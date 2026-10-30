@@ -11,15 +11,11 @@ final class Seen: @unchecked Sendable {
     private var values: [Int] = []
 
     func add(_ value: Int) {
-        lock.lock()
-        values.append(value)
-        lock.unlock()
+        lock.withLock { values.append(value) }
     }
 
     var all: [Int] {
-        lock.lock()
-        defer { lock.unlock() }
-        return values
+        lock.withLock { values }
     }
 
     /// Waits up to 5 s for `value`.
@@ -185,7 +181,7 @@ func readSome(_ fd: Int32) -> String {
         let dir = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }
         let config = try realConfig(dir)
-        let vz = try VZBuilder.configuration(for: config, console: FileHandle.nullDevice)
+        let vz = try VZBuilder.configuration(for: config, consoleLog: nil)
         #expect(vz.cpuCount == config.cpus)
         #expect(vz.memorySize == config.memory)
         let boot = try #require(vz.bootLoader as? VZLinuxBootLoader)
@@ -208,11 +204,36 @@ func readSome(_ fd: Int32) -> String {
         #expect(vz.entropyDevices.count == 1)
         #expect(vz.socketDevices.count == 1)
         #expect(vz.serialPorts.count == 1)
+        // The console writes to a real descriptor: Virtualization.framework
+        // aborts the process for one without.
+        let console = try #require(vz.serialPorts.first?.attachment as? VZFileHandleSerialPortAttachment)
+        #expect((console.fileHandleForWriting?.fileDescriptor ?? -1) >= 0)
         // Only a binary signed with the entitlement may validate; `swift
         // test` isn't one. The vm-cycle step in check-full.sh validates
         // through the signed vibe-vm.
         if HostSupport.current().ready {
             try VZBuilder.validate(vz)
+        }
+    }
+
+    @Test @MainActor func theConsoleGoesToItsLog() throws {
+        let dir = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let log = dir.appendingPathComponent("console.log").path
+        let config = try realConfig(dir)
+        let vz = try VZBuilder.configuration(for: config, consoleLog: log)
+        #expect(FileManager.default.fileExists(atPath: log))
+        let console = try #require(vz.serialPorts.first?.attachment as? VZFileHandleSerialPortAttachment)
+        let writer = try #require(console.fileHandleForWriting)
+        try writer.write(contentsOf: Data("hello\n".utf8))
+        #expect(try String(contentsOfFile: log, encoding: .utf8) == "hello\n")
+        let unwritable = dir.appendingPathComponent("none/console.log").path
+        do {
+            _ = try VZBuilder.configuration(for: config, consoleLog: unwritable)
+            Issue.record("a console log that can't be opened was accepted")
+        } catch let failure as Failure {
+            #expect(failure.code == .badConfig)
+            #expect(failure.error.contains(unwritable), "\(failure.error)")
         }
     }
 
@@ -233,7 +254,7 @@ func readSome(_ fd: Int32) -> String {
             var config = good
             change(&config)
             do {
-                _ = try VZBuilder.configuration(for: config, console: FileHandle.nullDevice)
+                _ = try VZBuilder.configuration(for: config, consoleLog: nil)
                 Issue.record("\(message): accepted")
             } catch let failure as Failure {
                 #expect(failure.code == .badConfig)

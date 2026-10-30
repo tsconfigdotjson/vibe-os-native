@@ -85,15 +85,11 @@ final class Waits: @unchecked Sendable {
     var during: (@Sendable () async -> Void)?
 
     var all: [UInt64] {
-        lock.lock()
-        defer { lock.unlock() }
-        return waits
+        lock.withLock { waits }
     }
 
     func wait(_ ms: UInt64) async {
-        lock.lock()
-        waits.append(ms)
-        lock.unlock()
+        lock.withLock { waits.append(ms) }
         await during?()
     }
 }
@@ -388,14 +384,10 @@ final class Refusals: @unchecked Sendable {
     var state: MachineState?
 
     func add(_ failure: Failure?) {
-        lock.lock()
-        if let failure { failures.append(failure) }
-        lock.unlock()
+        lock.withLock { if let failure { failures.append(failure) } }
     }
 
     var all: [Failure] {
-        lock.lock()
-        defer { lock.unlock() }
-        return failures
+        lock.withLock { failures }
     }
 }

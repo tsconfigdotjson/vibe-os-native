@@ -18,7 +18,7 @@ public enum Runner {
             if config.mac == nil {
                 config.mac = randomMAC()
             }
-            let vz = try VZBuilder.configuration(for: config, console: FileHandle.nullDevice)
+            let vz = try VZBuilder.configuration(for: config, consoleLog: nil)
             try VZBuilder.validate(vz)
             try config.save(path: configPath)
             emit(Created(machineID: config.machineID ?? "", mac: config.mac ?? ""))
@@ -60,7 +60,7 @@ public enum Runner {
             try requireHost()
             socket = try ControlSocket.bind(path: socketPath)
             do {
-                let vz = try VZBuilder.configuration(for: config, console: try consoleHandle(config.consoleLog))
+                let vz = try VZBuilder.configuration(for: config, consoleLog: config.consoleLog)
                 try VZBuilder.validate(vz)
                 machine = VZMachine(configuration: vz)
             } catch {
@@ -122,16 +122,6 @@ public enum Runner {
         guard host.entitled else {
             throw Failure(.unsupported, "this vibe-vm isn't signed with the \(HostSupport.entitlement) entitlement")
         }
-    }
-
-    /// The console log, appended to; or nowhere.
-    static func consoleHandle(_ path: String?) throws -> FileHandle {
-        guard let path else { return FileHandle.nullDevice }
-        let fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0o600)
-        guard fd >= 0 else {
-            throw Failure(.badConfig, "can't open \(path): \(errnoString())")
-        }
-        return FileHandle(fileDescriptor: fd, closeOnDealloc: true)
     }
 
     /// One line on stdout, for vibed.

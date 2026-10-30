@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 @preconcurrency import Virtualization
 
@@ -6,11 +7,12 @@ public enum VZBuilder {
     /// Every device a `linux` agent's VM has (PRD: Mounts; Sleep and wake):
     /// kernel and initrd boot, the disks and shares in `config`, NAT
     /// networking with the fixed MAC address, a memory balloon, entropy,
-    /// vsock, and a console written to `console`.
+    /// vsock, and a console appended to `consoleLog`, or to /dev/null.
     @MainActor
-    public static func configuration(for config: VMConfig, console: FileHandle) throws
+    public static func configuration(for config: VMConfig, consoleLog: String?) throws
         -> VZVirtualMachineConfiguration
     {
+        let console = try openConsole(consoleLog)
         let files = FileManager.default
         func requireFile(_ what: String, _ path: String) throws {
             guard files.isReadableFile(atPath: path) else {
@@ -89,6 +91,18 @@ public enum VZBuilder {
         serial.attachment = VZFileHandleSerialPortAttachment(fileHandleForReading: nil, fileHandleForWriting: console)
         vz.serialPorts = [serial]
         return vz
+    }
+
+    /// A handle on a real open descriptor for the console to write to:
+    /// Virtualization.framework raises an Objective-C exception, which Swift
+    /// can't catch, for one without (`FileHandle.nullDevice` is one such).
+    static func openConsole(_ path: String?) throws -> FileHandle {
+        let target = path ?? "/dev/null"
+        let fd = open(target, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0o600)
+        guard fd >= 0 else {
+            throw Failure(.badConfig, "can't open \(target) for the console: \(errnoString())")
+        }
+        return FileHandle(fileDescriptor: fd, closeOnDealloc: true)
     }
 
     /// Checks Virtualization.framework accepts the VM, and can save and

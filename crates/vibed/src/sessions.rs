@@ -410,7 +410,12 @@ mod tests {
         // The same answer once its lock is free: whatever answered is no
         // shim of ours, and the shim that was is gone.
         drop(held);
-        assert!(matches!(probe(&other).await, Probe::Gone));
+        let after = probe(&other).await;
+        assert!(
+            matches!(after, Probe::Gone),
+            "{after:?} with its lock let go; lock_held says {}",
+            lock_held(&other)
+        );
 
         // A stale socket whose lock a shim holds as it starts is left be.
         let starting = tmp.path().join("starting.sock");
