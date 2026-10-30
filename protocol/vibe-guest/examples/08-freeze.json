@@ -1,0 +1,15 @@
+{
+  "request": {
+    "op": "freeze"
+  },
+  "reply": {
+    "ok": true,
+    "processes": 3,
+    "freeze_ms": 4,
+    "sync_ms": 12,
+    "memory": {
+      "total": 4111171584,
+      "available": 3382181888
+    }
+  }
+}

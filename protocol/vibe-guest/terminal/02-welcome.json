@@ -1,0 +1,27 @@
+{
+  "kind": "welcome",
+  "payload": {
+    "protocol": 1,
+    "session": {
+      "pid": 214,
+      "command": [
+        "claude",
+        "--session-id",
+        "6f1e5c2a-0b7e-4d38-9a41-2f5c8e1d7b90",
+        "--model",
+        "opus",
+        "--effort",
+        "high",
+        "--permission-mode",
+        "auto",
+        "Fix the flaky login test"
+      ],
+      "cwd": "/Users/me/VibeOS/worktrees/app/quiet-amber-otter",
+      "started_ms": 1830
+    },
+    "size": {
+      "rows": 40,
+      "cols": 120
+    }
+  }
+}

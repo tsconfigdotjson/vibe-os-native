@@ -11,6 +11,8 @@ repository = "https://github.com/tsconfigdotjson/vibe-os-native"
 
 [workspace.dependencies]
 vibe-core = { path = "crates/vibe-core" }
+vibe-env = { path = "crates/vibe-env" }
+vibe-guest = { path = "crates/vibe-guest" }
 vibed = { path = "crates/vibed" }
 libc = "0.2"
 # SQLite is compiled in, so a Linux host needs no system library. Cross

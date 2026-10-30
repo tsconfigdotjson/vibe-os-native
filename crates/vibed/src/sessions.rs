@@ -408,8 +408,21 @@ mod tests {
         });
         assert!(matches!(probe(&other).await, Probe::Broken(_)));
         // The same answer once its lock is free: whatever answered is no
-        // shim of ours, and the shim that was is gone.
+        // shim of ours, and the shim that was is gone. A lock is let go when
+        // the last descriptor of its open file closes, and a command another
+        // test spawns meanwhile holds copies of all of this process's
+        // descriptors until its exec closes them, which macOS's code-signing
+        // checks can make take a while. So "free" is waited for, not
+        // assumed the moment `held` drops.
         drop(held);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while lock_held(&other) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the lock stayed held after it was let go"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         let after = probe(&other).await;
         assert!(
             matches!(after, Probe::Gone),

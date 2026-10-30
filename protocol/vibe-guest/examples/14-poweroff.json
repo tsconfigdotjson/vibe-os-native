@@ -1,0 +1,8 @@
+{
+  "request": {
+    "op": "poweroff"
+  },
+  "reply": {
+    "ok": true
+  }
+}

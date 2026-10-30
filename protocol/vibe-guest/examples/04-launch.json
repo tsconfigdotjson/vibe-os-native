@@ -1,0 +1,31 @@
+{
+  "request": {
+    "op": "launch",
+    "command": [
+      "claude",
+      "--session-id",
+      "6f1e5c2a-0b7e-4d38-9a41-2f5c8e1d7b90",
+      "--model",
+      "opus",
+      "--effort",
+      "high",
+      "--permission-mode",
+      "auto",
+      "Fix the flaky login test"
+    ],
+    "env": {
+      "CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-…",
+      "DISABLE_AUTOUPDATER": "1"
+    },
+    "cwd": "/Users/me/VibeOS/worktrees/app/quiet-amber-otter",
+    "size": {
+      "rows": 40,
+      "cols": 120
+    },
+    "time_ms": 1793395977123
+  },
+  "reply": {
+    "ok": true,
+    "pid": 214
+  }
+}

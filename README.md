@@ -15,12 +15,12 @@ truth.
 | `crates/vibe-status` | The status engine (agent-tail) |
 | `crates/vibe-env` | Environment backends behind `Compartment`, `Limiter`, `Sleeper`, and `vibe_env::vm`, which drives `vibe-vm` |
 | `crates/vibe-shim` | Holds one agent's terminal |
-| `crates/vibe-guest` | PID 1 in each `linux` VM; a static `aarch64-unknown-linux-musl` binary |
-| `crates/vibe-testguest` | PID 1 of the small test guest `vibe-vm` is tested with; not shipped |
+| `crates/vibe-guest` | PID 1 in each `linux` VM; a static `aarch64-unknown-linux-musl` binary. Its library is the protocol `vibed` and `vibe-shim` speak to it |
+| `crates/vibe-testguest` | PID 1 of the small test guest `vibe-vm` is tested with, and a stand-in for Claude in the one `vibe-guest` is; not shipped |
 | `crates/vibe-mcp` | The MCP server |
 | `swift/VibeOS` | `VibeOS.app`, the SwiftUI menu bar app, and `VibeRPC`, its socket client |
 | `swift/vibe-vm` | `vibe-vm`, the Virtualization.framework helper |
-| `protocol/` | The socket contract both sides are tested against, and `vibe-vm`'s in `protocol/vibe-vm/`; see the READMEs |
+| `protocol/` | The socket contract both sides are tested against, `vibe-vm`'s in `protocol/vibe-vm/` and `vibe-guest`'s in `protocol/vibe-guest/`; see the READMEs |
 | `scripts/` | `check-full.sh` runs every check; `sign-macos.sh` signs for local use; `test-guest.sh` builds the test guest; `vm-reboot-test.sh` checks a saved VM survives a reboot |
 
 Every crate builds on macOS and Linux (x86_64 and arm64); `vibe-guest` and
@@ -42,7 +42,8 @@ cargo build -p vibe-guest --target aarch64-unknown-linux-musl
 scripts/sign-macos.sh           # build/VibeOS.app and build/vibe-vm, ad hoc signed
 open build/VibeOS.app
 
-scripts/test-guest.sh           # build/test-guest: a small Linux guest for vibe-vm
+scripts/test-guest.sh           # build/test-guest: small Linux guests for vibe-vm and vibe-guest
+cargo build -p vibe-shim        # the vibe-guest test attaches through a real shim
 VIBE_VM_BIN=build/vibe-vm VIBE_VM_GUEST=build/test-guest \
   cargo test -p vibe-env --test vm_cycle -- --test-threads=1 --nocapture
 ```

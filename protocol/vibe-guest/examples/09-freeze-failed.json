@@ -1,0 +1,10 @@
+{
+  "request": {
+    "op": "freeze"
+  },
+  "reply": {
+    "ok": false,
+    "code": "freeze_failed",
+    "error": "the guest has no cgroup to freeze the agent with"
+  }
+}

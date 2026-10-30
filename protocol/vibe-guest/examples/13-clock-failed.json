@@ -1,0 +1,11 @@
+{
+  "request": {
+    "op": "clock",
+    "time_ms": 1793395977123
+  },
+  "reply": {
+    "ok": false,
+    "code": "clock_failed",
+    "error": "can't set the clock: Operation not permitted (os error 1)"
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "kind": "resize",
+  "payload": {
+    "rows": 50,
+    "cols": 160
+  }
+}

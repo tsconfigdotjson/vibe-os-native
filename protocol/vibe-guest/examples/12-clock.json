@@ -1,0 +1,10 @@
+{
+  "request": {
+    "op": "clock",
+    "time_ms": 1793395977123
+  },
+  "reply": {
+    "ok": true,
+    "step_ms": 1793395975001
+  }
+}
