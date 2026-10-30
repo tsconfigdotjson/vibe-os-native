@@ -33,7 +33,7 @@ v1 is one owner, one Mac, many agents. MCP matters most: the menu bar and Termin
 - Reaching ports inside `linux` VMs (dev servers, previews). Agents test from inside their VM.
 - A menu bar on any machine other than the host. Remote users drive agents over MCP and attach over SSH.
 - A browser desktop, a custom terminal emulator, or terminals other than Terminal.app.
-- File sandboxing for `macos` agents. They are trusted, and only resource-limited.
+- File sandboxing for `macos` agents, or tracking and cleaning up what they install outside their worktree. They are trusted and only resource-limited; deleting one removes its worktree, nothing more. Work that needs containment belongs in `linux`.
 - Network egress filtering.
 - Custom VM images or Dockerfiles. The Linux template covers customization.
 - Multiple users or teams on one host.
