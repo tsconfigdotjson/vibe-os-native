@@ -78,13 +78,13 @@ An agent, its worktree and its compartment are one unit. They're created togethe
 | Environment | `linux` or `macos`. Set by the profile, and fixed for the agent's life. | The profile |
 | Linux template | The Linux machine every `linux` agent boots a copy of: whatever you install in the toolbox shell (`apt`, `curl … \| sh`, `npm -g`). Versioned. | Host disk image |
 | Linux home | Logins and dotfiles every `linux` agent starts with (`gh`, `gcloud`, `~/.gitconfig`), set up in the toolbox shell. Kept apart from the template so a rebuild doesn't lose them. | Host disk image |
-| Linux Claude home | One `~/.claude` shared read-write by every `linux` agent and the toolbox, as VibeOS shares one on its box: the Claude login, CLAUDE.md, settings, skills and transcripts. | `~/VibeOS/linux-claude/` |
+| Linux Claude config | Your Claude setup for `linux` agents (CLAUDE.md, settings, skills, MCP servers), made in the toolbox shell. Copied into each agent's own `~/.claude` when it starts. | `~/VibeOS/linux-claude/` |
 | Managed layer | Tools the daemon keeps current for every `linux` VM. In v1 that's only Claude Code. | Host disk image |
 | Toolbox shell | A Terminal session in a writable Linux VM, for changing the template and the Linux home. | Menu → Linux toolbox, or `vibe toolbox` |
 | Host limits | Everything that isn't per profile: memory and cores kept for macOS, CPU cores per agent, process count, disk. | Settings → Host, or `~/.config/vibeos/host.toml` |
 | Snapshot | A sleeping `linux` agent's whole VM, RAM included, saved to disk. Restoring it resumes the agent exactly. | `~/VibeOS/snapshots/<ref>` |
 | Session | The PTY the agent runs in. A shim holds it, so it outlives every client. | `…/run/<ref>.sock` |
-| Transcript | The session file Claude Code writes on its own. agent-tail reads it to get status. | `macos`: `~/.claude/projects/`; `linux`: the Linux Claude home on the host |
+| Transcript | The session file Claude Code writes on its own. agent-tail reads it to get status. | `macos`: `~/.claude/projects/`; `linux`: the agent's own Claude home on the host |
 | Client | Anything attached to an agent or calling `vibed`: Terminal via `vibe attach`, an MCP client, or the menu bar app. | — |
 
 ## Key user flows
@@ -99,7 +99,7 @@ An agent's life runs setup → start (worktree and compartment included) → wor
    - Tailscale (optional, for remote MCP)
 
    Meanwhile it downloads the Linux base image and the current Claude Code. Then it offers two last steps:
-   - **Set up Linux.** The toolbox shell opens in Terminal: run `claude` and `/login`, `gh auth login`, and anything else you want every Linux agent to have (`gcloud auth login`, `apt install …`, your Claude settings). Exit to save.
+   - **Set up Linux.** Log in to Claude for Linux agents: the app runs `claude setup-token`, which opens the same browser sign-in as `/login`, and keeps the long-lived token in Keychain. Then the toolbox shell opens in Terminal: run `gh auth login`, and anything else you want every Linux agent to have (`gcloud auth login`, `apt install …`, your Claude settings). Exit to save.
    - **Settings → API keys → New key**, with a ready `claude mcp add …` line to copy.
 2. **Add a project.** Settings → Projects → Add takes a GitHub `owner/name`, cloned with the Mac's `gh` login into `~/VibeOS/projects/`, or a local path. The project starts with two profiles, one per environment (see Profiles), which you can edit or add to.
 3. **Start an agent.** `vibe_start_agent {project, profile, prompt}`, or New agent… in the menu. One call does it all:
@@ -169,7 +169,7 @@ Every agent runs in its own compartment, in the environment its profile names. `
 
 | Environment | How it runs | Enforces | Sleeps by | Pick it for | Logins and binaries | Trust |
 | --- | --- | --- | --- | --- | --- | --- |
-| `linux` | Micro-VM per agent on Apple's Virtualization.framework | vCPUs and RAM fixed at boot; separate kernel and filesystem | Saving the VM to disk: RAM freed, exact restore | Most work: web, backend, CLIs, anything that builds on Linux | The Linux toolchain and home, plus the shared Linux Claude home | Isolated from the host and from other agents |
+| `linux` | Micro-VM per agent on Apple's Virtualization.framework | vCPUs and RAM fixed at boot; separate kernel and filesystem | Saving the VM to disk: RAM freed, exact restore | Most work: web, backend, CLIs, anything that builds on Linux | The Linux toolchain and home, plus Claude's long-lived token | Isolated from the host and from other agents |
 | `macos` | Native processes under `vibed`'s governor | CPU, memory, process count and disk, by supervision | `SIGSTOP`: exact; macOS compresses or swaps the memory | iOS and macOS apps, Xcode, Swift, Homebrew-only tools | The Mac's own binaries and logins, as you | Runs as you, with no file sandbox: the governor protects the machine's resources, not your files |
 
 ### Profiles
@@ -257,7 +257,7 @@ Repos don't customize the VM themselves. Project dependencies go in `.vibe/setup
 | What | Why the frozen template doesn't fit | How it works instead |
 | --- | --- | --- |
 | Claude Code | It must stay current | The managed layer: the daemon downloads each new release into a new layer version. Claude's own auto-updater is off inside VMs |
-| Claude's login and config | Claude refreshes its login and writes settings and transcripts; a per-agent copy would drift, and a refreshed login in one copy would leave the others dead | Not in a layer: one shared, read-write Linux Claude home (Mounts, below) |
+| Claude's login and config | A login that refreshes itself can't be copied per agent: a refresh in one copy leaves the others dead. Sharing one Claude home across VMs failed the spike | Login: a long-lived `claude setup-token` token, kept in Keychain and injected as `CLAUDE_CODE_OAUTH_TOKEN`, so nothing refreshes. Config: copied per agent (Mounts, below) |
 | Other self-updating CLIs (`gcloud`, `gh`) | An update inside an agent lands in that agent's throwaway copy | The `[update]` commands in `toolbox.toml`, or updating by hand in the toolbox shell |
 | Shared, writable state | Can't be a read-only layer | Read-write mounts (below) |
 
@@ -266,8 +266,8 @@ Repos don't customize the VM themselves. Project dependencies go in `.vibe/setup
 Mounts are the same for every agent:
 
 - **The worktree**, read-write, at the same absolute path as on the host.
-- **The project's `.git` directory**, read-write, at its host path. A worktree's `.git` file points into it. Git's lock files handle concurrent ref updates from several VMs. Agents run with `gc.auto=0`, and the daemon runs `git maintenance` on the host during quiet periods.
-- **The Linux Claude home**, one host directory mounted read-write as `~/.claude` in every `linux` VM and in the toolbox, the way every window on a VibeOS box shares one `~/.claude`. It holds the Claude login from `/login`, so a refresh by any agent is seen by all. It also holds CLAUDE.md, settings, skills and transcripts: agent-tail reads them on the host, and `claude --resume` finds them after a crash or reboot.
+- **The project's `.git` directory**, read-write, at its host path. A worktree's `.git` file points into it. Git's lock files handle concurrent ref updates from several VMs: they use O_EXCL, which the spike showed holds across VMs, unlike `flock` and `mkdir` locks. Agents run with `gc.auto=0`, and the daemon runs `git maintenance` on the host during quiet periods.
+- **The agent's Claude home**, a per-agent host directory mounted as `~/.claude`. When the agent starts, it's seeded with a copy of the Linux Claude config (CLAUDE.md, settings, skills, MCP servers) made in the toolbox shell. agent-tail reads the transcripts from it on the host, and `claude --resume` finds them after a crash or reboot. It isn't shared between agents: VibeOS shares one `~/.claude` on a single disk, but across VMs the spike lost appended lines and served stale files under a lock.
 - **Shared package caches** (npm, pnpm, cargo, pip), read-write.
 
 #### Sleep and wake
@@ -362,12 +362,12 @@ An API key is a shell on the Mac, so keys are mandatory and the server listens o
 | Environment | GitHub, gcloud and other logins | Claude | Set up by |
 | --- | --- | --- | --- |
 | `macos` | The Mac's own: `gh` as git's credential helper, `~/.config/gcloud` and so on | The Mac's Claude login in Keychain | Logging in on the Mac as yourself, as you already do |
-| `linux` | The Linux home: read-only in every VM, with a per-agent copy on top | One `/login`, in the shared Linux Claude home | One toolbox-shell session |
+| `linux` | The Linux home: read-only in every VM, with a per-agent copy on top | A long-lived `claude setup-token` token, kept in Keychain and injected as `CLAUDE_CODE_OAUTH_TOKEN` | One toolbox-shell session, plus one Claude sign-in through `setup-token` |
 
 **Threat model, plainly:**
 
 - `macos` protects the machine's resources: runaway builds, fork bombs, memory leaks. It does not protect your files. A `macos` agent can do anything you can.
-- `linux` protects the host and other agents from a misbehaving agent. It does not protect the Linux home's logins or the shared Linux Claude home: any agent can use the logins and read other agents' transcripts, and a compromised agent could copy them. For tighter scope, log the Linux home's `gh` into a fine-grained token rather than your full account. Network egress is open.
+- `linux` protects the host and other agents from a misbehaving agent. It does not protect the Linux home's logins or the Claude token: any agent can use them, and a compromised agent could copy them. For tighter scope, log the Linux home's `gh` into a fine-grained token rather than your full account. Network egress is open.
 - Every agent can write to the project's shared `.git`, so a misbehaving agent could rewrite other branches' refs. Pushed branches on GitHub are the backstop.
 - Nothing protects against a stolen API key except revoking it.
 
@@ -404,7 +404,7 @@ Only transcripts of agents this app spawned are read. agent-tail is fed specific
 
 - **By id.** Claude Code is launched with `--session-id <uuid>` generated by `vibed`, so the transcript path is known exactly. `--resume` keeps the same id.
 - **By worktree.** If `/clear` changes the id, `vibed` takes the newest session whose recorded cwd is the agent's worktree. Each worktree has exactly one agent, so this is always exact.
-- **Where.** `macos` transcripts are in the Mac's normal `~/.claude/projects/`. `linux` transcripts are in the Linux Claude home, which is a host directory, so tailing works the same way.
+- **Where.** `macos` transcripts are in the Mac's normal `~/.claude/projects/`. `linux` transcripts are in the agent's own Claude home, which is a host directory, so tailing works the same way.
 - **Polling.** Each agent's reducer gets appended bytes on every file-system event, plus a 1 s poll as a backstop. `vibed` passes `now` in, as the library expects, and sets agent-tail's idle window to the idle debounce.
 
 ### Going to sleep
@@ -467,7 +467,20 @@ Virtualization.framework's save and restore works for this design. The spike ran
 | Network after a restore | Same IP; the gateway and the internet were reachable |
 | Configuration | A restore fails ("invalid argument") unless the configuration matches the saved one exactly. The NIC's random default MAC address broke it until it was fixed |
 
-Not tested yet: surviving a host reboot, several VMs at once, a shared Claude home across VMs (open question 5), the size of a real Claude session, and layered disks (open question 2).
+A second spike the same day ran several VMs at once, all sharing one folder, the way agents share a project's `.git`:
+
+| Check | Result |
+| --- | --- |
+| Three VMs booting, saving and restoring at the same time | Fine: booted in 0.4 s, all saved together in 0.9 s, all restored together in 0.5 s |
+| `flock` locks across VMs | Don't work. Each VM's lock is local to it: the other VM and the Mac both took a lock that was held |
+| Two VMs appending to one file | Lines are lost: 1,000 written, 500 kept |
+| A file swapped in by write-then-rename | The other VM keeps seeing the old one for about 0.8 to 0.9 s |
+| `mkdir` as a lock | Exclusive, but whoever takes it next can read a stale file: a locked counter reached 6 to 40 of 200 |
+| O_EXCL lock files, as git uses for `index.lock` and ref locks | Correct: the locked counter reached 200 of 200 in four runs out of four |
+
+So linux agents don't share a Claude home. Its append-only logs and its login refresh are exactly what failed, and they now use `setup-token` instead. The shared `.git` should be safe, because git locks with O_EXCL, but the prototype should confirm it with real git. Nothing else should be shared read-write across VMs.
+
+Not tested yet: surviving a host reboot, the size of a real Claude session, real git on the shared `.git`, and layered disks (open question 2).
 
 ## Open questions
 
@@ -475,11 +488,11 @@ One of these blocks design work: how the layers stack. The rest have a recommend
 
 | # | Question | Recommendation | Why |
 | --- | --- | --- | --- |
-| 1 | What's left of VM snapshots after the spike? | Test that a snapshot survives a host reboot, that several VMs save and restore at once, and how big a real idle Claude's snapshot is after the balloon | The core works (see Spike results). If a snapshot doesn't survive a reboot, linux agents wake with `claude --resume` after one, as `macos` agents already do |
+| 1 | What's left of VM snapshots after the spike? | Test that a snapshot survives a host reboot, and how big a real idle Claude's snapshot is after the balloon | The core works (see Spike results). If a snapshot doesn't survive a reboot, linux agents wake with `claude --resume` after one, as `macos` agents already do |
 | 2 | How do the template, managed layer, home and agent copy stack? | Read-only disk images plus a per-agent writable image, combined with overlayfs inside the guest. Never overlayfs on top of virtio-fs | Block images are stable and versionable. Overlayfs over a shared filesystem is fragile |
 | 3 | Are 4 GB starter profiles right? | Measure real Claude sessions with typical builds on 32 GB and 64 GB machines | Every number here is a guess until measured |
 | 4 | Does Claude Code wake cleanly from `SIGCONT`, and from a VM restore with dropped connections and a jumped clock? | Add both scenarios to agent-tail's harness CI | Sleeping is only safe if waking always works |
-| 5 | Is one shared Claude home safe across VMs over virtio-fs? | In the VM spike, run several agents on one login and force token refreshes at the same moment. Check that Claude's credential and settings writes (file locks, write-then-rename) behave as on a local disk | VibeOS shares one `~/.claude` on a single filesystem; several VMs over a shared folder may not behave the same. If it fails, fall back to a `claude setup-token` token injected as `CLAUDE_CODE_OAUTH_TOKEN` |
+| 5 | Does a `claude setup-token` token cover everything Claude needs inside a VM? | Check it in the prototype, with real Claude in a `linux` agent | Sharing one Claude home across VMs failed the spike, so this token is now the one credential every `linux` agent depends on |
 | 6 | Does agent-tail report a usage-limit stop as a firm resting state? | Add a mock-server scenario that returns the limit error, tracked in [agent-tail#121](https://github.com/tsconfigdotjson/agent-tail/issues/121). Ideally it also reports the reason and reset time | If not, a limited agent shows as unknown and never sleeps, holding its memory until the limit resets |
 
 **Decided on 2026-10-29:**
@@ -494,7 +507,7 @@ One of these blocks design work: how the layers stack. The rest have a recommend
 - Any profile may use `bypass`, including `macos`; that's the owner's call.
 - Profiles belong to projects and set environment, model, reasoning level, mode (`auto` or `bypass`) and memory. Each new project starts with a `linux` and a `macos` profile: Opus, high reasoning, `auto`, 4 GB.
 - `macos` agents use the Mac's own binaries and logins, and are resource-governed only, with no file sandbox.
-- `linux` agents use the Linux template and home set up in the toolbox shell. Claude Code comes from a daemon-managed layer updated daily. All `linux` agents share one read-write Linux Claude home, logged in once with `/login`, as on VibeOS.
+- `linux` agents use the Linux template and home set up in the toolbox shell. Claude Code comes from a daemon-managed layer updated daily. Claude authenticates with a `setup-token` token, and each agent gets its own Claude home seeded from the Linux Claude config. Sharing one Claude home across VMs was tried and failed the spike.
 - The MCP keeps VibeOS's round and semantics, folded to one agent per worktree: eight tools.
 - Idle is decided by agent-tail's firm states plus a process-tree check and a 60 s debounce. `linux` agents sleep by saving the VM to disk, `macos` agents by `SIGSTOP`, and both wake exactly where they were. `claude --resume` is only for crashes, reboots and dropped snapshots.
 - Sleeping `linux` agents share one snapshot budget, 20 GB by default and adjustable; past it, the oldest snapshot is dropped.
