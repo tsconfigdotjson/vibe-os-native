@@ -28,7 +28,7 @@ v1 is one owner, one Mac, many agents. MCP matters most: the menu bar and Termin
 
 **Non-goals for v1**
 
-- Harnesses other than Claude Code. agent-tail already reads seven more, so they can be added later.
+- Harnesses other than Claude Code. Pi comes next, added as a profile field; agent-tail already reads it, CI-verified.
 - Several agents in one worktree.
 - Reaching ports inside `linux` VMs (dev servers, previews). Agents test from inside their VM.
 - A menu bar on any machine other than the host. Remote users drive agents over MCP and attach over SSH.
@@ -37,7 +37,7 @@ v1 is one owner, one Mac, many agents. MCP matters most: the menu bar and Termin
 - Network egress filtering.
 - Custom VM images or Dockerfiles. The Linux template covers customization.
 - Multiple users or teams on one host.
-- Shipping on a Linux host. The environment layer is built so it can be ported.
+- Linux hosts. This is a Mac-only app.
 - Running macOS GUI apps or Xcode simulators inside `linux` VMs.
 - Orchestration logic such as planning, queues or merge bots. Clients build that on top of MCP.
 - A cloud relay. Remote access goes through Tailscale or SSH.
@@ -94,7 +94,7 @@ An agent's life runs setup → start (worktree and compartment included) → wor
    - `gh auth status` and `gh auth setup-git`
    - git, the `claude` binary, and its login
    - Automation permission to control Terminal
-   - power: auto-login, no system sleep
+   - power: no system sleep (v1 assumes the Mac stays up)
    - Tailscale (optional, for remote MCP)
 
    Meanwhile it downloads the Linux base image and the current Claude Code. Then it offers two last steps:
@@ -271,7 +271,7 @@ Mounts are the same for every agent:
 
 #### Sleep and wake
 
-The VM boots with its agent. When the agent goes idle, `vibe-vm` pauses the VM, saves its whole state (RAM and devices) to the agent's snapshot file and exits, so all its RAM goes back to the Mac. Waking restores the snapshot: Claude is exactly where it was, mid-prompt or mid-question, with nothing replayed. `vibe-guest` then resets the clock and the shim reconnects. Network connections open at sleep time are dropped; an idle Claude has none in flight (open question 5 checks this).
+The VM boots with its agent. When the agent goes idle, `vibe-vm` pauses the VM, saves its whole state (RAM and devices) to the agent's snapshot file and exits, so all its RAM goes back to the Mac. Waking restores the snapshot: Claude is exactly where it was, mid-prompt or mid-question, with nothing replayed. `vibe-guest` then resets the clock and the shim reconnects. Network connections open at sleep time are dropped; an idle Claude has none in flight (open question 4 checks this).
 
 All snapshots share one disk budget, `snapshot_disk`: 20 GB by default, adjustable in Settings → Host. When a new snapshot wouldn't fit, the oldest snapshot is dropped, and that agent wakes later with `claude --resume` instead, losing any pending question.
 
@@ -441,20 +441,15 @@ Never put to sleep: `thinking`, `running_tool`, `background_work`, and any *infe
 
 ## Open questions
 
-Three of these block design work: VM snapshots, how the layers stack, and the headless-reboot story. The rest have a recommended answer that can be confirmed later.
+Two of these block design work: VM snapshots and how the layers stack. The rest have a recommended answer that can be confirmed later.
 
 | # | Question | Recommendation | Why |
 | --- | --- | --- | --- |
 | 1 | Does Virtualization.framework's save and restore work for our VMs? | A one-week spike. Test it with virtio-fs shares and vsock attached. Measure restore time and snapshot size for a 4 GB VM, and whether a snapshot grows with the RAM the guest used or is always the full 4 GB. Check that a snapshot survives a reboot, and that the guest doesn't see stale files in the shared `.git` after a restore. Also check whether Apple Containerization exposes snapshots | Snapshots make sleep exact and free. If they fall short, stop and decide with the owner before picking a fallback: libkrun with `claude --resume` (which loses pending questions), or Containerization |
 | 2 | How do the template, managed layer, home and agent copy stack? | Read-only disk images plus a per-agent writable image, combined with overlayfs inside the guest. Never overlayfs on top of virtio-fs | Block images are stable and versionable. Overlayfs over a shared filesystem is fragile |
-| 3 | How does a headless Mac come back after a reboot? A LaunchAgent needs a logged-in user | v1 requires auto-login, and the doctor checks for it. macOS turns auto-login off when FileVault is on, so this means FileVault off, or a manual unlock after each reboot. Parked for now. A LaunchDaemon mode comes later | A Mac mini in a closet will reboot for updates |
-| 4 | Are 4 GB starter profiles right? | Measure real Claude sessions with typical builds on 32 GB and 64 GB machines | Every number here is a guess until measured |
-| 5 | Does Claude Code wake cleanly from `SIGCONT`, and from a VM restore with dropped connections and a jumped clock? | Add both scenarios to agent-tail's harness CI | Sleeping is only safe if waking always works |
-| 6 | Does a `claude setup-token` token cover everything Claude needs inside a VM? | Verify it during the VM spike | It's the one credential every `linux` agent depends on |
-| 7 | How to depend on agent-tail, which isn't on crates.io | Use a git tag pinned to the frozen v0.1 status model | Stable contract, no publishing work yet |
-| 8 | Shared package caches across `linux` VMs | Share them by default, with an opt-out | Speed matters more than cache poisoning for one owner |
-| 9 | Which harness comes after Claude Code? | Codex, added as a profile field | It's CI-verified in agent-tail and can resume |
-| 10 | Linux hosts | Later: the same `vibed` on a Linux host, offering only `linux`, on a KVM VMM with snapshots (Firecracker or Cloud Hypervisor) | The `Environment` trait is built for it from day one |
+| 3 | Are 4 GB starter profiles right? | Measure real Claude sessions with typical builds on 32 GB and 64 GB machines | Every number here is a guess until measured |
+| 4 | Does Claude Code wake cleanly from `SIGCONT`, and from a VM restore with dropped connections and a jumped clock? | Add both scenarios to agent-tail's harness CI | Sleeping is only safe if waking always works |
+| 5 | Does a `claude setup-token` token cover everything Claude needs inside a VM? | Verify it during the VM spike | It's the one credential every `linux` agent depends on |
 
 **Decided on 2026-10-29:**
 
@@ -474,7 +469,11 @@ Three of these block design work: VM snapshots, how the layers stack, and the he
 - If VM snapshots fail the spike, work pauses for a decision before any fallback is chosen.
 - Agents share the project's `.git`, with auto-gc off and maintenance run by the daemon.
 - Agents push and open PRs themselves, in both environments.
-- v1 supports Claude Code only.
+- v1 supports Claude Code only. Pi is the next harness.
+- Mac only: no Linux hosts, ever.
+- v1 assumes the host stays up. A reboot is handled (agents come back asleep), but there's no FileVault or auto-login story.
+- agent-tail is a git dependency pinned to a tag on the frozen v0.1 status model.
+- npm, pnpm, cargo and pip caches are shared across `linux` VMs by default, with an opt-out.
 - MCP always requires an API key, generated in Settings.
 - Projects are added in Settings, from GitHub `owner/name` or a local path.
 - A full host puts idle agents to sleep first, then refuses. Starts never queue.
