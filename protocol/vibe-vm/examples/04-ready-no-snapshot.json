@@ -1,0 +1,4 @@
+{
+  "command": ["restore"],
+  "ready": { "ok": false, "code": "no_snapshot", "error": "there's no snapshot at /Users/me/VibeOS/snapshots/quiet-amber-otter" }
+}

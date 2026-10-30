@@ -1,0 +1,4 @@
+{
+  "request": { "op": "sleep" },
+  "reply": { "ok": false, "code": "busy", "error": "the VM is already saving" }
+}

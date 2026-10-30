@@ -1,0 +1,4 @@
+{
+  "request": { "op": "stop" },
+  "reply": { "ok": true }
+}

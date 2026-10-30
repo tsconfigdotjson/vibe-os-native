@@ -590,6 +590,13 @@ dependencies = [
 [[package]]
 name = "vibe-env"
 version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "vibe-core",
+]
 
 [[package]]
 name = "vibe-guest"
@@ -614,6 +621,14 @@ dependencies = [
 [[package]]
 name = "vibe-status"
 version = "0.1.0"
+
+[[package]]
+name = "vibe-testguest"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde_json",
+]
 
 [[package]]
 name = "vibed"

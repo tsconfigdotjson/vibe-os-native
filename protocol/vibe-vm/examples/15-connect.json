@@ -1,0 +1,4 @@
+{
+  "request": { "op": "connect", "port": 1024 },
+  "reply": { "ok": true }
+}

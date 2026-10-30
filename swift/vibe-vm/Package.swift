@@ -18,5 +18,10 @@ let package = Package(
         // scripts/sign-macos.sh.
         .executableTarget(name: "vibe-vm", dependencies: ["VibeVMKit"]),
         .testTarget(name: "VibeVMKitTests", dependencies: ["VibeVMKit"]),
-    ]
+    ],
+    // Virtualization.framework's classes aren't annotated for Swift 6's
+    // strict concurrency checks. vibe-vm keeps every one of them on the main
+    // actor, as the framework requires, and builds in the Swift 5 mode so the
+    // checks it can't satisfy stay warnings.
+    swiftLanguageModes: [.v5]
 )

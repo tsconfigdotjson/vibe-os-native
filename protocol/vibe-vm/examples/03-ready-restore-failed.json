@@ -1,0 +1,4 @@
+{
+  "command": ["restore"],
+  "ready": { "ok": false, "code": "restore_failed", "error": "can't restore /Users/me/VibeOS/snapshots/quiet-amber-otter: The virtual machine failed to restore." }
+}

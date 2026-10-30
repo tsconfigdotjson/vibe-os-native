@@ -1,0 +1,4 @@
+{
+  "request": { "op": "connect", "port": 1024 },
+  "reply": { "ok": false, "code": "bad_state", "error": "the VM is paused" }
+}

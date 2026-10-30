@@ -3,6 +3,8 @@
 #
 #   - the Rust workspace: fmt, clippy (warnings denied), build, test
 #   - the vibe-guest cross-build: a static aarch64-unknown-linux-musl binary
+#   - the test guest for vibe-vm (scripts/test-guest.sh): Alpine's netboot
+#     kernel and initrd, plus vibe-testguest as PID 1
 #   - cargo check of the workspace for every host target it doesn't run on
 #     (macOS and Linux, arm64 and x86_64)
 #   - a vibed hello-world smoke test, through `vibe hello` and `vibe rpc`
@@ -14,6 +16,10 @@
 #     including the Swift half of the Rust<->Swift contract test
 #   - ad hoc signing, with the virtualization entitlement on vibe-vm
 #   - vibe-vm check, signed and unsigned
+#   - VMs through vibe-vm, as vibed drives them: boot, save and restore the
+#     test guest, on its own and three at once, within the spike's numbers
+#     (crates/vibe-env/tests/vm_cycle.rs). The check across a reboot is
+#     scripts/vm-reboot-test.sh, which can't run here.
 #   - the Swift client against a live vibed
 #   - VibeOS.app launching and saying hello to a live vibed
 #
@@ -180,6 +186,8 @@ s_guest() {
   case $info in *"statically linked"*) ;; *) echo "not statically linked"; return 1 ;; esac
 }
 
+s_test_guest() { scripts/test-guest.sh build/test-guest; }
+
 # Every crate type-checks for the hosts vibed runs on, whatever this machine
 # is. Checking needs each target's std but no linker, so it works anywhere.
 s_cross() {
@@ -327,6 +335,21 @@ s_vm_check() {
   case $out in *'"entitled":false'*) ;; *) echo "unsigned vibe-vm claims the entitlement"; return 1 ;; esac
 }
 
+s_vm_cycle() {
+  local marker="$WORK/vm-marker" t
+  # A Mac that is itself a VM (a CI runner) can't run nested VMs.
+  if [ "$(sysctl -n kern.hv_vmm_present 2>/dev/null || echo 0)" = 1 ]; then
+    echo "this Mac is a VM: it can't run the test guest"
+    return 0
+  fi
+  rm -rf "$marker"
+  VIBE_VM_BIN="$ROOT/build/vibe-vm" VIBE_VM_GUEST="$ROOT/build/test-guest" VIBE_VM_MARKER="$marker" \
+    cargo test -p vibe-env --locked --test vm_cycle -- --test-threads=1 --nocapture
+  for t in boot_save_restore three_vms_at_once; do
+    [ -f "$marker/$t" ] || { echo "$t was skipped, not run"; return 1; }
+  done
+}
+
 s_live_contract() {
   local log="$WORK/live-vibed.log" marker="$WORK/live-marker"
   start_vibed "$WORK/live/run/vibed.sock" "$log"
@@ -360,6 +383,7 @@ step clippy "cargo clippy, warnings denied" s_clippy
 step build "cargo build" s_build
 step test "cargo test (incl. the Rust contract tests)" s_test
 step guest "vibe-guest: static aarch64-unknown-linux-musl" s_guest
+step test-guest "test guest for vibe-vm: kernel, initrd, modloop" s_test_guest
 step cross "cargo check for macOS and Linux, arm64 and x86_64" s_cross
 step smoke "vibed hello world via vibe hello and vibe rpc" s_smoke build
 step registry "registry via vibe rpc survives a vibed restart" s_registry build
@@ -370,6 +394,7 @@ mac_step swift-vm-build "swift build swift/vibe-vm" s_swift_vm_build
 mac_step swift-vm-test "swift test swift/vibe-vm" s_swift_vm_test swift-vm-build
 mac_step sign "ad hoc signing; vibe-vm gets the virtualization entitlement" s_sign swift-app-build swift-vm-build
 mac_step vm-check "vibe-vm check, signed and unsigned" s_vm_check sign
+mac_step vm-cycle "vibe-vm boots, saves and restores the test guest" s_vm_cycle sign test-guest
 mac_step live-contract "Swift client against a live vibed" s_live_contract build swift-app-test
 mac_step app-launch "VibeOS.app launches and says hello to vibed" s_app_launch build sign
 

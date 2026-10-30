@@ -1,0 +1,4 @@
+{
+  "request": { "op": "sleep" },
+  "reply": { "ok": false, "code": "save_failed", "error": "can't save the VM: No space left on device; it was resumed" }
+}

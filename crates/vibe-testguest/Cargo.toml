@@ -1,0 +1,15 @@
+[package]
+name = "vibe-testguest"
+description = "PID 1 of the test guest that checks vibe-vm end to end; not shipped"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+libc.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

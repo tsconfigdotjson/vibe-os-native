@@ -1,0 +1,4 @@
+{
+  "command": ["create"],
+  "ready": { "ok": false, "code": "bad_config", "error": "share tag `worktree` is used twice" }
+}

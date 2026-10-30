@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "ref": "quiet-amber-otter",
+  "cpus": 4,
+  "memory": 4294967296,
+  "kernel": "/Users/me/VibeOS/linux/kernel-1/Image",
+  "initrd": "/Users/me/VibeOS/linux/kernel-1/initrd",
+  "cmdline": "console=hvc0 quiet",
+  "machine_id": "YnBsaXN0MDDRAQJURUNJRBMAAAAAAAAAAQgLDgAAAAAAAAEBAAAAAAAAAAMAAAAAAAAAAAAAAAAAAAAX",
+  "mac": "02:5f:3a:11:9c:e4",
+  "disks": [
+    { "id": "base", "path": "/Users/me/VibeOS/linux/base-1.img", "read_only": true },
+    { "id": "template", "path": "/Users/me/VibeOS/linux/template-3.img", "read_only": true },
+    { "id": "managed", "path": "/Users/me/VibeOS/linux/managed-12.img", "read_only": true },
+    { "id": "home", "path": "/Users/me/VibeOS/linux/home-2.img", "read_only": true },
+    { "id": "agent", "path": "/Users/me/VibeOS/agents/quiet-amber-otter/disk.img", "read_only": false }
+  ],
+  "shares": [
+    { "tag": "worktree", "path": "/Users/me/VibeOS/worktrees/app/quiet-amber-otter", "read_only": false },
+    { "tag": "git", "path": "/Users/me/VibeOS/projects/app/.git", "read_only": false },
+    { "tag": "claude", "path": "/Users/me/VibeOS/agents/quiet-amber-otter/claude", "read_only": false },
+    { "tag": "cache-npm", "path": "/Users/me/VibeOS/cache/npm", "read_only": false }
+  ],
+  "console_log": "/Users/me/VibeOS/agents/quiet-amber-otter/console.log",
+  "snapshot": "/Users/me/VibeOS/snapshots/quiet-amber-otter"
+}
