@@ -1,0 +1,12 @@
+{
+  "request": {
+    "op": "thaw",
+    "time_ms": 1793399577123
+  },
+  "reply": {
+    "ok": true,
+    "clock_step_ms": 3600412,
+    "shares_ms": 912,
+    "thaw_ms": 3
+  }
+}

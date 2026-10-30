@@ -1,0 +1,8 @@
+{
+  "request_raw": "{\"op\":\"dance\"}",
+  "reply": {
+    "ok": false,
+    "code": "bad_request",
+    "error": "unknown op `dance`"
+  }
+}

@@ -1,0 +1,38 @@
+{
+  "request": {
+    "op": "status"
+  },
+  "reply": {
+    "ok": true,
+    "protocol": 1,
+    "version": "0.1.0",
+    "boot_id": "5b0c8a54-3e0f-4c7e-9f0e-1a7b6d1c2e33",
+    "uptime_ms": 990321,
+    "state": "exited",
+    "frozen": false,
+    "session": {
+      "pid": 214,
+      "command": [
+        "claude",
+        "--session-id",
+        "6f1e5c2a-0b7e-4d38-9a41-2f5c8e1d7b90",
+        "--model",
+        "opus",
+        "--effort",
+        "high",
+        "--permission-mode",
+        "auto",
+        "Fix the flaky login test"
+      ],
+      "cwd": "/Users/me/VibeOS/worktrees/app/quiet-amber-otter",
+      "started_ms": 1830,
+      "exit": {
+        "code": 0
+      }
+    },
+    "memory": {
+      "total": 4111171584,
+      "available": 3382181888
+    }
+  }
+}

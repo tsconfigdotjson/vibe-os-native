@@ -1,0 +1,14 @@
+{
+  "request": {
+    "op": "launch",
+    "command": [
+      "claude"
+    ],
+    "cwd": "/Users/me/VibeOS/worktrees/app/gone"
+  },
+  "reply": {
+    "ok": false,
+    "code": "launch_failed",
+    "error": "/Users/me/VibeOS/worktrees/app/gone isn't a directory"
+  }
+}

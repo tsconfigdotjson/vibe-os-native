@@ -1,0 +1,15 @@
+{
+  "request": {
+    "op": "launch",
+    "command": [
+      "claude",
+      "--resume",
+      "6f1e5c2a-0b7e-4d38-9a41-2f5c8e1d7b90"
+    ]
+  },
+  "reply": {
+    "ok": false,
+    "code": "busy",
+    "error": "a command is already running, as pid 214"
+  }
+}

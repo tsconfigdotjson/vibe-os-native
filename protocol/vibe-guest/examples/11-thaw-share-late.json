@@ -1,0 +1,19 @@
+{
+  "request": {
+    "op": "thaw",
+    "time_ms": 1793399577123,
+    "share_timeout_ms": 5000
+  },
+  "reply": {
+    "ok": true,
+    "clock_step_ms": 3600412,
+    "shares_ms": 5001,
+    "unanswered": [
+      "cache-npm"
+    ],
+    "thaw_ms": 3,
+    "problems": [
+      "shares still not answering after 5001 ms: cache-npm"
+    ]
+  }
+}

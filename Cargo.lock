@@ -596,11 +596,20 @@ dependencies = [
  "serde_json",
  "tempfile",
  "vibe-core",
+ "vibe-guest",
+ "vt100",
 ]
 
 [[package]]
 name = "vibe-guest"
 version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "vt100",
+]
 
 [[package]]
 name = "vibe-mcp"
@@ -615,6 +624,8 @@ dependencies = [
  "tempfile",
  "tokio",
  "vibe-core",
+ "vibe-env",
+ "vibe-guest",
  "vt100",
 ]
 

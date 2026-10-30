@@ -5,6 +5,12 @@
 //! It detaches like `dtach -n`: it binds the socket, forks a process that
 //! leads a session of its own and starts the command on a new terminal,
 //! prints that process's pid once the command is running, and exits.
+//!
+//! For a `linux` agent on the Mac the command runs in the VM instead, on
+//! `vibe-guest`'s terminal: with `--vm run/<ref>.vm` the shim attaches to
+//! that through `vibe-vm` rather than starting anything. If the stream
+//! drops (the VM went to sleep), the shim exits and leaves the command
+//! running; the next shim picks the terminal up where it was.
 
 mod pty;
 mod screen;
@@ -24,12 +30,14 @@ use vibe_core::model::validate_ref;
 use vibe_core::shim::{self, Size};
 use vibe_core::socket;
 use vibe_core::time::{now, rfc3339};
+use vibe_env::guest::{self, TermSize};
 
 use crate::screen::DEFAULT_HISTORY;
 use crate::serve::Session;
 
 const USAGE: &str = "\
 usage: vibe-shim --ref REF --socket PATH --state DIR [options] -- COMMAND [ARG...]
+       vibe-shim --ref REF --socket PATH --state DIR --vm VMSOCKET [options]
 
 Starts COMMAND on a new terminal in a detached session, serves that terminal
 on the Unix socket PATH for `vibe attach` and vibed, prints the shim's pid
@@ -37,12 +45,19 @@ once COMMAND is running, and exits. vibed starts shims; run one by hand only
 to test. When COMMAND exits, the shim writes session.json in DIR, removes
 the socket and exits too. Its log is shim.log in DIR.
 
+With --vm, the command is a linux agent's, already running in its VM: the
+shim serves vibe-guest's terminal, reached through the vibe-vm serving
+VMSOCKET (run/REF.vm). If that stream drops, or the shim is asked to stop,
+it exits without a record and the command goes on in the VM.
+
 options:
   --ref REF           the agent's ref, which the session goes by
   --socket PATH       the socket to serve, normally run/REF.sock
   --state DIR         where the log and the record go, created if needed
-  --cwd DIR           where COMMAND starts (default: here)
-  --size COLSxROWS    the terminal's size until a client attaches (default: 80x24)
+  --vm VMSOCKET       serve the terminal of vibe-guest in this VM
+  --cwd DIR           where COMMAND starts (default: here; not with --vm)
+  --size COLSxROWS    the terminal's size until a client attaches (default:
+                      80x24, or with --vm the size it has)
   --history LINES     lines that scrolled off the screen to keep (default: 10000)
   -V, --version       print the version
   -h, --help          print this help";
@@ -54,7 +69,11 @@ struct Options {
     state: PathBuf,
     cwd: Option<PathBuf>,
     size: Size,
+    /// Whether `--size` was given, rather than the default.
+    size_given: bool,
     history: usize,
+    /// For a `linux` agent: the `vibe-vm` socket to reach its guest by.
+    vm: Option<PathBuf>,
     command: Vec<OsString>,
 }
 
@@ -85,10 +104,15 @@ fn parse_args(args: &[OsString]) -> Result<Args, String> {
     let mut state = None;
     let mut cwd = None;
     let mut size = Size::DEFAULT;
+    let mut size_given = false;
     let mut history = DEFAULT_HISTORY;
+    let mut vm = None;
     let mut iter = args.iter();
     let command: Vec<OsString> = loop {
         let Some(arg) = iter.next() else {
+            if vm.is_some() {
+                break Vec::new();
+            }
             return Err("missing `-- COMMAND`".into());
         };
         let arg = arg
@@ -110,7 +134,11 @@ fn parse_args(args: &[OsString]) -> Result<Args, String> {
             "--socket" => socket = Some(PathBuf::from(value(arg)?)),
             "--state" => state = Some(PathBuf::from(value(arg)?)),
             "--cwd" => cwd = Some(PathBuf::from(value(arg)?)),
-            "--size" => size = parse_size(&text(value(arg)?, arg)?)?,
+            "--size" => {
+                size = parse_size(&text(value(arg)?, arg)?)?;
+                size_given = true;
+            }
+            "--vm" => vm = Some(PathBuf::from(value(arg)?)),
             "--history" => {
                 let v = text(value(arg)?, arg)?;
                 history = v
@@ -123,7 +151,14 @@ fn parse_args(args: &[OsString]) -> Result<Args, String> {
     };
     let agent = agent.ok_or("missing --ref")?;
     validate_ref(&agent)?;
-    if command.is_empty() {
+    if vm.is_some() {
+        if !command.is_empty() {
+            return Err("with --vm the guest runs the command; give none".into());
+        }
+        if cwd.is_some() {
+            return Err("with --vm the command's directory is the guest's; drop --cwd".into());
+        }
+    } else if command.is_empty() {
         return Err("missing the COMMAND after `--`".into());
     }
     Ok(Args::Run(Options {
@@ -132,7 +167,9 @@ fn parse_args(args: &[OsString]) -> Result<Args, String> {
         state: state.ok_or("missing --state")?,
         cwd,
         size,
+        size_given,
         history,
+        vm,
         command,
     }))
 }
@@ -327,15 +364,13 @@ fn detached(
         libc::signal(libc::SIGTTOU, libc::SIG_IGN);
         libc::signal(libc::SIGTTIN, libc::SIG_IGN);
     }
-    let command: Vec<String> = options
-        .command
-        .iter()
-        .map(|a| a.to_string_lossy().into_owned())
-        .collect();
-    let pty = match pty::spawn(&options.command, &cwd, options.size) {
-        Ok(p) => p,
-        Err(e) => {
-            let message = format!("can't start {}: {e}", command[0]);
+    let started = match &options.vm {
+        None => start_command(&options, &cwd),
+        Some(vm) => attach_guest(&options, vm),
+    };
+    let started = match started {
+        Ok(s) => s,
+        Err(message) => {
             log!("{message}");
             // The socket goes before the launcher hears, so a retry finds
             // it free.
@@ -346,10 +381,22 @@ fn detached(
         }
     };
     log!(
-        "started {:?} in {} as pid {}, serving {}",
-        command,
-        cwd.display(),
-        pty.child.id(),
+        "{} {:?} in {}{}, serving {}",
+        if options.vm.is_some() {
+            "attached to"
+        } else {
+            "started"
+        },
+        started.command,
+        started.cwd,
+        match &options.vm {
+            Some(vm) => format!(
+                " as pid {} in the VM of {}",
+                started.child_pid,
+                vm.display()
+            ),
+            None => format!(" as pid {}", started.child_pid),
+        },
         options.socket.display()
     );
     // A new session supersedes the record of the last one.
@@ -359,13 +406,13 @@ fn detached(
 
     let session = Session {
         agent: options.agent,
-        command,
-        cwd: cwd.to_string_lossy().into_owned(),
+        command: started.command,
+        cwd: started.cwd,
         state_dir: options.state,
         socket: options.socket,
         started_at: now(),
         history: options.history,
-        size: options.size,
+        size: started.size,
     };
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -377,7 +424,12 @@ fn detached(
             return 1;
         }
     };
-    let result = runtime.block_on(serve::run(session, listener, pty));
+    let result = runtime.block_on(serve::run(
+        session,
+        listener,
+        started.end,
+        started.child_pid,
+    ));
     drop(guard);
     match result {
         Ok(_) => 0,
@@ -386,6 +438,57 @@ fn detached(
             1
         }
     }
+}
+
+/// The terminal the shim serves, and what's running on it.
+#[derive(Debug)]
+struct Started {
+    end: serve::TerminalEnd,
+    child_pid: u32,
+    command: Vec<String>,
+    cwd: String,
+    size: Size,
+}
+
+/// Starts the command on a PTY.
+fn start_command(options: &Options, cwd: &std::path::Path) -> Result<Started, String> {
+    let command: Vec<String> = options
+        .command
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    let pty = pty::spawn(&options.command, cwd, options.size)
+        .map_err(|e| format!("can't start {}: {e}", command[0]))?;
+    Ok(Started {
+        child_pid: pty.child.id(),
+        end: serve::TerminalEnd::Pty(pty),
+        command,
+        cwd: cwd.to_string_lossy().into_owned(),
+        size: options.size,
+    })
+}
+
+/// Attaches to the terminal of `vibe-guest` in the VM `vm` serves. Its
+/// size is the guest's unless `--size` says otherwise.
+fn attach_guest(options: &Options, vm: &std::path::Path) -> Result<Started, String> {
+    let size = options.size_given.then_some(TermSize {
+        rows: options.size.rows,
+        cols: options.size.cols,
+    });
+    let terminal = guest::attach(vm, "vibe-shim", size)
+        .map_err(|e| format!("can't attach to the guest's terminal: {e}"))?;
+    let session = terminal.welcome.session;
+    let size = terminal.welcome.size;
+    Ok(Started {
+        end: serve::TerminalEnd::Guest(terminal.stream),
+        child_pid: session.pid,
+        command: session.command,
+        cwd: session.cwd,
+        size: Size {
+            rows: size.rows,
+            cols: size.cols,
+        },
+    })
 }
 
 /// Points stdin and stdout at /dev/null and stderr at the log.
@@ -441,7 +544,9 @@ mod tests {
                     rows: 40,
                     cols: 120
                 },
+                size_given: true,
                 history: 5,
+                vm: None,
                 command: vec!["claude".into(), "--resume".into()],
             }))
         );
@@ -451,10 +556,30 @@ mod tests {
             panic!("defaults")
         };
         assert_eq!(
-            (defaults.size, defaults.history),
-            (Size::DEFAULT, DEFAULT_HISTORY)
+            (defaults.size, defaults.size_given, defaults.history),
+            (Size::DEFAULT, false, DEFAULT_HISTORY)
         );
-        assert_eq!(defaults.cwd, None);
+        assert_eq!((defaults.cwd, defaults.vm), (None, None));
+        // A linux agent's shim runs nothing itself.
+        let Ok(Args::Run(o)) = parse(&[
+            "--ref",
+            "r",
+            "--socket",
+            "s",
+            "--state",
+            "d",
+            "--vm",
+            "/run/r.vm",
+        ]) else {
+            panic!("--vm")
+        };
+        assert_eq!((o.vm, o.command), (Some("/run/r.vm".into()), vec![]));
+        let Ok(Args::Run(o)) = parse(&[
+            "--ref", "r", "--socket", "s", "--state", "d", "--vm", "v", "--",
+        ]) else {
+            panic!("--vm and an empty --")
+        };
+        assert!(o.command.is_empty());
         // Everything after `--` is the command's, flags included.
         let Ok(Args::Run(o)) = parse(&["--ref", "r", "--socket", "s", "--state", "d", "--", "-V"])
         else {
@@ -498,6 +623,13 @@ mod tests {
             ],
             &["--ref"],
             &["--bogus"],
+            &[
+                "--ref", "r", "--socket", "s", "--state", "d", "--vm", "v", "--", "sh",
+            ],
+            &[
+                "--ref", "r", "--socket", "s", "--state", "d", "--vm", "v", "--cwd", "/w",
+            ],
+            &["--ref", "r", "--socket", "s", "--state", "d", "--vm"],
         ] {
             assert!(parse(bad).is_err(), "{bad:?}");
         }

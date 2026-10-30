@@ -2,7 +2,9 @@
 # Every check in one command:
 #
 #   - the Rust workspace: fmt, clippy (warnings denied), build, test
-#   - the vibe-guest cross-build: a static aarch64-unknown-linux-musl binary
+#   - the vibe-guest cross-build: a static aarch64-unknown-linux-musl binary,
+#     and clippy for that target over it and the test guest, as musl's libc
+#     differs
 #   - cargo check of the workspace for every host target it doesn't run on
 #     (macOS and Linux, arm64 and x86_64)
 #   - a vibed hello-world smoke test, through `vibe hello` and `vibe rpc`
@@ -14,11 +16,16 @@
 #     including the Swift half of the Rust<->Swift contract test
 #   - ad hoc signing, with the virtualization entitlement on vibe-vm
 #   - vibe-vm check, signed and unsigned
-#   - the test guest for vibe-vm (scripts/test-guest.sh): Alpine's netboot
-#     kernel and initrd, plus vibe-testguest as PID 1
+#   - the test guests (scripts/test-guest.sh): Alpine's netboot kernel, and
+#     initrds with vibe-testguest or vibe-guest as PID 1
 #   - VMs through vibe-vm, as vibed drives them: boot, save and restore the
-#     test guest, on its own and three at once, within the spike's numbers
-#     (crates/vibe-env/tests/vm_cycle.rs). The check across a reboot is
+#     test guest, on its own and three at once, within the spike's numbers;
+#     and vibe-guest's: a stand-in for Claude with a question pending,
+#     through a real vibe-shim, still on screen after freeze, save, restore
+#     and thaw (crates/vibe-env/tests/vm_cycle.rs). With VIBE_CLAUDE_BIN
+#     (Claude Code's linux-arm64-musl build) and CLAUDE_CODE_OAUTH_TOKEN set,
+#     the same with the real Claude and its AskUserQuestion, which is then
+#     required too. The check across a reboot is
 #     scripts/vm-reboot-test.sh, which can't run here. On a Mac that is
 #     itself a VM, such as a CI runner, this step is N/A: it can't nest VMs.
 #   - the Swift client against a live vibed
@@ -192,6 +199,7 @@ s_guest() {
   echo "$info"
   case $info in *"ARM aarch64"*) ;; *) echo "not an aarch64 binary"; return 1 ;; esac
   case $info in *"statically linked"*) ;; *) echo "not statically linked"; return 1 ;; esac
+  cargo clippy -p vibe-guest -p vibe-testguest --all-targets --locked --target "$target" -- -D warnings
 }
 
 s_test_guest() { scripts/test-guest.sh build/test-guest; }
@@ -352,8 +360,15 @@ s_vm_cycle() {
   fi
   rm -rf "$marker"
   VIBE_VM_BIN="$ROOT/build/vibe-vm" VIBE_VM_GUEST="$ROOT/build/test-guest" VIBE_VM_MARKER="$marker" \
+    VIBE_SHIM_BIN="$ROOT/target/debug/vibe-shim" \
     cargo test -p vibe-env --locked --test vm_cycle -- --test-threads=1 --nocapture
-  for t in boot_save_restore three_vms_at_once; do
+  local required=(boot_save_restore three_vms_at_once guest_question_survives_sleep)
+  if [ -n "${VIBE_CLAUDE_BIN:-}" ] && [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+    required+=(guest_claude_question_survives_sleep)
+  else
+    echo "guest_claude_question_survives_sleep not asked for: set VIBE_CLAUDE_BIN and CLAUDE_CODE_OAUTH_TOKEN"
+  fi
+  for t in "${required[@]}"; do
     [ -f "$marker/$t" ] || { echo "$t was skipped, not run"; return 1; }
   done
 }
@@ -390,8 +405,8 @@ step fmt "cargo fmt --check" s_fmt
 step clippy "cargo clippy, warnings denied" s_clippy
 step build "cargo build" s_build
 step test "cargo test (incl. the Rust contract tests)" s_test
-step guest "vibe-guest: static aarch64-unknown-linux-musl" s_guest
-mac_step test-guest "test guest for vibe-vm: kernel, initrd, modloop" s_test_guest
+step guest "vibe-guest: static aarch64-unknown-linux-musl, clippy for musl" s_guest
+mac_step test-guest "test guests: kernel, initrd, initrd-guest, modloop" s_test_guest
 step cross "cargo check for macOS and Linux, arm64 and x86_64" s_cross
 step smoke "vibed hello world via vibe hello and vibe rpc" s_smoke build
 step registry "registry via vibe rpc survives a vibed restart" s_registry build
@@ -402,7 +417,7 @@ mac_step swift-vm-build "swift build swift/vibe-vm" s_swift_vm_build
 mac_step swift-vm-test "swift test swift/vibe-vm" s_swift_vm_test swift-vm-build
 mac_step sign "ad hoc signing; vibe-vm gets the virtualization entitlement" s_sign swift-app-build swift-vm-build
 mac_step vm-check "vibe-vm check, signed and unsigned" s_vm_check sign
-mac_step vm-cycle "vibe-vm boots, saves and restores the test guest" s_vm_cycle sign test-guest
+mac_step vm-cycle "VMs boot, save and restore; vibe-guest's question survives" s_vm_cycle build sign test-guest
 mac_step live-contract "Swift client against a live vibed" s_live_contract build swift-app-test
 mac_step app-launch "VibeOS.app launches and says hello to vibed" s_app_launch build sign
 

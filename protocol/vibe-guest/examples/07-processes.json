@@ -1,0 +1,58 @@
+{
+  "request": {
+    "op": "processes"
+  },
+  "reply": {
+    "ok": true,
+    "uptime_ms": 482200,
+    "processes": [
+      {
+        "pid": 214,
+        "ppid": 1,
+        "name": "claude",
+        "args": [
+          "claude",
+          "--session-id",
+          "6f1e5c2a-0b7e-4d38-9a41-2f5c8e1d7b90",
+          "--model",
+          "opus",
+          "--effort",
+          "high",
+          "--permission-mode",
+          "auto",
+          "Fix the flaky login test"
+        ],
+        "state": "S",
+        "started_ms": 1830,
+        "cpu_ms": 41210,
+        "rss": 356515840
+      },
+      {
+        "pid": 240,
+        "ppid": 214,
+        "name": "node",
+        "args": [
+          "node",
+          "/opt/mcp/server.js"
+        ],
+        "state": "S",
+        "started_ms": 3120,
+        "cpu_ms": 800,
+        "rss": 61865984
+      },
+      {
+        "pid": 377,
+        "ppid": 1,
+        "name": "sleep",
+        "args": [
+          "sleep",
+          "3600"
+        ],
+        "state": "S",
+        "started_ms": 95500,
+        "cpu_ms": 0,
+        "rss": 786432
+      }
+    ]
+  }
+}

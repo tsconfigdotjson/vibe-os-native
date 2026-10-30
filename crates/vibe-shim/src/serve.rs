@@ -1,11 +1,13 @@
 //! The running shim: one task owns the terminal's state, and every client
 //! connection is a task that talks to it over a channel. Two threads move
-//! bytes to and from the terminal, and one waits for the command to exit.
+//! bytes to and from the terminal, and for a PTY one waits for the command
+//! to exit; a guest's terminal says so itself.
 
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::net::UnixStream as StdUnixStream;
 use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -23,6 +25,7 @@ use vibe_core::shim::{
     Role, Size, Status, Welcome,
 };
 use vibe_core::time::{now, rfc3339};
+use vibe_guest::proto as guest;
 
 use crate::log;
 use crate::pty::{self, Pty};
@@ -90,6 +93,9 @@ enum Event {
     Pty(Vec<u8>),
     PtyClosed,
     Exited(SessionExit),
+    /// The guest's terminal dropped without saying the command ended: the
+    /// VM went to sleep or stopped, or another shim took over.
+    Gone(String),
     Attach {
         hello: Hello,
         reply: oneshot::Sender<Joined>,
@@ -118,8 +124,8 @@ struct State {
     welcome: Arc<Welcome>,
     screen: Screen,
     size: Size,
-    master: RawFd,
-    input: std::sync::mpsc::SyncSender<Vec<u8>>,
+    end: End,
+    input: std::sync::mpsc::SyncSender<ToTerm>,
     out: broadcast::Sender<Out>,
     clients: BTreeMap<u64, Attached>,
     next_id: u64,
@@ -146,9 +152,19 @@ impl State {
         if size == self.size {
             return;
         }
-        if let Err(e) = pty::set_size(self.master, size) {
-            log!("can't resize the terminal to {size}: {e}");
-            return;
+        match self.end {
+            End::Pty(master) => {
+                if let Err(e) = pty::set_size(master, size) {
+                    log!("can't resize the terminal to {size}: {e}");
+                    return;
+                }
+            }
+            End::Guest => {
+                if self.input.try_send(ToTerm::Resize(size)).is_err() {
+                    log!("can't pass a resize to {size} on to the guest");
+                    return;
+                }
+            }
         }
         self.size = size;
         self.screen.resize(size);
@@ -191,7 +207,7 @@ impl State {
                 // No attach clients is fine.
                 let _ = self.out.send(Out::Bytes(bytes.into()));
             }
-            Event::PtyClosed | Event::Exited(_) => {}
+            Event::PtyClosed | Event::Exited(_) | Event::Gone(_) => {}
             Event::Attach { hello, reply } => {
                 let id = self.next_id;
                 self.next_id += 1;
@@ -233,7 +249,9 @@ impl State {
                 if let Some(id) = id {
                     self.touch(id);
                 }
-                if let Err(std::sync::mpsc::TrySendError::Full(_)) = self.input.try_send(bytes) {
+                if let Err(std::sync::mpsc::TrySendError::Full(_)) =
+                    self.input.try_send(ToTerm::Input(bytes))
+                {
                     log!("the command isn't reading its input; dropped some");
                 }
             }
@@ -309,59 +327,164 @@ fn read_pty(mut master: File, events: mpsc::Sender<Event>) {
     let _ = events.blocking_send(Event::PtyClosed);
 }
 
+/// What goes to the terminal, in order.
+#[derive(Debug)]
+enum ToTerm {
+    Input(Vec<u8>),
+    /// Only for a guest's terminal; a PTY is resized at once.
+    Resize(Size),
+}
+
+/// Which terminal the shim holds.
+#[derive(Debug, Clone, Copy)]
+enum End {
+    /// A PTY's master end.
+    Pty(RawFd),
+    /// `vibe-guest`'s terminal, through `vibe-vm`.
+    Guest,
+}
+
+/// The agent's terminal, as the shim got it.
+#[derive(Debug)]
+pub(crate) enum TerminalEnd {
+    /// A command the shim started on a PTY (`macos`, a Linux host).
+    Pty(Pty),
+    /// The terminal of `vibe-guest` in a `linux` VM, past its welcome: the
+    /// command runs there, and outlives the shim.
+    Guest(StdUnixStream),
+}
+
 /// Writes input to the terminal, in order. A command that stops reading
 /// blocks this thread only.
-fn write_pty(mut master: File, input: std::sync::mpsc::Receiver<Vec<u8>>) {
-    while let Ok(bytes) = input.recv() {
-        if master.write_all(&bytes).is_err() {
+fn write_pty(mut master: File, input: std::sync::mpsc::Receiver<ToTerm>) {
+    while let Ok(m) = input.recv() {
+        if let ToTerm::Input(bytes) = m
+            && master.write_all(&bytes).is_err()
+        {
             return;
         }
     }
 }
 
-/// Serves the session until the command exits. Returns how it ended.
+/// Moves what the guest's terminal sends into the loop: output, then the
+/// exit if the command ends, or why the stream ended if it doesn't.
+fn read_guest(mut stream: StdUnixStream, events: mpsc::Sender<Event>) {
+    let why = loop {
+        match guest::read_frame(&mut stream) {
+            Ok(Some(f)) => match f.kind {
+                guest::FrameKind::Output => {
+                    if events.blocking_send(Event::Pty(f.payload)).is_err() {
+                        return;
+                    }
+                }
+                guest::FrameKind::Exit => {
+                    let exit = match f.decode::<guest::Exit>() {
+                        Ok(e) => SessionExit {
+                            code: e.code,
+                            signal: e.signal,
+                            at: rfc3339(now()),
+                        },
+                        Err(e) => break e.to_string(),
+                    };
+                    let _ = events.blocking_send(Event::Exited(exit));
+                    let _ = events.blocking_send(Event::PtyClosed);
+                    return;
+                }
+                other => break format!("the guest sent a {other:?} frame"),
+            },
+            Ok(None) => break "the guest closed the terminal".into(),
+            Err(e) => break format!("the guest's terminal failed: {e}"),
+        }
+    };
+    let _ = events.blocking_send(Event::Gone(why));
+}
+
+/// Writes input and resizes to the guest's terminal, in order.
+fn write_guest(mut stream: StdUnixStream, input: std::sync::mpsc::Receiver<ToTerm>) {
+    while let Ok(m) = input.recv() {
+        let sent = match m {
+            ToTerm::Input(bytes) => guest::output_frames(guest::FrameKind::Input, &bytes)
+                .try_for_each(|f| guest::write_frame(&mut stream, &f)),
+            ToTerm::Resize(size) => {
+                let size = guest::TermSize {
+                    rows: size.rows,
+                    cols: size.cols,
+                };
+                guest::write_frame(
+                    &mut stream,
+                    &guest::Frame::json(guest::FrameKind::Resize, &size),
+                )
+            }
+        };
+        if sent.is_err() {
+            return;
+        }
+    }
+}
+
+/// Serves the session until the command exits, and returns how it ended;
+/// or, for a guest's terminal, until the stream drops or the shim is asked
+/// to stop, leaving the command running in the guest: `None`.
 pub(crate) async fn run(
     session: Session,
     listener: std::os::unix::net::UnixListener,
-    pty: Pty,
-) -> io::Result<SessionExit> {
-    let Pty { master, mut child } = pty;
-    let child_pid = child.id();
+    end: TerminalEnd,
+    child_pid: u32,
+) -> io::Result<Option<SessionExit>> {
     let (events_tx, mut events) = mpsc::channel::<Event>(256);
     let (input_tx, input_rx) = std::sync::mpsc::sync_channel(INPUT_BACKLOG);
-    let master_fd = master.as_raw_fd();
-    {
-        let reader = master.try_clone()?;
-        let tx = events_tx.clone();
-        std::thread::Builder::new()
-            .name("pty-read".into())
-            .spawn(move || read_pty(reader, tx))?;
-    }
-    {
-        let writer = master.try_clone()?;
-        std::thread::Builder::new()
-            .name("pty-write".into())
-            .spawn(move || write_pty(writer, input_rx))?;
-    }
-    {
-        let tx = events_tx.clone();
-        std::thread::Builder::new()
-            .name("wait".into())
-            .spawn(move || {
-                let exit = match child.wait() {
-                    Ok(status) => session_exit(status),
-                    Err(e) => {
-                        log!("can't wait for the command: {e}");
-                        SessionExit {
-                            code: None,
-                            signal: None,
-                            at: rfc3339(now()),
-                        }
-                    }
-                };
-                let _ = tx.blocking_send(Event::Exited(exit));
-            })?;
-    }
+    // Keep a PTY's master open for the resize ioctl until the end.
+    let (end_kind, _master) = match end {
+        TerminalEnd::Pty(Pty { master, mut child }) => {
+            let master_fd = master.as_raw_fd();
+            {
+                let reader = master.try_clone()?;
+                let tx = events_tx.clone();
+                std::thread::Builder::new()
+                    .name("pty-read".into())
+                    .spawn(move || read_pty(reader, tx))?;
+            }
+            {
+                let writer = master.try_clone()?;
+                std::thread::Builder::new()
+                    .name("pty-write".into())
+                    .spawn(move || write_pty(writer, input_rx))?;
+            }
+            {
+                let tx = events_tx.clone();
+                std::thread::Builder::new()
+                    .name("wait".into())
+                    .spawn(move || {
+                        let exit = match child.wait() {
+                            Ok(status) => session_exit(status),
+                            Err(e) => {
+                                log!("can't wait for the command: {e}");
+                                SessionExit {
+                                    code: None,
+                                    signal: None,
+                                    at: rfc3339(now()),
+                                }
+                            }
+                        };
+                        let _ = tx.blocking_send(Event::Exited(exit));
+                    })?;
+            }
+            (End::Pty(master_fd), Some(master))
+        }
+        TerminalEnd::Guest(stream) => {
+            {
+                let reader = stream.try_clone()?;
+                let tx = events_tx.clone();
+                std::thread::Builder::new()
+                    .name("guest-read".into())
+                    .spawn(move || read_guest(reader, tx))?;
+            }
+            std::thread::Builder::new()
+                .name("guest-write".into())
+                .spawn(move || write_guest(stream, input_rx))?;
+            (End::Guest, None)
+        }
+    };
 
     let welcome = Arc::new(Welcome {
         protocol: PROTOCOL,
@@ -377,15 +500,13 @@ pub(crate) async fn run(
         welcome: welcome.clone(),
         screen,
         size,
-        master: master_fd,
+        end: end_kind,
         input: input_tx,
         out,
         clients: BTreeMap::new(),
         next_id: 1,
         ticks: 0,
     };
-    // Keep the master open for the resize ioctl until the end.
-    let _master = master;
 
     listener.set_nonblocking(true)?;
     let listener = UnixListener::from_std(listener)?;
@@ -395,6 +516,7 @@ pub(crate) async fn run(
     let mut tasks = JoinSet::new();
     let mut kill_at: Option<tokio::time::Instant> = None;
     let mut pty_closed = false;
+    let guest = matches!(end_kind, End::Guest);
 
     let exit = loop {
         let kill_timer = async {
@@ -405,8 +527,12 @@ pub(crate) async fn run(
         };
         tokio::select! {
             event = events.recv() => match event {
-                Some(Event::Exited(exit)) => break exit,
+                Some(Event::Exited(exit)) => break Some(exit),
                 Some(Event::PtyClosed) => pty_closed = true,
+                Some(Event::Gone(why)) => {
+                    log!("{why}; the command goes on in the guest");
+                    break None;
+                }
                 Some(event) => state.handle(event),
                 None => unreachable!("the loop holds a sender"),
             },
@@ -420,11 +546,13 @@ pub(crate) async fn run(
                 }
             },
             // Being asked to stop hangs up on the command, as closing a
-            // terminal window would; it then exits as usual.
-            _ = term.recv() => hang_up(child_pid, &mut kill_at),
-            _ = int.recv() => hang_up(child_pid, &mut kill_at),
+            // terminal window would; it then exits as usual. A guest's
+            // command isn't the shim's to end: it goes on in the VM, and
+            // `child_pid` is a pid there, not here.
+            _ = term.recv() => if guest { break stop_leaving_guest() } else { hang_up(child_pid, &mut kill_at) },
+            _ = int.recv() => if guest { break stop_leaving_guest() } else { hang_up(child_pid, &mut kill_at) },
             // We have no terminal of our own to lose; this is someone's kill.
-            _ = hup.recv() => hang_up(child_pid, &mut kill_at),
+            _ = hup.recv() => if guest { break stop_leaving_guest() } else { hang_up(child_pid, &mut kill_at) },
             () = kill_timer => {
                 log!("the command ignored SIGHUP; killing it");
                 kill_group(child_pid, libc::SIGKILL);
@@ -434,6 +562,15 @@ pub(crate) async fn run(
         }
     };
 
+    let Some(exit) = exit else {
+        // No record: the session isn't over, and the next shim carries it
+        // on. Clients see the connection close.
+        let _ = std::fs::remove_file(&state.session.socket);
+        drop(listener);
+        drop(state);
+        tasks.abort_all();
+        return Ok(None);
+    };
     describe(&exit);
     // The rest of what the command wrote, still serving the clients there
     // are; new ones wait in the listener's queue. The socket stays until
@@ -444,7 +581,7 @@ pub(crate) async fn run(
             while let Some(event) = events.recv().await {
                 match event {
                     Event::PtyClosed => return,
-                    Event::Exited(_) => {}
+                    Event::Exited(_) | Event::Gone(_) => {}
                     event => state.handle(event),
                 }
             }
@@ -474,7 +611,12 @@ pub(crate) async fn run(
         while tasks.join_next().await.is_some() {}
     })
     .await;
-    Ok(exit)
+    Ok(Some(exit))
+}
+
+fn stop_leaving_guest() -> Option<SessionExit> {
+    log!("asked to stop; the command goes on in the guest");
+    None
 }
 
 fn describe(exit: &SessionExit) {

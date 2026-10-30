@@ -1,0 +1,7 @@
+{
+  "kind": "refused",
+  "payload": {
+    "message": "nothing is running in the guest yet",
+    "protocol": 1
+  }
+}

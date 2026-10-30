@@ -1,13 +1,28 @@
 [package]
 name = "vibe-guest"
-description = "PID 1 inside each linux agent VM; a static aarch64 musl binary"
+description = "PID 1 inside each linux agent VM (a static aarch64 musl binary), and the protocol vibed and vibe-shim speak to it"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+# The library is the protocol, which builds anywhere; the binary does its
+# work only on Linux.
 [dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+vt100.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc.workspace = true
+vt100.workspace = true
 
 [lints]
 workspace = true

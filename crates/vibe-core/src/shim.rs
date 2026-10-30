@@ -238,7 +238,8 @@ pub struct Welcome {
     /// The shim's pid, which is also the session ID of every process the
     /// agent starts.
     pub pid: u32,
-    /// The command's pid.
+    /// The command's pid. For a `linux` agent's shim (`vibe-shim --vm`),
+    /// that's its pid in the guest, which means nothing on this host.
     pub child_pid: u32,
 }
 
@@ -275,6 +276,7 @@ pub struct Status {
     #[serde(rename = "ref")]
     pub agent: String,
     pub pid: u32,
+    /// As in [`Welcome::child_pid`]: in the guest, for a `linux` agent.
     pub child_pid: u32,
     pub command: Vec<String>,
     pub cwd: String,

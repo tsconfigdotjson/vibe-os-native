@@ -1,0 +1,11 @@
+{
+  "kind": "hello",
+  "payload": {
+    "protocol": 1,
+    "client": "vibe-shim",
+    "size": {
+      "rows": 40,
+      "cols": 120
+    }
+  }
+}

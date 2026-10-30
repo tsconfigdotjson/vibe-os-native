@@ -9,12 +9,14 @@ repository.workspace = true
 
 [dependencies]
 vibe-core.workspace = true
+vibe-guest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
 libc.workspace = true
 tempfile.workspace = true
+vt100.workspace = true
 
 [lints]
 workspace = true

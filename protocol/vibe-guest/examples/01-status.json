@@ -1,0 +1,67 @@
+{
+  "request": {
+    "op": "status"
+  },
+  "reply": {
+    "ok": true,
+    "protocol": 1,
+    "version": "0.1.0",
+    "boot_id": "5b0c8a54-3e0f-4c7e-9f0e-1a7b6d1c2e33",
+    "uptime_ms": 482113,
+    "state": "running",
+    "frozen": false,
+    "session": {
+      "pid": 214,
+      "command": [
+        "claude",
+        "--session-id",
+        "6f1e5c2a-0b7e-4d38-9a41-2f5c8e1d7b90",
+        "--model",
+        "opus",
+        "--effort",
+        "high",
+        "--permission-mode",
+        "auto",
+        "Fix the flaky login test"
+      ],
+      "cwd": "/Users/me/VibeOS/worktrees/app/quiet-amber-otter",
+      "started_ms": 1830
+    },
+    "memory": {
+      "total": 4111171584,
+      "available": 3382181888
+    },
+    "network": {
+      "interface": "eth0",
+      "address": "192.168.64.5/24",
+      "gateway": "192.168.64.1",
+      "dns": [
+        "192.168.64.1"
+      ]
+    },
+    "layers": [
+      "managed",
+      "home",
+      "template",
+      "base"
+    ],
+    "shares": [
+      {
+        "tag": "worktree",
+        "path": "/Users/me/VibeOS/worktrees/app/quiet-amber-otter"
+      },
+      {
+        "tag": "git",
+        "path": "/Users/me/VibeOS/projects/app/.git"
+      },
+      {
+        "tag": "claude",
+        "path": "/home/vibe/.claude"
+      },
+      {
+        "tag": "cache-npm",
+        "path": "/home/vibe/.npm"
+      }
+    ]
+  }
+}

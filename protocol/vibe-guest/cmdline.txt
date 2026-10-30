@@ -1,0 +1,1 @@
+console=hvc0 quiet vibe.layers=managed,home,template,base vibe.upper=agent vibe.share=worktree:/Users/me/VibeOS/worktrees/app/quiet-amber-otter vibe.share=git:/Users/me/VibeOS/projects/app/.git vibe.share=claude:/home/vibe/.claude vibe.share=cache-npm:/home/vibe/.npm vibe.uid=501 vibe.gid=20

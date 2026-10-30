@@ -24,16 +24,27 @@
 //!   snapshot must always hold.
 //! - `write-disk TEXT`: writes TEXT and a newline at the start of the
 //!   `agent` disk, without syncing, so a snapshot must carry it.
+//!
+//! `vibe-testguest ask` is something else: not PID 1 but the command
+//! `vibe-guest` runs in the second test guest, standing in for Claude with
+//! a question pending (see `ask.rs`).
 
 /// The vsock port the test guest serves.
 pub const PORT: u32 = 1024;
 
 #[cfg(target_os = "linux")]
+mod ask;
+#[cfg(target_os = "linux")]
 mod guest;
 
 fn main() -> std::process::ExitCode {
     #[cfg(target_os = "linux")]
-    guest::run();
+    {
+        if std::env::args().nth(1).as_deref() == Some("ask") {
+            ask::run();
+        }
+        guest::run();
+    }
     #[cfg(not(target_os = "linux"))]
     {
         eprintln!("vibe-testguest runs as PID 1 of a Linux test VM");
