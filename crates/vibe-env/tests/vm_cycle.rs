@@ -297,7 +297,11 @@ impl TestVm {
     }
 
     fn sleep(&self, balloon_ms: Option<u64>) -> Slept {
-        let slept = vm::sleep(&self.socket, balloon_ms, None)
+        self.sleep_down_to(balloon_ms, None)
+    }
+
+    fn sleep_down_to(&self, balloon_ms: Option<u64>, balloon_floor: Option<u64>) -> Slept {
+        let slept = vm::sleep(&self.socket, balloon_ms, balloon_floor)
             .unwrap_or_else(|e| panic!("sleep {}: {e}\n{}", self.name, self.logs()));
         assert_eq!(slept.snapshot, self.config.snapshot);
         assert!(self.config.snapshot.exists());
@@ -434,18 +438,58 @@ fn boot_save_restore() {
 
     assert_eq!((vm.tick(), vm.tick(), vm.tick()), (1, 2, 3));
 
-    // Without the balloon, memory the guest touched and freed is saved too.
-    vm.must_ask("dirty 512");
-    let unballooned = vm.sleep(Some(0));
+    // What a snapshot holds (PRD: Spike results). The guest's memory is
+    // written with data that doesn't compress: a page of mostly zeros costs
+    // a snapshot next to nothing, so it proves nothing. (Writing one byte a
+    // page, 512 MiB of touched and freed memory came to a 29 MiB snapshot.)
+    eprintln!("the guest's balloon: {}", first["balloon"]);
+
+    // 1. Memory in use is saved whole. The balloon's floor stays above it,
+    // as vibed's will (PRD: Sleep and wake).
+    let held = vm.must_ask("hold 256")["sum"].clone();
+    let slept = vm.sleep_down_to(None, Some(512 * MIB));
     eprintln!(
-        "no balloon, 512 MiB touched and freed: {} MiB snapshot, {:?}",
-        mib(unballooned.snapshot_bytes),
-        unballooned.timings
+        "256 MiB in use, balloon down to 512 MiB: {} MiB snapshot, {:?}",
+        mib(slept.snapshot_bytes),
+        slept.timings
     );
     assert!(
-        unballooned.snapshot_bytes >= 384 * MIB,
-        "the guest's freed memory should be in the snapshot: {} MiB",
-        mib(unballooned.snapshot_bytes)
+        slept.snapshot_bytes >= 256 * MIB,
+        "memory in use must be in the snapshot: {} MiB",
+        mib(slept.snapshot_bytes)
+    );
+    let (ready, answer) = vm.restore();
+    eprintln!(
+        "restore of {} MiB to first answer: {} ms, {:?}",
+        mib(slept.snapshot_bytes),
+        answer.as_millis(),
+        ready.timings
+    );
+    assert_eq!(vm.tick(), 4, "the guest carries on exactly");
+    let status = vm.must_ask("status");
+    assert_eq!(
+        (&status["held_mib"], &status["held_sum"]),
+        (&Value::from(256), &held),
+        "the memory in use came back exactly"
+    );
+    vm.must_ask("release");
+
+    // 2. Without the balloon. The spike saw memory the guest had freed
+    // saved all the same (1.09 GB after freeing 1 GB); with free page
+    // reporting the guest may hand it back on its own. Either way this is
+    // what the balloon is measured against.
+    vm.must_ask("dirty 512");
+    let unballooned = vm.sleep(Some(0));
+    let reporting = first["balloon"]["free_page_reporting"].as_bool();
+    eprintln!(
+        "no balloon, 512 MiB touched and freed: {} MiB snapshot ({}; free page reporting: {reporting:?}), {:?}",
+        mib(unballooned.snapshot_bytes),
+        if unballooned.snapshot_bytes >= 384 * MIB {
+            "the freed memory was saved, as in the spike"
+        } else {
+            "the freed memory stayed out of it"
+        },
+        unballooned.timings
     );
     let (ready, answer) = vm.restore();
     eprintln!(
@@ -454,9 +498,10 @@ fn boot_save_restore() {
         answer.as_millis(),
         ready.timings
     );
-    assert_eq!(vm.tick(), 4, "the guest carries on exactly");
+    assert_eq!(vm.tick(), 5, "the guest carries on exactly");
 
-    // With it, the snapshot holds only what the guest really uses.
+    // 3. With it, the snapshot holds only what the guest really uses, and
+    // never more than without.
     vm.must_ask("dirty 512");
     // Written through the guest's page cache and not flushed: only the
     // snapshot can carry it.
@@ -471,6 +516,12 @@ fn boot_save_restore() {
         slept.snapshot_bytes <= BALLOONED_LIMIT,
         "the balloon should keep freed memory out: {} MiB",
         mib(slept.snapshot_bytes)
+    );
+    assert!(
+        slept.snapshot_bytes <= unballooned.snapshot_bytes + 32 * MIB,
+        "the balloon made the snapshot bigger: {} MiB against {} MiB",
+        mib(slept.snapshot_bytes),
+        mib(unballooned.snapshot_bytes)
     );
     let save_ms = ms(slept.timings.save_ms);
     assert!(save_ms <= SAVE_LIMIT_MS, "the save took {save_ms} ms");
@@ -488,7 +539,7 @@ fn boot_save_restore() {
         "the restore took {restore_ms} ms"
     );
     assert!(answer <= RESTORE_LIMIT, "the first answer took {answer:?}");
-    assert_eq!(vm.tick(), 5, "the guest carries on exactly");
+    assert_eq!(vm.tick(), 6, "the guest carries on exactly");
     // The share is missing for about a second after a restore, then fresh.
     let status = vm.wait_for("share", Some("after"), Duration::from_secs(5));
     assert_eq!(status["boot_id"], boot_id, "the same boot");

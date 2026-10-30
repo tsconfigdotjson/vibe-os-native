@@ -14,11 +14,14 @@
 //! - `status`: the count, the kernel's boot id, eth0's MAC address and the
 //!   IPv4 address DHCP gave it, the contents of `/mnt/share/probe` and of the
 //!   disk whose serial is `agent` (up to the first newline), the uptime, the
-//!   vCPUs and the hardware RNG in use.
+//!   vCPUs, the hardware RNG in use, free and held memory, and the
+//!   balloon's negotiated features.
 //! - `sync`: flushes everything written to the disks.
-//! - `dirty MIB`: touches MIB MiB of memory and frees it again, like a guest
-//!   that used memory and gave it back. Without the balloon, a snapshot
-//!   would still hold those pages.
+//! - `dirty MIB`: fills MIB MiB of memory with data that doesn't compress
+//!   and frees it again, like a guest that used memory and gave it back.
+//!   Without the balloon, a snapshot would still hold those pages.
+//! - `hold MIB`: the same, but kept in use until `release`: memory a
+//!   snapshot must always hold.
 //! - `write-disk TEXT`: writes TEXT and a newline at the start of the
 //!   `agent` disk, without syncing, so a snapshot must carry it.
 

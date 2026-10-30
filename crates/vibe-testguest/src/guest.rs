@@ -5,6 +5,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -13,6 +14,9 @@ use serde_json::{Value, json};
 use crate::PORT;
 
 static COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Memory `hold` keeps in use until `release`.
+static HELD: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 
 /// Serves [`PORT`] for ever. As PID 1 it must never return: if it can't
 /// serve, it says why on the console and waits, so the test that boots it
@@ -119,6 +123,10 @@ fn answer(command: &str) -> Value {
             "cpus": std::thread::available_parallelism().map(|n| n.get()).ok(),
             "rng": read_trimmed("/sys/class/misc/hw_random/rng_current"),
             "ip": ipv4("eth0"),
+            "mem_free_kib": meminfo("MemFree"),
+            "held_mib": HELD.lock().unwrap().iter().map(|m| m.len() >> 20).sum::<usize>(),
+            "held_sum": HELD.lock().unwrap().iter().fold(0u64, |sum, m| sum.wrapping_add(checksum(m))),
+            "balloon": balloon(),
         }),
         "sync" => {
             // SAFETY: sync takes no arguments and can't fail.
@@ -127,11 +135,24 @@ fn answer(command: &str) -> Value {
         }
         "dirty" => match arg.parse::<usize>() {
             Ok(mib) => {
-                dirty(mib);
-                json!({ "dirtied_mib": mib })
+                let sum = checksum(&filled(mib));
+                json!({ "dirtied_mib": mib, "sum": sum })
             }
             Err(_) => json!({ "error": "dirty takes a number of MiB" }),
         },
+        "hold" => match arg.parse::<usize>() {
+            Ok(mib) => {
+                let memory = filled(mib);
+                let sum = checksum(&memory);
+                HELD.lock().unwrap().push(memory);
+                json!({ "held_mib": mib, "sum": sum })
+            }
+            Err(_) => json!({ "error": "hold takes a number of MiB" }),
+        },
+        "release" => {
+            HELD.lock().unwrap().clear();
+            json!({ "held_mib": 0 })
+        }
         "write-disk" => match write_disk(arg) {
             Ok(()) => json!({ "written": arg }),
             Err(e) => json!({ "error": e.to_string() }),
@@ -178,15 +199,66 @@ fn uptime_ms() -> Option<u64> {
     Some((secs * 1000.0) as u64)
 }
 
-/// Touches `mib` MiB, then frees them: the allocation is large enough that
-/// musl maps it on its own and unmaps it on free, giving the pages back to
-/// the guest kernel.
-fn dirty(mib: usize) {
+/// `mib` MiB, every byte of it written with pseudo-random data. A page
+/// that is mostly zeros costs a snapshot next to nothing, so it would prove
+/// nothing about what a snapshot holds; these pages don't compress. `dirty`
+/// frees them again at once: the allocation is large enough that musl maps
+/// it on its own and unmaps it on free, giving the pages back to the guest
+/// kernel. `hold` keeps them.
+fn filled(mib: usize) -> Vec<u8> {
     let mut memory = vec![0u8; mib << 20];
-    for page in memory.chunks_mut(4096) {
-        page[0] = 0x5a;
+    // xorshift64*, seeded afresh for every fill, so no two fills match and
+    // none could be shared between them.
+    static FILLS: AtomicU64 = AtomicU64::new(1);
+    let mut x = FILLS
+        .fetch_add(1, Ordering::SeqCst)
+        .wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    let (words, _) = memory.as_chunks_mut::<8>();
+    for word in words {
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        *word = x.wrapping_mul(0x2545_f491_4f6c_dd1d).to_le_bytes();
     }
-    std::hint::black_box(&memory);
+    memory
+}
+
+/// Reads every byte, so none of the writes can be optimised away.
+fn checksum(memory: &[u8]) -> u64 {
+    let (words, _) = memory.as_chunks::<8>();
+    words
+        .iter()
+        .fold(0u64, |sum, w| sum.wrapping_add(u64::from_le_bytes(*w)))
+}
+
+/// A field of /proc/meminfo, in KiB.
+fn meminfo(field: &str) -> Option<u64> {
+    let text = fs::read_to_string("/proc/meminfo").ok()?;
+    let line = text.lines().find(|l| l.starts_with(&format!("{field}:")))?;
+    line.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// The virtio balloon's negotiated feature bits, and whether they include
+/// free page reporting (bit 5), through which the guest hands freed pages to
+/// the host on its own, a couple of seconds after freeing them.
+fn balloon() -> Value {
+    let Ok(devices) = fs::read_dir("/sys/bus/virtio/devices") else {
+        return Value::Null;
+    };
+    for device in devices.flatten() {
+        let id = fs::read_to_string(device.path().join("device")).unwrap_or_default();
+        if id.trim() == "0x0005" {
+            let features = read_trimmed(&device.path().join("features").to_string_lossy());
+            let bit = |n: usize| features.as_deref().and_then(|f| f.chars().nth(n)) == Some('1');
+            return json!({
+                "features": features,
+                "deflate_on_oom": bit(2),
+                "free_page_hint": bit(3),
+                "free_page_reporting": bit(5),
+            });
+        }
+    }
+    Value::Null
 }
 
 /// The block device whose virtio serial is `agent`.
@@ -244,6 +316,10 @@ mod tests {
             "cpus",
             "rng",
             "ip",
+            "mem_free_kib",
+            "held_mib",
+            "held_sum",
+            "balloon",
         ] {
             assert!(status.get(key).is_some(), "{key} in {status}");
         }
@@ -256,9 +332,31 @@ mod tests {
     }
 
     #[test]
-    fn dirty_touches_and_frees() {
-        assert_eq!(answer("dirty 4"), json!({ "dirtied_mib": 4 }));
+    fn dirty_hold_and_release() {
+        let dirty = answer("dirty 4");
+        assert_eq!(dirty["dirtied_mib"], 4);
+        assert!(dirty["sum"].is_u64());
         assert!(answer("dirty lots")["error"].is_string());
+        let two = answer("hold 2")["sum"].as_u64().unwrap();
+        let three = answer("hold 3")["sum"].as_u64().unwrap();
+        let status = answer("status");
+        assert_eq!(status["held_mib"], 5);
+        assert_eq!(status["held_sum"].as_u64(), Some(two.wrapping_add(three)));
+        assert_eq!(answer("release"), json!({ "held_mib": 0 }));
+        assert_eq!(answer("status")["held_mib"], 0);
+        assert!(answer("hold x")["error"].is_string());
+    }
+
+    #[test]
+    fn fills_are_random_enough_not_to_compress() {
+        let memory = filled(1);
+        // No byte value takes more than a sliver of the MiB, and no two
+        // fills are the same.
+        let mut counts = [0usize; 256];
+        memory.iter().for_each(|&b| counts[b as usize] += 1);
+        assert!(counts.iter().all(|&c| c < 8192), "{:?}", &counts[..4]);
+        assert_ne!(filled(1), memory);
+        assert!(meminfo("MemFree").unwrap() > 0);
     }
 
     #[test]
