@@ -40,23 +40,42 @@ pub enum Probe {
     Broken(String),
 }
 
-/// Asks the shim at `socket` for its status.
+/// Asks the shim at `socket` for its status. When it doesn't answer, what
+/// failed doesn't decide whether it's gone, as the errors differ by OS
+/// (macOS reports a socket nobody serves differently to a non-blocking
+/// connect than Linux does). Instead: a shim removes its socket as its
+/// command exits, and holds the socket's lock for its whole life, so with
+/// the socket or the lock gone, so is the shim.
 pub async fn probe(socket: &Path) -> Probe {
-    match tokio::time::timeout(PROBE_TIMEOUT, ask_status(socket)).await {
-        Ok(Ok(status)) => Probe::Running(status),
-        Ok(Err(e))
-            if matches!(
-                e.kind(),
-                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
-            ) =>
-        {
-            Probe::Gone
-        }
-        // A shim removes its socket as its command exits, then closes the
-        // connections it had; one that went meanwhile is gone, not broken.
-        Ok(Err(_)) if !socket.exists() => Probe::Gone,
-        Ok(Err(e)) => Probe::Broken(e.to_string()),
-        Err(_) => Probe::Broken(format!("no answer in {}s", PROBE_TIMEOUT.as_secs())),
+    let why = match tokio::time::timeout(PROBE_TIMEOUT, ask_status(socket)).await {
+        Ok(Ok(status)) => return Probe::Running(status),
+        Ok(Err(e)) => e.to_string(),
+        Err(_) => format!("no answer in {}s", PROBE_TIMEOUT.as_secs()),
+    };
+    if !socket.exists() || !lock_held(socket) {
+        Probe::Gone
+    } else {
+        Probe::Broken(why)
+    }
+}
+
+/// Whether a process holds the lock beside `socket`, as a running shim
+/// does. If that can't be told, it's taken as held, so nothing is removed
+/// on a guess.
+fn lock_held(socket: &Path) -> bool {
+    let lock = match OpenOptions::new()
+        .write(true)
+        .open(socket::lock_path(socket))
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return false,
+        Err(_) => return true,
+    };
+    match lock.try_lock() {
+        // Released as `lock` drops.
+        Ok(()) => false,
+        Err(TryLockError::WouldBlock) => true,
+        Err(TryLockError::Error(_)) => true,
     }
 }
 
@@ -368,16 +387,47 @@ mod tests {
             probe(&tmp.path().join("none.sock")).await,
             Probe::Gone
         ));
+        // A socket nobody serves, with or without the lock file a dead
+        // shim leaves.
         let stale = tmp.path().join("stale.sock");
         drop(std::os::unix::net::UnixListener::bind(&stale).unwrap());
         assert!(matches!(probe(&stale).await, Probe::Gone));
-        // Something that isn't a shim.
+        std::fs::write(socket::lock_path(&stale), "").unwrap();
+        assert!(matches!(probe(&stale).await, Probe::Gone));
+
+        // Something holding the lock but not answering as a shim does: alive,
+        // so broken, not gone.
         let other = tmp.path().join("other.sock");
+        let held = held_lock(&other);
         let listener = tokio::net::UnixListener::bind(&other).unwrap();
         tokio::spawn(async move {
-            let (mut s, _) = listener.accept().await.unwrap();
-            let _ = s.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
+            loop {
+                let (mut s, _) = listener.accept().await.unwrap();
+                let _ = s.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
+            }
         });
         assert!(matches!(probe(&other).await, Probe::Broken(_)));
+        // The same answer once its lock is free: whatever answered is no
+        // shim of ours, and the shim that was is gone.
+        drop(held);
+        assert!(matches!(probe(&other).await, Probe::Gone));
+
+        // A stale socket whose lock a shim holds as it starts is left be.
+        let starting = tmp.path().join("starting.sock");
+        drop(std::os::unix::net::UnixListener::bind(&starting).unwrap());
+        let _held = held_lock(&starting);
+        assert!(matches!(probe(&starting).await, Probe::Broken(_)));
+    }
+
+    /// The lock beside `socket`, held as a running shim holds it.
+    fn held_lock(socket: &Path) -> std::fs::File {
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(socket::lock_path(socket))
+            .unwrap();
+        lock.lock().unwrap();
+        lock
     }
 }
