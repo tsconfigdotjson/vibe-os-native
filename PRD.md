@@ -1,46 +1,49 @@
 # VibeOS Native — Product Requirements
 
-Oct 29, 2026 · @Lee
+Oct 30, 2026 · @Lee
 
 ## Summary
 
-VibeOS Native (repo: `vibe-os-native`) turns an always-on Apple Silicon Mac on the latest macOS into a private agent host. It has three parts: a Rust daemon, an MCP server and a SwiftUI menu bar app. Every agent gets its own git worktree and its own compartment. The agent's profile picks the compartment: a Linux micro-VM, or native macOS under a resource governor when the work needs a Mac.
+VibeOS Native (repo: `vibe-os-native`) turns an always-on Apple Silicon Mac on the latest macOS into a private agent host, and can add Linux servers (a VPS, say) as more hosts. It has three parts: a Rust daemon, an MCP server and a SwiftUI menu bar app. The same daemon runs on every host; the menu bar runs on the Mac. Every agent gets its own git worktree and its own compartment. The agent's profile picks the compartment: a Linux micro-VM, or native macOS under a resource governor when the work needs a Mac.
 
-The MCP server is the main interface. The menu bar lists the agents this app started, with live status. Clicking one opens Terminal.app attached to its session. Closing the window detaches; the agent keeps running.
+The MCP server is the main interface. The menu bar lists the agents this app started on every host, with live status, so a Linux server feels like part of the Mac. Clicking one opens Terminal.app attached to its session. Closing the window detaches; the agent keeps running.
 
 Status comes from agent-tail, which reads Claude Code's own transcripts, so no hooks are needed. That's what lets the daemon put idle agents to sleep and give their resources back. VibeOS inspired the product, but there is no shared code and no compatibility promise.
 
 ## Goals and non-goals
 
-v1 is one owner, one Mac, many agents. MCP matters most: the menu bar and Terminal are views onto what MCP drives. The menu shows only agents this app started, never other agent processes on the machine.
+v1 is one owner, one Mac, any number of Linux hosts, many agents. MCP matters most: the menu bar and Terminal are views onto what MCP drives. The menu shows only agents this app started, never other agent processes on the machine.
 
 **Goals**
 
 1. **MCP is the control plane, shaped like VibeOS's.** The round that already drives a working orchestrator stays: start an agent with a prompt, `vibe_wait`, read what it said, answer its questions with `vibe_send`. It's folded to one agent per worktree. Host setup (projects, profiles, the Linux template) lives in Settings.
 2. **One agent, one worktree, one compartment.** Agents never share a checkout, because parallel work no longer needs sequencing inside one worktree.
 3. **Profiles pick the environment.** Each project has a few profiles, such as `software-eng-linux` and `software-eng-mac`. A profile sets the environment, model, reasoning level, permission mode and memory. `linux` is a micro-VM; `macos` runs natively under a resource governor, for Xcode and other Mac toolchains.
-4. **Many agents, one responsive host.** With 4 GB profiles, about 7 agents can be awake at once on a 32 GB Mac, and 15 on 64 GB. Asleep agents use no RAM, so many more can exist, limited only by disk. No compartment can starve macOS, the daemon or another agent.
+4. **Many agents, responsive hosts.** With 4 GB profiles, about 7 agents can be awake at once on a 32 GB Mac, and 15 on 64 GB. Asleep agents use no RAM, so many more can exist, limited only by disk. No compartment can starve macOS, the daemon or another agent.
 5. **Know what every agent is doing without hooks.** agent-tail reads Claude Code's transcripts, and no Claude config is changed.
 6. **Idle agents cost close to nothing and wake exactly where they were.** About a minute after agent-tail says an agent is at rest with nothing attached, a `linux` VM is paused and saved to disk, freeing all its RAM, and a `macos` agent is frozen. A send or an attach brings it back mid-prompt, even mid-question.
 7. **No custom terminal.** Clicking an agent opens Terminal.app attached to the live session. Closing it detaches.
 8. **Nothing is lost by accident.** Agents survive the menu bar app quitting, the daemon restarting or upgrading, and clients disconnecting. After a reboot they come back asleep. Deleting an agent with unsaved work is refused.
 9. **Short setup.** About five minutes on a Mac where `gh` and `claude` are already logged in: add a project, keep or edit its two starter profiles, and log the Linux toolbox into `gh` once.
+10. **Linux servers are part of the same menu.** Add one by its SSH address; the app installs the daemon over SSH. Its agents show up in the menu bar and in the Mac's MCP like local ones, and clicking one attaches over SSH. A Linux host also runs on its own, with its own MCP, when the Mac is off.
+11. **One external address.** A Linux host with a public address can be the front door for outside MCP callers: one URL and one API key reach agents on that host and on the Mac behind it, with nothing opened on the Mac.
 
 **Non-goals for v1**
 
 - Harnesses other than Claude Code. Pi comes next, added as a profile field; agent-tail already reads it, CI-verified.
 - Several agents in one worktree.
 - Reaching ports inside `linux` VMs (dev servers, previews). Agents test from inside their VM.
-- A menu bar on any machine other than the host. Remote users drive agents over MCP and attach over SSH.
+- A menu bar on a Linux host. Linux hosts are driven from the Mac's menu bar, over MCP, or with the `vibe` CLI.
 - A browser desktop, a custom terminal emulator, or terminals other than Terminal.app.
 - File sandboxing for `macos` agents, or tracking and cleaning up what they install outside their worktree. They are trusted and only resource-limited. Deleting one removes everything VibeOS made for it (see Delete), but not what the agent installed elsewhere on the Mac. Work that needs containment belongs in `linux`.
 - Network egress filtering.
 - Custom VM images or Dockerfiles. The Linux template covers customization.
 - Multiple users or teams on one host.
-- Linux hosts. This is a Mac-only app.
+- Micro-VMs on Linux hosts. Most VPSes have no KVM, so Linux-host agents run under cgroups instead (see Hosts).
 - Running macOS GUI apps or Xcode simulators inside `linux` VMs.
 - Orchestration logic such as planning, queues or merge bots. Clients build that on top of MCP.
-- A cloud relay. Remote access goes through Tailscale or SSH.
+- A hosted cloud relay. Outside callers reach agents through a Linux host the owner runs (see External access).
+- OAuth for consumer connectors such as claude.ai's. External access uses API keys only.
 
 ## Lineage: what VibeOS taught us
 
@@ -65,17 +68,18 @@ VibeOS proved out the ideas, so this product borrows them. Nothing else carries 
 
 ## Core concepts
 
-An agent, its worktree and its compartment are one unit. They're created together and deleted together, and one ref (e.g. `quiet-amber-otter`) names all three. The branch is the bare ref too, with no prefix.
+An agent, its worktree and its compartment are one unit. They're created together and deleted together, and one ref (e.g. `quiet-amber-otter`) names all three. The branch is the bare ref too, with no prefix. Every agent also belongs to a host, from day one: refs are unique per host, and an agent on another host is written `vps:quiet-amber-otter` when the host isn't clear from context.
 
 | Term | Meaning | Lives at |
 | --- | --- | --- |
-| Host | The Mac running `vibed`. It has one owner. | — |
-| Project | A GitHub repo cloned onto the host by `owner/name`, or a local repo registered by path. Added in Settings, where its profiles live too. | `~/VibeOS/projects/<name>` |
+| Host | A machine running `vibed`: the Mac, or a Linux host. Each host keeps its own projects, profiles and agents; the Mac's menu and MCP show all of them. One owner for all. | — |
+| Linux host | A Linux server (a VPS, say) added by its SSH address. `vibed` runs there as a systemd user service, and agents run natively under cgroups v2. | The server |
+| Project | A GitHub repo cloned onto a host by `owner/name`, or a local repo registered by path. Added in Settings, where its profiles live too. | `~/VibeOS/projects/<name>` |
 | Profile | A per-project preset for starting agents: environment, model, reasoning level, mode (`auto` or `bypass`) and memory. A new project starts with one per environment. | Settings → Projects (SQLite) |
 | Agent | One Claude Code process and all its children, started from a profile, working in its own worktree inside its own compartment. | Process tree under a shim |
 | Worktree | The agent's git worktree, on its own branch. Deleted with the agent; the branch is kept. | `~/VibeOS/worktrees/<project>/<ref>` |
-| Compartment | The agent's isolation boundary: a micro-VM in `linux`, a governed process tree in `macos`. | — |
-| Environment | `linux` or `macos`. Set by the profile, and fixed for the agent's life. | The profile |
+| Compartment | The agent's isolation boundary: a micro-VM for `linux` on the Mac, a cgroup on a Linux host, a governed process tree for `macos`. | — |
+| Environment | `linux` or `macos` (`macos` only on the Mac). Set by the profile, and fixed for the agent's life. The host decides how `linux` runs: a VM on the Mac, a cgroup on a Linux host. | The profile |
 | Linux template | The Linux machine every `linux` agent boots a copy of: whatever you install in the toolbox shell (`apt`, `curl … \| sh`, `npm -g`). Versioned. | Host disk image |
 | Linux home | Logins and dotfiles every `linux` agent starts with (`gh`, `gcloud`, `~/.gitconfig`), set up in the toolbox shell. Kept apart from the template so a rebuild doesn't lose them. | Host disk image |
 | Linux Claude config | Your Claude setup for `linux` agents (CLAUDE.md, settings, skills, MCP servers), made in the toolbox shell. Copied into each agent's own `~/.claude` when it starts. | `~/VibeOS/linux-claude/` |
@@ -84,7 +88,7 @@ An agent, its worktree and its compartment are one unit. They're created togethe
 | Host limits | Everything that isn't per profile: memory and cores kept for macOS, CPU cores per agent, process count, disk. | Settings → Host, or `~/.config/vibeos/host.toml` |
 | Snapshot | A sleeping `linux` agent's whole VM, RAM included, saved to disk. Restoring it resumes the agent exactly. | `~/VibeOS/snapshots/<ref>` |
 | Session | The PTY the agent runs in. A shim holds it, so it outlives every client. | `…/run/<ref>.sock` |
-| Transcript | The session file Claude Code writes on its own. agent-tail reads it to get status. | `macos`: `~/.claude/projects/`; `linux`: the agent's own Claude home on the host |
+| Transcript | The session file Claude Code writes on its own. agent-tail reads it to get status. | `macos` and Linux hosts: `~/.claude/projects/`; `linux` on the Mac: the agent's own Claude home on the Mac |
 | Client | Anything attached to an agent or calling `vibed`: Terminal via `vibe attach`, an MCP client, or the menu bar app. | — |
 
 ## Key user flows
@@ -123,11 +127,11 @@ A Rust daemon owns all state and logic. Every other part is a thin client of it.
 | Component | Language | Runs as | Job |
 | --- | --- | --- | --- |
 | `VibeOS.app` | SwiftUI (`MenuBarExtra`) | Login item | UI only, holds no state. Talks to `vibed` over a Unix socket. Quitting it changes nothing. |
-| `vibed` | Rust | LaunchAgent (via `SMAppService`), as the logged-in user, no root | Registry (SQLite); worktree manager (shells out to `git`); agent supervisor; **status engine** (agent-tail); **resource governor** for `macos` agents; sleep and wake; Linux template, home and managed-layer builder; MCP server; event stream. |
+| `vibed` | Rust | On the Mac a LaunchAgent (via `SMAppService`); on a Linux host a systemd user service. Always as the user, no root | Registry (SQLite); worktree manager (shells out to `git`); agent supervisor; **status engine** (agent-tail); **resource governor** for `macos` agents; sleep and wake; Linux template, home and managed-layer builder; MCP server; event stream. |
 | `vibe-shim` | Rust | One per awake agent, on the host, detached (its own session) | Owns the agent's terminal end: PTY (`macos`) or a vsock stream to `vibe-guest` (`linux`), a scrollback ring buffer, and a screen model (`vt100` crate) for `read_output` and redraw on attach. Serves `run/<ref>.sock`. |
 | `vibe-vm` | Swift (Virtualization.framework) | One per awake `linux` agent, detached | Boots the agent's VM, or restores it from its snapshot. To sleep, it pauses the VM, saves its state to disk and exits. Holds the `com.apple.security.virtualization` entitlement. |
 | `vibe-guest` | Rust, static Linux binary | PID 1 inside each VM | Starts Claude as the unprivileged user `vibe` on a PTY. Reports the process tree for the idle rules. Freezes Claude's tree before a save. After a restore, sets the clock from the host, waits for the shared folders to answer, then thaws Claude. If the vsock link drops, Claude keeps running until the shim reconnects. |
-| `vibe` CLI | Rust | On demand; linked into `/usr/local/bin` at setup | `vibe attach <ref>`, `vibe ls`, `vibe doctor`, `vibe toolbox`, and `vibe mcp` (a stdio bridge for clients that can only start a command). |
+| `vibe` CLI | Rust | On demand; linked into `/usr/local/bin` at setup | `vibe attach <ref>`, `vibe ls`, `vibe doctor`, `vibe toolbox`, `vibe mcp` (a stdio bridge for clients that can only start a command), `vibe rpc` (the socket API over stdio, which the Mac uses through SSH), and `vibe key`, `vibe project` and `vibe profile` for setting up a Linux host without the menu bar. |
 
 **Restarts.** Shims and `vibe-vm` processes are detached from `vibed`. A daemon crash or upgrade leaves every agent running, and on start `vibed` re-adopts them by scanning `run/`.
 
@@ -135,7 +139,41 @@ A Rust daemon owns all state and logic. Every other part is a thin client of it.
 
 **No Rust in the Swift processes.** The Swift app talks to `vibed` only through the socket. There is no UniFFI and no linked library, which keeps the Swift side small and the builds independent. `vibe-vm` is Swift too, because Virtualization.framework is an Apple API; it's a separate process that `vibed` drives over a pipe.
 
-**Crates:** `vibe-core` (domain + store), `vibe-status` (wraps agent-tail), `vibe-env` (an `Environment` trait with `linux` and `macos` backends), `vibe-shim`, `vibe-guest`, `vibe-mcp`, `vibe-cli`.
+**Crates:** `vibe-core` (domain + store), `vibe-status` (wraps agent-tail), `vibe-env` (environment backends, below), `vibe-shim`, `vibe-guest`, `vibe-mcp`, `vibe-cli`. Everything but `vibe-guest` builds for macOS and Linux; the Swift app, `vibe-vm` and the `macos` governor are Mac-only.
+
+### Environment backends
+
+Every way of running an agent sits behind one small interface, so the policy code (sleep, admission, MCP, the menu) never asks which backend it's talking to. It's three focused traits and a capabilities record, not an inheritance tree:
+
+```rust
+trait Compartment {               // lifecycle: every backend
+    fn create(&self, spec: &AgentSpec) -> Result<Handle>;
+    fn launch(&self, h: &Handle, cmd: &Launch) -> Result<TerminalEnd>; // PTY or vsock, for the shim
+    fn processes(&self, h: &Handle) -> Result<Vec<Proc>>;              // for the idle rule
+    fn stop(&self, h: &Handle) -> Result<()>;
+    fn delete(&self, h: &Handle) -> Result<()>;                       // leaves nothing behind
+}
+trait Limiter {                   // governor, cgroups, or fixed at VM boot
+    fn apply(&self, h: &Handle, limits: &Limits) -> Result<()>;
+    fn usage(&self, h: &Handle) -> Result<Usage>;
+}
+trait Sleeper {                   // SIGSTOP, cgroup freezer, or snapshot
+    fn sleep(&self, h: &Handle) -> Result<()>;
+    fn wake(&self, h: &Handle) -> Result<()>;
+}
+struct Capabilities { sleep_frees_memory: bool, exact_after_reboot: bool,
+                      kernel_limits: bool, file_containment: bool, wake_cost: Duration }
+```
+
+| Backend | Limits | Sleep | Sleep frees RAM | Exact after reboot | Files contained |
+| --- | --- | --- | --- | --- | --- |
+| `macos` on the Mac | Supervised (governor) | `SIGSTOP` | No (macOS may swap) | No, `--resume` | No |
+| `linux` on the Mac | Kernel, fixed at VM boot | Snapshot to disk | Yes | Yes | Yes |
+| `linux` on a Linux host | Kernel (cgroups v2) | cgroup freezer | No (may swap) | No, `--resume` | No |
+
+Policy reads only the traits and `Capabilities`. For example, admission sleeps an agent early to free memory only when `sleep_frees_memory` is true. "Freeze a process tree" is one shared building block: the `macos` sleeper, the cgroup freezer and `vibe-guest`'s freeze-before-snapshot all use it. A later backend, such as Firecracker on a Linux host that has KVM, is one new implementation.
+
+One conformance test suite holds every backend to the same contract: start, then its processes are visible; a limit hit pauses it; sleep then wake leaves the session exactly where it was, or reports `--resume` when `exact_after_reboot` says so; delete leaves nothing behind.
 
 **Status engine.** It wraps agent-tail's `SessionReducer`. `vibed` matches each agent to its transcript and feeds in the bytes as they're appended (details under State and lifecycle). The shim's screen model is a fallback only, for the rare moment a transcript can't be found.
 
@@ -171,6 +209,7 @@ Every agent runs in its own compartment, in the environment its profile names. `
 | --- | --- | --- | --- | --- | --- | --- |
 | `linux` | Micro-VM per agent on Apple's Virtualization.framework | vCPUs and RAM fixed at boot; separate kernel and filesystem | Saving the VM to disk: RAM freed, exact restore | Most work: web, backend, CLIs, anything that builds on Linux | The Linux toolchain and home, plus Claude's long-lived token | Isolated from the host and from other agents |
 | `macos` | Native processes under `vibed`'s governor | CPU, memory, process count and disk, by supervision | `SIGSTOP`: exact; macOS compresses or swaps the memory | iOS and macOS apps, Xcode, Swift, Homebrew-only tools | The Mac's own binaries and logins, as you | Runs as you, with no file sandbox: the governor protects the machine's resources, not your files |
+| `linux` on a Linux host | Native processes in a cgroup v2 per agent | CPU, memory, process count by the kernel; disk by measurement | cgroup freezer: exact; memory stays, and may swap | Work that should run on a server, or more agents than the Mac holds | The server's own binaries and logins | Runs as the server's user; protects the server's resources, not its files |
 
 ### Profiles
 
@@ -186,7 +225,7 @@ A profile is everything you choose when starting an agent, saved under a name. P
 - **Mode:** `auto` by default, or `bypass` (`--dangerously-skip-permissions`), in either environment. Bypass on `macos` is the owner's call.
 - **Memory:** the agent's high-water mark: a `linux` VM's fixed RAM, or a `macos` agent's hard limit. 4 GB by default, and adjustable per profile.
 
-MCP clients see each project's profiles in `vibe_list_projects` and pass one by name to `vibe_start_agent`. An agent can't change profile or environment; start a new one `from` the same branch instead.
+On a Linux host, a new project starts with one profile, `software-eng-linux`, with the same defaults. MCP clients see each project's profiles in `vibe_list_projects` and pass one by name to `vibe_start_agent`. An agent can't change profile or environment; start a new one `from` the same branch instead.
 
 ### Host limits
 
@@ -278,17 +317,59 @@ The VM boots with its agent. Sleeping, as measured in the spike below:
 2. `vibed` inflates the memory balloon and lets it go, so pages the guest has freed are handed back and stay out of the snapshot.
 3. `vibe-vm` pauses the VM, saves its whole state (RAM and devices) to the agent's snapshot file, and exits. All its RAM goes back to the Mac.
 
-Waking runs it backwards. `vibe-vm` restores the snapshot and resumes the VM. `vibe-guest` sets the clock from the host, because it stopped while the VM slept. It waits for the shared folders to answer, which takes about a second after a restore, and then thaws Claude. Claude is exactly where it was, mid-prompt or mid-question, with nothing replayed, and the shim reconnects. Network connections open at sleep time may drop; an idle Claude has none in flight (open question 1 checks this).
+Waking runs it backwards. `vibe-vm` restores the snapshot and resumes the VM. `vibe-guest` sets the clock from the host, because it stopped while the VM slept. It waits for the shared folders to answer, which takes about a second after a restore, and then thaws Claude. Claude is exactly where it was, mid-prompt or mid-question, with nothing replayed, and the shim reconnects. Network connections open at sleep time may drop; an idle Claude has none in flight, and agent-tail#122 showed a dropped connection plus an hour's clock jump doesn't trouble it.
 
 A restore only works with the exact configuration the VM was saved with, so each agent's VM keeps a fixed MAC address and machine identifier for its whole life.
 
 A snapshot is about the size of the memory the guest is really using, not the VM's configured size. All snapshots share one disk budget, `snapshot_disk`: 20 GB by default, adjustable in Settings → Host. When a new snapshot wouldn't fit, the oldest snapshot is dropped, and that agent wakes later with `claude --resume` instead, losing any pending question.
 
+## Linux hosts and external access
+
+A Linux server runs the same `vibed`, so it joins the Mac as another host. Its agents show up in the menu bar and in the Mac's MCP next to local ones, and the server can also be the one public address for outside MCP callers.
+
+### Adding a Linux host
+
+- **Menu → Add Linux host…** takes an SSH destination, such as `me@vps.example.com` or a Tailscale name. The app installs or upgrades `vibed` over SSH (one static binary plus a systemd user service), checks `git`, `gh` and `claude` there, and lists what's missing.
+- The server has its own logins, set up on the server itself: `gh auth login`, and `claude` with `/login`. It's one machine with one `~/.claude`, like a VibeOS box, so plain `/login` works; the cross-VM problem that forced `setup-token` doesn't apply.
+- Projects are cloned on the host that runs their agents. The same GitHub repo can be a project on the Mac and on a server.
+- There's no toolbox or Linux template on a server: install tools on it directly, as you would on any server.
+
+### How agents run on a Linux host
+
+- Each agent gets its own cgroup v2 (through systemd, as the user, no root). Memory, CPU and process count are hard kernel limits from the profile and host limits.
+- Sleep uses the cgroup freezer: exact, like `SIGSTOP`, but memory stays allocated. Under memory pressure a frozen agent is ended and later resumes with `claude --resume`.
+- The worktree, `.git`, transcripts and the `vibe-shim` session work exactly as on the Mac; it's the same code.
+- File containment is not in v1. `bubblewrap` could add it later, and a server with KVM could later get a micro-VM backend.
+
+### The link between the Mac and a host
+
+- The Mac's `vibed` drives each host through SSH: `ssh <host> vibe rpc` carries the same JSON-RPC as the local socket, both ways. Nothing new is opened on the server, and SSH keys are the authentication.
+- `vibed` supervises the link: keepalives, reconnect with backoff, and a connected/down state in the menu. When a link is down, that host's agents show as unavailable; nothing on either side stops.
+- Clicking a remote agent opens Terminal with `ssh -t <host> vibe attach <ref>`.
+- A host runs on its own too. It serves its own MCP for its own agents, and `vibe key`, `vibe project` and `vibe profile` replace the Settings screens. When the Mac is connected, its menu and MCP show the host's agents as well.
+- "Host" is in the core from day one, even before any server is added: every agent records its host, MCP calls take an optional `host`, and the menu groups agents by host.
+
+### External access
+
+Outside MCP callers (an API-based agent, a cloud orchestrator) need a public URL. A Linux host with a public address is that URL, so nobody has to set up Tailscale Funnel or a Cloudflare tunnel, and nothing is opened on the Mac.
+
+```
+outside caller ──HTTPS + API key──▶ Linux host (public, vibed) ══ tunnel the Mac opened ══▶ Mac (vibed)
+```
+
+- **Turn it on per host:** Settings → Hosts → *Use as external address*. The host serves `https://<host>/mcp`, with a certificate from Let's Encrypt.
+- **The Mac dials out.** It keeps a supervised SSH reverse tunnel to the host, forwarded to a Unix socket on the server (not a TCP port, so other users there can't reach it).
+- **One URL for everything.** The host's MCP lists agents on itself and on the Mac, each tagged with its host. Calls for the Mac go down the tunnel; calls for the host's own agents are answered there.
+- **Keys are checked where the agent lives.** API keys are made on the Mac, and their hashes are pushed to connected hosts, so one key works everywhere. The Mac verifies every call forwarded to it, so a compromised server can't drive the Mac without a key.
+- The public endpoint rate-limits and logs every call.
+- If the Mac is offline or the tunnel is down, the host still answers for its own agents, and Mac agents show as unavailable.
+- API keys only. OAuth for consumer connectors (such as claude.ai's) and a hosted relay for owners without a server are both out of scope.
+
 ## MCP interface
 
-MCP is the product. It keeps the shape of VibeOS's MCP, which already drives a working orchestrator: start an agent with a prompt, `vibe_wait`, read what it said, and answer its questions with `vibe_send`. Where VibeOS split one job across a workspace and its windows, this server has one tool, because each worktree has exactly one agent. Every call needs an API key. Host setup (API keys, projects, profiles, host limits, the Linux template) is menu-only.
+MCP is the product. It keeps the shape of VibeOS's MCP, which already drives a working orchestrator: start an agent with a prompt, `vibe_wait`, read what it said, and answer its questions with `vibe_send`. Where VibeOS split one job across a workspace and its windows, this server has one tool, because each worktree has exactly one agent. Every call needs an API key. Host setup (API keys, projects, profiles, host limits, the Linux template) is in the menu on the Mac, and in the `vibe` CLI on a Linux host.
 
-**Transport.** Streamable HTTP at `http://127.0.0.1:7878/mcp` (port to be decided). The Tailscale interface can be turned on in Settings. There's also stdio through `vibe mcp` for clients that can only launch a command. Built with `rmcp`.
+**Transport.** Streamable HTTP at `http://127.0.0.1:7878/mcp` (port to be decided). The Tailscale interface can be turned on in Settings, and a Linux host can serve it publicly (see External access). There's also stdio through `vibe mcp` for clients that can only launch a command. Built with `rmcp`.
 
 **Auth is always on.** There's no unauthenticated mode, not even on loopback.
 
@@ -299,9 +380,9 @@ MCP is the product. It keeps the shape of VibeOS's MCP, which already drives a w
 
 | Tool | Does | From VibeOS |
 | --- | --- | --- |
-| `vibe_list_projects` | Projects, each with its profiles: name, environment, model, reasoning, mode, memory | Same tool; profile fields changed |
-| `vibe_start_agent` | `{project, profile, prompt, from?: branch, name?}` → ref. Creates the worktree, branch, compartment and agent in one call, and submits the prompt | Replaces `vibe_create_workspace` + `vibe_open_window` |
-| `vibe_list_agents` | Agents with their state, activity, profile, worktree path, branch, live memory and attach command. Filters: `project`, `state` | Replaces `vibe_list_workspaces` + `vibe_list_windows` |
+| `vibe_list_projects` | Projects on every connected host, each with its host and its profiles: name, environment, model, reasoning, mode, memory | Same tool; profile fields changed |
+| `vibe_start_agent` | `{project, profile, prompt, host?, from?: branch, name?}` → ref. `host` is only needed when the same project exists on more than one host. Creates the worktree, branch, compartment and agent in one call, and submits the prompt | Replaces `vibe_create_workspace` + `vibe_open_window` |
+| `vibe_list_agents` | Agents on every connected host, with their host, state, activity, profile, worktree path, branch, live memory and attach command. Filters: `host`, `project`, `state` | Replaces `vibe_list_workspaces` + `vibe_list_windows` |
 | `vibe_send` | `text`, submitted unless `submit: false`, or `keys` (`["2"]`, `["Escape"]`, `["Down", "Enter"]`). Wakes a sleeping or exited agent first | Same |
 | `vibe_wait` | Blocks until an agent, or the first of several, answers the last send, not just until it's quiet. `background: true` also waits for commands it left running. Progress every 20 s and on every change; up to 240 s, default 120 | Same |
 | `vibe_read_messages` | The agent's last messages, from its transcript | Same |
@@ -310,18 +391,20 @@ MCP is the product. It keeps the shape of VibeOS's MCP, which already drives a w
 
 **States.** As in VibeOS, an agent is `busy`, `idle`, `question` or `asleep`, plus `paused` (a limit hit) and `exited`. `question` covers any prompt waiting on an answer: a menu, a yes/no, a permission prompt. agent-tail's finer `activity` (`thinking`, `running_tool`, `awaiting_approval`, …) rides along for clients that want it. Frozen and saved-to-disk agents both show as `asleep`, because a send wakes either.
 
+**Routing.** Every call after `vibe_start_agent` names an agent by its ref, which says which host it lives on, so `send`, `wait`, `read` and `delete` work the same on any host.
+
 **Rules carried over.** Reads (`vibe_wait`, `vibe_read_*`, `vibe_list_*`) never wake an agent; `vibe_send` does. Text results are cut at about 32,000 characters, keeping the end, with a note saying how much was cut. MCP Resources and Tasks aren't used in v1. Events reach the menu bar over the socket, and MCP clients through `vibe_wait`.
 
 ## Menu bar and Terminal attach
 
-The menu bar lists every agent this app started, across all projects, and nothing else. Clicking a row gives you that agent's raw terminal in Terminal.app.
+The menu bar lists every agent this app started, across all hosts and projects, and nothing else. Clicking a row gives you that agent's raw terminal in Terminal.app.
 
 **Menu bar icon.** A glyph plus the count of awake agents. It gets an amber dot when any agent has a question, and a red dot when one is paused by a limit.
 
 **The menu** (`MenuBarExtra`, window style, so rows can be rich):
 
-- **Header:** agent count, host memory used/total, `gh` login state, MCP on/off.
-- **Agent rows,** grouped by project, each tagged with its profile. Each row shows:
+- **Header:** agent count, the Mac's memory used/total, `gh` login state, MCP on/off, and each Linux host's link (connected or down) and external-address state.
+- **Agent rows,** grouped by host, then project, each tagged with its profile. Each row shows:
   - a state dot: busy (pulsing), question (amber), idle (grey), asleep (hollow), paused or exited (red)
   - the label or ref
   - the session title from the transcript, and the latest activity line
@@ -330,7 +413,8 @@ The menu bar lists every agent this app started, across all projects, and nothin
 - **Footer:**
   - New agent… (a small sheet: project, profile, prompt)
   - Linux toolbox (open shell, rebuild template, see logins)
-  - Settings… (API keys, projects and their profiles, host limits)
+  - Add Linux host…
+  - Settings… (API keys, hosts and external access, projects and their profiles, host limits)
   - Quit menu. This leaves `vibed` and every agent running.
 
 **Notifications** fire on a question, an error, a limit hit, and the end of a turn (off by default). Clicking one attaches.
@@ -354,7 +438,7 @@ An API key is a shell on the Mac, so keys are mandatory and the server listens o
 
 - **No root.** `vibed` runs as the logged-in user. v1 has no privileged helper.
 - **Distribution.** Open source under MIT, in a public repo. Releases are a DMG signed with the owner's existing Developer ID and notarized and a Homebrew cask, with Sparkle for updates. Not the Mac App Store, whose sandbox blocks most of this. `vibe-vm` carries the `com.apple.security.virtualization` entitlement.
-- **Network exposure.** Loopback by default. Settings can also bind the Tailscale address. Never `0.0.0.0`. Public exposure (e.g. Tailscale Funnel) is the user's own choice and is documented, not built in.
+- **Network exposure.** On the Mac, loopback by default, and Settings can also bind the Tailscale address; never `0.0.0.0`. Nothing listens publicly on the Mac, even with external access on. A Linux host chosen as the external address serves HTTPS publicly; every other host listens on loopback only and is reached over SSH.
 - **GitHub.** `vibed` checks `gh auth status` at startup and every hour, and the menu header shows the result. Worktrees fetch through `gh` as git's credential helper.
 
 **Who gets which credentials:**
@@ -363,21 +447,24 @@ An API key is a shell on the Mac, so keys are mandatory and the server listens o
 | --- | --- | --- | --- |
 | `macos` | The Mac's own: `gh` as git's credential helper, `~/.config/gcloud` and so on | The Mac's Claude login in Keychain | Logging in on the Mac as yourself, as you already do |
 | `linux` | The Linux home: read-only in every VM, with a per-agent copy on top | A long-lived `claude setup-token` token, kept in Keychain and injected as `CLAUDE_CODE_OAUTH_TOKEN` | One toolbox-shell session, plus one Claude sign-in through `setup-token` |
+| Linux host | The server's own: `gh` and the rest, logged in on the server | The server's `~/.claude`, from `/login` on the server | Logging in on the server once |
 
 **Threat model, plainly:**
 
 - `macos` protects the machine's resources: runaway builds, fork bombs, memory leaks. It does not protect your files. A `macos` agent can do anything you can.
 - `linux` protects the host and other agents from a misbehaving agent. It does not protect the Linux home's logins or the Claude token: any agent can use them, and a compromised agent could copy them. For tighter scope, log the Linux home's `gh` into a fine-grained token rather than your full account. Network egress is open.
 - Every agent can write to the project's shared `.git`, so a misbehaving agent could rewrite other branches' refs. Pushed branches on GitHub are the backstop.
-- Nothing protects against a stolen API key except revoking it.
+- Nothing protects against a stolen API key except revoking it. With external access on, a key works from the internet, so treat it like a password; the public endpoint rate-limits and logs every call.
+- A Linux host's agents can do anything the server's user can. The host protects its resources, not its files.
+- A compromised Linux host can use the tunnel but can't drive the Mac without a valid key, because the Mac checks every forwarded call itself.
 
 **Permissions.** Each profile sets Claude's mode: `auto` (the default), or `bypass` (`--dangerously-skip-permissions`). Bypass is safest in `linux`, where the VM is the sandbox. A `macos` profile can use it too; that agent then acts as you without asking, which is the owner's call.
 
-Transcripts, scrollback and logs never leave the Mac. Logs redact keys and tokens.
+Transcripts, scrollback and logs stay on the host that runs the agent; the Mac reads remote ones over SSH and doesn't copy them. Logs redact keys and tokens.
 
 ## State, lifecycle and failure handling
 
-agent-tail decides what an agent is doing, and `vibed` decides what happens to its process. An agent at rest with nobody watching goes to sleep on its own, with no hooks and no long timeout. agent-tail's firm states say when it's truly idle, and after a 60 s debounce a `linux` agent is saved to disk and a `macos` agent is frozen. Either way it wakes exactly where it was.
+agent-tail decides what an agent is doing, and `vibed` decides what happens to its process. An agent at rest with nobody watching goes to sleep on its own, with no hooks and no long timeout. agent-tail's firm states say when it's truly idle, and after a 60 s debounce a `linux` agent on the Mac is saved to disk, while a `macos` agent or an agent on a Linux host is frozen. Either way it wakes exactly where it was.
 
 ```mermaid
 stateDiagram-v2
@@ -392,7 +479,7 @@ stateDiagram-v2
   Paused --> Exited: killed
   AtRest: At rest (done · idle · awaiting_* · errored · interrupted)
   Working: Working (thinking · running_tool · background_work)
-  Asleep: Asleep (linux — VM saved to disk · macos — frozen with SIGSTOP)
+  Asleep: Asleep (linux on the Mac — VM saved to disk · macos — SIGSTOP · Linux host — cgroup freezer)
   Exited: Exited (Claude quit, VM died, or killed — a send resumes it)
 ```
 
@@ -404,27 +491,38 @@ Only transcripts of agents this app spawned are read. agent-tail is fed specific
 
 - **By id.** Claude Code is launched with `--session-id <uuid>` generated by `vibed`, so the transcript path is known exactly. `--resume` keeps the same id.
 - **By worktree.** If `/clear` changes the id, `vibed` takes the newest session whose recorded cwd is the agent's worktree. Each worktree has exactly one agent, so this is always exact.
-- **Where.** `macos` transcripts are in the Mac's normal `~/.claude/projects/`. `linux` transcripts are in the agent's own Claude home, which is a host directory, so tailing works the same way.
+- **Where.** `macos` transcripts are in the Mac's normal `~/.claude/projects/`, and a Linux host's in its own `~/.claude/projects/`. `linux` transcripts on the Mac are in the agent's own Claude home, which is a directory on the Mac, so tailing works the same way. Each host tails its own agents; the Mac gets their status over the SSH link.
 - **Polling.** Each agent's reducer gets appended bytes on every file-system event, plus a 1 s poll as a backstop. `vibed` passes `now` in, as the library expects, and sets agent-tail's idle window to the idle debounce.
 
 ### Going to sleep
 
-**Idle** means all of these hold:
+**Idle** means all of these hold. The agent-tail fields named here are from v0.1 plus agent-tail#120, #121 and #122, all merged; `vibe-status` pins agent-tail to a commit that includes them (`a68bc4a`, or a tag once there is one).
 
-- agent-tail reports a *firm* `done`, `interrupted`, `errored`, `awaiting_answer` or `awaiting_approval`. Its firm states already rule out subagents and background tasks, which show as `background_work`, so no timing guess is needed. An agent stopped by a Claude usage limit counts as at rest too: it sleeps like any other, and the next send wakes it. That depends on agent-tail reporting the limit stop as firm (open question 2).
-- no process in the tree that agent-tail can't see: nothing started more than 30 s after Claude, other than the MCP servers Claude starts. This catches detached jobs such as `nohup` or a container. In `linux`, `vibe-guest` reports the tree.
-- no pending scheduled wakeup (`/loop`, `ScheduleWakeup`, `CronCreate`), which wouldn't fire while asleep. Until [agent-tail#120](https://github.com/tsconfigdotjson/agent-tail/issues/120) can see these, `vibed` treats any such call in the transcript as keeping the agent awake for the rest of the session.
-- no client is attached
-- the agent has stayed idle for the debounce, 60 s by default. This absorbs the usual MCP loop of `vibe_wait`, then read, then the next send, so each turn doesn't pay a wake. It can be set to 0.
+- **At rest.** agent-tail reports a firm `done`, `interrupted`, `errored` or `awaiting_answer`. Its firm states already rule out subagents and background tasks, which show as `background_work`.
+- **Permission prompts.** Claude Code records a permission prompt only as an *inferred* `awaiting_approval`, after the transcript has been unchanged for 20 s. Sleep is exact, so a prompt is safe to sleep on, but a long silent tool run could look the same. So an inferred awaiting state counts as at rest only after a longer quiet period (5 min, proposed), with no extra processes in the tree and its CPU near zero.
+- **Usage limits.** A Claude usage-limit stop is a firm `errored` with `stop_reason: usage_limit`, and `resets_at` when Claude recorded it (agent-tail#121). It sleeps like any idle agent. The menu row and `vibe_list_agents` show "limited until …", and the next send wakes it.
+- **No unseen processes.** Nothing in the tree that agent-tail can't see: nothing started more than 30 s after Claude, other than the MCP servers Claude starts. This catches detached jobs such as `nohup` or a container. In `linux` on the Mac, `vibe-guest` reports the tree.
+- **Scheduled wakeups**, from agent-tail's `pending_wakeups` (agent-tail#120). Each entry has a `kind` (`loop` or `cron`), and optionally a `due_at`:
+  - none pending: may sleep
+  - a firm `loop` wakeup with a `due_at`: may sleep, and `vibed` wakes the agent 30 s before `due_at`, so `/loop` fires on time (a restore takes at most a few seconds)
+  - anything else (an inferred wakeup, one with no due time, or any `cron` job): stays awake
+  - a recurring cron job (`/loop 5m …` uses one) currently drops out of `pending_wakeups` after its first run, because agent-tail clears every cron wakeup when any of them fires. Until that's fixed upstream, an agent whose transcript has a `CronCreate` with `recurring: true` and no matching `CronDelete` stays awake for the rest of its session.
+- **Nothing attached.**
+- **Debounce.** The agent has stayed idle for 60 s by default. This absorbs the usual MCP loop of `vibe_wait`, then read, then the next send, so each turn doesn't pay a wake. It can be set to 0.
 
-| Environment | Sleep | Cost while asleep | Wake |
+| Where | Sleep | Cost while asleep | Wake |
 | --- | --- | --- | --- |
-| `linux` | `vibe-vm` pauses the VM, writes its state to the snapshot file and exits. The shim exits too | Disk, up to the VM's RAM. No RAM, no CPU | Restore the snapshot and start a shim. Exact, in a few seconds (to measure) |
+| `linux` on the Mac | `vibe-vm` pauses the VM, writes its state to the snapshot file and exits. The shim exits too | Disk, up to the VM's RAM. No RAM, no CPU | Restore the snapshot and start a shim. Exact, about 0.5 to 4 s |
 | `macos` | `SIGSTOP` the whole tree | No CPU. Memory stays allocated, and macOS compresses or swaps it under pressure | `SIGCONT`. Exact and instant |
+| Linux host | Freeze the agent's cgroup | No CPU. Memory stays allocated, and may swap | Thaw the cgroup. Exact and instant |
 
-Wake triggers are `vibe_send` and attach. Reading doesn't wake an agent: transcripts are on the host, so `vibe_read_messages` and the menu rows work while it sleeps, and `vibe_read_output` returns the last saved screen.
+Waking is proven safe in agent-tail's CI (agent-tail#122). Claude Code sessions frozen while `done`, `awaiting_answer` and `awaiting_approval` were woken and continued the same session with the right status. That includes a variant that drops open connections and jumps the clock an hour forward, standing in for a VM restore. The same holds for Codex, Copilot CLI, OpenCode, Pi and Gemini CLI.
 
-Never put to sleep: `thinking`, `running_tool`, `background_work`, and any *inferred* awaiting state. `claude --resume` is used only when an agent's processes are gone: after a crash, after a reboot in `macos`, or when a `macos` agent is killed under critical memory pressure. Resuming that way loses a pending question.
+Wake triggers are `vibe_send`, attach, and a due `/loop` wakeup. Reading doesn't wake an agent: transcripts are on the host, so `vibe_read_messages` and the menu rows work while it sleeps, and `vibe_read_output` returns the last saved screen.
+
+Never put to sleep: `thinking`, `running_tool` or `background_work`.
+
+`claude --resume` is used only when an agent's processes are gone: after a crash, after a reboot in `macos` or on a Linux host, or when an agent is ended under critical memory pressure. Resuming that way loses a pending question. It re-arms a still-future `/loop` wakeup, but session-only cron jobs are lost; a durable one (`durable: true`, kept in the worktree's `.claude/scheduled_tasks.json`) survives.
 
 ### Failures
 
@@ -440,6 +538,10 @@ Never put to sleep: `thinking`, `running_tool`, `background_work`, and any *infe
 | Critical host memory pressure (`DISPATCH_SOURCE_TYPE_MEMORYPRESSURE`) | Refuse new agents, put idle agents to sleep early, then pause the `macos` agent furthest over 80% of its memory. A paused agent is killed (resumable) after a 5 min grace period if pressure stays critical |
 | System sleep | While any agent is awake, `vibed` holds an IOPM no-idle-sleep assertion. Display sleep is still allowed |
 | Low disk | New agents are refused below 10 GB free (proposed). A `linux` agent whose snapshot wouldn't fit stays awake instead of sleeping |
+| The SSH link to a Linux host drops | That host's agents show as unavailable in the menu and MCP. They keep running on the host, and the link reconnects with backoff |
+| A Linux host reboots | systemd starts `vibed` again (the user service has lingering enabled). Every agent there is `asleep` and wakes with `claude --resume` |
+| Memory pressure on a Linux host | Refuse new agents there, then end frozen agents, oldest first (resumable). Each cgroup's own memory limit stops a single agent from taking the server |
+| The Mac is offline while a host is the external address | The host keeps answering for its own agents; Mac agents show as unavailable until the tunnel is back |
 
 **Where state lives:**
 
@@ -447,6 +549,7 @@ Never put to sleep: `thinking`, `running_tool`, `background_work`, and any *infe
 - snapshots in `~/VibeOS/snapshots/`
 - logs in `~/Library/Logs/VibeOS/`
 - sockets in `…/VibeOS/run/`
+- on a Linux host: the same layout under `~/.local/share/vibeos/`, with projects and worktrees in `~/VibeOS/`
 
 ## Spike results: VM snapshots (2026-10-29)
 
@@ -510,50 +613,59 @@ Two fixes for the base image came out of it. Claude warns when it runs from outs
 
 ## Open questions
 
-None of these block design work. Both are agent-tail scenarios already under way.
+None of these block building.
 
 | # | Question | Recommendation | Why |
 | --- | --- | --- | --- |
-| 1 | Does Claude Code wake cleanly from `SIGCONT`, and from a VM restore with dropped connections and a jumped clock? | Add both scenarios to agent-tail's harness CI, tracked in [agent-tail#122](https://github.com/tsconfigdotjson/agent-tail/issues/122) | Sleeping is only safe if waking always works |
-| 2 | Does agent-tail report a usage-limit stop as a firm resting state? | Add a mock-server scenario that returns the limit error, tracked in [agent-tail#121](https://github.com/tsconfigdotjson/agent-tail/issues/121). Ideally it also reports the reason and reset time | If not, a limited agent shows as unknown and never sleeps, holding its memory until the limit resets |
+| 1 | Recurring cron wakeups drop out of `pending_wakeups` after their first run | Fix upstream: agent-tail should keep a `recurring: true` job pending until `CronDelete` or session end (issue to file). The stopgap under Going to sleep keeps such agents awake until then | Otherwise an agent running `/loop 5m` is put to sleep after one run and misses the rest |
+| 2 | How long must an inferred `awaiting_approval` stay quiet before the agent sleeps? | 5 min, with no extra processes and CPU near zero; tune with real use | Claude records permission prompts only as inferred, so too short risks freezing a silent tool run, and too long holds memory |
+| 3 | Should API keys have scopes (read-only, or limited to some projects)? | Add them with external access, before a key is ever used from the internet | A full key is effectively a shell on the Mac |
 
-**Decided on 2026-10-29:**
+**Decided (2026-10-29 and 2026-10-30):**
 
-- Memory is a per-profile high-water mark, 4 GB by default, that the owner can change in each profile.
+*Shape*
 
-- `linux` agents log in to Claude with one `claude setup-token` token; a spike confirmed interactive use, model and effort choice, auto mode, tool use and resume all work with it inside a VM.
-
-- After a host reboot, `linux` agents wake from their snapshots exactly where they were; only `macos` agents fall back to `claude --resume`.
-
-- `linux` disks are read-only ext4 images (base, template, managed layer, Linux home) plus a writable image per agent, stacked with overlayfs inside the guest. Images are never changed in place.
-- The `macos` governor finds an agent's processes by tree walk and session ID, not by an environment tag.
-
-- `linux` VMs run on Apple's Virtualization.framework and sleep by saving the VM to disk, as the snapshot spike showed works.
-
-- The menu bar runs on the host only, and shows only agents this app started. Remote users use MCP and `ssh -t host vibe attach`.
-- One agent per worktree, each with its own compartment and, in `linux`, its own VM.
-- The product is VibeOS Native, in the `vibe-os-native` repo. It targets the latest macOS only. Inside the product, names stay short: `VibeOS.app`, `~/VibeOS/`, `~/.config/vibeos/`.
-- Releases are signed and notarized with the owner's existing Apple Developer account.
-- Agent branches are the bare ref (`quiet-amber-otter`), with no prefix.
-- Any profile may use `bypass`, including `macos`; that's the owner's call.
-- Profiles belong to projects and set environment, model, reasoning level, mode (`auto` or `bypass`) and memory. Each new project starts with a `linux` and a `macos` profile: Opus, high reasoning, `auto`, 4 GB.
-- `macos` agents use the Mac's own binaries and logins, and are resource-governed only, with no file sandbox.
-- `linux` agents use the Linux template and home set up in the toolbox shell. Claude Code comes from a daemon-managed layer updated daily. Claude authenticates with a `setup-token` token, and each agent gets its own Claude home seeded from the Linux Claude config. Sharing one Claude home across VMs was tried and failed the spike.
-- The MCP keeps VibeOS's round and semantics, folded to one agent per worktree: eight tools.
-- Idle is decided by agent-tail's firm states plus a process-tree check and a 60 s debounce. `linux` agents sleep by saving the VM to disk, `macos` agents by `SIGSTOP`, and both wake exactly where they were. `claude --resume` is only for crashes, reboots and dropped snapshots.
-- Sleeping `linux` agents share one snapshot budget, 20 GB by default and adjustable; past it, the oldest snapshot is dropped.
-- An agent stopped by a Claude usage limit sleeps like any idle agent.
-- If VM snapshots fail the spike, work pauses for a decision before any fallback is chosen.
-- Agents share the project's `.git`, with auto-gc off and maintenance run by the daemon.
-- Agents push and open PRs themselves, in both environments.
+- The product is VibeOS Native, in the `vibe-os-native` repo, for the latest macOS only. Inside the product, names stay short: `VibeOS.app`, `~/VibeOS/`, `~/.config/vibeos/`.
+- One owner, one Mac, any number of Linux hosts. The menu bar runs on the Mac and shows only agents this app started, on every host.
+- One agent per worktree, each with its own compartment.
+- "Host" is in the core from day one: every agent records its host, MCP calls take an optional `host`, and the menu groups by host.
+- Environment backends sit behind three small traits (`Compartment`, `Limiter`, `Sleeper`) and a `Capabilities` record, with one conformance suite every backend must pass.
 - v1 supports Claude Code only. Pi is the next harness.
-- Mac only: no Linux hosts, ever.
-- v1 assumes the host stays up. A reboot is handled (agents come back asleep), but there's no FileVault or auto-login story.
-- agent-tail is a git dependency pinned to a tag on the frozen v0.1 status model.
+- Open source under MIT. Releases are signed and notarized with the owner's existing Apple Developer account.
+
+*Profiles and projects*
+
+- Profiles belong to projects and set environment, model, reasoning level, mode (`auto` or `bypass`) and memory. Memory is a per-profile high-water mark, 4 GB by default.
+- A new project on the Mac starts with a `linux` and a `macos` profile; on a Linux host, with one `linux` profile. All use Opus, high reasoning, `auto` and 4 GB.
+- Any profile may use `bypass`, including `macos`; that's the owner's call.
+- Projects are added in Settings, or with `vibe project add` on a Linux host, from GitHub `owner/name` or a local path.
+- Agent branches are the bare ref (`quiet-amber-otter`), with no prefix.
+
+*Environments*
+
+- `linux` on the Mac runs in a micro-VM on Apple's Virtualization.framework. It sleeps by saving the VM to disk, and wakes exactly where it was, even after a reboot.
+- `linux` disks are read-only ext4 images (base, template, managed layer, Linux home) plus a writable image per agent, stacked with overlayfs inside the guest. Images are never changed in place.
+- `linux` agents on the Mac use the Linux template and home set up in the toolbox shell. Claude Code comes from a daemon-managed layer updated daily, and authenticates with one `setup-token` token. Each agent gets its own Claude home seeded from the Linux Claude config; sharing one across VMs failed the spike.
+- Sleeping `linux` agents share one snapshot budget, 20 GB by default and adjustable; past it, the oldest snapshot is dropped.
+- `macos` agents use the Mac's own binaries and logins. They are resource-governed only, with no file sandbox and no cleanup outside what VibeOS made. The governor finds their processes by tree walk and session ID.
+- Linux hosts run agents natively under cgroups v2, sleep with the cgroup freezer, and use the server's own logins (`/login` on the server). No micro-VMs or file containment there in v1.
 - npm, pnpm, cargo and pip caches are shared across `linux` VMs by default, with an opt-out.
-- MCP always requires an API key, generated in Settings.
-- Projects are added in Settings, from GitHub `owner/name` or a local path.
+- Agents share the project's `.git`, with auto-gc off and maintenance run by the daemon. Git's O_EXCL locks hold across VMs; nothing else is shared read-write across VMs.
+
+*Status and sleep*
+
+- agent-tail is a git dependency pinned to a commit that includes #120, #121 and #122 (`a68bc4a`), until it has tags.
+- Idle is decided by agent-tail's state (including `pending_wakeups` and `stop_reason`) plus a process-tree check and a 60 s debounce. `claude --resume` is only for crashes, reboots of `macos` or Linux hosts, and dropped snapshots.
+- An agent stopped by a Claude usage limit sleeps like any idle agent.
+- A firm `/loop` wakeup doesn't keep an agent awake: `vibed` wakes it 30 s before it's due.
 - A full host puts idle agents to sleep first, then refuses. Starts never queue.
-- Cleanup is manual. Deletion refuses on uncommitted or unpushed work unless forced.
+- v1 assumes hosts stay up. Reboots are handled (agents come back asleep), but there's no FileVault or auto-login story.
+
+*Interfaces*
+
+- The MCP keeps VibeOS's round and semantics, folded to one agent per worktree: eight tools, which route by ref to any host.
+- MCP always requires an API key. Keys are made in Settings (or `vibe key create` on a standalone Linux host), and their hashes are pushed to connected hosts.
+- The Mac drives Linux hosts over SSH (`ssh <host> vibe rpc`). A Linux host also runs on its own, with its own MCP.
+- External access goes through a Linux host with a public address. It serves `https://<host>/mcp`, and the Mac keeps an outbound SSH tunnel to it. API keys only; no OAuth and no hosted relay.
+- Deleting an agent removes everything VibeOS made for it, transcripts included; the branch is kept. Cleanup is manual, and deletion refuses on uncommitted or unpushed work unless forced.
 - Not in v1: egress filtering, port forwarding, terminals other than Terminal.app, custom VM images, token cost in the menu.
-- Open source under MIT.
