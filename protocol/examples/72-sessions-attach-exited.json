@@ -1,0 +1,5 @@
+{
+  "description": "A session whose command has exited can't be attached to; the error says how it ended.",
+  "request": {"jsonrpc": "2.0", "id": 72, "method": "sessions.attach", "params": {"ref": "brave-copper-lynx"}},
+  "response": {"jsonrpc": "2.0", "id": 72, "error": {"code": -32001, "message": "session brave-copper-lynx isn't running: its command exited with code 0 at 2026-10-30T11:00:00Z"}}
+}

@@ -30,7 +30,9 @@ options:
   -h, --help      print this help
 
 environment:
-  VIBE_GH         the gh to run (default: gh on PATH)";
+  VIBE_GH         the gh to run (default: gh on PATH)
+  VIBE_SHIM       the vibe-shim to start sessions with (default: the one
+                  beside vibed, or on PATH)";
 
 /// How often `gh auth status` runs (PRD: Auth, security and trust).
 const GH_CHECK_EVERY: Duration = Duration::from_secs(60 * 60);
@@ -129,6 +131,9 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
     if let Some(gh) = std::env::var_os("VIBE_GH").filter(|v| !v.is_empty()) {
         config.gh = gh;
     }
+    if let Some(shim) = std::env::var_os("VIBE_SHIM").filter(|v| !v.is_empty()) {
+        config.shim = shim;
+    }
     let gh: OsString = config.gh.clone();
     let core = Arc::new(Core::open(config)?);
     vibed::log!(
@@ -137,6 +142,18 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
         gh.to_string_lossy()
     );
     core.warn_about_limits();
+    // In the background, so a shim that's slow to answer doesn't hold up
+    // the socket.
+    let adopting = {
+        let core = Arc::clone(&core);
+        tokio::spawn(async move {
+            let adopted = core.adopt_sessions().await;
+            vibed::log!(
+                "vibed: {adopted} running session{} found",
+                if adopted == 1 { "" } else { "s" }
+            );
+        })
+    };
     let gh_checks = core.spawn_gh_checks(GH_CHECK_EVERY);
     vibed::log!(
         "vibed {} listening on {}",
@@ -151,6 +168,7 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
     };
     server::serve(listener, core, MAX_MESSAGE_BYTES, shutdown).await;
     gh_checks.abort();
+    adopting.abort();
     drop(guard);
     vibed::log!("vibed: stopped");
     Ok(())

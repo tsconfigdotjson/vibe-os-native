@@ -1,0 +1,5 @@
+{
+  "description": "No session by that ref.",
+  "request": {"jsonrpc": "2.0", "id": 73, "method": "sessions.attach", "params": {"host": "local", "ref": "lone-grey-wolf"}},
+  "response": {"jsonrpc": "2.0", "id": 73, "error": {"code": -32001, "message": "no session lone-grey-wolf on local"}}
+}

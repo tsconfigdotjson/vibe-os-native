@@ -137,6 +137,11 @@ let swiftTypes: [String: Set<String>] = [
     "GhStatus": keys(GhStatus.CodingKeys.self),
     "Subscribed": keys(Subscribed.CodingKeys.self),
     "Event": keys(DaemonEvent.CodingKeys.self),
+    "SessionParams": keys(SessionParams.CodingKeys.self),
+    "SessionList": keys(SessionList.CodingKeys.self),
+    "SessionInfo": keys(SessionInfo.CodingKeys.self),
+    "SessionExit": keys(SessionExit.CodingKeys.self),
+    "SessionAttach": keys(SessionAttach.CodingKeys.self),
 ]
 
 /// The index's enums, from the Swift ones.
@@ -148,6 +153,7 @@ let swiftEnums: [String: [String]] = [
     "ProjectSource": ProjectSource.allCases.map(\.rawValue),
     "GhState": GhState.allCases.map(\.rawValue),
     "EventKind": EventKind.allCases.map(\.rawValue),
+    "SessionState": SessionState.allCases.map(\.rawValue),
 ]
 
 /// A method's Swift types, and a typed round trip of an example of it.
@@ -188,6 +194,8 @@ func methodChecks() -> [String: MethodCheck] {
         check(KeysVerify.self),
         check(GhStatusGet.self),
         check(EventsSubscribe.self),
+        check(SessionsList.self),
+        check(SessionsAttach.self),
     ])
 }
 

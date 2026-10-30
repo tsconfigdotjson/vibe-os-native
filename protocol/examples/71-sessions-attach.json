@@ -1,0 +1,5 @@
+{
+  "description": "Where to attach to a running session: its shim's socket, the window title, and the terminals of clients already attached. The client then connects to the shim itself, so restarting vibed doesn't interrupt it.",
+  "request": {"jsonrpc": "2.0", "id": 71, "method": "sessions.attach", "params": {"host": "local", "ref": "quiet-amber-otter"}},
+  "response": {"jsonrpc": "2.0", "id": 71, "result": {"host": "local", "ref": "quiet-amber-otter", "title": "quiet-amber-otter", "socket": "/Users/me/Library/Application Support/VibeOS/run/quiet-amber-otter.sock", "ttys": []}}
+}

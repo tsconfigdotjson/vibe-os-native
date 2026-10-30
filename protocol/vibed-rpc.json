@@ -25,7 +25,9 @@
     { "name": "keys.revoke", "params": "KeyParams", "result": "ApiKey" },
     { "name": "keys.verify", "params": "KeyVerifyParams", "result": "ApiKey" },
     { "name": "gh.status", "params": "GhStatusParams", "result": "GhStatus" },
-    { "name": "events.subscribe", "params": "NoParams", "result": "Subscribed" }
+    { "name": "events.subscribe", "params": "NoParams", "result": "Subscribed" },
+    { "name": "sessions.list", "params": "HostParams", "result": "SessionList" },
+    { "name": "sessions.attach", "params": "SessionParams", "result": "SessionAttach" }
   ],
   "notifications": [
     { "name": "events.event", "params": "Event" }
@@ -49,7 +51,8 @@
     "Mode": ["auto", "bypass"],
     "ProjectSource": ["github", "path"],
     "GhState": ["unknown", "logged_in", "logged_out", "not_installed", "error"],
-    "EventKind": ["project.added", "project.removed", "profiles.changed", "limits.changed", "keys.changed", "gh.status", "agent.state", "agent.limit", "lagged"]
+    "EventKind": ["project.added", "project.removed", "profiles.changed", "limits.changed", "keys.changed", "gh.status", "agent.state", "agent.limit", "lagged"],
+    "SessionState": ["running", "exited"]
   },
   "types": {
     "Request": ["jsonrpc", "id", "method", "params"],
@@ -82,7 +85,12 @@
     "GhStatusParams": ["refresh"],
     "GhStatus": ["state", "account", "detail", "checked_at"],
     "Subscribed": ["seq"],
-    "Event": ["seq", "at", "host", "kind", "project", "ref", "state", "limit", "message"]
+    "Event": ["seq", "at", "host", "kind", "project", "ref", "state", "limit", "message"],
+    "SessionParams": ["host", "ref"],
+    "SessionList": ["sessions"],
+    "SessionInfo": ["host", "ref", "state", "title", "clients", "ttys", "exit"],
+    "SessionExit": ["code", "signal", "at"],
+    "SessionAttach": ["host", "ref", "title", "socket", "ttys"]
   },
   "optional": {
     "Request": ["id", "params"],
@@ -114,7 +122,12 @@
     "GhStatusParams": ["refresh"],
     "GhStatus": ["account", "detail", "checked_at"],
     "Subscribed": [],
-    "Event": ["project", "ref", "state", "limit", "message"]
+    "Event": ["project", "ref", "state", "limit", "message"],
+    "SessionParams": ["host"],
+    "SessionList": [],
+    "SessionInfo": ["exit"],
+    "SessionExit": ["code", "signal"],
+    "SessionAttach": []
   },
   "nested": {
     "HostList": { "hosts": "HostInfo" },
@@ -122,6 +135,8 @@
     "ProjectList": { "projects": "Project" },
     "ProfileList": { "profiles": "Profile" },
     "KeyList": { "keys": "ApiKey" },
-    "KeyCreated": { "key": "ApiKey" }
+    "KeyCreated": { "key": "ApiKey" },
+    "SessionList": { "sessions": "SessionInfo" },
+    "SessionInfo": { "exit": "SessionExit" }
   }
 }

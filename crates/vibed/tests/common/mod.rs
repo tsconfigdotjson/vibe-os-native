@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -160,17 +161,47 @@ pub struct Golden {
     /// is behind a symlink).
     pub home: PathBuf,
     pub gh: PathBuf,
+    sessions: Vec<RunningShim>,
 }
 
 impl Golden {
     pub fn new() -> Golden {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = short_tempdir();
         let root = dir.path().canonicalize().unwrap();
         let home = root.join("home");
         repo(&home.join("src/app"));
         repo(&root.join("remotes/web"));
         let gh = fake_gh(&root.join("bin"), &root.join("remotes"));
-        Golden { dir, home, gh }
+        Golden {
+            dir,
+            home,
+            gh,
+            sessions: Vec::new(),
+        }
+    }
+
+    /// The sessions the examples list: `quiet-amber-otter` running, and two
+    /// that exited, `brave-copper-lynx` with code 0 and `calm-silver-heron`
+    /// killed.
+    pub fn with_sessions(mut self) -> Golden {
+        let layout = Layout::new(&self.home, "macos");
+        write_record(
+            &layout,
+            "brave-copper-lynx",
+            Some(0),
+            None,
+            "2026-10-30T11:00:00Z",
+        );
+        write_record(
+            &layout,
+            "calm-silver-heron",
+            None,
+            Some("SIGKILL"),
+            "2026-10-30T11:30:00Z",
+        );
+        self.sessions
+            .push(start_shim(&layout, "quiet-amber-otter", &["sleep", "600"]));
+        self
     }
 
     pub fn config(&self) -> Config {
@@ -191,6 +222,109 @@ impl Golden {
 
     pub fn core(&self) -> Arc<Core> {
         Arc::new(Core::open(self.config()).unwrap())
+    }
+}
+
+/// A temp dir under /tmp, as a socket's path in it must fit in 104 bytes
+/// on macOS, where the usual temp dir is long.
+pub fn short_tempdir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("vibe")
+        .tempdir_in("/tmp")
+        .unwrap()
+}
+
+/// A binary of the workspace's other packages, built beside the tests'.
+/// `cargo test --workspace` builds them all first; a test of one package
+/// needs `cargo build --workspace` before.
+pub fn workspace_bin(name: &str) -> PathBuf {
+    let exe = std::env::current_exe().unwrap();
+    let path = exe.parent().unwrap().parent().unwrap().join(name);
+    assert!(
+        path.is_file(),
+        "{} isn't built; run `cargo build --workspace` first",
+        path.display()
+    );
+    path
+}
+
+/// A record like the one a shim leaves when its command exits.
+pub fn write_record(
+    layout: &Layout,
+    agent: &str,
+    code: Option<i32>,
+    signal: Option<&str>,
+    at: &str,
+) {
+    let record = vibe_core::shim::Record {
+        agent: agent.into(),
+        command: vec!["claude".into()],
+        cwd: "/".into(),
+        started_at: "2026-10-30T10:00:00Z".into(),
+        exit: vibe_core::rpc::SessionExit {
+            code,
+            signal: signal.map(str::to_owned),
+            at: at.into(),
+        },
+        output: Default::default(),
+    };
+    let dir = layout.agent_dir(agent);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join(vibe_core::shim::RECORD_FILE),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+}
+
+/// A `vibe-shim` started the way vibed starts one; killed when dropped.
+pub struct RunningShim {
+    pub pid: i32,
+    pub socket: PathBuf,
+}
+
+impl Drop for RunningShim {
+    fn drop(&mut self) {
+        // SAFETY: a signal to the shim this test started.
+        unsafe { libc::kill(self.pid, libc::SIGKILL) };
+    }
+}
+
+pub fn start_shim(layout: &Layout, agent: &str, command: &[&str]) -> RunningShim {
+    let socket = layout.session_socket(agent);
+    let out = Command::new(workspace_bin("vibe-shim"))
+        .args(["--ref", agent, "--socket"])
+        .arg(&socket)
+        .arg("--state")
+        .arg(layout.agent_dir(agent))
+        .args(["--cwd", "/", "--"])
+        .args(command)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "vibe-shim: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let pid = String::from_utf8(out.stdout)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    RunningShim { pid, socket }
+}
+
+pub fn alive(pid: i32) -> bool {
+    // SAFETY: signal 0 only checks the process exists.
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// Waits up to 20 s for `ok`.
+pub fn wait_until(what: &str, mut ok: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !ok() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 

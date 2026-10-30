@@ -33,6 +33,8 @@ public enum VibeRPC {
         KeysVerify.name,
         GhStatusGet.name,
         EventsSubscribe.name,
+        SessionsList.name,
+        SessionsAttach.name,
     ]
     /// Every notification vibed sends.
     public static let notifications = [EventNotice.name]
@@ -372,6 +374,11 @@ public enum EventKind: String, Codable, CaseIterable, Hashable, Sendable {
     case lagged
 }
 
+/// Whether a session's shim still holds its terminal.
+public enum SessionState: String, Codable, CaseIterable, Hashable, Sendable {
+    case running, exited
+}
+
 // MARK: - Methods
 
 /// `hosts.list`: every host this vibed knows; for now, itself.
@@ -475,6 +482,22 @@ public enum EventsSubscribe: RPCMethod {
     public typealias Params = NoParams
     public typealias Result = Subscribed
     public static let name = "events.subscribe"
+}
+
+/// `sessions.list`: a host's sessions: running, and exited with a record.
+public enum SessionsList: RPCMethod {
+    public typealias Params = HostParams
+    public typealias Result = SessionList
+    public static let name = "sessions.list"
+}
+
+/// `sessions.attach`: where to attach to a running session. Terminal runs
+/// `vibe attach <ref>`, which calls this itself; the menu uses `ttys` to
+/// raise a tab that's already attached.
+public enum SessionsAttach: RPCMethod {
+    public typealias Params = SessionParams
+    public typealias Result = SessionAttach
+    public static let name = "sessions.attach"
 }
 
 /// `events.event`: one event, sent to subscribed connections.
@@ -882,5 +905,72 @@ public struct DaemonEvent: Codable, Hashable, Sendable {
 
     public enum CodingKeys: String, CodingKey, CaseIterable {
         case seq, at, host, kind, project, ref, state, limit, message
+    }
+}
+
+public struct SessionParams: Codable, Hashable, Sendable {
+    public var host: String?
+    public var ref: String
+
+    public init(host: String? = nil, ref: String) {
+        self.host = host
+        self.ref = ref
+    }
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case host, ref
+    }
+}
+
+public struct SessionList: Codable, Hashable, Sendable {
+    public var sessions: [SessionInfo]
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case sessions
+    }
+}
+
+/// A session: the terminal an agent runs in, held by its shim.
+public struct SessionInfo: Codable, Hashable, Sendable {
+    public var host: String
+    public var ref: String
+    public var state: SessionState
+    /// `<ref> · <profile>`, or the ref alone for a session with no agent.
+    public var title: String
+    /// How many `vibe attach` clients are attached.
+    public var clients: Int
+    /// Their terminals, such as `/dev/ttys003`.
+    public var ttys: [String]
+    /// How the command ended, once it has.
+    public var exit: SessionExit?
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case host, ref, state, title, clients, ttys, exit
+    }
+}
+
+/// How a session's command ended.
+public struct SessionExit: Codable, Hashable, Sendable {
+    public var code: Int?
+    /// Such as `SIGKILL`.
+    public var signal: String?
+    public var at: String
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case code, signal, at
+    }
+}
+
+public struct SessionAttach: Codable, Hashable, Sendable {
+    public var host: String
+    public var ref: String
+    public var title: String
+    /// The shim's socket.
+    public var socket: String
+    /// Terminals already attached, to raise instead of opening another.
+    public var ttys: [String]
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case host, ref, title, socket, ttys
     }
 }
