@@ -1,0 +1,9 @@
+{
+  "description": "A project name is unique per host; this is refused before anything is cloned.",
+  "request": {"jsonrpc": "2.0", "id": 23, "method": "projects.add", "params": {"repo": "me/web"}},
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 23,
+    "error": {"code": -32002, "message": "a project named web already exists on local"}
+  }
+}

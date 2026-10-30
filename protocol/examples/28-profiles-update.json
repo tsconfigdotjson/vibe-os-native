@@ -1,0 +1,28 @@
+{
+  "description": "Changes only the fields given.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 28,
+    "method": "profiles.update",
+    "params": {
+      "project": "web",
+      "profile": "software-eng-linux",
+      "model": "sonnet",
+      "reasoning": "xhigh",
+      "mode": "bypass",
+      "memory": 8589934592
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 28,
+    "result": {
+      "name": "software-eng-linux",
+      "environment": "linux",
+      "model": "sonnet",
+      "reasoning": "xhigh",
+      "mode": "bypass",
+      "memory": 8589934592
+    }
+  }
+}

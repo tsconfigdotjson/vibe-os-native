@@ -1,13 +1,18 @@
 //! The `vibe` binary against an in-process `vibed`.
 
+// vibed's test helpers: the golden world the contract examples need.
+#[path = "../../vibed/tests/common/mod.rs"]
+mod common;
+
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
 
 use serde_json::Value;
+use vibe_core::paths::Layout;
 use vibe_core::rpc::MAX_MESSAGE_BYTES;
-use vibed::dispatch::DaemonInfo;
+use vibed::core::{Config, Core, DaemonInfo};
 use vibed::server::{self, SocketGuard};
 
 const VIBE: &str = env!("CARGO_BIN_EXE_vibe");
@@ -21,19 +26,26 @@ struct Server {
 }
 
 fn start(info: DaemonInfo) -> Server {
+    let dir = tempfile::tempdir().unwrap();
+    let os = info.os.clone();
+    let core = Core::open(Config::new(info, Layout::new(dir.path().join("home"), &os))).unwrap();
+    start_core(core, dir)
+}
+
+/// Serves `core` on a socket in `dir`, which is kept until the server goes.
+fn start_core(core: Core, dir: tempfile::TempDir) -> Server {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
         .enable_all()
         .build()
         .unwrap();
-    let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("run/vibed.sock");
     let (listener, guard) = server::bind(&path).unwrap();
     rt.spawn(async move {
         let listener = tokio::net::UnixListener::from_std(listener).unwrap();
         server::serve(
             listener,
-            Arc::new(info),
+            Arc::new(core),
             MAX_MESSAGE_BYTES,
             std::future::pending(),
         )
@@ -108,30 +120,19 @@ fn hello_without_a_daemon_fails_clearly() {
 #[test]
 fn rpc_bridges_the_whole_contract() {
     // The golden daemon of protocol/examples, so every reply is exact.
-    let s = start(DaemonInfo {
-        version: "0.1.0".into(),
-        os: "macos".into(),
-        arch: "aarch64".into(),
-        pid: 4242,
-    });
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../protocol/examples");
-    let mut files: Vec<_> = std::fs::read_dir(dir)
-        .unwrap()
-        .map(|e| e.unwrap().path())
-        .collect();
-    files.sort();
+    let golden = common::Golden::new();
+    let core = Core::open(golden.config()).unwrap();
+    let s = start_core(core, tempfile::tempdir().unwrap());
     let mut input = Vec::new();
     let mut expected = Vec::new();
-    for f in files {
-        let ex: Value = serde_json::from_str(&std::fs::read_to_string(&f).unwrap()).unwrap();
-        match ex.get("request_raw") {
-            Some(raw) => input.extend_from_slice(raw.as_str().unwrap().as_bytes()),
-            None => input.extend(serde_json::to_vec(&ex["request"]).unwrap()),
-        }
+    for ex in common::examples(&golden.home) {
+        let Some(line) = ex.line else { continue };
+        input.extend(line);
         input.push(b'\n');
-        if !ex["response"].is_null() {
-            expected.push(ex["response"].clone());
+        if !ex.response.is_null() {
+            expected.push(ex.response);
         }
+        expected.extend(ex.events);
     }
     let out = vibe(&["rpc"], &s.path, &input);
     assert!(out.status.success(), "{}", text(&out.stderr));

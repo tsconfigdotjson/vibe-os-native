@@ -1,0 +1,9 @@
+{
+  "description": "A change that would leave the limits inconsistent is refused, and host.toml is left alone.",
+  "request": {"jsonrpc": "2.0", "id": 61, "method": "limits.set", "params": {"disk_soft": 42949672960}},
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 61,
+    "error": {"code": -32602, "message": "Invalid params: disk_soft (40G) must not be more than disk_hard (30G)"}
+  }
+}

@@ -1,0 +1,50 @@
+{
+  "description": "After events.subscribe answers, the connection also gets an events.event notification for every event, in seq order. `events` are the lines that follow the response.",
+  "request": [
+    {"jsonrpc": "2.0", "id": "sub", "method": "events.subscribe", "params": {}},
+    {
+      "jsonrpc": "2.0",
+      "id": 62,
+      "method": "limits.set",
+      "params": {
+        "host": "local",
+        "reserve_memory": 6442450944,
+        "reserve_cores": 1,
+        "max_awake_agents": 8,
+        "cpu_cores": 6,
+        "max_processes": 1024,
+        "disk_soft": 10737418240,
+        "disk_hard": 16106127360,
+        "vm_disk": 32212254720,
+        "idle_debounce": 120,
+        "snapshot_disk": 42949672960
+      }
+    }
+  ],
+  "response": [
+    {"jsonrpc": "2.0", "id": "sub", "result": {"seq": 10}},
+    {
+      "jsonrpc": "2.0",
+      "id": 62,
+      "result": {
+        "reserve_memory": 6442450944,
+        "reserve_cores": 1,
+        "max_awake_agents": 8,
+        "cpu_cores": 6,
+        "max_processes": 1024,
+        "disk_soft": 10737418240,
+        "disk_hard": 16106127360,
+        "vm_disk": 32212254720,
+        "idle_debounce": 120,
+        "snapshot_disk": 42949672960
+      }
+    }
+  ],
+  "events": [
+    {
+      "jsonrpc": "2.0",
+      "method": "events.event",
+      "params": {"seq": 11, "at": "2026-10-30T12:00:00Z", "host": "local", "kind": "limits.changed"}
+    }
+  ]
+}

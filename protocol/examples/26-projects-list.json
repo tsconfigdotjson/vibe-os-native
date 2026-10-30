@@ -1,0 +1,63 @@
+{
+  "description": "A host's projects by name, each with its profiles.",
+  "request": {"jsonrpc": "2.0", "id": 26, "method": "projects.list", "params": {"host": "local"}},
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 26,
+    "result": {
+      "projects": [
+        {
+          "host": "local",
+          "name": "app",
+          "source": "path",
+          "path": "/Users/me/src/app",
+          "added_at": "2026-10-30T12:00:00Z",
+          "profiles": [
+            {
+              "name": "software-eng-linux",
+              "environment": "linux",
+              "model": "opus",
+              "reasoning": "high",
+              "mode": "auto",
+              "memory": 4294967296
+            },
+            {
+              "name": "software-eng-mac",
+              "environment": "macos",
+              "model": "opus",
+              "reasoning": "high",
+              "mode": "auto",
+              "memory": 4294967296
+            }
+          ]
+        },
+        {
+          "host": "local",
+          "name": "web",
+          "source": "github",
+          "repo": "me/web",
+          "path": "/Users/me/VibeOS/projects/web",
+          "added_at": "2026-10-30T12:00:00Z",
+          "profiles": [
+            {
+              "name": "software-eng-linux",
+              "environment": "linux",
+              "model": "opus",
+              "reasoning": "high",
+              "mode": "auto",
+              "memory": 4294967296
+            },
+            {
+              "name": "software-eng-mac",
+              "environment": "macos",
+              "model": "opus",
+              "reasoning": "high",
+              "mode": "auto",
+              "memory": 4294967296
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "description": "Profile memory is a whole number of MiB, from 1G to 1T.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 33,
+    "method": "profiles.update",
+    "params": {"project": "web", "profile": "software-eng-linux", "memory": 1000}
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 33,
+    "error": {"code": -32602, "message": "Invalid params: memory must be a whole number of MiB, not 1000 bytes"}
+  }
+}

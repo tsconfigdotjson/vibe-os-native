@@ -1,5 +1,5 @@
 //! The Unix socket: binding it safely and serving newline-delimited
-//! JSON-RPC on it.
+//! JSON-RPC on it, with event notifications for connections that subscribe.
 
 use std::fmt;
 use std::fs::{self, DirBuilder, File, OpenOptions, Permissions, TryLockError};
@@ -11,10 +11,22 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{UnixListener, UnixStream};
-use vibe_core::rpc::{ErrorCode, ErrorObject, Id, Response};
+use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::task::JoinHandle;
+use vibe_core::rpc::{ErrorCode, ErrorObject, Event, EventNotice, Id, Request, Response};
 
-use crate::dispatch::{self, DaemonInfo};
+use crate::core::Core;
+use crate::dispatch::{self, Session};
+
+/// How long a closing connection may take to send what's queued to a client
+/// that has stopped reading, before it's dropped.
+const FLUSH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Lines queued for a connection's writer. When a client stops reading, its
+/// queue fills, and then its events lag rather than pile up.
+const QUEUE: usize = 64;
 
 #[derive(Debug)]
 pub enum BindError {
@@ -172,7 +184,7 @@ pub fn bind(path: &Path) -> Result<(std::os::unix::net::UnixListener, SocketGuar
 /// on its own task, one message at a time.
 pub async fn serve(
     listener: UnixListener,
-    info: Arc<DaemonInfo>,
+    core: Arc<Core>,
     max_message_bytes: usize,
     shutdown: impl Future<Output = ()>,
 ) {
@@ -182,9 +194,9 @@ pub async fn serve(
             () = &mut shutdown => return,
             accepted = listener.accept() => match accepted {
                 Ok((stream, _)) => {
-                    let info = info.clone();
+                    let core = core.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = connection(stream, &info, max_message_bytes).await {
+                        if let Err(e) = connection(stream, core, max_message_bytes).await {
                             crate::log!("vibed: connection error: {e}");
                         }
                     });
@@ -199,9 +211,57 @@ pub async fn serve(
     }
 }
 
-async fn connection(stream: UnixStream, info: &DaemonInfo, max_bytes: usize) -> io::Result<()> {
-    let (read, mut write) = stream.into_split();
+/// Serves one connection. Responses and events go through one writer task,
+/// so lines never interleave, and a subscription's events start after the
+/// response to `events.subscribe`.
+async fn connection(stream: UnixStream, core: Arc<Core>, max_bytes: usize) -> io::Result<()> {
+    let (read, write) = stream.into_split();
+    let (tx, rx) = mpsc::channel(QUEUE);
+    let writer = tokio::spawn(write_lines(write, rx));
+    let mut forwarder = None;
+    let read_result = read_messages(read, &core, max_bytes, &tx, &mut forwarder).await;
+    if let Some((closing, mut task)) = forwarder {
+        // Events already waiting, such as those the last message caused,
+        // still go out; then the forwarder stops.
+        let _ = closing.send(());
+        if tokio::time::timeout(FLUSH_TIMEOUT, &mut task)
+            .await
+            .is_err()
+        {
+            task.abort();
+        }
+    }
+    // The writer sends what's queued, then ends once every sender is gone;
+    // unless the client has stopped reading, which mustn't keep it forever.
+    drop(tx);
+    let mut writer = writer;
+    let write_result = match tokio::time::timeout(FLUSH_TIMEOUT, &mut writer).await {
+        Ok(joined) => joined.unwrap_or_else(|e| Err(io::Error::other(e))),
+        Err(_) => {
+            writer.abort();
+            Ok(())
+        }
+    };
+    read_result.and(write_result).or_else(|e| {
+        // A client that goes away mid-reply is a normal end, not an error.
+        match e.kind() {
+            io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::NotConnected => Ok(()),
+            _ => Err(e),
+        }
+    })
+}
+
+async fn read_messages(
+    read: tokio::net::unix::OwnedReadHalf,
+    core: &Arc<Core>,
+    max_bytes: usize,
+    tx: &mpsc::Sender<String>,
+    forwarder: &mut Option<(oneshot::Sender<()>, JoinHandle<()>)>,
+) -> io::Result<()> {
     let mut reader = BufReader::new(read);
+    let mut session = Session::default();
     let mut line = Vec::new();
     loop {
         line.clear();
@@ -226,21 +286,87 @@ async fn connection(stream: UnixStream, info: &DaemonInfo, max_bytes: usize) -> 
                 ErrorCode::InvalidRequest,
                 format!("Message too large: the limit is {max_bytes} bytes"),
             );
-            let reply = dispatch::encode(&Response::error(Id::Null, error));
-            write_line(&mut write, &reply).await?;
+            let _ = tx
+                .send(dispatch::encode(&Response::error(Id::Null, error)))
+                .await;
             return Ok(());
         }
         // Without a newline the peer has closed its end: answer what it
         // sent, then stop.
         if !line.iter().all(u8::is_ascii_whitespace)
-            && let Some(reply) = dispatch::handle_message(info, &line)
+            && let Some(reply) = dispatch::handle_message(core, &mut session, &line).await
+            && tx.send(reply).await.is_err()
         {
-            write_line(&mut write, &reply).await?;
+            // The writer is gone: the client stopped listening.
+            return Ok(());
+        }
+        if let Some((seq, events)) = session.take_subscription() {
+            let (closing, closed) = oneshot::channel();
+            let task = tokio::spawn(forward_events(
+                seq,
+                events,
+                closed,
+                core.clone(),
+                tx.clone(),
+            ));
+            *forwarder = Some((closing, task));
         }
         if !complete {
             return Ok(());
         }
     }
+}
+
+/// Sends each event as an `events.event` notification, starting after
+/// `seq`. Once `closed` fires, it sends the events already waiting and stops.
+async fn forward_events(
+    mut seq: u64,
+    mut events: broadcast::Receiver<Event>,
+    mut closed: oneshot::Receiver<()>,
+    core: Arc<Core>,
+    tx: mpsc::Sender<String>,
+) {
+    use broadcast::error::{RecvError, TryRecvError};
+    let mut closing = false;
+    loop {
+        let event = if closing {
+            match events.try_recv() {
+                Ok(e) => e,
+                Err(TryRecvError::Lagged(missed)) => core.lagged(missed, seq + missed),
+                Err(TryRecvError::Empty | TryRecvError::Closed) => return,
+            }
+        } else {
+            tokio::select! {
+                biased;
+                received = events.recv() => match received {
+                    Ok(e) => e,
+                    Err(RecvError::Lagged(missed)) => core.lagged(missed, seq + missed),
+                    Err(RecvError::Closed) => return,
+                },
+                _ = &mut closed => {
+                    closing = true;
+                    continue;
+                }
+            }
+        };
+        seq = event.seq;
+        let line = dispatch::encode(&Request::notification::<EventNotice>(&event));
+        if tx.send(line).await.is_err() {
+            return;
+        }
+    }
+}
+
+async fn write_lines(
+    mut write: OwnedWriteHalf,
+    mut lines: mpsc::Receiver<String>,
+) -> io::Result<()> {
+    while let Some(line) = lines.recv().await {
+        write_line(&mut write, &line).await?;
+    }
+    // macOS refuses a shutdown once the peer has closed; that's fine.
+    let _ = write.shutdown().await;
+    Ok(())
 }
 
 async fn write_line(write: &mut (impl AsyncWriteExt + Unpin), line: &str) -> io::Result<()> {

@@ -1,27 +1,39 @@
 //! `vibed`: serves the JSON-RPC socket until SIGTERM or SIGINT.
 
+use std::ffi::OsString;
+use std::fs::DirBuilder;
+use std::os::unix::fs::DirBuilderExt;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::net::UnixListener;
 use tokio::signal::unix::{SignalKind, signal};
-use vibe_core::paths;
+use vibe_core::paths::{self, Layout};
 use vibe_core::rpc::MAX_MESSAGE_BYTES;
-use vibed::dispatch::DaemonInfo;
-use vibed::server;
+use vibed::core::{Config, Core, DaemonInfo};
+use vibed::{logging, server};
 
 const USAGE: &str = "\
 usage: vibed [--socket PATH]
 
 Serves the VibeOS JSON-RPC API on a Unix socket until SIGTERM or SIGINT.
+State lives under $HOME: on macOS in ~/Library/Application Support/VibeOS
+(logs in ~/Library/Logs/VibeOS), elsewhere in ~/.local/share/vibeos. Host
+limits are in ~/.config/vibeos/host.toml.
 
 options:
-  --socket PATH   the socket to serve (default: $VIBE_SOCKET, or
-                  ~/Library/Application Support/VibeOS/run/vibed.sock on macOS,
-                  ~/.local/share/vibeos/run/vibed.sock elsewhere)
+  --socket PATH   the socket to serve (default: $VIBE_SOCKET, or run/vibed.sock
+                  in the state directory)
   -V, --version   print the version
-  -h, --help      print this help";
+  -h, --help      print this help
+
+environment:
+  VIBE_GH         the gh to run (default: gh on PATH)";
+
+/// How often `gh auth status` runs (PRD: Auth, security and trust).
+const GH_CHECK_EVERY: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Debug, PartialEq, Eq)]
 enum Args {
@@ -67,6 +79,13 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let layout = match Layout::current() {
+        Ok(l) => l,
+        Err(e) => {
+            vibed::log!("vibed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let path = match paths::socket_path(socket) {
         Ok(p) => p,
         Err(e) => {
@@ -74,6 +93,15 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let logs = layout.logs_dir();
+    let logged = DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&logs)
+        .and_then(|()| logging::to_file(&logs.join("vibed.log")));
+    if let Err(e) = logged {
+        vibed::log!("vibed: warning: can't log to {}: {e}", logs.display());
+    }
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
         Err(e) => {
@@ -81,7 +109,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match runtime.block_on(run(path)) {
+    match runtime.block_on(run(path, layout)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             vibed::log!("vibed: {e}");
@@ -90,13 +118,26 @@ fn main() -> ExitCode {
     }
 }
 
-async fn run(path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Error>> {
     // Install the handlers before the socket exists, so a client that sees
     // the socket can always stop the daemon cleanly.
     let mut term = signal(SignalKind::terminate())?;
     let mut int = signal(SignalKind::interrupt())?;
     let (listener, guard) = server::bind(&path)?;
     let listener = UnixListener::from_std(listener)?;
+    let mut config = Config::new(DaemonInfo::current(), layout);
+    if let Some(gh) = std::env::var_os("VIBE_GH").filter(|v| !v.is_empty()) {
+        config.gh = gh;
+    }
+    let gh: OsString = config.gh.clone();
+    let core = Arc::new(Core::open(config)?);
+    vibed::log!(
+        "vibed: state in {}, gh is {}",
+        core.layout().data_dir().display(),
+        gh.to_string_lossy()
+    );
+    core.warn_about_limits();
+    let gh_checks = core.spawn_gh_checks(GH_CHECK_EVERY);
     vibed::log!(
         "vibed {} listening on {}",
         env!("CARGO_PKG_VERSION"),
@@ -108,13 +149,8 @@ async fn run(path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
             _ = int.recv() => {}
         }
     };
-    server::serve(
-        listener,
-        Arc::new(DaemonInfo::current()),
-        MAX_MESSAGE_BYTES,
-        shutdown,
-    )
-    .await;
+    server::serve(listener, core, MAX_MESSAGE_BYTES, shutdown).await;
+    gh_checks.abort();
     drop(guard);
     vibed::log!("vibed: stopped");
     Ok(())

@@ -1,0 +1,12 @@
+{
+  "description": "When the clone fails, the error has gh's last words and nothing is left behind.",
+  "request": {"jsonrpc": "2.0", "id": 24, "method": "projects.add", "params": {"repo": "me/missing"}},
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 24,
+    "error": {
+      "code": -32004,
+      "message": "gh repo clone me/missing failed: GraphQL: Could not resolve to a Repository with the name 'me/missing'. (repository)"
+    }
+  }
+}

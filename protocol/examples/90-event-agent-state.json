@@ -1,0 +1,16 @@
+{
+  "description": "A notification, not a reply: an agent changed state (sent once agents exist, #4 and #5).",
+  "notification": {
+    "jsonrpc": "2.0",
+    "method": "events.event",
+    "params": {
+      "seq": 12,
+      "at": "2026-10-30T12:00:00Z",
+      "host": "local",
+      "kind": "agent.state",
+      "project": "web",
+      "ref": "quiet-amber-otter",
+      "state": "question"
+    }
+  }
+}

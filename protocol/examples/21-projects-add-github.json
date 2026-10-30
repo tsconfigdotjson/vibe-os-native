@@ -1,0 +1,34 @@
+{
+  "description": "Adds a GitHub repo: cloned with the host's gh login into ~/VibeOS/projects/<name>, with the Mac's two starter profiles.",
+  "request": {"jsonrpc": "2.0", "id": 21, "method": "projects.add", "params": {"repo": "me/web"}},
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 21,
+    "result": {
+      "host": "local",
+      "name": "web",
+      "source": "github",
+      "repo": "me/web",
+      "path": "/Users/me/VibeOS/projects/web",
+      "added_at": "2026-10-30T12:00:00Z",
+      "profiles": [
+        {
+          "name": "software-eng-linux",
+          "environment": "linux",
+          "model": "opus",
+          "reasoning": "high",
+          "mode": "auto",
+          "memory": 4294967296
+        },
+        {
+          "name": "software-eng-mac",
+          "environment": "macos",
+          "model": "opus",
+          "reasoning": "high",
+          "mode": "auto",
+          "memory": 4294967296
+        }
+      ]
+    }
+  }
+}

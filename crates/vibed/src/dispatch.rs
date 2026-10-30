@@ -1,36 +1,41 @@
-//! Turns one JSON-RPC message into its response. Pure, so the contract
-//! examples in `protocol/examples/` replay through it exactly.
+//! Turns one JSON-RPC message into its response, through the core
+//! handlers. Apart from the core's state it's pure, so the contract examples
+//! in `protocol/examples/` replay through it exactly.
 
 use serde_json::Value;
+use tokio::sync::broadcast;
 use vibe_core::rpc::{
-    ErrorCode, ErrorObject, Hello, HelloParams, HelloResult, Id, Method, PROTOCOL_VERSION,
-    ProtocolMismatchData, Request, Response,
+    ErrorCode, ErrorObject, Event, EventsSubscribe, GhStatusGet, Hello, HelloParams, HelloResult,
+    HostsList, Id, KeysCreate, KeysList, KeysRevoke, KeysVerify, LimitsGet, LimitsSet, Method,
+    PROTOCOL_VERSION, ProfilesCreate, ProfilesDelete, ProfilesList, ProfilesUpdate, ProjectsAdd,
+    ProjectsList, ProjectsRemove, ProtocolMismatchData, Request, Response, Subscribed,
 };
 
-/// What `daemon.hello` reports about this daemon.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DaemonInfo {
-    pub version: String,
-    pub os: String,
-    pub arch: String,
-    pub pid: u32,
+use crate::core::Core;
+pub use crate::core::DaemonInfo;
+
+/// What one connection carries between messages.
+#[derive(Debug, Default)]
+pub struct Session {
+    subscribed: bool,
+    /// A subscription made by the last message, for the connection to start
+    /// forwarding once that message's response is out.
+    new_subscription: Option<(u64, broadcast::Receiver<Event>)>,
 }
 
-impl DaemonInfo {
-    pub fn current() -> Self {
-        DaemonInfo {
-            version: env!("CARGO_PKG_VERSION").to_owned(),
-            os: std::env::consts::OS.to_owned(),
-            arch: std::env::consts::ARCH.to_owned(),
-            pid: std::process::id(),
-        }
+impl Session {
+    /// The subscription the last message made, if it made one, and the
+    /// `seq` of the last event before it. Events published since are waiting
+    /// in it.
+    pub fn take_subscription(&mut self) -> Option<(u64, broadcast::Receiver<Event>)> {
+        self.new_subscription.take()
     }
 }
 
 /// Handles one message, a line without its newline, and returns the line to
 /// send back, if any. Notifications, and batches of only notifications, get
-/// nothing.
-pub fn handle_message(info: &DaemonInfo, message: &[u8]) -> Option<String> {
+/// nothing. A batch's calls run in order.
+pub async fn handle_message(core: &Core, session: &mut Session, message: &[u8]) -> Option<String> {
     let value: Value = match serde_json::from_slice(message) {
         Ok(v) => v,
         Err(_) => {
@@ -43,13 +48,15 @@ pub fn handle_message(info: &DaemonInfo, message: &[u8]) -> Option<String> {
             Some(encode(&Response::error(Id::Null, invalid_request())))
         }
         Value::Array(items) => {
-            let responses: Vec<Response> = items
-                .into_iter()
-                .filter_map(|v| handle_value(info, v))
-                .collect();
+            let mut responses = Vec::new();
+            for item in items {
+                if let Some(r) = handle_value(core, session, item).await {
+                    responses.push(r);
+                }
+            }
             (!responses.is_empty()).then(|| encode(&responses))
         }
-        value => handle_value(info, value).map(|r| encode(&r)),
+        value => handle_value(core, session, value).await.map(|r| encode(&r)),
     }
 }
 
@@ -69,7 +76,7 @@ fn invalid_params(detail: &str) -> ErrorObject {
     )
 }
 
-fn handle_value(info: &DaemonInfo, value: Value) -> Option<Response> {
+async fn handle_value(core: &Core, session: &mut Session, value: Value) -> Option<Response> {
     // An invalid request still gets its id back when the id itself is valid.
     let id_hint = value
         .get("id")
@@ -81,7 +88,7 @@ fn handle_value(info: &DaemonInfo, value: Value) -> Option<Response> {
     if matches!(&request.params, Some(p) if !p.is_object() && !p.is_array()) {
         return Some(Response::error(id_hint, invalid_request()));
     }
-    let outcome = call(info, &request.method, request.params);
+    let outcome = call(core, session, &request.method, request.params).await;
     let id = request.id?;
     Some(match outcome {
         Ok(result) => Response::result(id, result),
@@ -89,7 +96,12 @@ fn handle_value(info: &DaemonInfo, value: Value) -> Option<Response> {
     })
 }
 
-fn call(info: &DaemonInfo, method: &str, params: Option<Value>) -> Result<Value, ErrorObject> {
+async fn call(
+    core: &Core,
+    session: &mut Session,
+    method: &str,
+    params: Option<Value>,
+) -> Result<Value, ErrorObject> {
     match method {
         Hello::NAME => {
             // The version is checked before the params are decoded strictly,
@@ -103,7 +115,52 @@ fn call(info: &DaemonInfo, method: &str, params: Option<Value>) -> Result<Value,
             {
                 return Err(protocol_mismatch(theirs));
             }
-            handle::<Hello>(params, |p| hello(info, p))
+            encode_result(hello(core.info(), decode::<Hello>(params)?))
+        }
+        HostsList::NAME => {
+            decode::<HostsList>(params)?;
+            encode_result(core.hosts())
+        }
+        ProjectsList::NAME => encode_result(core.projects(decode::<ProjectsList>(params)?)),
+        ProjectsAdd::NAME => encode_result(core.add_project(decode::<ProjectsAdd>(params)?).await),
+        ProjectsRemove::NAME => {
+            encode_result(core.remove_project(decode::<ProjectsRemove>(params)?))
+        }
+        ProfilesList::NAME => encode_result(core.profiles(decode::<ProfilesList>(params)?)),
+        ProfilesCreate::NAME => {
+            encode_result(core.create_profile(decode::<ProfilesCreate>(params)?))
+        }
+        ProfilesUpdate::NAME => {
+            encode_result(core.update_profile(decode::<ProfilesUpdate>(params)?))
+        }
+        ProfilesDelete::NAME => {
+            encode_result(core.delete_profile(decode::<ProfilesDelete>(params)?))
+        }
+        LimitsGet::NAME => encode_result(core.limits(decode::<LimitsGet>(params)?)),
+        LimitsSet::NAME => encode_result(core.set_limits(decode::<LimitsSet>(params)?)),
+        KeysList::NAME => {
+            decode::<KeysList>(params)?;
+            encode_result(core.keys())
+        }
+        KeysCreate::NAME => encode_result(core.create_key(decode::<KeysCreate>(params)?)),
+        KeysRevoke::NAME => encode_result(core.revoke_key(decode::<KeysRevoke>(params)?)),
+        KeysVerify::NAME => encode_result(core.verify_key_call(decode::<KeysVerify>(params)?)),
+        GhStatusGet::NAME => {
+            let p = decode::<GhStatusGet>(params)?;
+            encode_result(Ok(core.gh_status(p).await))
+        }
+        EventsSubscribe::NAME => {
+            decode::<EventsSubscribe>(params)?;
+            if session.subscribed {
+                return Err(ErrorObject::new(
+                    ErrorCode::Conflict,
+                    "this connection is already subscribed",
+                ));
+            }
+            let (seq, rx) = core.subscribe();
+            session.subscribed = true;
+            session.new_subscription = Some((seq, rx));
+            encode_result(Ok(Subscribed { seq }))
         }
         _ => Err(ErrorObject::new(
             ErrorCode::MethodNotFound,
@@ -112,20 +169,20 @@ fn call(info: &DaemonInfo, method: &str, params: Option<Value>) -> Result<Value,
     }
 }
 
-/// Decodes `M`'s params (by name only; absent means `{}`), runs the handler
-/// and encodes its result.
-fn handle<M: Method>(
-    params: Option<Value>,
-    handler: impl FnOnce(M::Params) -> Result<M::Result, ErrorObject>,
-) -> Result<Value, ErrorObject> {
+/// Decodes `M`'s params, by name only; absent means `{}`.
+fn decode<M: Method>(params: Option<Value>) -> Result<M::Params, ErrorObject> {
     let params = match params {
         None => Value::Object(Default::default()),
         Some(p @ Value::Object(_)) => p,
         Some(_) => return Err(invalid_params("params must be an object")),
     };
-    let params = serde_json::from_value(params).map_err(|e| invalid_params(&e.to_string()))?;
-    let result = handler(params)?;
-    serde_json::to_value(result)
+    serde_json::from_value(params).map_err(|e| invalid_params(&e.to_string()))
+}
+
+fn encode_result<T: serde::Serialize>(
+    result: Result<T, ErrorObject>,
+) -> Result<Value, ErrorObject> {
+    serde_json::to_value(result?)
         .map_err(|e| ErrorObject::new(ErrorCode::InternalError, format!("Internal error: {e}")))
 }
 
@@ -163,7 +220,9 @@ fn hello(info: &DaemonInfo, params: HelloParams) -> Result<HelloResult, ErrorObj
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::Config;
     use serde_json::json;
+    use vibe_core::paths::Layout;
 
     fn info() -> DaemonInfo {
         DaemonInfo {
@@ -174,11 +233,26 @@ mod tests {
         }
     }
 
+    fn core(dir: &tempfile::TempDir) -> Core {
+        Core::open(Config::new(info(), Layout::new(dir.path(), "linux"))).unwrap()
+    }
+
     fn reply(message: &str) -> Option<Value> {
-        handle_message(&info(), message.as_bytes()).map(|s| {
+        reply_bytes(message.as_bytes()).map(|s| serde_json::from_str(&s).unwrap())
+    }
+
+    fn reply_bytes(message: &[u8]) -> Option<String> {
+        let dir = tempfile::tempdir().unwrap();
+        let core = core(&dir);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let out = rt.block_on(handle_message(&core, &mut Session::default(), message));
+        if let Some(s) = &out {
             assert!(!s.contains('\n'), "a response is one line");
-            serde_json::from_str(&s).unwrap()
-        })
+        }
+        out
     }
 
     #[test]
@@ -204,11 +278,7 @@ mod tests {
 
     #[test]
     fn invalid_utf8_is_a_parse_error() {
-        let r = handle_message(
-            &info(),
-            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"\xff\"}",
-        )
-        .unwrap();
+        let r = reply_bytes(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"\xff\"}").unwrap();
         assert!(r.contains("-32700"), "{r}");
     }
 
@@ -250,6 +320,45 @@ mod tests {
             r,
             json!([{"jsonrpc": "2.0", "id": null, "error": {"code": -32600, "message": "Invalid Request"}}])
         );
+    }
+
+    #[test]
+    fn methods_without_params_take_an_empty_object_or_none() {
+        for m in [
+            r#"{"jsonrpc":"2.0","id":1,"method":"hosts.list"}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"hosts.list","params":{}}"#,
+        ] {
+            assert_eq!(
+                reply(m).unwrap()["result"]["hosts"][0]["name"],
+                "local",
+                "{m}"
+            );
+        }
+        let r =
+            reply(r#"{"jsonrpc":"2.0","id":1,"method":"hosts.list","params":{"x":1}}"#).unwrap();
+        assert_eq!(r["error"]["code"], -32602);
+    }
+
+    #[test]
+    fn subscribing_twice_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = core(&dir);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let mut session = Session::default();
+        let sub = br#"{"jsonrpc":"2.0","id":1,"method":"events.subscribe"}"#;
+        let first = rt
+            .block_on(handle_message(&core, &mut session, sub))
+            .unwrap();
+        assert!(first.contains(r#""result":{"seq":0}"#), "{first}");
+        assert!(session.take_subscription().is_some());
+        assert!(session.take_subscription().is_none());
+        let second = rt
+            .block_on(handle_message(&core, &mut session, sub))
+            .unwrap();
+        assert!(second.contains("-32002"), "{second}");
+        assert!(session.take_subscription().is_none());
     }
 
     #[test]

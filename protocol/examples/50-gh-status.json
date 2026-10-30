@@ -1,0 +1,14 @@
+{
+  "description": "The last `gh auth status`, run at startup and hourly; `refresh` runs it now.",
+  "request": {"jsonrpc": "2.0", "id": 50, "method": "gh.status", "params": {"refresh": true}},
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 50,
+    "result": {
+      "state": "logged_in",
+      "account": "me",
+      "detail": "Logged in to github.com account me (keyring)",
+      "checked_at": "2026-10-30T12:00:00Z"
+    }
+  }
+}

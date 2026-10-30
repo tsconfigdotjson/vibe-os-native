@@ -1,0 +1,17 @@
+{
+  "description": "A notification, not a reply: an agent hit a limit and was paused (#6, #11, #17).",
+  "notification": {
+    "jsonrpc": "2.0",
+    "method": "events.event",
+    "params": {
+      "seq": 13,
+      "at": "2026-10-30T12:00:00Z",
+      "host": "local",
+      "kind": "agent.limit",
+      "project": "web",
+      "ref": "quiet-amber-otter",
+      "limit": "memory",
+      "message": "paused at 100% of its 4G"
+    }
+  }
+}

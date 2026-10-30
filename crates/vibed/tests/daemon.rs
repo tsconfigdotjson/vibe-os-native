@@ -1,5 +1,8 @@
-//! The real `vibed` binary: starting, serving, refusing a second instance and
-//! stopping cleanly.
+//! The real `vibed` binary: starting, serving, refusing a second instance,
+//! keeping its state across restarts and stopping cleanly. Each test gives
+//! it a temp `$HOME`, so nothing touches the real one.
+
+mod common;
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -36,16 +39,42 @@ fn spawn(cmd: &mut Command, socket: &Path) -> Daemon {
     daemon
 }
 
-fn hello(socket: &Path) -> Value {
+/// `vibed` with its own `$HOME` in `tmp`, serving `socket`.
+fn vibed(tmp: &tempfile::TempDir, socket: &Path) -> Command {
+    let mut cmd = Command::new(VIBED);
+    cmd.arg("--socket")
+        .arg(socket)
+        .env("HOME", tmp.path().join("home"))
+        .env("VIBE_GH", "/nonexistent/gh");
+    cmd
+}
+
+/// One call on its own connection.
+fn call(socket: &Path, method: &str, params: Value) -> Value {
     let mut s = UnixStream::connect(socket).unwrap();
-    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    s.write_all(
-        b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"daemon.hello\",\"params\":{\"client\":\"daemon-test\",\"protocol\":1}}\n",
-    )
-    .unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    let req = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
+    s.write_all(format!("{req}\n").as_bytes()).unwrap();
     let mut line = String::new();
     BufReader::new(s).read_line(&mut line).unwrap();
     serde_json::from_str(&line).unwrap()
+}
+
+fn hello(socket: &Path) -> Value {
+    call(
+        socket,
+        "daemon.hello",
+        serde_json::json!({"client": "daemon-test", "protocol": 1}),
+    )
+}
+
+fn stop(mut d: Daemon) -> String {
+    sigterm(&d.child);
+    let out = d.child.wait().unwrap();
+    assert!(out.success(), "{out}");
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(&mut d.child.stderr.take().unwrap(), &mut stderr).unwrap();
+    stderr
 }
 
 fn sigterm(child: &Child) {
@@ -65,7 +94,7 @@ fn socket_in(dir: &tempfile::TempDir) -> PathBuf {
 fn serves_hello_and_stops_cleanly_on_sigterm() {
     let tmp = tempfile::tempdir().unwrap();
     let socket = socket_in(&tmp);
-    let mut d = spawn(Command::new(VIBED).arg("--socket").arg(&socket), &socket);
+    let d = spawn(&mut vibed(&tmp, &socket), &socket);
     let r = hello(&socket);
     let result = &r["result"];
     assert_eq!(result["daemon"], "vibed");
@@ -75,12 +104,8 @@ fn serves_hello_and_stops_cleanly_on_sigterm() {
     assert_eq!(result["arch"], std::env::consts::ARCH);
     assert_eq!(result["pid"], d.child.id());
 
-    sigterm(&d.child);
-    let out = d.child.wait().unwrap();
-    assert!(out.success(), "{out}");
+    let stderr = stop(d);
     assert!(!socket.exists(), "the socket is removed on exit");
-    let mut stderr = String::new();
-    std::io::Read::read_to_string(&mut d.child.stderr.take().unwrap(), &mut stderr).unwrap();
     assert!(stderr.contains("listening on"), "{stderr}");
     assert!(stderr.contains("hello from daemon-test"), "{stderr}");
     assert!(stderr.contains("vibed: stopped"), "{stderr}");
@@ -90,12 +115,8 @@ fn serves_hello_and_stops_cleanly_on_sigterm() {
 fn a_second_daemon_on_the_same_socket_is_refused() {
     let tmp = tempfile::tempdir().unwrap();
     let socket = socket_in(&tmp);
-    let _first = spawn(Command::new(VIBED).arg("--socket").arg(&socket), &socket);
-    let out = Command::new(VIBED)
-        .arg("--socket")
-        .arg(&socket)
-        .output()
-        .unwrap();
+    let _first = spawn(&mut vibed(&tmp, &socket), &socket);
+    let out = vibed(&tmp, &socket).output().unwrap();
     assert_eq!(out.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("already serving"), "{stderr}");
@@ -110,7 +131,13 @@ fn a_second_daemon_on_the_same_socket_is_refused() {
 fn socket_comes_from_vibe_socket() {
     let tmp = tempfile::tempdir().unwrap();
     let socket = socket_in(&tmp);
-    let _d = spawn(Command::new(VIBED).env("VIBE_SOCKET", &socket), &socket);
+    let _d = spawn(
+        Command::new(VIBED)
+            .env("VIBE_SOCKET", &socket)
+            .env("HOME", tmp.path().join("home"))
+            .env("VIBE_GH", "/nonexistent/gh"),
+        &socket,
+    );
     assert_eq!(hello(&socket)["result"]["daemon"], "vibed");
 }
 
@@ -124,10 +151,161 @@ fn default_socket_is_under_home() {
     let _d = spawn(
         Command::new(VIBED)
             .env_remove("VIBE_SOCKET")
-            .env("HOME", tmp.path()),
+            .env("HOME", tmp.path())
+            .env("VIBE_GH", "/nonexistent/gh"),
         &socket,
     );
     assert_eq!(hello(&socket)["result"]["daemon"], "vibed");
+}
+
+#[test]
+fn a_second_daemon_on_the_same_state_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = socket_in(&tmp);
+    let _first = spawn(&mut vibed(&tmp, &socket), &socket);
+    // Another socket, but the same $HOME.
+    let out = vibed(&tmp, &tmp.path().join("run2/vibed.sock"))
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("another vibed is already using"),
+        "{stderr}"
+    );
+    assert_eq!(hello(&socket)["result"]["daemon"], "vibed");
+}
+
+/// The ticket's "done when", through the real binary: add a project, list
+/// its starter profiles, edit one and change a host limit; restart; all of
+/// it is still there.
+#[test]
+fn state_survives_a_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let socket = socket_in(&tmp);
+    let app = root.join("home/src/app");
+    common::repo(&app);
+    let gh = common::fake_gh(&root.join("bin"), &root.join("remotes"));
+    common::repo(&root.join("remotes/web"));
+    let start = || {
+        let mut cmd = vibed(&tmp, &socket);
+        cmd.env("VIBE_GH", &gh);
+        spawn(&mut cmd, &socket)
+    };
+    // What a new project starts with here: both environments on a Mac.
+    let starters: &[&str] = if cfg!(target_os = "macos") {
+        &["software-eng-linux", "software-eng-mac"]
+    } else {
+        &["software-eng-linux"]
+    };
+
+    let d = start();
+    let r = call(&socket, "projects.add", serde_json::json!({"path": app}));
+    assert_eq!(r["result"]["name"], "app", "{r}");
+    let r = call(
+        &socket,
+        "projects.add",
+        serde_json::json!({"repo": "me/web"}),
+    );
+    assert_eq!(r["result"]["source"], "github", "{r}");
+    let r = call(
+        &socket,
+        "profiles.list",
+        serde_json::json!({"project": "app"}),
+    );
+    let names: Vec<&str> = r["result"]["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, starters);
+    let r = call(
+        &socket,
+        "profiles.update",
+        serde_json::json!({"project": "app", "profile": "software-eng-linux", "memory": 8u64 << 30}),
+    );
+    assert_eq!(r["result"]["memory"], 8u64 << 30, "{r}");
+    let r = call(
+        &socket,
+        "limits.set",
+        serde_json::json!({"max_awake_agents": 7}),
+    );
+    assert_eq!(r["result"]["max_awake_agents"], 7, "{r}");
+    let r = call(
+        &socket,
+        "keys.create",
+        serde_json::json!({"name": "laptop"}),
+    );
+    let secret = r["result"]["secret"].as_str().unwrap().to_owned();
+    let stderr = stop(d);
+    assert!(!stderr.contains(&secret), "a key reached the log");
+
+    let d = start();
+    let r = call(&socket, "projects.list", serde_json::json!({}));
+    let projects = r["result"]["projects"].as_array().unwrap();
+    let names: Vec<&str> = projects
+        .iter()
+        .map(|p| p["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["app", "web"]);
+    assert_eq!(projects[0]["profiles"][0]["memory"], 8u64 << 30);
+    assert_eq!(
+        projects[0]["profiles"].as_array().unwrap().len(),
+        starters.len()
+    );
+    let r = call(&socket, "limits.get", serde_json::json!({}));
+    assert_eq!(r["result"]["max_awake_agents"], 7);
+    let r = call(
+        &socket,
+        "keys.verify",
+        serde_json::json!({"secret": secret}),
+    );
+    assert_eq!(r["result"]["name"], "laptop", "{r}");
+    // VIBE_GH picks the gh that runs.
+    let r = call(&socket, "gh.status", serde_json::json!({"refresh": true}));
+    assert_eq!(r["result"]["state"], "logged_in", "{r}");
+    stop(d);
+
+    // State is where the PRD says, and the log too.
+    let home = root.join("home");
+    let (db, log) = if cfg!(target_os = "macos") {
+        (
+            home.join("Library/Application Support/VibeOS/vibe.db"),
+            home.join("Library/Logs/VibeOS/vibed.log"),
+        )
+    } else {
+        (
+            home.join(".local/share/vibeos/vibe.db"),
+            home.join(".local/share/vibeos/logs/vibed.log"),
+        )
+    };
+    assert!(db.exists());
+    assert!(home.join(".config/vibeos/host.toml").exists());
+    assert!(home.join("VibeOS/projects/web/README.md").exists());
+    let log = std::fs::read_to_string(log).unwrap();
+    assert!(log.contains("added project app"), "{log}");
+    assert!(!log.contains(&secret), "a key reached the log file");
+    // Each line is timestamped.
+    assert!(
+        log.lines().all(|l| l.as_bytes().get(10) == Some(&b'T')),
+        "{log}"
+    );
+}
+
+#[test]
+fn no_home_is_a_clear_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = Command::new(VIBED)
+        .arg("--socket")
+        .arg(socket_in(&tmp))
+        .env_remove("HOME")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("$HOME is not set"), "{stderr}");
 }
 
 #[test]
