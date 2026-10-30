@@ -167,7 +167,8 @@ s_clippy() { cargo clippy --workspace --all-targets --locked -- -D warnings; }
 
 s_build() { cargo build --workspace --locked; }
 
-s_test() { cargo test --workspace --locked "${TEST_ARGS[@]}"; }
+# Every test binary runs, so one failure doesn't hide the others.
+s_test() { cargo test --workspace --locked --no-fail-fast "${TEST_ARGS[@]}"; }
 
 s_guest() {
   local target=aarch64-unknown-linux-musl info

@@ -89,8 +89,8 @@ impl World {
 /// program leads a session whose controlling terminal this is.
 struct Term {
     master: File,
-    /// Kept so the terminal's settings can be read after the program goes.
-    slave: OwnedFd,
+    /// Kept open, as a terminal emulator would.
+    _slave: OwnedFd,
     child: Child,
     seen: Arc<Mutex<Vec<u8>>>,
 }
@@ -157,7 +157,7 @@ impl Term {
         });
         Term {
             master,
-            slave,
+            _slave: slave,
             child,
             seen,
         }
@@ -207,13 +207,21 @@ impl Term {
         }
     }
 
+    /// Waits until `vibe attach` has joined the session: it names the window
+    /// once the shim has taken it on. Typing before then would be echoed by
+    /// this terminal itself, not by the session.
+    fn attached(&self) {
+        self.expect("\x1b]0;");
+    }
+
     /// Whether the terminal is back in canonical mode with echo, as a shell
-    /// left it.
+    /// left it. Read through the master: macOS revokes the slave side once
+    /// the session leader that owned it exits.
     fn cooked(&self) -> bool {
         // SAFETY: termios is plain data, filled in by tcgetattr.
         unsafe {
             let mut t: libc::termios = std::mem::zeroed();
-            check(libc::tcgetattr(self.slave.as_raw_fd(), &mut t)).unwrap();
+            check(libc::tcgetattr(self.master.as_raw_fd(), &mut t)).unwrap();
             t.c_lflag & libc::ICANON != 0 && t.c_lflag & libc::ECHO != 0
         }
     }
@@ -323,6 +331,7 @@ fn closing_the_window_detaches() {
     let w = world();
     let shim = w.shell();
     let mut term = w.attach("quiet-amber-otter", Size { rows: 24, cols: 80 });
+    term.attached();
     term.type_line("echo up-$((3+3))");
     term.expect("up-6");
     // Closing Terminal's window hangs up its terminal, and the kernel
@@ -335,10 +344,35 @@ fn closing_the_window_detaches() {
 }
 
 #[test]
+fn a_hangup_detaches_even_when_hangups_were_ignored() {
+    let w = world();
+    let shim = w.shell();
+    let mut cmd = w.vibe();
+    cmd.args(["attach", "quiet-amber-otter"]);
+    // As when whoever started it ignored SIGHUP, which children inherit.
+    // SAFETY: signal is async-signal-safe.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::signal(libc::SIGHUP, libc::SIG_IGN);
+            Ok(())
+        });
+    }
+    let mut term = Term::spawn(cmd, Size { rows: 24, cols: 80 });
+    term.attached();
+    assert_eq!(clients(&w), 1, "counted as attached once it's welcomed");
+    // SAFETY: a signal to the process this test started.
+    unsafe { libc::kill(term.child.id() as libc::pid_t, libc::SIGHUP) };
+    term.wait();
+    wait_until("the detach", || clients(&w) == 0);
+    assert!(alive(shim.pid));
+}
+
+#[test]
 fn the_programs_own_title_is_kept_out() {
     let w = world();
     let _shim = w.shell();
     let mut term = w.attach("quiet-amber-otter", Size { rows: 24, cols: 80 });
+    term.attached();
     term.type_line(r"printf '\033]0;stolen\007shown-%s\n' $((9*9))");
     term.expect("shown-81");
     assert!(!term.text().contains("\x1b]0;stolen"), "{:?}", term.text());
@@ -349,7 +383,7 @@ fn an_exit_is_reported_and_ends_the_attachment() {
     let w = world();
     let _shim = w.session(&["sh", "-c", "read x; exit 7"]);
     let mut term = w.attach("quiet-amber-otter", Size { rows: 24, cols: 80 });
-    term.expect("\x1b]0;");
+    term.attached();
     term.type_line("go");
     assert_eq!(term.wait(), Some(0));
     term.expect("[quiet-amber-otter exited with code 7]");
@@ -365,6 +399,7 @@ fn attach_works_while_vibed_is_down() {
         .env("VIBE_SOCKET", w.layout.home().join("no-vibed.sock"))
         .env("HOME", w.layout.home());
     let mut term = Term::spawn(cmd, Size { rows: 24, cols: 80 });
+    term.attached();
     term.type_line("echo direct-$((6+6))");
     term.expect("direct-12");
     term.type_bytes(b"\x1c");
@@ -421,8 +456,9 @@ fn ls_lists_sessions() {
         "2026-10-30T11:00:00Z",
     );
     let mut term = w.attach("quiet-amber-otter", Size { rows: 24, cols: 80 });
-    term.type_line("echo ready");
-    term.expect("ready");
+    term.attached();
+    term.type_line("echo ready-$((1+1))");
+    term.expect("ready-2");
     let out = w.vibe().arg("ls").output().unwrap();
     assert!(
         out.status.success(),

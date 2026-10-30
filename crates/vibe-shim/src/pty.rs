@@ -82,8 +82,9 @@ pub(crate) struct Pty {
 
 /// Makes this process, which must lead its session, own a new terminal of
 /// `size`, and starts `command` on it in `cwd` as the terminal's foreground
-/// process group. The caller ignores `SIGHUP`: it owns the terminal, and
-/// closing the master end, as a failed start does, hangs it up.
+/// process group. The caller ignores `SIGHUP`, as it owns the terminal and
+/// closing the master end, as a failed start does, hangs it up; and
+/// `SIGTTOU`, as it isn't the terminal's foreground.
 pub(crate) fn spawn(command: &[OsString], cwd: &Path, size: Size) -> io::Result<Pty> {
     let (master, slave) = open_pty(size)?;
     // SAFETY: we lead our session and have no controlling terminal yet; this
@@ -106,7 +107,6 @@ pub(crate) fn spawn(command: &[OsString], cwd: &Path, size: Size) -> io::Result<
             check(libc::setpgid(0, 0))?;
             libc::signal(libc::SIGTTOU, libc::SIG_IGN);
             check(libc::tcsetpgrp(0, libc::getpid()))?;
-            libc::signal(libc::SIGTTOU, libc::SIG_DFL);
             // The shim ignores hangups, and whoever started vibed may have
             // left others ignored; the command gets the defaults.
             for signal in [
@@ -116,6 +116,7 @@ pub(crate) fn spawn(command: &[OsString], cwd: &Path, size: Size) -> io::Result<
                 libc::SIGTERM,
                 libc::SIGTSTP,
                 libc::SIGTTIN,
+                libc::SIGTTOU,
             ] {
                 libc::signal(signal, libc::SIG_DFL);
             }

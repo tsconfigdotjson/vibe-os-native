@@ -346,7 +346,15 @@ pub(crate) fn attach(socket: &Path, agent: &str) -> Result<End, AttachError> {
     validate_ref(agent).map_err(AttachError::BadRef)?;
     let found = locate(socket, agent)?;
     // Caught before the size is read, so a resize in between isn't lost.
-    let signals = catch(&[libc::SIGWINCH, libc::SIGTERM, libc::SIGINT, libc::SIGQUIT])?;
+    // SIGHUP too: closing the window must detach even if whoever started
+    // this left hangups ignored.
+    let signals = catch(&[
+        libc::SIGWINCH,
+        libc::SIGHUP,
+        libc::SIGTERM,
+        libc::SIGINT,
+        libc::SIGQUIT,
+    ])?;
     let hello = Hello {
         protocol: PROTOCOL,
         role: Role::Attach,
@@ -409,8 +417,9 @@ pub(crate) fn attach(socket: &Path, agent: &str) -> Result<End, AttachError> {
         },
         End::Lost => format!("lost the session {agent}"),
     };
-    write!(stdout, "{RESET}{leave_alternate}\r\n[{said}]\r\n")?;
-    stdout.flush()?;
+    // After a hangup the terminal is gone; saying goodbye is best effort.
+    let _ = write!(stdout, "{RESET}{leave_alternate}\r\n[{said}]\r\n");
+    let _ = stdout.flush();
     Ok(end)
 }
 

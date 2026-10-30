@@ -317,6 +317,16 @@ fn detached(
     }
     // SAFETY: setting a signal's disposition has no memory effects.
     unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
+    // The shim is in the terminal's session but not its foreground, and its
+    // process group is orphaned. On macOS that makes its own ioctls on the
+    // terminal, such as a resize through the master, fail with EIO unless
+    // SIGTTOU is ignored; reading would do the same with SIGTTIN. The
+    // command gets both back at their defaults.
+    // SAFETY: as above.
+    unsafe {
+        libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+        libc::signal(libc::SIGTTIN, libc::SIG_IGN);
+    }
     let command: Vec<String> = options
         .command
         .iter()

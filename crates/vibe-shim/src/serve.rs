@@ -603,16 +603,18 @@ async fn connection(stream: UnixStream, events: mpsc::Sender<Event>, welcome: Ar
         }
         Err(e) => return refuse(&mut write, format!("expected a hello: {e}")).await,
     };
-    if write_frame(&mut write, &Frame::json(FrameKind::Welcome, &*welcome))
-        .await
-        .is_err()
-    {
-        return;
-    }
     let frames = spawn_reader(read);
     let result = match hello.role {
-        Role::Attach => attach(hello, frames, write, &events).await,
-        Role::Control => control(frames, write, &events).await,
+        Role::Attach => attach(hello, frames, write, &events, &welcome).await,
+        Role::Control => {
+            if write_frame(&mut write, &Frame::json(FrameKind::Welcome, &*welcome))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            control(frames, write, &events).await
+        }
     };
     if let Err(e) = result
         && !matches!(
@@ -633,13 +635,15 @@ async fn refuse(write: &mut OwnedWriteHalf, message: String) {
     let _ = write_frame(write, &Frame::json(FrameKind::Refused, &refused)).await;
 }
 
-/// An attach client: the redraw, then output both ways until it leaves or
-/// the command exits.
+/// An attach client: joined first, so it counts as attached and its size
+/// applies by the time it's welcomed; then the redraw, then output both
+/// ways until it leaves or the command exits.
 async fn attach(
     hello: Hello,
     mut frames: mpsc::Receiver<io::Result<Frame>>,
     mut write: OwnedWriteHalf,
     events: &mpsc::Sender<Event>,
+    welcome: &Welcome,
 ) -> io::Result<()> {
     let (reply, joined) = oneshot::channel();
     if events.send(Event::Attach { hello, reply }).await.is_err() {
@@ -649,6 +653,7 @@ async fn attach(
         return Ok(());
     };
     let result = async {
+        write_frame(&mut write, &Frame::json(FrameKind::Welcome, welcome)).await?;
         write_output(&mut write, &redraw).await?;
         loop {
             tokio::select! {
