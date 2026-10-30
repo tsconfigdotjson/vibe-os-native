@@ -33,7 +33,7 @@ v1 is one owner, one Mac, many agents. MCP matters most: the menu bar and Termin
 - Reaching ports inside `linux` VMs (dev servers, previews). Agents test from inside their VM.
 - A menu bar on any machine other than the host. Remote users drive agents over MCP and attach over SSH.
 - A browser desktop, a custom terminal emulator, or terminals other than Terminal.app.
-- File sandboxing for `macos` agents, or tracking and cleaning up what they install outside their worktree. They are trusted and only resource-limited; deleting one removes its worktree, nothing more. Work that needs containment belongs in `linux`.
+- File sandboxing for `macos` agents, or tracking and cleaning up what they install outside their worktree. They are trusted and only resource-limited. Deleting one removes everything VibeOS made for it (see Delete), but not what the agent installed elsewhere on the Mac. Work that needs containment belongs in `linux`.
 - Network egress filtering.
 - Custom VM images or Dockerfiles. The Linux template covers customization.
 - Multiple users or teams on one host.
@@ -113,7 +113,7 @@ An agent's life runs setup → start (worktree and compartment included) → wor
 5. **Attach.** Click the row and Terminal.app opens running `vibe attach <ref>`. If a tab is already attached, that tab is raised instead. Closing the window detaches; the agent keeps running.
 6. **Go idle.** About a minute after the agent comes to rest with nothing attached, it goes to sleep: a `linux` VM is saved to disk and its RAM freed, and a `macos` agent is frozen. A send or an attach wakes it exactly where it was, including mid-question.
 7. **Finish.** The agent commits, pushes and opens a PR itself, in either environment. It uses the Mac's `gh` login in `macos`, and the Linux home's in `linux`.
-8. **Delete.** `vibe_delete_agent` ends the agent and removes its worktree, compartment and snapshot. The branch is kept. Deletion is refused if there are uncommitted changes or unpushed commits, unless `force` is set. Nothing is deleted automatically.
+8. **Delete.** `vibe_delete_agent` ends the agent and removes everything VibeOS made for it: the worktree, its temp directory (the shim points `TMPDIR` at `~/VibeOS/agents/<ref>/tmp`), Claude's transcripts for that worktree, its scrollback, socket and record, and in `linux` its VM disk, Claude home and snapshot. The branch is kept. Deletion is refused if there are uncommitted changes or unpushed commits, unless `force` is set. Nothing is deleted automatically.
 9. **Reboot.** `vibed` starts at login and marks every agent `asleep`. A `linux` agent wakes from its snapshot exactly where it was; a spike confirmed snapshots survive a reboot. A `macos` agent's processes are gone, so it wakes by continuing its conversation with `claude --resume`.
 
 ## Architecture
@@ -306,7 +306,7 @@ MCP is the product. It keeps the shape of VibeOS's MCP, which already drives a w
 | `vibe_wait` | Blocks until an agent, or the first of several, answers the last send, not just until it's quiet. `background: true` also waits for commands it left running. Progress every 20 s and on every change; up to 240 s, default 120 | Same |
 | `vibe_read_messages` | The agent's last messages, from its transcript | Same |
 | `vibe_read_output` | The screen, plus what scrolled into history since an `after` cursor | Same |
-| `vibe_delete_agent` | Ends the agent and removes its worktree, compartment and snapshot. Keeps the branch. Refuses on uncommitted changes or unpushed commits unless `force` | Replaces `vibe_close_window` + `vibe_delete_workspace` |
+| `vibe_delete_agent` | Ends the agent and removes everything VibeOS made for it: worktree, temp directory, transcripts, scrollback, compartment and snapshot. Keeps the branch. Refuses on uncommitted changes or unpushed commits unless `force` | Replaces `vibe_close_window` + `vibe_delete_workspace` |
 
 **States.** As in VibeOS, an agent is `busy`, `idle`, `question` or `asleep`, plus `paused` (a limit hit) and `exited`. `question` covers any prompt waiting on an answer: a menu, a yes/no, a permission prompt. agent-tail's finer `activity` (`thinking`, `running_tool`, `awaiting_approval`, …) rides along for clients that want it. Frozen and saved-to-disk agents both show as `asleep`, because a send wakes either.
 
