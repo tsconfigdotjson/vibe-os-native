@@ -1,0 +1,4 @@
+{
+  "request": { "op": "connect", "port": 9 },
+  "reply": { "ok": false, "code": "connect_failed", "error": "nothing in the guest accepted vsock port 9: Connection reset by peer" }
+}

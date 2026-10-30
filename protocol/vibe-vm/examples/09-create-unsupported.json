@@ -1,0 +1,4 @@
+{
+  "command": ["create"],
+  "ready": { "ok": false, "code": "unsupported", "error": "this VM can't be saved and restored: Save/restore is not supported for this configuration" }
+}

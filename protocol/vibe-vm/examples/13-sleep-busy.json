@@ -1,0 +1,4 @@
+{
+  "request": { "op": "sleep", "balloon_ms": 2000, "balloon_floor": 805306368 },
+  "reply": { "ok": false, "code": "busy", "error": "the VM is already saving" }
+}

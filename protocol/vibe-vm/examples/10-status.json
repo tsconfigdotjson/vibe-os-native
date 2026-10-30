@@ -1,0 +1,4 @@
+{
+  "request": { "op": "status" },
+  "reply": { "ok": true, "protocol": 1, "ref": "quiet-amber-otter", "pid": 4243, "state": "running", "started": "restore" }
+}

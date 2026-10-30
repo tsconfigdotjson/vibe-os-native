@@ -1,0 +1,9 @@
+{
+  "request": { "op": "sleep", "balloon_ms": 0 },
+  "reply": {
+    "ok": true,
+    "snapshot": "/Users/me/VibeOS/snapshots/quiet-amber-otter",
+    "snapshot_bytes": 1170210816,
+    "timings": { "balloon_ms": 0, "pause_ms": 11, "save_ms": 3104, "stop_ms": 4, "total_ms": 3119 }
+  }
+}

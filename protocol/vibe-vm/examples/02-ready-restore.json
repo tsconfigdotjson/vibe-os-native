@@ -1,0 +1,4 @@
+{
+  "command": ["restore"],
+  "ready": { "ok": true, "protocol": 1, "pid": 4243, "started": "restore", "timings": { "restore_ms": 420, "resume_ms": 3, "total_ms": 455 } }
+}

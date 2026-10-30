@@ -1,0 +1,4 @@
+{
+  "command": ["boot"],
+  "ready": { "ok": false, "code": "already_running", "error": "another vibe-vm is already serving /Users/me/Library/Application Support/VibeOS/run/quiet-amber-otter.vm" }
+}

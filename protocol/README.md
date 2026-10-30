@@ -50,6 +50,10 @@ a real `vibe-shim` running `sleep`, and the records of two that exited:
 replays build that world in a temp directory and put its path in place of
 `/Users/me`.
 
+**`vibe-vm` has a contract of its own**, in `vibe-vm/`: the configuration
+`vibed` gives it, the line it prints as it starts, and its control socket.
+See [vibe-vm/README.md](vibe-vm/README.md).
+
 **Shims aren't in this contract.** Each session's `vibe-shim` serves
 `run/<ref>.sock` with a framed protocol of its own (`vibe_core::shim`),
 which only `vibe attach` and `vibed` speak. Clients find a session with

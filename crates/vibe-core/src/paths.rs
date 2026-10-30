@@ -113,6 +113,13 @@ impl Layout {
         self.run_dir().join(format!("{agent_ref}.sock"))
     }
 
+    /// The control socket of a `linux` agent's `vibe-vm`, while its VM runs.
+    /// It's `<ref>.vm`, not `.sock`, so a scan for sessions never takes it
+    /// for a shim's, and it's no longer than a session's socket.
+    pub fn vm_socket(&self, agent_ref: &str) -> PathBuf {
+        self.run_dir().join(format!("{agent_ref}.vm"))
+    }
+
     /// The default socket, the same path [`resolve_socket`] gives without
     /// overrides.
     pub fn socket(&self) -> PathBuf {
@@ -150,6 +157,32 @@ impl Layout {
 
     pub fn agent_dir(&self, agent_ref: &str) -> PathBuf {
         self.agents_dir().join(agent_ref)
+    }
+
+    /// A `linux` agent's VM configuration, fixed for its life.
+    pub fn vm_config(&self, agent_ref: &str) -> PathBuf {
+        self.agent_dir(agent_ref).join("vm.json")
+    }
+
+    /// Where a `linux` agent's guest console goes.
+    pub fn vm_console_log(&self, agent_ref: &str) -> PathBuf {
+        self.agent_dir(agent_ref).join("console.log")
+    }
+
+    /// A `linux` agent's `vibe-vm` log.
+    pub fn vm_log(&self, agent_ref: &str) -> PathBuf {
+        self.agent_dir(agent_ref).join("vibe-vm.log")
+    }
+
+    /// Sleeping `linux` agents' snapshots, which share the `snapshot_disk`
+    /// budget.
+    pub fn snapshots_dir(&self) -> PathBuf {
+        self.home.join("VibeOS/snapshots")
+    }
+
+    /// A sleeping `linux` agent's whole VM, RAM included.
+    pub fn snapshot(&self, agent_ref: &str) -> PathBuf {
+        self.snapshots_dir().join(agent_ref)
     }
 }
 
@@ -235,6 +268,17 @@ mod tests {
             l.session_socket("x"),
             p("/Users/u/Library/Application Support/VibeOS/run/x.sock")
         );
+        assert_eq!(
+            l.vm_socket("x"),
+            p("/Users/u/Library/Application Support/VibeOS/run/x.vm")
+        );
+        assert_eq!(l.vm_config("x"), p("/Users/u/VibeOS/agents/x/vm.json"));
+        assert_eq!(
+            l.vm_console_log("x"),
+            p("/Users/u/VibeOS/agents/x/console.log")
+        );
+        assert_eq!(l.vm_log("x"), p("/Users/u/VibeOS/agents/x/vibe-vm.log"));
+        assert_eq!(l.snapshot("x"), p("/Users/u/VibeOS/snapshots/x"));
     }
 
     #[test]
@@ -250,6 +294,20 @@ mod tests {
             l.session_socket("x"),
             p("/home/u/.local/share/vibeos/run/x.sock")
         );
+    }
+
+    #[test]
+    fn vm_sockets_never_look_like_sessions() {
+        // A session scan takes every `<ref>.sock` in run/; a VM's socket must
+        // not be one, whatever the ref, and must fit wherever a session's
+        // does.
+        let l = Layout::new("/h", "macos");
+        for r in ["a", "a.vm", "quiet-amber-otter"] {
+            let vm = l.vm_socket(r);
+            assert!(!vm.to_string_lossy().ends_with(".sock"), "{vm:?}");
+            assert_ne!(vm, l.session_socket(r));
+            assert!(vm.as_os_str().len() <= l.session_socket(r).as_os_str().len());
+        }
     }
 
     #[test]

@@ -1,0 +1,4 @@
+{
+  "command": ["boot"],
+  "ready": { "ok": false, "code": "boot_failed", "error": "can't start the VM: Internal Virtualization error. The virtual machine failed to start." }
+}

@@ -8,6 +8,13 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+vibe-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+libc.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

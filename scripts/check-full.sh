@@ -14,6 +14,13 @@
 #     including the Swift half of the Rust<->Swift contract test
 #   - ad hoc signing, with the virtualization entitlement on vibe-vm
 #   - vibe-vm check, signed and unsigned
+#   - the test guest for vibe-vm (scripts/test-guest.sh): Alpine's netboot
+#     kernel and initrd, plus vibe-testguest as PID 1
+#   - VMs through vibe-vm, as vibed drives them: boot, save and restore the
+#     test guest, on its own and three at once, within the spike's numbers
+#     (crates/vibe-env/tests/vm_cycle.rs). The check across a reboot is
+#     scripts/vm-reboot-test.sh, which can't run here. On a Mac that is
+#     itself a VM, such as a CI runner, this step is N/A: it can't nest VMs.
 #   - the Swift client against a live vibed
 #   - VibeOS.app launching and saying hello to a live vibed
 #
@@ -76,6 +83,10 @@ status_of() {
   echo NONE
 }
 
+# A step function that exits with this has nothing it can check here, and
+# says why on its last line: the step is N/A, not a pass.
+NOT_APPLICABLE=77
+
 # step <id> <description> <function> [<id it needs>...]
 step() {
   local id=$1 desc=$2 fn=$3 dep log start rc
@@ -95,6 +106,9 @@ step() {
   rc=$?
   if [ $rc -eq 0 ]; then
     record "$id" PASS "$desc ($((SECONDS - start))s)"
+  elif [ $rc -eq $NOT_APPLICABLE ]; then
+    record "$id" N/A "$desc: $(tail -n 1 "$log")"
+    echo "--  $id: not applicable: $(tail -n 1 "$log")"
   else
     record "$id" FAIL "$desc ($((SECONDS - start))s; log: build/check/$id.log)"
     echo "--- $id failed (exit $rc); the end of its log:"
@@ -179,6 +193,8 @@ s_guest() {
   case $info in *"ARM aarch64"*) ;; *) echo "not an aarch64 binary"; return 1 ;; esac
   case $info in *"statically linked"*) ;; *) echo "not statically linked"; return 1 ;; esac
 }
+
+s_test_guest() { scripts/test-guest.sh build/test-guest; }
 
 # Every crate type-checks for the hosts vibed runs on, whatever this machine
 # is. Checking needs each target's std but no linker, so it works anywhere.
@@ -327,6 +343,21 @@ s_vm_check() {
   case $out in *'"entitled":false'*) ;; *) echo "unsigned vibe-vm claims the entitlement"; return 1 ;; esac
 }
 
+s_vm_cycle() {
+  local marker="$WORK/vm-marker" t
+  # A Mac that is itself a VM (a CI runner) can't run nested VMs.
+  if [ "$(sysctl -n kern.hv_vmm_present 2>/dev/null || echo 0)" = 1 ]; then
+    echo "this Mac is a VM, so it can't run the test guest"
+    return $NOT_APPLICABLE
+  fi
+  rm -rf "$marker"
+  VIBE_VM_BIN="$ROOT/build/vibe-vm" VIBE_VM_GUEST="$ROOT/build/test-guest" VIBE_VM_MARKER="$marker" \
+    cargo test -p vibe-env --locked --test vm_cycle -- --test-threads=1 --nocapture
+  for t in boot_save_restore three_vms_at_once; do
+    [ -f "$marker/$t" ] || { echo "$t was skipped, not run"; return 1; }
+  done
+}
+
 s_live_contract() {
   local log="$WORK/live-vibed.log" marker="$WORK/live-marker"
   start_vibed "$WORK/live/run/vibed.sock" "$log"
@@ -360,6 +391,7 @@ step clippy "cargo clippy, warnings denied" s_clippy
 step build "cargo build" s_build
 step test "cargo test (incl. the Rust contract tests)" s_test
 step guest "vibe-guest: static aarch64-unknown-linux-musl" s_guest
+mac_step test-guest "test guest for vibe-vm: kernel, initrd, modloop" s_test_guest
 step cross "cargo check for macOS and Linux, arm64 and x86_64" s_cross
 step smoke "vibed hello world via vibe hello and vibe rpc" s_smoke build
 step registry "registry via vibe rpc survives a vibed restart" s_registry build
@@ -370,6 +402,7 @@ mac_step swift-vm-build "swift build swift/vibe-vm" s_swift_vm_build
 mac_step swift-vm-test "swift test swift/vibe-vm" s_swift_vm_test swift-vm-build
 mac_step sign "ad hoc signing; vibe-vm gets the virtualization entitlement" s_sign swift-app-build swift-vm-build
 mac_step vm-check "vibe-vm check, signed and unsigned" s_vm_check sign
+mac_step vm-cycle "vibe-vm boots, saves and restores the test guest" s_vm_cycle sign test-guest
 mac_step live-contract "Swift client against a live vibed" s_live_contract build swift-app-test
 mac_step app-launch "VibeOS.app launches and says hello to vibed" s_app_launch build sign
 
@@ -377,11 +410,13 @@ echo
 echo "================================ summary ================================"
 failed=0
 skipped=0
+na=0
 for i in "${!IDS[@]}"; do
   printf '%-5s %-16s %s\n' "${STATUS[$i]}" "${IDS[$i]}" "${NOTES[$i]}"
   case ${STATUS[$i]} in
     FAIL) failed=$((failed + 1)) ;;
     SKIP) skipped=$((skipped + 1)) ;;
+    N/A) na=$((na + 1)) ;;
   esac
 done
 echo "========================================================================="
@@ -393,6 +428,8 @@ elif [ "$OS" = Darwin ] && [ $skipped -gt 0 ]; then
   exit 1
 elif [ $skipped -gt 0 ]; then
   echo "PASS on $OS: $skipped macOS-only steps skipped; run this on a Mac for those."
+elif [ $na -gt 0 ]; then
+  echo "PASS, but $na steps had nothing to check on this machine (N/A above)."
 else
   echo "PASS: every step ran and passed."
 fi

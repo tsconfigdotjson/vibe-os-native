@@ -1,0 +1,4 @@
+{
+  "command": ["boot"],
+  "ready": { "ok": true, "protocol": 1, "pid": 4242, "started": "boot", "timings": { "start_ms": 380, "total_ms": 412 } }
+}
