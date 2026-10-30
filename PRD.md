@@ -497,7 +497,7 @@ Only transcripts of agents this app spawned are read. agent-tail is fed specific
 
 ### Going to sleep
 
-**Idle** means all of these hold. The agent-tail fields named here are from v0.1 plus agent-tail#120, #121, #122 and #127, all merged; `vibe-status` pins agent-tail to a commit that includes them (`19f9213`, or a tag once there is one).
+**Idle** means all of these hold. The agent-tail fields named here are from v0.1 plus agent-tail#120, #121, #122, #127 and #130, all merged; `vibe-status` pins agent-tail to a commit that includes them (`0b5c3f6`, or a tag once there is one).
 
 - **At rest.** agent-tail reports a firm `done`, `interrupted`, `errored` or `awaiting_answer`. Its firm states already rule out subagents and background tasks, which show as `background_work`.
 - **Permission prompts.** Claude Code records a permission prompt only as an *inferred* `awaiting_approval`, after the transcript has been unchanged for 20 s. Sleep is exact, so a prompt is safe to sleep on, but a long silent tool run could look the same. So an inferred awaiting state counts as at rest only after a longer quiet period (5 min), with no extra processes in the tree and its CPU near zero.
@@ -614,11 +614,7 @@ Two fixes for the base image came out of it. Claude warns when it runs from outs
 
 ## Open questions
 
-None of these block building.
-
-| # | Question | Recommendation | Why |
-| --- | --- | --- | --- |
-| 1 | Any cron fire clears every one-shot cron job, not just the one that fired, because Claude's fire record has no reliable job id | Fix upstream in agent-tail: clear only one-shots whose `cron` and `prompt` match the fire record ([agent-tail#130](https://github.com/tsconfigdotjson/agent-tail/issues/130)) | Otherwise an agent with one-shots at 2pm and 3pm, and nothing recurring, may sleep after the 2pm run and miss 3pm. Rare, and no worse than before #127 |
+None. The last one, one-shot cron jobs being cleared by an unrelated fire, was fixed upstream in agent-tail#130.
 
 **Decided (2026-10-29 and 2026-10-30):**
 
@@ -653,7 +649,7 @@ None of these block building.
 
 *Status and sleep*
 
-- agent-tail is a git dependency pinned to a commit that includes #120, #121, #122 and #127 (`19f9213`), until it has tags.
+- agent-tail is a git dependency pinned to a commit that includes #120, #121, #122, #127 and #130 (`0b5c3f6`), until it has tags.
 - Idle is decided by agent-tail's state (including `pending_wakeups` and `stop_reason`) plus a process-tree check and a 60 s debounce. `claude --resume` is only for crashes, reboots of `macos` or Linux hosts, and dropped snapshots.
 - An agent stopped by a Claude usage limit sleeps like any idle agent.
 - An agent with an inferred `awaiting_approval` (a permission prompt) sleeps after 5 min quiet, with no extra processes and CPU near zero.
