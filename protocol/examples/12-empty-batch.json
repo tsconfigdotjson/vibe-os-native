@@ -1,0 +1,5 @@
+{
+  "description": "An empty batch is an invalid request.",
+  "request": [],
+  "response": { "jsonrpc": "2.0", "id": null, "error": { "code": -32600, "message": "Invalid Request" } }
+}

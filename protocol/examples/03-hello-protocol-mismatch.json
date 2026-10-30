@@ -1,0 +1,13 @@
+{
+  "description": "A client on another protocol version is refused, and told the daemon's.",
+  "request": { "jsonrpc": "2.0", "id": 2, "method": "daemon.hello", "params": { "client": "vibe-cli", "protocol": 2 } },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 2,
+    "error": {
+      "code": -32000,
+      "message": "Protocol version mismatch: the client speaks 2, vibed speaks 1",
+      "data": { "protocol": 1 }
+    }
+  }
+}

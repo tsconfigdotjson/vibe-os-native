@@ -1,0 +1,13 @@
+[package]
+name = "vibe-guest"
+description = "PID 1 inside each linux agent VM; a static aarch64 musl binary"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

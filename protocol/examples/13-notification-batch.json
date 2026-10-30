@@ -1,0 +1,7 @@
+{
+  "description": "A batch of only notifications gets no response at all.",
+  "request": [
+    { "jsonrpc": "2.0", "method": "daemon.hello", "params": { "client": "vibe-cli", "protocol": 1 } }
+  ],
+  "response": null
+}

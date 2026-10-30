@@ -1,0 +1,9 @@
+{
+  "description": "Params are always by name; an array is invalid params.",
+  "request": { "jsonrpc": "2.0", "id": 7, "method": "daemon.hello", "params": ["vibe-cli", 1] },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 7,
+    "error": { "code": -32602, "message": "Invalid params: params must be an object" }
+  }
+}
