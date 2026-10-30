@@ -3,11 +3,12 @@
 //! the registry, host limits, API keys, the `gh` login check and the event
 //! stream.
 
-use std::ffi::OsString;
+use std::collections::HashSet;
+use std::ffi::{OsStr, OsString};
 use std::fs::{DirBuilder, File, OpenOptions, TryLockError};
 use std::io;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-use std::path::PathBuf;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -16,7 +17,7 @@ use vibe_core::keys;
 use vibe_core::limits::{self, LimitsError};
 use vibe_core::model::{
     Environment, EventKind, GhState, GithubRepo, LOCAL_HOST, Profile, ProjectSource,
-    starter_profiles, validate_name,
+    starter_profiles, validate_key_name, validate_name,
 };
 use vibe_core::paths::Layout;
 use vibe_core::rpc::{
@@ -81,18 +82,40 @@ impl std::fmt::Debug for Config {
 }
 
 impl Config {
-    /// The real thing: the system clock, the OS's randomness and the `gh` on
-    /// `PATH`.
+    /// The real thing: the system clock, the OS's randomness and the `gh`
+    /// [`find_program`] finds.
     pub fn new(info: DaemonInfo, layout: Layout) -> Self {
         Config {
             info,
             label: hostname(),
             layout,
-            gh: "gh".into(),
+            gh: find_program("gh", std::env::var_os("PATH").as_deref()),
             clock: Arc::new(vibe_core::time::now),
             entropy: Arc::new(keys::random_bytes),
         }
     }
+}
+
+/// Where Homebrew puts programs, on Apple Silicon and on Intel. launchd
+/// starts `vibed` with a `PATH` of only the system directories, so these are
+/// searched too.
+const EXTRA_BIN_DIRS: [&str; 2] = ["/opt/homebrew/bin", "/usr/local/bin"];
+
+/// The first executable `name` on `path`, then in [`EXTRA_BIN_DIRS`]; or
+/// just `name` if there's none, so running it fails with a clear error.
+pub fn find_program(name: &str, path: Option<&OsStr>) -> OsString {
+    let dirs = path
+        .map(|p| std::env::split_paths(p).collect::<Vec<_>>())
+        .unwrap_or_default();
+    dirs.iter()
+        .map(PathBuf::as_path)
+        .chain(EXTRA_BIN_DIRS.iter().map(Path::new))
+        .map(|d| d.join(name))
+        .find(|p| {
+            std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        })
+        .map(PathBuf::into_os_string)
+        .unwrap_or_else(|| name.into())
 }
 
 fn hostname() -> String {
@@ -158,9 +181,10 @@ pub struct Core {
     store: Mutex<Store>,
     /// One `host.toml` edit at a time.
     limits_lock: Mutex<()>,
-    /// One project add at a time: a clone can take minutes, and two adds of
-    /// the same repo must not race for its directory.
-    adding: tokio::sync::Mutex<()>,
+    /// Names of projects being added. A clone can take minutes; meanwhile
+    /// no other add may take its name or its directory, but other adds go
+    /// ahead.
+    adding: Mutex<HashSet<String>>,
     events: EventBus,
     gh_status: Mutex<GhStatus>,
     _state_lock: File,
@@ -223,6 +247,7 @@ impl Core {
                 path: dir.clone(),
                 source,
             })?;
+        make_private(&dir)?;
         let lock_path = dir.join("vibed.lock");
         let state_lock = OpenOptions::new()
             .create(true)
@@ -260,7 +285,7 @@ impl Core {
             entropy: config.entropy,
             store: Mutex::new(store),
             limits_lock: Mutex::new(()),
-            adding: tokio::sync::Mutex::new(()),
+            adding: Mutex::new(HashSet::new()),
             events: EventBus {
                 tx,
                 last: Mutex::new(0),
@@ -332,11 +357,12 @@ impl Core {
         (*last, self.events.tx.subscribe())
     }
 
-    /// What a subscriber gets in place of `missed` events it was too slow
-    /// for. It isn't numbered: it's for that subscriber alone.
-    pub fn lagged(&self, missed: u64) -> Event {
+    /// What a subscriber gets in place of the `missed` events it was too
+    /// slow for, the last of which was `last_missed`. It takes that `seq`, so
+    /// the subscriber's `seq`s still only go up.
+    pub fn lagged(&self, missed: u64, last_missed: u64) -> Event {
         let mut e = self.event(EventKind::Lagged);
-        e.seq = *lock(&self.events.last);
+        e.seq = last_missed;
         e.message = Some(format!("missed {missed} events; read everything again"));
         e
     }
@@ -360,12 +386,12 @@ impl Core {
     /// host's starter profiles.
     pub async fn add_project(&self, p: ProjectAddParams) -> Result<Project, ErrorObject> {
         let host = self.host(p.host.as_deref())?;
-        let _one_at_a_time = self.adding.lock().await;
+        let _reserved;
         let new = match (p.repo, p.path) {
             (Some(repo), None) => {
                 let repo = GithubRepo::parse(&repo).map_err(invalid)?;
                 let name = p.name.unwrap_or_else(|| repo.name.clone());
-                self.check_new_project(host, &name)?;
+                _reserved = self.reserve_project(host, &name)?;
                 let dest = self.layout.projects_dir().join(&name);
                 let path = projects::github_clone(&self.gh, &repo, &dest).await?;
                 NewProject {
@@ -385,7 +411,7 @@ impl Core {
                         .map(|n| n.to_string_lossy().into_owned())
                         .unwrap_or_default(),
                 };
-                self.check_new_project(host, &name)?;
+                _reserved = self.reserve_project(host, &name)?;
                 NewProject {
                     host: host.into(),
                     name,
@@ -408,17 +434,30 @@ impl Core {
         Ok(project)
     }
 
+    /// Holds `name` for a new project until the returned value is dropped.
     /// Fails early, before any cloning, if `name` can't be a new project.
-    fn check_new_project(&self, host: &str, name: &str) -> Result<(), ErrorObject> {
+    fn reserve_project(&self, host: &str, name: &str) -> Result<Reserved<'_>, ErrorObject> {
         validate_name("project", name).map_err(invalid)?;
         match self.store().project(host, name) {
-            Ok(_) => Err(error(
-                ErrorCode::Conflict,
-                format!("a project named {name} already exists on {host}"),
-            )),
-            Err(StoreError::NotFound(_)) => Ok(()),
-            Err(e) => Err(store_error(e)),
+            Ok(_) => {
+                return Err(error(
+                    ErrorCode::Conflict,
+                    format!("a project named {name} already exists on {host}"),
+                ));
+            }
+            Err(StoreError::NotFound(_)) => {}
+            Err(e) => return Err(store_error(e)),
         }
+        if !lock(&self.adding).insert(name.to_owned()) {
+            return Err(error(
+                ErrorCode::Conflict,
+                format!("a project named {name} is being added already"),
+            ));
+        }
+        Ok(Reserved {
+            core: self,
+            name: name.to_owned(),
+        })
     }
 
     /// Forgets a project and its profiles; its files stay on disk.
@@ -534,7 +573,7 @@ impl Core {
     }
 
     pub fn create_key(&self, p: KeyCreateParams) -> Result<KeyCreated, ErrorObject> {
-        validate_name("key", &p.name).map_err(invalid)?;
+        validate_key_name(&p.name).map_err(invalid)?;
         let bytes = (self.entropy)().map_err(|e| {
             error(
                 ErrorCode::InternalError,
@@ -644,5 +683,70 @@ impl Core {
     /// The label this host goes by.
     pub fn label(&self) -> &str {
         &self.label
+    }
+}
+
+/// A project name held by an add in progress.
+struct Reserved<'a> {
+    core: &'a Core,
+    name: String,
+}
+
+impl Drop for Reserved<'_> {
+    fn drop(&mut self) {
+        lock(&self.core.adding).remove(&self.name);
+    }
+}
+
+/// Makes `dir` private to this user if it's this user's, and refuses it if
+/// it's someone else's: it holds the registry and the API key hashes.
+fn make_private(dir: &Path) -> Result<(), OpenError> {
+    let io = |what, source| OpenError::Io {
+        what,
+        path: dir.to_owned(),
+        source,
+    };
+    let meta = std::fs::metadata(dir).map_err(|e| io("read", e))?;
+    // SAFETY: geteuid has no preconditions and can't fail.
+    if meta.uid() != unsafe { libc::geteuid() } {
+        return Err(io(
+            "use",
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("it belongs to uid {}", meta.uid()),
+            ),
+        ));
+    }
+    if meta.permissions().mode() & 0o077 != 0 {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| io("make private", e))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn programs_are_found_on_path_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (a, b) = (tmp.path().join("a"), tmp.path().join("b"));
+        for d in [&a, &b] {
+            std::fs::create_dir(d).unwrap();
+        }
+        std::fs::write(a.join("tool"), "").unwrap(); // not executable
+        std::fs::write(b.join("tool"), "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(b.join("tool"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = std::env::join_paths([&a, &b]).unwrap();
+        assert_eq!(
+            find_program("tool", Some(&path)),
+            b.join("tool").into_os_string()
+        );
+        assert_eq!(
+            find_program("vibe-no-such-tool", Some(&path)),
+            "vibe-no-such-tool"
+        );
+        assert_eq!(find_program("vibe-no-such-tool", None), "vibe-no-such-tool");
     }
 }

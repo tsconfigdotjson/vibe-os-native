@@ -27,24 +27,45 @@ fn failed(message: String) -> ErrorObject {
     ErrorObject::new(ErrorCode::CommandFailed, message)
 }
 
-/// Runs a command with no terminal to prompt on, and gives up after
-/// `timeout`.
+/// Kills a process group when dropped, unless disarmed: `gh repo clone`
+/// runs `git clone`, which must not outlive a clone that was given up on.
+struct GroupKiller(Option<i32>);
+
+impl Drop for GroupKiller {
+    fn drop(&mut self) {
+        if let Some(pgid) = self.0 {
+            // SAFETY: killpg has no memory-safety preconditions; at worst the
+            // group is already gone and it fails with ESRCH.
+            unsafe { libc::killpg(pgid, libc::SIGKILL) };
+        }
+    }
+}
+
+/// Runs a command with no terminal to prompt on, in a process group of its
+/// own, and gives up after `timeout`. Giving up, or dropping the future,
+/// kills the command and everything it started.
 async fn run(program: &OsStr, args: &[&OsStr], timeout: Duration) -> io::Result<Output> {
     let child = Command::new(program)
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GH_PROMPT_DISABLED", "1")
         .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
         .kill_on_drop(true)
-        .output();
-    tokio::time::timeout(timeout, child)
-        .await
-        .unwrap_or_else(|_| {
-            Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!("it didn't finish in {}s", timeout.as_secs()),
-            ))
-        })
+        .spawn()?;
+    let mut killer = GroupKiller(child.id().and_then(|id| i32::try_from(id).ok()));
+    match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(out) => {
+            killer.0 = None;
+            out
+        }
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("it didn't finish in {}s", timeout.as_secs()),
+        )),
+    }
 }
 
 /// The last thing a failed command said, in a line.
@@ -160,8 +181,13 @@ pub async fn github_clone(
             Ok(o) => failed(format!("gh repo clone {repo} failed: {}", last_words(&o))),
         });
     }
-    fs::rename(&partial, dest)
-        .map_err(|e| failed(format!("can't move the clone to {}: {e}", dest.display())))?;
+    if let Err(e) = fs::rename(&partial, dest) {
+        let _ = fs::remove_dir_all(&partial);
+        return Err(failed(format!(
+            "can't move the clone to {}: {e}",
+            dest.display()
+        )));
+    }
     utf8(fs::canonicalize(dest).map_err(|e| failed(format!("{}: {e}", dest.display())))?)
 }
 
@@ -209,6 +235,38 @@ mod tests {
         fs::write(&file, "").unwrap();
         let file = local_repo(file.to_str().unwrap()).await.unwrap_err();
         assert!(file.message.contains("isn't a directory"), "{file}");
+    }
+
+    #[tokio::test]
+    async fn giving_up_kills_everything_the_command_started() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pidfile = tmp.path().join("pid");
+        // Like gh running git: a child that would outlive its parent.
+        let script = format!("sleep 30 & echo $! > {}; wait", pidfile.display());
+        let started = std::time::Instant::now();
+        let err = run(
+            OsStr::new("/bin/sh"),
+            &[OsStr::new("-c"), OsStr::new(&script)],
+            Duration::from_millis(300),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let pid: i32 = fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        // SAFETY: signal 0 only checks that the process exists.
+        while unsafe { libc::kill(pid, 0) } == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the grandchild outlived the timeout"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     #[tokio::test]

@@ -212,6 +212,22 @@ pub fn validate_name(what: &str, name: &str) -> Result<(), String> {
     }
 }
 
+/// API key names are only shown, never used as paths: anything printable up
+/// to 100 characters, such as "laptop Claude Code".
+pub fn validate_key_name(name: &str) -> Result<(), String> {
+    let ok = !name.trim().is_empty()
+        && name.trim() == name
+        && name.chars().count() <= 100
+        && !name.chars().any(char::is_control);
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "`{name}` isn't a valid key name: use up to 100 printable characters, not starting or ending with a space"
+        ))
+    }
+}
+
 /// A GitHub repo as `owner/name`. A trailing `.git` is dropped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GithubRepo {
@@ -228,7 +244,16 @@ impl GithubRepo {
             && owner.len() <= 39
             && !owner.starts_with('-')
             && owner.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
-        if !owner_ok || validate_name("repo", name).is_err() {
+        // GitHub's rule for repo names, which unlike project names may start
+        // with a dot, as in `owner/.github`.
+        let name_ok = !name.is_empty()
+            && name.len() <= 100
+            && name != "."
+            && name != ".."
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+        if !owner_ok || !name_ok {
             return Err(bad());
         }
         Ok(GithubRepo {
@@ -332,11 +357,35 @@ mod tests {
     }
 
     #[test]
+    fn key_names() {
+        for ok in [
+            "laptop",
+            "laptop Claude Code",
+            "CI (staging) ✓",
+            &"k".repeat(100),
+        ] {
+            assert_eq!(validate_key_name(ok), Ok(()), "{ok}");
+        }
+        for bad in [
+            "",
+            " ",
+            " laptop",
+            "laptop ",
+            "a\nb",
+            "a\tb",
+            &"k".repeat(101),
+        ] {
+            assert!(validate_key_name(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
     fn github_repos() {
         let r = GithubRepo::parse("tsconfigdotjson/vibe-os-native.git").unwrap();
         assert_eq!(r.to_string(), "tsconfigdotjson/vibe-os-native");
+        assert_eq!(GithubRepo::parse("me/.github").unwrap().name, ".github");
         for bad in [
-            "", "x", "/x", "x/", "a/b/c", "a b/c", "-a/b", "a/.git", "a/..", "a/.b",
+            "", "x", "/x", "x/", "a/b/c", "a b/c", "-a/b", "a/.git", "a/..", "a/.", "a/b c",
         ] {
             assert!(GithubRepo::parse(bad).is_err(), "{bad}");
         }

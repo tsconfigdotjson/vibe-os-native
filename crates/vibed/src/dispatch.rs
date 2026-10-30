@@ -20,13 +20,14 @@ pub struct Session {
     subscribed: bool,
     /// A subscription made by the last message, for the connection to start
     /// forwarding once that message's response is out.
-    new_subscription: Option<broadcast::Receiver<Event>>,
+    new_subscription: Option<(u64, broadcast::Receiver<Event>)>,
 }
 
 impl Session {
-    /// The subscription the last message made, if it made one. Events
-    /// published since are waiting in it.
-    pub fn take_subscription(&mut self) -> Option<broadcast::Receiver<Event>> {
+    /// The subscription the last message made, if it made one, and the
+    /// `seq` of the last event before it. Events published since are waiting
+    /// in it.
+    pub fn take_subscription(&mut self) -> Option<(u64, broadcast::Receiver<Event>)> {
         self.new_subscription.take()
     }
 }
@@ -158,7 +159,7 @@ async fn call(
             }
             let (seq, rx) = core.subscribe();
             session.subscribed = true;
-            session.new_subscription = Some(rx);
+            session.new_subscription = Some((seq, rx));
             encode_result(Ok(Subscribed { seq }))
         }
         _ => Err(ErrorObject::new(

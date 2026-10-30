@@ -20,6 +20,10 @@ use vibe_core::rpc::{ErrorCode, ErrorObject, Event, EventNotice, Id, Request, Re
 use crate::core::Core;
 use crate::dispatch::{self, Session};
 
+/// How long a closing connection may take to send what's queued to a client
+/// that has stopped reading, before it's dropped.
+const FLUSH_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Lines queued for a connection's writer. When a client stops reading, its
 /// queue fills, and then its events lag rather than pile up.
 const QUEUE: usize = 64;
@@ -216,15 +220,28 @@ async fn connection(stream: UnixStream, core: Arc<Core>, max_bytes: usize) -> io
     let writer = tokio::spawn(write_lines(write, rx));
     let mut forwarder = None;
     let read_result = read_messages(read, &core, max_bytes, &tx, &mut forwarder).await;
-    if let Some((closing, task)) = forwarder {
+    if let Some((closing, mut task)) = forwarder {
         // Events already waiting, such as those the last message caused,
         // still go out; then the forwarder stops.
         let _ = closing.send(());
-        let _ = task.await;
+        if tokio::time::timeout(FLUSH_TIMEOUT, &mut task)
+            .await
+            .is_err()
+        {
+            task.abort();
+        }
     }
-    // The writer sends what's queued, then ends once every sender is gone.
+    // The writer sends what's queued, then ends once every sender is gone;
+    // unless the client has stopped reading, which mustn't keep it forever.
     drop(tx);
-    let write_result = writer.await.unwrap_or_else(|e| Err(io::Error::other(e)));
+    let mut writer = writer;
+    let write_result = match tokio::time::timeout(FLUSH_TIMEOUT, &mut writer).await {
+        Ok(joined) => joined.unwrap_or_else(|e| Err(io::Error::other(e))),
+        Err(_) => {
+            writer.abort();
+            Ok(())
+        }
+    };
     read_result.and(write_result).or_else(|e| {
         // A client that goes away mid-reply is a normal end, not an error.
         match e.kind() {
@@ -283,9 +300,15 @@ async fn read_messages(
             // The writer is gone: the client stopped listening.
             return Ok(());
         }
-        if let Some(events) = session.take_subscription() {
+        if let Some((seq, events)) = session.take_subscription() {
             let (closing, closed) = oneshot::channel();
-            let task = tokio::spawn(forward_events(events, closed, core.clone(), tx.clone()));
+            let task = tokio::spawn(forward_events(
+                seq,
+                events,
+                closed,
+                core.clone(),
+                tx.clone(),
+            ));
             *forwarder = Some((closing, task));
         }
         if !complete {
@@ -294,9 +317,10 @@ async fn read_messages(
     }
 }
 
-/// Sends each event as an `events.event` notification. Once `closed`
-/// fires, it sends the events already waiting and stops.
+/// Sends each event as an `events.event` notification, starting after
+/// `seq`. Once `closed` fires, it sends the events already waiting and stops.
 async fn forward_events(
+    mut seq: u64,
     mut events: broadcast::Receiver<Event>,
     mut closed: oneshot::Receiver<()>,
     core: Arc<Core>,
@@ -308,7 +332,7 @@ async fn forward_events(
         let event = if closing {
             match events.try_recv() {
                 Ok(e) => e,
-                Err(TryRecvError::Lagged(missed)) => core.lagged(missed),
+                Err(TryRecvError::Lagged(missed)) => core.lagged(missed, seq + missed),
                 Err(TryRecvError::Empty | TryRecvError::Closed) => return,
             }
         } else {
@@ -316,7 +340,7 @@ async fn forward_events(
                 biased;
                 received = events.recv() => match received {
                     Ok(e) => e,
-                    Err(RecvError::Lagged(missed)) => core.lagged(missed),
+                    Err(RecvError::Lagged(missed)) => core.lagged(missed, seq + missed),
                     Err(RecvError::Closed) => return,
                 },
                 _ = &mut closed => {
@@ -325,6 +349,7 @@ async fn forward_events(
                 }
             }
         };
+        seq = event.seq;
         let line = dispatch::encode(&Request::notification::<EventNotice>(&event));
         if tx.send(line).await.is_err() {
             return;

@@ -121,6 +121,86 @@ fn the_state_directory_is_private() {
     assert_eq!(mode(&core.layout().db()), 0o600);
 }
 
+#[test]
+fn an_existing_state_directory_is_made_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let golden = Golden::new();
+    let dir = Layout::new(&golden.home, "macos").data_dir();
+    fs::create_dir_all(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+    let _core = golden.core();
+    assert_eq!(
+        fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+}
+
+/// A clone that takes a while holds its name, but nothing else.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slow_clone_holds_only_its_own_name() {
+    let golden = Golden::new();
+    let slow = golden
+        .dir
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join("bin/slow-gh");
+    let marker = golden.dir.path().join("cloning");
+    common::write_script(
+        &slow,
+        &format!(
+            "#!/bin/sh\ntouch {}\nsleep 3\necho 'GraphQL: Could not resolve' >&2\nexit 1\n",
+            marker.display()
+        ),
+    );
+    let mut config = golden.config();
+    config.gh = slow.into();
+    let core = Arc::new(Core::open(config).unwrap());
+    let server = serve(core, tempfile::tempdir().unwrap(), MAX_MESSAGE_BYTES);
+    let mut cloning = Conn::open(&server.path).await;
+    let mut other = Conn::open(&server.path).await;
+    cloning
+        .send(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"projects.add\",\"params\":{\"repo\":\"me/web\"}}\n")
+        .await;
+    while !marker.exists() {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let started = std::time::Instant::now();
+    let same = other.call("projects.add", json!({"repo": "me/web"})).await;
+    assert_eq!(code(&same), -32002);
+    assert_eq!(
+        same["error"]["message"],
+        "a project named web is being added already"
+    );
+    let app = other
+        .call("projects.add", json!({"path": golden.home.join("src/app")}))
+        .await;
+    assert_eq!(ok(&app)["name"], "app");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the local add waited for the clone"
+    );
+    // Once the clone fails, the name is free again.
+    assert_eq!(code(&cloning.reply().await), -32004);
+    let again = other
+        .call(
+            "projects.add",
+            json!({"path": golden.home.join("src/app"), "name": "web"}),
+        )
+        .await;
+    assert_eq!(
+        code(&again),
+        -32002,
+        "same path, but the name is free: {again}"
+    );
+    assert!(
+        again["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("already the project app")
+    );
+}
+
 #[tokio::test]
 async fn a_linux_host_starts_projects_with_one_profile_and_no_macos() {
     let tmp = tempfile::tempdir().unwrap();
@@ -454,8 +534,16 @@ async fn key_secrets_are_never_stored() {
         name: "laptop".into(),
     });
     assert_eq!(dup.unwrap_err().code, -32002);
-    let bad = core.create_key(vibe_core::rpc::KeyCreateParams { name: "a b".into() });
-    assert_eq!(bad.unwrap_err().code, -32602);
+    // Key names are for people: spaces are fine, blank ones and line
+    // breaks aren't.
+    let spaced = core.create_key(vibe_core::rpc::KeyCreateParams {
+        name: "laptop Claude Code".into(),
+    });
+    assert_eq!(spaced.unwrap().key.name, "laptop Claude Code");
+    for name in ["", " ", "a\nb"] {
+        let bad = core.create_key(vibe_core::rpc::KeyCreateParams { name: name.into() });
+        assert_eq!(bad.unwrap_err().code, -32602, "{name:?}");
+    }
 }
 
 #[tokio::test]
@@ -494,7 +582,7 @@ async fn gh_logging_out_is_an_event() {
     let (_, mut events) = core.subscribe();
     // Swap in a gh that says it's logged out.
     let script = "#!/bin/sh\necho 'You are not logged into any GitHub hosts. To log in, run: gh auth login' >&2\nexit 1\n";
-    fs::write(&golden.gh, script).unwrap();
+    common::write_script(&golden.gh, script);
     let status = core.check_gh().await;
     assert_eq!(status.state, GhState::LoggedOut);
     let e = events.try_recv().unwrap();

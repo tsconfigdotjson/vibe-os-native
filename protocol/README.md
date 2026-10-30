@@ -54,10 +54,19 @@ with Linux hosts (#16).
 **Units.** Sizes are bytes and durations are seconds, as integers. Only
 `host.toml` writes them as `"4G"` and `"60s"`. Times are RFC 3339 in UTC.
 
+**Hello.** `daemon.hello` is how a client checks it speaks the daemon's
+protocol version. Clients send it first on a connection they keep; the
+daemon doesn't require it, so one-call clients (`vibe hello`, the Swift
+`VibedClient`, which opens a connection per call) can make a call directly.
+
 **Events.** After `events.subscribe` answers, that connection also gets an
 `events.event` notification (no `id`) for every event, in `seq` order,
-interleaved with the responses to its own calls. Use a connection of its own
-for it. A subscriber that falls too far behind gets a `lagged` event in place
-of what it missed, and should read everything again. When the client closes
+interleaved with the responses to its own calls. An event a call causes may
+arrive before that call's response, so match responses by `id`, or better,
+use a connection of its own for events. A subscriber that falls too far
+behind gets a `lagged` event in place of what it missed, carrying the `seq`
+of the last event it missed, and should read everything again. `seq`s only
+go up. When the client closes
 its end, events already due to it, such as those its last call caused, are
-sent before the daemon closes.
+sent before the daemon closes; a client that has stopped reading gets 10 s
+for that.

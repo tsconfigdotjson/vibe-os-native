@@ -22,7 +22,7 @@ async fn dispatcher_answers_every_example_exactly() {
             .map(|s| serde_json::from_str::<Value>(&s).unwrap())
             .unwrap_or(Value::Null);
         assert_eq!(got, ex.response, "{}", ex.name);
-        if let Some(rx) = session.take_subscription() {
+        if let Some((_, rx)) = session.take_subscription() {
             events = Some(rx);
         }
         let mut sent = Vec::new();

@@ -11,7 +11,14 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use toml_edit::{DocumentMut, Item, Value};
 
-use crate::units::{GIB, format_duration, format_size, parse_duration, parse_size};
+use crate::units::{GIB, TIB, format_duration, format_size, parse_duration, parse_size};
+
+/// The largest size any setting takes: far beyond any disk, and well inside
+/// the 64-bit signed integers clients decode it into.
+const MAX_SIZE: u64 = 1024 * TIB;
+
+/// The longest `idle_debounce`: a year.
+const MAX_DURATION: u64 = 365 * 24 * 3600;
 
 /// Host-wide limits. On the socket, sizes are bytes and durations seconds;
 /// in `host.toml` they're written like `"4G"` and `"60s"`.
@@ -98,6 +105,16 @@ impl HostLimits {
         })
     }
 
+    /// One setting by name.
+    pub fn get(&self, key: &str) -> u64 {
+        let mut copy = *self;
+        match copy.slot(key) {
+            Some(Slot::Wide(v)) => *v,
+            Some(Slot::Narrow(v)) => u64::from(*v),
+            None => 0,
+        }
+    }
+
     /// Sets one setting by name. Counts must fit in 32 bits.
     pub fn set(&mut self, key: &str, value: u64) -> Result<(), String> {
         match self.slot(key) {
@@ -122,6 +139,17 @@ impl HostLimits {
         for (key, v) in at_least_one {
             if v == 0 {
                 return Err(format!("{key} must be more than 0"));
+            }
+        }
+        for (key, kind) in SETTINGS {
+            let v = self.get(key);
+            let max = match kind {
+                Kind::Size => MAX_SIZE,
+                Kind::Duration => MAX_DURATION,
+                Kind::Count => continue,
+            };
+            if v > max {
+                return Err(format!("{key} must be at most {}", show(kind, max)));
             }
         }
         if self.disk_soft > self.disk_hard {
@@ -302,8 +330,16 @@ fn interpret(doc: &DocumentMut) -> Result<HostLimits, String> {
 }
 
 /// Replaces `path` in one step, so a crash leaves the old file or the new
-/// one, never half of either. An existing file keeps its permissions.
+/// one, never half of either. An existing file keeps its permissions, and a
+/// symlink (to a dotfiles repo, say) stays one: its target is replaced.
 fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), LimitsError> {
+    let is_link = fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink());
+    let target = if is_link {
+        link_target(path)
+    } else {
+        path.to_owned()
+    };
+    let path = target.as_path();
     let io_err = |what| {
         let path = path.to_owned();
         move |source| LimitsError::Io { what, path, source }
@@ -326,6 +362,17 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), LimitsError> {
         let _ = fs::remove_file(&tmp);
     }
     result.map_err(io_err("write"))
+}
+
+/// Where a symlink ends up, even if that file doesn't exist yet.
+fn link_target(link: &Path) -> PathBuf {
+    if let Ok(real) = fs::canonicalize(link) {
+        return real;
+    }
+    match fs::read_link(link) {
+        Ok(t) => link.parent().unwrap_or(Path::new(".")).join(t),
+        Err(_) => link.to_owned(),
+    }
 }
 
 #[cfg(test)]
@@ -465,6 +512,68 @@ snapshot_disk    = "20G"   # total for all sleeping linux agents
         let err = update(&path, &[("cpu_cores", 2)]).unwrap_err();
         assert!(matches!(err, LimitsError::Invalid { .. }), "{err}");
         assert_eq!(fs::read_to_string(&path).unwrap(), "cpu_cores = = 4\n");
+    }
+
+    #[test]
+    fn sizes_and_durations_have_a_ceiling() {
+        let (_d, path) = file("snapshot_disk = \"16000000T\"\n");
+        let err = load(&path).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("snapshot_disk must be at most 1024T"),
+            "{err}"
+        );
+        let err = update(&path, &[("snapshot_disk", u64::MAX)]).unwrap_err();
+        assert!(matches!(err, LimitsError::Rejected(_)), "{err}");
+        let err = update(
+            &path,
+            &[("snapshot_disk", 20 * GIB), ("idle_debounce", 400 * 86400)],
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("idle_debounce must be at most"),
+            "{err}"
+        );
+        update(
+            &path,
+            &[
+                ("snapshot_disk", 1024 * TIB),
+                ("idle_debounce", 365 * 86400),
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_symlinked_file_stays_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let dotfiles = dir.path().join("dotfiles");
+        fs::create_dir(&dotfiles).unwrap();
+        fs::write(dotfiles.join("host.toml"), "cpu_cores = 4 # mine\n").unwrap();
+        let path = dir.path().join("host.toml");
+        std::os::unix::fs::symlink("dotfiles/host.toml", &path).unwrap();
+        update(&path, &[("cpu_cores", 2)]).unwrap();
+        assert!(
+            fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read_to_string(dotfiles.join("host.toml")).unwrap(),
+            "cpu_cores = 2 # mine\n"
+        );
+        // A link to a file that doesn't exist yet creates the file.
+        let dangling = dir.path().join("other.toml");
+        std::os::unix::fs::symlink("dotfiles/new.toml", &dangling).unwrap();
+        update(&dangling, &[("cpu_cores", 3)]).unwrap();
+        assert!(
+            fs::symlink_metadata(&dangling)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(load(&dotfiles.join("new.toml")).unwrap().cpu_cores, 3);
     }
 
     #[test]

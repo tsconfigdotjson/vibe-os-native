@@ -103,6 +103,18 @@ pub fn repo(dir: &Path) {
     git(&["-C", d, "commit", "-q", "-m", "first"]);
 }
 
+/// Writes an executable script beside `path` and renames it into place, so
+/// no test thread can fork while it's open for writing, which makes running
+/// it fail with "text file busy" on Linux.
+pub fn write_script(path: &Path, body: &str) {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".new");
+    let tmp = PathBuf::from(tmp);
+    fs::write(&tmp, body).unwrap();
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::rename(&tmp, path).unwrap();
+}
+
 /// A stand-in for `gh`: `auth status` says it's logged in as `me`, and
 /// `repo clone OWNER/NAME DEST` clones `<remotes>/NAME` if it exists, with
 /// origin pointing at GitHub as a real clone's would.
@@ -135,8 +147,7 @@ esac
 "#,
         remotes = remotes.display()
     );
-    fs::write(&gh, script).unwrap();
-    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+    write_script(&gh, &script);
     gh
 }
 

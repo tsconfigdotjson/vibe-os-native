@@ -202,21 +202,53 @@ async fn a_slow_subscriber_is_told_it_missed_events() {
     }
     let first = slow.reply().await;
     assert_eq!(first["params"]["kind"], "lagged", "{first}");
-    assert!(
-        first["params"]["message"]
-            .as_str()
-            .unwrap()
-            .starts_with("missed "),
-        "{first}"
+    let missed = first["params"]["seq"].as_u64().unwrap();
+    assert_eq!(
+        first["params"]["message"],
+        format!("missed {missed} events; read everything again")
     );
-    // Then it carries on with what's left, ending at the last.
+    // Then it carries on with what's left, every seq one more than the
+    // last, ending at the last event.
+    let mut last = missed;
     loop {
         let e = slow.reply().await;
         assert_eq!(e["params"]["kind"], "keys.changed");
-        if e["params"]["seq"] == n {
+        let seq = e["params"]["seq"].as_u64().unwrap();
+        assert_eq!(seq, last + 1, "seqs only go up, without gaps after a lag");
+        last = seq;
+        if seq == n {
             break;
         }
     }
+}
+
+/// A client that closes its end but never reads mustn't keep its
+/// connection, and so the core, forever.
+#[tokio::test]
+async fn a_client_that_never_reads_is_let_go() {
+    let server = start(golden_info(), 1 << 20);
+    let baseline = std::sync::Arc::strong_count(&server.core);
+    let mut c = Conn::open(&server.path).await;
+    c.call("events.subscribe", serde_json::json!({})).await;
+    // More than the socket buffer holds, with time to fill it.
+    for _ in 0..40 {
+        for _ in 0..500 {
+            server
+                .core
+                .publish(server.core.event(vibe_core::model::EventKind::KeysChanged));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    c.write.shutdown().await.unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while std::sync::Arc::strong_count(&server.core) > baseline {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the connection was kept"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    drop(c);
 }
 
 #[tokio::test]

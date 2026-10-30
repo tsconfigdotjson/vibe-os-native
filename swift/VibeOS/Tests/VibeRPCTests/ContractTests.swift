@@ -62,8 +62,14 @@ func jsonData(_ object: Any) throws -> Data {
     try JSONSerialization.data(withJSONObject: object, options: [.fragmentsAllowed])
 }
 
+/// Whether two parsed JSON values are the same, compared as canonical JSON:
+/// NSNumber's isEqual would take `true` for `1`.
 func sameJSON(_ a: Any, _ b: Any) -> Bool {
-    (a as AnyObject).isEqual(b)
+    let canonical = { (v: Any) in
+        try? JSONSerialization.data(withJSONObject: v, options: [.sortedKeys, .fragmentsAllowed])
+    }
+    guard let x = canonical(a), let y = canonical(b) else { return false }
+    return x == y
 }
 
 /// The fields of `name` the index says may be absent; nil for Response,
