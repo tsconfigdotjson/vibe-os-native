@@ -363,6 +363,7 @@ outside caller ──HTTPS + API key──▶ Linux host (public, vibed) ══ 
 - **Keys are checked where the agent lives.** API keys are made on the Mac, and their hashes are pushed to connected hosts, so one key works everywhere. The Mac verifies every call forwarded to it, so a compromised server can't drive the Mac without a key.
 - The public endpoint rate-limits and logs every call.
 - If the Mac is offline or the tunnel is down, the host still answers for its own agents, and Mac agents show as unavailable.
+- Every key has full access; there are no scopes. Treat a key like an SSH key to the Mac and revoke it in Settings if it leaks.
 - API keys only. OAuth for consumer connectors (such as claude.ai's) and a hosted relay for owners without a server are both out of scope.
 
 ## MCP interface
@@ -499,7 +500,7 @@ Only transcripts of agents this app spawned are read. agent-tail is fed specific
 **Idle** means all of these hold. The agent-tail fields named here are from v0.1 plus agent-tail#120, #121 and #122, all merged; `vibe-status` pins agent-tail to a commit that includes them (`a68bc4a`, or a tag once there is one).
 
 - **At rest.** agent-tail reports a firm `done`, `interrupted`, `errored` or `awaiting_answer`. Its firm states already rule out subagents and background tasks, which show as `background_work`.
-- **Permission prompts.** Claude Code records a permission prompt only as an *inferred* `awaiting_approval`, after the transcript has been unchanged for 20 s. Sleep is exact, so a prompt is safe to sleep on, but a long silent tool run could look the same. So an inferred awaiting state counts as at rest only after a longer quiet period (5 min, proposed), with no extra processes in the tree and its CPU near zero.
+- **Permission prompts.** Claude Code records a permission prompt only as an *inferred* `awaiting_approval`, after the transcript has been unchanged for 20 s. Sleep is exact, so a prompt is safe to sleep on, but a long silent tool run could look the same. So an inferred awaiting state counts as at rest only after a longer quiet period (5 min), with no extra processes in the tree and its CPU near zero.
 - **Usage limits.** A Claude usage-limit stop is a firm `errored` with `stop_reason: usage_limit`, and `resets_at` when Claude recorded it (agent-tail#121). It sleeps like any idle agent. The menu row and `vibe_list_agents` show "limited until …", and the next send wakes it.
 - **No unseen processes.** Nothing in the tree that agent-tail can't see: nothing started more than 30 s after Claude, other than the MCP servers Claude starts. This catches detached jobs such as `nohup` or a container. In `linux` on the Mac, `vibe-guest` reports the tree.
 - **Scheduled wakeups**, from agent-tail's `pending_wakeups` (agent-tail#120). Each entry has a `kind` (`loop` or `cron`), and optionally a `due_at`:
@@ -618,8 +619,6 @@ None of these block building.
 | # | Question | Recommendation | Why |
 | --- | --- | --- | --- |
 | 1 | Recurring cron wakeups drop out of `pending_wakeups` after their first run | Fix upstream: agent-tail should keep a `recurring: true` job pending until `CronDelete` or session end ([agent-tail#127](https://github.com/tsconfigdotjson/agent-tail/issues/127)). The stopgap under Going to sleep keeps such agents awake until then | Otherwise an agent running `/loop 5m` is put to sleep after one run and misses the rest |
-| 2 | How long must an inferred `awaiting_approval` stay quiet before the agent sleeps? | 5 min, with no extra processes and CPU near zero; tune with real use | Claude records permission prompts only as inferred, so too short risks freezing a silent tool run, and too long holds memory |
-| 3 | Should API keys have scopes (read-only, or limited to some projects)? | Add them with external access, before a key is ever used from the internet | A full key is effectively a shell on the Mac |
 
 **Decided (2026-10-29 and 2026-10-30):**
 
@@ -657,6 +656,7 @@ None of these block building.
 - agent-tail is a git dependency pinned to a commit that includes #120, #121 and #122 (`a68bc4a`), until it has tags.
 - Idle is decided by agent-tail's state (including `pending_wakeups` and `stop_reason`) plus a process-tree check and a 60 s debounce. `claude --resume` is only for crashes, reboots of `macos` or Linux hosts, and dropped snapshots.
 - An agent stopped by a Claude usage limit sleeps like any idle agent.
+- An agent with an inferred `awaiting_approval` (a permission prompt) sleeps after 5 min quiet, with no extra processes and CPU near zero.
 - A firm `/loop` wakeup doesn't keep an agent awake: `vibed` wakes it 30 s before it's due.
 - A full host puts idle agents to sleep first, then refuses. Starts never queue.
 - v1 assumes hosts stay up. Reboots are handled (agents come back asleep), but there's no FileVault or auto-login story.
@@ -666,6 +666,6 @@ None of these block building.
 - The MCP keeps VibeOS's round and semantics, folded to one agent per worktree: eight tools, which route by ref to any host.
 - MCP always requires an API key. Keys are made in Settings (or `vibe key create` on a standalone Linux host), and their hashes are pushed to connected hosts.
 - The Mac drives Linux hosts over SSH (`ssh <host> vibe rpc`). A Linux host also runs on its own, with its own MCP.
-- External access goes through a Linux host with a public address. It serves `https://<host>/mcp`, and the Mac keeps an outbound SSH tunnel to it. API keys only; no OAuth and no hosted relay.
+- External access goes through a Linux host with a public address. It serves `https://<host>/mcp`, and the Mac keeps an outbound SSH tunnel to it. API keys only, all full access with no scopes; no OAuth and no hosted relay.
 - Deleting an agent removes everything VibeOS made for it, transcripts included; the branch is kept. Cleanup is manual, and deletion refuses on uncommitted or unpushed work unless forced.
 - Not in v1: egress filtering, port forwarding, terminals other than Terminal.app, custom VM images, token cost in the menu.
