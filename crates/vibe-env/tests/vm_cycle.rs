@@ -17,12 +17,13 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use vibe_env::vm::{
-    self, Disk, ErrorCode, Launch, Probe, Share, Slept, Started, VmConfig, VmState,
+    self, Disk, ErrorCode, Launch, Probe, Ready, Share, Slept, Started, VmConfig, VmState,
 };
 
 /// The vsock port `vibe-testguest` serves.
@@ -35,16 +36,24 @@ const MIB: u64 = 1 << 20;
 /// its drivers from a squashfs first.
 const BOOT_LIMIT: Duration = Duration::from_secs(10);
 
-/// Saving an idle VM, after the balloon: about 1 s in the spike.
-const SAVE_LIMIT_MS: u64 = 3000;
+/// vibe-vm's own save of an idle VM, after the balloon: about 1 s in the
+/// spike (0.65 s with layered disks, 0.9 s for three at once).
+const SAVE_LIMIT_MS: u64 = 2000;
+
+/// vibe-vm's own restore and resume of an idle VM: 0.42 to 0.5 s in the
+/// spike.
+const RESTORE_LIMIT_MS: u64 = 1000;
 
 /// Starting `vibe-vm restore` to the guest's first answer, for an idle VM:
 /// about 0.5 s in the spike.
-const RESTORE_LIMIT: Duration = Duration::from_secs(3);
+const RESTORE_LIMIT: Duration = Duration::from_secs(2);
 
 /// An idle VM's snapshot after the balloon, though the guest had touched
 /// 512 MiB and freed it. The spike's came to 41 MB.
-const BALLOONED_LIMIT: u64 = 256 * MIB;
+const BALLOONED_LIMIT: u64 = 128 * MIB;
+
+/// How long one poll of a starting guest waits for its vsock to answer.
+const POLL_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct Guest {
     vibe_vm: PathBuf,
@@ -67,19 +76,24 @@ fn guest(test: &str) -> Option<Guest> {
     }
 }
 
+/// A path from the environment: relative ones are to the repo's root, where
+/// the commands above run, not to this crate, where cargo runs the test.
 fn absolute(path: PathBuf) -> PathBuf {
     if path.is_absolute() {
         path
     } else {
-        std::env::current_dir().unwrap().join(path)
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(path)
     }
 }
 
 /// Leaves a mark that `test` really ran.
 fn mark(test: &str) {
     if let Some(dir) = std::env::var_os("VIBE_VM_MARKER") {
+        let dir = absolute(PathBuf::from(dir));
         fs::create_dir_all(&dir).unwrap();
-        fs::write(Path::new(&dir).join(test), "ran\n").unwrap();
+        fs::write(dir.join(test), "ran\n").unwrap();
     }
 }
 
@@ -99,6 +113,25 @@ struct TestVm {
     share: PathBuf,
     config: VmConfig,
     vibe_vm: PathBuf,
+    /// The running vibe-vm's pid, to kill it if a failing test can't stop it.
+    pid: AtomicU32,
+}
+
+/// A failing test must not leave detached VMs running.
+impl Drop for TestVm {
+    fn drop(&mut self) {
+        if !vm::lock_held(&self.socket) {
+            return;
+        }
+        if vm::stop(&self.socket).is_ok() && vm::wait_gone(&self.socket, Duration::from_secs(10)) {
+            return;
+        }
+        let pid = self.pid.load(Ordering::SeqCst);
+        if pid != 0 {
+            // SAFETY: a plain kill(2) of the vibe-vm this test started.
+            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        }
+    }
 }
 
 impl TestVm {
@@ -158,6 +191,7 @@ impl TestVm {
             share,
             config,
             vibe_vm: g.vibe_vm.clone(),
+            pid: AtomicU32::new(0),
         }
     }
 
@@ -173,6 +207,7 @@ impl TestVm {
             log: dir.join("vibe-vm.log"),
             share: dir.join("share"),
             vibe_vm: g.vibe_vm.clone(),
+            pid: AtomicU32::new(0),
         }
     }
 
@@ -203,10 +238,13 @@ impl TestVm {
 
     /// One command to the guest, one JSON line back.
     fn ask(&self, command: &str) -> Result<Value, String> {
-        let mut stream = vm::connect(&self.socket, PORT).map_err(|e| e.to_string())?;
-        stream
-            .set_read_timeout(Some(Duration::from_secs(30)))
-            .unwrap();
+        self.ask_within(command, Duration::from_secs(30))
+    }
+
+    fn ask_within(&self, command: &str, timeout: Duration) -> Result<Value, String> {
+        let mut stream =
+            vm::connect_within(&self.socket, PORT, timeout).map_err(|e| e.to_string())?;
+        stream.set_read_timeout(Some(timeout)).unwrap();
         stream
             .write_all(format!("{command}\n").as_bytes())
             .map_err(|e| e.to_string())?;
@@ -234,7 +272,7 @@ impl TestVm {
     fn first_answer(&self, since: Instant, limit: Duration) -> Duration {
         let deadline = Instant::now() + limit.max(Duration::from_secs(30));
         loop {
-            match self.ask("status") {
+            match self.ask_within("status", POLL_TIMEOUT) {
                 Ok(_) => return since.elapsed(),
                 Err(e) if Instant::now() >= deadline => {
                     panic!(
@@ -252,14 +290,14 @@ impl TestVm {
         let t = Instant::now();
         let ready = vm::boot(&self.launch())
             .unwrap_or_else(|e| panic!("boot {}: {e}\n{}", self.name, self.logs()));
+        self.pid.store(ready.pid, Ordering::SeqCst);
         assert_eq!(ready.started, Started::Boot);
-        assert_eq!(ready.protocol, vm::PROTOCOL);
         assert!(ready.timings.start_ms.is_some() && ready.timings.total_ms.is_some());
         self.first_answer(t, BOOT_LIMIT)
     }
 
     fn sleep(&self, balloon_ms: Option<u64>) -> Slept {
-        let slept = vm::sleep(&self.socket, balloon_ms)
+        let slept = vm::sleep(&self.socket, balloon_ms, None)
             .unwrap_or_else(|e| panic!("sleep {}: {e}\n{}", self.name, self.logs()));
         assert_eq!(slept.snapshot, self.config.snapshot);
         assert!(self.config.snapshot.exists());
@@ -279,16 +317,18 @@ impl TestVm {
         slept
     }
 
-    fn restore(&self) -> Duration {
+    /// Restores the VM; vibe-vm's ready line, and how long it took from
+    /// starting vibe-vm to the guest's first answer.
+    fn restore(&self) -> (Ready, Duration) {
         let t = Instant::now();
         let ready = vm::restore(&self.launch())
             .unwrap_or_else(|e| panic!("restore {}: {e}\n{}", self.name, self.logs()));
+        self.pid.store(ready.pid, Ordering::SeqCst);
         assert_eq!(ready.started, Started::Restore);
-        assert!(ready.timings.restore_ms.is_some() && ready.timings.resume_ms.is_some());
         let answer = self.first_answer(t, RESTORE_LIMIT);
         // A running VM's disks move on, so its snapshot is gone.
         assert!(!self.config.snapshot.exists());
-        answer
+        (ready, answer)
     }
 
     fn stop(&self) {
@@ -296,29 +336,52 @@ impl TestVm {
         assert!(vm::wait_gone(&self.socket, Duration::from_secs(10)));
     }
 
-    /// Waits up to 5 s for the share's probe file to read `want` in the
-    /// guest: right after a restore the share is missing for about a second.
-    fn wait_for_share(&self, want: &str) -> Value {
-        let deadline = Instant::now() + Duration::from_secs(5);
+    /// Waits up to `limit` for the guest's status to show `key` as `want`
+    /// (`None`: anything but null).
+    fn wait_for(&self, key: &str, want: Option<&str>, limit: Duration) -> Value {
+        let deadline = Instant::now() + limit;
         loop {
             let status = self.must_ask("status");
-            if status["share"] == want {
+            let ok = match want {
+                Some(want) => status[key] == want,
+                None => !status[key].is_null(),
+            };
+            if ok {
                 return status;
             }
             if Instant::now() >= deadline {
                 panic!(
-                    "{}: the share reads {status}, not {want}\n{}",
+                    "{}: {key} is {} in {status}, not {want:?}\n{}",
                     self.name,
+                    status[key],
                     self.logs()
                 );
             }
             thread::sleep(Duration::from_millis(50));
         }
     }
+
+    /// The first line of the agent disk's image, read on the host.
+    fn disk_on_host(&self) -> String {
+        let disk = &self
+            .config
+            .disks
+            .iter()
+            .find(|d| d.id == "agent")
+            .unwrap()
+            .path;
+        let bytes = fs::read(disk).unwrap();
+        let end = bytes.iter().position(|&b| b == b'\n' || b == 0).unwrap();
+        String::from_utf8_lossy(&bytes[..end]).into_owned()
+    }
 }
 
 fn mib(bytes: u64) -> u64 {
     bytes / MIB
+}
+
+fn ms(timing: Option<u64>) -> u64 {
+    timing.expect("a timing")
 }
 
 #[test]
@@ -335,7 +398,7 @@ fn boot_save_restore() {
         root.path().join("cycle.vm"),
     );
 
-    // Boot.
+    // Boot, with every device there.
     let boot = vm.boot();
     eprintln!("boot to first answer: {} ms", boot.as_millis());
     assert!(boot <= BOOT_LIMIT, "boot took {boot:?}\n{}", vm.logs());
@@ -346,7 +409,8 @@ fn boot_save_restore() {
         (status.state, status.started, status.agent.as_str()),
         (VmState::Running, Started::Boot, "cycle")
     );
-    let first = vm.must_ask("status");
+    // NAT networking: DHCP gives eth0 an address.
+    let first = vm.wait_for("ip", None, Duration::from_secs(15));
     let boot_id = first["boot_id"].clone();
     assert!(boot_id.is_string(), "{first}");
     assert_eq!(
@@ -355,6 +419,11 @@ fn boot_save_restore() {
         "the guest's NIC has the fixed MAC"
     );
     assert_eq!(first["share"], "before", "{first}");
+    assert_eq!(first["cpus"].as_u64(), Some(u64::from(vm.config.cpus)));
+    assert!(
+        first["rng"].as_str().is_some_and(|r| r.contains("virtio")),
+        "the entropy device: {first}"
+    );
 
     // One vibe-vm per VM.
     let err = vm::boot(&vm.launch()).unwrap_err();
@@ -378,12 +447,19 @@ fn boot_save_restore() {
         "the guest's freed memory should be in the snapshot: {} MiB",
         mib(unballooned.snapshot_bytes)
     );
-    let restored = vm.restore();
-    eprintln!("restore to first answer: {} ms", restored.as_millis());
+    let (ready, answer) = vm.restore();
+    eprintln!(
+        "restore of {} MiB to first answer: {} ms, {:?}",
+        mib(unballooned.snapshot_bytes),
+        answer.as_millis(),
+        ready.timings
+    );
     assert_eq!(vm.tick(), 4, "the guest carries on exactly");
 
     // With it, the snapshot holds only what the guest really uses.
     vm.must_ask("dirty 512");
+    // Written through the guest's page cache and not flushed: only the
+    // snapshot can carry it.
     vm.must_ask("write-disk not yet flushed");
     let slept = vm.sleep(None);
     eprintln!(
@@ -396,27 +472,47 @@ fn boot_save_restore() {
         "the balloon should keep freed memory out: {} MiB",
         mib(slept.snapshot_bytes)
     );
-    let save_ms = slept.timings.save_ms.unwrap();
+    let save_ms = ms(slept.timings.save_ms);
     assert!(save_ms <= SAVE_LIMIT_MS, "the save took {save_ms} ms");
 
     // A file changed on the host while the VM slept.
     fs::write(vm.share.join("probe"), "after").unwrap();
-    let restored = vm.restore();
-    eprintln!("idle restore to first answer: {} ms", restored.as_millis());
-    assert!(restored <= RESTORE_LIMIT, "the restore took {restored:?}");
+    let (ready, answer) = vm.restore();
+    let restore_ms = ms(ready.timings.restore_ms) + ms(ready.timings.resume_ms);
+    eprintln!(
+        "idle restore: {restore_ms} ms in vibe-vm, {} ms to first answer",
+        answer.as_millis()
+    );
+    assert!(
+        restore_ms <= RESTORE_LIMIT_MS,
+        "the restore took {restore_ms} ms"
+    );
+    assert!(answer <= RESTORE_LIMIT, "the first answer took {answer:?}");
     assert_eq!(vm.tick(), 5, "the guest carries on exactly");
-    let status = vm.wait_for_share("after");
+    // The share is missing for about a second after a restore, then fresh.
+    let status = vm.wait_for("share", Some("after"), Duration::from_secs(5));
     assert_eq!(status["boot_id"], boot_id, "the same boot");
-    assert_eq!(status["disk"], "not yet flushed", "{status}");
+    assert_eq!(status["ip"], first["ip"], "the same address");
     assert_eq!(
         status["mac"].as_str().map(str::to_lowercase),
         vm.config.mac.clone()
     );
+    // The unflushed write survived in the guest, and reaches the agent's
+    // disk image once flushed.
+    assert_eq!(status["disk"], "not yet flushed", "{status}");
+    vm.must_ask("sync");
+    assert_eq!(vm.disk_on_host(), "not yet flushed");
 
     // Nothing to restore now: the snapshot went when the VM ran again.
     vm.stop();
     let err = vm::restore(&vm.launch()).unwrap_err();
     assert_eq!(err.code(), Some(ErrorCode::NoSnapshot), "{err}");
+    // A snapshot that won't restore is reported and kept, for vibed.
+    fs::write(&vm.config.snapshot, "not a snapshot").unwrap();
+    let err = vm::restore(&vm.launch()).unwrap_err();
+    assert_eq!(err.code(), Some(ErrorCode::RestoreFailed), "{err}");
+    assert!(vm.config.snapshot.exists());
+    assert!(!vm::lock_held(&vm.socket));
     mark("boot_save_restore");
 }
 
@@ -434,41 +530,47 @@ fn three_vms_at_once() {
         })
         .collect();
 
-    let all = |f: &(dyn Fn(&TestVm) + Sync)| {
+    // Runs `f` on every VM at once; how long they took together.
+    fn all<T: Send>(vms: &[TestVm], f: impl Fn(&TestVm) -> T + Sync) -> (Vec<T>, Duration) {
         let t = Instant::now();
-        thread::scope(|s| {
-            for vm in &vms {
-                s.spawn(move || f(vm));
-            }
+        let results = thread::scope(|s| {
+            let handles: Vec<_> = vms.iter().map(|vm| s.spawn(|| f(vm))).collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
-        t.elapsed()
-    };
+        (results, t.elapsed())
+    }
 
-    let boot = all(&|vm| {
-        vm.boot();
-    });
+    let (_, boot) = all(&vms, TestVm::boot);
     eprintln!("three boots: {} ms", boot.as_millis());
     for vm in &vms {
         assert_eq!(vm.tick(), 1);
     }
-    let save = all(&|vm| {
-        vm.sleep(None);
-    });
-    eprintln!("three sleeps: {} ms", save.as_millis());
-    let restore = all(&|vm| {
-        vm.restore();
-    });
+    let (slept, sleep) = all(&vms, |vm| vm.sleep(None));
+    eprintln!("three sleeps: {} ms", sleep.as_millis());
+    for s in &slept {
+        eprintln!("  {} MiB, {:?}", mib(s.snapshot_bytes), s.timings);
+        let save_ms = ms(s.timings.save_ms);
+        assert!(save_ms <= SAVE_LIMIT_MS, "a save took {save_ms} ms");
+    }
+    let (restored, restore) = all(&vms, TestVm::restore);
     eprintln!("three restores: {} ms", restore.as_millis());
+    for (ready, answer) in &restored {
+        let restore_ms = ms(ready.timings.restore_ms) + ms(ready.timings.resume_ms);
+        eprintln!(
+            "  {restore_ms} ms in vibe-vm, {} ms to first answer",
+            answer.as_millis()
+        );
+        assert!(
+            restore_ms <= RESTORE_LIMIT_MS,
+            "a restore took {restore_ms} ms"
+        );
+    }
+    // The spike restored three at once in 0.5 s.
+    assert!(restore <= RESTORE_LIMIT, "three restores took {restore:?}");
     for vm in &vms {
         assert_eq!(vm.tick(), 2, "{} carries on exactly", vm.name);
     }
-    all(&|vm| vm.stop());
-    // The spike saved three in 0.9 s and restored them in 0.5 s, balloon
-    // aside; each sleep here holds the balloon for 2 s.
-    assert!(
-        restore <= RESTORE_LIMIT * 2,
-        "three restores took {restore:?}"
-    );
+    all(&vms, TestVm::stop);
     mark("three_vms_at_once");
 }
 
@@ -509,16 +611,19 @@ fn reboot() {
         }
         Some("restore") => {
             let vm = TestVm::load(&g, &root, "reboot", socket);
-            let restored = vm.restore();
+            let (ready, answer) = vm.restore();
             eprintln!(
-                "restored after the reboot: {} ms to first answer",
-                restored.as_millis()
+                "restored after the reboot: {:?}, {} ms to first answer",
+                ready.timings,
+                answer.as_millis()
             );
             assert_eq!(vm.tick(), 8, "the guest carries on exactly");
             let status = vm.must_ask("status");
             let boot_id = fs::read_to_string(root.join("boot_id")).unwrap();
             assert_eq!(status["boot_id"].to_string(), boot_id, "the same boot");
             assert_eq!(status["disk"], "saved before the reboot");
+            vm.must_ask("sync");
+            assert_eq!(vm.disk_on_host(), "saved before the reboot");
             vm.stop();
             mark("reboot");
         }

@@ -114,6 +114,20 @@ public enum VZBuilder {
     }
 }
 
+/// True for whoever claims it first.
+private final class Once: @unchecked Sendable {
+    private let lock = NSLock()
+    private var claimed = false
+
+    func claim() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if claimed { return false }
+        claimed = true
+        return true
+    }
+}
+
 /// A Virtualization.framework VM, on the main queue.
 @MainActor
 public final class VZMachine: NSObject, Machine, VZVirtualMachineDelegate {
@@ -162,13 +176,27 @@ public final class VZMachine: NSObject, Machine, VZVirtualMachineDelegate {
         }
     }
 
+    /// How long a connect may wait for the guest. Virtualization.framework
+    /// may never answer one to a port nothing in the guest listens on.
+    static let connectTimeout = 5
+
     public func connect(port: UInt32) async throws -> GuestStream {
         guard let device = vm.socketDevices.first as? VZVirtioSocketDevice else {
             throw Failure(.connectFailed, "the VM has no vsock device")
         }
+        let once = Once()
         let connection: VZVirtioSocketConnection = try await withCheckedThrowingContinuation { continuation in
             device.connect(toPort: port) { result in
+                guard once.claim() else {
+                    // Too late: the caller has been told it failed.
+                    if case .success(let late) = result { late.close() }
+                    return
+                }
                 continuation.resume(with: result)
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + .seconds(VZMachine.connectTimeout)) {
+                guard once.claim() else { return }
+                continuation.resume(throwing: Failure(.connectFailed, "no answer in \(VZMachine.connectTimeout)s"))
             }
         }
         nextStream += 1

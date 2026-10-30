@@ -11,9 +11,11 @@
 //! - `tick`: `{"count":N}`. N counts ticks since boot, in memory only, so a
 //!   restored VM carries on from where it was saved and a fresh boot starts
 //!   again at 1.
-//! - `status`: the count, the kernel's boot id, eth0's MAC address, the
-//!   contents of `/mnt/share/probe` and of the disk whose serial is `agent`
-//!   (up to the first newline), and the uptime.
+//! - `status`: the count, the kernel's boot id, eth0's MAC address and the
+//!   IPv4 address DHCP gave it, the contents of `/mnt/share/probe` and of the
+//!   disk whose serial is `agent` (up to the first newline), the uptime, the
+//!   vCPUs and the hardware RNG in use.
+//! - `sync`: flushes everything written to the disks.
 //! - `dirty MIB`: touches MIB MiB of memory and frees it again, like a guest
 //!   that used memory and gave it back. Without the balloon, a snapshot
 //!   would still hold those pages.

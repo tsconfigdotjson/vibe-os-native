@@ -34,7 +34,9 @@ and the random defaults Virtualization.framework would pick for the machine
 identifier and the MAC address differ on every start; the random MAC is
 what broke restores in the spike. So `vibe-vm create` fills both in, once,
 and writes them back into `vm.json`; `boot` and `restore` refuse a
-configuration without them. Nothing in `vm.json` changes after that.
+configuration without them. Those two never change. The rest of `vm.json`
+is fixed from a save until its restore; before a fresh boot `vibed` may
+change the disks (newer layer versions), `cpus` or `memory`.
 
 ## Commands
 
@@ -56,13 +58,15 @@ failure, and exits 0 or 1.
 collects its exit. `vibed` starts it with stdout on a pipe and stderr on
 its log (`vibe-vm.log` in the agent's directory). Once the VM runs,
 `vibe-vm` prints one ready line on the pipe, with its pid and timings, and
-writes nothing more there; or it prints a failure and exits 1. Then it
-serves its control socket until the VM stops. A restarted `vibed` finds it
+writes nothing more there; or it prints a failure and exits 1. It serves
+its control socket from before the VM starts until it stops, so a probe
+during a long restore finds it restoring. A restarted `vibed` finds it
 again by that socket.
 
-`restore` reads the snapshot (`snapshot` in `vm.json`), resumes the VM and
-then deletes the snapshot: the VM's disks move on from that moment, so the
-snapshot must never be restored again. A snapshot that won't restore is
+`restore` reads the snapshot (`snapshot` in `vm.json`), deletes it, and
+only then resumes the VM: the VM's disks move on from that moment, so the
+snapshot must never be restored again. For the same reason `boot` deletes
+any snapshot the VM still has before it starts. A snapshot that won't restore is
 kept, with the error code `restore_failed`, for `vibed` to discard and
 resume the agent with `claude --resume` in a fresh VM (PRD: Failures).
 
@@ -72,20 +76,23 @@ resume the agent with `claude --resume` in a fresh VM (PRD: Failures).
 the 104-byte limit wherever a session's socket does, and never taken for a
 shim's by a session scan. It's `0600` in the private run directory, and
 `vibe-vm` holds `run/<ref>.vm.lock` for its whole life, so there's one per
-VM, and a probe can tell a dead one by the free lock (as for shims).
+VM, and a probe can tell a dead one by the free lock (as for shims). It
+removes the socket and lets the lock go just before it exits, so a restore
+can follow a sleep at once.
 
-A connection carries one request line and gets one reply line, both JSON.
+A connection carries one request line, sent within 30 s, and gets one reply
+line, both JSON.
 Every reply is `{"ok":true, …}` or `{"ok":false,"code":…,"error":…}`.
 
 | Request | Does | Reply |
 | --- | --- | --- |
 | `{"op":"status"}` | | `ref`, `pid`, `state`, `started` (`boot` or `restore`), `protocol` |
-| `{"op":"connect","port":N}` | Makes the connection a byte stream to vsock port N in the guest, both ways, with half-closes passed on. This is how a shim reaches `vibe-guest`, since only the process that owns a VM can reach its vsock | `{"ok":true}`, then the stream |
-| `{"op":"sleep","balloon_ms":N}` | `vibe-guest` must have frozen the agent first. Inflates the memory balloon to the least the VM may have, waits N ms (2000 if absent; 0 skips the balloon), lets it go, pauses, saves the VM to `<snapshot>.partial`, renames it into place, stops the VM and exits | The snapshot's path and size on disk, and how long each step took, sent once the VM is stopped. If the save fails, nothing is left behind, the VM resumes and the code is `save_failed` |
+| `{"op":"connect","port":N}` | Makes the connection a byte stream to vsock port N in the guest, both ways, with half-closes passed on: a guest that sees its input end should finish and close. This is how a shim reaches `vibe-guest`, since only the process that owns a VM can reach its vsock. A port nobody answers on fails within 5 s | `{"ok":true}`, then the stream |
+| `{"op":"sleep","balloon_ms":N,"balloon_floor":B}` | `vibe-guest` must have frozen the agent first. Inflates the memory balloon down to B bytes (absent: the least the VM may have; `vibed` should pass what the guest really uses plus headroom, so nothing in it runs short), waits N ms (2000 if absent; 0 skips the balloon), lets it go, pauses, saves the VM to `.<ref>.partial` beside the snapshot (no ref starts with a dot, so it's never another agent's snapshot), flushes it to disk, makes it `0600` (it holds all the guest's memory, secrets included), renames it into place, stops the VM and exits | The snapshot's path and size on disk, and how long each step took, sent once the VM is stopped. If the save fails, nothing is left behind, the VM resumes and the code is `save_failed` |
 | `{"op":"stop"}` | Stops the VM at once, without saving, and exits | `{"ok":true}` |
 
-While a sleep or stop is under way, other requests that would change the
-VM are refused with `busy`; a request the VM's state doesn't allow (a
+While the VM starts, restores, sleeps or stops, and after a sleep until
+`vibe-vm` exits, requests that would change it are refused with `busy`; a request the VM's state doesn't allow (a
 `connect` to a paused VM, say) with `bad_state`. If the guest stops the VM
 itself, `vibe-vm` removes its socket and exits: 0 for a power-off, 1 for an
 error.

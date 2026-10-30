@@ -6,9 +6,9 @@
 //!
 //! 1. [`create`] once, when the agent is made: `vibe-vm create` gives the
 //!    VM its machine identifier and MAC address, writes them into the
-//!    agent's `vm.json`, and checks the VM can be saved and restored. The
-//!    configuration is then fixed for the agent's life, because a snapshot
-//!    only restores into the exact configuration it was saved from.
+//!    agent's `vm.json`, and checks the VM can be saved and restored. Those
+//!    two stay for the agent's life, because a snapshot only restores into
+//!    the exact configuration it was saved from.
 //! 2. [`boot`] or [`restore`]: starts a detached `vibe-vm`, which prints one
 //!    line on the pipe it was started with (the [`Ready`] line, with
 //!    timings), then serves its control socket, `run/<ref>.vm`.
@@ -67,9 +67,10 @@ const SAVE_TIMEOUT: Duration = Duration::from_secs(300);
 // ---------------------------------------------------------------------------
 // The configuration
 
-/// A `linux` agent's VM, as `vibed` writes it to `vm.json`. Everything here
-/// is fixed for the agent's life: a snapshot restores only into the exact
-/// configuration it was saved from.
+/// A `linux` agent's VM, as `vibed` writes it to `vm.json`. A snapshot
+/// restores only into the exact configuration it was saved from, so nothing
+/// here changes between a save and its restore, and `machine_id` and `mac`
+/// never change. A fresh boot may take newer disks, vCPUs or memory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VmConfig {
     pub version: u32,
@@ -155,11 +156,10 @@ impl VmConfig {
         if let Some(mac) = &self.mac {
             parse_mac(mac)?;
         }
-        if let Some(id) = &self.machine_id {
-            let base64 = |c: char| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=');
-            if id.is_empty() || !id.chars().all(base64) {
-                return Err("machine_id must be base64".into());
-            }
+        if let Some(id) = &self.machine_id
+            && !is_base64(id)
+        {
+            return Err("machine_id must be base64".into());
         }
         let mut ids = BTreeSet::new();
         for disk in &self.disks {
@@ -200,9 +200,34 @@ impl VmConfig {
         tmp.push(".tmp");
         let tmp = PathBuf::from(tmp);
         let what = format!("write {}", path.display());
-        fs::write(&tmp, text).map_err(io_err(what.clone()))?;
-        fs::rename(&tmp, path).map_err(io_err(what))
+        // The identity a restore depends on is in here: make it durable.
+        let write = || -> io::Result<()> {
+            let mut file = File::create(&tmp)?;
+            file.write_all(text.as_bytes())?;
+            file.sync_all()?;
+            fs::rename(&tmp, path)?;
+            if let Some(dir) = path.parent() {
+                File::open(dir)?.sync_all()?;
+            }
+            Ok(())
+        };
+        write().map_err(|source| {
+            let _ = fs::remove_file(&tmp);
+            VmError::Io { what, source }
+        })
     }
+}
+
+/// Strict, padded base64, as Foundation's `Data(base64Encoded:)` reads it.
+fn is_base64(s: &str) -> bool {
+    let body = s.trim_end_matches('=');
+    let padding = s.len() - body.len();
+    !s.is_empty()
+        && s.len().is_multiple_of(4)
+        && padding <= 2
+        && body
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/')
 }
 
 fn absolute(what: &str, path: &Path) -> Result<(), String> {
@@ -238,7 +263,7 @@ pub fn parse_mac(s: &str) -> Result<[u8; 6], String> {
     let mut parts = s.split(':');
     for byte in &mut mac {
         let part = parts.next().ok_or_else(bad)?;
-        if part.len() != 2 {
+        if part.len() != 2 || !part.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(bad());
         }
         *byte = u8::from_str_radix(part, 16).map_err(|_| bad())?;
@@ -289,6 +314,11 @@ pub enum Request {
         /// default, 0 to skip it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         balloon_ms: Option<u64>,
+        /// The least memory, in bytes, the balloon leaves the guest: what
+        /// it really uses plus headroom, so nothing in it runs short while
+        /// the balloon is up. Absent: the least the VM may have.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        balloon_floor: Option<u64>,
     },
     /// Stops the VM at once, without saving, and exits.
     Stop,
@@ -605,7 +635,14 @@ fn start(launch: &Launch<'_>, command: &str, timeout: Duration) -> Result<Ready,
         let _ = tx.send(read_line(&mut BufReader::new(stdout)));
     });
     let line = match rx.recv_timeout(timeout) {
-        Ok(Ok(line)) => line,
+        Ok(Ok(Some(line))) => line,
+        Ok(Ok(None)) => {
+            let status = wait_or_kill(&mut child);
+            return Err(VmError::Exited(format!(
+                "vibe-vm {command} {status} before it was ready; its log: {}",
+                launch.log.display()
+            )));
+        }
         Ok(Err(e)) => {
             let _ = child.kill();
             let _ = child.wait();
@@ -624,26 +661,55 @@ fn start(launch: &Launch<'_>, command: &str, timeout: Duration) -> Result<Ready,
             )));
         }
     };
-    if line.is_empty() {
-        let status = child.wait().map_err(io_err("wait for vibe-vm"))?;
-        return Err(VmError::Exited(format!(
-            "vibe-vm {command} exited with {status} before it was ready; its log: {}",
-            launch.log.display()
-        )));
-    }
     match decode_reply::<Ready>(&line) {
         Ok(Ok(ready)) => {
+            let expected = if command == "boot" {
+                Started::Boot
+            } else {
+                Started::Restore
+            };
+            if ready.protocol != PROTOCOL || ready.started != expected {
+                // Not a vibe-vm this code can drive: don't leave its VM running.
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(VmError::Protocol(format!(
+                    "vibe-vm {command} answered for protocol {} and a {:?}; expected protocol {PROTOCOL}",
+                    ready.protocol, ready.started
+                )));
+            }
             reap(child);
             Ok(ready)
         }
         Ok(Err(failure)) => {
-            let _ = child.wait();
+            wait_or_kill(&mut child);
             Err(VmError::Refused(failure))
         }
         Err(why) => {
             let _ = child.kill();
             let _ = child.wait();
             Err(VmError::Protocol(format!("{why}: {line}")))
+        }
+    }
+}
+
+/// How long a `vibe-vm` that gave up gets to exit before it's killed.
+const EXIT_GRACE: Duration = Duration::from_secs(10);
+
+/// Waits for a `vibe-vm` that has given up to exit, killing it if it
+/// doesn't in [`EXIT_GRACE`]; says how it ended.
+fn wait_or_kill(child: &mut Child) -> String {
+    let deadline = Instant::now() + EXIT_GRACE;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return format!("exited with {status}"),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return format!("didn't exit in {}s and was killed", EXIT_GRACE.as_secs());
+            }
         }
     }
 }
@@ -656,15 +722,15 @@ fn reap(mut child: Child) {
     });
 }
 
-/// One `\n`-terminated line, without the newline; empty at EOF. It reads a
-/// byte at a time, so after a `connect` nothing of the guest's stream is
-/// taken into a buffer.
-fn read_line(reader: &mut impl Read) -> io::Result<String> {
+/// One `\n`-terminated line, without the newline; `None` at EOF before a
+/// newline. It reads a byte at a time, so after a `connect` nothing of the
+/// guest's stream is taken into a buffer.
+fn read_line(reader: &mut impl Read) -> io::Result<Option<String>> {
     let mut line = Vec::new();
     let mut byte = [0u8; 1];
     loop {
         match reader.read(&mut byte) {
-            Ok(0) => break,
+            Ok(0) => return Ok(None),
             Ok(_) if byte[0] == b'\n' => break,
             Ok(_) => {
                 line.push(byte[0]);
@@ -679,7 +745,9 @@ fn read_line(reader: &mut impl Read) -> io::Result<String> {
             Err(e) => return Err(e),
         }
     }
-    String::from_utf8(line).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    String::from_utf8(line)
+        .map(Some)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 // ---------------------------------------------------------------------------
@@ -713,11 +781,11 @@ fn call<T: DeserializeOwned>(
             source: e,
         },
     })?;
-    if reply.is_empty() {
+    let Some(reply) = reply else {
         return Err(VmError::Protocol(
             "the connection closed without a reply".into(),
         ));
-    }
+    };
     match decode_reply::<T>(&reply) {
         Ok(Ok(t)) => Ok((t, stream)),
         Ok(Err(failure)) => Err(VmError::Refused(failure)),
@@ -726,15 +794,34 @@ fn call<T: DeserializeOwned>(
 }
 
 pub fn status(socket: &Path) -> Result<Status, VmError> {
-    call(socket, &Request::Status, CALL_TIMEOUT).map(|(s, _)| s)
+    let (status, _): (Status, _) = call(socket, &Request::Status, CALL_TIMEOUT)?;
+    if status.protocol != PROTOCOL {
+        return Err(VmError::Protocol(format!(
+            "vibe-vm speaks protocol {}, not {PROTOCOL}",
+            status.protocol
+        )));
+    }
+    Ok(status)
 }
 
 /// Puts the VM to sleep: the reply comes once its snapshot is saved and the
 /// VM stopped, and `vibe-vm` then exits. `vibe-guest` must have frozen the
-/// agent first. `balloon_ms`: see [`Request::Sleep`].
-pub fn sleep(socket: &Path, balloon_ms: Option<u64>) -> Result<Slept, VmError> {
+/// agent first. `balloon_ms` and `balloon_floor`: see [`Request::Sleep`].
+pub fn sleep(
+    socket: &Path,
+    balloon_ms: Option<u64>,
+    balloon_floor: Option<u64>,
+) -> Result<Slept, VmError> {
     let timeout = SAVE_TIMEOUT + Duration::from_millis(balloon_ms.unwrap_or(10_000));
-    call(socket, &Request::Sleep { balloon_ms }, timeout).map(|(s, _)| s)
+    call(
+        socket,
+        &Request::Sleep {
+            balloon_ms,
+            balloon_floor,
+        },
+        timeout,
+    )
+    .map(|(s, _)| s)
 }
 
 /// Stops the VM without saving it; `vibe-vm` exits.
@@ -745,7 +832,13 @@ pub fn stop(socket: &Path) -> Result<(), VmError> {
 /// A stream to vsock `port` in the guest, through `vibe-vm`. It has no
 /// timeouts set.
 pub fn connect(socket: &Path, port: u32) -> Result<UnixStream, VmError> {
-    let (Done {}, stream) = call(socket, &Request::Connect { port }, CALL_TIMEOUT)?;
+    connect_within(socket, port, CALL_TIMEOUT)
+}
+
+/// [`connect`], giving up after `timeout`: for polling a guest that is still
+/// starting, whose vsock may not answer yet.
+pub fn connect_within(socket: &Path, port: u32, timeout: Duration) -> Result<UnixStream, VmError> {
+    let (Done {}, stream) = call(socket, &Request::Connect { port }, timeout)?;
     stream
         .set_read_timeout(None)
         .and_then(|()| stream.set_write_timeout(None))
@@ -836,6 +929,16 @@ mod tests {
         config().validate().unwrap();
     }
 
+    #[test]
+    fn base64_is_strict() {
+        for good in ["AAAA", "AAA=", "AA==", "YnBsaXN0+/8="] {
+            assert!(is_base64(good), "{good}");
+        }
+        for bad in ["", "AAA", "A=A=", "A===", "AA AA", "AAAA="] {
+            assert!(!is_base64(bad), "{bad}");
+        }
+    }
+
     type Change = Box<dyn Fn(&mut VmConfig)>;
 
     #[test]
@@ -869,6 +972,18 @@ mod tests {
             ),
             (
                 Box::new(|c| c.machine_id = Some("not base64!".into())),
+                "machine_id must be base64",
+            ),
+            (
+                Box::new(|c| c.machine_id = Some("AAA".into())),
+                "machine_id must be base64",
+            ),
+            (
+                Box::new(|c| c.machine_id = Some("A=A=".into())),
+                "machine_id must be base64",
+            ),
+            (
+                Box::new(|c| c.machine_id = Some("A===".into())),
                 "machine_id must be base64",
             ),
             (
@@ -935,6 +1050,7 @@ mod tests {
             "2:5f:3a:11:9c:e4",
             "02-5f-3a-11-9c-e4",
             "zz:5f:3a:11:9c:e4",
+            "+f:5f:3a:11:9c:e4",
         ] {
             assert!(parse_mac(bad).is_err(), "{bad}");
         }
@@ -1061,7 +1177,7 @@ mod tests {
             (s.agent.as_str(), s.pid, s.state),
             ("x", 7, VmState::Running)
         );
-        let slept = sleep(&vm.socket, Some(0)).unwrap();
+        let slept = sleep(&vm.socket, Some(0), Some(1 << 30)).unwrap();
         assert_eq!(slept.snapshot_bytes, 5);
         assert_eq!(slept.timings.save_ms, Some(9));
         let err = stop(&vm.socket).unwrap_err();
@@ -1074,7 +1190,8 @@ mod tests {
             [
                 Request::Status,
                 Request::Sleep {
-                    balloon_ms: Some(0)
+                    balloon_ms: Some(0),
+                    balloon_floor: Some(1 << 30),
                 },
                 Request::Stop,
                 Request::Stop,
@@ -1199,6 +1316,25 @@ exec sleep 30"#,
         )
         .unwrap_err();
         assert!(matches!(err, VmError::TimedOut(_)), "{err}");
+
+        // A vibe-vm this code can't drive is refused, and its VM not left.
+        let bin = script(
+            dir.path(),
+            r#"echo '{"ok":true,"protocol":2,"pid":1,"started":"boot","timings":{}}'; exec sleep 30"#,
+        );
+        let err = boot(&launch(dir.path(), &bin, &log)).unwrap_err();
+        assert!(err.to_string().contains("protocol 2"), "{err}");
+        let bin = script(
+            dir.path(),
+            r#"echo '{"ok":true,"protocol":1,"pid":1,"started":"boot","timings":{}}'; exec sleep 30"#,
+        );
+        let err = restore(&launch(dir.path(), &bin, &log)).unwrap_err();
+        assert!(matches!(err, VmError::Protocol(_)), "{err}");
+
+        // Output that never ends its line counts as none.
+        let bin = script(dir.path(), "printf 'half a line'; exit 4");
+        let err = boot(&launch(dir.path(), &bin, &log)).unwrap_err();
+        assert!(err.to_string().contains("exit status: 4"), "{err}");
 
         let missing = dir.path().join("missing");
         let err = boot(&launch(dir.path(), &missing, &log)).unwrap_err();

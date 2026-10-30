@@ -21,6 +21,17 @@ pub(crate) fn run() -> ! {
     match listen() {
         Ok(listener) => {
             println!("vibe-testguest: serving vsock port {PORT}");
+            // For the console log: when DHCP has given eth0 an address.
+            std::thread::spawn(|| {
+                for _ in 0..300 {
+                    if let Some(ip) = ipv4("eth0") {
+                        println!("vibe-testguest: eth0 has {ip}");
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                println!("vibe-testguest: eth0 has no address after 30s");
+            });
             loop {
                 match accept(&listener) {
                     Ok(conn) => {
@@ -105,7 +116,15 @@ fn answer(command: &str) -> Value {
             "share": read_trimmed("/mnt/share/probe"),
             "disk": read_disk(),
             "uptime_ms": uptime_ms(),
+            "cpus": std::thread::available_parallelism().map(|n| n.get()).ok(),
+            "rng": read_trimmed("/sys/class/misc/hw_random/rng_current"),
+            "ip": ipv4("eth0"),
         }),
+        "sync" => {
+            // SAFETY: sync takes no arguments and can't fail.
+            unsafe { libc::sync() };
+            json!({ "synced": true })
+        }
         "dirty" => match arg.parse::<usize>() {
             Ok(mib) => {
                 dirty(mib);
@@ -123,6 +142,34 @@ fn answer(command: &str) -> Value {
 
 fn read_trimmed(path: &str) -> Option<String> {
     fs::read_to_string(path).ok().map(|s| s.trim().to_owned())
+}
+
+/// The IPv4 address DHCP gave `interface`, if any.
+fn ipv4(interface: &str) -> Option<String> {
+    let mut addrs: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs fills a list this function frees before returning,
+    // and every pointer read is checked for null first.
+    unsafe {
+        if libc::getifaddrs(&mut addrs) != 0 {
+            return None;
+        }
+        let mut found = None;
+        let mut cur = addrs;
+        while !cur.is_null() {
+            let ifa = &*cur;
+            let inet =
+                !ifa.ifa_addr.is_null() && i32::from((*ifa.ifa_addr).sa_family) == libc::AF_INET;
+            if inet && std::ffi::CStr::from_ptr(ifa.ifa_name).to_bytes() == interface.as_bytes() {
+                let sin = &*(ifa.ifa_addr as *const libc::sockaddr_in);
+                found =
+                    Some(std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr)).to_string());
+                break;
+            }
+            cur = ifa.ifa_next;
+        }
+        libc::freeifaddrs(addrs);
+        found
+    }
 }
 
 fn uptime_ms() -> Option<u64> {
@@ -187,13 +234,25 @@ mod tests {
     #[test]
     fn status_has_every_field() {
         let status = answer("status");
-        for key in ["count", "boot_id", "mac", "share", "disk", "uptime_ms"] {
+        for key in [
+            "count",
+            "boot_id",
+            "mac",
+            "share",
+            "disk",
+            "uptime_ms",
+            "cpus",
+            "rng",
+            "ip",
+        ] {
             assert!(status.get(key).is_some(), "{key} in {status}");
         }
         // This host has a boot id and an uptime, if no `agent` disk.
         assert!(status["boot_id"].is_string(), "{status}");
         assert!(status["uptime_ms"].as_u64().unwrap() > 0);
         assert!(status["disk"].is_null());
+        assert!(status["cpus"].as_u64().unwrap() >= 1);
+        assert_eq!(answer("sync"), json!({ "synced": true }));
     }
 
     #[test]

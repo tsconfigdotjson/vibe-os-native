@@ -1,7 +1,9 @@
 # CI runs the same script developers run: scripts/check-full.sh. On Linux it
 # covers the Rust workspace, the vibe-guest cross-build and the vibed smoke
 # test; on macOS 26 it adds both Swift packages, the Swift contract tests,
-# ad hoc signing and the vibe-vm and VibeOS.app smoke tests.
+# ad hoc signing and the vibe-vm and VibeOS.app smoke tests. The runner is
+# itself a VM, so the step that boots real VMs (vm-cycle) is N/A there; it
+# needs a Mac on real hardware.
 name: CI
 
 on:

@@ -151,14 +151,22 @@ fn every_example_round_trips() {
 }
 
 #[test]
-fn sleep_takes_an_optional_balloon_time() {
+fn sleep_takes_an_optional_balloon_time_and_floor() {
     let r: Request = serde_json::from_str(r#"{"op":"sleep"}"#).unwrap();
-    assert_eq!(r, Request::Sleep { balloon_ms: None });
-    let r: Request = serde_json::from_str(r#"{"op":"sleep","balloon_ms":0}"#).unwrap();
     assert_eq!(
         r,
         Request::Sleep {
-            balloon_ms: Some(0)
+            balloon_ms: None,
+            balloon_floor: None
+        }
+    );
+    let r: Request =
+        serde_json::from_str(r#"{"op":"sleep","balloon_ms":0,"balloon_floor":1024}"#).unwrap();
+    assert_eq!(
+        r,
+        Request::Sleep {
+            balloon_ms: Some(0),
+            balloon_floor: Some(1024)
         }
     );
     assert!(serde_json::from_str::<Request>(r#"{"op":"connect"}"#).is_err());

@@ -11,7 +11,9 @@
 # Needs build/vibe-vm (scripts/sign-macos.sh) and build/test-guest
 # (scripts/test-guest.sh); builds them if missing. Its state is kept in
 # build/vm-reboot/ between the halves. Run from Terminal in the logged-in
-# session, like check-full.sh.
+# session, like check-full.sh. The restore half fails if the Mac hasn't
+# rebooted since the save; VIBE_VM_NO_REBOOT=1 runs it anyway, to try the
+# script out, but then it can't pass.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -30,23 +32,29 @@ if [ "$(uname -s)" != Darwin ]; then
   exit 1
 fi
 
-STATE=build/vm-reboot
-MARKER=build/vm-reboot-marker
+ROOT=$(pwd)
+STATE="$ROOT/build/vm-reboot"
+MARKER="$ROOT/build/vm-reboot-marker"
 [ -x build/vibe-vm ] || scripts/sign-macos.sh
 [ -f build/test-guest/Image ] || scripts/test-guest.sh build/test-guest
 
 boot_time() { sysctl -n kern.boottime; }
 
+rebooted=yes
 if [ "$phase" = restore ]; then
   [ -f "$STATE/boottime" ] || { echo "run the save half first" >&2; exit 1; }
   if [ "$(boot_time)" = "$(cat "$STATE/boottime")" ]; then
-    echo "vm-reboot-test.sh: the Mac hasn't rebooted since the save; restoring anyway" >&2
+    if [ "${VIBE_VM_NO_REBOOT:-}" != 1 ]; then
+      echo "vm-reboot-test.sh: the Mac hasn't rebooted since the save; reboot first" >&2
+      exit 1
+    fi
+    rebooted=no
   fi
 fi
 rm -rf "$MARKER"
 
 VIBE_VM_PHASE=$phase VIBE_VM_STATE="$STATE" VIBE_VM_MARKER="$MARKER" \
-  VIBE_VM_BIN=build/vibe-vm VIBE_VM_GUEST=build/test-guest \
+  VIBE_VM_BIN="$ROOT/build/vibe-vm" VIBE_VM_GUEST="$ROOT/build/test-guest" \
   cargo test -p vibe-env --locked --test vm_cycle -- reboot --exact --nocapture
 
 if [ "$phase" = save ]; then
@@ -54,5 +62,9 @@ if [ "$phase" = save ]; then
   echo "saved. Reboot the Mac, then run: scripts/vm-reboot-test.sh restore"
 else
   [ -f "$MARKER/reboot" ] || { echo "the restore half didn't run" >&2; exit 1; }
+  if [ "$rebooted" = no ]; then
+    echo "restored, but without a reboot in between: not a pass" >&2
+    exit 1
+  fi
   echo "PASS: the VM saved before $(cat "$STATE/boottime") restored after $(boot_time)"
 fi

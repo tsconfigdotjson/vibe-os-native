@@ -108,6 +108,13 @@ public final class ControlSocket: @unchecked Sendable {
     public func remove() {
         unlink(path)
     }
+
+    /// Removes the socket and lets the lock go, so the next vibe-vm for this
+    /// VM can start at once. Only right before exiting.
+    public func release() {
+        unlink(path)
+        close(lockFD)
+    }
 }
 
 /// Connects to the Unix socket at `path`.
@@ -134,6 +141,12 @@ public func connectUnix(_ path: String) throws -> Int32 {
         throw Failure(.badRequest, "can't connect to \(path): \(why)")
     }
     return fd
+}
+
+/// How long a read on `fd` may block; 0 for ever.
+func setReceiveTimeout(_ fd: Int32, seconds: Int) {
+    var tv = timeval(tv_sec: seconds, tv_usec: 0)
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
 }
 
 /// A write to a closed socket must fail, not kill vibe-vm with SIGPIPE.
@@ -182,7 +195,8 @@ public func writeAll(_ fd: Int32, _ data: Data) throws {
 
 /// Copies bytes both ways between a client and a guest stream, each way on
 /// a thread of its own, until both ways end. An end of input is passed on as
-/// a half close. Then the client is closed and `done` is called; the guest
+/// a half close, so a guest that sees one is expected to finish and close
+/// its end too. Then the client is closed and `done` is called; the guest
 /// stream is the caller's to close.
 public func splice(client: Int32, guest: Int32, done: @escaping @Sendable () -> Void) {
     let finished = Countdown(2) {

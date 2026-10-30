@@ -163,7 +163,8 @@ public func parseMAC(_ s: String) -> [UInt8]? {
     guard parts.count == 6 else { return nil }
     var bytes: [UInt8] = []
     for part in parts {
-        guard part.count == 2, let byte = UInt8(part, radix: 16) else { return nil }
+        let hex = part.utf8.allSatisfy { (0x30...0x39).contains($0) || (0x41...0x46).contains($0) || (0x61...0x66).contains($0) }
+        guard part.count == 2, hex, let byte = UInt8(part, radix: 16) else { return nil }
         bytes.append(byte)
     }
     return bytes[0] & 1 == 0 ? bytes : nil

@@ -166,7 +166,9 @@ public enum Request: Equatable, Sendable {
     case status
     /// Balloon, pause, save, stop and exit. `balloonMS`: how long the
     /// balloon stays inflated; nil for the default, 0 to skip it.
-    case sleep(balloonMS: UInt64?)
+    /// `balloonFloor`: the least memory, in bytes, the balloon leaves the
+    /// guest; nil for the least the VM may have.
+    case sleep(balloonMS: UInt64?, balloonFloor: UInt64?)
     /// Stop at once, without saving, and exit.
     case stop
     /// Make this connection a stream to `port` in the guest.
@@ -195,6 +197,7 @@ extension Request: Codable {
     enum CodingKeys: String, CodingKey {
         case op
         case balloonMS = "balloon_ms"
+        case balloonFloor = "balloon_floor"
         case port
     }
 
@@ -203,7 +206,10 @@ extension Request: Codable {
         let op = try c.decode(String.self, forKey: .op)
         switch op {
         case "status": self = .status
-        case "sleep": self = .sleep(balloonMS: try c.decodeIfPresent(UInt64.self, forKey: .balloonMS))
+        case "sleep":
+            self = .sleep(
+                balloonMS: try c.decodeIfPresent(UInt64.self, forKey: .balloonMS),
+                balloonFloor: try c.decodeIfPresent(UInt64.self, forKey: .balloonFloor))
         case "stop": self = .stop
         case "connect": self = .connect(port: try c.decode(UInt32.self, forKey: .port))
         default:
@@ -215,9 +221,10 @@ extension Request: Codable {
         var c = encoder.container(keyedBy: CodingKeys.self)
         switch self {
         case .status: try c.encode("status", forKey: .op)
-        case .sleep(let balloonMS):
+        case .sleep(let balloonMS, let balloonFloor):
             try c.encode("sleep", forKey: .op)
             try c.encodeIfPresent(balloonMS, forKey: .balloonMS)
+            try c.encodeIfPresent(balloonFloor, forKey: .balloonFloor)
         case .stop: try c.encode("stop", forKey: .op)
         case .connect(let port):
             try c.encode("connect", forKey: .op)

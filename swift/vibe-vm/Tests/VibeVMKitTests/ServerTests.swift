@@ -58,8 +58,10 @@ func readSome(_ fd: Int32) -> String {
         defer { try? FileManager.default.removeItem(at: dir) }
         let path = dir.appendingPathComponent("run/x.vm").path
         var first: ControlSocket? = try ControlSocket.bind(path: path)
-        #expect(throws: Failure(.alreadyRunning, "another vibe-vm is already serving \(path)")) {
-            try ControlSocket.bind(path: path)
+        withExtendedLifetime(first) {
+            #expect(throws: Failure(.alreadyRunning, "another vibe-vm is already serving \(path)")) {
+                try ControlSocket.bind(path: path)
+            }
         }
         // The run directory is made private.
         let mode = try FileManager.default.attributesOfItem(atPath: dir.appendingPathComponent("run").path)[.posixPermissions]

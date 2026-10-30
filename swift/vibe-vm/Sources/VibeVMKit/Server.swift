@@ -35,8 +35,12 @@ public final class ControlServer: Sendable {
         acceptor.start()
     }
 
+    /// How long a client may take to send its request line.
+    static let requestTimeout = 30
+
     func serve(_ client: Int32) {
         let outcome: Outcome
+        setReceiveTimeout(client, seconds: ControlServer.requestTimeout)
         do {
             guard let line = try readLine(client, max: ControlProtocol.maxRequestBytes) else {
                 close(client)
@@ -65,6 +69,8 @@ public final class ControlServer: Sendable {
                 Task { await closeStream(stream.id) }
                 return
             }
+            // The stream may be quiet for as long as it likes.
+            setReceiveTimeout(client, seconds: 0)
             splice(client: client, guest: stream.fd) {
                 Task { await closeStream(stream.id) }
             }

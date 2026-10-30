@@ -73,39 +73,36 @@ public enum Runner {
         }
 
         logMessage("\(mode.rawValue): \(config.ref), \(config.cpus) vCPUs, \(config.memory >> 20) MiB")
+        let exiter = Exiter(socket: socket)
         let controller = Controller(config: config, machine: machine)
         machine.onStop = { error in
             if let code = controller.machineStopped(error: error) {
-                socket.remove()
-                exit(code)
+                exiter.exit(code)
             }
         }
+        // Served from the start, so a probe during a long restore finds a
+        // vibe-vm that is restoring, not one that doesn't answer.
+        let server = ControlServer(
+            socket: socket,
+            handle: { request in await controller.handle(request) },
+            closeStream: { id in await controller.closeStream(id) },
+            exit: { code in exiter.exit(code) })
+        server.start()
+
         let result: Result<Ready, Failure>
         switch mode {
         case .boot: result = await controller.boot(since: processStart)
         case .restore: result = await controller.restore(since: processStart)
         }
-        let ready: Ready
-        switch result {
-        case .failure(let failure):
-            logMessage(failure.error)
-            socket.remove()
-            emit(failure)
-            exit(1)
-        case .success(let value):
-            ready = value
+        guard case .success(let ready) = result else {
+            if case .failure(let failure) = result {
+                logMessage(failure.error)
+                emit(failure)
+            }
+            exiter.exit(1)
+            return
         }
         logMessage("running after \(ready.timings.totalMS ?? 0) ms")
-
-        let server = ControlServer(
-            socket: socket,
-            handle: { request in await controller.handle(request) },
-            closeStream: { id in await controller.closeStream(id) },
-            exit: { code in
-                socket.remove()
-                exit(code)
-            })
-        server.start()
         emit(ready)
         // vibed reads only the ready line and may close its end at any time;
         // nothing more goes to stdout.
@@ -140,5 +137,31 @@ public enum Runner {
     /// One line on stdout, for vibed.
     static func emit(_ value: some Encodable) {
         try? writeAll(STDOUT_FILENO, Wire.line(value))
+    }
+}
+
+/// Ends vibe-vm, once, whichever gets there first: a reply that ends it, the
+/// guest stopping the VM, a failed start. It exits on the main queue, not
+/// on a server thread in the middle of Virtualization.framework's work, and
+/// lets the socket's lock go first.
+final class Exiter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var exiting = false
+    private let socket: ControlSocket
+
+    init(socket: ControlSocket) {
+        self.socket = socket
+    }
+
+    func exit(_ code: Int32) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !exiting else { return }
+        exiting = true
+        let socket = self.socket
+        DispatchQueue.main.async {
+            socket.release()
+            Darwin.exit(code)
+        }
     }
 }

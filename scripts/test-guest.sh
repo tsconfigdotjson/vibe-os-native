@@ -116,6 +116,21 @@ for m in vsock vmw_vsock_virtio_transport_common vmw_vsock_virtio_transport; do
 done
 mount -t virtiofs share /mnt/share || echo "test-guest: no share"
 ip link set eth0 up || echo "test-guest: no eth0"
+# DHCP from the NAT network, in the background so the vsock server needn't
+# wait for it.
+cat >/udhcpc.script <<'DHCP'
+#!/bin/sh
+case $1 in
+  bound | renew)
+    ip addr flush dev "$interface"
+    ip addr add "$ip/$mask" dev "$interface"
+    [ -n "$router" ] && ip route add default via "${router%% *}" dev "$interface"
+    ;;
+esac
+exit 0
+DHCP
+chmod 755 /udhcpc.script
+udhcpc -i eth0 -s /udhcpc.script -f -q -n -t 10 -T 1 >/dev/null 2>&1 &
 echo "test-guest: exec vibe-testguest"
 exec /vibe-testguest
 INIT

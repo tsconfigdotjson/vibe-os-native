@@ -26,7 +26,8 @@ func roundTrip<T: Codable>(_ type: T.Type, _ value: Any, _ name: String) throws 
     let data = try JSONSerialization.data(withJSONObject: value)
     let decoded = try JSONDecoder().decode(T.self, from: data)
     let again = try jsonObject(Wire.line(decoded))
-    #expect(again.isEqual(to: try jsonObject(data)), "\(name): \(again)")
+    let original = try jsonObject(data)
+    #expect(again == original, "\(name): \(again)")
     return decoded
 }
 
@@ -119,7 +120,7 @@ func roundTripReply<T: Codable>(_ type: T.Type, _ reply: Any, _ name: String) th
         #expect(started == [.boot, .restore])
     }
 
-    @Test func requestsAreParsedStrictly() {
+    @Test func requestsAreChecked() {
         let cases: [(String, String)] = [
             ("", "one JSON object"),
             ("[]", "one JSON object"),
@@ -137,6 +138,6 @@ func roundTripReply<T: Codable>(_ type: T.Type, _ reply: Any, _ name: String) th
             #expect(failure.code == .badRequest)
             #expect(failure.error.contains(message), "\(line): \(failure.error)")
         }
-        #expect(Request.parse(Data(#"{"op":"sleep"}"#.utf8)) == .success(.sleep(balloonMS: nil)))
+        #expect(Request.parse(Data(#"{"op":"sleep"}"#.utf8)) == .success(.sleep(balloonMS: nil, balloonFloor: nil)))
     }
 }

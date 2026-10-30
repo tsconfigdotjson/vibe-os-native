@@ -119,7 +119,10 @@ import Testing
     @Test func macs() {
         #expect(parseMAC("02:5f:3a:11:9c:e4") == [0x02, 0x5f, 0x3a, 0x11, 0x9c, 0xe4])
         #expect(parseMAC("02:5F:3A:11:9C:E4") != nil)
-        for bad in ["", "02:5f:3a:11:9c", "02:5f:3a:11:9c:e4:00", "2:5f:3a:11:9c:e4", "zz:5f:3a:11:9c:e4", "01:00:00:00:00:00"] {
+        for bad in [
+            "", "02:5f:3a:11:9c", "02:5f:3a:11:9c:e4:00", "2:5f:3a:11:9c:e4", "zz:5f:3a:11:9c:e4", "01:00:00:00:00:00",
+            "+2:5f:3a:11:9c:e4", "02:-0:3a:11:9c:e4",
+        ] {
             #expect(parseMAC(bad) == nil, "\(bad)")
         }
         for _ in 0..<100 {
@@ -139,11 +142,8 @@ import Testing
         #expect(try FileManager.default.contentsOfDirectory(atPath: dir.path) == ["vm.json"])
         try Data("{".utf8).write(to: URL(fileURLWithPath: path))
         #expect(throws: Failure.self) { try VMConfig.load(path: path) }
-        do {
-            _ = try VMConfig.load(path: dir.appendingPathComponent("none.json").path)
-        } catch let failure as Failure {
-            #expect(failure.code == .badConfig)
-        }
+        let missing = dir.appendingPathComponent("none.json").path
+        #expect(throws: Failure.self) { try VMConfig.load(path: missing) }
     }
 }
 

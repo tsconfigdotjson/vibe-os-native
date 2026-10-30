@@ -18,6 +18,8 @@ final class FakeMachine: Machine {
     var failSave = false
     var failConnect = false
     var guestEnds: [Int32] = []
+    /// If set, each resume notes whether this file is still there.
+    var snapshot: String?
 
     func start() async throws {
         calls.append("start")
@@ -39,6 +41,9 @@ final class FakeMachine: Machine {
     }
 
     func resume() async throws {
+        if let snapshot, FileManager.default.fileExists(atPath: snapshot) {
+            calls.append("resume with the snapshot still there")
+        }
         calls.append("resume")
         state = .running
     }
@@ -144,7 +149,7 @@ func failure(_ outcome: Outcome) throws -> Failure {
         let (controller, dir) = try makeController(machine, waits: waits)
         defer { try? FileManager.default.removeItem(at: dir) }
         _ = await controller.boot(since: ContinuousClock.now)
-        let outcome = await controller.handle(.sleep(balloonMS: nil))
+        let outcome = await controller.handle(.sleep(balloonMS: nil, balloonFloor: nil))
         guard case .exit(_, let code) = outcome else {
             Issue.record("a sleep must end vibe-vm: \(outcome)")
             return
@@ -160,14 +165,55 @@ func failure(_ outcome: Outcome) throws -> Failure {
         // to whole MiB), then back to the VM's 1 GiB, before the pause.
         #expect(
             machine.calls == [
-                "start", "balloon 2", "balloon 1024", "pause", "save quiet-amber-otter.partial", "stop",
+                "start", "balloon 2", "balloon 1024", "pause", "save .quiet-amber-otter.partial", "stop",
             ])
         #expect(waits.all == [Controller.defaultBalloonMS])
         #expect(controller.stopping)
+        // Until vibe-vm exits, nothing else may touch the stopped VM.
+        #expect(try failure(await controller.handle(.stop)) == Failure(.busy, "the VM is already stopped"))
         // The VM stopping now isn't the guest dying.
         #expect(controller.machineStopped(error: nil) == nil)
         let snapshots = (controller.config.snapshot as NSString).deletingLastPathComponent
         #expect(try FileManager.default.contentsOfDirectory(atPath: snapshots) == ["quiet-amber-otter"])
+        let mode = try FileManager.default.attributesOfItem(atPath: controller.config.snapshot)[.posixPermissions]
+        #expect(mode as? Int == 0o600, "the snapshot holds the guest's memory")
+    }
+
+    @Test func vibedCanSetTheBalloonsFloor() async throws {
+        let machine = FakeMachine()
+        let (controller, dir) = try makeController(machine)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        _ = await controller.boot(since: ContinuousClock.now)
+        _ = try decode(Slept.self, await controller.handle(.sleep(balloonMS: 5, balloonFloor: 300 << 20)))
+        #expect(machine.calls.prefix(3) == ["start", "balloon 300", "balloon 1024"])
+        #expect(controller.balloonTarget(floor: nil) == 2 << 20)
+        #expect(controller.balloonTarget(floor: (300 << 20) + 1) == 301 << 20)
+        #expect(controller.balloonTarget(floor: 1 << 40) == 1 << 30)
+        #expect(controller.balloonTarget(floor: .max) == 1 << 30)
+    }
+
+    @Test func aFreshBootDeletesAStaleSnapshot() async throws {
+        let machine = FakeMachine()
+        let (controller, dir) = try makeController(machine)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let snapshot = controller.config.snapshot
+        try FileManager.default.createDirectory(
+            atPath: (snapshot as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+        for path in [snapshot, controller.partialPath] {
+            try Data("old".utf8).write(to: URL(fileURLWithPath: path))
+        }
+        _ = try await controller.boot(since: ContinuousClock.now).get()
+        #expect(!FileManager.default.fileExists(atPath: snapshot))
+        #expect(!FileManager.default.fileExists(atPath: controller.partialPath))
+    }
+
+    @Test func thePartialSnapshotIsNeverAnotherAgents() async throws {
+        let machine = FakeMachine()
+        let (controller, dir) = try makeController(machine)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let name = (controller.partialPath as NSString).lastPathComponent
+        #expect(name == ".quiet-amber-otter.partial")
+        #expect(!isRef(name))
     }
 
     @Test func aSleepCanSkipTheBalloon() async throws {
@@ -176,9 +222,9 @@ func failure(_ outcome: Outcome) throws -> Failure {
         let (controller, dir) = try makeController(machine, waits: waits)
         defer { try? FileManager.default.removeItem(at: dir) }
         _ = await controller.boot(since: ContinuousClock.now)
-        let slept = try decode(Slept.self, await controller.handle(.sleep(balloonMS: 0)))
+        let slept = try decode(Slept.self, await controller.handle(.sleep(balloonMS: 0, balloonFloor: nil)))
         #expect(slept.timings.balloonMS != nil)
-        #expect(machine.calls == ["start", "pause", "save quiet-amber-otter.partial", "stop"])
+        #expect(machine.calls == ["start", "pause", "save .quiet-amber-otter.partial", "stop"])
         #expect(waits.all.isEmpty)
     }
 
@@ -188,7 +234,7 @@ func failure(_ outcome: Outcome) throws -> Failure {
         defer { try? FileManager.default.removeItem(at: dir) }
         _ = await controller.boot(since: ContinuousClock.now)
         machine.failSave = true
-        let refused = try failure(await controller.handle(.sleep(balloonMS: 0)))
+        let refused = try failure(await controller.handle(.sleep(balloonMS: 0, balloonFloor: nil)))
         #expect(refused == Failure(.saveFailed, "can't save the VM: No space left on device; it was resumed"))
         #expect(machine.state == .running)
         #expect(!controller.stopping)
@@ -196,7 +242,7 @@ func failure(_ outcome: Outcome) throws -> Failure {
         #expect(try FileManager.default.contentsOfDirectory(atPath: snapshots).isEmpty)
         // It isn't left busy: the next sleep works.
         machine.failSave = false
-        _ = try decode(Slept.self, await controller.handle(.sleep(balloonMS: 0)))
+        _ = try decode(Slept.self, await controller.handle(.sleep(balloonMS: 0, balloonFloor: nil)))
     }
 
     @Test func aFailedPauseKeepsRunning() async throws {
@@ -205,7 +251,7 @@ func failure(_ outcome: Outcome) throws -> Failure {
         defer { try? FileManager.default.removeItem(at: dir) }
         _ = await controller.boot(since: ContinuousClock.now)
         machine.failPause = true
-        let refused = try failure(await controller.handle(.sleep(balloonMS: 0)))
+        let refused = try failure(await controller.handle(.sleep(balloonMS: 0, balloonFloor: nil)))
         #expect(refused.code == .saveFailed)
         #expect(machine.state == .running)
         #expect(!machine.calls.contains { $0.hasPrefix("save") })
@@ -217,8 +263,8 @@ func failure(_ outcome: Outcome) throws -> Failure {
         defer { try? FileManager.default.removeItem(at: dir) }
         _ = await controller.boot(since: ContinuousClock.now)
         machine.state = .paused
-        _ = try decode(Slept.self, await controller.handle(.sleep(balloonMS: nil)))
-        #expect(machine.calls == ["start", "save quiet-amber-otter.partial", "stop"])
+        _ = try decode(Slept.self, await controller.handle(.sleep(balloonMS: nil, balloonFloor: nil)))
+        #expect(machine.calls == ["start", "save .quiet-amber-otter.partial", "stop"])
     }
 
     @Test func requestsWhileSavingAreRefused() async throws {
@@ -231,13 +277,13 @@ func failure(_ outcome: Outcome) throws -> Failure {
         // While the balloon is up, everything that changes the VM waits its
         // turn by being refused; a status still answers.
         waits.during = {
-            for request in [Request.sleep(balloonMS: 0), .stop, .connect(port: 1024)] {
+            for request in [Request.sleep(balloonMS: 0, balloonFloor: nil), .stop, .connect(port: 1024)] {
                 refusals.add(try? failure(await controller.handle(request)))
             }
             let status = try? decode(Status.self, await controller.handle(.status))
             refusals.state = status?.state
         }
-        _ = try decode(Slept.self, await controller.handle(.sleep(balloonMS: 1)))
+        _ = try decode(Slept.self, await controller.handle(.sleep(balloonMS: 1, balloonFloor: nil)))
         #expect(refusals.all == Array(repeating: Failure(.busy, "the VM is already saving"), count: 3))
         #expect(refusals.state == .running)
     }
@@ -246,7 +292,7 @@ func failure(_ outcome: Outcome) throws -> Failure {
         let machine = FakeMachine()
         let (controller, dir) = try makeController(machine)
         defer { try? FileManager.default.removeItem(at: dir) }
-        #expect(try failure(await controller.handle(.sleep(balloonMS: 0))) == Failure(.badState, "the VM is stopped"))
+        #expect(try failure(await controller.handle(.sleep(balloonMS: 0, balloonFloor: nil))) == Failure(.badState, "the VM is stopped"))
         _ = await controller.boot(since: ContinuousClock.now)
         machine.state = .paused
         #expect(try failure(await controller.handle(.connect(port: 1))) == Failure(.badState, "the VM is paused"))
@@ -317,21 +363,16 @@ func failure(_ outcome: Outcome) throws -> Failure {
 
         machine.failRestore = false
         machine.calls = []
+        machine.snapshot = snapshot
         let ready = try await controller.restore(since: ContinuousClock.now).get()
         #expect(ready.started == .restore)
         #expect(ready.timings.restoreMS != nil && ready.timings.resumeMS != nil && ready.timings.totalMS != nil)
+        // The snapshot is gone before the VM runs again.
         #expect(machine.calls == ["restore", "resume"])
         #expect(machine.state == .running)
         #expect(!FileManager.default.fileExists(atPath: snapshot))
         let status = try decode(Status.self, await controller.handle(.status))
         #expect(status.started == .restore)
-    }
-
-    @Test func balloonFloorNeverExceedsTheVM() async throws {
-        let machine = FakeMachine()
-        let (controller, dir) = try makeController(machine)
-        defer { try? FileManager.default.removeItem(at: dir) }
-        #expect(controller.balloonFloor() == 2 << 20)
     }
 
     @Test func millisecondsRoundDown() {
