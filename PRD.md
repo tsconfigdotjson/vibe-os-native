@@ -114,7 +114,7 @@ An agent's life runs setup → start (worktree and compartment included) → wor
 6. **Go idle.** About a minute after the agent comes to rest with nothing attached, it goes to sleep: a `linux` VM is saved to disk and its RAM freed, and a `macos` agent is frozen. A send or an attach wakes it exactly where it was, including mid-question.
 7. **Finish.** The agent commits, pushes and opens a PR itself, in either environment. It uses the Mac's `gh` login in `macos`, and the Linux home's in `linux`.
 8. **Delete.** `vibe_delete_agent` ends the agent and removes its worktree, compartment and snapshot. The branch is kept. Deletion is refused if there are uncommitted changes or unpushed commits, unless `force` is set. Nothing is deleted automatically.
-9. **Reboot.** `vibed` starts at login and marks every agent `asleep`. A `linux` agent wakes from its snapshot, if snapshots survive a reboot (open question 1). A `macos` agent's processes are gone, so it wakes by continuing its conversation with `claude --resume`.
+9. **Reboot.** `vibed` starts at login and marks every agent `asleep`. A `linux` agent wakes from its snapshot exactly where it was; a spike confirmed snapshots survive a reboot. A `macos` agent's processes are gone, so it wakes by continuing its conversation with `claude --resume`.
 
 ## Architecture
 
@@ -278,7 +278,7 @@ The VM boots with its agent. Sleeping, as measured in the spike below:
 2. `vibed` inflates the memory balloon and lets it go, so pages the guest has freed are handed back and stay out of the snapshot.
 3. `vibe-vm` pauses the VM, saves its whole state (RAM and devices) to the agent's snapshot file, and exits. All its RAM goes back to the Mac.
 
-Waking runs it backwards. `vibe-vm` restores the snapshot and resumes the VM. `vibe-guest` sets the clock from the host, because it stopped while the VM slept. It waits for the shared folders to answer, which takes about a second after a restore, and then thaws Claude. Claude is exactly where it was, mid-prompt or mid-question, with nothing replayed, and the shim reconnects. Network connections open at sleep time may drop; an idle Claude has none in flight (open question 3 checks this).
+Waking runs it backwards. `vibe-vm` restores the snapshot and resumes the VM. `vibe-guest` sets the clock from the host, because it stopped while the VM slept. It waits for the shared folders to answer, which takes about a second after a restore, and then thaws Claude. Claude is exactly where it was, mid-prompt or mid-question, with nothing replayed, and the shim reconnects. Network connections open at sleep time may drop; an idle Claude has none in flight (open question 2 checks this).
 
 A restore only works with the exact configuration the VM was saved with, so each agent's VM keeps a fixed MAC address and machine identifier for its whole life.
 
@@ -411,7 +411,7 @@ Only transcripts of agents this app spawned are read. agent-tail is fed specific
 
 **Idle** means all of these hold:
 
-- agent-tail reports a *firm* `done`, `interrupted`, `errored`, `awaiting_answer` or `awaiting_approval`. Its firm states already rule out subagents and background tasks, which show as `background_work`, so no timing guess is needed. An agent stopped by a Claude usage limit counts as at rest too: it sleeps like any other, and the next send wakes it. That depends on agent-tail reporting the limit stop as firm (open question 5).
+- agent-tail reports a *firm* `done`, `interrupted`, `errored`, `awaiting_answer` or `awaiting_approval`. Its firm states already rule out subagents and background tasks, which show as `background_work`, so no timing guess is needed. An agent stopped by a Claude usage limit counts as at rest too: it sleeps like any other, and the next send wakes it. That depends on agent-tail reporting the limit stop as firm (open question 4).
 - no process in the tree that agent-tail can't see: nothing started more than 30 s after Claude, other than the MCP servers Claude starts. This catches detached jobs such as `nohup` or a container. In `linux`, `vibe-guest` reports the tree.
 - no pending scheduled wakeup (`/loop`, `ScheduleWakeup`, `CronCreate`), which wouldn't fire while asleep. Until [agent-tail#120](https://github.com/tsconfigdotjson/agent-tail/issues/120) can see these, `vibed` treats any such call in the transcript as keeping the agent awake for the rest of the session.
 - no client is attached
@@ -492,7 +492,9 @@ A third spike the same day covered real git, layered disks, the `macos` governor
 | `phys_footprint`, `PRIO_DARWIN_BG`, `SIGSTOP`/`SIGCONT` on another process of the same user | All work, unprivileged. Background priority showed as 31 → 4 in `ps` |
 | A real, long-running Claude Code session on this Mac | 340 MB physical footprint. An idle agent's snapshot after the balloon should be about 400 MB with the kernel, so the 20 GB budget holds about 50 sleeping agents |
 
-Not tested yet: surviving a host reboot (open question 1), and Claude itself inside a VM with a `setup-token` login (open question 4).
+A saved VM also survives a host reboot: one saved before a real reboot restored afterwards in 0.52 s, with its in-memory state intact.
+
+Not tested yet: Claude itself inside a VM with a `setup-token` login (open question 3).
 
 ## Open questions
 
@@ -500,13 +502,14 @@ None of these block design work any more. Each has a test ready or under way.
 
 | # | Question | Recommendation | Why |
 | --- | --- | --- | --- |
-| 1 | Does a saved VM survive a host reboot? | A saved VM is waiting in `~/vibe-os-reboot-spike`. After the next reboot, run its `check.sh`, which restores it, reports, and deletes the folder | If it doesn't, linux agents wake with `claude --resume` after a reboot, as `macos` agents already do |
-| 2 | Are 4 GB starter profiles right? | Measure real Claude sessions with typical builds on 32 GB and 64 GB machines | Every number here is a guess until measured |
-| 3 | Does Claude Code wake cleanly from `SIGCONT`, and from a VM restore with dropped connections and a jumped clock? | Add both scenarios to agent-tail's harness CI, tracked in [agent-tail#122](https://github.com/tsconfigdotjson/agent-tail/issues/122) | Sleeping is only safe if waking always works |
-| 4 | Does a `claude setup-token` token cover everything Claude needs inside a VM? | The owner creates a token with `claude setup-token`; run Claude Code in a throwaway VM with it, then revoke it | Sharing one Claude home across VMs failed the spike, so this token is now the one credential every `linux` agent depends on |
-| 5 | Does agent-tail report a usage-limit stop as a firm resting state? | Add a mock-server scenario that returns the limit error, tracked in [agent-tail#121](https://github.com/tsconfigdotjson/agent-tail/issues/121). Ideally it also reports the reason and reset time | If not, a limited agent shows as unknown and never sleeps, holding its memory until the limit resets |
+| 1 | Are 4 GB starter profiles right? | Measure real Claude sessions with typical builds on 32 GB and 64 GB machines | Every number here is a guess until measured |
+| 2 | Does Claude Code wake cleanly from `SIGCONT`, and from a VM restore with dropped connections and a jumped clock? | Add both scenarios to agent-tail's harness CI, tracked in [agent-tail#122](https://github.com/tsconfigdotjson/agent-tail/issues/122) | Sleeping is only safe if waking always works |
+| 3 | Does a `claude setup-token` token cover everything Claude needs inside a VM? | The owner creates a token with `claude setup-token`; run Claude Code in a throwaway VM with it, then revoke it | Sharing one Claude home across VMs failed the spike, so this token is now the one credential every `linux` agent depends on |
+| 4 | Does agent-tail report a usage-limit stop as a firm resting state? | Add a mock-server scenario that returns the limit error, tracked in [agent-tail#121](https://github.com/tsconfigdotjson/agent-tail/issues/121). Ideally it also reports the reason and reset time | If not, a limited agent shows as unknown and never sleeps, holding its memory until the limit resets |
 
 **Decided on 2026-10-29:**
+
+- After a host reboot, `linux` agents wake from their snapshots exactly where they were; only `macos` agents fall back to `claude --resume`.
 
 - `linux` disks are read-only ext4 images (base, template, managed layer, Linux home) plus a writable image per agent, stacked with overlayfs inside the guest. Images are never changed in place.
 - The `macos` governor finds an agent's processes by tree walk and session ID, not by an environment tag.
