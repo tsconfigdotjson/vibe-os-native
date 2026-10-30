@@ -497,7 +497,7 @@ Only transcripts of agents this app spawned are read. agent-tail is fed specific
 
 ### Going to sleep
 
-**Idle** means all of these hold. The agent-tail fields named here are from v0.1 plus agent-tail#120, #121 and #122, all merged; `vibe-status` pins agent-tail to a commit that includes them (`a68bc4a`, or a tag once there is one).
+**Idle** means all of these hold. The agent-tail fields named here are from v0.1 plus agent-tail#120, #121, #122 and #127, all merged; `vibe-status` pins agent-tail to a commit that includes them (`19f9213`, or a tag once there is one).
 
 - **At rest.** agent-tail reports a firm `done`, `interrupted`, `errored` or `awaiting_answer`. Its firm states already rule out subagents and background tasks, which show as `background_work`.
 - **Permission prompts.** Claude Code records a permission prompt only as an *inferred* `awaiting_approval`, after the transcript has been unchanged for 20 s. Sleep is exact, so a prompt is safe to sleep on, but a long silent tool run could look the same. So an inferred awaiting state counts as at rest only after a longer quiet period (5 min), with no extra processes in the tree and its CPU near zero.
@@ -507,7 +507,7 @@ Only transcripts of agents this app spawned are read. agent-tail is fed specific
   - none pending: may sleep
   - a firm `loop` wakeup with a `due_at`: may sleep, and `vibed` wakes the agent 30 s before `due_at`, so `/loop` fires on time (a restore takes at most a few seconds)
   - anything else (an inferred wakeup, one with no due time, or any `cron` job): stays awake
-  - a recurring cron job (`/loop 5m …` uses one) currently drops out of `pending_wakeups` after its first run, because agent-tail clears every cron wakeup when any of them fires. Until that's fixed upstream ([agent-tail#127](https://github.com/tsconfigdotjson/agent-tail/issues/127)), an agent whose transcript has a `CronCreate` with `recurring: true` and no matching `CronDelete` stays awake for the rest of its session.
+  - a recurring cron job (`recurring: true`; `/loop 5m …` uses one) stays in `pending_wakeups` after each run, with no `due_at`, until `CronDelete` or the session ends (agent-tail#127). So its agent stays awake for as long as the job exists.
 - **Nothing attached.**
 - **Debounce.** The agent has stayed idle for 60 s by default. This absorbs the usual MCP loop of `vibe_wait`, then read, then the next send, so each turn doesn't pay a wake. It can be set to 0.
 
@@ -618,7 +618,7 @@ None of these block building.
 
 | # | Question | Recommendation | Why |
 | --- | --- | --- | --- |
-| 1 | Recurring cron wakeups drop out of `pending_wakeups` after their first run | Fix upstream: agent-tail should keep a `recurring: true` job pending until `CronDelete` or session end ([agent-tail#127](https://github.com/tsconfigdotjson/agent-tail/issues/127)). The stopgap under Going to sleep keeps such agents awake until then | Otherwise an agent running `/loop 5m` is put to sleep after one run and misses the rest |
+| 1 | Any cron fire clears every one-shot cron job, not just the one that fired, because Claude's fire record has no reliable job id | Fix upstream in agent-tail: clear only one-shots whose `cron` and `prompt` match the fire record | Otherwise an agent with one-shots at 2pm and 3pm, and nothing recurring, may sleep after the 2pm run and miss 3pm. Rare, and no worse than before #127 |
 
 **Decided (2026-10-29 and 2026-10-30):**
 
@@ -653,7 +653,7 @@ None of these block building.
 
 *Status and sleep*
 
-- agent-tail is a git dependency pinned to a commit that includes #120, #121 and #122 (`a68bc4a`), until it has tags.
+- agent-tail is a git dependency pinned to a commit that includes #120, #121, #122 and #127 (`19f9213`), until it has tags.
 - Idle is decided by agent-tail's state (including `pending_wakeups` and `stop_reason`) plus a process-tree check and a 60 s debounce. `claude --resume` is only for crashes, reboots of `macos` or Linux hosts, and dropped snapshots.
 - An agent stopped by a Claude usage limit sleeps like any idle agent.
 - An agent with an inferred `awaiting_approval` (a permission prompt) sleeps after 5 min quiet, with no extra processes and CPU near zero.
