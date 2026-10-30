@@ -107,8 +107,7 @@ kv=$(uname -r)
 k=/usr/lib/modules/$kv/kernel
 for m in drivers/block/virtio_blk net/core/failover drivers/net/net_failover \
   drivers/net/virtio_net drivers/virtio/virtio_balloon drivers/char/hw_random/rng-core \
-  drivers/char/hw_random/virtio-rng fs/fuse/fuse fs/fuse/virtiofs fs/squashfs/squashfs \
-  net/packet/af_packet; do
+  drivers/char/hw_random/virtio-rng fs/fuse/fuse fs/fuse/virtiofs fs/squashfs/squashfs; do
   insmod "$k/$m.ko" || echo "test-guest: can't load $m"
 done
 modloop=
@@ -177,6 +176,8 @@ initrd initrd "$OUT/init-testguest"
 # The vibe-guest test guest: vibe-guest as PID 1, from the initrd (no
 # vibe.layers), doing its own mounts and DHCP.
 cat >"$OUT/init-guest" <<'INIT'
+# Packet sockets, for vibe-guest's DHCP client.
+insmod "$k/net/packet/af_packet.ko" || echo "test-guest: can't load af_packet"
 echo "test-guest: exec vibe-guest"
 exec /vibe-guest
 INIT

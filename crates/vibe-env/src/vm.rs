@@ -761,9 +761,7 @@ fn call<T: DeserializeOwned>(
 ) -> Result<(T, UnixStream), VmError> {
     let mut stream =
         UnixStream::connect(socket).map_err(io_err(format!("connect to {}", socket.display())))?;
-    stream
-        .set_read_timeout(Some(timeout))
-        .and_then(|()| stream.set_write_timeout(Some(CALL_TIMEOUT)))
+    set_timeouts(&stream, Some(timeout), Some(CALL_TIMEOUT))
         .map_err(io_err("set socket timeouts"))?;
     let mut line = serde_json::to_string(request).expect("a request always encodes");
     line.push('\n');
@@ -839,11 +837,31 @@ pub fn connect(socket: &Path, port: u32) -> Result<UnixStream, VmError> {
 /// starting, whose vsock may not answer yet.
 pub fn connect_within(socket: &Path, port: u32, timeout: Duration) -> Result<UnixStream, VmError> {
     let (Done {}, stream) = call(socket, &Request::Connect { port }, timeout)?;
-    stream
-        .set_read_timeout(None)
-        .and_then(|()| stream.set_write_timeout(None))
-        .map_err(io_err("clear socket timeouts"))?;
+    set_timeouts(&stream, None, None).map_err(io_err("clear socket timeouts"))?;
     Ok(stream)
+}
+
+/// Sets a stream's read and write timeouts (`None`: wait for ever). macOS
+/// refuses that with `EINVAL` once the other end has shut down, as a guest
+/// that has said all it will may already have; the timeouts no longer
+/// matter then, since reading ends at once, so that refusal is no error.
+pub(crate) fn set_timeouts(
+    stream: &UnixStream,
+    read: Option<Duration>,
+    write: Option<Duration>,
+) -> io::Result<()> {
+    for set in [
+        stream.set_read_timeout(read),
+        stream.set_write_timeout(write),
+    ] {
+        match set {
+            // `EINVAL`. The only other cause, a zero timeout, is never asked
+            // for here.
+            Err(e) if e.kind() == io::ErrorKind::InvalidInput => {}
+            other => other?,
+        }
+    }
+    Ok(())
 }
 
 /// What a VM's control socket says about it.
@@ -1198,6 +1216,23 @@ mod tests {
                 Request::Status
             ]
         );
+    }
+
+    #[test]
+    fn timeouts_set_on_a_stream_whose_other_end_is_gone() {
+        // What macOS refuses with EINVAL: a guest that has said its last
+        // and closed, before the client clears its timeouts.
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        drop(theirs);
+        set_timeouts(
+            &ours,
+            Some(Duration::from_secs(1)),
+            Some(Duration::from_secs(1)),
+        )
+        .unwrap();
+        set_timeouts(&ours, None, None).unwrap();
+        let mut buf = [0u8; 1];
+        assert_eq!(ours.try_clone().unwrap().read(&mut buf).unwrap(), 0);
     }
 
     #[test]

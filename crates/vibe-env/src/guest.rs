@@ -92,9 +92,7 @@ fn call<T: DeserializeOwned>(
 ) -> Result<T, GuestError> {
     let mut stream =
         vm::connect_within(socket, proto::CONTROL_PORT, timeout).map_err(GuestError::Vm)?;
-    stream
-        .set_read_timeout(Some(timeout))
-        .and_then(|()| stream.set_write_timeout(Some(CALL_TIMEOUT)))
+    vm::set_timeouts(&stream, Some(timeout), Some(CALL_TIMEOUT))
         .map_err(io_err("set socket timeouts"))?;
     let mut line = serde_json::to_string(request).expect("a request always encodes");
     line.push('\n');
@@ -231,9 +229,7 @@ pub struct Terminal {
 pub fn attach(socket: &Path, client: &str, size: Option<TermSize>) -> Result<Terminal, GuestError> {
     let mut stream =
         vm::connect_within(socket, proto::TERMINAL_PORT, CALL_TIMEOUT).map_err(GuestError::Vm)?;
-    stream
-        .set_read_timeout(Some(CALL_TIMEOUT))
-        .and_then(|()| stream.set_write_timeout(Some(CALL_TIMEOUT)))
+    vm::set_timeouts(&stream, Some(CALL_TIMEOUT), Some(CALL_TIMEOUT))
         .map_err(io_err("set socket timeouts"))?;
     let hello = proto::TermHello {
         protocol: proto::PROTOCOL,
@@ -247,10 +243,7 @@ pub fn attach(socket: &Path, client: &str, size: Option<TermSize>) -> Result<Ter
     let decode = |e: io::Error| GuestError::Protocol(e.to_string());
     match frame.kind {
         proto::FrameKind::Welcome => {
-            stream
-                .set_read_timeout(None)
-                .and_then(|()| stream.set_write_timeout(None))
-                .map_err(io_err("clear socket timeouts"))?;
+            vm::set_timeouts(&stream, None, None).map_err(io_err("clear socket timeouts"))?;
             Ok(Terminal {
                 welcome: frame.decode().map_err(decode)?,
                 stream,

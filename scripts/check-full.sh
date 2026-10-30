@@ -351,6 +351,21 @@ s_vm_check() {
   case $out in *'"entitled":false'*) ;; *) echo "unsigned vibe-vm claims the entitlement"; return 1 ;; esac
 }
 
+# settle: waits up to 2 minutes for the 1-minute load average to fall below
+# half the cores, and says what it was.
+settle() {
+  local cores load i
+  cores=$(sysctl -n hw.ncpu)
+  for i in $(seq 1 120); do
+    load=$(sysctl -n vm.loadavg | awk '{print $2}')
+    if awk -v l="$load" -v c="$cores" 'BEGIN { exit !(l < c / 2) }'; then
+      break
+    fi
+    sleep 1
+  done
+  echo "load average $load on $cores cores after ${i}s"
+}
+
 s_vm_cycle() {
   local marker="$WORK/vm-marker" t
   # A Mac that is itself a VM (a CI runner) can't run nested VMs.
@@ -359,6 +374,11 @@ s_vm_cycle() {
     return $NOT_APPLICABLE
   fi
   rm -rf "$marker"
+  # The VM tests hold saves and restores to the spike's numbers, so they
+  # start once the build is done and the Mac has settled: its 1-minute
+  # load below half its cores, or two minutes, whichever comes first.
+  cargo test -p vibe-env --locked --test vm_cycle --no-run
+  settle
   VIBE_VM_BIN="$ROOT/build/vibe-vm" VIBE_VM_GUEST="$ROOT/build/test-guest" VIBE_VM_MARKER="$marker" \
     VIBE_SHIM_BIN="$ROOT/target/debug/vibe-shim" \
     cargo test -p vibe-env --locked --test vm_cycle -- --test-threads=1 --nocapture
