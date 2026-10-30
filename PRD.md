@@ -506,7 +506,7 @@ Only transcripts of agents this app spawned are read. agent-tail is fed specific
   - none pending: may sleep
   - a firm `loop` wakeup with a `due_at`: may sleep, and `vibed` wakes the agent 30 s before `due_at`, so `/loop` fires on time (a restore takes at most a few seconds)
   - anything else (an inferred wakeup, one with no due time, or any `cron` job): stays awake
-  - a recurring cron job (`/loop 5m …` uses one) currently drops out of `pending_wakeups` after its first run, because agent-tail clears every cron wakeup when any of them fires. Until that's fixed upstream, an agent whose transcript has a `CronCreate` with `recurring: true` and no matching `CronDelete` stays awake for the rest of its session.
+  - a recurring cron job (`/loop 5m …` uses one) currently drops out of `pending_wakeups` after its first run, because agent-tail clears every cron wakeup when any of them fires. Until that's fixed upstream ([agent-tail#127](https://github.com/tsconfigdotjson/agent-tail/issues/127)), an agent whose transcript has a `CronCreate` with `recurring: true` and no matching `CronDelete` stays awake for the rest of its session.
 - **Nothing attached.**
 - **Debounce.** The agent has stayed idle for 60 s by default. This absorbs the usual MCP loop of `vibe_wait`, then read, then the next send, so each turn doesn't pay a wake. It can be set to 0.
 
@@ -617,7 +617,7 @@ None of these block building.
 
 | # | Question | Recommendation | Why |
 | --- | --- | --- | --- |
-| 1 | Recurring cron wakeups drop out of `pending_wakeups` after their first run | Fix upstream: agent-tail should keep a `recurring: true` job pending until `CronDelete` or session end (issue to file). The stopgap under Going to sleep keeps such agents awake until then | Otherwise an agent running `/loop 5m` is put to sleep after one run and misses the rest |
+| 1 | Recurring cron wakeups drop out of `pending_wakeups` after their first run | Fix upstream: agent-tail should keep a `recurring: true` job pending until `CronDelete` or session end ([agent-tail#127](https://github.com/tsconfigdotjson/agent-tail/issues/127)). The stopgap under Going to sleep keeps such agents awake until then | Otherwise an agent running `/loop 5m` is put to sleep after one run and misses the rest |
 | 2 | How long must an inferred `awaiting_approval` stay quiet before the agent sleeps? | 5 min, with no extra processes and CPU near zero; tune with real use | Claude records permission prompts only as inferred, so too short risks freezing a silent tool run, and too long holds memory |
 | 3 | Should API keys have scopes (read-only, or limited to some projects)? | Add them with external access, before a key is ever used from the internet | A full key is effectively a shell on the Mac |
 
