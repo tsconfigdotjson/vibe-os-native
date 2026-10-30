@@ -184,7 +184,7 @@ A profile is everything you choose when starting an agent, saved under a name. P
 - **Model:** Opus or Sonnet (`--model`).
 - **Reasoning:** Claude's effort level (`--effort`).
 - **Mode:** `auto` by default, or `bypass` (`--dangerously-skip-permissions`), in either environment. Bypass on `macos` is the owner's call.
-- **Memory:** the agent's high-water mark: a `linux` VM's fixed RAM, or a `macos` agent's hard limit.
+- **Memory:** the agent's high-water mark: a `linux` VM's fixed RAM, or a `macos` agent's hard limit. 4 GB by default, and adjustable per profile.
 
 MCP clients see each project's profiles in `vibe_list_projects` and pass one by name to `vibe_start_agent`. An agent can't change profile or environment; start a new one `from` the same branch instead.
 
@@ -278,7 +278,7 @@ The VM boots with its agent. Sleeping, as measured in the spike below:
 2. `vibed` inflates the memory balloon and lets it go, so pages the guest has freed are handed back and stay out of the snapshot.
 3. `vibe-vm` pauses the VM, saves its whole state (RAM and devices) to the agent's snapshot file, and exits. All its RAM goes back to the Mac.
 
-Waking runs it backwards. `vibe-vm` restores the snapshot and resumes the VM. `vibe-guest` sets the clock from the host, because it stopped while the VM slept. It waits for the shared folders to answer, which takes about a second after a restore, and then thaws Claude. Claude is exactly where it was, mid-prompt or mid-question, with nothing replayed, and the shim reconnects. Network connections open at sleep time may drop; an idle Claude has none in flight (open question 2 checks this).
+Waking runs it backwards. `vibe-vm` restores the snapshot and resumes the VM. `vibe-guest` sets the clock from the host, because it stopped while the VM slept. It waits for the shared folders to answer, which takes about a second after a restore, and then thaws Claude. Claude is exactly where it was, mid-prompt or mid-question, with nothing replayed, and the shim reconnects. Network connections open at sleep time may drop; an idle Claude has none in flight (open question 1 checks this).
 
 A restore only works with the exact configuration the VM was saved with, so each agent's VM keeps a fixed MAC address and machine identifier for its whole life.
 
@@ -411,7 +411,7 @@ Only transcripts of agents this app spawned are read. agent-tail is fed specific
 
 **Idle** means all of these hold:
 
-- agent-tail reports a *firm* `done`, `interrupted`, `errored`, `awaiting_answer` or `awaiting_approval`. Its firm states already rule out subagents and background tasks, which show as `background_work`, so no timing guess is needed. An agent stopped by a Claude usage limit counts as at rest too: it sleeps like any other, and the next send wakes it. That depends on agent-tail reporting the limit stop as firm (open question 3).
+- agent-tail reports a *firm* `done`, `interrupted`, `errored`, `awaiting_answer` or `awaiting_approval`. Its firm states already rule out subagents and background tasks, which show as `background_work`, so no timing guess is needed. An agent stopped by a Claude usage limit counts as at rest too: it sleeps like any other, and the next send wakes it. That depends on agent-tail reporting the limit stop as firm (open question 2).
 - no process in the tree that agent-tail can't see: nothing started more than 30 s after Claude, other than the MCP servers Claude starts. This catches detached jobs such as `nohup` or a container. In `linux`, `vibe-guest` reports the tree.
 - no pending scheduled wakeup (`/loop`, `ScheduleWakeup`, `CronCreate`), which wouldn't fire while asleep. Until [agent-tail#120](https://github.com/tsconfigdotjson/agent-tail/issues/120) can see these, `vibed` treats any such call in the transcript as keeping the agent awake for the rest of the session.
 - no client is attached
@@ -510,15 +510,16 @@ Two fixes for the base image came out of it. Claude warns when it runs from outs
 
 ## Open questions
 
-None of these block design work any more. Each has a test ready or under way.
+None of these block design work. Both are agent-tail scenarios already under way.
 
 | # | Question | Recommendation | Why |
 | --- | --- | --- | --- |
-| 1 | Are 4 GB starter profiles right? | Measure real Claude sessions with typical builds on 32 GB and 64 GB machines | Every number here is a guess until measured |
-| 2 | Does Claude Code wake cleanly from `SIGCONT`, and from a VM restore with dropped connections and a jumped clock? | Add both scenarios to agent-tail's harness CI, tracked in [agent-tail#122](https://github.com/tsconfigdotjson/agent-tail/issues/122) | Sleeping is only safe if waking always works |
-| 3 | Does agent-tail report a usage-limit stop as a firm resting state? | Add a mock-server scenario that returns the limit error, tracked in [agent-tail#121](https://github.com/tsconfigdotjson/agent-tail/issues/121). Ideally it also reports the reason and reset time | If not, a limited agent shows as unknown and never sleeps, holding its memory until the limit resets |
+| 1 | Does Claude Code wake cleanly from `SIGCONT`, and from a VM restore with dropped connections and a jumped clock? | Add both scenarios to agent-tail's harness CI, tracked in [agent-tail#122](https://github.com/tsconfigdotjson/agent-tail/issues/122) | Sleeping is only safe if waking always works |
+| 2 | Does agent-tail report a usage-limit stop as a firm resting state? | Add a mock-server scenario that returns the limit error, tracked in [agent-tail#121](https://github.com/tsconfigdotjson/agent-tail/issues/121). Ideally it also reports the reason and reset time | If not, a limited agent shows as unknown and never sleeps, holding its memory until the limit resets |
 
 **Decided on 2026-10-29:**
+
+- Memory is a per-profile high-water mark, 4 GB by default, that the owner can change in each profile.
 
 - `linux` agents log in to Claude with one `claude setup-token` token; a spike confirmed interactive use, model and effort choice, auto mode, tool use and resume all work with it inside a VM.
 
