@@ -1,0 +1,9 @@
+{
+  "description": "A host's sessions, by ref. A running one is asked for its clients by its shim; one whose command exited is read from the record its shim left in ~/VibeOS/agents/<ref>/session.json. The title is `<ref> · <profile>` for an agent's session, or the ref alone.",
+  "request": {"jsonrpc": "2.0", "id": 70, "method": "sessions.list", "params": {}},
+  "response": {"jsonrpc": "2.0", "id": 70, "result": {"sessions": [
+    {"host": "local", "ref": "brave-copper-lynx", "state": "exited", "title": "brave-copper-lynx", "clients": 0, "ttys": [], "exit": {"code": 0, "at": "2026-10-30T11:00:00Z"}},
+    {"host": "local", "ref": "calm-silver-heron", "state": "exited", "title": "calm-silver-heron", "clients": 0, "ttys": [], "exit": {"signal": "SIGKILL", "at": "2026-10-30T11:30:00Z"}},
+    {"host": "local", "ref": "quiet-amber-otter", "state": "running", "title": "quiet-amber-otter", "clients": 0, "ttys": []}
+  ]}}
+}

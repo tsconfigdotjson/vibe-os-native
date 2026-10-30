@@ -1,5 +1,6 @@
 //! `vibe`: the command-line client of `vibed`.
 
+mod attach;
 mod client;
 
 use std::io::{self, Write};
@@ -9,7 +10,9 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use vibe_core::paths;
-use vibe_core::rpc::{Hello, HelloParams, PROTOCOL_VERSION};
+use vibe_core::rpc::{
+    Hello, HelloParams, HostParams, PROTOCOL_VERSION, SessionInfo, SessionState, SessionsList,
+};
 
 use crate::client::ClientError;
 
@@ -17,8 +20,11 @@ const USAGE: &str = "\
 usage: vibe [--socket PATH] <command>
 
 commands:
-  hello   check that vibed is up, and print what it reports
-  rpc     the vibed socket API on stdin and stdout, one JSON-RPC message per line
+  attach REF  join an agent's terminal; Ctrl-\\ detaches, and so does closing
+              the window. From elsewhere: ssh -t <host> vibe attach REF
+  ls          list the sessions on this host
+  hello       check that vibed is up, and print what it reports
+  rpc         the vibed socket API on stdin and stdout, one JSON-RPC message per line
 
 options:
   --socket PATH   vibed's socket (default: $VIBE_SOCKET, or the platform default)
@@ -27,6 +33,8 @@ options:
 
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
+    Attach(String),
+    Ls,
     Hello,
     Rpc,
 }
@@ -53,6 +61,8 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
                 socket = Some(PathBuf::from(iter.next().ok_or("--socket needs a path")?));
                 continue;
             }
+            "attach" => Command::Attach(iter.next().ok_or("attach needs a ref")?.clone()),
+            "ls" => Command::Ls,
             "hello" => Command::Hello,
             "rpc" => Command::Rpc,
             other => match other.strip_prefix("--socket=") {
@@ -96,6 +106,17 @@ fn main() -> ExitCode {
         }
     };
     let result = match command {
+        Command::Attach(agent) => {
+            return match attach::attach(&socket, &agent) {
+                Ok(attach::End::Lost) => ExitCode::FAILURE,
+                Ok(_) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("vibe: {e}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        Command::Ls => ls(&socket),
         Command::Hello => hello(&socket),
         Command::Rpc => rpc(&socket),
     };
@@ -106,6 +127,49 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn ls(socket: &Path) -> Result<(), ClientError> {
+    let list =
+        client::call::<SessionsList>(socket, &HostParams::default(), Duration::from_secs(30))?;
+    print!("{}", ls_table(&list.sessions));
+    Ok(())
+}
+
+/// One line per session: its ref, its state, and who's attached or how it
+/// ended.
+fn ls_table(sessions: &[SessionInfo]) -> String {
+    if sessions.is_empty() {
+        return "no sessions\n".into();
+    }
+    let width = sessions.iter().map(|s| s.agent.len()).max().unwrap_or(0);
+    let mut out = String::new();
+    for s in sessions {
+        let detail = match (s.state, &s.exit) {
+            (SessionState::Exited, Some(exit)) => {
+                let how = match (&exit.code, &exit.signal) {
+                    (Some(code), _) => format!("code {code}"),
+                    (None, Some(signal)) => signal.clone(),
+                    (None, None) => "ended".into(),
+                };
+                format!("{how} at {}", exit.at)
+            }
+            _ if s.clients == 0 => "not attached".into(),
+            _ if s.ttys.is_empty() => format!("{} attached", s.clients),
+            _ => format!("{} attached ({})", s.clients, s.ttys.join(", ")),
+        };
+        let title = if s.title == s.agent {
+            String::new()
+        } else {
+            format!("  {}", s.title)
+        };
+        out.push_str(&format!(
+            "{:width$}  {:7}  {detail}{title}\n",
+            s.agent,
+            s.state.as_str()
+        ));
+    }
+    out
 }
 
 fn hello(socket: &Path) -> Result<(), ClientError> {
@@ -180,5 +244,81 @@ mod tests {
         assert!(parse(&["hello", "rpc"]).is_err());
         assert!(parse(&["attach"]).is_err());
         assert!(parse(&["hello", "--socket"]).is_err());
+        assert_eq!(
+            parse(&["attach", "quiet-amber-otter"]),
+            Ok(Args::Run {
+                socket: None,
+                command: Command::Attach("quiet-amber-otter".into())
+            })
+        );
+        assert_eq!(
+            parse(&["ls", "--socket=/s"]),
+            Ok(Args::Run {
+                socket: Some("/s".into()),
+                command: Command::Ls
+            })
+        );
+        assert!(parse(&["ls", "attach", "x"]).is_err());
+    }
+
+    #[test]
+    fn ls_lines() {
+        use vibe_core::rpc::SessionExit;
+        let session = |r: &str, state, clients, ttys: &[&str], exit| SessionInfo {
+            host: "local".into(),
+            agent: r.into(),
+            state,
+            title: r.into(),
+            clients,
+            ttys: ttys.iter().map(|t| t.to_string()).collect(),
+            exit,
+        };
+        assert_eq!(ls_table(&[]), "no sessions\n");
+        let mut titled = session(
+            "quiet-amber-otter",
+            SessionState::Running,
+            2,
+            &["/dev/ttys003"],
+            None,
+        );
+        titled.title = "quiet-amber-otter · reviewer".into();
+        let at = "2026-10-30T11:00:00Z".to_owned();
+        let table = ls_table(&[
+            titled,
+            session("calm", SessionState::Running, 0, &[], None),
+            session("w", SessionState::Running, 1, &[], None),
+            session(
+                "brave",
+                SessionState::Exited,
+                0,
+                &[],
+                Some(SessionExit {
+                    code: Some(0),
+                    signal: None,
+                    at: at.clone(),
+                }),
+            ),
+            session(
+                "dead",
+                SessionState::Exited,
+                0,
+                &[],
+                Some(SessionExit {
+                    code: None,
+                    signal: Some("SIGKILL".into()),
+                    at,
+                }),
+            ),
+        ]);
+        assert_eq!(
+            table,
+            "\
+quiet-amber-otter  running  2 attached (/dev/ttys003)  quiet-amber-otter · reviewer
+calm               running  not attached
+w                  running  1 attached
+brave              exited   code 0 at 2026-10-30T11:00:00Z
+dead               exited   SIGKILL at 2026-10-30T11:00:00Z
+"
+        );
     }
 }

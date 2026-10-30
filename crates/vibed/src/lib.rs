@@ -7,3 +7,4 @@ pub mod gh;
 pub mod logging;
 pub mod projects;
 pub mod server;
+pub mod sessions;

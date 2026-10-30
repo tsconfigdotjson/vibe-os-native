@@ -8,6 +8,8 @@
 #   - a vibed hello-world smoke test, through `vibe hello` and `vibe rpc`
 #   - the registry through `vibe rpc`: add a project, edit a profile, change
 #     a host limit, restart vibed, and find all of it
+#   - sessions: a shell held by vibe-shim keeps running when vibed is killed,
+#     a new vibed adopts it again, and `vibe ls` shows it, then its exit
 #   - both Swift packages (swift/VibeOS, swift/vibe-vm): build and test,
 #     including the Swift half of the Rust<->Swift contract test
 #   - ad hoc signing, with the virtualization entitlement on vibe-vm
@@ -165,7 +167,8 @@ s_clippy() { cargo clippy --workspace --all-targets --locked -- -D warnings; }
 
 s_build() { cargo build --workspace --locked; }
 
-s_test() { cargo test --workspace --locked "${TEST_ARGS[@]}"; }
+# Every test binary runs, so one failure doesn't hide the others.
+s_test() { cargo test --workspace --locked --no-fail-fast "${TEST_ARGS[@]}"; }
 
 s_guest() {
   local target=aarch64-unknown-linux-musl info
@@ -249,6 +252,47 @@ s_registry() {
   grep -q "max_awake_agents = 7" "$WORK/registry/home/.config/vibeos/host.toml"
 }
 
+# vibe ls, against the daemon start_vibed started, with its home.
+ls_sessions() { HOME="$1" target/debug/vibe --socket "$VIBED_SOCKET" ls; }
+
+s_sessions() {
+  local socket="$WORK/sessions/run/vibed.sock" home="$WORK/sessions/home" run shim i
+  if [ "$OS" = Darwin ]; then
+    run="$home/Library/Application Support/VibeOS/run"
+  else
+    run="$home/.local/share/vibeos/run"
+  fi
+  start_vibed "$socket" "$WORK/sessions-vibed-1.log"
+  shim=$(PS1='$ ' target/debug/vibe-shim --ref smoke-shell --socket "$run/smoke-shell.sock" \
+    --state "$home/VibeOS/agents/smoke-shell" --cwd "$WORK" -- sh)
+  echo "$shim" >>"$WORK/pids"
+  echo "vibe-shim started as pid $shim"
+  out=$(ls_sessions "$home")
+  echo "$out"
+  expect "smoke-shell  running  not attached" "the running session"
+
+  # Killed mid-session, vibed takes nothing with it.
+  kill -KILL "$VIBED_PID"
+  wait "$VIBED_PID" 2>/dev/null || true
+  kill -0 "$shim" || { echo "the session died with vibed"; return 1; }
+  start_vibed "$socket" "$WORK/sessions-vibed-2.log"
+  wait_for "$WORK/sessions-vibed-2.log" "re-adopted session smoke-shell"
+  out=$(ls_sessions "$home")
+  echo "after a restart: $out"
+  expect "smoke-shell  running" "the adopted session"
+
+  # Stopping the shim hangs up the shell and leaves a record of the end.
+  kill -TERM "$shim"
+  for i in $(seq 1 100); do
+    kill -0 "$shim" 2>/dev/null || break
+    sleep 0.1
+  done
+  out=$(ls_sessions "$home")
+  echo "after the shim stopped: $out"
+  expect "smoke-shell  exited   SIGHUP at" "the session's exit"
+  stop_vibed
+}
+
 s_swift_app_build() { swift build --package-path swift/VibeOS; }
 
 # The Swift half of the contract test runs here; the live suite stays off.
@@ -319,6 +363,7 @@ step guest "vibe-guest: static aarch64-unknown-linux-musl" s_guest
 step cross "cargo check for macOS and Linux, arm64 and x86_64" s_cross
 step smoke "vibed hello world via vibe hello and vibe rpc" s_smoke build
 step registry "registry via vibe rpc survives a vibed restart" s_registry build
+step sessions "a session outlives a killed vibed and is re-adopted" s_sessions build
 mac_step swift-app-build "swift build swift/VibeOS" s_swift_app_build
 mac_step swift-app-test "swift test swift/VibeOS (Swift contract tests)" s_swift_app_test swift-app-build
 mac_step swift-vm-build "swift build swift/vibe-vm" s_swift_vm_build

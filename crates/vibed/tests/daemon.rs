@@ -10,7 +10,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use serde_json::Value;
+use serde_json::{Value, json};
+use vibe_core::paths::Layout;
+use vibe_core::shim::{self, FrameKind};
 
 const VIBED: &str = env!("CARGO_BIN_EXE_vibed");
 
@@ -318,4 +320,94 @@ fn version_and_bad_args() {
     );
     let out = Command::new(VIBED).arg("--bogus").output().unwrap();
     assert_eq!(out.status.code(), Some(2));
+}
+
+/// An attach client of a shim, collecting what it shows.
+struct Terminal {
+    stream: UnixStream,
+    seen: String,
+}
+
+impl Terminal {
+    fn attach(socket: &str) -> Terminal {
+        let hello = shim::Hello {
+            protocol: shim::PROTOCOL,
+            role: shim::Role::Attach,
+            client: "daemon-test".into(),
+            tty: Some("/dev/ttys042".into()),
+            size: None,
+        };
+        let conn = shim::connect(Path::new(socket), &hello, Duration::from_secs(10)).unwrap();
+        Terminal {
+            stream: conn.stream,
+            seen: String::new(),
+        }
+    }
+
+    /// Types `line` and waits to see `answer`.
+    fn run(&mut self, line: &str, answer: &str) {
+        let input = shim::Frame::new(FrameKind::Input, format!("{line}\r"));
+        shim::write_frame(&mut self.stream, &input).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !self.seen.contains(answer) {
+            assert!(
+                Instant::now() < deadline,
+                "no {answer:?} in {:?}",
+                self.seen
+            );
+            let frame = shim::read_frame(&mut self.stream)
+                .unwrap()
+                .expect("the shim closed");
+            if frame.kind == FrameKind::Output {
+                self.seen.push_str(&String::from_utf8_lossy(&frame.payload));
+            }
+        }
+    }
+}
+
+#[test]
+fn a_session_outlives_a_killed_vibed_and_is_adopted_again() {
+    let tmp = common::short_tempdir();
+    let socket = socket_in(&tmp);
+    let layout = Layout::new(tmp.path().join("home"), std::env::consts::OS);
+    let mut first = spawn(&mut vibed(&tmp, &socket), &socket);
+    let shim = common::start_shim(&layout, "quiet-amber-otter", &["sh"]);
+
+    // vibed says where the session is; the terminal talks to its shim.
+    let found = call(
+        &socket,
+        "sessions.attach",
+        json!({"ref": "quiet-amber-otter"}),
+    );
+    let path = found["result"]["socket"].as_str().unwrap().to_owned();
+    let mut terminal = Terminal::attach(&path);
+    terminal.run("echo before-$((1+1))", "before-2");
+
+    // Killed mid-session, without a chance to clean up.
+    first.child.kill().unwrap();
+    first.child.wait().unwrap();
+    terminal.run("echo during-$((2+2))", "during-4");
+    assert!(common::alive(shim.pid));
+
+    // A new vibed finds the session again, attached client and all.
+    let second = spawn(&mut vibed(&tmp, &socket), &socket);
+    let list = call(&socket, "sessions.list", json!({}));
+    let session = &list["result"]["sessions"][0];
+    assert_eq!(session["ref"], "quiet-amber-otter");
+    assert_eq!(session["state"], "running");
+    assert_eq!(session["clients"], 1);
+    assert_eq!(session["ttys"], json!(["/dev/ttys042"]));
+    terminal.run("echo after-$((3+3))", "after-6");
+    let found = call(
+        &socket,
+        "sessions.attach",
+        json!({"ref": "quiet-amber-otter"}),
+    );
+    assert_eq!(found["result"]["socket"], path.as_str());
+    let stderr = stop(second);
+    assert!(
+        stderr.contains("re-adopted session quiet-amber-otter"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("1 running session found"), "{stderr}");
 }

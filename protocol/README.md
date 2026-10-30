@@ -44,8 +44,16 @@ name; a method that takes none accepts `{}` or no params at all.
 **The examples are one session.** From `20-` on they run in file order
 against one daemon: a Mac (`os` `macos`, so new projects get two starter
 profiles) whose home is `/Users/me`, at 2026-10-30T12:00:00Z, with `src/app`
-checked out and `me/web` on GitHub. The Rust replays build that world in a
-temp directory and put its path in place of `/Users/me`.
+checked out and `me/web` on GitHub. Its sessions are `quiet-amber-otter`,
+a real `vibe-shim` running `sleep`, and the records of two that exited:
+`brave-copper-lynx` with code 0 and `calm-silver-heron` killed. The Rust
+replays build that world in a temp directory and put its path in place of
+`/Users/me`.
+
+**Shims aren't in this contract.** Each session's `vibe-shim` serves
+`run/<ref>.sock` with a framed protocol of its own (`vibe_core::shim`),
+which only `vibe attach` and `vibed` speak. Clients find a session with
+`sessions.attach` here.
 
 **Hosts.** Every method that acts on one host takes an optional `host`;
 absent means this one, which every `vibed` calls `local`. Other hosts come

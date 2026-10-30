@@ -17,7 +17,7 @@ use serde_json::Value;
 
 pub use crate::limits::HostLimits;
 pub use crate::model::{
-    Environment, EventKind, GhState, Mode, Model, Profile, ProjectSource, Reasoning,
+    Environment, EventKind, GhState, Mode, Model, Profile, ProjectSource, Reasoning, SessionState,
 };
 
 /// Bumped on any incompatible change to the contract. Clients send theirs in
@@ -339,6 +339,8 @@ pub const METHODS: &[&str] = &[
     KeysVerify::NAME,
     GhStatusGet::NAME,
     EventsSubscribe::NAME,
+    SessionsList::NAME,
+    SessionsAttach::NAME,
 ];
 
 /// Every notification the daemon sends.
@@ -481,6 +483,19 @@ method! {
     /// `events.subscribe`: from now on, this connection also gets an
     /// `events.event` notification for every event, after this response.
     EventsSubscribe = "events.subscribe", NoParams => Subscribed
+}
+
+method! {
+    /// `sessions.list`: a host's sessions, by ref: those running, and those
+    /// whose command has exited but whose record is still there.
+    SessionsList = "sessions.list", HostParams => SessionList
+}
+
+method! {
+    /// `sessions.attach`: what a client needs to attach to a running
+    /// session. The client then talks to the session's shim directly, so
+    /// restarting `vibed` doesn't interrupt it.
+    SessionsAttach = "sessions.attach", SessionParams => SessionAttach
 }
 
 /// `events.event`: one event, sent to subscribed connections.
@@ -735,6 +750,65 @@ pub struct Subscribed {
     /// The `seq` of the last event before this subscription; the first one
     /// this connection gets is the next.
     pub seq: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(rename = "ref")]
+    pub agent: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionList {
+    pub sessions: Vec<SessionInfo>,
+}
+
+/// A session: the terminal an agent runs in, held by its shim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionInfo {
+    pub host: String,
+    #[serde(rename = "ref")]
+    pub agent: String,
+    pub state: SessionState,
+    /// What `vibe attach` names the window: `<ref> · <profile>`, or the ref
+    /// alone for a session with no agent.
+    pub title: String,
+    /// How many `vibe attach` clients are attached.
+    pub clients: u32,
+    /// The terminals those clients run in, such as `/dev/ttys003`, for
+    /// those that have one.
+    pub ttys: Vec<String>,
+    /// How the command ended, once it has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit: Option<SessionExit>,
+}
+
+/// How a session's command ended.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionExit {
+    /// Its exit code, if it exited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<i32>,
+    /// The signal that ended it, if one did, such as `SIGKILL`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<String>,
+    pub at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionAttach {
+    pub host: String,
+    #[serde(rename = "ref")]
+    pub agent: String,
+    pub title: String,
+    /// The shim's socket, to connect to.
+    pub socket: String,
+    /// The terminals of clients already attached, so the menu bar can raise
+    /// one of those instead of opening another.
+    pub ttys: Vec<String>,
 }
 
 /// Something that happened on a host. Fields other than these four are set

@@ -1,9 +1,9 @@
 //! The core handlers: the one implementation the socket, and through it the
 //! CLI, the menu bar and MCP, all call (PRD: One core, three doors). It owns
-//! the registry, host limits, API keys, the `gh` login check and the event
-//! stream.
+//! the registry, host limits, API keys, the `gh` login check, the event
+//! stream, and finding the sessions agents run in.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{DirBuilder, File, OpenOptions, TryLockError};
 use std::io;
@@ -17,18 +17,20 @@ use vibe_core::keys;
 use vibe_core::limits::{self, LimitsError};
 use vibe_core::model::{
     Environment, EventKind, GhState, GithubRepo, LOCAL_HOST, Profile, ProjectSource,
-    starter_profiles, validate_key_name, validate_name,
+    starter_profiles, validate_key_name, validate_name, validate_ref,
 };
 use vibe_core::paths::Layout;
 use vibe_core::rpc::{
     ApiKey, ErrorCode, ErrorObject, Event, GhStatus, GhStatusParams, HostLimits, HostList,
     HostParams, KeyCreateParams, KeyCreated, KeyList, KeyParams, KeyVerifyParams, LimitsSetParams,
     ProfileCreateParams, ProfileList, ProfileParams, ProfileUpdateParams, Project,
-    ProjectAddParams, ProjectList, ProjectParams,
+    ProjectAddParams, ProjectList, ProjectParams, SessionAttach, SessionInfo, SessionList,
+    SessionParams,
 };
 use vibe_core::store::{NewProject, Store, StoreError};
 use vibe_core::time::rfc3339;
 
+use crate::sessions::{self, Probe, SessionSpec};
 use crate::{gh, projects};
 
 /// What `daemon.hello` reports about this daemon.
@@ -66,6 +68,8 @@ pub struct Config {
     pub layout: Layout,
     /// The `gh` to run.
     pub gh: OsString,
+    /// The `vibe-shim` to start sessions with.
+    pub shim: OsString,
     pub clock: Clock,
     pub entropy: Entropy,
 }
@@ -77,19 +81,22 @@ impl std::fmt::Debug for Config {
             .field("label", &self.label)
             .field("layout", &self.layout)
             .field("gh", &self.gh)
+            .field("shim", &self.shim)
             .finish_non_exhaustive()
     }
 }
 
 impl Config {
-    /// The real thing: the system clock, the OS's randomness and the `gh`
-    /// [`find_program`] finds.
+    /// The real thing: the system clock, the OS's randomness, the `gh`
+    /// [`find_program`] finds and the `vibe-shim` [`find_shim`] finds.
     pub fn new(info: DaemonInfo, layout: Layout) -> Self {
+        let path = std::env::var_os("PATH");
         Config {
             info,
             label: hostname(),
             layout,
-            gh: find_program("gh", std::env::var_os("PATH").as_deref()),
+            gh: find_program("gh", path.as_deref()),
+            shim: find_shim(std::env::current_exe().ok().as_deref(), path.as_deref()),
             clock: Arc::new(vibe_core::time::now),
             entropy: Arc::new(keys::random_bytes),
         }
@@ -116,6 +123,16 @@ pub fn find_program(name: &str, path: Option<&OsStr>) -> OsString {
         })
         .map(PathBuf::into_os_string)
         .unwrap_or_else(|| name.into())
+}
+
+/// `vibe-shim` beside `exe`, as it's installed next to `vibed`; or else
+/// the one [`find_program`] finds.
+pub fn find_shim(exe: Option<&Path>, path: Option<&OsStr>) -> OsString {
+    let beside = exe.and_then(Path::parent).map(|d| d.join("vibe-shim"));
+    match beside {
+        Some(p) if std::fs::metadata(&p).is_ok_and(|m| m.is_file()) => p.into_os_string(),
+        _ => find_program("vibe-shim", path),
+    }
 }
 
 fn hostname() -> String {
@@ -176,6 +193,7 @@ pub struct Core {
     label: String,
     layout: Layout,
     gh: OsString,
+    shim: OsString,
     clock: Clock,
     entropy: Entropy,
     store: Mutex<Store>,
@@ -281,6 +299,7 @@ impl Core {
             label: config.label,
             layout: config.layout,
             gh: config.gh,
+            shim: config.shim,
             clock: config.clock,
             entropy: config.entropy,
             store: Mutex::new(store),
@@ -684,6 +703,196 @@ impl Core {
     pub fn label(&self) -> &str {
         &self.label
     }
+
+    // Sessions.
+
+    /// What `vibe attach` names an agent's window: `<ref> · <profile>`, or
+    /// the ref alone when there's no agent by that ref.
+    fn titles(&self, host: &str) -> Result<HashMap<String, String>, ErrorObject> {
+        let agents = self.store().agents(host).map_err(store_error)?;
+        Ok(agents
+            .into_iter()
+            .map(|a| {
+                let title = format!("{} · {}", a.agent_ref, a.profile);
+                (a.agent_ref, title)
+            })
+            .collect())
+    }
+
+    /// Asks the shim behind every socket in `run/` what it holds, and
+    /// removes sockets left by shims that are gone.
+    async fn scan_sessions(&self) -> Vec<(String, Probe)> {
+        // All at once: a stuck shim costs one probe's timeout, not one each.
+        let mut probes = tokio::task::JoinSet::new();
+        for r in sessions::socket_refs(&self.layout.run_dir()) {
+            let path = self.layout.session_socket(&r);
+            probes.spawn(async move {
+                let probe = sessions::probe(&path).await;
+                (r, path, probe)
+            });
+        }
+        let mut found = Vec::new();
+        while let Some(joined) = probes.join_next().await {
+            let Ok((r, path, probe)) = joined else {
+                continue;
+            };
+            match &probe {
+                Probe::Gone => match sessions::remove_stale(&path) {
+                    Ok(true) => crate::log!("vibed: removed the stale socket of session {r}"),
+                    Ok(false) => {}
+                    Err(e) => crate::log!("vibed: can't remove {}: {e}", path.display()),
+                },
+                Probe::Broken(why) => crate::log!("vibed: session {r} isn't answering: {why}"),
+                Probe::Running(_) => {}
+            }
+            found.push((r, probe));
+        }
+        found.sort_by(|a, b| a.0.cmp(&b.0));
+        found
+    }
+
+    /// Finds the sessions that kept running while `vibed` was down, as on
+    /// every start (PRD: Restarts), and returns how many there are.
+    pub async fn adopt_sessions(&self) -> usize {
+        let mut adopted = 0;
+        for (r, probe) in self.scan_sessions().await {
+            if let Probe::Running(status) = probe {
+                adopted += 1;
+                crate::log!(
+                    "vibed: re-adopted session {r}: shim pid {}, command pid {}, {} attached",
+                    status.pid,
+                    status.child_pid,
+                    status.clients.len()
+                );
+            }
+        }
+        adopted
+    }
+
+    /// A host's sessions: those running, then those that exited and left a
+    /// record, merged by ref.
+    pub async fn sessions(&self, p: HostParams) -> Result<SessionList, ErrorObject> {
+        let host = self.host(p.host.as_deref())?;
+        let titles = self.titles(host)?;
+        let title = |r: &str| titles.get(r).cloned().unwrap_or_else(|| r.to_owned());
+        let mut found = BTreeMap::new();
+        for (r, probe) in self.scan_sessions().await {
+            let info = match probe {
+                Probe::Running(status) => sessions::running(host, title(&r), &status),
+                // It's there, so it's running, even if it isn't answering.
+                Probe::Broken(_) => SessionInfo {
+                    host: host.to_owned(),
+                    agent: r.clone(),
+                    state: vibe_core::model::SessionState::Running,
+                    title: title(&r),
+                    clients: 0,
+                    ttys: Vec::new(),
+                    exit: None,
+                },
+                Probe::Gone => continue,
+            };
+            found.insert(r, info);
+        }
+        for r in sessions::record_refs(&self.layout.agents_dir()) {
+            if found.contains_key(&r) {
+                continue;
+            }
+            if let Some(record) = sessions::read_record(&self.layout, &r) {
+                let info = sessions::exited(host, &r, title(&r), record.exit);
+                found.insert(r, info);
+            }
+        }
+        Ok(SessionList {
+            sessions: found.into_values().collect(),
+        })
+    }
+
+    /// Where to attach to a running session. The client then talks to the
+    /// shim itself, so a `vibed` restart doesn't touch it.
+    pub async fn attach_session(&self, p: SessionParams) -> Result<SessionAttach, ErrorObject> {
+        let host = self.host(p.host.as_deref())?;
+        validate_ref(&p.agent).map_err(invalid)?;
+        let socket = self.layout.session_socket(&p.agent);
+        // Waking an asleep agent first comes with sleep and wake (#6).
+        match sessions::probe(&socket).await {
+            Probe::Running(status) => {
+                let title = self
+                    .titles(host)?
+                    .remove(&p.agent)
+                    .unwrap_or_else(|| p.agent.clone());
+                Ok(SessionAttach {
+                    host: host.to_owned(),
+                    agent: p.agent,
+                    title,
+                    socket: socket.to_string_lossy().into_owned(),
+                    ttys: sessions::ttys(&status),
+                })
+            }
+            Probe::Broken(why) => Err(error(
+                ErrorCode::InternalError,
+                format!("Internal error: session {} isn't answering: {why}", p.agent),
+            )),
+            Probe::Gone => {
+                let _ = sessions::remove_stale(&socket);
+                Err(match sessions::read_record(&self.layout, &p.agent) {
+                    Some(record) => error(
+                        ErrorCode::NotFound,
+                        format!(
+                            "session {} isn't running: its command {} at {}",
+                            p.agent,
+                            sessions::describe_exit(&record.exit),
+                            record.exit.at
+                        ),
+                    ),
+                    None => error(
+                        ErrorCode::NotFound,
+                        format!("no session {} on {host}", p.agent),
+                    ),
+                })
+            }
+        }
+    }
+
+    /// Starts a session: a detached `vibe-shim` running `spec`'s command on
+    /// a new terminal. Agents (#4) start Claude this way.
+    pub async fn start_session(&self, spec: SessionSpec) -> Result<SessionInfo, ErrorObject> {
+        validate_ref(&spec.agent).map_err(invalid)?;
+        let pid = sessions::spawn_shim(&self.shim, &self.layout, &spec)
+            .await
+            .map_err(|m| error(ErrorCode::CommandFailed, m))?;
+        crate::log!("vibed: started session {} (shim pid {pid})", spec.agent);
+        let title = self
+            .titles(LOCAL_HOST)?
+            .remove(&spec.agent)
+            .unwrap_or_else(|| spec.agent.clone());
+        match sessions::probe(&self.layout.session_socket(&spec.agent)).await {
+            Probe::Running(status) => Ok(sessions::running(LOCAL_HOST, title, &status)),
+            // It started, and already ended. The shim writes its record
+            // before it removes its socket, so the record is there.
+            Probe::Gone => match sessions::read_record(&self.layout, &spec.agent) {
+                Some(record) => Ok(sessions::exited(
+                    LOCAL_HOST,
+                    &spec.agent,
+                    title,
+                    record.exit,
+                )),
+                None => Err(error(
+                    ErrorCode::InternalError,
+                    format!(
+                        "Internal error: session {} started, then vanished",
+                        spec.agent
+                    ),
+                )),
+            },
+            Probe::Broken(why) => Err(error(
+                ErrorCode::InternalError,
+                format!(
+                    "Internal error: session {} isn't answering: {why}",
+                    spec.agent
+                ),
+            )),
+        }
+    }
 }
 
 /// A project name held by an add in progress.
@@ -748,5 +957,33 @@ mod tests {
             "vibe-no-such-tool"
         );
         assert_eq!(find_program("vibe-no-such-tool", None), "vibe-no-such-tool");
+    }
+
+    #[test]
+    fn the_shim_beside_vibed_wins() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (bin, other) = (tmp.path().join("bin"), tmp.path().join("other"));
+        for d in [&bin, &other] {
+            std::fs::create_dir(d).unwrap();
+        }
+        std::fs::write(other.join("vibe-shim"), "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(
+            other.join("vibe-shim"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let path = std::env::join_paths([&other]).unwrap();
+        let vibed = bin.join("vibed");
+        // Nothing beside vibed: the one on PATH.
+        assert_eq!(
+            find_shim(Some(&vibed), Some(&path)),
+            other.join("vibe-shim").into_os_string()
+        );
+        std::fs::write(bin.join("vibe-shim"), "").unwrap();
+        assert_eq!(
+            find_shim(Some(&vibed), Some(&path)),
+            bin.join("vibe-shim").into_os_string()
+        );
+        assert_eq!(find_shim(None, None), "vibe-shim");
     }
 }

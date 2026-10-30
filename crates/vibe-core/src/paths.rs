@@ -103,9 +103,14 @@ impl Layout {
         self.data_dir().join("vibe.db")
     }
 
-    /// Sockets: `vibed.sock` and, later, one per agent.
+    /// Sockets: `vibed.sock`, and `<ref>.sock` for each running session.
     pub fn run_dir(&self) -> PathBuf {
         self.data_dir().join("run")
+    }
+
+    /// The socket of the session `agent_ref`'s shim serves.
+    pub fn session_socket(&self, agent_ref: &str) -> PathBuf {
+        self.run_dir().join(format!("{agent_ref}.sock"))
     }
 
     /// The default socket, the same path [`resolve_socket`] gives without
@@ -135,6 +140,16 @@ impl Layout {
     /// Where GitHub projects are cloned.
     pub fn projects_dir(&self) -> PathBuf {
         self.home.join("VibeOS/projects")
+    }
+
+    /// One directory per agent, for what VibeOS keeps of it outside its
+    /// worktree: its temp dir and its session's log and record.
+    pub fn agents_dir(&self) -> PathBuf {
+        self.home.join("VibeOS/agents")
+    }
+
+    pub fn agent_dir(&self, agent_ref: &str) -> PathBuf {
+        self.agents_dir().join(agent_ref)
     }
 }
 
@@ -215,6 +230,11 @@ mod tests {
         assert_eq!(l.logs_dir(), p("/Users/u/Library/Logs/VibeOS"));
         assert_eq!(l.host_config(), p("/Users/u/.config/vibeos/host.toml"));
         assert_eq!(l.projects_dir(), p("/Users/u/VibeOS/projects"));
+        assert_eq!(l.agent_dir("x"), p("/Users/u/VibeOS/agents/x"));
+        assert_eq!(
+            l.session_socket("x"),
+            p("/Users/u/Library/Application Support/VibeOS/run/x.sock")
+        );
     }
 
     #[test]
@@ -225,6 +245,11 @@ mod tests {
         assert_eq!(l.logs_dir(), p("/home/u/.local/share/vibeos/logs"));
         assert_eq!(l.host_config(), p("/home/u/.config/vibeos/host.toml"));
         assert_eq!(l.projects_dir(), p("/home/u/VibeOS/projects"));
+        assert_eq!(l.agent_dir("x"), p("/home/u/VibeOS/agents/x"));
+        assert_eq!(
+            l.session_socket("x"),
+            p("/home/u/.local/share/vibeos/run/x.sock")
+        );
     }
 
     #[test]

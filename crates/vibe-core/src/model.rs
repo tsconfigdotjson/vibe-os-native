@@ -118,6 +118,16 @@ names! {
     }
 }
 
+names! {
+    /// Whether a session's shim is still holding its terminal.
+    SessionState {
+        /// Its shim is up, and clients can attach.
+        Running = "running",
+        /// Its command ended; the shim left a record of how.
+        Exited = "exited",
+    }
+}
+
 /// The default memory of a profile.
 pub const DEFAULT_PROFILE_MEMORY: u64 = 4 * GIB;
 pub const MIN_PROFILE_MEMORY: u64 = GIB;
@@ -212,6 +222,34 @@ pub fn validate_name(what: &str, name: &str) -> Result<(), String> {
     }
 }
 
+/// The longest ref. A ref names a socket, `run/<ref>.sock`, whose path must
+/// fit in 103 bytes on macOS. That leaves 26 for the home directory, such as
+/// `/Users/` and a name of up to 19 letters.
+pub const MAX_REF_LEN: usize = 32;
+
+/// Names `run/` uses for itself, so no session may take them.
+const RESERVED_REFS: [&str; 1] = ["vibed"];
+
+/// An agent's ref, which also names its worktree, branch and session: like
+/// a name (see [`validate_name`]) but at most [`MAX_REF_LEN`] characters,
+/// and not `vibed`, whose socket is in the same directory.
+pub fn validate_ref(r: &str) -> Result<(), String> {
+    let ok = !r.is_empty()
+        && r.len() <= MAX_REF_LEN
+        && r.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && r.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if !ok {
+        return Err(format!(
+            "`{r}` isn't a valid ref: use up to {MAX_REF_LEN} letters, digits, `.`, `_` and `-`, starting with a letter or digit"
+        ));
+    }
+    if RESERVED_REFS.contains(&r) {
+        return Err(format!("`{r}` is reserved; pick another ref"));
+    }
+    Ok(())
+}
+
 /// API key names are only shown, never used as paths: anything printable up
 /// to 100 characters, such as "laptop Claude Code".
 pub fn validate_key_name(name: &str) -> Result<(), String> {
@@ -288,6 +326,18 @@ impl fmt::Display for GithubRepo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refs() {
+        assert_eq!(validate_ref("quiet-amber-otter"), Ok(()));
+        assert_eq!(validate_ref(&"a".repeat(MAX_REF_LEN)), Ok(()));
+        for bad in ["", "-x", "a/b", "a b", "vibed", "..", ".hidden"] {
+            assert!(validate_ref(bad).is_err(), "{bad:?}");
+        }
+        let long = validate_ref(&"a".repeat(MAX_REF_LEN + 1)).unwrap_err();
+        assert!(long.contains("up to 32"), "{long}");
+        assert_eq!(SessionState::Exited.as_str(), "exited");
+    }
 
     #[test]
     fn names_round_trip() {

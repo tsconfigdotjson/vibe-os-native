@@ -8,7 +8,8 @@ use vibe_core::rpc::{
     ErrorCode, ErrorObject, Event, EventsSubscribe, GhStatusGet, Hello, HelloParams, HelloResult,
     HostsList, Id, KeysCreate, KeysList, KeysRevoke, KeysVerify, LimitsGet, LimitsSet, Method,
     PROTOCOL_VERSION, ProfilesCreate, ProfilesDelete, ProfilesList, ProfilesUpdate, ProjectsAdd,
-    ProjectsList, ProjectsRemove, ProtocolMismatchData, Request, Response, Subscribed,
+    ProjectsList, ProjectsRemove, ProtocolMismatchData, Request, Response, SessionsAttach,
+    SessionsList, Subscribed,
 };
 
 use crate::core::Core;
@@ -161,6 +162,10 @@ async fn call(
             session.subscribed = true;
             session.new_subscription = Some((seq, rx));
             encode_result(Ok(Subscribed { seq }))
+        }
+        SessionsList::NAME => encode_result(core.sessions(decode::<SessionsList>(params)?).await),
+        SessionsAttach::NAME => {
+            encode_result(core.attach_session(decode::<SessionsAttach>(params)?).await)
         }
         _ => Err(ErrorObject::new(
             ErrorCode::MethodNotFound,

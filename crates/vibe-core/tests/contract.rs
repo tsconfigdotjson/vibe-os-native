@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 use serde::de::{self, DeserializeOwned, Deserializer, Visitor};
 use serde::{Serialize, forward_to_deserialize_any};
 use serde_json::Value;
-use vibe_core::model::{Environment, EventKind, GhState, Mode, Model, ProjectSource, Reasoning};
+use vibe_core::model::{
+    Environment, EventKind, GhState, Mode, Model, ProjectSource, Reasoning, SessionState,
+};
 use vibe_core::paths;
 use vibe_core::rpc::*;
 
@@ -176,6 +178,11 @@ fn rust_types() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
         entry::<GhStatus>(),
         entry::<Subscribed>(),
         entry::<Event>(),
+        entry::<SessionParams>(),
+        entry::<SessionList>(),
+        entry::<SessionInfo>(),
+        entry::<SessionExit>(),
+        entry::<SessionAttach>(),
     ])
 }
 
@@ -230,6 +237,8 @@ fn rust_methods() -> BTreeMap<&'static str, MethodTypes> {
         method::<KeysVerify>(),
         method::<GhStatusGet>(),
         method::<EventsSubscribe>(),
+        method::<SessionsList>(),
+        method::<SessionsAttach>(),
     ])
 }
 
@@ -258,6 +267,10 @@ fn rust_enums() -> BTreeMap<&'static str, Vec<&'static str>> {
         ),
         ("GhState", names(GhState::ALL, GhState::as_str)),
         ("EventKind", names(EventKind::ALL, EventKind::as_str)),
+        (
+            "SessionState",
+            names(SessionState::ALL, SessionState::as_str),
+        ),
     ])
 }
 

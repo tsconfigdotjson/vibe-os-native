@@ -1,0 +1,5 @@
+{
+  "description": "A ref names a socket and a directory, so only a ref's characters are allowed.",
+  "request": {"jsonrpc": "2.0", "id": 74, "method": "sessions.attach", "params": {"ref": "../vibed"}},
+  "response": {"jsonrpc": "2.0", "id": 74, "error": {"code": -32602, "message": "Invalid params: `../vibed` isn't a valid ref: use up to 32 letters, digits, `.`, `_` and `-`, starting with a letter or digit"}}
+}
