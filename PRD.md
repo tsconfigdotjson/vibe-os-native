@@ -126,7 +126,7 @@ A Rust daemon owns all state and logic. Every other part is a thin client of it.
 | `vibed` | Rust | LaunchAgent (via `SMAppService`), as the logged-in user, no root | Registry (SQLite); worktree manager (shells out to `git`); agent supervisor; **status engine** (agent-tail); **resource governor** for `macos` agents; sleep and wake; Linux template, home and managed-layer builder; MCP server; event stream. |
 | `vibe-shim` | Rust | One per awake agent, on the host, detached (its own session) | Owns the agent's terminal end: PTY (`macos`) or a vsock stream to `vibe-guest` (`linux`), a scrollback ring buffer, and a screen model (`vt100` crate) for `read_output` and redraw on attach. Serves `run/<ref>.sock`. |
 | `vibe-vm` | Swift (Virtualization.framework) | One per awake `linux` agent, detached | Boots the agent's VM, or restores it from its snapshot. To sleep, it pauses the VM, saves its state to disk and exits. Holds the `com.apple.security.virtualization` entitlement. |
-| `vibe-guest` | Rust, static Linux binary | PID 1 inside each VM | Starts Claude as the unprivileged user `vibe` on a PTY. Reports the process tree for the idle rules. After a restore, resets the clock. If the vsock link drops, Claude keeps running until the shim reconnects. |
+| `vibe-guest` | Rust, static Linux binary | PID 1 inside each VM | Starts Claude as the unprivileged user `vibe` on a PTY. Reports the process tree for the idle rules. Freezes Claude's tree before a save. After a restore, sets the clock from the host, waits for the shared folders to answer, then thaws Claude. If the vsock link drops, Claude keeps running until the shim reconnects. |
 | `vibe` CLI | Rust | On demand; linked into `/usr/local/bin` at setup | `vibe attach <ref>`, `vibe ls`, `vibe doctor`, `vibe toolbox`, and `vibe mcp` (a stdio bridge for clients that can only start a command). |
 
 **Restarts.** Shims and `vibe-vm` processes are detached from `vibed`. A daemon crash or upgrade leaves every agent running, and on start `vibed` re-adopts them by scanning `run/`.
@@ -272,9 +272,17 @@ Mounts are the same for every agent:
 
 #### Sleep and wake
 
-The VM boots with its agent. When the agent goes idle, `vibe-vm` pauses the VM, saves its whole state (RAM and devices) to the agent's snapshot file and exits, so all its RAM goes back to the Mac. Waking restores the snapshot: Claude is exactly where it was, mid-prompt or mid-question, with nothing replayed. `vibe-guest` then resets the clock and the shim reconnects. Network connections open at sleep time are dropped; an idle Claude has none in flight (open question 4 checks this).
+The VM boots with its agent. Sleeping, as measured in the spike below:
 
-All snapshots share one disk budget, `snapshot_disk`: 20 GB by default, adjustable in Settings → Host. When a new snapshot wouldn't fit, the oldest snapshot is dropped, and that agent wakes later with `claude --resume` instead, losing any pending question.
+1. `vibe-guest` freezes Claude's process tree inside the VM.
+2. `vibed` inflates the memory balloon and lets it go, so pages the guest has freed are handed back and stay out of the snapshot.
+3. `vibe-vm` pauses the VM, saves its whole state (RAM and devices) to the agent's snapshot file, and exits. All its RAM goes back to the Mac.
+
+Waking runs it backwards. `vibe-vm` restores the snapshot and resumes the VM. `vibe-guest` sets the clock from the host, because it stopped while the VM slept. It waits for the shared folders to answer, which takes about a second after a restore, and then thaws Claude. Claude is exactly where it was, mid-prompt or mid-question, with nothing replayed, and the shim reconnects. Network connections open at sleep time may drop; an idle Claude has none in flight (open question 4 checks this).
+
+A restore only works with the exact configuration the VM was saved with, so each agent's VM keeps a fixed MAC address and machine identifier for its whole life.
+
+A snapshot is about the size of the memory the guest is really using, not the VM's configured size. All snapshots share one disk budget, `snapshot_disk`: 20 GB by default, adjustable in Settings → Host. When a new snapshot wouldn't fit, the oldest snapshot is dropped, and that agent wakes later with `claude --resume` instead, losing any pending question.
 
 ## MCP interface
 
@@ -440,13 +448,34 @@ Never put to sleep: `thinking`, `running_tool`, `background_work`, and any *infe
 - logs in `~/Library/Logs/VibeOS/`
 - sockets in `…/VibeOS/run/`
 
+## Spike results: VM snapshots (2026-10-29)
+
+Virtualization.framework's save and restore works for this design. The spike ran a small Swift harness on an 8 GB Apple Silicon Mac with macOS 26.6.2, booting an Alpine 3.24 guest (Linux 6.18) with every device a `linux` agent needs attached. Everything it installed was removed afterwards.
+
+| Check | Result |
+| --- | --- |
+| Save and restore with a shared folder (virtio-fs), vsock, NAT networking, a block disk and a memory balloon attached | Supported (`validateSaveRestoreSupport` passes) |
+| Restore in a fresh process, as when `vibe-vm` exits on sleep | Works. The guest carried on exactly: an in-memory counter continued from where it stopped |
+| Boot to first answer over vsock | 0.35 to 1 s |
+| Save | 1.0 s with 40 MB in use; 3.1 s with 1 GB in use |
+| Restore to first answer over vsock | 0.5 s with 40 MB in use; 3.8 s with 1 GB in use |
+| Snapshot size | Follows the memory the guest has touched, not the configured size: 30 MB for an idle 2 GB VM, 45 MB for an idle 4 GB VM, 1.09 GB with 1 GB in use |
+| Memory the guest freed | Still saved (1.09 GB after freeing that 1 GB), unless the balloon reclaims it first. Inflating and releasing the balloon before saving cut the same snapshot to 41 MB |
+| A file changed on the host while the VM slept | Seen with its new contents after restore, not stale |
+| Shared folder right after a restore | Missing (`No such file or directory`) for about 0.9 s, then fine |
+| Guest clock | Stops while the VM sleeps and stays behind until reset |
+| Network after a restore | Same IP; the gateway and the internet were reachable |
+| Configuration | A restore fails ("invalid argument") unless the configuration matches the saved one exactly. The NIC's random default MAC address broke it until it was fixed |
+
+Not tested yet: surviving a host reboot, several VMs at once, a shared Claude home across VMs (open question 5), the size of a real Claude session, and layered disks (open question 2).
+
 ## Open questions
 
-Two of these block design work: VM snapshots and how the layers stack. The rest have a recommended answer that can be confirmed later.
+One of these blocks design work: how the layers stack. The rest have a recommended answer that can be confirmed later.
 
 | # | Question | Recommendation | Why |
 | --- | --- | --- | --- |
-| 1 | Does Virtualization.framework's save and restore work for our VMs? | A one-week spike. Test it with virtio-fs shares and vsock attached. Measure restore time and snapshot size for a 4 GB VM, and whether a snapshot grows with the RAM the guest used or is always the full 4 GB. Check that a snapshot survives a reboot, and that the guest doesn't see stale files in the shared `.git` after a restore. Also check whether Apple Containerization exposes snapshots | Snapshots make sleep exact and free. If they fall short, stop and decide with the owner before picking a fallback: libkrun with `claude --resume` (which loses pending questions), or Containerization |
+| 1 | What's left of VM snapshots after the spike? | Test that a snapshot survives a host reboot, that several VMs save and restore at once, and how big a real idle Claude's snapshot is after the balloon | The core works (see Spike results). If a snapshot doesn't survive a reboot, linux agents wake with `claude --resume` after one, as `macos` agents already do |
 | 2 | How do the template, managed layer, home and agent copy stack? | Read-only disk images plus a per-agent writable image, combined with overlayfs inside the guest. Never overlayfs on top of virtio-fs | Block images are stable and versionable. Overlayfs over a shared filesystem is fragile |
 | 3 | Are 4 GB starter profiles right? | Measure real Claude sessions with typical builds on 32 GB and 64 GB machines | Every number here is a guess until measured |
 | 4 | Does Claude Code wake cleanly from `SIGCONT`, and from a VM restore with dropped connections and a jumped clock? | Add both scenarios to agent-tail's harness CI | Sleeping is only safe if waking always works |
@@ -454,6 +483,8 @@ Two of these block design work: VM snapshots and how the layers stack. The rest 
 | 6 | Does agent-tail report a usage-limit stop as a firm resting state? | Add a mock-server scenario that returns the limit error, tracked in [agent-tail#121](https://github.com/tsconfigdotjson/agent-tail/issues/121). Ideally it also reports the reason and reset time | If not, a limited agent shows as unknown and never sleeps, holding its memory until the limit resets |
 
 **Decided on 2026-10-29:**
+
+- `linux` VMs run on Apple's Virtualization.framework and sleep by saving the VM to disk, as the snapshot spike showed works.
 
 - The menu bar runs on the host only, and shows only agents this app started. Remote users use MCP and `ssh -t host vibe attach`.
 - One agent per worktree, each with its own compartment and, in `linux`, its own VM.
