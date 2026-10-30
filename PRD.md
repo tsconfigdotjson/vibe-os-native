@@ -363,7 +363,7 @@ outside caller ──HTTPS + API key──▶ Linux host (public, vibed) ══ 
 - **Keys are checked where the agent lives.** API keys are made on the Mac, and their hashes are pushed to connected hosts, so one key works everywhere. The Mac verifies every call forwarded to it, so a compromised server can't drive the Mac without a key.
 - The public endpoint rate-limits and logs every call.
 - If the Mac is offline or the tunnel is down, the host still answers for its own agents, and Mac agents show as unavailable.
-- Every key has full access; there are no scopes. Treat a key like an SSH key to the Mac and revoke it in Settings if it leaks.
+- Every key has full access; there are no scopes. Treat a key like an SSH key to the Mac and revoke it in Settings if it leaks. A revoke is pushed to every connected host at once, and the Mac rejects the key itself even if a host hasn't caught up.
 - API keys only. OAuth for consumer connectors (such as claude.ai's) and a hosted relay for owners without a server are both out of scope.
 
 ## MCP interface
