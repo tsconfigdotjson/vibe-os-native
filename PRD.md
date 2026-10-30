@@ -107,7 +107,7 @@ An agent's life runs setup → start (worktree and compartment included) → wor
    - check admission against host headroom, using the profile's memory
    - create the compartment: boot the VM for `linux`, or set up the governed tree for `macos`
    - run the optional `.vibe/setup.sh` inside it
-   - mark the worktree as trusted for Claude, start the shim, and launch `claude --session-id <uuid>` with the profile's model, reasoning level and mode. The prompt is an argument, never pasted, so a startup dialog can't swallow it.
+   - pre-fill Claude's state so it opens straight to its prompt: first-run onboarding done (otherwise Claude stops at its theme picker) and the worktree trusted. Then start the shim, and launch `claude --session-id <uuid>` with the profile's model, reasoning level and mode. The prompt is an argument, never pasted, so a startup dialog can't swallow it.
    - agent-tail starts tailing the transcript
 4. **Monitor.** The menu bar row shows state, title and the latest activity line. A notification fires when an agent has a question, errors or hits a limit. MCP clients use `vibe_wait`.
 5. **Attach.** Click the row and Terminal.app opens running `vibe attach <ref>`. If a tab is already attached, that tab is raised instead. Closing the window detaches; the agent keeps running.
@@ -411,7 +411,7 @@ Only transcripts of agents this app spawned are read. agent-tail is fed specific
 
 **Idle** means all of these hold:
 
-- agent-tail reports a *firm* `done`, `interrupted`, `errored`, `awaiting_answer` or `awaiting_approval`. Its firm states already rule out subagents and background tasks, which show as `background_work`, so no timing guess is needed. An agent stopped by a Claude usage limit counts as at rest too: it sleeps like any other, and the next send wakes it. That depends on agent-tail reporting the limit stop as firm (open question 4).
+- agent-tail reports a *firm* `done`, `interrupted`, `errored`, `awaiting_answer` or `awaiting_approval`. Its firm states already rule out subagents and background tasks, which show as `background_work`, so no timing guess is needed. An agent stopped by a Claude usage limit counts as at rest too: it sleeps like any other, and the next send wakes it. That depends on agent-tail reporting the limit stop as firm (open question 3).
 - no process in the tree that agent-tail can't see: nothing started more than 30 s after Claude, other than the MCP servers Claude starts. This catches detached jobs such as `nohup` or a container. In `linux`, `vibe-guest` reports the tree.
 - no pending scheduled wakeup (`/loop`, `ScheduleWakeup`, `CronCreate`), which wouldn't fire while asleep. Until [agent-tail#120](https://github.com/tsconfigdotjson/agent-tail/issues/120) can see these, `vibed` treats any such call in the transcript as keeping the agent awake for the rest of the session.
 - no client is attached
@@ -494,7 +494,19 @@ A third spike the same day covered real git, layered disks, the `macos` governor
 
 A saved VM also survives a host reboot: one saved before a real reboot restored afterwards in 0.52 s, with its in-memory state intact.
 
-Not tested yet: Claude itself inside a VM with a `setup-token` login (open question 3).
+A fourth spike ran real Claude Code (2.1.314, the Linux arm64 musl build) in a `linux` VM as an unprivileged user, logged in only with a `claude setup-token` token:
+
+| Check | Result |
+| --- | --- |
+| Interactive Claude in a terminal over vsock, the way `vibe-shim` will reach it | Works. With first-run state pre-filled it opens straight to its prompt and answers; `/status` shows `Auth token: CLAUDE_CODE_OAUTH_TOKEN` |
+| Starting with nothing pre-filled | Claude stops at its first-run theme picker, so the daemon must pre-fill onboarding as well as trust |
+| Profile settings: Opus, Sonnet with `--effort high`, `--permission-mode auto` | All work with the token; `/status` shows `Auto mode server: Enabled` |
+| Bash tool use, with `--permission-mode bypassPermissions` as a non-root user | Works |
+| A fixed `--session-id`, the transcript on disk, and `--resume` | Works: the transcript lands in `~/.claude/projects/` where agent-tail reads it, and `--resume` recalls the session |
+| Save, 30 s asleep, restore, then `--resume` the same session | Works. The guest clock came back 34 s behind and was reset before the call |
+| Snapshot of a 2 GB VM after several Claude runs, without the balloon step | 440 MB, in line with the estimate above |
+
+Two fixes for the base image came out of it. Claude warns when it runs from outside `~/.local/bin`, so the managed layer should mark its install method and turn off the auto-updater. It also wants a private runtime directory (`XDG_RUNTIME_DIR`) for its peer socket.
 
 ## Open questions
 
@@ -504,10 +516,11 @@ None of these block design work any more. Each has a test ready or under way.
 | --- | --- | --- | --- |
 | 1 | Are 4 GB starter profiles right? | Measure real Claude sessions with typical builds on 32 GB and 64 GB machines | Every number here is a guess until measured |
 | 2 | Does Claude Code wake cleanly from `SIGCONT`, and from a VM restore with dropped connections and a jumped clock? | Add both scenarios to agent-tail's harness CI, tracked in [agent-tail#122](https://github.com/tsconfigdotjson/agent-tail/issues/122) | Sleeping is only safe if waking always works |
-| 3 | Does a `claude setup-token` token cover everything Claude needs inside a VM? | The owner creates a token with `claude setup-token`; run Claude Code in a throwaway VM with it, then revoke it | Sharing one Claude home across VMs failed the spike, so this token is now the one credential every `linux` agent depends on |
-| 4 | Does agent-tail report a usage-limit stop as a firm resting state? | Add a mock-server scenario that returns the limit error, tracked in [agent-tail#121](https://github.com/tsconfigdotjson/agent-tail/issues/121). Ideally it also reports the reason and reset time | If not, a limited agent shows as unknown and never sleeps, holding its memory until the limit resets |
+| 3 | Does agent-tail report a usage-limit stop as a firm resting state? | Add a mock-server scenario that returns the limit error, tracked in [agent-tail#121](https://github.com/tsconfigdotjson/agent-tail/issues/121). Ideally it also reports the reason and reset time | If not, a limited agent shows as unknown and never sleeps, holding its memory until the limit resets |
 
 **Decided on 2026-10-29:**
+
+- `linux` agents log in to Claude with one `claude setup-token` token; a spike confirmed interactive use, model and effort choice, auto mode, tool use and resume all work with it inside a VM.
 
 - After a host reboot, `linux` agents wake from their snapshots exactly where they were; only `macos` agents fall back to `claude --resume`.
 
