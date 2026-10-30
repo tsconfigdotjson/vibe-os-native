@@ -65,7 +65,7 @@ VibeOS proved out the ideas, so this product borrows them. Nothing else carries 
 
 ## Core concepts
 
-An agent, its worktree and its compartment are one unit. They're created together and deleted together, and one ref (e.g. `quiet-amber-otter`) names all three, plus the branch.
+An agent, its worktree and its compartment are one unit. They're created together and deleted together, and one ref (e.g. `quiet-amber-otter`) names all three. The branch is the bare ref too, with no prefix.
 
 | Term | Meaning | Lives at |
 | --- | --- | --- |
@@ -182,7 +182,7 @@ A profile is everything you choose when starting an agent, saved under a name. P
 
 - **Model:** Opus or Sonnet (`--model`).
 - **Reasoning:** Claude's effort level (`--effort`).
-- **Mode:** `auto` by default, or `bypass` (`--dangerously-skip-permissions`). Settings warns when a `macos` profile uses bypass, because that agent acts as you without asking.
+- **Mode:** `auto` by default, or `bypass` (`--dangerously-skip-permissions`), in either environment. Bypass on `macos` is the owner's call.
 - **Memory:** the agent's high-water mark: a `linux` VM's fixed RAM, or a `macos` agent's hard limit.
 
 MCP clients see each project's profiles in `vibe_list_projects` and pass one by name to `vibe_start_agent`. An agent can't change profile or environment; start a new one `from` the same branch instead.
@@ -344,7 +344,7 @@ The menu bar lists every agent this app started, across all projects, and nothin
 An API key is a shell on the Mac, so keys are mandatory and the server listens on loopback by default. Logins follow one rule: a `macos` agent uses the Mac's own logins, and a `linux` agent uses the Linux home, which the owner sets up once.
 
 - **No root.** `vibed` runs as the logged-in user. v1 has no privileged helper.
-- **Distribution.** Open source under MIT, in a public repo. Releases are a Developer ID-signed, notarized DMG and a Homebrew cask, with Sparkle for updates. Not the Mac App Store, whose sandbox blocks most of this. `vibe-vm` carries the `com.apple.security.virtualization` entitlement.
+- **Distribution.** Open source under MIT, in a public repo. Releases are a DMG signed with the owner's existing Developer ID and notarized and a Homebrew cask, with Sparkle for updates. Not the Mac App Store, whose sandbox blocks most of this. `vibe-vm` carries the `com.apple.security.virtualization` entitlement.
 - **Network exposure.** Loopback by default. Settings can also bind the Tailscale address. Never `0.0.0.0`. Public exposure (e.g. Tailscale Funnel) is the user's own choice and is documented, not built in.
 - **GitHub.** `vibed` checks `gh auth status` at startup and every hour, and the menu header shows the result. Worktrees fetch through `gh` as git's credential helper.
 
@@ -362,7 +362,7 @@ An API key is a shell on the Mac, so keys are mandatory and the server listens o
 - Every agent can write to the project's shared `.git`, so a misbehaving agent could rewrite other branches' refs. Pushed branches on GitHub are the backstop.
 - Nothing protects against a stolen API key except revoking it.
 
-**Permissions.** Each profile sets Claude's mode: `auto` (the default), or `bypass` (`--dangerously-skip-permissions`). Bypass is safest in `linux`, where the VM is the sandbox. Settings warns when a `macos` profile uses it, because that agent acts as you without asking.
+**Permissions.** Each profile sets Claude's mode: `auto` (the default), or `bypass` (`--dangerously-skip-permissions`). Bypass is safest in `linux`, where the VM is the sandbox. A `macos` profile can use it too; that agent then acts as you without asking, which is the owner's call.
 
 Transcripts, scrollback and logs never leave the Mac. Logs redact keys and tokens.
 
@@ -460,7 +460,10 @@ Three of these block design work: VM snapshots, how the layers stack, and the he
 
 - The menu bar runs on the host only, and shows only agents this app started. Remote users use MCP and `ssh -t host vibe attach`.
 - One agent per worktree, each with its own compartment and, in `linux`, its own VM.
-- The product is VibeOS Native, in the `vibe-os-native` repo. It targets the latest macOS only.
+- The product is VibeOS Native, in the `vibe-os-native` repo. It targets the latest macOS only. Inside the product, names stay short: `VibeOS.app`, `~/VibeOS/`, `~/.config/vibeos/`.
+- Releases are signed and notarized with the owner's existing Apple Developer account.
+- Agent branches are the bare ref (`quiet-amber-otter`), with no prefix.
+- Any profile may use `bypass`, including `macos`; that's the owner's call.
 - Profiles belong to projects and set environment, model, reasoning level, mode (`auto` or `bypass`) and memory. Each new project starts with a `linux` and a `macos` profile: Opus, high reasoning, `auto`, 4 GB.
 - `macos` agents use the Mac's own binaries and logins, and are resource-governed only, with no file sandbox.
 - `linux` agents use the Linux template and home set up in the toolbox shell, including Claude config. Claude Code comes from a daemon-managed layer updated daily, and authenticates with a `setup-token` token.
