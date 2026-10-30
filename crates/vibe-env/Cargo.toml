@@ -1,0 +1,13 @@
+[package]
+name = "vibe-env"
+description = "VibeOS environment backends behind the Compartment, Limiter and Sleeper traits"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

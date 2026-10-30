@@ -1,0 +1,37 @@
+{
+  "protocol_version": 1,
+  "jsonrpc": "2.0",
+  "framing": "One JSON value per line (UTF-8, LF-terminated), in both directions.",
+  "max_message_bytes": 16777216,
+  "socket": {
+    "env": "VIBE_SOCKET",
+    "macos": "Library/Application Support/VibeOS/run/vibed.sock",
+    "linux": ".local/share/vibeos/run/vibed.sock"
+  },
+  "methods": [
+    { "name": "daemon.hello", "params": "HelloParams", "result": "HelloResult" }
+  ],
+  "errors": [
+    { "name": "parse_error", "code": -32700 },
+    { "name": "invalid_request", "code": -32600 },
+    { "name": "method_not_found", "code": -32601 },
+    { "name": "invalid_params", "code": -32602 },
+    { "name": "internal_error", "code": -32603 },
+    { "name": "protocol_mismatch", "code": -32000, "data": "ProtocolMismatchData" }
+  ],
+  "types": {
+    "Request": ["jsonrpc", "id", "method", "params"],
+    "Response": ["jsonrpc", "id", "result", "error"],
+    "ErrorObject": ["code", "message", "data"],
+    "HelloParams": ["client", "protocol"],
+    "HelloResult": ["daemon", "version", "protocol", "os", "arch", "pid"],
+    "ProtocolMismatchData": ["protocol"]
+  },
+  "optional": {
+    "Request": ["id", "params"],
+    "ErrorObject": ["data"],
+    "HelloParams": [],
+    "HelloResult": [],
+    "ProtocolMismatchData": []
+  }
+}

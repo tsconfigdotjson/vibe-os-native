@@ -1,0 +1,9 @@
+{
+  "description": "An unknown method.",
+  "request": { "jsonrpc": "2.0", "id": 4, "method": "daemon.nope" },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 4,
+    "error": { "code": -32601, "message": "Method not found: daemon.nope" }
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "description": "A line that isn't JSON gets a parse error with a null id.",
+  "request_raw": "{\"jsonrpc\": \"2.0\", \"method\"",
+  "response": {
+    "jsonrpc": "2.0",
+    "id": null,
+    "error": { "code": -32700, "message": "Parse error" }
+  }
+}

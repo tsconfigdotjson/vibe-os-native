@@ -1,0 +1,24 @@
+[package]
+name = "vibe-cli"
+description = "The vibe command: attach, ls, rpc and host setup, as a client of vibed"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "vibe"
+path = "src/main.rs"
+
+[dependencies]
+vibe-core.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+vibed.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

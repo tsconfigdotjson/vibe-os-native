@@ -1,0 +1,9 @@
+{
+  "description": "Params that don't match the method's type are invalid params.",
+  "request": { "jsonrpc": "2.0", "id": 3, "method": "daemon.hello", "params": { "client": "vibe-cli" } },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 3,
+    "error": { "code": -32602, "message": "Invalid params: missing field `protocol`" }
+  }
+}

@@ -1,0 +1,5 @@
+# vibe-guest is a static aarch64 musl binary. Rust ships the musl CRT and
+# libc for this target, so linking with the bundled rust-lld needs no
+# cross C toolchain, on macOS or on Linux.
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"

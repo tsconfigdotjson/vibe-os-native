@@ -1,0 +1,72 @@
+# CI runs the same script developers run: scripts/check-full.sh. On Linux it
+# covers the Rust workspace, the vibe-guest cross-build and the vibed smoke
+# test; on macOS 26 it adds both Swift packages, the Swift contract tests,
+# ad hoc signing and the vibe-vm and VibeOS.app smoke tests.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: check (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            runner: ubuntu-24.04
+          - name: linux-arm64
+            runner: ubuntu-24.04-arm
+          - name: macos-26
+            runner: macos-26
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: 4
+      TEST_THREADS: 4
+    steps:
+      - uses: actions/checkout@v4
+
+      # Installs the toolchain, components and targets rust-toolchain.toml
+      # names (rustup 1.28+), installing rustup itself if the image lacks it.
+      - name: Install the Rust toolchain
+        run: |
+          if ! command -v rustup >/dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          rustup self update || true
+          rustup toolchain install
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            swift/VibeOS/.build
+            swift/vibe-vm/.build
+          key: ${{ matrix.name }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'swift/*/Package.swift') }}
+          restore-keys: ${{ matrix.name }}-
+
+      - name: scripts/check-full.sh
+        run: scripts/check-full.sh
+
+      - name: Upload the step logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: check-logs-${{ matrix.name }}
+          path: build/check/

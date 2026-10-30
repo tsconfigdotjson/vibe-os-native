@@ -1,0 +1,13 @@
+[package]
+name = "vibe-status"
+description = "The VibeOS status engine: agent-tail reading Claude Code's transcripts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true
