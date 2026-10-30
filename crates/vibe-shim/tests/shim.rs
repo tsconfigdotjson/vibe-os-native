@@ -339,16 +339,17 @@ fn a_command_that_ignores_the_hangup_is_killed() {
 
 /// Asks the shell its terminal's size, through client `via`.
 fn stty_size(via: &mut Attach) -> String {
-    // A marker of its own, so an answer redrawn from earlier isn't taken.
+    // The shell works out the marker, so only its answer contains it: the
+    // terminal's echo of the command line, which a shell may draw more than
+    // once (bash redraws it on a resize), shows only `sz$((…))`. Each ask
+    // has its own, so an answer redrawn from earlier isn't taken.
     static ASKED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let n = ASKED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let marker = format!("size{n}=");
-    via.clear();
-    via.type_line(&format!("echo {marker}$(stty size | tr ' ' x)="));
+    let marker = format!("sz{}=", 1000 + n);
+    via.type_line(&format!("echo sz$((1000+{n}))=$(stty size | tr ' ' x)="));
     let deadline = Instant::now() + WAIT;
     loop {
-        // The first is the echo of the command line; the second, its answer.
-        if let Some(rest) = via.output.split(&marker).nth(2)
+        if let Some((_, rest)) = via.output.split_once(&marker)
             && let Some((size, _)) = rest.split_once('=')
         {
             return size.to_owned();

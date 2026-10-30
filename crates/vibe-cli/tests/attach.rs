@@ -244,13 +244,17 @@ fn clients(w: &World) -> usize {
         .len()
 }
 
-/// Asks the session's shell for its terminal size, with a marker of its own.
-fn stty_size(term: &mut Term, marker: &str) -> String {
-    term.type_line(&format!("echo {marker}=$(stty size | tr ' ' x)="));
+/// Asks the session's shell for its terminal size. The shell works out the
+/// marker, so only its answer contains it, never the echo of the command
+/// line, which bash may draw more than once (it redraws it on a resize).
+/// `n` makes each ask's marker its own.
+fn stty_size(term: &mut Term, n: u32) -> String {
+    let marker = format!("sz{}=", 1000 + n);
+    term.type_line(&format!("echo sz$((1000+{n}))=$(stty size | tr ' ' x)="));
     let deadline = Instant::now() + WAIT;
     loop {
         let text = term.text();
-        if let Some(rest) = text.split(&format!("{marker}=")).nth(2)
+        if let Some((_, rest)) = text.split_once(&marker)
             && let Some((size, _)) = rest.split_once('=')
         {
             return size.to_owned();
@@ -287,7 +291,7 @@ fn attach_streams_resizes_and_detaches_with_ctrl_backslash() {
     assert!(term.child.try_wait().unwrap().is_none());
 
     // The session takes the window's size, and follows it.
-    assert_eq!(stty_size(&mut term, "a"), "30x100");
+    assert_eq!(stty_size(&mut term, 1), "30x100");
     term.resize(Size {
         rows: 40,
         cols: 120,
@@ -303,7 +307,7 @@ fn attach_streams_resizes_and_detaches_with_ctrl_backslash() {
                 cols: 120,
             }
     });
-    assert_eq!(stty_size(&mut term, "b"), "40x120");
+    assert_eq!(stty_size(&mut term, 2), "40x120");
 
     // Ctrl-\ detaches, puts the terminal back, and the session goes on.
     term.type_bytes(b"\x1c");
