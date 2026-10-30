@@ -105,7 +105,7 @@ An agent's life runs setup → start (worktree and compartment included) → wor
    Meanwhile it downloads the Linux base image and the current Claude Code. Then it offers two last steps:
    - **Set up Linux.** Log in to Claude for Linux agents: the app runs `claude setup-token`, which opens the same browser sign-in as `/login`, and keeps the long-lived token in Keychain. Then the toolbox shell opens in Terminal: run `gh auth login`, and anything else you want every Linux agent to have (`gcloud auth login`, `apt install …`, your Claude settings). Exit to save.
    - **Settings → API keys → New key**, with a ready `claude mcp add …` line to copy.
-2. **Add a project.** Settings → Projects → Add takes a GitHub `owner/name`, cloned with the Mac's `gh` login into `~/VibeOS/projects/`, or a local path. The project starts with two profiles, one per environment (see Profiles), which you can edit or add to.
+2. **Add a project.** Settings → Projects → Add takes a GitHub `owner/name`, cloned with the Mac's `gh` login into `~/VibeOS/projects/`, or a local path. The project starts with two profiles, one per environment (see Profiles), which you can edit or add to. Removing a project forgets it and its profiles but leaves its files on disk; adding the same repo again picks up its existing clone. A project with agents can't be removed.
 3. **Start an agent.** `vibe_start_agent {project, profile, prompt}`, or New agent… in the menu. One call does it all:
    - fetch `origin` and cut a worktree on a new branch from the default branch (or from `from`), with `push.autoSetupRemote` set
    - check admission against host headroom, using the profile's memory
@@ -137,7 +137,7 @@ A Rust daemon owns all state and logic. Every other part is a thin client of it.
 
 **One core, three doors.** The menu bar, the CLI and MCP all call the same core handlers inside `vibed` over JSON-RPC 2.0, so they can't drift apart. MCP is a façade on that core, built with `rmcp` (the official Rust MCP SDK).
 
-**The socket contract.** The API is plain JSON-RPC 2.0, one message per line (UTF-8, `\n`-terminated, at most 16 MB), with batches and params by name. The same framing runs on the local socket and through `ssh <host> vibe rpc`. Every client opens with `daemon.hello {client, protocol}`; the daemon refuses a different protocol version with error `-32000` and its own version in the error's data. The socket is `~/Library/Application Support/VibeOS/run/vibed.sock` on the Mac and `~/.local/share/vibeos/run/vibed.sock` on a Linux host, or `$VIBE_SOCKET`. Its directory is `0700`, the socket is `0600`, and a lock file beside it keeps a second `vibed` off it. The contract lives in `protocol/`: an index of the methods, error codes and every type's field names, plus golden request/response examples. The Rust types (`vibe_core::rpc`) and the Swift types (`VibeRPC` in `swift/VibeOS`) are both tested against those files, and `vibed` must answer every example exactly, so neither side can change alone.
+**The socket contract.** The API is plain JSON-RPC 2.0, one message per line (UTF-8, `\n`-terminated, at most 16 MB), with batches and params by name. The same framing runs on the local socket and through `ssh <host> vibe rpc`. Every client opens with `daemon.hello {client, protocol}`; the daemon refuses a different protocol version with error `-32000` and its own version in the error's data. A client that wants the event stream calls `events.subscribe` on a connection of its own, which then also carries an `events.event` notification for every event: registry changes, `gh` login changes, and, as those parts land, agent state changes and limit hits. Over the socket, sizes are bytes and durations seconds. The socket is `~/Library/Application Support/VibeOS/run/vibed.sock` on the Mac and `~/.local/share/vibeos/run/vibed.sock` on a Linux host, or `$VIBE_SOCKET`. Its directory is `0700`, the socket is `0600`, and a lock file beside it keeps a second `vibed` off it. The contract lives in `protocol/`: an index of the methods, error codes and every type's field names, plus golden request/response examples. The Rust types (`vibe_core::rpc`) and the Swift types (`VibeRPC` in `swift/VibeOS`) are both tested against those files, and `vibed` must answer every example exactly, so neither side can change alone.
 
 **No Rust in the Swift processes.** The Swift app talks to `vibed` only through the socket. There is no UniFFI and no linked library, which keeps the Swift side small and the builds independent. `vibe-vm` is Swift too, because Virtualization.framework is an Apple API; it's a separate process that `vibed` drives over a pipe.
 
@@ -223,15 +223,15 @@ A profile is everything you choose when starting an agent, saved under a name. P
 | `software-eng-mac` | `macos` | Opus | high | auto | 4 GB |
 
 - **Model:** Opus or Sonnet (`--model`).
-- **Reasoning:** Claude's effort level (`--effort`).
+- **Reasoning:** Claude's effort level (`--effort`): `low`, `medium`, `high`, `xhigh` or `max`.
 - **Mode:** `auto` by default, or `bypass` (`--dangerously-skip-permissions`), in either environment. Bypass on `macos` is the owner's call.
-- **Memory:** the agent's high-water mark: a `linux` VM's fixed RAM, or a `macos` agent's hard limit. 4 GB by default, and adjustable per profile.
+- **Memory:** the agent's high-water mark: a `linux` VM's fixed RAM, or a `macos` agent's hard limit. 4 GB by default, and adjustable per profile from 1 GB to 1 TB, in whole MB.
 
 On a Linux host, a new project starts with one profile, `software-eng-linux`, with the same defaults. MCP clients see each project's profiles in `vibe_list_projects` and pass one by name to `vibe_start_agent`. An agent can't change profile or environment; start a new one `from` the same branch instead.
 
 ### Host limits
 
-Everything that isn't per profile is host-wide, in Settings → Host or `~/.config/vibeos/host.toml`. Every number is a proposed default to check on real hardware:
+Everything that isn't per profile is host-wide, in Settings → Host or `~/.config/vibeos/host.toml`. `vibed` reads the file on every use, so hand edits take effect at once, and edits from Settings keep the file's comments. A setting left out of the file has its default. Every number is a proposed default to check on real hardware:
 
 ```toml
 reserve_memory   = "4G"    # always left for macOS and vibed
@@ -349,7 +349,7 @@ A Linux server runs the same `vibed`, so it joins the Mac as another host. Its a
 - `vibed` supervises the link: keepalives, reconnect with backoff, and a connected/down state in the menu. When a link is down, that host's agents show as unavailable; nothing on either side stops.
 - Clicking a remote agent opens Terminal with `ssh -t <host> vibe attach <ref>`.
 - A host runs on its own too. It serves its own MCP for its own agents, and `vibe key`, `vibe project` and `vibe profile` replace the Settings screens. When the Mac is connected, its menu and MCP show the host's agents as well.
-- "Host" is in the core from day one, even before any server is added: every agent records its host, MCP calls take an optional `host`, and the menu groups agents by host.
+- "Host" is in the core from day one, even before any server is added: every agent records its host, MCP calls take an optional `host`, and the menu groups agents by host. Each `vibed` calls itself `local`; another host goes by the name it was added under, such as `vps`.
 
 ### External access
 
@@ -377,7 +377,7 @@ MCP is the product. It keeps the shape of VibeOS's MCP, which already drives a w
 **Auth is always on.** There's no unauthenticated mode, not even on loopback.
 
 - **Settings → API keys** generates a key (`vk_…`, 256 bits) with a name such as "laptop Claude Code". The key is shown with **Copy** and **Copy setup command** buttons.
-- Keys are stored hashed. Each one can be revoked and shows when it was last used.
+- Keys are stored hashed (SHA-256; a key is 256 random bits, so nothing slower is needed), with their first characters to tell them apart. Each one can be revoked, which deletes it, and shows when it was last used.
 - Clients send `Authorization: Bearer <key>`.
 - A key is equivalent to a shell on the Mac, and the Settings screen says so.
 
@@ -548,11 +548,12 @@ Never put to sleep: `thinking`, `running_tool` or `background_work`.
 
 **Where state lives:**
 
-- SQLite at `~/Library/Application Support/VibeOS/vibe.db`: projects, profiles, worktrees, agents (ref, profile, shim socket, Claude session id, worktree, last state), API key hashes
+- SQLite at `~/Library/Application Support/VibeOS/vibe.db`: hosts, projects, profiles, agents (ref, profile, shim socket, Claude session id, worktree, last state; one agent has one worktree, so it's a column), API key hashes. The state directory is private (`0700`), and a lock in it allows one `vibed` at a time
 - snapshots in `~/VibeOS/snapshots/`
-- logs in `~/Library/Logs/VibeOS/`
+- logs in `~/Library/Logs/VibeOS/vibed.log`, with anything shaped like an API key redacted
 - sockets in `…/VibeOS/run/`
-- on a Linux host: the same layout under `~/.local/share/vibeos/`, with projects and worktrees in `~/VibeOS/`
+- host limits in `~/.config/vibeos/host.toml`
+- on a Linux host: the same layout under `~/.local/share/vibeos/` (logs in its `logs/`), with projects and worktrees in `~/VibeOS/` and host limits in `~/.config/vibeos/host.toml`
 
 ## Spike results: VM snapshots (2026-10-29)
 

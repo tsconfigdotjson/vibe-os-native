@@ -1,0 +1,10 @@
+{
+  "description": "Names that don't exist are not_found.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 32,
+    "method": "profiles.delete",
+    "params": {"project": "app", "profile": "reviewer"}
+  },
+  "response": {"jsonrpc": "2.0", "id": 32, "error": {"code": -32001, "message": "app has no profile named reviewer"}}
+}

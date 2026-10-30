@@ -1,0 +1,33 @@
+{
+  "description": "Forgets a project and its profiles, and returns it. Its files stay on disk. Refused while it has agents.",
+  "request": {"jsonrpc": "2.0", "id": 34, "method": "projects.remove", "params": {"host": "local", "project": "app"}},
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 34,
+    "result": {
+      "host": "local",
+      "name": "app",
+      "source": "path",
+      "path": "/Users/me/src/app",
+      "added_at": "2026-10-30T12:00:00Z",
+      "profiles": [
+        {
+          "name": "software-eng-linux",
+          "environment": "linux",
+          "model": "opus",
+          "reasoning": "high",
+          "mode": "auto",
+          "memory": 4294967296
+        },
+        {
+          "name": "software-eng-mac",
+          "environment": "macos",
+          "model": "opus",
+          "reasoning": "high",
+          "mode": "auto",
+          "memory": 4294967296
+        }
+      ]
+    }
+  }
+}

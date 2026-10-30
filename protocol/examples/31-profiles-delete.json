@@ -1,0 +1,21 @@
+{
+  "description": "Returns the profile it deleted.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 31,
+    "method": "profiles.delete",
+    "params": {"host": "local", "project": "app", "profile": "reviewer"}
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 31,
+    "result": {
+      "name": "reviewer",
+      "environment": "linux",
+      "model": "sonnet",
+      "reasoning": "medium",
+      "mode": "auto",
+      "memory": 2147483648
+    }
+  }
+}

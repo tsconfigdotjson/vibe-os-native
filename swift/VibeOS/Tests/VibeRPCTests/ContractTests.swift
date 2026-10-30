@@ -27,10 +27,14 @@ func contractIndex() throws -> [String: Any] {
 
 struct Example {
     var name: String
-    /// nil for a malformed `request_raw` line.
+    /// nil for a malformed `request_raw` line, or a notification example.
     var request: Any?
     /// NSNull for none.
     var response: Any
+    /// Notifications vibed sends on the connection after the response.
+    var events: [Any]
+    /// A notification example: a message vibed sends unasked.
+    var notification: Any?
 }
 
 func contractExamples() throws -> [Example] {
@@ -40,11 +44,17 @@ func contractExamples() throws -> [Example] {
         .sorted { $0.lastPathComponent < $1.lastPathComponent }
     #expect(!files.isEmpty)
     return try files.map { url in
-        let object = try #require(try loadJSON(url) as? [String: Any], "\(url.lastPathComponent)")
+        let name = url.lastPathComponent
+        let object = try #require(try loadJSON(url) as? [String: Any], "\(name)")
+        if let notification = object["notification"] {
+            return Example(name: name, request: nil, response: NSNull(), events: [], notification: notification)
+        }
         return Example(
-            name: url.lastPathComponent,
+            name: name,
             request: object["request"],
-            response: try #require(object["response"], "\(url.lastPathComponent): response"))
+            response: try #require(object["response"], "\(name): response"),
+            events: object["events"] as? [Any] ?? [],
+            notification: nil)
     }
 }
 
@@ -96,7 +106,94 @@ let swiftTypes: [String: Set<String>] = [
     "HelloParams": keys(HelloParams.CodingKeys.self),
     "HelloResult": keys(HelloResult.CodingKeys.self),
     "ProtocolMismatchData": keys(ProtocolMismatchData.CodingKeys.self),
+    "NoParams": keys(NoParams.CodingKeys.self),
+    "HostParams": keys(HostParams.CodingKeys.self),
+    "HostInfo": keys(HostInfo.CodingKeys.self),
+    "HostList": keys(HostList.CodingKeys.self),
+    "Project": keys(Project.CodingKeys.self),
+    "ProjectList": keys(ProjectList.CodingKeys.self),
+    "ProjectAddParams": keys(ProjectAddParams.CodingKeys.self),
+    "ProjectParams": keys(ProjectParams.CodingKeys.self),
+    "Profile": keys(Profile.CodingKeys.self),
+    "ProfileList": keys(ProfileList.CodingKeys.self),
+    "ProfileCreateParams": keys(ProfileCreateParams.CodingKeys.self),
+    "ProfileUpdateParams": keys(ProfileUpdateParams.CodingKeys.self),
+    "ProfileParams": keys(ProfileParams.CodingKeys.self),
+    "HostLimits": keys(HostLimits.CodingKeys.self),
+    "LimitsSetParams": keys(LimitsSetParams.CodingKeys.self),
+    "ApiKey": keys(ApiKey.CodingKeys.self),
+    "KeyList": keys(KeyList.CodingKeys.self),
+    "KeyCreateParams": keys(KeyCreateParams.CodingKeys.self),
+    "KeyCreated": keys(KeyCreated.CodingKeys.self),
+    "KeyParams": keys(KeyParams.CodingKeys.self),
+    "KeyVerifyParams": keys(KeyVerifyParams.CodingKeys.self),
+    "GhStatusParams": keys(GhStatusParams.CodingKeys.self),
+    "GhStatus": keys(GhStatus.CodingKeys.self),
+    "Subscribed": keys(Subscribed.CodingKeys.self),
+    "Event": keys(DaemonEvent.CodingKeys.self),
 ]
+
+/// The index's enums, from the Swift ones.
+let swiftEnums: [String: [String]] = [
+    "Environment": AgentEnvironment.allCases.map(\.rawValue),
+    "Model": ClaudeModel.allCases.map(\.rawValue),
+    "Reasoning": ReasoningLevel.allCases.map(\.rawValue),
+    "Mode": PermissionMode.allCases.map(\.rawValue),
+    "ProjectSource": ProjectSource.allCases.map(\.rawValue),
+    "GhState": GhState.allCases.map(\.rawValue),
+    "EventKind": EventKind.allCases.map(\.rawValue),
+]
+
+/// A method's Swift types, and a typed round trip of an example of it.
+struct MethodCheck {
+    var params: String
+    var result: String
+    var roundTrip: (_ params: Any, _ result: Any, _ response: Any, _ what: String) throws -> Void
+}
+
+func check<M: RPCMethod>(_: M.Type) -> (String, MethodCheck) {
+    let params = String(describing: M.Params.self)
+    let result = String(describing: M.Result.self)
+    let check = MethodCheck(params: params, result: result) { p, r, response, what in
+        try roundTrip(M.Params.self, params, p, "\(what): params")
+        try roundTrip(M.Result.self, result, r, "\(what): result")
+        try roundTrip(RPCResponse<M.Result>.self, "Response", response, what)
+    }
+    return (M.name, check)
+}
+
+/// Every method's Swift types, by method name.
+func methodChecks() -> [String: MethodCheck] {
+    Dictionary(uniqueKeysWithValues: [
+        check(Hello.self),
+        check(HostsList.self),
+        check(ProjectsList.self),
+        check(ProjectsAdd.self),
+        check(ProjectsRemove.self),
+        check(ProfilesList.self),
+        check(ProfilesCreate.self),
+        check(ProfilesUpdate.self),
+        check(ProfilesDelete.self),
+        check(LimitsGet.self),
+        check(LimitsSet.self),
+        check(KeysList.self),
+        check(KeysCreate.self),
+        check(KeysRevoke.self),
+        check(KeysVerify.self),
+        check(GhStatusGet.self),
+        check(EventsSubscribe.self),
+    ])
+}
+
+/// Checks a notification vibed sends: an `events.event` with an Event.
+func checkNotification(_ object: Any, _ what: String) throws {
+    let typed = try JSONDecoder().decode(RPCRequest<DaemonEvent>.self, from: jsonData(object))
+    #expect(typed.id == nil, "\(what): a notification has no id")
+    #expect(typed.method == EventNotice.name, "\(what): unknown notification \(typed.method)")
+    try roundTrip(RPCRequest<DaemonEvent>.self, "Request", object, what)
+    let params = try #require((object as? [String: Any])?["params"], "\(what): params")
+    try roundTrip(DaemonEvent.self, "Event", params, "\(what): params")
+}
 
 /// The type of each error code's data, if it has one.
 let swiftErrorData: [RPCErrorCode: String] = [.protocolMismatch: "ProtocolMismatchData"]
@@ -113,15 +210,24 @@ let swiftErrorData: [RPCErrorCode: String] = [.protocolMismatch: "ProtocolMismat
 
         let methods = try #require(index["methods"] as? [[String: String]])
         #expect(methods.map { $0["name"] } == VibeRPC.methods)
+        let checks = methodChecks()
+        #expect(Set(checks.keys) == Set(VibeRPC.methods))
         for method in methods {
-            switch method["name"] {
-            case Hello.name:
-                #expect(method["params"] == String(describing: Hello.Params.self))
-                #expect(method["result"] == String(describing: Hello.Result.self))
-            default:
-                Issue.record("\(method["name"] ?? "?") has no Swift types; add them")
+            let name = method["name"] ?? "?"
+            guard let check = checks[name] else {
+                Issue.record("\(name) has no Swift types; add them")
+                continue
             }
+            #expect(method["params"] == check.params, "\(name): params")
+            #expect(method["result"] == check.result, "\(name): result")
         }
+
+        let notifications = try #require(index["notifications"] as? [[String: String]])
+        #expect(notifications.map { $0["name"] } == VibeRPC.notifications)
+        #expect(notifications.first?["params"] == "Event")
+
+        let enums = try #require(index["enums"] as? [String: [String]])
+        #expect(enums == swiftEnums)
 
         let errors = try #require(index["errors"] as? [[String: Any]])
         #expect(errors.count == RPCErrorCode.allCases.count)
@@ -150,6 +256,13 @@ let swiftErrorData: [RPCErrorCode: String] = [.protocolMismatch: "ProtocolMismat
     @Test func examplesRoundTripThroughTheTypes() throws {
         var succeeded = Set<String>()
         for example in try contractExamples() {
+            if let notification = example.notification {
+                try checkNotification(notification, example.name)
+                continue
+            }
+            for (i, event) in example.events.enumerated() {
+                try checkNotification(event, "\(example.name): event \(i)")
+            }
             var requests: [Any] = []
             if let list = example.request as? [Any] {
                 requests = list
@@ -185,12 +298,9 @@ let swiftErrorData: [RPCErrorCode: String] = [.protocolMismatch: "ProtocolMismat
                     let request = try #require(byID[typed.id], "\(what): no request with its id")
                     let params = try #require(request.params, "\(what): params")
                     let result = try #require(fields["result"])
-                    switch request.method {
-                    case Hello.name:
-                        try roundTrip(HelloParams.self, "HelloParams", params, "\(what): params")
-                        try roundTrip(HelloResult.self, "HelloResult", result, "\(what): result")
-                        try roundTrip(RPCResponse<HelloResult>.self, "Response", response, what)
-                    default:
+                    if let check = methodChecks()[request.method] {
+                        try check.roundTrip(params, result, response, what)
+                    } else {
                         Issue.record("\(what): no typed check for \(request.method); add one")
                     }
                     succeeded.insert(request.method)
@@ -274,6 +384,23 @@ struct LiveDaemonTests {
         #expect(hello.protocolVersion == VibeRPC.protocolVersion)
         #expect(hello.os == "macos")
         #expect(hello.pid > 0)
+
+        // The registry, through the typed methods. check-full.sh starts this
+        // vibed with an empty home, so everything has its default.
+        let hosts = try client.call(HostsList.self, NoParams())
+        #expect(hosts.hosts.map(\.name) == [VibeRPC.localHost])
+        #expect(hosts.hosts.first?.os == "macos")
+        let limits = try client.call(LimitsGet.self, HostParams())
+        #expect(limits.maxAwakeAgents == 16)
+        #expect(limits.reserveMemory == 4 << 30)
+        let projects = try client.call(ProjectsList.self, HostParams(host: VibeRPC.localHost))
+        #expect(projects.projects.isEmpty)
+        do {
+            _ = try client.call(ProfilesList.self, ProjectParams(project: "nope"))
+            Issue.record("vibed listed the profiles of a project that doesn't exist")
+        } catch VibedClientError.rpc(let rpc) {
+            #expect(rpc.code == RPCErrorCode.notFound.rawValue)
+        }
 
         // A client on another protocol is refused with the daemon's version.
         do {

@@ -148,3 +148,91 @@ async fn connections_are_independent() {
         .await;
     assert_eq!(idle.reply().await["error"]["code"], -32601);
 }
+
+#[tokio::test]
+async fn subscribers_get_every_event_after_their_response() {
+    let server = start(golden_info(), 1 << 20);
+    let mut watcher = Conn::open(&server.path).await;
+    let mut other = Conn::open(&server.path).await;
+    let mut quiet = Conn::open(&server.path).await;
+    let sub = watcher
+        .call("events.subscribe", serde_json::json!({}))
+        .await;
+    assert_eq!(sub["result"]["seq"], 0);
+
+    // Changes made on another connection reach the watcher, in order.
+    other
+        .call("limits.set", serde_json::json!({"cpu_cores": 2}))
+        .await;
+    other
+        .call("keys.create", serde_json::json!({"name": "k"}))
+        .await;
+    for (seq, kind) in [(1, "limits.changed"), (2, "keys.changed")] {
+        let e = watcher.reply().await;
+        assert_eq!(e["method"], "events.event");
+        assert!(e.get("id").is_none(), "a notification: {e}");
+        assert_eq!(
+            (&e["params"]["seq"], &e["params"]["kind"]),
+            (&seq.into(), &kind.into())
+        );
+        assert_eq!(e["params"]["host"], "local");
+    }
+    // The watcher can still make calls; replies and events share the line.
+    let hosts = watcher.call("hosts.list", serde_json::json!({})).await;
+    assert_eq!(hosts["result"]["hosts"][0]["name"], "local");
+    // A connection that didn't subscribe gets nothing but its replies.
+    assert_eq!(
+        quiet.call("hosts.list", serde_json::json!({})).await["id"],
+        1
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_slow_subscriber_is_told_it_missed_events() {
+    let server = start(golden_info(), 1 << 20);
+    let mut slow = Conn::open(&server.path).await;
+    let sub = slow.call("events.subscribe", serde_json::json!({})).await;
+    assert_eq!(sub["result"]["seq"], 0);
+    // More than the backlog, before the forwarder can run.
+    let n = 3000;
+    for _ in 0..n {
+        server
+            .core
+            .publish(server.core.event(vibe_core::model::EventKind::KeysChanged));
+    }
+    let first = slow.reply().await;
+    assert_eq!(first["params"]["kind"], "lagged", "{first}");
+    assert!(
+        first["params"]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("missed "),
+        "{first}"
+    );
+    // Then it carries on with what's left, ending at the last.
+    loop {
+        let e = slow.reply().await;
+        assert_eq!(e["params"]["kind"], "keys.changed");
+        if e["params"]["seq"] == n {
+            break;
+        }
+    }
+}
+
+#[tokio::test]
+async fn closing_a_subscribed_connection_ends_it_cleanly() {
+    let server = start(golden_info(), 1 << 20);
+    let mut c = Conn::open(&server.path).await;
+    c.call("events.subscribe", serde_json::json!({})).await;
+    c.write.shutdown().await.unwrap();
+    assert_eq!(c.line().await, None, "the daemon closes its end too");
+    // Events with no one left to read them go nowhere, harmlessly.
+    server.core.publish(
+        server
+            .core
+            .event(vibe_core::model::EventKind::LimitsChanged),
+    );
+    let mut next = Conn::open(&server.path).await;
+    next.send(format!("{HELLO}\n").as_bytes()).await;
+    assert_eq!(next.reply().await["id"], "probe");
+}

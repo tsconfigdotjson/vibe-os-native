@@ -6,6 +6,8 @@
 #   - cargo check of the workspace for every host target it doesn't run on
 #     (macOS and Linux, arm64 and x86_64)
 #   - a vibed hello-world smoke test, through `vibe hello` and `vibe rpc`
+#   - the registry through `vibe rpc`: add a project, edit a profile, change
+#     a host limit, restart vibed, and find all of it
 #   - both Swift packages (swift/VibeOS, swift/vibe-vm): build and test,
 #     including the Swift half of the Rust<->Swift contract test
 #   - ad hoc signing, with the virtualization entitlement on vibe-vm
@@ -107,10 +109,12 @@ mac_step() {
   fi
 }
 
-# start_vibed <socket> <log>: starts target/debug/vibed and waits for it.
+# start_vibed <socket> <log>: starts target/debug/vibed and waits for it. Its
+# $HOME is the socket's grandparent's home/, so it never touches the real
+# state; a restart on the same socket finds the same state.
 start_vibed() {
   VIBED_SOCKET=$1
-  target/debug/vibed --socket "$1" 2>"$2" &
+  HOME="$(dirname "$(dirname "$1")")/home" target/debug/vibed --socket "$1" 2>"$2" &
   VIBED_PID=$!
   echo "$VIBED_PID" >>"$WORK/pids"
   local i
@@ -181,7 +185,9 @@ s_cross() {
   for target in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
     [ "$target" = "$host" ] && continue
     rustup target add "$target"
-    cargo check --workspace --all-targets --locked --target "$target"
+    # The bundled SQLite is C, which needs the target's C toolchain to
+    # build. A check links nothing, so skip it and use the bindings alone.
+    LIBSQLITE3_SYS_USE_PKG_CONFIG=1 cargo check --workspace --all-targets --locked --target "$target"
   done
 }
 
@@ -198,6 +204,49 @@ s_smoke() {
   grep -q "hello from vibe-cli" "$log"
   grep -q "hello from check-full" "$log"
   cat "$log"
+}
+
+# rpc <message>...: one connection through `vibe rpc`, printing the replies.
+rpc() { printf '%s\n' "$@" | target/debug/vibe --socket "$VIBED_SOCKET" rpc; }
+
+# expect <text> <what>: fails unless $out contains <text>.
+expect() {
+  case $out in *"$1"*) ;; *) echo "missing $2: $1"; return 1 ;; esac
+}
+
+s_registry() {
+  local socket="$WORK/registry/run/vibed.sock" repo="$WORK/registry/src/app" starters
+  mkdir -p "$repo"
+  git -C "$repo" init -q
+  start_vibed "$socket" "$WORK/registry-vibed-1.log"
+  out=$(rpc \
+    "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"projects.add\",\"params\":{\"path\":\"$repo\"}}" \
+    '{"jsonrpc":"2.0","id":2,"method":"profiles.list","params":{"project":"app"}}' \
+    '{"jsonrpc":"2.0","id":3,"method":"profiles.update","params":{"project":"app","profile":"software-eng-linux","memory":8589934592,"mode":"bypass"}}' \
+    '{"jsonrpc":"2.0","id":4,"method":"limits.set","params":{"max_awake_agents":7}}')
+  echo "first run: $out"
+  case $out in *'"error"'*) echo "a call failed"; return 1 ;; esac
+  # A new project starts with a profile per environment the host has.
+  starters=$(printf '%s\n' "$out" | grep '"id":2' | grep -o '"name":"software-eng-[a-z]*"' | tr '\n' ' ')
+  echo "starter profiles: $starters"
+  if [ "$OS" = Darwin ]; then
+    [ "$starters" = '"name":"software-eng-linux" "name":"software-eng-mac" ' ] || { echo "a Mac starts with two"; return 1; }
+  else
+    [ "$starters" = '"name":"software-eng-linux" ' ] || { echo "a Linux host starts with one"; return 1; }
+  fi
+  stop_vibed
+
+  start_vibed "$socket" "$WORK/registry-vibed-2.log"
+  out=$(rpc \
+    '{"jsonrpc":"2.0","id":5,"method":"projects.list","params":{}}' \
+    '{"jsonrpc":"2.0","id":6,"method":"limits.get","params":{}}')
+  echo "after a restart: $out"
+  expect '"name":"app"' "the project"
+  expect '"memory":8589934592' "the edited profile"
+  expect '"mode":"bypass"' "the edited mode"
+  expect '"max_awake_agents":7' "the host limit"
+  stop_vibed
+  grep -q "max_awake_agents = 7" "$WORK/registry/home/.config/vibeos/host.toml"
 }
 
 s_swift_app_build() { swift build --package-path swift/VibeOS; }
@@ -269,6 +318,7 @@ step test "cargo test (incl. the Rust contract tests)" s_test
 step guest "vibe-guest: static aarch64-unknown-linux-musl" s_guest
 step cross "cargo check for macOS and Linux, arm64 and x86_64" s_cross
 step smoke "vibed hello world via vibe hello and vibe rpc" s_smoke build
+step registry "registry via vibe rpc survives a vibed restart" s_registry build
 mac_step swift-app-build "swift build swift/VibeOS" s_swift_app_build
 mac_step swift-app-test "swift test swift/VibeOS (Swift contract tests)" s_swift_app_test swift-app-build
 mac_step swift-vm-build "swift build swift/vibe-vm" s_swift_vm_build

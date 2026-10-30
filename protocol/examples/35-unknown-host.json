@@ -1,0 +1,5 @@
+{
+  "description": "Every per-host method takes an optional `host`; absent means `local`.",
+  "request": {"jsonrpc": "2.0", "id": 35, "method": "projects.list", "params": {"host": "vps"}},
+  "response": {"jsonrpc": "2.0", "id": 35, "error": {"code": -32001, "message": "no host named vps"}}
+}

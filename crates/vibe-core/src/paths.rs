@@ -1,9 +1,10 @@
-//! Where `vibed`'s socket lives. Clients and the daemon resolve it the same
-//! way; `protocol/vibed-rpc.json` records the defaults for the Swift side.
+//! Where `vibed` keeps things. Clients and the daemon resolve the socket the
+//! same way; `protocol/vibed-rpc.json` records its defaults for the Swift
+//! side. [`Layout`] has the rest (PRD: Where state lives).
 
 use std::ffi::OsString;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Overrides the socket path for the daemon and every client.
 pub const SOCKET_ENV: &str = "VIBE_SOCKET";
@@ -31,7 +32,7 @@ impl fmt::Display for NoHomeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "can't find the vibed socket: $HOME is not set (set {SOCKET_ENV})"
+            "$HOME is not set, so there's no default for vibed's files (or set {SOCKET_ENV} for the socket alone)"
         )
     }
 }
@@ -55,6 +56,86 @@ pub fn resolve_socket(
     }
     let home = home.and_then(nonempty).ok_or(NoHomeError)?;
     Ok(PathBuf::from(home).join(default_socket_relative(os)))
+}
+
+/// Every path `vibed` uses for one user, on one OS. macOS keeps state under
+/// `~/Library`; every other Unix uses the Linux layout under
+/// `~/.local/share/vibeos/`. Projects and host config are in the same place on
+/// both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Layout {
+    home: PathBuf,
+    mac: bool,
+}
+
+impl Layout {
+    /// The layout for `home` on `os` (as in `std::env::consts::OS`).
+    pub fn new(home: impl Into<PathBuf>, os: &str) -> Self {
+        Layout {
+            home: home.into(),
+            mac: os == "macos",
+        }
+    }
+
+    /// The layout for this process: `$HOME` (non-empty) on this OS.
+    pub fn current() -> Result<Self, NoHomeError> {
+        let home = std::env::var_os("HOME")
+            .filter(|h| !h.is_empty())
+            .ok_or(NoHomeError)?;
+        Ok(Layout::new(home, std::env::consts::OS))
+    }
+
+    pub fn home(&self) -> &Path {
+        &self.home
+    }
+
+    /// `vibe.db`, the run directory and, on Linux, the logs.
+    pub fn data_dir(&self) -> PathBuf {
+        if self.mac {
+            self.home.join("Library/Application Support/VibeOS")
+        } else {
+            self.home.join(".local/share/vibeos")
+        }
+    }
+
+    /// The SQLite registry.
+    pub fn db(&self) -> PathBuf {
+        self.data_dir().join("vibe.db")
+    }
+
+    /// Sockets: `vibed.sock` and, later, one per agent.
+    pub fn run_dir(&self) -> PathBuf {
+        self.data_dir().join("run")
+    }
+
+    /// The default socket, the same path [`resolve_socket`] gives without
+    /// overrides.
+    pub fn socket(&self) -> PathBuf {
+        self.run_dir().join("vibed.sock")
+    }
+
+    pub fn logs_dir(&self) -> PathBuf {
+        if self.mac {
+            self.home.join("Library/Logs/VibeOS")
+        } else {
+            self.data_dir().join("logs")
+        }
+    }
+
+    /// `~/.config/vibeos`, on every OS.
+    pub fn config_dir(&self) -> PathBuf {
+        self.home.join(".config/vibeos")
+    }
+
+    /// Host limits, which the owner may also edit by hand.
+    pub fn host_config(&self) -> PathBuf {
+        self.config_dir().join("host.toml")
+    }
+
+    /// Where GitHub projects are cloned.
+    pub fn projects_dir(&self) -> PathBuf {
+        self.home.join("VibeOS/projects")
+    }
 }
 
 /// [`resolve_socket`] for this process: its environment and its OS.
@@ -116,5 +197,44 @@ mod tests {
             Err(NoHomeError)
         );
         assert_eq!(resolve_socket(None, None, None, "linux"), Err(NoHomeError));
+    }
+
+    #[test]
+    fn mac_layout() {
+        let l = Layout::new("/Users/u", "macos");
+        let p = |s: &str| PathBuf::from(s);
+        assert_eq!(l.home(), Path::new("/Users/u"));
+        assert_eq!(
+            l.db(),
+            p("/Users/u/Library/Application Support/VibeOS/vibe.db")
+        );
+        assert_eq!(
+            l.run_dir(),
+            p("/Users/u/Library/Application Support/VibeOS/run")
+        );
+        assert_eq!(l.logs_dir(), p("/Users/u/Library/Logs/VibeOS"));
+        assert_eq!(l.host_config(), p("/Users/u/.config/vibeos/host.toml"));
+        assert_eq!(l.projects_dir(), p("/Users/u/VibeOS/projects"));
+    }
+
+    #[test]
+    fn linux_layout() {
+        let l = Layout::new("/home/u", "linux");
+        let p = |s: &str| PathBuf::from(s);
+        assert_eq!(l.db(), p("/home/u/.local/share/vibeos/vibe.db"));
+        assert_eq!(l.logs_dir(), p("/home/u/.local/share/vibeos/logs"));
+        assert_eq!(l.host_config(), p("/home/u/.config/vibeos/host.toml"));
+        assert_eq!(l.projects_dir(), p("/home/u/VibeOS/projects"));
+    }
+
+    #[test]
+    fn layout_socket_is_the_default_socket() {
+        for os in ["macos", "linux"] {
+            assert_eq!(
+                Ok(Layout::new("/h", os).socket()),
+                resolve_socket(None, None, Some(OsString::from("/h")), os),
+                "{os}"
+            );
+        }
     }
 }

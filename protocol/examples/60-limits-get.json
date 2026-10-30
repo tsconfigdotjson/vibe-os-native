@@ -1,0 +1,20 @@
+{
+  "description": "Host limits: ~/.config/vibeos/host.toml over the defaults. Sizes are bytes, idle_debounce is seconds.",
+  "request": {"jsonrpc": "2.0", "id": 60, "method": "limits.get", "params": {"host": "local"}},
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 60,
+    "result": {
+      "reserve_memory": 4294967296,
+      "reserve_cores": 2,
+      "max_awake_agents": 16,
+      "cpu_cores": 4,
+      "max_processes": 512,
+      "disk_soft": 21474836480,
+      "disk_hard": 32212254720,
+      "vm_disk": 21474836480,
+      "idle_debounce": 60,
+      "snapshot_disk": 21474836480
+    }
+  }
+}

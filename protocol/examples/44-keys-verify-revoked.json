@@ -1,0 +1,10 @@
+{
+  "description": "A revoked or unknown key is not_found.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 44,
+    "method": "keys.verify",
+    "params": {"secret": "vk_aaaqeayeaudaocajbifqydiob4ibceqtcqkrmfyydenbwha5dypq"}
+  },
+  "response": {"jsonrpc": "2.0", "id": 44, "error": {"code": -32001, "message": "that key is unknown or revoked"}}
+}

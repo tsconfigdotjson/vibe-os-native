@@ -1,0 +1,30 @@
+{
+  "description": "A new profile. Fields left out take the defaults: linux, opus, high, auto, 4G.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 30,
+    "method": "profiles.create",
+    "params": {
+      "host": "local",
+      "project": "app",
+      "name": "reviewer",
+      "environment": "linux",
+      "model": "sonnet",
+      "reasoning": "medium",
+      "mode": "auto",
+      "memory": 2147483648
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 30,
+    "result": {
+      "name": "reviewer",
+      "environment": "linux",
+      "model": "sonnet",
+      "reasoning": "medium",
+      "mode": "auto",
+      "memory": 2147483648
+    }
+  }
+}

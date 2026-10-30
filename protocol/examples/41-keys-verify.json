@@ -1,0 +1,19 @@
+{
+  "description": "Checks a key and records that it was used.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 41,
+    "method": "keys.verify",
+    "params": {"secret": "vk_aaaqeayeaudaocajbifqydiob4ibceqtcqkrmfyydenbwha5dypq"}
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 41,
+    "result": {
+      "name": "laptop",
+      "prefix": "vk_aaaqeaye",
+      "created_at": "2026-10-30T12:00:00Z",
+      "last_used_at": "2026-10-30T12:00:00Z"
+    }
+  }
+}

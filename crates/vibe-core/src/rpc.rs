@@ -15,6 +15,11 @@ use serde::de::{DeserializeOwned, Error as _};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
+pub use crate::limits::HostLimits;
+pub use crate::model::{
+    Environment, EventKind, GhState, Mode, Model, Profile, ProjectSource, Reasoning,
+};
+
 /// Bumped on any incompatible change to the contract. Clients send theirs in
 /// `daemon.hello`, and the daemon refuses a mismatch.
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -83,6 +88,16 @@ pub struct Request {
 }
 
 impl Request {
+    /// A notification `N` from the daemon, such as an event.
+    pub fn notification<N: Notification>(params: &N::Params) -> Self {
+        Request {
+            jsonrpc: V2,
+            id: None,
+            method: N::NAME.to_owned(),
+            params: Some(serde_json::to_value(params).expect("params serialize to JSON")),
+        }
+    }
+
     /// A call to `M` that expects a response.
     pub fn call<M: Method>(id: Id, params: &M::Params) -> Self {
         Request {
@@ -185,16 +200,29 @@ pub enum ErrorCode {
     /// The client's `protocol` in `daemon.hello` isn't the daemon's. The
     /// error's data is a [`ProtocolMismatchData`].
     ProtocolMismatch,
+    /// No host, project, profile or key by that name.
+    NotFound,
+    /// The name is taken, or the thing is in use.
+    Conflict,
+    /// `host.toml` can't be read; the message says where and why.
+    HostConfigInvalid,
+    /// A command `vibed` ran, such as `gh repo clone`, failed; the message
+    /// has its error.
+    CommandFailed,
 }
 
 impl ErrorCode {
-    pub const ALL: [ErrorCode; 6] = [
+    pub const ALL: [ErrorCode; 10] = [
         ErrorCode::ParseError,
         ErrorCode::InvalidRequest,
         ErrorCode::MethodNotFound,
         ErrorCode::InvalidParams,
         ErrorCode::InternalError,
         ErrorCode::ProtocolMismatch,
+        ErrorCode::NotFound,
+        ErrorCode::Conflict,
+        ErrorCode::HostConfigInvalid,
+        ErrorCode::CommandFailed,
     ];
 
     pub fn code(self) -> i64 {
@@ -205,6 +233,10 @@ impl ErrorCode {
             ErrorCode::InvalidParams => -32602,
             ErrorCode::InternalError => -32603,
             ErrorCode::ProtocolMismatch => -32000,
+            ErrorCode::NotFound => -32001,
+            ErrorCode::Conflict => -32002,
+            ErrorCode::HostConfigInvalid => -32003,
+            ErrorCode::CommandFailed => -32004,
         }
     }
 
@@ -217,6 +249,10 @@ impl ErrorCode {
             ErrorCode::InvalidParams => "invalid_params",
             ErrorCode::InternalError => "internal_error",
             ErrorCode::ProtocolMismatch => "protocol_mismatch",
+            ErrorCode::NotFound => "not_found",
+            ErrorCode::Conflict => "conflict",
+            ErrorCode::HostConfigInvalid => "host_config_invalid",
+            ErrorCode::CommandFailed => "command_failed",
         }
     }
 
@@ -263,8 +299,50 @@ pub trait Method {
     type Result: Serialize + DeserializeOwned;
 }
 
+/// A notification the daemon sends, with its parameter type.
+pub trait Notification {
+    const NAME: &'static str;
+    type Params: Serialize + DeserializeOwned;
+}
+
+/// Declares a method: its marker type, name, and param and result types.
+macro_rules! method {
+    ($(#[$meta:meta])* $marker:ident = $name:literal, $params:ty => $result:ty) => {
+        $(#[$meta])*
+        #[derive(Debug)]
+        pub enum $marker {}
+
+        impl Method for $marker {
+            const NAME: &'static str = $name;
+            type Params = $params;
+            type Result = $result;
+        }
+    };
+}
+
 /// Every method in the contract.
-pub const METHODS: &[&str] = &[Hello::NAME];
+pub const METHODS: &[&str] = &[
+    Hello::NAME,
+    HostsList::NAME,
+    ProjectsList::NAME,
+    ProjectsAdd::NAME,
+    ProjectsRemove::NAME,
+    ProfilesList::NAME,
+    ProfilesCreate::NAME,
+    ProfilesUpdate::NAME,
+    ProfilesDelete::NAME,
+    LimitsGet::NAME,
+    LimitsSet::NAME,
+    KeysList::NAME,
+    KeysCreate::NAME,
+    KeysRevoke::NAME,
+    KeysVerify::NAME,
+    GhStatusGet::NAME,
+    EventsSubscribe::NAME,
+];
+
+/// Every notification the daemon sends.
+pub const NOTIFICATIONS: &[&str] = &[EventNotice::NAME];
 
 /// `daemon.hello`: the handshake. It names the client and checks that both
 /// sides speak the same protocol version.
@@ -306,6 +384,383 @@ pub struct HelloResult {
 pub struct ProtocolMismatchData {
     /// The daemon's [`PROTOCOL_VERSION`].
     pub protocol: u32,
+}
+
+/// The params of a method that takes none: `{}`, or none at all.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NoParams {}
+
+// Every method that acts on one host takes an optional `host`: absent means
+// this one, `local`. Other hosts come with #16.
+
+method! {
+    /// `hosts.list`: every host this daemon knows; for now, itself.
+    HostsList = "hosts.list", NoParams => HostList
+}
+
+method! {
+    /// `projects.list`: a host's projects, with their profiles.
+    ProjectsList = "projects.list", HostParams => ProjectList
+}
+
+method! {
+    /// `projects.add`: clones a GitHub repo into `~/VibeOS/projects/` with
+    /// the host's `gh` login, or registers a local repo where it is. The
+    /// project starts with its host's starter profiles.
+    ProjectsAdd = "projects.add", ProjectAddParams => Project
+}
+
+method! {
+    /// `projects.remove`: forgets a project and its profiles. Its files stay
+    /// on disk. Refused while it has agents.
+    ProjectsRemove = "projects.remove", ProjectParams => Project
+}
+
+method! {
+    /// `profiles.list`: a project's profiles, oldest first.
+    ProfilesList = "profiles.list", ProjectParams => ProfileList
+}
+
+method! {
+    /// `profiles.create`: a new profile; unset fields take the defaults
+    /// (`linux`, Opus, high, `auto`, 4 GB).
+    ProfilesCreate = "profiles.create", ProfileCreateParams => Profile
+}
+
+method! {
+    /// `profiles.update`: changes the fields given, and renames the profile
+    /// when `name` is given.
+    ProfilesUpdate = "profiles.update", ProfileUpdateParams => Profile
+}
+
+method! {
+    /// `profiles.delete`: returns the profile it deleted.
+    ProfilesDelete = "profiles.delete", ProfileParams => Profile
+}
+
+method! {
+    /// `limits.get`: the host's limits, from `host.toml` over the defaults.
+    LimitsGet = "limits.get", HostParams => HostLimits
+}
+
+method! {
+    /// `limits.set`: writes the settings given into `host.toml` and returns
+    /// the limits that result.
+    LimitsSet = "limits.set", LimitsSetParams => HostLimits
+}
+
+method! {
+    /// `keys.list`: the API keys, oldest first. Never the keys themselves.
+    KeysList = "keys.list", NoParams => KeyList
+}
+
+method! {
+    /// `keys.create`: a new API key. Its secret is in this one response and
+    /// nowhere else; only its hash is kept.
+    KeysCreate = "keys.create", KeyCreateParams => KeyCreated
+}
+
+method! {
+    /// `keys.revoke`: deletes a key, so it stops working at once.
+    KeysRevoke = "keys.revoke", KeyParams => ApiKey
+}
+
+method! {
+    /// `keys.verify`: checks a key and records that it was used.
+    KeysVerify = "keys.verify", KeyVerifyParams => ApiKey
+}
+
+method! {
+    /// `gh.status`: the last `gh auth status`, run at startup and every
+    /// hour, or now when `refresh` is set.
+    GhStatusGet = "gh.status", GhStatusParams => GhStatus
+}
+
+method! {
+    /// `events.subscribe`: from now on, this connection also gets an
+    /// `events.event` notification for every event, after this response.
+    EventsSubscribe = "events.subscribe", NoParams => Subscribed
+}
+
+/// `events.event`: one event, sent to subscribed connections.
+#[derive(Debug)]
+pub enum EventNotice {}
+
+impl Notification for EventNotice {
+    const NAME: &'static str = "events.event";
+    type Params = Event;
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostInfo {
+    /// `local` for this host.
+    pub name: String,
+    /// `macos` or `linux`.
+    pub os: String,
+    /// For people: the machine's hostname.
+    pub label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostList {
+    pub hosts: Vec<HostInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Project {
+    pub host: String,
+    pub name: String,
+    pub source: ProjectSource,
+    /// `owner/name`, for a project cloned from GitHub.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    /// The repo's absolute path on its host.
+    pub path: String,
+    pub added_at: String,
+    pub profiles: Vec<Profile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectList {
+    pub projects: Vec<Project>,
+}
+
+/// Exactly one of `repo` and `path`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectAddParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    /// A GitHub repo, `owner/name`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    /// An absolute path to the top of a local git checkout.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// The project's name; by default the repo's or the directory's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    pub project: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileList {
+    pub profiles: Vec<Profile>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileCreateParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    pub project: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub environment: Option<Environment>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<Model>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<Reasoning>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<Mode>,
+    /// Bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileUpdateParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    pub project: String,
+    /// The profile to change.
+    pub profile: String,
+    /// A new name for it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub environment: Option<Environment>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<Model>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<Reasoning>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<Mode>,
+    /// Bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    pub project: String,
+    pub profile: String,
+}
+
+/// The settings to change; the others keep their values. Sizes are bytes,
+/// `idle_debounce` is seconds.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LimitsSetParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reserve_memory: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reserve_cores: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_awake_agents: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_cores: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_processes: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_soft: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_hard: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vm_disk: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idle_debounce: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot_disk: Option<u64>,
+}
+
+impl LimitsSetParams {
+    /// The settings given, as (name, value).
+    pub fn changes(&self) -> Vec<(&'static str, u64)> {
+        let wide = |key, v: Option<u64>| v.map(|v| (key, v));
+        let narrow = |key, v: Option<u32>| v.map(|v| (key, u64::from(v)));
+        [
+            wide("reserve_memory", self.reserve_memory),
+            narrow("reserve_cores", self.reserve_cores),
+            narrow("max_awake_agents", self.max_awake_agents),
+            narrow("cpu_cores", self.cpu_cores),
+            narrow("max_processes", self.max_processes),
+            wide("disk_soft", self.disk_soft),
+            wide("disk_hard", self.disk_hard),
+            wide("vm_disk", self.vm_disk),
+            wide("idle_debounce", self.idle_debounce),
+            wide("snapshot_disk", self.snapshot_disk),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+}
+
+/// An API key, as it's shown: never the key itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApiKey {
+    pub name: String,
+    /// The start of the key, e.g. `vk_abcdefgh`, to tell keys apart.
+    pub prefix: String,
+    pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyList {
+    pub keys: Vec<ApiKey>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeyCreateParams {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyCreated {
+    pub key: ApiKey,
+    /// The key itself, `vk_…`. It can't be shown again.
+    pub secret: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeyParams {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeyVerifyParams {
+    pub secret: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GhStatusParams {
+    /// Run `gh auth status` now instead of returning the last result.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refresh: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GhStatus {
+    pub state: GhState,
+    /// The GitHub account, when logged in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// What `gh` said, in a line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Subscribed {
+    /// The `seq` of the last event before this subscription; the first one
+    /// this connection gets is the next.
+    pub seq: u64,
+}
+
+/// Something that happened on a host. Fields other than these four are set
+/// when they apply to the kind.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Event {
+    /// Counts up from 1 for the daemon's life.
+    pub seq: u64,
+    pub at: String,
+    pub host: String,
+    pub kind: EventKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    /// The agent's ref.
+    #[serde(rename = "ref", default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// The new state: an agent's for `agent.state`, a [`GhState`] for
+    /// `gh.status`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    /// Which limit an `agent.limit` is about: `memory`, `processes`, `disk`
+    /// or `cpu`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 #[cfg(test)]
@@ -427,6 +882,58 @@ mod tests {
             json!({"jsonrpc": "2.0", "id": 3, "method": "daemon.hello",
                    "params": {"client": "t", "protocol": PROTOCOL_VERSION}})
         );
+    }
+
+    #[test]
+    fn limits_set_lists_only_the_changes() {
+        let p = LimitsSetParams {
+            cpu_cores: Some(8),
+            vm_disk: Some(1 << 30),
+            ..Default::default()
+        };
+        assert_eq!(p.changes(), [("cpu_cores", 8), ("vm_disk", 1 << 30)]);
+        let every = LimitsSetParams {
+            host: None,
+            reserve_memory: Some(1),
+            reserve_cores: Some(1),
+            max_awake_agents: Some(1),
+            cpu_cores: Some(1),
+            max_processes: Some(1),
+            disk_soft: Some(1),
+            disk_hard: Some(1),
+            vm_disk: Some(1),
+            idle_debounce: Some(1),
+            snapshot_disk: Some(1),
+        };
+        let keys: Vec<&str> = every.changes().iter().map(|(k, _)| *k).collect();
+        assert_eq!(keys, HostLimits::keys().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn notifications_have_no_id() {
+        let e = Event {
+            seq: 1,
+            at: "t".into(),
+            host: "local".into(),
+            kind: EventKind::LimitsChanged,
+            project: None,
+            agent: Some("quiet-amber-otter".into()),
+            state: None,
+            limit: None,
+            message: None,
+        };
+        assert_eq!(
+            serde_json::to_value(Request::notification::<EventNotice>(&e)).unwrap(),
+            json!({"jsonrpc": "2.0", "method": "events.event", "params": {
+                "seq": 1, "at": "t", "host": "local", "kind": "limits.changed",
+                "ref": "quiet-amber-otter"}})
+        );
+    }
+
+    #[test]
+    fn no_params_is_an_empty_object() {
+        assert_eq!(serde_json::to_value(NoParams {}).unwrap(), json!({}));
+        assert!(serde_json::from_value::<NoParams>(json!({"x": 1})).is_err());
     }
 
     #[test]

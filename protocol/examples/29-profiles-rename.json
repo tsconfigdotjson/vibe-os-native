@@ -1,0 +1,27 @@
+{
+  "description": "`profile` names the profile to change; `name` renames it.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 29,
+    "method": "profiles.update",
+    "params": {
+      "host": "local",
+      "project": "web",
+      "profile": "software-eng-mac",
+      "name": "mac-builder",
+      "environment": "macos"
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 29,
+    "result": {
+      "name": "mac-builder",
+      "environment": "macos",
+      "model": "opus",
+      "reasoning": "high",
+      "mode": "auto",
+      "memory": 4294967296
+    }
+  }
+}

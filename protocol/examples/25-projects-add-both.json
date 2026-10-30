@@ -1,0 +1,14 @@
+{
+  "description": "A project comes from a repo or a path, not both.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 25,
+    "method": "projects.add",
+    "params": {"repo": "me/web2", "path": "/Users/me/src/web2"}
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 25,
+    "error": {"code": -32602, "message": "Invalid params: give exactly one of `repo` and `path`"}
+  }
+}

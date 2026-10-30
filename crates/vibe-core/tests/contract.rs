@@ -8,11 +8,9 @@ use std::path::{Path, PathBuf};
 use serde::de::{self, DeserializeOwned, Deserializer, Visitor};
 use serde::{Serialize, forward_to_deserialize_any};
 use serde_json::Value;
+use vibe_core::model::{Environment, EventKind, GhState, Mode, Model, ProjectSource, Reasoning};
 use vibe_core::paths;
-use vibe_core::rpc::{
-    ErrorCode, ErrorObject, Hello, HelloParams, HelloResult, MAX_MESSAGE_BYTES, METHODS, Method,
-    Outcome, PROTOCOL_VERSION, ProtocolMismatchData, Request, Response,
-};
+use vibe_core::rpc::*;
 
 fn protocol_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../protocol")
@@ -29,9 +27,14 @@ fn index() -> Value {
 
 struct Example {
     name: String,
-    /// `None` for a malformed `request_raw` line.
+    /// `None` for a malformed `request_raw` line, or a notification example.
     request: Option<Value>,
+    /// `Null` for none.
     response: Value,
+    /// Notifications the daemon sends on the connection after the response.
+    events: Vec<Value>,
+    /// A notification example: a message the daemon sends unasked.
+    notification: Option<Value>,
 }
 
 fn examples() -> Vec<Example> {
@@ -51,12 +54,23 @@ fn examples() -> Vec<Example> {
             let obj = v
                 .as_object()
                 .unwrap_or_else(|| panic!("{name}: not an object"));
-            let keys: BTreeSet<&str> = obj.keys().map(String::as_str).collect();
+            let mut keys: BTreeSet<&str> = obj.keys().map(String::as_str).collect();
+            if keys == BTreeSet::from(["description", "notification"]) {
+                return Example {
+                    name,
+                    request: None,
+                    response: Value::Null,
+                    events: vec![],
+                    notification: Some(obj["notification"].clone()),
+                };
+            }
             let has_raw = keys.contains("request_raw");
+            let has_events = keys.remove("events");
             assert!(
                 keys == BTreeSet::from(["description", "request", "response"])
                     || keys == BTreeSet::from(["description", "request_raw", "response"]),
-                "{name}: an example has `description`, `request` or `request_raw`, and `response`"
+                "{name}: an example has `description`, `request` or `request_raw`, `response` \
+                 and maybe `events`; or `description` and `notification`"
             );
             if has_raw {
                 assert!(
@@ -64,10 +78,19 @@ fn examples() -> Vec<Example> {
                     "{name}: request_raw is a string"
                 );
             }
+            let events = if has_events {
+                let events = obj["events"].as_array().cloned().unwrap_or_default();
+                assert!(!events.is_empty(), "{name}: `events` is a non-empty array");
+                events
+            } else {
+                vec![]
+            };
             Example {
                 name,
                 request: (!has_raw).then(|| obj["request"].clone()),
                 response: obj["response"].clone(),
+                events,
+                notification: None,
             }
         })
         .collect()
@@ -110,24 +133,132 @@ fn fields_of<T: DeserializeOwned>() -> BTreeSet<&'static str> {
         .collect()
 }
 
+/// The last segment of a type's path, as the index names types.
+fn short_name<T>() -> &'static str {
+    let full = std::any::type_name::<T>();
+    full.rsplit("::").next().unwrap()
+}
+
 /// The serde field names of every type named in the index.
 fn rust_types() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
+    fn entry<T: DeserializeOwned>() -> (&'static str, BTreeSet<&'static str>) {
+        (short_name::<T>(), fields_of::<T>())
+    }
     BTreeMap::from([
-        ("Request", fields_of::<Request>()),
-        ("Response", fields_of::<Response>()),
-        ("ErrorObject", fields_of::<ErrorObject>()),
-        ("HelloParams", fields_of::<HelloParams>()),
-        ("HelloResult", fields_of::<HelloResult>()),
-        ("ProtocolMismatchData", fields_of::<ProtocolMismatchData>()),
+        entry::<Request>(),
+        entry::<Response>(),
+        entry::<ErrorObject>(),
+        entry::<HelloParams>(),
+        entry::<HelloResult>(),
+        entry::<ProtocolMismatchData>(),
+        entry::<NoParams>(),
+        entry::<HostParams>(),
+        entry::<HostInfo>(),
+        entry::<HostList>(),
+        entry::<Project>(),
+        entry::<ProjectList>(),
+        entry::<ProjectAddParams>(),
+        entry::<ProjectParams>(),
+        entry::<Profile>(),
+        entry::<ProfileList>(),
+        entry::<ProfileCreateParams>(),
+        entry::<ProfileUpdateParams>(),
+        entry::<ProfileParams>(),
+        entry::<HostLimits>(),
+        entry::<LimitsSetParams>(),
+        entry::<ApiKey>(),
+        entry::<KeyList>(),
+        entry::<KeyCreateParams>(),
+        entry::<KeyCreated>(),
+        entry::<KeyParams>(),
+        entry::<KeyVerifyParams>(),
+        entry::<GhStatusParams>(),
+        entry::<GhStatus>(),
+        entry::<Subscribed>(),
+        entry::<Event>(),
+    ])
+}
+
+/// A method's Rust types: their index names, and a check that decodes an
+/// example's params and result into them.
+struct MethodTypes {
+    params: &'static str,
+    result: &'static str,
+    check: fn(&Value, &Value, &str),
+}
+
+fn method<M: Method>() -> (&'static str, MethodTypes) {
+    fn check<M: Method>(params: &Value, result: &Value, what: &str) {
+        round_trip::<M::Params>(
+            params,
+            short_name::<M::Params>(),
+            &format!("{what}: params"),
+        );
+        round_trip::<M::Result>(
+            result,
+            short_name::<M::Result>(),
+            &format!("{what}: result"),
+        );
+    }
+    (
+        M::NAME,
+        MethodTypes {
+            params: short_name::<M::Params>(),
+            result: short_name::<M::Result>(),
+            check: check::<M>,
+        },
+    )
+}
+
+/// Every method's types; `METHODS` must list exactly these.
+fn rust_methods() -> BTreeMap<&'static str, MethodTypes> {
+    BTreeMap::from([
+        method::<Hello>(),
+        method::<HostsList>(),
+        method::<ProjectsList>(),
+        method::<ProjectsAdd>(),
+        method::<ProjectsRemove>(),
+        method::<ProfilesList>(),
+        method::<ProfilesCreate>(),
+        method::<ProfilesUpdate>(),
+        method::<ProfilesDelete>(),
+        method::<LimitsGet>(),
+        method::<LimitsSet>(),
+        method::<KeysList>(),
+        method::<KeysCreate>(),
+        method::<KeysRevoke>(),
+        method::<KeysVerify>(),
+        method::<GhStatusGet>(),
+        method::<EventsSubscribe>(),
     ])
 }
 
 /// The (params, result) type names of each method, as the index names them.
 fn rust_method_types(method: &str) -> (&'static str, &'static str) {
-    match method {
-        Hello::NAME => ("HelloParams", "HelloResult"),
-        other => panic!("{other} has no Rust types; add it to rust_method_types"),
+    let methods = rust_methods();
+    let m = methods
+        .get(method)
+        .unwrap_or_else(|| panic!("{method} has no Rust types; add it to rust_methods"));
+    (m.params, m.result)
+}
+
+/// The variants of every enum the index lists.
+fn rust_enums() -> BTreeMap<&'static str, Vec<&'static str>> {
+    fn names<T: Copy>(all: &[T], name: fn(T) -> &'static str) -> Vec<&'static str> {
+        all.iter().map(|v| name(*v)).collect()
     }
+    BTreeMap::from([
+        ("Environment", names(Environment::ALL, Environment::as_str)),
+        ("Model", names(Model::ALL, Model::as_str)),
+        ("Reasoning", names(Reasoning::ALL, Reasoning::as_str)),
+        ("Mode", names(Mode::ALL, Mode::as_str)),
+        (
+            "ProjectSource",
+            names(ProjectSource::ALL, ProjectSource::as_str),
+        ),
+        ("GhState", names(GhState::ALL, GhState::as_str)),
+        ("EventKind", names(EventKind::ALL, EventKind::as_str)),
+    ])
 }
 
 /// The type of an error code's `data`, if it has one.
@@ -202,6 +333,34 @@ fn index_matches_rust() {
         assert_eq!(m["result"], result, "{}: result type", m["name"]);
     }
 
+    let notifications: Vec<&str> = index["notifications"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(notifications, NOTIFICATIONS);
+    assert_eq!(
+        index["notifications"][0]["params"],
+        short_name::<<EventNotice as Notification>::Params>()
+    );
+
+    let enums: BTreeMap<&str, Vec<&str>> = index["enums"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .map(|(k, v)| {
+            let names = v
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|n| n.as_str().unwrap())
+                .collect();
+            (k.as_str(), names)
+        })
+        .collect();
+    assert_eq!(enums, rust_enums(), "the index's enums differ from Rust's");
+
     let errors = index["errors"].as_array().unwrap();
     assert_eq!(errors.len(), ErrorCode::ALL.len(), "error codes differ");
     for (e, code) in errors.iter().zip(ErrorCode::ALL) {
@@ -259,6 +418,22 @@ fn types_match_serde_fields() {
             );
         }
     }
+    // Nested fields name declared types, and fields those types have.
+    for (outer, fields) in index["nested"].as_object().unwrap() {
+        for (field, inner) in fields.as_object().unwrap() {
+            assert!(
+                rust[outer.as_str()].contains(field.as_str()),
+                "{outer}.{field}"
+            );
+            assert!(
+                declared.contains_key(inner.as_str().unwrap()),
+                "{outer}.{field}"
+            );
+        }
+    }
+    for n in index["notifications"].as_array().unwrap() {
+        assert!(declared.contains_key(n["params"].as_str().unwrap()));
+    }
     // Every type an index entry refers to is declared.
     for m in index["methods"].as_array().unwrap() {
         for k in ["params", "result"] {
@@ -275,17 +450,49 @@ fn types_match_serde_fields() {
 #[derive(Default)]
 struct Seen {
     /// Keys seen per type, for coverage.
-    keys: BTreeMap<&'static str, BTreeSet<String>>,
+    keys: BTreeMap<String, BTreeSet<String>>,
     succeeded: BTreeSet<String>,
+    notified: BTreeSet<String>,
     codes: BTreeSet<i64>,
 }
 
 impl Seen {
-    fn keys(&mut self, ty: &'static str, value: &Value) {
+    /// Records the keys of `value`, a `ty`, and of the types nested in it.
+    fn keys(&mut self, ty: &str, value: &Value) {
         let obj = value
             .as_object()
             .unwrap_or_else(|| panic!("{ty}: not an object: {value}"));
-        self.keys.entry(ty).or_default().extend(obj.keys().cloned());
+        self.keys
+            .entry(ty.to_owned())
+            .or_default()
+            .extend(obj.keys().cloned());
+        if let Some(nested) = index()["nested"].get(ty) {
+            for (field, inner) in nested.as_object().unwrap() {
+                let inner = inner.as_str().unwrap();
+                match obj.get(field) {
+                    Some(Value::Array(items)) => items.iter().for_each(|i| self.keys(inner, i)),
+                    Some(v @ Value::Object(_)) => self.keys(inner, v),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// Checks a notification the daemon sends.
+    fn notification(&mut self, n: &Value, what: &str) {
+        let typed: Request = serde_json::from_value(n.clone())
+            .unwrap_or_else(|e| panic!("{what}: not a notification: {e}"));
+        assert_eq!(typed.id, None, "{what}: a notification has no id");
+        round_trip::<Request>(n, "Request", what);
+        assert_eq!(
+            typed.method,
+            EventNotice::NAME,
+            "{what}: unknown notification"
+        );
+        let params = typed.params.unwrap_or(Value::Null);
+        round_trip::<Event>(&params, "Event", &format!("{what}: params"));
+        self.keys("Event", &params);
+        self.notified.insert(typed.method);
     }
 }
 
@@ -302,6 +509,13 @@ fn as_list(v: &Value) -> Vec<Value> {
 fn walk_examples() -> Seen {
     let mut seen = Seen::default();
     for ex in examples() {
+        if let Some(n) = &ex.notification {
+            seen.notification(n, &ex.name);
+            continue;
+        }
+        for (i, e) in ex.events.iter().enumerate() {
+            seen.notification(e, &format!("{}: event {i}", ex.name));
+        }
         let requests: Vec<Value> = ex.request.as_ref().map(as_list).unwrap_or_default();
         // Requests that are valid envelopes, by id.
         let mut by_id = BTreeMap::new();
@@ -330,22 +544,17 @@ fn walk_examples() -> Seen {
             match typed.outcome {
                 Outcome::Result(result) => {
                     let req = request.unwrap_or_else(|| panic!("{what}: no request with its id"));
-                    let params = req.params.clone().unwrap_or(Value::Null);
-                    match req.method.as_str() {
-                        Hello::NAME => {
-                            round_trip::<HelloParams>(
-                                &params,
-                                "HelloParams",
-                                &format!("{what}: params"),
-                            );
-                            round_trip::<HelloResult>(
-                                &result,
-                                "HelloResult",
-                                &format!("{what}: result"),
-                            );
-                        }
-                        other => panic!("{what}: no typed check for {other}; add one"),
-                    }
+                    // Params are always given in the examples, so both
+                    // sides can check them; `{}` when there are none.
+                    let params = req
+                        .params
+                        .clone()
+                        .unwrap_or_else(|| panic!("{what}: give the request's params"));
+                    let methods = rust_methods();
+                    let types = methods
+                        .get(req.method.as_str())
+                        .unwrap_or_else(|| panic!("{what}: no typed check for {}", req.method));
+                    (types.check)(&params, &result, &what);
                     let (pty, rty) = rust_method_types(&req.method);
                     seen.keys(pty, &params);
                     seen.keys(rty, &result);
@@ -388,9 +597,19 @@ fn examples_cover_the_contract() {
     for m in METHODS {
         assert!(seen.succeeded.contains(*m), "no successful example for {m}");
     }
+    for n in NOTIFICATIONS {
+        assert!(
+            seen.notified.contains(*n),
+            "no example of the notification {n}"
+        );
+    }
     for code in ErrorCode::ALL {
-        // An internal error can't be provoked on purpose.
-        if code != ErrorCode::InternalError {
+        // An internal error can't be provoked on purpose, and an invalid
+        // host.toml needs a broken file; vibed's own tests cover that one.
+        if !matches!(
+            code,
+            ErrorCode::InternalError | ErrorCode::HostConfigInvalid
+        ) {
             assert!(
                 seen.codes.contains(&code.code()),
                 "no example of {}",
