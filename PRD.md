@@ -618,7 +618,7 @@ None of these block building.
 
 | # | Question | Recommendation | Why |
 | --- | --- | --- | --- |
-| 1 | Any cron fire clears every one-shot cron job, not just the one that fired, because Claude's fire record has no reliable job id | Fix upstream in agent-tail: clear only one-shots whose `cron` and `prompt` match the fire record | Otherwise an agent with one-shots at 2pm and 3pm, and nothing recurring, may sleep after the 2pm run and miss 3pm. Rare, and no worse than before #127 |
+| 1 | Any cron fire clears every one-shot cron job, not just the one that fired, because Claude's fire record has no reliable job id | Fix upstream in agent-tail: clear only one-shots whose `cron` and `prompt` match the fire record ([agent-tail#130](https://github.com/tsconfigdotjson/agent-tail/issues/130)) | Otherwise an agent with one-shots at 2pm and 3pm, and nothing recurring, may sleep after the 2pm run and miss 3pm. Rare, and no worse than before #127 |
 
 **Decided (2026-10-29 and 2026-10-30):**
 
