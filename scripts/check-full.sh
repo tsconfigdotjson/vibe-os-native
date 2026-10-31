@@ -770,13 +770,33 @@ s_menu_live() {
   stop_vibed
 }
 
-# terminal_tabs: how many tabs Terminal has, without starting it.
+# terminal_tabs: how many tabs Terminal has. Bounded, as a Terminal that
+# isn't answering would otherwise hold osascript for two minutes.
 terminal_tabs() {
   osascript \
-    -e 'if application "Terminal" is not running then return 0' \
-    -e 'tell application "Terminal"' -e 'set n to 0' \
+    -e 'with timeout of 10 seconds' -e 'tell application "Terminal"' -e 'set n to 0' \
     -e 'repeat with w in windows' -e 'set n to n + (count of tabs of w)' -e 'end repeat' \
-    -e 'return n' -e 'end tell'
+    -e 'return n' -e 'end tell' -e 'end timeout'
+}
+
+# terminal_up: starts Terminal if it isn't running, through Launch Services
+# as Finder would, and waits up to 30 s for it to answer Apple events.
+terminal_up() {
+  local i
+  # Outside the logged-in GUI session (over SSH, say) Terminal can start
+  # without ever answering.
+  if [ "$(launchctl managername 2>/dev/null)" != Aqua ]; then
+    echo "not in the logged-in GUI session (launchctl managername: $(launchctl managername 2>/dev/null)); run this from Terminal on the Mac"
+    return 1
+  fi
+  open -b com.apple.Terminal
+  for i in $(seq 1 60); do
+    osascript -e 'with timeout of 2 seconds' -e 'tell application "Terminal" to count windows' \
+      -e 'end timeout' >/dev/null 2>&1 && return 0
+    sleep 0.5
+  done
+  echo "Terminal is running but doesn't answer Apple events after 30 s"
+  return 1
 }
 
 # attached <home> <ref>: the line `vibe ls` gives <ref> once one client is
@@ -809,6 +829,7 @@ s_terminal_attach() {
   ref=$(json_field "$out" 4 ref)
   [ -n "$ref" ] || { echo "no agent"; return 1; }
   export VIBE_SOCKET="$VIBED_SOCKET" VIBE_CLI="$ROOT/target/debug/vibe"
+  terminal_up
   before=$(terminal_tabs)
   # Two clicks in a row, as fast as one process makes them.
   "$app" --attach "$ref" --attach "$ref"
@@ -830,6 +851,7 @@ s_terminal_attach() {
   sleep 1
   osascript - "$tty" <<'EOF' || true
 on run argv
+  with timeout of 10 seconds
   tell application "Terminal"
     repeat with w in (every window)
       repeat with t in tabs of w
@@ -840,6 +862,7 @@ on run argv
       end repeat
     end repeat
   end tell
+  end timeout
 end run
 EOF
   out=$(rpc "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"agents.delete\",\"params\":{\"ref\":\"$ref\",\"force\":true}}")

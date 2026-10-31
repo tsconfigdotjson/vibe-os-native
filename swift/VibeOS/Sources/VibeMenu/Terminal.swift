@@ -136,13 +136,19 @@ public final class AppleScriptTerminal: TerminalScripting {
     /// count as busy.
     public let process: String
 
+    /// How long one script may wait on Terminal before it gives up, in
+    /// seconds; AppleScript's own default is two minutes.
+    public var answerTimeout = 10
+    /// How long a Terminal that wasn't running gets to start and answer.
+    public var launchTimeout: TimeInterval = 20
+
     public init(vibePath: String = defaultVibePath()) {
         process = (vibePath as NSString).lastPathComponent
     }
 
     // NSAppleScript is for the main thread only, so a call blocks the menu
     // while Terminal answers, and while macOS asks for Automation the first
-    // time; both are short, and only on a click.
+    // time; both are bounded by the timeouts above, and only on a click.
 
     private var isRunning: Bool {
         !NSRunningApplication.runningApplications(withBundleIdentifier: AppleScriptTerminal.bundleID).isEmpty
@@ -155,6 +161,7 @@ public final class AppleScriptTerminal: TerminalScripting {
         let source = """
             set anyOf to {\(list(ttys))}
             set busyOf to {\(list(busyOnly))}
+            with timeout of \(answerTimeout) seconds
             tell application "Terminal"
                 repeat with w in windows
                     repeat with t in tabs of w
@@ -169,37 +176,77 @@ public final class AppleScriptTerminal: TerminalScripting {
                     end repeat
                 end repeat
             end tell
+            end timeout
             return false
             """
         return try execute(source).booleanValue
     }
 
     public func run(_ command: String) throws -> String? {
-        // A Terminal that has to start opens a window of its own: the
+        let started = !isRunning
+        if started { try launch() }
+        // A Terminal that has just started opens a window of its own: the
         // command goes in that one rather than a second, if it's the only
         // one and a shell waits in it, not a restored tab running something.
         let script = appleScriptString(command)
         let source = """
+            with timeout of \(answerTimeout) seconds
             tell application "Terminal"
-                if \(isRunning ? "true" : "false") then
-                    set t to do script \(script)
-                else
-                    activate
-                    repeat 50 times
+                set t to missing value
+                if \(started ? "true" : "false") then
+                    repeat 30 times
                         if (count of windows) > 0 then exit repeat
                         delay 0.1
                     end repeat
                     if (count of windows) = 1 and (count of tabs of window 1) = 1 and not (busy of tab 1 of window 1) then
                         set t to do script \(script) in tab 1 of window 1
-                    else
-                        set t to do script \(script)
                     end if
                 end if
+                if t is missing value then set t to do script \(script)
                 activate
                 return tty of t
             end tell
+            end timeout
             """
         return try execute(source).stringValue
+    }
+
+    /// Starts Terminal as Finder would, through Launch Services, and waits
+    /// until it answers Apple events, for up to `launchTimeout`. Asked
+    /// before it's ready, Terminal can hold an event until AppleScript's
+    /// two-minute timeout.
+    private func launch() throws {
+        let open = Process()
+        open.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        open.arguments = ["-b", AppleScriptTerminal.bundleID]
+        try open.run()
+        open.waitUntilExit()
+        guard open.terminationStatus == 0 else {
+            throw TerminalError.failed("Terminal couldn't be started (open exited with \(open.terminationStatus))")
+        }
+        let ping = """
+            with timeout of 2 seconds
+            tell application "Terminal" to count windows
+            end timeout
+            """
+        let deadline = Date().addingTimeInterval(launchTimeout)
+        var why = "it never started"
+        repeat {
+            if isRunning {
+                do {
+                    _ = try execute(ping)
+                    return
+                } catch TerminalError.notPermitted {
+                    throw TerminalError.notPermitted
+                } catch {
+                    why = describe(error)
+                }
+            }
+            Thread.sleep(forTimeInterval: 0.25)
+        } while Date() < deadline
+        throw TerminalError.failed(
+            "Terminal didn't answer within \(Int(launchTimeout)) s of starting (\(why)). "
+                + "It has to run in the logged-in GUI session.")
     }
 
     public func runWithoutScripting(_ command: String) throws {
@@ -229,6 +276,10 @@ public final class AppleScriptTerminal: TerminalScripting {
             let code = info[NSAppleScript.errorNumber] as? Int ?? 0
             // errAEEventNotPermitted, errAEEventWouldRequireUserConsent
             if code == -1743 || code == -1744 { throw TerminalError.notPermitted }
+            // errAETimeout: Terminal is running but didn't answer in time.
+            if code == -1712 {
+                throw TerminalError.failed("Terminal didn't answer in time; it may be busy or still starting")
+            }
             let message = info[NSAppleScript.errorMessage] as? String ?? "error \(code)"
             throw TerminalError.failed("Terminal: \(message)")
         }
