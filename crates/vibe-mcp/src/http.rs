@@ -22,7 +22,7 @@ use http::{Request, Response, StatusCode, header};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use rmcp::transport::streamable_http_server::session::never::NeverSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use tokio::net::TcpListener;
@@ -36,6 +36,12 @@ type Body = BoxBody<Bytes, Infallible>;
 
 /// How long an idle event stream goes between keep-alives.
 const KEEP_ALIVE: Duration = Duration::from_secs(15);
+
+/// The most connections open at once on one listener.
+const MAX_CONNECTIONS: usize = 256;
+
+/// How long a client has to send a request's headers.
+const HEADER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The largest request body: a prompt can be long, but not this long.
 const MAX_BODY: usize = 4 << 20;
@@ -121,15 +127,29 @@ async fn handle<D: Daemon>(
 /// open finish on their own.
 pub async fn serve<D: Daemon>(listener: TcpListener, daemon: Arc<D>, check_host: bool) {
     let svc = service(Arc::clone(&daemon), check_host);
+    // Open connections are capped, so peers that connect and say nothing
+    // can't take every descriptor `vibed` has.
+    let room = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
+    let mut last_error: Option<String> = None;
     loop {
+        let Ok(permit) = Arc::clone(&room).acquire_owned().await else {
+            return;
+        };
         let (stream, _) = match listener.accept().await {
             Ok(s) => s,
             Err(e) => {
-                daemon.log(&format!("mcp: can't accept a connection: {e}"));
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                // Said once until it changes, as it repeats while it lasts
+                // (out of descriptors, say).
+                let why = e.to_string();
+                if last_error.as_ref() != Some(&why) {
+                    daemon.log(&format!("mcp: can't accept a connection: {why}"));
+                    last_error = Some(why);
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
             }
         };
+        last_error = None;
         let (svc, daemon) = (svc.clone(), Arc::clone(&daemon));
         tokio::spawn(async move {
             let conn = hyper::service::service_fn(move |req| {
@@ -137,8 +157,11 @@ pub async fn serve<D: Daemon>(listener: TcpListener, daemon: Arc<D>, check_host:
                 async move { Ok::<_, Infallible>(handle(req, svc, daemon).await) }
             });
             let _ = hyper::server::conn::http1::Builder::new()
+                .timer(TokioTimer::new())
+                .header_read_timeout(HEADER_TIMEOUT)
                 .serve_connection(TokioIo::new(stream), conn)
                 .await;
+            drop(permit);
         });
     }
 }

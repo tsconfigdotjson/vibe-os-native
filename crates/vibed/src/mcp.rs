@@ -5,7 +5,8 @@
 //! Only this host's agents are reachable until Linux hosts (#16) connect
 //! others: a call for another host gets the core's "no host named …".
 
-use std::sync::Arc;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::task::JoinHandle;
@@ -35,19 +36,44 @@ fn machine_name() -> String {
     }
 }
 
+/// The `vibe` an ssh command runs, by its path: over ssh, a Mac's shell
+/// has sshd's `PATH`, without `/usr/local/bin`. Setup links it there
+/// (PRD: Install and setup); otherwise it's the one beside `vibed`.
+fn vibe_path() -> String {
+    let linked = Path::new("/usr/local/bin/vibe");
+    if linked.exists() {
+        return linked.display().to_string();
+    }
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|d| d.join("vibe")))
+        .filter(|p| p.is_file() && !p.to_string_lossy().contains(char::is_whitespace))
+        .map_or_else(|| "vibe".to_owned(), |p| p.display().to_string())
+}
+
 impl Core {
     /// The MCP port and whether it's served on Tailscale too, from
-    /// `host.toml` as it is now. One that can't be read gives the
-    /// defaults, so MCP stays up on loopback while it's fixed.
-    pub fn mcp_settings(&self) -> (u16, bool) {
-        let l = limits::load(&self.layout.host_config()).unwrap_or_else(|_| HostLimits::default());
-        (l.mcp_port, l.mcp_tailscale)
+    /// `host.toml` as it is now, or `None` while it can't be read.
+    pub fn mcp_settings(&self) -> Option<(u16, bool)> {
+        limits::load(&self.layout.host_config())
+            .ok()
+            .map(|l| (l.mcp_port, l.mcp_tailscale))
     }
 
-    /// Serves MCP where `host.toml` says, until the task is aborted.
+    /// Serves MCP where `host.toml` says, until the task is aborted. While
+    /// the file can't be read, such as halfway through an edit, MCP stays
+    /// where it was; before it ever could, it's on the default port.
     pub fn spawn_mcp(self: &Arc<Self>, every: Duration) -> JoinHandle<()> {
         let core = Arc::clone(self);
-        let settings: Arc<Settings> = Arc::new(move || core.mcp_settings());
+        let defaults = HostLimits::default();
+        let last = Mutex::new((defaults.mcp_port, defaults.mcp_tailscale));
+        let settings: Arc<Settings> = Arc::new(move || {
+            let mut last = crate::core::lock(&last);
+            if let Some(now) = core.mcp_settings() {
+                *last = now;
+            }
+            *last
+        });
         vibe_mcp::http::spawn_listeners(Arc::clone(self), settings, every)
     }
 
@@ -60,6 +86,7 @@ impl Core {
             })
             .await?;
         let machine = machine_name();
+        let vibe = vibe_path();
         let mut views = Vec::new();
         for agent in list.agents {
             let record = self.store().agent(&agent.host, &agent.agent).ok();
@@ -70,7 +97,7 @@ impl Core {
                 _ => None,
             };
             views.push(AgentView {
-                attach_remote: format!("ssh -t {machine} {}", agent.attach),
+                attach_remote: format!("ssh -t {machine} {vibe} attach {}", agent.agent),
                 agent,
                 memory,
                 memory_limit,

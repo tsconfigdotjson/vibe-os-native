@@ -35,6 +35,12 @@ struct Fake {
     screen: Mutex<String>,
     reads: Mutex<Vec<(Target, Option<u64>)>>,
     message_reads: Mutex<Vec<usize>>,
+    /// What each agent is doing while it hasn't answered.
+    activities: Mutex<HashMap<String, Activity>>,
+    /// Each check's `background`.
+    backgrounds: Mutex<Vec<bool>>,
+    /// History given with `after`.
+    history: Mutex<Option<Vec<String>>>,
 }
 
 fn not_found(m: String) -> ErrorObject {
@@ -180,7 +186,8 @@ impl Daemon for Fake {
         })
     }
 
-    async fn check(&self, t: &Target, _background: bool) -> Result<Check, ErrorObject> {
+    async fn check(&self, t: &Target, background: bool) -> Result<Check, ErrorObject> {
+        self.backgrounds.lock().unwrap().push(background);
         let a = self.find(t)?;
         let n = {
             let mut checks = self.checks.lock().unwrap();
@@ -199,12 +206,17 @@ impl Daemon for Fake {
             Some(busy) => n > *busy,
             None => false,
         };
+        let activity = self.activities.lock().unwrap().get(&t.agent).copied();
         Ok(Check {
-            state: if answered { AgentState::Idle } else { state },
-            activity: if answered {
-                Activity::Done
+            state: if answered && activity.is_none() {
+                AgentState::Idle
             } else {
-                Activity::Thinking
+                state
+            },
+            activity: match (answered, activity) {
+                (_, Some(a)) => a,
+                (true, None) => Activity::Done,
+                (false, None) => Activity::Thinking,
             },
             line: Some("$ cargo test".into()),
             answered,
@@ -214,10 +226,20 @@ impl Daemon for Fake {
     async fn read_output(&self, t: &Target, after: Option<u64>) -> Result<Screen, ErrorObject> {
         self.find(t)?;
         self.reads.lock().unwrap().push((t.clone(), after));
+        let history = match (after, self.history.lock().unwrap().clone()) {
+            (Some(_), Some(h)) => h,
+            _ => vec!["old 1".into(), "old 2".into()],
+        };
+        // The cursor is after the last line, as a shim's is.
+        let cursor = if history.len() > 2 {
+            history.len() as u64
+        } else {
+            7
+        };
         Ok(Screen {
             screen: self.screen.lock().unwrap().clone(),
-            history: vec!["old 1".into(), "old 2".into()],
-            cursor: 7,
+            history,
+            cursor,
             dropped: if after == Some(0) { 5 } else { 0 },
             more: false,
             live: t.agent != "sleepy",
@@ -960,4 +982,155 @@ async fn listeners_follow_the_settings() {
         )),
         "{log}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn waits_for_what_until_asks() {
+    let (fake, mut c) = client().await;
+    // A permission prompt is an answer, said to be maybe a silent command.
+    fake.busy_for.lock().unwrap().insert("slow".into(), 0);
+    fake.activities
+        .lock()
+        .unwrap()
+        .insert("slow".into(), Activity::AwaitingApproval);
+    fake.states
+        .lock()
+        .unwrap()
+        .insert("slow".into(), AgentState::Question);
+    let r = c
+        .call(
+            "vibe_wait",
+            json!({"agents": "slow", "lines": 0, "background": true}),
+        )
+        .await;
+    assert_eq!(r["structuredContent"]["reached"], true);
+    assert!(
+        text(&r).contains("It may be waiting on a permission prompt"),
+        "{}",
+        text(&r)
+    );
+    assert!(r["structuredContent"]["waitedMs"].is_number());
+    assert!(
+        fake.backgrounds.lock().unwrap().iter().all(|b| *b),
+        "background reaches the daemon"
+    );
+    // until: question ends on the question; idle doesn't.
+    let r = c
+        .call(
+            "vibe_wait",
+            json!({"agents": "slow", "until": "question", "lines": 0}),
+        )
+        .await;
+    assert_eq!(r["structuredContent"]["reached"], true);
+    assert!(
+        !fake.backgrounds.lock().unwrap().last().unwrap(),
+        "background is off by default"
+    );
+    let r = c
+        .call(
+            "vibe_wait",
+            json!({"agents": "slow", "until": "idle", "timeout": 1, "lines": 0}),
+        )
+        .await;
+    assert_eq!(r["structuredContent"]["reached"], false, "{}", text(&r));
+    // until: change ends on any change of state or activity.
+    fake.busy_for.lock().unwrap().insert("never".into(), 2);
+    let r = c
+        .call(
+            "vibe_wait",
+            json!({"agents": "never", "until": "change", "turn": false, "lines": 0}),
+        )
+        .await;
+    assert_eq!(r["structuredContent"]["reached"], true);
+    assert_eq!(r["structuredContent"]["activity"], "done");
+    let e = c
+        .fails("vibe_wait", json!({"agents": "never", "until": "soon"}))
+        .await;
+    assert_eq!(e, "until must be settled, idle, question or change");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reading_on_from_a_cursor_leaves_what_doesnt_fit_for_next_time() {
+    let (fake, mut c) = client().await;
+    *fake.screen.lock().unwrap() = "$".into();
+    // 10,000 new lines, far more than fit.
+    let lines: Vec<String> = (0..10_000).map(|i| format!("line {i:05}")).collect();
+    *fake.history.lock().unwrap() = Some(lines);
+    let r = c
+        .call("vibe_read_output", json!({"agent": "slow", "after": 0}))
+        .await;
+    let t = text(&r);
+    assert!(
+        t.chars().count() <= MAX_RESULT_CHARS,
+        "{}",
+        t.chars().count()
+    );
+    assert!(
+        t.contains("new since 0:\nline 00000\nline 00001"),
+        "the oldest come first"
+    );
+    assert!(t.ends_with("screen:\n$"), "and the screen last");
+    assert!(t.contains("more history waits"), "{}", &t[..200]);
+    let kept = t.lines().filter(|l| l.starts_with("line ")).count() as i64;
+    assert!(kept > 1000 && kept < 10_000, "{kept}");
+    // The cursor follows the last line given, so nothing is skipped.
+    let s = &r["structuredContent"];
+    assert_eq!(s["cursor"], kept);
+    assert_eq!(s["more"], true);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_tailscale_listener_takes_any_host_but_no_browser() {
+    let fake = Arc::new(Fake::default());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(vibe_mcp::http::serve(listener, fake, false));
+    let auth = format!("Bearer {KEY}");
+    let host = ("Host", "mac-mini.tail1234.ts.net:7878");
+    let r = post_raw(
+        addr,
+        "/mcp",
+        &[("Authorization", &auth), host],
+        &initialize(),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    let r = post_raw(
+        addr,
+        "/mcp",
+        &[
+            ("Authorization", &auth),
+            host,
+            ("Origin", "https://evil.example"),
+        ],
+        &initialize(),
+    )
+    .await;
+    assert_eq!(r.status, 403);
+    let r = post_raw(addr, "/mcp", &[host], &initialize()).await;
+    assert_eq!(r.status, 401);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_2026_client_needs_no_initialize() {
+    let fake = Arc::new(Fake::default());
+    let addr = serve(Arc::clone(&fake)).await;
+    let auth = format!("Bearer {KEY}");
+    let meta = json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientInfo": {"name": "t", "version": "1"},
+        "io.modelcontextprotocol/clientCapabilities": {},
+    });
+    let headers = [
+        ("Authorization", auth.as_str()),
+        ("MCP-Protocol-Version", "2026-07-28"),
+        ("Mcp-Method", "tools/call"),
+        ("Mcp-Name", "vibe_list_agents"),
+    ];
+    let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
+        "name": "vibe_list_agents", "arguments": {"host": "vps"}, "_meta": meta}});
+    let r = post_raw(addr, "/mcp", &headers, &body.to_string()).await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    let t = text(&r.response()["result"]);
+    assert!(t.starts_with("vps:quiet-amber-otter"), "{t}");
 }

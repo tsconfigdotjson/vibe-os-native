@@ -93,6 +93,19 @@ fn type_into(socket: &Path, chunks: &[(Vec<u8>, Duration)]) -> std::io::Result<(
     c.status().map(|_| ())
 }
 
+/// The refusal of text sent to an agent on a question.
+fn on_a_question(agent_ref: &str, woken: &str) -> ErrorObject {
+    error(
+        ErrorCode::Conflict,
+        format!(
+            "{agent_ref} is waiting on a question, so nothing was pasted.{woken} Read it with \
+             vibe_read_output, then answer with vibe_send keys: the option's number, like \
+             [\"2\"], or [\"Up\"] and [\"Down\"] to move the ❯ marker, then [\"Enter\"]. Or \
+             pass force: true to paste anyway"
+        ),
+    )
+}
+
 /// The bytes of a send, in the reads they go as.
 fn chunks_of(input: &Input, bracketed: bool) -> Vec<(Vec<u8>, Duration)> {
     match input {
@@ -200,15 +213,7 @@ impl Core {
         if let Input::Text { force: false, .. } = &input
             && state == AgentState::Question
         {
-            return Err(error(
-                ErrorCode::Conflict,
-                format!(
-                    "{agent_ref} is waiting on a question, so nothing was pasted. Read it with \
-                     vibe_read_output, then answer with vibe_send keys: the option's number, like \
-                     [\"2\"], or [\"Up\"] and [\"Down\"] to move the ❯ marker, then [\"Enter\"]. Or \
-                     pass force: true to paste anyway"
-                ),
-            ));
+            return Err(on_a_question(agent_ref, ""));
         }
         let socket = self.layout.session_socket(agent_ref);
         let woke = matches!(
@@ -224,11 +229,23 @@ impl Core {
                 wait_ready(&socket).await;
             }
             crate::log!("vibed: {agent_ref} was {state}, and a send woke it");
+            // Asleep or paused, it read as that; woken where it was, it may
+            // be on a question. One resumed with `--resume` has lost any
+            // question it had (PRD: Going to sleep), whatever its
+            // transcript last said.
+            let mut record = self.named(Some(&host), agent_ref)?;
+            let status = self.agent_status(&mut record, debounce).await;
+            if state != AgentState::Exited
+                && let Input::Text { force: false, .. } = &input
+                && self.observed_state(&record, &status).await == AgentState::Question
+            {
+                return Err(on_a_question(agent_ref, " It was woken first."));
+            }
         }
         // Where its transcript is now: the answer to this send is what
-        // comes after.
+        // comes after. It's kept only once the send is in, so a send that
+        // failed leaves the wait on the one before.
         let mark = self.mark_send(Some(&host), agent_ref).await?;
-        lock(&self.sends).insert(agent_ref.to_owned(), mark);
         let s = socket.clone();
         let screen = tokio::task::spawn_blocking(move || screen_now(&s))
             .await
@@ -249,9 +266,14 @@ impl Core {
                     format!("{agent_ref} didn't take the send: {e}"),
                 )
             })?;
+        // A delete may have run meanwhile: then there's nothing to wait on,
+        // and a new agent by the same name mustn't inherit this mark.
         let state = match self.store().agent(&host, agent_ref) {
-            Ok(r) => r.state,
-            Err(_) => state,
+            Ok(r) => {
+                lock(&self.sends).insert(agent_ref.to_owned(), mark);
+                r.state
+            }
+            Err(_) => AgentState::Exited,
         };
         Ok(Sent { woke, state })
     }

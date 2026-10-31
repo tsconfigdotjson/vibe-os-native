@@ -357,3 +357,101 @@ async fn a_revoked_key_stops_working_at_once() {
     .await;
     assert_eq!(r.status, 401);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_send_wakes_an_asleep_agent_and_still_guards_its_question() {
+    let w = world().await;
+    let mut c = w.client().await;
+    let r = c
+        .call(
+            "vibe_start_agent",
+            json!({"project": "app", "profile": "software-eng-mac", "prompt": "question"}),
+        )
+        .await;
+    let agent = r["structuredContent"]["ref"].as_str().unwrap().to_owned();
+    c.call("vibe_wait", json!({"agents": agent, "timeout": 30}))
+        .await;
+    // Asleep as vibed records it (#6 puts it there), its session frozen
+    // but still there.
+    {
+        let mut store = vibe_core::store::Store::open(&w.layout.db()).unwrap();
+        store
+            .set_agent_state("local", &agent, vibe_core::model::AgentState::Asleep)
+            .unwrap();
+    }
+    let r = c.call("vibe_read_output", json!({"agent": agent})).await;
+    assert!(
+        text(&r).starts_with(&format!("{agent} is asleep")),
+        "{}",
+        text(&r)
+    );
+    let r = c.call("vibe_list_agents", json!({})).await;
+    assert_eq!(
+        r["structuredContent"]["agents"][0]["state"], "asleep",
+        "reads don't wake it"
+    );
+    // Text is still refused once it's awake on its question.
+    let e = c
+        .fails("vibe_send", json!({"agent": agent, "text": "blue"}))
+        .await;
+    assert!(
+        e.contains("is waiting on a question, so nothing was pasted. It was woken first."),
+        "{e}"
+    );
+    let r = c.call("vibe_list_agents", json!({})).await;
+    assert_eq!(r["structuredContent"]["agents"][0]["state"], "question");
+    let r = c
+        .call(
+            "vibe_send",
+            json!({"agent": agent, "keys": ["R", "e", "d", "Enter"]}),
+        )
+        .await;
+    assert_eq!(r["structuredContent"]["woke"], false);
+    let r = c
+        .call("vibe_wait", json!({"agents": agent, "timeout": 30}))
+        .await;
+    assert_eq!(r["structuredContent"]["state"], "idle", "{}", text(&r));
+    c.call("vibe_delete_agent", json!({"agent": agent, "force": true}))
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_name_used_again_is_waited_on_afresh() {
+    let w = world().await;
+    let mut c = w.client().await;
+    let start = json!({"project": "app", "profile": "software-eng-linux", "prompt": "question", "name": "worker"});
+    c.call("vibe_start_agent", start.clone()).await;
+    c.call("vibe_wait", json!({"agents": "worker", "timeout": 30}))
+        .await;
+    c.call(
+        "vibe_send",
+        json!({"agent": "worker", "keys": ["R", "e", "d", "Enter"]}),
+    )
+    .await;
+    let r = c
+        .call("vibe_wait", json!({"agents": "worker", "timeout": 30}))
+        .await;
+    assert_eq!(r["structuredContent"]["state"], "idle");
+    c.call(
+        "vibe_delete_agent",
+        json!({"agent": "worker", "force": true}),
+    )
+    .await;
+    // Its branch is kept, which holds the name until it goes too.
+    let project = w.layout.home().join("src/app");
+    common::git(&["-C", project.to_str().unwrap(), "branch", "-D", "worker"]);
+    // The new worker's prompt is what's waited on, not the old one's send.
+    c.call("vibe_start_agent", start).await;
+    let begun = std::time::Instant::now();
+    let r = c
+        .call("vibe_wait", json!({"agents": "worker", "timeout": 30}))
+        .await;
+    assert_eq!(r["structuredContent"]["reached"], true, "{}", text(&r));
+    assert_eq!(r["structuredContent"]["state"], "question");
+    assert!(begun.elapsed() < Duration::from_secs(15));
+    c.call(
+        "vibe_delete_agent",
+        json!({"agent": "worker", "force": true}),
+    )
+    .await;
+}

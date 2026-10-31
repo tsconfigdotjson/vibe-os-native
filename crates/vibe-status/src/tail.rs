@@ -259,26 +259,42 @@ impl Tail {
     /// on what may be a permission prompt for [`INFERRED_QUIET`], as a long
     /// silent tool run looks the same until then.
     pub fn answered(&self, mark: &Mark, now: Timestamp) -> bool {
-        self.answered_after(mark, now, true)
+        self.moved_since(mark) && self.status(now).settled(now)
     }
 
-    /// [`Tail::answered`], except that unless `background` is set, a turn
-    /// that ended with commands still running in the background counts as
-    /// answered too, as `vibe_wait` does by default: a server left running
-    /// never finishes.
+    /// What `vibe_wait` takes for an answer to what was sent after `mark`:
+    /// the transcript moved on since, as for [`Tail::answered`], and the
+    /// agent has stopped. A permission prompt counts as soon as agent-tail
+    /// infers one, not after [`INFERRED_QUIET`]: that longer wait is for
+    /// sleeping, and a wait can't outlast it. The caller says it may be a
+    /// long silent tool run instead. Unless `background` is set, a turn
+    /// that ended with work still running in the background counts too, as
+    /// a server left running never finishes.
     pub fn answered_after(&self, mark: &Mark, now: Timestamp, background: bool) -> bool {
+        if !self.moved_since(mark) {
+            return false;
+        }
+        let status = self.status(now);
+        status.settled(now)
+            || status.activity == Activity::AwaitingApproval
+            || !background && status.activity == Activity::BackgroundWork
+    }
+
+    /// Whether the transcript has moved on since `mark`; if the agent was
+    /// at work when the mark was taken, by a prompt or interrupt of the
+    /// user's, as the end of the turn it was in is no answer to a send it
+    /// hasn't read yet.
+    fn moved_since(&self, mark: &Mark) -> bool {
         let Some(f) = &self.followed else {
             return false;
         };
-        let moved = self.generation != mark.generation
+        self.generation != mark.generation
             || if mark.busy {
                 f.inputs > mark.inputs
             } else {
                 f.reducer.received() > mark.received
                     && f.reducer.state(Timestamp::EPOCH).last_at != mark.last_at
-            };
-        let status = self.status(now);
-        moved && (status.settled(now) || !background && status.activity == Activity::BackgroundWork)
+            }
     }
 
     /// Picks the transcript to follow, and says whether it changed.
@@ -1217,6 +1233,11 @@ mod tests {
         assert!(!tail.answered(&mark, t("2026-10-30T12:00:34Z")));
         assert!(!tail.answered(&mark, t("2026-10-30T12:04:00Z")));
         assert!(tail.answered(&mark, t("2026-10-30T12:05:05Z")));
+        // A wait, which can't outlast five minutes, takes the prompt once
+        // agent-tail infers it, and not before.
+        assert!(!tail.answered_after(&mark, t("2026-10-30T12:00:10Z"), false));
+        assert!(tail.answered_after(&mark, t("2026-10-30T12:00:34Z"), false));
+        assert!(tail.answered_after(&mark, t("2026-10-30T12:00:34Z"), true));
     }
 
     #[test]

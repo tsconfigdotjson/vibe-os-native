@@ -47,6 +47,21 @@ const MAX_LINES: u64 = 2000;
 const MAX_MESSAGES: u64 = 500;
 const MAX_WAIT_AGENTS: usize = 32;
 
+/// What a read's text may hold, leaving room for the line about it within
+/// [`MAX_RESULT_CHARS`].
+const BODY_CHARS: usize = MAX_RESULT_CHARS - 1000;
+
+/// What a wait waits for, as VibeOS's `until` says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Until {
+    /// Not at work: with `turn`, the answer to the last send.
+    Settled,
+    Idle,
+    Question,
+    /// Any change of state or activity.
+    Change,
+}
+
 const INSTRUCTIONS: &str = "VibeOS Native runs coding agents (Claude Code), each in its own git worktree and its own compartment, on this host and the hosts connected to it.
 
 To hand an agent a task: vibe_list_projects to find a project and its profiles, vibe_start_agent with a prompt, then vibe_wait until it has answered, then vibe_read_messages for its answer (or vibe_read_output for its screen). Answer its questions with vibe_send. When it's done, vibe_delete_agent; its branch is kept.
@@ -277,7 +292,8 @@ pub(crate) fn tools() -> Vec<Tool> {
                 ]},
                 "timeout": {"type": "integer", "minimum": 1, "maximum": MAX_WAIT_SECS, "description": format!("Seconds, up to {MAX_WAIT_SECS}. Default {DEFAULT_WAIT_SECS}")},
                 "background": {"type": "boolean", "description": "Also wait for commands the agent left running in the background, and subagents, to finish. Off by default: a server left running never finishes"},
-                "turn": {"type": "boolean", "description": "Wait for the answer to the last send. Default true; false waits only until it's not busy"},
+                "until": {"type": "string", "enum": ["settled", "idle", "question", "change"], "description": "settled (default): it has stopped; idle or question: that state; change: any change of state or activity"},
+                "turn": {"type": "boolean", "description": "Wait for the answer to the last send. Default true; false waits only for the state until asks for"},
                 "lines": {"type": "integer", "minimum": 0, "maximum": MAX_LINES, "description": format!("Lines of its screen to return. Default {DEFAULT_WAIT_LINES}")}
             }, "required": ["agents"]}),
         ),
@@ -626,7 +642,7 @@ impl<D: Daemon> Server<D> {
                 "{what}{}. Call vibe_wait to know when it has answered",
                 if sent.woke { " (woke it first)" } else { "" }
             ),
-            json!({"ref": r, "host": t.host, "delivered": true, "woke": sent.woke, "state": sent.state}),
+            json!({"ref": r, "host": t.host, "delivered": true, "woke": sent.woke, "started": sent.woke, "state": sent.state}),
         )
     }
 
@@ -687,10 +703,12 @@ impl<D: Daemon> Server<D> {
             .await
             .map(|c| c.state.to_string())
             .unwrap_or_else(|_| "unknown".into());
+        let mut cursor = out.cursor;
+        let mut more = out.more;
         let body = match after {
             None => {
                 let n = lines.map_or(DEFAULT_READ_LINES, |n| n as usize);
-                last_lines(&out.history, &out.screen, n)
+                clip_to(&last_lines(&out.history, &out.screen, n), BODY_CHARS)
             }
             Some(after) => {
                 let mut history = out.history.clone();
@@ -698,30 +716,48 @@ impl<D: Daemon> Server<D> {
                     let skip = history.len().saturating_sub(n as usize);
                     history.drain(..skip);
                 }
+                // Read on from a cursor, the oldest lines come first, and
+                // what doesn't fit is left for the next read: the cursor
+                // says where to go on from.
+                let screen = clip_to(&out.screen, BODY_CHARS / 4);
+                let mut budget = BODY_CHARS.saturating_sub(screen.chars().count());
+                let mut kept = 0;
+                for line in &history {
+                    let cost = line.chars().count() + 1;
+                    if cost > budget {
+                        break;
+                    }
+                    budget -= cost;
+                    kept += 1;
+                }
+                if kept < history.len() {
+                    cursor = cursor.saturating_sub((history.len() - kept) as u64);
+                    more = true;
+                    history.truncate(kept);
+                }
                 let mut parts = Vec::new();
                 if !history.is_empty() {
                     parts.push(format!("new since {after}:\n{}", history.join("\n")));
                 }
-                parts.push(format!("screen:\n{}", out.screen));
+                parts.push(format!("screen:\n{screen}"));
                 parts.join("\n\n")
             }
         };
-        let mut head = format!("{r} is {state}. cursor {}", out.cursor);
+        let mut head = format!("{r} is {state}. cursor {cursor}");
         if out.dropped > 0 {
             head.push_str(&format!(" ({} lines were no longer held)", out.dropped));
         }
-        if out.more {
+        if more {
             head.push_str("; more history waits: read again with after set to the cursor");
         }
         if !out.live {
             head.push_str(". This is the last screen saved: it isn't running");
         }
-        let clipped = clip(&body);
         ok(
             &format!("{head}\n\n{body}"),
             json!({
-                "ref": r, "state": state, "text": clipped, "screen": clip(&out.screen),
-                "cursor": out.cursor, "dropped": out.dropped, "more": out.more, "live": out.live,
+                "ref": r, "state": state, "text": body, "cursor": cursor,
+                "dropped": out.dropped, "more": more, "live": out.live,
             }),
         )
     }
@@ -768,6 +804,13 @@ impl<D: Daemon> Server<D> {
         let timeout = integer(args, "timeout", 1, MAX_WAIT_SECS)?.unwrap_or(DEFAULT_WAIT_SECS);
         let background = boolean(args, "background")?.unwrap_or(false);
         let turn = boolean(args, "turn")?.unwrap_or(true);
+        let until = match string(args, "until")?.as_deref() {
+            None | Some("settled") => Until::Settled,
+            Some("idle") => Until::Idle,
+            Some("question") => Until::Question,
+            Some("change") => Until::Change,
+            Some(_) => return Err("until must be settled, idle, question or change".into()),
+        };
         let lines =
             integer(args, "lines", 0, MAX_LINES)?.map_or(DEFAULT_WAIT_LINES, |n| n as usize);
         let mut targets = Vec::new();
@@ -783,6 +826,7 @@ impl<D: Daemon> Server<D> {
         let mut progress = 0u32;
         let mut last_report = begun;
         let mut seen: HashMap<Target, (AgentState, String)> = HashMap::new();
+        let mut first: HashMap<Target, (AgentState, String)> = HashMap::new();
         let describe = |checks: &[(Target, Check)]| {
             checks
                 .iter()
@@ -814,16 +858,20 @@ impl<D: Daemon> Server<D> {
             let mut changed = false;
             for (t, c) in &checks {
                 let now = (c.state, c.activity.to_string());
+                first.entry(t.clone()).or_insert_with(|| now.clone());
                 if seen.get(t) != Some(&now) {
                     changed = true;
                     seen.insert(t.clone(), now);
                 }
             }
-            let done = checks.iter().find(|(_, c)| {
-                if turn {
-                    c.answered
-                } else {
-                    c.state != AgentState::Busy || c.answered
+            let done = checks.iter().find(|(t, c)| {
+                let answered = !turn || c.answered;
+                match until {
+                    Until::Settled if turn => c.answered,
+                    Until::Settled => c.state != AgentState::Busy,
+                    Until::Idle => answered && c.state == AgentState::Idle,
+                    Until::Question => answered && c.state == AgentState::Question,
+                    Until::Change => first.get(t) != seen.get(t),
                 }
             });
             if let Some((t, c)) = done {
@@ -890,7 +938,9 @@ impl<D: Daemon> Server<D> {
                 ),
             }
         };
-        let hint = if reached && check.state == AgentState::Question {
+        let hint = if reached && check.activity == vibe_core::model::Activity::AwaitingApproval {
+            "\nIt may be waiting on a permission prompt: read it with vibe_read_output, and answer with vibe_send keys. If it's a command that's still running instead, call vibe_wait again."
+        } else if reached && check.state == AgentState::Question {
             "\nIt is asking something: read it with vibe_read_output, and answer with vibe_send keys."
         } else if reached && check.state == AgentState::Exited {
             "\nIt has exited since: vibe_send resumes it."
@@ -929,9 +979,32 @@ impl<D: Daemon> Server<D> {
             ),
             json!({
                 "ref": r, "state": check.state, "activity": check.activity,
-                "reached": reached, "waited": waited, "agents": all, "text": clip(&screen),
+                "reached": reached, "waited": waited, "waitedMs": (waited * 1000.0).round(),
+                "agents": all, "text": clip(&screen),
             }),
         )
+    }
+}
+
+impl<D: Daemon> Server<D> {
+    /// Runs the tool `name`, which is one of [`tools`].
+    async fn run(
+        &self,
+        name: &str,
+        args: &JsonObject,
+        ctx: &RequestContext<RoleServer>,
+    ) -> Outcome {
+        match name {
+            "vibe_list_projects" => self.list_projects(args).await,
+            "vibe_start_agent" => self.start_agent(args).await,
+            "vibe_list_agents" => self.list_agents(args).await,
+            "vibe_send" => self.send(args).await,
+            "vibe_wait" => self.wait(args, ctx).await,
+            "vibe_read_messages" => self.read_messages(args).await,
+            "vibe_read_output" => self.read_output(args).await,
+            "vibe_delete_agent" => self.delete_agent(args).await,
+            other => Err(format!("no tool called {other}")),
+        }
     }
 }
 
@@ -976,22 +1049,18 @@ impl<D: Daemon> ServerHandler for Server<D> {
             .unwrap_or_default();
         self.daemon
             .log(&format!("mcp: key {caller:?} called {name}{about}"));
-        let outcome = match name {
-            "vibe_list_projects" => self.list_projects(&args).await,
-            "vibe_start_agent" => self.start_agent(&args).await,
-            "vibe_list_agents" => self.list_agents(&args).await,
-            "vibe_send" => self.send(&args).await,
-            "vibe_wait" => self.wait(&args, &context).await,
-            "vibe_read_messages" => self.read_messages(&args).await,
-            "vibe_read_output" => self.read_output(&args).await,
-            "vibe_delete_agent" => self.delete_agent(&args).await,
-            other => {
-                return Err(ErrorData::invalid_params(
-                    format!("no tool called {other}"),
-                    None,
-                ));
-            }
-        };
+        if !tools().iter().any(|t| t.name == name) {
+            return Err(ErrorData::invalid_params(
+                format!("no tool called {name}"),
+                None,
+            ));
+        }
+        // On a task of its own, so a handler that panics fails its call
+        // instead of leaving the client waiting on a response.
+        let (server, tool) = (self.clone(), name.to_owned());
+        let outcome = tokio::spawn(async move { server.run(&tool, &args, &context).await })
+            .await
+            .unwrap_or_else(|e| Err(format!("Internal error: the call failed: {e}")));
         Ok(outcome
             .unwrap_or_else(|e| {
                 self.daemon.log(&format!("mcp: {name} failed: {e}"));

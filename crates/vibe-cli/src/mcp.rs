@@ -10,7 +10,7 @@
 //!
 //! stdout is the protocol channel, so everything this says goes to stderr.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
@@ -44,22 +44,33 @@ impl Url {
             Some(i) => (&rest[..i], &rest[i..]),
             None => (rest, "/mcp"),
         };
-        let (host, port) = match authority.rsplit_once(':') {
-            Some((h, p)) if !h.ends_with(']') || h.starts_with('[') => (
-                h,
-                p.parse::<u16>()
-                    .map_err(|_| format!("{s}: {p} isn't a port"))?,
-            ),
-            _ => (authority, 80),
+        let port_of = |p: &str| {
+            p.parse::<u16>()
+                .map_err(|_| format!("{s}: {p} isn't a port"))
+        };
+        let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
+            // An IPv6 address: [addr] or [addr]:port.
+            let (h, rest) = bracketed
+                .split_once(']')
+                .ok_or_else(|| format!("{s}: an unclosed ["))?;
+            match rest {
+                "" => (h, 80),
+                r => (
+                    h,
+                    port_of(r.strip_prefix(':').ok_or_else(|| format!("{s}: no host"))?)?,
+                ),
+            }
+        } else {
+            match authority.rsplit_once(':') {
+                Some((h, p)) => (h, port_of(p)?),
+                None => (authority, 80),
+            }
         };
         if host.is_empty() {
             return Err(format!("{s}: no host"));
         }
         Ok(Url {
-            host: host
-                .trim_start_matches('[')
-                .trim_end_matches(']')
-                .to_owned(),
+            host: host.to_owned(),
             port,
             path: path.to_owned(),
         })
@@ -86,8 +97,10 @@ struct Bridge {
     protocol: Mutex<Option<String>>,
     out: Mutex<io::Stdout>,
     in_flight: InFlight,
-    /// Requests the client cancelled, which get no response.
-    cancelled: Mutex<std::collections::HashSet<String>>,
+    /// Requests read and not yet answered, by id.
+    pending: Mutex<HashSet<String>>,
+    /// Of those, the ones the client cancelled, which get no response.
+    cancelled: Mutex<HashSet<String>>,
 }
 
 impl Bridge {
@@ -105,27 +118,38 @@ impl Bridge {
         );
     }
 
-    fn post(&self, message: Value) {
-        let id = message
-            .get("id")
-            .filter(|_| message.get("method").is_some())
-            .cloned();
+    /// Takes a message as it's read: a request becomes pending, and a
+    /// cancel of a pending one closes it. Says whether it's to be posted.
+    fn take(&self, message: &Value) -> bool {
         let method = message.get("method").and_then(Value::as_str).unwrap_or("");
         if method == "notifications/cancelled" {
             if let Some(req) = message.pointer("/params/requestId") {
-                lock(&self.cancelled).insert(req.to_string());
-                let stream = lock(&self.in_flight).remove(&req.to_string());
-                if let Some(s) = stream {
-                    let _ = s.shutdown(Shutdown::Both);
+                let req = req.to_string();
+                if lock(&self.pending).contains(&req) {
+                    lock(&self.cancelled).insert(req.clone());
+                    if let Some(s) = lock(&self.in_flight).remove(&req) {
+                        let _ = s.shutdown(Shutdown::Both);
+                    }
                 }
             }
-            return;
+            // A stateless server can't tie a cancel to another request:
+            // closing that request is how it's told.
+            return false;
         }
+        if let Some(id) = request_id(message) {
+            lock(&self.pending).insert(id.to_string());
+        }
+        true
+    }
+
+    fn post(&self, message: Value) {
+        let id = request_id(&message).cloned();
+        let method = message.get("method").and_then(Value::as_str).unwrap_or("");
         let is_initialize = method == "initialize";
         let outcome = self.exchange(&message, id.as_ref(), is_initialize);
         let cancelled = id
             .as_ref()
-            .is_some_and(|id| lock(&self.cancelled).remove(&id.to_string()));
+            .is_some_and(|id| lock(&self.cancelled).contains(&id.to_string()));
         match outcome {
             Ok(()) => {}
             // The client gave up on it, and expects nothing more.
@@ -136,7 +160,10 @@ impl Bridge {
             },
         }
         if let Some(id) = &id {
-            lock(&self.in_flight).remove(&id.to_string());
+            let id = id.to_string();
+            lock(&self.in_flight).remove(&id);
+            lock(&self.cancelled).remove(&id);
+            lock(&self.pending).remove(&id);
         }
     }
 
@@ -149,14 +176,25 @@ impl Bridge {
     ) -> Result<(), String> {
         let unreachable =
             |e: io::Error| format!("can't reach vibed's MCP at {}: {e}", self.url_text());
-        let addr = self
+        // Every address the name has, in turn: `localhost` may be ::1
+        // first, and vibed serves 127.0.0.1.
+        let mut last = io::Error::new(io::ErrorKind::NotFound, "the name has no address");
+        let mut connected = None;
+        for addr in self
             .url
             .authority()
             .to_socket_addrs()
             .map_err(unreachable)?
-            .next()
-            .ok_or_else(|| format!("{} has no address", self.url.host))?;
-        let mut stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).map_err(unreachable)?;
+        {
+            match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
+                Ok(s) => {
+                    connected = Some(s);
+                    break;
+                }
+                Err(e) => last = e,
+            }
+        }
+        let mut stream = connected.ok_or_else(|| unreachable(last))?;
         stream
             .set_read_timeout(Some(READ_TIMEOUT))
             .map_err(|e| e.to_string())?;
@@ -164,6 +202,11 @@ impl Bridge {
             && let Ok(clone) = stream.try_clone()
         {
             lock(&self.in_flight).insert(id.to_string(), clone);
+            // Cancelled before it was under way.
+            if lock(&self.cancelled).contains(&id.to_string()) {
+                let _ = stream.shutdown(Shutdown::Both);
+                return Err("cancelled".into());
+            }
         }
         let body = message.to_string();
         let protocol = lock(&self.protocol).clone();
@@ -174,8 +217,8 @@ impl Bridge {
             self.key,
             body.len()
         );
-        if let Some(p) = protocol.filter(|_| !initialize) {
-            head.push_str(&format!("MCP-Protocol-Version: {p}\r\n"));
+        for (name, value) in request_headers(message, protocol.filter(|_| !initialize)) {
+            head.push_str(&format!("{name}: {value}\r\n"));
         }
         head.push_str("\r\n");
         stream
@@ -199,7 +242,19 @@ impl Bridge {
                     text_of(&mut body)
                 ));
             }
-            status => return Err(format!("vibed answered {status}: {}", text_of(&mut body))),
+            status => {
+                // A JSON-RPC error the server sent with its status, such as
+                // an unsupported protocol version, goes to the client as it
+                // is: it says how to fall back.
+                let text = text_of(&mut body);
+                if let Ok(v) = serde_json::from_str::<Value>(&text)
+                    && v.get("jsonrpc").is_some()
+                {
+                    self.write(&v);
+                    return Ok(());
+                }
+                return Err(format!("vibed answered {status}: {text}"));
+            }
         }
         let mut seen = |v: Value| {
             if initialize
@@ -237,6 +292,77 @@ impl Bridge {
     fn url_text(&self) -> String {
         format!("http://{}{}", self.url.authority(), self.url.path)
     }
+}
+
+/// A request's id: a message with a method and an id.
+fn request_id(message: &Value) -> Option<&Value> {
+    message
+        .get("id")
+        .filter(|_| message.get("method").is_some())
+}
+
+/// The headers Streamable HTTP asks of a request beyond the usual ones:
+/// `MCP-Protocol-Version`, from its own `_meta` (2026-07-28 on) or else what
+/// `initialize` agreed; and `Mcp-Method` and `Mcp-Name`, which servers on
+/// 2026-07-28 route by (SEP-2243).
+fn request_headers(message: &Value, agreed: Option<String>) -> Vec<(&'static str, String)> {
+    let mut out = Vec::new();
+    let own = message
+        .pointer("/params/_meta")
+        .and_then(|m| m.get("io.modelcontextprotocol/protocolVersion"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    if let Some(v) = own.or(agreed) {
+        out.push(("MCP-Protocol-Version", v));
+    }
+    let Some(method) = message.get("method").and_then(Value::as_str) else {
+        return out;
+    };
+    out.push(("Mcp-Method", header_value(method)));
+    let key = match method {
+        "tools/call" | "prompts/get" => "name",
+        "resources/read" | "resources/subscribe" | "resources/unsubscribe" => "uri",
+        m if m.starts_with("tasks/") => "taskId",
+        _ => return out,
+    };
+    if let Some(name) = message
+        .pointer(&format!("/params/{key}"))
+        .and_then(Value::as_str)
+    {
+        out.push(("Mcp-Name", header_value(name)));
+    }
+    out
+}
+
+/// A value as a header carries it: as it is when it's plain printable
+/// ASCII, or else Base64 in `=?base64?…?=` (SEP-2243).
+fn header_value(v: &str) -> String {
+    let plain = !v.starts_with([' ', '\t'])
+        && !v.ends_with([' ', '\t'])
+        && v.chars().all(|c| (' '..='~').contains(&c));
+    if plain {
+        return v.to_owned();
+    }
+    const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::from("=?base64?");
+    for chunk in v.as_bytes().chunks(3) {
+        let n = chunk.len();
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let x = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for i in 0..4 {
+            if i <= n {
+                out.push(B64[((x >> (18 - 6 * i)) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out.push_str("?=");
+    out
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -391,7 +517,8 @@ pub(crate) fn run(url: Url, key: String) -> Result<(), String> {
         protocol: Mutex::new(None),
         out: Mutex::new(io::stdout()),
         in_flight: Arc::new(Mutex::new(HashMap::new())),
-        cancelled: Mutex::new(std::collections::HashSet::new()),
+        pending: Mutex::new(HashSet::new()),
+        cancelled: Mutex::new(HashSet::new()),
     });
     let stdin = io::stdin();
     let mut lines = stdin.lock();
@@ -417,6 +544,9 @@ pub(crate) fn run(url: Url, key: String) -> Result<(), String> {
                 continue;
             }
         };
+        if !bridge.take(&message) {
+            continue;
+        }
         // `initialize` first, alone, so every later request carries the
         // version it agreed.
         if message.get("method").and_then(Value::as_str) == Some("initialize") {
@@ -449,9 +579,46 @@ mod tests {
         );
         assert_eq!(u.authority(), "[fd7a:115c:a1e0::1]:9000");
         assert_eq!(Url::parse("http://mac-mini/x").unwrap().port, 80);
+        let u = Url::parse("http://[::1]/mcp").unwrap();
+        assert_eq!((u.host.as_str(), u.port), ("::1", 80));
+        assert!(Url::parse("http://[::1/mcp").is_err());
+        assert!(Url::parse("http://[::1]x/mcp").is_err());
         assert!(Url::parse("https://vps.example.com/mcp").is_err());
         assert!(Url::parse("http://h:port/mcp").is_err());
         assert!(Url::parse("http:///mcp").is_err());
+    }
+
+    #[test]
+    fn requests_carry_the_headers_streamable_http_asks_for() {
+        let call = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "vibe_wait", "arguments": {}}});
+        assert_eq!(
+            request_headers(&call, Some("2025-06-18".into())),
+            [
+                ("MCP-Protocol-Version", "2025-06-18".to_owned()),
+                ("Mcp-Method", "tools/call".to_owned()),
+                ("Mcp-Name", "vibe_wait".to_owned()),
+            ]
+        );
+        // A 2026-07-28 request says its version itself.
+        let own = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {
+            "_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28"}}});
+        assert_eq!(
+            request_headers(&own, Some("2025-06-18".into())),
+            [
+                ("MCP-Protocol-Version", "2026-07-28".to_owned()),
+                ("Mcp-Method", "tools/list".to_owned()),
+            ]
+        );
+        let first = json!({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {}});
+        assert_eq!(
+            request_headers(&first, None),
+            [("Mcp-Method", "initialize".to_owned())]
+        );
+        assert_eq!(header_value("vibe_send"), "vibe_send");
+        assert_eq!(header_value("é"), "=?base64?w6k=?=");
+        assert_eq!(header_value(" a"), "=?base64?IGE=?=");
+        assert_eq!(header_value("abc\n"), "=?base64?YWJjCg==?=");
     }
 
     #[test]

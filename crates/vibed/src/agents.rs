@@ -700,6 +700,9 @@ impl Core {
         let (agent_ref, _held) = self
             .pick_ref(host, &project.name, &project_path, p.name.as_deref())
             .await?;
+        // Its prompt is what a wait waits on first, not a send to an agent
+        // that had its name before.
+        lock(&self.sends).remove(&agent_ref);
         let mut undo = Undo {
             project: project_path.clone(),
             ..Undo::default()

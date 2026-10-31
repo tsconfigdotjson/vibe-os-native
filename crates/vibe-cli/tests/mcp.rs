@@ -198,8 +198,8 @@ fn the_bridge_carries_mcp_over_stdio() {
     let t = r["result"]["content"][0]["text"].as_str().unwrap();
     assert!(t.starts_with("still busy after 1s"), "{t}");
 
-    // A cancelled call gets no response, and closes on the server; the
-    // bridge carries on.
+    // A cancelled call gets no response: the bridge closes its request,
+    // which is how a stateless server hears of a cancel, and carries on.
     b.send(
         json!({"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {
         "name": "vibe_wait", "arguments": {"agents": a.agent, "timeout": 60, "lines": 0}}}),
@@ -217,6 +217,32 @@ fn the_bridge_carries_mcp_over_stdio() {
         "nothing for the cancelled call"
     );
     assert!(begun.elapsed() < Duration::from_secs(10));
+
+    // A 2026-07-28 client, with no initialize: its version and the headers
+    // that go with it reach the server, and an error the server sends with
+    // a 4xx comes back as the server wrote it.
+    let meta = json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientInfo": {"name": "new", "version": "1"},
+        "io.modelcontextprotocol/clientCapabilities": {},
+    });
+    b.send(
+        json!({"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {
+        "name": "vibe_list_projects", "arguments": {}, "_meta": meta}}),
+    );
+    let r = b.expect();
+    assert_eq!(r["id"], 7, "{r}");
+    let t = r["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(t.starts_with("app (on local)"), "{r}");
+    b.send(
+        json!({"jsonrpc": "2.0", "id": 8, "method": "tools/list", "params": {
+        "_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28"}}}),
+    );
+    let r = b.expect();
+    assert_eq!(r["id"], 8, "{r}");
+    assert_eq!(r["error"]["code"], -32602, "the server's own error: {r}");
 
     // A line that isn't JSON gets the protocol's parse error.
     b.stdin.as_mut().unwrap().write_all(b"not json\n").unwrap();

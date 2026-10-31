@@ -39,7 +39,8 @@ commands:
   toolbox rebuild  rebuild the template on the newest base image from toolbox.toml
   mcp         MCP over stdin and stdout, for clients that can only start a
               command: a bridge to vibed's http://127.0.0.1:7878/mcp, with the
-              API key in VIBE_API_KEY (or --key KEY; --url URL for another)
+              API key in VIBE_API_KEY (--key KEY works too, but shows it to
+              anyone who can run ps); --url URL for another endpoint
   key         list this host's API keys for MCP
   key create NAME  make an API key, and print it once
   key revoke NAME  revoke an API key

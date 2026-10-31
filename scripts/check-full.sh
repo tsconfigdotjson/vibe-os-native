@@ -459,13 +459,14 @@ s_agents() {
 mcp_call() {
   printf '%s\n' "$2" >&7
   local i line
-  for i in $(seq 1 600); do
+  # Longer than any wait it asks for, so a slow machine isn't a failure.
+  for i in $(seq 1 900); do
     line=$(grep -E "\"id\":$1[,}]" "$MCP_OUT" | grep -v '"method"' | head -n 1 || true)
     [ -n "$line" ] && break
     sleep 0.1
   done
   echo "$1: $line"
-  [ -n "$line" ] || { echo "no response to $1 in 60 s; the bridge said:"; cat "$MCP_OUT"; return 1; }
+  [ -n "$line" ] || { echo "no response to $1 in 90 s; the bridge said:"; cat "$MCP_OUT"; return 1; }
   case $line in *"$3"*) ;; *) echo "response $1 doesn't say: $3"; return 1 ;; esac
   case $line in *'"isError":true'*|*'"error":'*) echo "response $1 is an error"; return 1 ;; esac
 }
