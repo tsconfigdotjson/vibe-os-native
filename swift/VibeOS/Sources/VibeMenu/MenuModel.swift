@@ -256,6 +256,18 @@ public final class MenuModel: ObservableObject {
         }
     }
 
+    /// Whether Open Shell can open the toolbox now: it's closed, or open
+    /// already; an update, a rebuild or a save holds it.
+    public var toolboxCanOpen: Bool {
+        toolbox?.state == .closed || toolbox?.state == .open
+    }
+
+    /// See Logins: what the Linux home holds, and Claude's login. It boots
+    /// nothing, so it's fine to ask whenever the window shows.
+    public func toolboxLogins() async throws -> ToolboxLogins {
+        try await call(ToolboxLoginsGet.self, NoParams())
+    }
+
     /// Runs `vibe <words>` in a new Terminal window, where it can take as
     /// long as it needs and show how it goes, as Rebuild Template and Log
     /// In to Claude do. With `exec`, the window's shell becomes it. `words`

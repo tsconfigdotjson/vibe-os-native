@@ -306,6 +306,7 @@ impl Backend for TestBackend {
 /// version in `~/VibeOS/linux/`, as the real one keeps the disks it wrote.
 /// Update and recipe commands run natively with `sh -c` in its directory,
 /// so `true` succeeds and `exit 3` fails; a rebuild reports `uncovered`.
+/// Each home it keeps holds the logins it was given ([`TestToolbox::with_logins`]).
 #[derive(Debug)]
 pub struct TestToolbox {
     layout: vibe_core::paths::Layout,
@@ -314,6 +315,8 @@ pub struct TestToolbox {
     uncovered: Vec<String>,
     outlives_shim: bool,
     discard_takes: Duration,
+    logins: Vec<vibe_core::rpc::Login>,
+    claude: bool,
 }
 
 impl TestToolbox {
@@ -325,7 +328,17 @@ impl TestToolbox {
             uncovered: Vec::new(),
             outlives_shim: false,
             discard_takes: Duration::ZERO,
+            logins: Vec::new(),
+            claude: false,
         }
+    }
+
+    /// The logins each home its shell saves holds, as the real toolbox's
+    /// look finds them, and whether linux agents have a Claude login.
+    pub fn with_logins(mut self, logins: Vec<vibe_core::rpc::Login>, claude: bool) -> TestToolbox {
+        self.logins = logins;
+        self.claude = claude;
+        self
     }
 
     /// Its discard takes `how_long`, as stopping a VM an interrupted
@@ -433,9 +446,12 @@ impl crate::toolbox::ToolboxHost for TestToolbox {
         let base = self
             .base()
             .ok_or_else(|| EnvError::new("no Linux base image yet"))?;
+        let template = self.keep(Kind::Template, Some(base))?;
+        let home = self.keep(Kind::Home, None)?;
+        self.images.note_logins(home, &self.logins)?;
         Ok(crate::toolbox::Saved {
-            template: Some(self.keep(Kind::Template, Some(base))?),
-            home: Some(self.keep(Kind::Home, None)?),
+            template: Some(template),
+            home: Some(home),
             uncovered: Vec::new(),
         })
     }
@@ -476,5 +492,9 @@ impl crate::toolbox::ToolboxHost for TestToolbox {
             home: None,
             uncovered: self.uncovered.clone(),
         })
+    }
+
+    fn logins(&self) -> vibe_core::rpc::ToolboxLogins {
+        crate::toolbox::home_logins(&self.images, self.claude)
     }
 }

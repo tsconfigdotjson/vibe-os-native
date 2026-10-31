@@ -17,9 +17,9 @@ use serde_json::Value;
 
 pub use crate::limits::HostLimits;
 pub use crate::model::{
-    Activity, AgentState, Certainty, Environment, EventKind, GhState, HostLink, Mode, Model,
-    Profile, ProjectSource, Reasoning, SessionState, StopReason, ToolboxAction, ToolboxState,
-    WakeupKind,
+    Activity, AgentState, Certainty, Environment, EventKind, GhState, HostLink, LoginTool, Mode,
+    Model, Profile, ProjectSource, Reasoning, SessionState, StopReason, ToolboxAction,
+    ToolboxState, WakeupKind,
 };
 
 /// Bumped on any incompatible change to the contract. Clients send theirs in
@@ -353,6 +353,7 @@ pub const METHODS: &[&str] = &[
     ToolboxOpen::NAME,
     ToolboxUpdate::NAME,
     ToolboxRebuild::NAME,
+    ToolboxLoginsGet::NAME,
 ];
 
 /// Every notification the daemon sends.
@@ -581,6 +582,14 @@ method! {
     /// what the old template has that the recipe doesn't cover. The Linux
     /// home carries over.
     ToolboxRebuild = "toolbox.rebuild", NoParams => ToolboxRun
+}
+
+method! {
+    /// `toolbox.logins`: **See logins**. What the Linux home new agents
+    /// boot holds, as the toolbox found when it saved that home, and
+    /// whether linux agents have a Claude login. Reads only what's kept on
+    /// the Mac: it never boots a VM.
+    ToolboxLoginsGet = "toolbox.logins", NoParams => ToolboxLogins
 }
 
 /// `events.event`: one event, sent to subscribed connections.
@@ -1123,6 +1132,33 @@ pub struct ToolboxRun {
     /// Why it failed, in which case nothing was kept.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// The logins linux agents start with, for `toolbox.logins`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolboxLogins {
+    /// The Linux home version new agents boot; absent before the toolbox
+    /// has saved one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home: Option<u32>,
+    /// What that home holds, found as the toolbox saved it; absent if that
+    /// home was saved without a look (by a VibeOS before `toolbox.logins`).
+    /// Without a home, none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logins: Option<Vec<Login>>,
+    /// Whether linux agents have a Claude login: the token `vibe
+    /// setup-token` keeps, which lives on the Mac, not in the home.
+    pub claude: bool,
+}
+
+/// One login the Linux home holds. Never its secret.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Login {
+    pub tool: LoginTool,
+    /// Whose it is, for people: `octocat on github.com` for `gh`, an
+    /// account for `gcloud`, `Name <email>` for git, the key's file and
+    /// comment for SSH.
+    pub account: String,
 }
 
 #[cfg(test)]

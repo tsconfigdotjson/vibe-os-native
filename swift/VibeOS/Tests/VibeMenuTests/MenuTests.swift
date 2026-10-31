@@ -120,6 +120,35 @@ import VibeRPC
                 == "claude mcp add --transport http vibeos http://100.101.102.103:9123/mcp --header \"Authorization: Bearer vk_abc\"")
     }
 
+    @Test func seeLoginsSaysWhatAgentsStartWithOrPlainlyThatItsNothing() throws {
+        let known = LoginsSummary(
+            try decode(
+                ToolboxLogins.self,
+                [
+                    "home": 2, "claude": true,
+                    "logins": [
+                        ["tool": "gh", "account": "octocat on github.com"],
+                        ["tool": "git", "account": "Octo Cat <octo@example.com>"],
+                    ],
+                ] as [String: Any]))
+        #expect(known.headline == "Every new linux agent starts with what Linux home 2 holds:")
+        #expect(known.rows.map(\.tool) == ["GitHub (gh)", "Git identity"])
+        #expect(known.rows.map(\.account) == ["octocat on github.com", "Octo Cat <octo@example.com>"])
+        #expect(known.claude == "Claude: linux agents are logged in.")
+        #expect(!known.needsClaude)
+
+        let empty = LoginsSummary(try decode(ToolboxLogins.self, ["home": 2, "logins": [Any](), "claude": false] as [String: Any]))
+        #expect(empty.headline.hasPrefix("Linux home 2 has no logins yet."))
+        #expect(empty.rows.isEmpty)
+        #expect(empty.needsClaude)
+        #expect(empty.claude == "Claude: linux agents aren't logged in yet.")
+        let unknown = LoginsSummary(try decode(ToolboxLogins.self, ["home": 3, "claude": true] as [String: Any]))
+        #expect(unknown.headline.contains("can't say what's in it"))
+        let none = LoginsSummary(try decode(ToolboxLogins.self, ["logins": [Any](), "claude": true] as [String: Any]))
+        #expect(none.headline.hasPrefix("There's no Linux home yet."))
+        #expect(LoginTool.allCases.map(toolName) == ["GitHub (gh)", "Google Cloud", "Git identity", "SSH key"])
+    }
+
     @Test func theToolboxMenuSaysWhatTheToolboxIsDoing() throws {
         #expect(toolboxLines(nil).isEmpty)
         #expect(toolboxLines(try decode(ToolboxStatus.self, ["state": "unavailable"])) == ["This host has no Linux toolbox"])
@@ -127,8 +156,8 @@ import VibeRPC
             ToolboxStatus.self,
             [
                 "state": "closed", "template": 3, "home": 2, "base": 1, "newest_base": 2,
-                "last": ["action": "rebuild", "at": "2026-10-30T12:00:00Z", "uncovered": ["apt: htop"]],
-            ])
+                "last": ["action": "rebuild", "at": "2026-10-30T12:00:00Z", "uncovered": ["apt: htop"]] as [String: Any],
+            ] as [String: Any])
         #expect(
             toolboxLines(status) == [
                 "New agents boot template v3, Linux home v2, base 1",
@@ -491,6 +520,25 @@ import VibeRPC
         #expect(terminal.raised.last == "/dev/ttys007")
         #expect(terminal.ran.count == 1)
         #expect(model.message == nil)
+    }
+
+    @Test func seeLoginsAsksVibedAndOpenShellFollowsTheToolbox() async throws {
+        let state = Box("closed")
+        let daemon = fakeDaemon()
+        daemon.on(ToolboxStatusGet.name) { _ in ["state": state.value] }
+        daemon.on(ToolboxLoginsGet.name) { _ in
+            ["home": 1, "logins": [["tool": "ssh", "account": "id_ed25519 (me@laptop)"]], "claude": true]
+        }
+        let model = makeModel(daemon)
+        #expect(!model.toolboxCanOpen)
+        await model.refresh()
+        #expect(model.toolboxCanOpen)
+        let logins = try await model.toolboxLogins()
+        #expect(logins.logins?.first?.tool == .ssh)
+        #expect(!daemon.calls.contains(ToolboxOpen.name))
+        state.value = "rebuilding"
+        await model.handle(try event(.toolboxChanged))
+        #expect(!model.toolboxCanOpen)
     }
 
     @Test func rebuildAndTheClaudeLoginRunInTerminal() async throws {

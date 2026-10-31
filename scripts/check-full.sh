@@ -64,7 +64,9 @@
 #     (crates/vibed/tests/linux_vm.rs). It needs the Claude token: from
 #     CLAUDE_CODE_OAUTH_TOKEN, or what `vibe setup-token` kept in the
 #     Keychain. Then the toolbox: gcloud and a login made in it reach a new
-#     agent, an agent asleep on the old template restores, and [update] and
+#     agent, See logins names the logins its save found in the real guest
+#     (gh, git, an SSH key), an agent asleep on the old template restores,
+#     and [update] and
 #     Rebuild template make new templates (crates/vibed/tests/toolbox_vm.rs,
 #     which needs the network). N/A on a Mac that is itself a VM, like
 #     vm-cycle.

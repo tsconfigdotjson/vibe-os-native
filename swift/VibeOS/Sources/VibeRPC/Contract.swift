@@ -45,6 +45,7 @@ public enum VibeRPC {
         ToolboxOpen.name,
         ToolboxUpdate.name,
         ToolboxRebuild.name,
+        ToolboxLoginsGet.name,
     ]
     /// Every notification vibed sends.
     public static let notifications = [EventNotice.name]
@@ -446,6 +447,12 @@ public enum ToolboxAction: String, Codable, CaseIterable, Hashable, Sendable {
     case shell, update, rebuild
 }
 
+/// What a login kept in the Linux home is for: `gh`, `gcloud`, git's
+/// identity, or an SSH key.
+public enum LoginTool: String, Codable, CaseIterable, Hashable, Sendable {
+    case gh, gcloud, git, ssh
+}
+
 // MARK: - Methods
 
 /// `hosts.list`: every host this vibed knows; for now, itself.
@@ -641,6 +648,15 @@ public enum ToolboxRebuild: RPCMethod {
     public typealias Params = NoParams
     public typealias Result = ToolboxRun
     public static let name = "toolbox.rebuild"
+}
+
+/// `toolbox.logins`: See logins. What the Linux home new agents boot holds,
+/// as the toolbox found when it saved it, and whether linux agents have a
+/// Claude login. Boots nothing.
+public enum ToolboxLoginsGet: RPCMethod {
+    public typealias Params = NoParams
+    public typealias Result = ToolboxLogins
+    public static let name = "toolbox.logins"
 }
 
 /// `events.event`: one event, sent to subscribed connections.
@@ -1341,5 +1357,34 @@ public struct ToolboxRun: Codable, Hashable, Sendable {
 
     public enum CodingKeys: String, CodingKey, CaseIterable {
         case action, at, template, uncovered, error
+    }
+}
+
+/// The logins linux agents start with, for `toolbox.logins`.
+public struct ToolboxLogins: Codable, Hashable, Sendable {
+    /// The Linux home version new agents boot; none before the toolbox has
+    /// saved one.
+    public var home: Int?
+    /// What that home holds, found as the toolbox saved it; nil if that home
+    /// was saved without a look. Without a home, empty.
+    public var logins: [Login]?
+    /// Whether linux agents have a Claude login (`vibe setup-token`'s token,
+    /// kept on the Mac).
+    public var claude: Bool
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case home, logins, claude
+    }
+}
+
+/// One login the Linux home holds. Never its secret.
+public struct Login: Codable, Hashable, Sendable {
+    public var tool: LoginTool
+    /// Whose it is: `octocat on github.com`, an account, `Name <email>`, or
+    /// an SSH key's file and comment.
+    public var account: String
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case tool, account
     }
 }

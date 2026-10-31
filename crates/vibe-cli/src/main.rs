@@ -37,6 +37,8 @@ commands:
   toolbox status   the template and Linux home versions, and the last run
   toolbox update   run toolbox.toml's [update] commands on the template now
   toolbox rebuild  rebuild the template on the newest base image from toolbox.toml
+  toolbox logins   what every new linux agent is logged in to: the Linux home's
+              logins (gh, gcloud, git, SSH keys) and Claude's
   mcp         MCP over stdin and stdout, for clients that can only start a
               command: a bridge to vibed's http://127.0.0.1:7878/mcp, with the
               API key in VIBE_API_KEY (--key KEY works too, but shows it to
@@ -412,6 +414,10 @@ mod tests {
         assert_eq!(
             parse(&["toolbox", "rebuild"]),
             toolbox(toolbox::Command::Rebuild)
+        );
+        assert_eq!(
+            parse(&["toolbox", "logins"]),
+            toolbox(toolbox::Command::Logins)
         );
         assert_eq!(
             parse(&["toolbox", "--socket", "/s"]),

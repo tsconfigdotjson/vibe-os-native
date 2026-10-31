@@ -268,3 +268,52 @@ public func toolboxLines(_ status: ToolboxStatus?) -> [String] {
 public func shellQuote(_ word: String) -> String {
     "'" + word.replacingOccurrences(of: "'", with: "'\\''") + "'"
 }
+
+/// A login's tool, for people.
+public func toolName(_ tool: LoginTool) -> String {
+    switch tool {
+    case .gh: "GitHub (gh)"
+    case .gcloud: "Google Cloud"
+    case .git: "Git identity"
+    case .ssh: "SSH key"
+    }
+}
+
+/// What See Logins says (PRD: Menu bar, Footer; Core concepts, Linux
+/// home): what every new linux agent starts logged in to, or plainly that
+/// there's nothing yet, or that it isn't known, and Claude's login.
+public struct LoginsSummary: Equatable, Sendable {
+    public struct Row: Equatable, Sendable, Identifiable {
+        public var tool: String
+        public var account: String
+        public var id: String { tool + "\u{0}" + account }
+    }
+
+    public var headline: String
+    public var rows: [Row]
+    public var claude: String
+    /// Whether linux agents still need the Claude login.
+    public var needsClaude: Bool
+
+    public init(_ logins: ToolboxLogins) {
+        rows = (logins.logins ?? []).map { Row(tool: toolName($0.tool), account: $0.account) }
+        switch (logins.home, logins.logins) {
+        case (nil, _):
+            headline = "There's no Linux home yet. Open the toolbox shell and log in to what your linux "
+                + "agents need, such as gh auth login. Exiting the shell saves it."
+        case (let home?, nil):
+            headline = "Linux home \(home) was saved before VibeOS kept track of its logins, so it can't "
+                + "say what's in it. Open the toolbox shell and exit it, and they'll show here."
+        case (let home?, let found?) where found.isEmpty:
+            headline = "Linux home \(home) has no logins yet. Open the toolbox shell and log in there "
+                + "(gh auth login, gcloud auth login, git config --global user.name …). "
+                + "Exiting the shell saves them."
+        case (let home?, _):
+            headline = "Every new linux agent starts with what Linux home \(home) holds:"
+        }
+        needsClaude = !logins.claude
+        claude = logins.claude
+            ? "Claude: linux agents are logged in."
+            : "Claude: linux agents aren't logged in yet."
+    }
+}

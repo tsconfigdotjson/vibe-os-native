@@ -12,10 +12,10 @@ use std::fmt::Write as _;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use vibe_core::model::{ToolboxAction, ToolboxState};
+use vibe_core::model::{LoginTool, ToolboxAction, ToolboxState};
 use vibe_core::rpc::{
-    NoParams, ToolboxOpen, ToolboxRebuild, ToolboxRun, ToolboxStatus, ToolboxStatusGet,
-    ToolboxUpdate,
+    NoParams, ToolboxLogins, ToolboxLoginsGet, ToolboxOpen, ToolboxRebuild, ToolboxRun,
+    ToolboxStatus, ToolboxStatusGet, ToolboxUpdate,
 };
 
 use crate::attach::{self, End};
@@ -37,6 +37,7 @@ pub(crate) enum Command {
     Status,
     Update,
     Rebuild,
+    Logins,
 }
 
 impl Command {
@@ -45,6 +46,7 @@ impl Command {
             "status" => Command::Status,
             "update" => Command::Update,
             "rebuild" => Command::Rebuild,
+            "logins" => Command::Logins,
             _ => return None,
         })
     }
@@ -57,6 +59,13 @@ pub(crate) fn run(socket: &Path, command: Command) -> Result<(), String> {
         Command::Status => {
             let status = status(socket)?;
             print!("{}", describe_status(&status));
+            Ok(())
+        }
+        Command::Logins => {
+            let logins =
+                client::call::<ToolboxLoginsGet>(socket, &NoParams {}, Duration::from_secs(30))
+                    .map_err(|e| e.to_string())?;
+            print!("{}", describe_logins(&logins));
             Ok(())
         }
         Command::Update => {
@@ -183,6 +192,59 @@ pub(crate) fn describe_run(run: &ToolboxRun) -> String {
     out
 }
 
+/// A login's tool, for people.
+pub(crate) fn tool_name(tool: LoginTool) -> &'static str {
+    match tool {
+        LoginTool::Gh => "GitHub (gh)",
+        LoginTool::Gcloud => "Google Cloud",
+        LoginTool::Git => "Git identity",
+        LoginTool::Ssh => "SSH key",
+    }
+}
+
+/// What `vibe toolbox logins` prints: what linux agents start logged in
+/// to, or plainly that there's nothing yet, or that it isn't known.
+pub(crate) fn describe_logins(l: &ToolboxLogins) -> String {
+    let mut out = String::new();
+    match (l.home, &l.logins) {
+        (None, _) => out.push_str(
+            "There's no Linux home yet. Open the toolbox (`vibe toolbox`) and log in to what your \
+             linux agents need, such as `gh auth login`; exiting saves it.\n",
+        ),
+        (Some(home), None) => {
+            let _ = writeln!(
+                out,
+                "Linux home {home} was saved before VibeOS kept track of its logins, so it can't \
+                 say what's in it. Open the toolbox (`vibe toolbox`) and exit, and they'll show \
+                 here."
+            );
+        }
+        (Some(home), Some(logins)) if logins.is_empty() => {
+            let _ = writeln!(
+                out,
+                "Linux home {home} has no logins yet. Open the toolbox (`vibe toolbox`), log in \
+                 there (`gh auth login`, `gcloud auth login`, `git config --global user.name …`), \
+                 and exit to save."
+            );
+        }
+        (Some(home), Some(logins)) => {
+            let _ = writeln!(
+                out,
+                "Every new linux agent starts with what Linux home {home} holds:"
+            );
+            for login in logins {
+                let _ = writeln!(out, "  {:<14}{}", tool_name(login.tool), login.account);
+            }
+        }
+    }
+    out.push_str(if l.claude {
+        "Claude: linux agents are logged in.\n"
+    } else {
+        "Claude: linux agents aren't logged in yet. Run `vibe setup-token`.\n"
+    });
+    out
+}
+
 pub(crate) fn describe_status(s: &ToolboxStatus) -> String {
     if s.state == ToolboxState::Unavailable {
         return "This host has no Linux toolbox: install tools on it directly.\n".into();
@@ -243,7 +305,43 @@ mod tests {
         assert_eq!(Command::parse("status"), Some(Command::Status));
         assert_eq!(Command::parse("update"), Some(Command::Update));
         assert_eq!(Command::parse("rebuild"), Some(Command::Rebuild));
+        assert_eq!(Command::parse("logins"), Some(Command::Logins));
         assert_eq!(Command::parse("open"), None);
+    }
+
+    #[test]
+    fn logins_say_what_agents_start_with_or_honestly_that_its_nothing() {
+        use vibe_core::rpc::Login;
+        let mut l = ToolboxLogins {
+            home: Some(2),
+            logins: Some(vec![
+                Login {
+                    tool: LoginTool::Gh,
+                    account: "octocat on github.com".into(),
+                },
+                Login {
+                    tool: LoginTool::Git,
+                    account: "Octo Cat <octo@example.com>".into(),
+                },
+            ]),
+            claude: true,
+        };
+        assert_eq!(
+            describe_logins(&l),
+            "Every new linux agent starts with what Linux home 2 holds:\n  \
+             GitHub (gh)   octocat on github.com\n  \
+             Git identity  Octo Cat <octo@example.com>\n\
+             Claude: linux agents are logged in.\n"
+        );
+        l.logins = Some(vec![]);
+        l.claude = false;
+        let out = describe_logins(&l);
+        assert!(out.starts_with("Linux home 2 has no logins yet."), "{out}");
+        assert!(out.ends_with("Run `vibe setup-token`.\n"), "{out}");
+        l.logins = None;
+        assert!(describe_logins(&l).contains("can't say what's in it"));
+        l.home = None;
+        assert!(describe_logins(&l).starts_with("There's no Linux home yet."));
     }
 
     #[test]

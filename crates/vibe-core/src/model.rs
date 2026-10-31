@@ -234,6 +234,12 @@ names! {
     ToolboxAction { Shell = "shell", Update = "update", Rebuild = "rebuild" }
 }
 
+names! {
+    /// What a login kept in the Linux home is for (PRD: Core concepts,
+    /// Linux home): `gh`, `gcloud`, git's identity, or an SSH key.
+    LoginTool { Gh = "gh", Gcloud = "gcloud", Git = "git", Ssh = "ssh" }
+}
+
 /// The default memory of a profile.
 pub const DEFAULT_PROFILE_MEMORY: u64 = 4 * GIB;
 pub const MIN_PROFILE_MEMORY: u64 = GIB;

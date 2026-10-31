@@ -15,8 +15,11 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::oneshot;
+use vibe_core::model::LoginTool;
 use vibe_core::paths::Layout;
+use vibe_core::rpc::Login;
 use vibe_core::units::GIB;
+use vibe_env::images::Images;
 use vibe_env::testing::{STAND_IN, TestBackend, TestToolbox};
 use vibed::agents::{Backends, HostAdmission};
 use vibed::core::{Config, Core, DaemonInfo};
@@ -274,6 +277,10 @@ impl Golden {
             fs::write(base.join(f), f).unwrap();
         }
         fs::write(layout.linux_dir().join("home-1.img"), "").unwrap();
+        // What the toolbox found in that home when it saved it.
+        Images::new(layout.linux_dir())
+            .note_logins(1, &golden_logins())
+            .unwrap();
         fs::create_dir_all(layout.config_dir()).unwrap();
         fs::write(
             layout.toolbox_config(),
@@ -297,7 +304,8 @@ impl Golden {
                 Layout::new(&self.home, "macos"),
                 vec!["sleep".into(), "600".into()],
             )
-            .with_uncovered(vec!["apt: htop".into()]),
+            .with_uncovered(vec!["apt: htop".into()])
+            .with_logins(golden_logins(), true),
         ));
         config.admission = Arc::new(HostAdmission {
             total_memory: 64 * GIB,
@@ -552,3 +560,17 @@ impl Conn {
 }
 
 pub const HELLO: &str = r#"{"jsonrpc":"2.0","id":"probe","method":"daemon.hello","params":{"client":"test","protocol":1}}"#;
+
+/// The logins the examples' Linux home holds.
+pub fn golden_logins() -> Vec<Login> {
+    vec![
+        Login {
+            tool: LoginTool::Gh,
+            account: "me on github.com".into(),
+        },
+        Login {
+            tool: LoginTool::Git,
+            account: "Me <me@example.com>".into(),
+        },
+    ]
+}

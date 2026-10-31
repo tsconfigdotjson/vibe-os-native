@@ -467,7 +467,17 @@ fn updates_run_as_root_and_keep_only_a_template() {
             uncovered: vec![],
         }
     );
-    let runs = s.fake.state.lock().unwrap().runs.clone();
+    // The shell's save looked at the home's logins first.
+    let runs: Vec<_> = s
+        .fake
+        .state
+        .lock()
+        .unwrap()
+        .runs
+        .iter()
+        .filter(|r| r.command.last().map(String::as_str) != Some(LOGINS))
+        .cloned()
+        .collect();
     assert_eq!(
         runs[0].command,
         [
@@ -578,7 +588,7 @@ run = "curl -sSL https://sdk.cloud.google.com | bash -s -- --disable-prompts --i
         .runs
         .iter()
         .map(|r| r.command.clone())
-        .filter(|c| c.last().map(String::as_str) != Some(INVENTORY))
+        .filter(|c| !matches!(c.last().map(String::as_str), Some(INVENTORY | LOGINS)))
         .collect();
     assert_eq!(
         runs,
@@ -756,4 +766,136 @@ fn a_failed_command_says_what_it_printed() {
 
     assert_eq!(output_tail(""), "");
     assert_eq!(output_tail("\n  \nE: x\n"), ":\nE: x");
+}
+
+fn login(tool: LoginTool, account: &str) -> Login {
+    Login {
+        tool,
+        account: account.into(),
+    }
+}
+
+#[test]
+fn saving_the_home_notes_its_logins() {
+    let s = Setup::new();
+    // No home yet: nothing to log in with.
+    assert_eq!(
+        s.toolbox.logins(),
+        ToolboxLogins {
+            home: None,
+            logins: Some(vec![]),
+            claude: true,
+        }
+    );
+    s.fake.state.lock().unwrap().run_handler = Some(Arc::new(|run, _| proto::Ran {
+        code: Some(0),
+        signal: None,
+        timed_out: false,
+        output: if run.command.last().map(String::as_str) == Some(LOGINS) {
+            "gh\toctocat on github.com\ngit\tOcto Cat <octo@example.com>\n".into()
+        } else {
+            String::new()
+        },
+    }));
+    assert_eq!(s.session(|| {}).home, Some(1));
+    assert_eq!(
+        s.toolbox.logins(),
+        ToolboxLogins {
+            home: Some(1),
+            logins: Some(vec![
+                login(LoginTool::Gh, "octocat on github.com"),
+                login(LoginTool::Git, "Octo Cat <octo@example.com>"),
+            ]),
+            claude: true,
+        }
+    );
+    // It looked while the guest ran, before the seal.
+    let calls = s.calls();
+    let look = calls.iter().rposition(|c| c == "run").unwrap();
+    let seal = calls.iter().rposition(|c| c == "seal").unwrap();
+    assert!(look < seal, "{calls:?}");
+
+    // A look that fails still saves; that home's logins are unknown.
+    s.fake.state.lock().unwrap().run_handler = None;
+    assert_eq!(s.session(|| {}).home, Some(2));
+    let l = s.toolbox.logins();
+    assert_eq!((l.home, l.logins), (Some(2), None));
+
+    // Without the Claude token, linux agents have no Claude login.
+    let none: TokenSource = Arc::new(|| Err(EnvError::new("no Claude login yet")));
+    let t = Toolbox::new(s.layout.clone(), s.fake.clone(), none);
+    assert!(!t.logins().claude);
+}
+
+#[test]
+fn the_look_at_the_logins_reads_what_the_tools_keep() {
+    let tmp = tempfile::tempdir().unwrap();
+    let h = tmp.path();
+    let write = |path: &str, text: &str| {
+        let p = h.join(path);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, text).unwrap();
+    };
+    let look = || {
+        let out = std::process::Command::new("/bin/bash")
+            .args(["-c", LOGINS, "logins"])
+            .arg(h)
+            .env_remove("GIT_CONFIG_GLOBAL")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        String::from_utf8(out.stdout).unwrap()
+    };
+    // An empty home holds nothing.
+    assert_eq!(parse_logins(&look()), vec![]);
+
+    write(
+        ".config/gh/hosts.yml",
+        "github.com:\n    users:\n        octocat:\n            oauth_token: gho_secret\n    \
+         git_protocol: https\n    oauth_token: gho_secret\n    user: octocat\n\
+         ghe.example.com:\n    oauth_token: other_secret\n    user: ada\n",
+    );
+    fs::create_dir_all(h.join(".config/gcloud/legacy_credentials/me@example.com")).unwrap();
+    write(".config/gcloud/application_default_credentials.json", "{}");
+    write(
+        ".gitconfig",
+        "[user]\n\tname = Ada Lovelace\n\temail = ada@example.com\n",
+    );
+    write(".ssh/id_ed25519", "PRIVATE");
+    write(".ssh/id_ed25519.pub", "ssh-ed25519 AAAAC3Nz me@laptop\n");
+    write(".ssh/id_rsa", "PRIVATE");
+    write(".ssh/id_old.pub", "ssh-rsa AAAAB3 public only\n");
+    write(".ssh/known_hosts", "github.com ssh-ed25519 AAAA\n");
+    let out = look();
+    assert!(!out.contains("secret") && !out.contains("PRIVATE"), "{out}");
+    assert_eq!(
+        parse_logins(&out),
+        vec![
+            login(LoginTool::Gh, "octocat on github.com"),
+            login(LoginTool::Gh, "ada on ghe.example.com"),
+            login(LoginTool::Gcloud, "me@example.com"),
+            login(LoginTool::Gcloud, "application default credentials"),
+            login(LoginTool::Git, "Ada Lovelace <ada@example.com>"),
+            login(LoginTool::Ssh, "id_ed25519 (me@laptop)"),
+            login(LoginTool::Ssh, "id_rsa"),
+        ]
+    );
+
+    // git's identity in its XDG file, and only half of one.
+    fs::remove_file(h.join(".gitconfig")).unwrap();
+    write(".config/git/config", "[user]\n\temail = ada@example.com\n");
+    assert!(parse_logins(&look()).contains(&login(LoginTool::Git, "ada@example.com")));
+}
+
+#[test]
+fn logins_parse_known_tools_once_each() {
+    assert_eq!(
+        parse_logins(
+            "gh\tme on github.com\nnope\nnpm\tme\ngh\tme on github.com\ngit\t  \nssh\tk\x07ey\n"
+        ),
+        vec![
+            login(LoginTool::Gh, "me on github.com"),
+            login(LoginTool::Ssh, "key")
+        ]
+    );
 }

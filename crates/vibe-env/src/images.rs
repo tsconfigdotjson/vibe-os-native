@@ -8,6 +8,8 @@
 //! template-<n>.img          the Linux template, from the toolbox
 //! template-<n>.base         the base release template <n> was built on
 //! home-<n>.img              the Linux home, from the toolbox
+//! home-<n>.logins           the logins home <n> holds, as the toolbox
+//!                           found when it saved it (JSON, no secrets)
 //! downloads/                downloads under way
 //! ```
 //!
@@ -230,6 +232,24 @@ impl Images {
                     .into_iter()
                     .find_map(|(n, _)| self.installed_base(n))
             })
+    }
+
+    /// The logins Linux home `home` holds, as noted when it was kept; `None`
+    /// if nothing was noted, or the note can't be read.
+    pub fn logins_of(&self, home: u32) -> Option<Vec<vibe_core::rpc::Login>> {
+        let text = fs::read_to_string(self.dir.join(format!("home-{home}.logins"))).ok()?;
+        serde_json::from_str(&text).ok()
+    }
+
+    /// Notes the logins Linux home `home` holds, beside its image. Never
+    /// any secret: only which tools, and whose.
+    pub fn note_logins(&self, home: u32, logins: &[vibe_core::rpc::Login]) -> Result<()> {
+        let note = self.dir.join(format!("home-{home}.logins"));
+        let tmp = note.with_extension("logins.partial");
+        let text = serde_json::to_string_pretty(logins).expect("logins serialize");
+        fs::write(&tmp, text + "\n")
+            .and_then(|()| fs::rename(&tmp, &note))
+            .map_err(io_err(format!("write {}", note.display())))
     }
 
     /// Keeps `working`, an image the toolbox wrote, as the next version of
@@ -553,6 +573,7 @@ impl Images {
             for (_, path) in all {
                 if !in_use.contains(&path) && fs::remove_file(&path).is_ok() {
                     let _ = fs::remove_file(path.with_extension("base"));
+                    let _ = fs::remove_file(path.with_extension("logins"));
                     gone.push(path);
                 }
             }

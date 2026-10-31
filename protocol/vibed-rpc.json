@@ -37,7 +37,8 @@
     { "name": "toolbox.status", "params": "NoParams", "result": "ToolboxStatus" },
     { "name": "toolbox.open", "params": "NoParams", "result": "SessionAttach" },
     { "name": "toolbox.update", "params": "NoParams", "result": "ToolboxRun" },
-    { "name": "toolbox.rebuild", "params": "NoParams", "result": "ToolboxRun" }
+    { "name": "toolbox.rebuild", "params": "NoParams", "result": "ToolboxRun" },
+    { "name": "toolbox.logins", "params": "NoParams", "result": "ToolboxLogins" }
   ],
   "notifications": [
     { "name": "events.event", "params": "Event" }
@@ -70,7 +71,8 @@
     "WakeupKind": ["loop", "cron"],
     "StopReason": ["usage_limit"],
     "ToolboxState": ["unavailable", "closed", "open", "saving", "updating", "rebuilding"],
-    "ToolboxAction": ["shell", "update", "rebuild"]
+    "ToolboxAction": ["shell", "update", "rebuild"],
+    "LoginTool": ["gh", "gcloud", "git", "ssh"]
   },
   "types": {
     "Request": ["jsonrpc", "id", "method", "params"],
@@ -119,7 +121,9 @@
     "Wakeup": ["kind", "due_at", "certainty", "recurring", "reason"],
     "AgentList": ["agents"],
     "ToolboxStatus": ["state", "template", "home", "base", "newest_base", "last"],
-    "ToolboxRun": ["action", "at", "template", "uncovered", "error"]
+    "ToolboxRun": ["action", "at", "template", "uncovered", "error"],
+    "ToolboxLogins": ["home", "logins", "claude"],
+    "Login": ["tool", "account"]
   },
   "optional": {
     "Request": ["id", "params"],
@@ -167,7 +171,9 @@
     "Wakeup": ["due_at", "reason"],
     "AgentList": [],
     "ToolboxStatus": ["template", "home", "base", "newest_base", "last"],
-    "ToolboxRun": ["template", "error"]
+    "ToolboxRun": ["template", "error"],
+    "ToolboxLogins": ["home", "logins"],
+    "Login": []
   },
   "nested": {
     "HostList": { "hosts": "HostInfo" },
@@ -182,6 +188,7 @@
     "Agent": { "status": "AgentStatus" },
     "AgentStatus": { "pending_wakeups": "Wakeup" },
     "AgentList": { "agents": "Agent" },
-    "ToolboxStatus": { "last": "ToolboxRun" }
+    "ToolboxStatus": { "last": "ToolboxRun" },
+    "ToolboxLogins": { "logins": "Login" }
   }
 }

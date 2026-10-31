@@ -298,11 +298,12 @@ struct FooterView: View {
             .disabled(model.connection != .connected)
             Menu {
                 Button("Open Shell") { Task { await model.openToolbox() } }
-                    .disabled(!canOpenToolbox)
+                    .disabled(!model.toolboxCanOpen)
                 // In Terminal, as it can take many minutes and says how it goes.
                 Button("Rebuild Template") { model.runInTerminal(["toolbox", "rebuild"], exec: false) }
                     .disabled(model.toolbox?.state != .closed)
-                Button("See Logins") {}.disabled(true)
+                Button("See Logins…") { show(WindowID.logins, with: openWindow) }
+                    .disabled(model.toolbox == nil || model.toolbox?.state == .unavailable)
                 let lines = toolboxLines(model.toolbox)
                 if !lines.isEmpty {
                     Divider()
@@ -329,13 +330,6 @@ struct FooterView: View {
                 NSApplication.shared.terminate(nil)
             }
         }
-    }
-
-    /// The shell opens while the toolbox is closed or already open; an
-    /// update, a rebuild or a save holds it.
-    private var canOpenToolbox: Bool {
-        guard let state = model.toolbox?.state else { return false }
-        return state == .closed || state == .open
     }
 }
 
