@@ -216,7 +216,8 @@ fn launch_boots_and_starts_claude_with_the_token() {
             socket: socket.clone()
         }
     );
-    assert_eq!(s.fake.calls(), ["create", "boot", "launch"]);
+    // The clock is set as soon as the guest answers.
+    assert_eq!(s.fake.calls(), ["create", "boot", "clock", "launch"]);
     let launch = lock(&s.fake.state).launches[0].clone();
     assert_eq!(launch.command, ["claude", "--session-id", "s", "--", "hi"]);
     assert_eq!(launch.cwd.as_deref(), h.worktree.to_str());
@@ -399,7 +400,8 @@ fn a_command_runs_to_completion_inside_beside_claude() {
     assert_eq!(String::from_utf8(out.output).unwrap(), "installing\ndone\n");
     assert_eq!(
         s.fake.calls(),
-        ["create", "boot", "run"],
+        // The clock before `.vibe/setup.sh`, which comes before the launch.
+        ["create", "boot", "clock", "run"],
         "it boots the VM first"
     );
     let sent = lock(&s.fake.state).runs[0].clone();

@@ -347,7 +347,10 @@ async fn new_agents_get_what_the_toolbox_installed_and_sleeping_ones_keep_theirs
     fs::create_dir_all(layout.config_dir()).unwrap();
     fs::write(
         layout.toolbox_config(),
-        "packages = [\"tree\"]\n\n[update]\nrun = [\"touch /usr/local/bin/updated\"]\n",
+        // apt in the update's VM: its clock and network, which signatures
+        // and downloads need.
+        "packages = [\"tree\"]\n\n[update]\nrun = [\"apt-get update -q\", \
+         \"touch /usr/local/bin/updated\"]\n",
     )
     .unwrap();
     let run = w

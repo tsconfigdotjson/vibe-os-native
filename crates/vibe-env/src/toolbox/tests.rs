@@ -674,3 +674,86 @@ fn recipe_commands_and_inventories() {
         ["apt: htop", "npm: tsx"]
     );
 }
+
+#[test]
+fn the_clock_is_set_before_anything_runs() {
+    // Without it, apt finds Debian's signatures "not live" yet, and says
+    // the repository isn't signed (the fake guest fails runs the same).
+    let s = Setup::new();
+    answer(&s, |_| String::new(), None);
+    s.toolbox.update(&["apt-get update".into()]).unwrap();
+    let calls = s.calls();
+    let boot = calls.iter().position(|c| c == "boot").unwrap();
+    let clock = calls.iter().position(|c| c == "clock").unwrap();
+    let run = calls.iter().position(|c| c == "run").unwrap();
+    assert!(boot < clock && clock < run, "{calls:?}");
+    // The shell's VM too, and the rebuild's every boot.
+    s.session(|| {});
+    s.toolbox.rebuild(&Recipe::default()).unwrap();
+    let calls = s.calls();
+    let boots = calls.iter().filter(|c| *c == "boot").count();
+    let clocks = calls.iter().filter(|c| *c == "clock").count();
+    assert_eq!(boots, clocks, "{calls:?}");
+}
+
+#[test]
+fn updates_wait_for_the_network_and_give_up_saying_so() {
+    let s = Setup::new();
+    answer(&s, |_| String::new(), None);
+    // DHCP answers a few polls after the guest does.
+    s.fake.state.lock().unwrap().network_after = 3;
+    s.toolbox.update(&["true".into()]).unwrap();
+    assert_eq!(s.fake.state.lock().unwrap().network_after, 0);
+
+    let toolbox = Toolbox::new(s.layout.clone(), s.fake.clone(), token())
+        .with_network_patience(Duration::from_millis(300));
+    s.fake.state.lock().unwrap().network_after = u32::MAX;
+    let e = toolbox.update(&["true".into()]).unwrap_err();
+    assert!(e.message().contains("got no network"), "{e}");
+    assert!(e.message().contains("nothing was kept"), "{e}");
+    assert_eq!(toolbox.versions().template, Some(1));
+    assert!(!s.fake.vm(&s.socket()).running);
+}
+
+#[test]
+fn a_failed_command_says_what_it_printed() {
+    let s = Setup::new();
+    s.fake.state.lock().unwrap().run_handler = Some(Arc::new(|run, _| {
+        let output = (1..=25)
+            .map(|i| format!("line {i} of {}", run.command.join(" ")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        proto::Ran {
+            code: Some(100),
+            signal: None,
+            timed_out: false,
+            output,
+        }
+    }));
+    let e = s.toolbox.update(&["apt-get update".into()]).unwrap_err();
+    let text = e.message();
+    assert!(
+        text.contains("`apt-get update` exited with code 100:\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("line 25 of") && text.contains("line 6 of"),
+        "{text}"
+    );
+    assert!(!text.contains("line 5 of"), "the last 20 lines: {text}");
+    let log = s.working("run.log");
+    assert!(text.contains(&log.display().to_string()), "{text}");
+    let logged = fs::read_to_string(&log).unwrap();
+    assert!(
+        logged.starts_with("$ sudo -n -H /bin/bash -c apt-get update\n"),
+        "{logged}"
+    );
+    assert!(logged.contains("line 1 of") && logged.contains("line 25 of"));
+    // The next run's log starts afresh.
+    answer(&s, |_| String::new(), None);
+    s.toolbox.update(&["true".into()]).unwrap();
+    assert!(!fs::read_to_string(&log).unwrap().contains("line 1 of"));
+
+    assert_eq!(output_tail(""), "");
+    assert_eq!(output_tail("\n  \nE: x\n"), ":\nE: x");
+}

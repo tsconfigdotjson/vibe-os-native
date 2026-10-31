@@ -44,7 +44,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, TryLockError};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use vibe_core::claude_token::TOKEN_ENV;
@@ -72,6 +72,14 @@ const MEMORY: u64 = DEFAULT_PROFILE_MEMORY;
 
 /// How long a booting guest may take to answer.
 const BOOT_PATIENCE: Duration = Duration::from_secs(60);
+
+/// How long a booted guest may take to get its network (DHCP) before an
+/// update or a rebuild, which download.
+const NETWORK_PATIENCE: Duration = Duration::from_secs(60);
+
+/// How many of a failed command's last lines its error carries; the whole
+/// of what it printed is in `run.log`.
+const ERROR_LINES: usize = 20;
 
 /// How long a power-off may take before the VM is stopped outright.
 const POWEROFF_PATIENCE: Duration = Duration::from_secs(30);
@@ -154,6 +162,7 @@ pub struct Toolbox {
     machine: Arc<dyn Machine>,
     token: TokenSource,
     host_cpus: usize,
+    network_patience: Duration,
     /// Held while anything boots, closes or runs in the toolbox VM.
     busy: Mutex<()>,
 }
@@ -242,6 +251,25 @@ pub fn apt_commands(packages: &[String]) -> Vec<Vec<String>> {
     vec![apt(&["update", "-q"]), install]
 }
 
+/// The last [`ERROR_LINES`] lines `output` has, for an error: on lines of
+/// their own after a colon, or nothing if it printed nothing.
+pub fn output_tail(output: &str) -> String {
+    let lines: Vec<&str> = output
+        .lines()
+        .map(str::trim_end)
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    if lines.is_empty() {
+        return String::new();
+    }
+    let from = lines.len().saturating_sub(ERROR_LINES);
+    let tail: Vec<String> = lines[from..]
+        .iter()
+        .map(|l| l.chars().take(500).collect())
+        .collect();
+    format!(":\n{}", tail.join("\n"))
+}
+
 /// What the old template has that its base doesn't, and that the rebuilt
 /// template doesn't have either: what was installed by hand and the recipe
 /// doesn't cover.
@@ -274,8 +302,15 @@ impl Toolbox {
             machine,
             token,
             host_cpus: std::thread::available_parallelism().map_or(1, |n| n.get()),
+            network_patience: NETWORK_PATIENCE,
             busy: Mutex::new(()),
         }
+    }
+
+    /// Waits this long for the guest's network instead of a minute.
+    pub fn with_network_patience(mut self, patience: Duration) -> Toolbox {
+        self.network_patience = patience;
+        self
     }
 
     pub fn images(&self) -> &Images {
@@ -299,6 +334,11 @@ impl Toolbox {
             Kind::Template => "template.img",
             Kind::Home => "home.img",
         })
+    }
+
+    /// What the commands of the last update or rebuild printed, whole.
+    fn run_log(&self) -> PathBuf {
+        self.dir().join("run.log")
     }
 
     fn opened_path(&self) -> PathBuf {
@@ -532,7 +572,8 @@ impl Toolbox {
                     status.problems.join("; ")
                 )));
             }
-            Ok(())
+            // A VM has no clock of its own; TLS and apt's signatures need it.
+            self.machine.set_clock(&socket, SystemTime::now())
         })();
         if up.is_err() {
             let _ = self.machine.stop(&socket);
@@ -583,35 +624,65 @@ impl Toolbox {
         self.clean()
     }
 
-    /// Runs `argv` as `vibe` in the VM; an error names `what` and the last
-    /// line it printed.
+    /// Runs `argv` as `vibe` in the VM. What it printed is added to
+    /// `run.log`; an error names `what`, says how it ended, and carries the
+    /// last lines it printed.
     fn run(&self, what: &str, argv: Vec<String>, timeout: Duration) -> Result<String> {
         let ran = self.machine.run(
             &self.socket(),
             &proto::Run {
-                command: argv,
+                command: argv.clone(),
                 env: Default::default(),
                 cwd: Some("/".into()),
                 timeout_ms: timeout.as_millis() as u64,
             },
         )?;
+        let log = self.run_log();
+        let logged = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log)
+            .and_then(|mut f| {
+                use std::io::Write;
+                writeln!(f, "$ {}\n{}", argv.join(" "), ran.output.trim_end())
+            });
+        if let Err(e) = logged {
+            return Err(err(format!("can't write {}: {e}", log.display())));
+        }
         if ran.code == Some(0) {
             return Ok(ran.output);
         }
-        let last = ran
-            .output
-            .lines()
-            .map(str::trim)
-            .rfind(|l| !l.is_empty())
-            .map(|l| format!(": {}", l.chars().take(300).collect::<String>()))
-            .unwrap_or_default();
         let how = match (ran.timed_out, ran.code, ran.signal) {
             (true, _, _) => format!("didn't finish in {} minutes", timeout.as_secs() / 60),
             (_, Some(code), _) => format!("exited with code {code}"),
             (_, None, Some(signal)) => format!("was ended by {signal}"),
             _ => "failed".into(),
         };
-        Err(err(format!("{what} {how}{last}")))
+        Err(err(format!(
+            "{what} {how}{}\n(all it printed is in {})",
+            output_tail(&ran.output),
+            log.display()
+        )))
+    }
+
+    /// Waits for the guest's network, as an update or a rebuild downloads.
+    fn wait_network(&self) -> Result<()> {
+        let socket = self.socket();
+        let deadline = Instant::now() + self.network_patience;
+        loop {
+            let status = self.machine.status(&socket)?;
+            if status.network.is_some() {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(err(format!(
+                    "the toolbox VM got no network in {} s: {}",
+                    self.network_patience.as_secs(),
+                    status.problems.join("; ")
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
 
     fn inventory(&self) -> Result<BTreeSet<String>> {
@@ -657,6 +728,7 @@ impl Toolbox {
     ) -> Result<u32> {
         let result = (|| -> Result<u32> {
             self.boot(plan, host)?;
+            self.wait_network()?;
             work()?;
             self.seal_and_power_off(&["template"])?;
             let (n, _) = self.images.keep(
@@ -847,6 +919,7 @@ impl ToolboxHost for Toolbox {
             ));
         }
         self.refuse_if_unsaved("update")?;
+        remove_file(&self.run_log())?;
         let host = self.host_limits()?;
         let base = self.current_base()?;
         let plan = Plan {
@@ -879,6 +952,7 @@ impl ToolboxHost for Toolbox {
             ));
         }
         self.refuse_if_unsaved("rebuild")?;
+        remove_file(&self.run_log())?;
         let host = self.host_limits()?;
         let newest = self
             .images

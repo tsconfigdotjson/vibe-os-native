@@ -24,6 +24,8 @@ pub(crate) struct Vm {
     /// None: nothing launched; Some(None): running; Some(Some(code)): exited.
     pub(crate) session: Option<Option<i32>>,
     pub(crate) config: PathBuf,
+    /// Whether the host has set the guest's clock since it booted.
+    pub(crate) clock_set: bool,
 }
 
 #[derive(Default)]
@@ -44,6 +46,9 @@ pub(crate) struct State {
     pub(crate) seal_fails: bool,
     /// What the guest's status reports went wrong at boot.
     pub(crate) problems: Vec<String>,
+    /// How many more status calls report no network yet; `u32::MAX` for
+    /// never.
+    pub(crate) network_after: u32,
 }
 
 /// How a fake run goes, from what it was asked to run and the VM's
@@ -95,7 +100,12 @@ impl Fake {
         f(s.vms.entry(socket.to_owned()).or_default())
     }
 
-    fn status_of(vm: &Vm, unmounted: Option<&str>, problems: &[String]) -> guest::Status {
+    fn status_of(
+        vm: &Vm,
+        unmounted: Option<&str>,
+        problems: &[String],
+        network: bool,
+    ) -> guest::Status {
         let shares: Vec<_> = VmConfig::load(&vm.config)
             .map(|c| c.shares)
             .unwrap_or_default()
@@ -120,6 +130,7 @@ impl Fake {
                 .unwrap_or_default(),
             "shares": shares,
             "problems": problems,
+            "network": network.then(|| json!({"interface": "eth0", "address": "192.168.64.5/24"})),
         }))
         .unwrap()
     }
@@ -211,11 +222,20 @@ impl Machine for Fake {
         if !vm.running {
             return Err(refused("not running"));
         }
-        let (unmounted, problems) = {
-            let st = lock(&self.state);
-            (st.unmounted.clone(), st.problems.clone())
+        let (unmounted, problems, network) = {
+            let mut st = lock(&self.state);
+            let network = st.network_after == 0;
+            if st.network_after != u32::MAX {
+                st.network_after = st.network_after.saturating_sub(1);
+            }
+            (st.unmounted.clone(), st.problems.clone(), network)
         };
-        Ok(Fake::status_of(&vm, unmounted.as_deref(), &problems))
+        Ok(Fake::status_of(
+            &vm,
+            unmounted.as_deref(),
+            &problems,
+            network,
+        ))
     }
 
     fn launch(&self, socket: &Path, launch: &guest::Launch) -> Result<()> {
@@ -251,7 +271,11 @@ impl Machine for Fake {
     }
 
     fn thaw(&self, socket: &Path, _: SystemTime) -> Result<guest::Thawed> {
-        self.with(socket, "thaw", |vm| vm.frozen = false);
+        // A thaw sets the clock first.
+        self.with(socket, "thaw", |vm| {
+            vm.frozen = false;
+            vm.clock_set = true;
+        });
         Ok(serde_json::from_value(json!({"shares_ms": 900, "thaw_ms": 1})).unwrap())
     }
 
@@ -261,6 +285,17 @@ impl Machine for Fake {
             vm.session = None;
         });
         Ok(())
+    }
+
+    fn set_clock(&self, socket: &Path, _: SystemTime) -> Result<()> {
+        self.with(socket, "clock", |vm| {
+            if vm.running {
+                vm.clock_set = true;
+                Ok(())
+            } else {
+                Err(refused("not running"))
+            }
+        })
     }
 
     fn seal(&self, socket: &Path) -> Result<Vec<String>> {
@@ -291,6 +326,18 @@ impl Machine for Fake {
         let vm = st.vms.get(socket).cloned().unwrap_or_default();
         if !vm.running {
             return Err(refused("not running"));
+        }
+        // A guest whose clock was never set fails as apt does there.
+        if !vm.clock_set {
+            return Ok(proto::Ran {
+                code: Some(100),
+                signal: None,
+                timed_out: false,
+                output: "W: OpenPGP signature verification failed: Not live until 2026-10-31\n\
+                         E: The repository 'http://deb.debian.org/debian trixie InRelease' is \
+                         not signed.\n"
+                    .into(),
+            });
         }
         if let Some(handler) = st.run_handler.clone() {
             drop(st);
