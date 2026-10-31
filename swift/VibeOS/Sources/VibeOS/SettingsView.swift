@@ -442,9 +442,11 @@ struct LimitsTab: View {
     @ObservedObject var model: MenuModel
     @State private var host = VibeRPC.localHost
     @State private var limits: HostLimits?
-    @State private var fields: [String: String] = [:]
+    /// What each row's field says, in `rows` order.
+    @State private var fields: [String] = []
     @State private var error: String?
-    @State private var saved = false
+    /// The fields as last saved, to say so while they're unchanged.
+    @State private var saved: [String]?
 
     /// Each limit: its key in `host.toml`, a label, its kind, and its value.
     private struct Field {
@@ -486,11 +488,13 @@ struct LimitsTab: View {
             }
             .frame(maxWidth: 260)
             Form {
-                ForEach(rows, id: \.key) { row in
-                    LabeledContent(row.label) {
-                        TextField(row.key, text: binding(row.key))
-                            .frame(width: 120)
-                            .foregroundStyle(parse(row) == nil ? Color.red : Color.primary)
+                if fields.count == rows.count {
+                    ForEach(rows.indices, id: \.self) { i in
+                        LabeledContent(rows[i].label) {
+                            TextField(rows[i].key, text: $fields[i])
+                                .frame(width: 120)
+                                .foregroundStyle(parse(i) == nil ? Color.red : Color.primary)
+                        }
                     }
                 }
             }
@@ -499,19 +503,16 @@ struct LimitsTab: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
             HStack {
-                if saved { Text("Saved.").foregroundStyle(.secondary) }
+                if saved == fields { Text("Saved.").foregroundStyle(.secondary) }
                 Spacer()
                 Button("Revert") { display(limits) }
                 Button("Save") { Task { await save() } }
-                    .disabled(limits == nil || rows.contains { parse($0) == nil })
+                    .disabled(limits == nil || fields.count != rows.count || rows.indices.contains { parse($0) == nil })
             }
             ErrorText(error: error)
         }
         .task(id: "\(host)#\(model.settingsRevision)") { await load() }
-    }
-
-    private func binding(_ key: String) -> Binding<String> {
-        Binding(get: { fields[key] ?? "" }, set: { fields[key] = $0; saved = false })
+        .onChange(of: host) { saved = nil }
     }
 
     private func text(_ row: Field, _ value: Int) -> String {
@@ -522,9 +523,10 @@ struct LimitsTab: View {
         }
     }
 
-    private func parse(_ row: Field) -> Int? {
-        let text = fields[row.key] ?? ""
-        switch row.kind {
+    private func parse(_ i: Int) -> Int? {
+        guard fields.indices.contains(i) else { return nil }
+        let text = fields[i]
+        switch rows[i].kind {
         case .bytes: return parseBytes(text)
         case .count: return Int(text.trimmingCharacters(in: .whitespaces)).flatMap { $0 >= 0 ? $0 : nil }
         case .seconds: return parseSeconds(text)
@@ -533,7 +535,7 @@ struct LimitsTab: View {
 
     private func display(_ limits: HostLimits?) {
         guard let limits else { return }
-        for row in rows { fields[row.key] = text(row, limits[keyPath: row.value]) }
+        fields = rows.map { text($0, limits[keyPath: $0.value]) }
     }
 
     private func load() async {
@@ -550,8 +552,8 @@ struct LimitsTab: View {
     private func save() async {
         guard let limits else { return }
         var params = LimitsSetParams(host: host)
-        for row in rows {
-            guard let value = parse(row) else { return }
+        for (i, row) in rows.enumerated() {
+            guard let value = parse(i) else { return }
             if value != limits[keyPath: row.value] { params[keyPath: row.set] = value }
         }
         do {
@@ -559,7 +561,7 @@ struct LimitsTab: View {
             self.limits = fresh
             display(fresh)
             error = nil
-            saved = true
+            saved = fields
         } catch {
             self.error = describe(error)
         }

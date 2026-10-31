@@ -25,11 +25,13 @@ enum WindowID {
 /// from vibed over the socket, and quitting it leaves vibed and every agent
 /// running.
 struct VibeOSApp: App {
-    @StateObject private var model: MenuModel = {
+    @StateObject private var model: MenuModel
+
+    init() {
         let model = MenuModel(daemon: VibedClient(), terminal: AppleScriptTerminal(), notifier: UserNotifier())
         model.start()
-        return model
-    }()
+        _model = StateObject(wrappedValue: model)
+    }
 
     var body: some Scene {
         MenuBarExtra {

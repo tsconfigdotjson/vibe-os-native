@@ -307,20 +307,20 @@ import VibeRPC
 }
 
 @Suite @MainActor struct ModelTests {
-    func makeModel(_ daemon: FakeDaemon, terminal: FakeTerminal = FakeTerminal(), notifier: FakeNotifier? = nil)
+    func makeModel(_ daemon: FakeDaemon, terminal: FakeTerminal? = nil, notifier: FakeNotifier? = nil)
         -> MenuModel
     {
         // A poll that never comes, so only events move the menu.
         let model = MenuModel(
-            daemon: daemon, terminal: terminal, notifier: notifier, vibePath: "/usr/local/bin/vibe", socket: nil,
+            daemon: daemon, terminal: terminal ?? FakeTerminal(), notifier: notifier, vibePath: "/usr/local/bin/vibe", socket: nil,
             openPoll: .seconds(3600), closedPoll: .seconds(3600), endOfTurn: { true })
         return model
     }
 
     @Test func theMenuTracksStateChangesLive() async throws {
-        var agents = [agentJSON("quiet-amber-otter", state: .busy)]
+        let agents = Box([agentJSON("quiet-amber-otter", state: .busy)])
         let daemon = fakeDaemon()
-        daemon.on(AgentsList.name) { _ in ["agents": agents] }
+        daemon.on(AgentsList.name) { _ in ["agents": agents.value] }
         let notifier = FakeNotifier()
         let model = makeModel(daemon, notifier: notifier)
         model.start()
@@ -350,13 +350,13 @@ import VibeRPC
         await eventually("the status") { model.agents.first?.status.line == "$ npm test" }
 
         // A new agent, and a paused one: read again.
-        agents.append(agentJSON("brave-copper-lynx", state: .paused))
+        agents.value.append(agentJSON("brave-copper-lynx", state: .paused))
         daemon.send(.event(try event(.agentAdded, ref: "brave-copper-lynx", seq: 4, extra: ["state": "busy"])))
         await eventually("the new agent") { model.agents.count == 2 }
         #expect(model.icon.paused)
 
         // A deleted one goes.
-        agents.removeFirst()
+        agents.value.removeFirst()
         daemon.send(.event(try event(.agentDeleted, ref: "quiet-amber-otter", seq: 5)))
         await eventually("the delete") { model.agents.map(\.ref) == ["brave-copper-lynx"] }
     }
@@ -397,10 +397,10 @@ import VibeRPC
     }
 
     @Test func aHostThatsDownKeepsItsRowsUnavailable() async throws {
-        var vpsLink = HostLink.connected
+        let vpsLink = Box(HostLink.connected)
         let daemon = fakeDaemon(agents: ["local": [agentJSON("a")], "vps": [agentJSON("b", host: "vps")]])
         daemon.on(HostsList.name) { _ in
-            ["hosts": [hostJSON("local", mcp: true), hostJSON("vps", link: vpsLink, external: true)]]
+            ["hosts": [hostJSON("local", mcp: true), hostJSON("vps", link: vpsLink.value, external: true)]]
         }
         let model = makeModel(daemon)
         await model.refresh()
@@ -412,7 +412,7 @@ import VibeRPC
         // Down, it isn't asked; its rows stay as they were, unavailable.
         let askedVps = { daemon.params(of: AgentsList.name).filter { ($0["host"] as? String) == "vps" }.count }
         let asked = askedVps()
-        vpsLink = .down
+        vpsLink.value = .down
         await model.refresh()
         #expect(model.agents.map(\.key) == ["local:a", "vps:b"])
         #expect(model.unavailableHosts == ["vps"])
@@ -482,16 +482,16 @@ import VibeRPC
     }
 
     @Test func interruptAndDelete() async throws {
-        var listed = [agentJSON("a")]
+        let listed = Box([agentJSON("a")])
         let daemon = fakeDaemon()
-        daemon.on(AgentsList.name) { _ in ["agents": listed] }
+        daemon.on(AgentsList.name) { _ in ["agents": listed.value] }
         daemon.on(AgentsInterrupt.name) { _ in agentJSON("a", activity: .interrupted) }
         daemon.on(AgentsDelete.name) { params in
             if params["force"] == nil {
                 throw VibedClientError.rpc(
                     RPCError(code: RPCErrorCode.conflict.rawValue, message: "a has unsaved work"))
             }
-            listed = []
+            listed.value = []
             return agentJSON("a", state: .exited)
         }
         let model = makeModel(daemon)

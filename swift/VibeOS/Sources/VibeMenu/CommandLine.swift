@@ -8,7 +8,7 @@ import VibeRPC
 @MainActor
 public enum AttachCommandLine {
     /// The refs to attach, if the arguments ask for any.
-    public static func refs(in arguments: [String]) -> [String]? {
+    public nonisolated static func refs(in arguments: [String]) -> [String]? {
         var refs: [String] = []
         var i = arguments.startIndex
         while i < arguments.endIndex {
@@ -23,9 +23,11 @@ public enum AttachCommandLine {
     }
 
     public static func run(
-        refs: [String], daemon: any DaemonConnection = VibedClient(),
-        terminal: TerminalScripting = AppleScriptTerminal(vibePath: defaultVibePath())
+        refs: [String], daemon: any DaemonConnection = VibedClient(), terminal: TerminalScripting? = nil
     ) -> Int32 {
+        // Made here, not as a default: a default argument is evaluated off
+        // the main actor.
+        let terminal = terminal ?? AppleScriptTerminal()
         let attacher = Attacher(terminal: terminal, vibePath: defaultVibePath(), socket: attachSocket())
         for ref in refs {
             do {

@@ -57,9 +57,25 @@ func event(_ kind: EventKind, ref: String? = nil, host: String = "local", seq: I
     return try decode(DaemonEvent.self, object)
 }
 
+/// A value tests change while a fake reads it from another thread.
+final class Box<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: Value
+
+    init(_ value: Value) {
+        stored = value
+    }
+
+    var value: Value {
+        get { lock.withLock { stored } }
+        set { lock.withLock { stored = newValue } }
+    }
+}
+
 /// vibed: each method answers from a handler given the params as JSON.
 final class FakeDaemon: DaemonConnection, @unchecked Sendable {
-    typealias Handler = ([String: Any]) throws -> [String: Any]
+    /// Runs on the thread the call is made on, off the main actor.
+    typealias Handler = @Sendable ([String: Any]) throws -> [String: Any]
 
     private let lock = NSLock()
     private var handlers: [String: Handler] = [:]
