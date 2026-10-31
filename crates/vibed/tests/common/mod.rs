@@ -297,9 +297,11 @@ impl Golden {
         config.label = "mac-mini".into();
         config.gh = self.gh.clone().into();
         config.shim = workspace_bin("vibe-shim").into_os_string();
-        config.backends = Backends::all(Arc::new(Seeding(
-            TestBackend::new(&self.claude).reporting_memory(AGENT_MEMORY_USED),
-        )));
+        config.backends = Backends::all(Arc::new(Seeding {
+            backend: TestBackend::new(&self.claude).reporting_memory(AGENT_MEMORY_USED),
+            run: Layout::new(&self.home, "macos").run_dir(),
+            settled: std::sync::atomic::AtomicBool::new(false),
+        }));
         config.toolbox = Some(Arc::new(
             TestToolbox::new(
                 Layout::new(&self.home, "macos"),
@@ -370,16 +372,59 @@ pub fn kill_shims(run: &Path) {
 
 /// The golden world's backend: the test backend, but `dark-mode-review`'s
 /// Claude home has a turn in its transcript before its Claude starts, so
-/// its conversation reads the same every time.
+/// its conversation reads the same every time. And the first time its
+/// memory is measured, as `agents.list` does just before the examples read
+/// its screen, it waits for that screen to be the one they read: the
+/// stand-in for Claude prints a moment after its session starts, and how
+/// long a moment depends on the machine (a shell starts slower on macOS).
 #[derive(Debug)]
-pub struct Seeding(pub TestBackend);
+pub struct Seeding {
+    pub backend: TestBackend,
+    /// Where its shims serve their sockets.
+    pub run: PathBuf,
+    settled: std::sync::atomic::AtomicBool,
+}
+
+/// What `dark-mode-review`'s stand-in for Claude shows once it's up, which
+/// `83a-agents-output.json` reads.
+const SETTLED_SCREEN: &str = "Ready.";
+
+impl Seeding {
+    /// Waits, once, up to 20 s, for `dark-mode-review`'s screen to show the
+    /// stand-in up and waiting.
+    fn settle(&self, agent: &str) {
+        use std::sync::atomic::Ordering;
+        if agent != "dark-mode-review" || self.settled.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let socket = self.run.join(format!("{agent}.sock"));
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut last = String::new();
+        while Instant::now() < deadline {
+            let read = vibe_core::shim::connect(
+                &socket,
+                &vibe_core::shim::control_hello("golden"),
+                Duration::from_secs(2),
+            )
+            .and_then(|mut c| Ok(c.read_output(None)?));
+            if let Ok(out) = read {
+                if out.screen.contains(SETTLED_SCREEN) {
+                    return;
+                }
+                last = out.screen;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("{agent}'s stand-in never showed {SETTLED_SCREEN:?}; its screen: {last:?}");
+    }
+}
 
 /// The session `dark-mode-review` gets in the examples.
 pub const SEEDED_SESSION: &str = "60616263-6465-4667-a869-6a6b6c6d6e6f";
 
 impl vibe_env::Compartment for Seeding {
     fn create(&self, spec: &vibe_env::AgentSpec) -> vibe_env::Result<vibe_env::Handle> {
-        let h = self.0.create(spec)?;
+        let h = self.backend.create(spec)?;
         if spec.agent_ref == "dark-mode-review" {
             let path = h.claude.transcript(&spec.worktree, SEEDED_SESSION);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -410,47 +455,48 @@ impl vibe_env::Compartment for Seeding {
         h: &vibe_env::Handle,
         run: &vibe_env::Run,
     ) -> vibe_env::Result<vibe_env::RunOutput> {
-        self.0.run(h, run)
+        self.backend.run(h, run)
     }
     fn launch(
         &self,
         h: &vibe_env::Handle,
         l: &vibe_env::Launch,
     ) -> vibe_env::Result<vibe_env::TerminalEnd> {
-        self.0.launch(h, l)
+        self.backend.launch(h, l)
     }
     fn processes(&self, h: &vibe_env::Handle) -> vibe_env::Result<Vec<vibe_env::Proc>> {
-        self.0.processes(h)
+        self.backend.processes(h)
     }
     fn stop(&self, h: &vibe_env::Handle) -> vibe_env::Result<()> {
-        self.0.stop(h)
+        self.backend.stop(h)
     }
     fn delete(&self, h: &vibe_env::Handle) -> vibe_env::Result<()> {
-        self.0.delete(h)
+        self.backend.delete(h)
     }
 }
 
 impl vibe_env::Limiter for Seeding {
     fn apply(&self, h: &vibe_env::Handle, limits: &vibe_env::Limits) -> vibe_env::Result<()> {
-        self.0.apply(h, limits)
+        self.backend.apply(h, limits)
     }
     fn usage(&self, h: &vibe_env::Handle) -> vibe_env::Result<vibe_env::Usage> {
-        self.0.usage(h)
+        self.settle(&h.agent_ref);
+        self.backend.usage(h)
     }
 }
 
 impl vibe_env::Sleeper for Seeding {
     fn sleep(&self, h: &vibe_env::Handle) -> vibe_env::Result<()> {
-        self.0.sleep(h)
+        self.backend.sleep(h)
     }
     fn wake(&self, h: &vibe_env::Handle) -> vibe_env::Result<vibe_env::Woke> {
-        self.0.wake(h)
+        self.backend.wake(h)
     }
 }
 
 impl vibe_env::Backend for Seeding {
     fn capabilities(&self) -> vibe_env::Capabilities {
-        self.0.capabilities()
+        self.backend.capabilities()
     }
 }
 
