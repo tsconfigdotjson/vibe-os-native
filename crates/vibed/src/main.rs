@@ -12,6 +12,8 @@ use tokio::net::UnixListener;
 use tokio::signal::unix::{SignalKind, signal};
 use vibe_core::paths::{self, Layout};
 use vibe_core::rpc::MAX_MESSAGE_BYTES;
+use vibe_env::testing::TestBackend;
+use vibed::agents::Backends;
 use vibed::core::{Config, Core, DaemonInfo};
 use vibed::{logging, server};
 
@@ -32,10 +34,17 @@ options:
 environment:
   VIBE_GH         the gh to run (default: gh on PATH)
   VIBE_SHIM       the vibe-shim to start sessions with (default: the one
-                  beside vibed, or on PATH)";
+                  beside vibed, or on PATH)
+  VIBE_TEST_BACKEND
+                  for tests only: run every environment's agents natively,
+                  unlimited but for a supervisor, with this program as
+                  Claude Code";
 
 /// How often `gh auth status` runs (PRD: Auth, security and trust).
 const GH_CHECK_EVERY: Duration = Duration::from_secs(60 * 60);
+
+/// How often projects whose agents are all at rest get `git maintenance`.
+const MAINTENANCE_EVERY: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Debug, PartialEq, Eq)]
 enum Args {
@@ -134,6 +143,14 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
     if let Some(shim) = std::env::var_os("VIBE_SHIM").filter(|v| !v.is_empty()) {
         config.shim = shim;
     }
+    if let Some(claude) = std::env::var_os("VIBE_TEST_BACKEND").filter(|v| !v.is_empty()) {
+        vibed::log!(
+            "vibed: VIBE_TEST_BACKEND is set: agents run under the test backend, with {} as \
+             Claude Code",
+            PathBuf::from(&claude).display()
+        );
+        config.backends = Backends::all(Arc::new(TestBackend::new(PathBuf::from(claude))));
+    }
     let gh: OsString = config.gh.clone();
     let core = Arc::new(Core::open(config)?);
     vibed::log!(
@@ -155,6 +172,7 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
         })
     };
     let gh_checks = core.spawn_gh_checks(GH_CHECK_EVERY);
+    let maintenance = core.spawn_maintenance(MAINTENANCE_EVERY);
     vibed::log!(
         "vibed {} listening on {}",
         env!("CARGO_PKG_VERSION"),
@@ -168,6 +186,7 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
     };
     server::serve(listener, core, MAX_MESSAGE_BYTES, shutdown).await;
     gh_checks.abort();
+    maintenance.abort();
     adopting.abort();
     drop(guard);
     vibed::log!("vibed: stopped");

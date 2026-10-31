@@ -1,7 +1,8 @@
 //! The core handlers: the one implementation the socket, and through it the
 //! CLI, the menu bar and MCP, all call (PRD: One core, three doors). It owns
 //! the registry, host limits, API keys, the `gh` login check, the event
-//! stream, and finding the sessions agents run in.
+//! stream, and finding the sessions agents run in. Agents themselves are in
+//! [`crate::agents`].
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
@@ -30,6 +31,7 @@ use vibe_core::rpc::{
 use vibe_core::store::{NewProject, Store, StoreError};
 use vibe_core::time::rfc3339;
 
+use crate::agents::{Admission, Backends, HostAdmission};
 use crate::sessions::{self, Probe, SessionSpec};
 use crate::{gh, projects};
 
@@ -72,6 +74,10 @@ pub struct Config {
     pub shim: OsString,
     pub clock: Clock,
     pub entropy: Entropy,
+    /// What runs agents, by environment.
+    pub backends: Backends,
+    /// Whether a new agent may start.
+    pub admission: Arc<dyn Admission>,
 }
 
 impl std::fmt::Debug for Config {
@@ -82,13 +88,17 @@ impl std::fmt::Debug for Config {
             .field("layout", &self.layout)
             .field("gh", &self.gh)
             .field("shim", &self.shim)
+            .field("backends", &self.backends)
+            .field("admission", &self.admission)
             .finish_non_exhaustive()
     }
 }
 
 impl Config {
     /// The real thing: the system clock, the OS's randomness, the `gh`
-    /// [`find_program`] finds and the `vibe-shim` [`find_shim`] finds.
+    /// [`find_program`] finds, the `vibe-shim` [`find_shim`] finds, and
+    /// admission by this machine's memory. No backends yet: those come with
+    /// each environment's own (#9, #11, #17).
     pub fn new(info: DaemonInfo, layout: Layout) -> Self {
         let path = std::env::var_os("PATH");
         Config {
@@ -99,6 +109,8 @@ impl Config {
             shim: find_shim(std::env::current_exe().ok().as_deref(), path.as_deref()),
             clock: Arc::new(vibe_core::time::now),
             entropy: Arc::new(keys::random_bytes),
+            backends: Backends::new(),
+            admission: Arc::new(HostAdmission::current()),
         }
     }
 }
@@ -191,11 +203,24 @@ struct EventBus {
 pub struct Core {
     info: DaemonInfo,
     label: String,
-    layout: Layout,
+    pub(crate) layout: Layout,
     gh: OsString,
-    shim: OsString,
+    pub(crate) shim: OsString,
     clock: Clock,
     entropy: Entropy,
+    pub(crate) backends: Backends,
+    pub(crate) admission: Arc<dyn Admission>,
+    /// Refs being started, deleted or resumed, one thing at a time each.
+    pub(crate) agents_busy: Mutex<HashSet<String>>,
+    /// One edit of Claude's state at a time: agents may share its file.
+    pub(crate) claude_lock: Arc<Mutex<()>>,
+    /// One admission at a time, so two starts can't both take the last room.
+    pub(crate) admitting: tokio::sync::Mutex<()>,
+    /// The memory of starts admitted but not yet running, by a token each.
+    pub(crate) starting: Mutex<HashMap<u64, u64>>,
+    /// One fetch at a time per project, as concurrent fetches of the same
+    /// refs fail on each other's locks.
+    pub(crate) fetching: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     store: Mutex<Store>,
     /// One `host.toml` edit at a time.
     limits_lock: Mutex<()>,
@@ -217,17 +242,17 @@ impl std::fmt::Debug for Core {
     }
 }
 
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     // A handler that panicked mid-way leaves nothing half-done that matters
     // here: the store's transactions roll back on their own.
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn error(code: ErrorCode, message: impl Into<String>) -> ErrorObject {
+pub(crate) fn error(code: ErrorCode, message: impl Into<String>) -> ErrorObject {
     ErrorObject::new(code, message)
 }
 
-fn store_error(e: StoreError) -> ErrorObject {
+pub(crate) fn store_error(e: StoreError) -> ErrorObject {
     match e {
         StoreError::NotFound(m) => error(ErrorCode::NotFound, m),
         StoreError::Conflict(m) => error(ErrorCode::Conflict, m),
@@ -243,7 +268,7 @@ fn limits_error(e: LimitsError) -> ErrorObject {
     }
 }
 
-fn invalid(message: impl std::fmt::Display) -> ErrorObject {
+pub(crate) fn invalid(message: impl std::fmt::Display) -> ErrorObject {
     error(
         ErrorCode::InvalidParams,
         format!("Invalid params: {message}"),
@@ -302,6 +327,13 @@ impl Core {
             shim: config.shim,
             clock: config.clock,
             entropy: config.entropy,
+            backends: config.backends,
+            admission: config.admission,
+            agents_busy: Mutex::new(HashSet::new()),
+            claude_lock: Arc::new(Mutex::new(())),
+            admitting: tokio::sync::Mutex::new(()),
+            starting: Mutex::new(HashMap::new()),
+            fetching: Mutex::new(HashMap::new()),
             store: Mutex::new(store),
             limits_lock: Mutex::new(()),
             adding: Mutex::new(HashSet::new()),
@@ -327,17 +359,32 @@ impl Core {
         &self.layout
     }
 
-    fn now(&self) -> i64 {
+    pub(crate) fn now(&self) -> i64 {
         (self.clock)()
     }
 
-    fn store(&self) -> MutexGuard<'_, Store> {
+    pub(crate) fn store(&self) -> MutexGuard<'_, Store> {
         lock(&self.store)
+    }
+
+    /// 32 random bytes, from the same source as API keys.
+    pub(crate) fn random(&self) -> Result<[u8; keys::KEY_BYTES], ErrorObject> {
+        (self.entropy)().map_err(|e| {
+            error(
+                ErrorCode::InternalError,
+                format!("Internal error: no randomness: {e}"),
+            )
+        })
+    }
+
+    pub(crate) fn random_16(&self) -> Result<[u8; 16], ErrorObject> {
+        let bytes = self.random()?;
+        Ok(std::array::from_fn(|i| bytes[i]))
     }
 
     /// The host a call is for. Absent means this one. Calls for other hosts
     /// are forwarded once #16 links them; until then there are none.
-    fn host(&self, host: Option<&str>) -> Result<&'static str, ErrorObject> {
+    pub(crate) fn host(&self, host: Option<&str>) -> Result<&'static str, ErrorObject> {
         match host {
             None | Some(LOCAL_HOST) => Ok(LOCAL_HOST),
             Some(other) => Err(error(ErrorCode::NotFound, format!("no host named {other}"))),
@@ -593,12 +640,7 @@ impl Core {
 
     pub fn create_key(&self, p: KeyCreateParams) -> Result<KeyCreated, ErrorObject> {
         validate_key_name(&p.name).map_err(invalid)?;
-        let bytes = (self.entropy)().map_err(|e| {
-            error(
-                ErrorCode::InternalError,
-                format!("Internal error: no randomness: {e}"),
-            )
-        })?;
+        let bytes = self.random()?;
         let secret = keys::encode(&bytes);
         let key = self
             .store()
@@ -754,6 +796,7 @@ impl Core {
     /// Finds the sessions that kept running while `vibed` was down, as on
     /// every start (PRD: Restarts), and returns how many there are.
     pub async fn adopt_sessions(&self) -> usize {
+        self.undo_cut_short_starts().await;
         let mut adopted = 0;
         for (r, probe) in self.scan_sessions().await {
             if let Probe::Running(status) = probe {
@@ -766,6 +809,7 @@ impl Core {
                 );
             }
         }
+        self.hold_agents_to_limits().await;
         adopted
     }
 

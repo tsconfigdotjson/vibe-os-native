@@ -317,6 +317,12 @@ async fn every_per_host_method_refuses_an_unknown_host() {
         ("profiles.delete", json!({"project": "x", "profile": "y"})),
         ("limits.get", json!({})),
         ("limits.set", json!({"cpu_cores": 2})),
+        (
+            "agents.start",
+            json!({"project": "x", "profile": "y", "prompt": "z"}),
+        ),
+        ("agents.list", json!({})),
+        ("agents.delete", json!({"ref": "x"})),
     ] {
         let mut params = params;
         params["host"] = json!("vps");
@@ -350,12 +356,18 @@ async fn projects_with_agents_cannot_be_removed() {
                 project: "app".into(),
                 profile: "software-eng-linux".into(),
                 environment: vibe_core::model::Environment::Linux,
+                model: vibe_core::model::Model::Opus,
+                reasoning: vibe_core::model::Reasoning::High,
+                mode: vibe_core::model::Mode::Auto,
+                memory: 1 << 30,
                 worktree: "/w".into(),
                 branch: "quiet-amber-otter".into(),
                 session_id: "s".into(),
                 shim_socket: None,
-                state: "idle".into(),
+                state: vibe_core::model::AgentState::Idle,
                 created_at: 0,
+                compartment: "{}".into(),
+                starting: false,
             })
             .unwrap();
     }

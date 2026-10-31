@@ -11,7 +11,7 @@ use vibed::dispatch::{Session, handle_message};
 
 #[tokio::test]
 async fn dispatcher_answers_every_example_exactly() {
-    let golden = Golden::new().with_sessions();
+    let golden = Golden::new().for_examples();
     let core = golden.core();
     let mut session = Session::default();
     let mut events = None;
@@ -38,7 +38,7 @@ async fn dispatcher_answers_every_example_exactly() {
 
 #[tokio::test]
 async fn socket_answers_every_example_exactly() {
-    let golden = Golden::new().with_sessions();
+    let golden = Golden::new().for_examples();
     let server = serve(
         golden.core(),
         tempfile::tempdir().unwrap(),

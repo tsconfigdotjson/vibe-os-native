@@ -5,11 +5,11 @@
 use serde_json::Value;
 use tokio::sync::broadcast;
 use vibe_core::rpc::{
-    ErrorCode, ErrorObject, Event, EventsSubscribe, GhStatusGet, Hello, HelloParams, HelloResult,
-    HostsList, Id, KeysCreate, KeysList, KeysRevoke, KeysVerify, LimitsGet, LimitsSet, Method,
-    PROTOCOL_VERSION, ProfilesCreate, ProfilesDelete, ProfilesList, ProfilesUpdate, ProjectsAdd,
-    ProjectsList, ProjectsRemove, ProtocolMismatchData, Request, Response, SessionsAttach,
-    SessionsList, Subscribed,
+    AgentsDelete, AgentsList, AgentsStart, ErrorCode, ErrorObject, Event, EventsSubscribe,
+    GhStatusGet, Hello, HelloParams, HelloResult, HostsList, Id, KeysCreate, KeysList, KeysRevoke,
+    KeysVerify, LimitsGet, LimitsSet, Method, PROTOCOL_VERSION, ProfilesCreate, ProfilesDelete,
+    ProfilesList, ProfilesUpdate, ProjectsAdd, ProjectsList, ProjectsRemove, ProtocolMismatchData,
+    Request, Response, SessionsAttach, SessionsList, Subscribed,
 };
 
 use crate::core::Core;
@@ -166,6 +166,11 @@ async fn call(
         SessionsList::NAME => encode_result(core.sessions(decode::<SessionsList>(params)?).await),
         SessionsAttach::NAME => {
             encode_result(core.attach_session(decode::<SessionsAttach>(params)?).await)
+        }
+        AgentsStart::NAME => encode_result(core.start_agent(decode::<AgentsStart>(params)?).await),
+        AgentsList::NAME => encode_result(core.agents(decode::<AgentsList>(params)?).await),
+        AgentsDelete::NAME => {
+            encode_result(core.delete_agent(decode::<AgentsDelete>(params)?).await)
         }
         _ => Err(ErrorObject::new(
             ErrorCode::MethodNotFound,

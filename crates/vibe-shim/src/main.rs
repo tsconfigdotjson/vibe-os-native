@@ -43,7 +43,8 @@ Starts COMMAND on a new terminal in a detached session, serves that terminal
 on the Unix socket PATH for `vibe attach` and vibed, prints the shim's pid
 once COMMAND is running, and exits. vibed starts shims; run one by hand only
 to test. When COMMAND exits, the shim writes session.json in DIR, removes
-the socket and exits too. Its log is shim.log in DIR.
+the socket and exits too. Its log is shim.log in DIR, and COMMAND's TMPDIR is
+tmp/ in DIR.
 
 With --vm, the command is a linux agent's, already running in its VM: the
 shim serves vibe-guest's terminal, reached through the vibe-vm serving
@@ -457,7 +458,15 @@ fn start_command(options: &Options, cwd: &std::path::Path) -> Result<Started, St
         .iter()
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
-    let pty = pty::spawn(&options.command, cwd, options.size)
+    // The agent's temp files stay with the rest of what VibeOS keeps of
+    // it, so deleting the agent takes them too (PRD: Delete).
+    let tmp = options.state.join(vibe_core::paths::TMP_DIR);
+    DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&tmp)
+        .map_err(|e| format!("can't create {}: {e}", tmp.display()))?;
+    let pty = pty::spawn(&options.command, cwd, &tmp, options.size)
         .map_err(|e| format!("can't start {}: {e}", command[0]))?;
     Ok(Started {
         child_pid: pty.child.id(),

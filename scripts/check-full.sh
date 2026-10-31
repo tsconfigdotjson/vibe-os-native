@@ -12,6 +12,11 @@
 #     a host limit, restart vibed, and find all of it
 #   - sessions: a shell held by vibe-shim keeps running when vibed is killed,
 #     a new vibed adopts it again, and `vibe ls` shows it, then its exit
+#   - agents through `vibe rpc`, on vibe-env's test backend with its stand-in
+#     for Claude Code: a start makes the worktree, the branch and the
+#     transcript where Claude writes it; the agent outlives a killed vibed;
+#     a delete is refused while a commit is unpushed, and once it's pushed,
+#     leaves nothing behind but the branch
 #   - both Swift packages (swift/VibeOS, swift/vibe-vm): build and test,
 #     including the Swift half of the Rust<->Swift contract test
 #   - ad hoc signing, with the virtualization entitlement on vibe-vm
@@ -64,6 +69,9 @@ cleanup() {
   if [ -f "$WORK/pids" ]; then
     while read -r pid; do kill "$pid" 2>/dev/null; done <"$WORK/pids"
   fi
+  # Anything else started on WORK's files, such as an agent's shim that a
+  # failed step left running; killing a shim hangs up its command.
+  pkill -KILL -f "$WORK/" 2>/dev/null
   rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -317,6 +325,95 @@ s_sessions() {
   stop_vibed
 }
 
+# json_field <text> <id> <field>: the first string <field> in the reply to
+# request <id>.
+json_field() {
+  printf '%s\n' "$1" | grep "\"id\":$2[,}]" | grep -o "\"$3\":\"[^\"]*\"" | head -n 1 | cut -d '"' -f 4
+}
+
+# wait_file <path>: up to 20 s for <path> to exist.
+wait_file() {
+  local i
+  for i in $(seq 1 200); do
+    [ -e "$1" ] && return 0
+    sleep 0.1
+  done
+  echo "$1 never appeared"
+  return 1
+}
+
+s_agents() {
+  # A short directory: a session's socket is under its home's Library on a
+  # Mac, and the whole path must fit in 104 bytes.
+  local socket="$WORK/ag/run/vibed.sock" home="$WORK/ag/home" origin="$WORK/ag/origin"
+  local repo="$WORK/ag/src/app" ref worktree session transcript i left run
+  if [ "$OS" = Darwin ]; then
+    run="$home/Library/Application Support/VibeOS/run"
+  else
+    run="$home/.local/share/vibeos/run"
+  fi
+  git init -q "$origin"
+  git -C "$origin" -c user.name=t -c user.email=t@example.com commit -q --allow-empty -m first
+  git clone -q "$origin" "$repo"
+  # The stand-in for Claude Code: on the prompt "commit" it commits on its
+  # branch, and stays until it's hung up.
+  export VIBE_TEST_BACKEND="$ROOT/crates/vibe-env/src/stand-in.sh"
+  start_vibed "$socket" "$WORK/ag-vibed-1.log"
+  # 1G agents and nothing kept back, so one fits on any machine.
+  out=$(rpc \
+    "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"projects.add\",\"params\":{\"path\":\"$repo\"}}" \
+    '{"jsonrpc":"2.0","id":2,"method":"profiles.update","params":{"project":"app","profile":"software-eng-linux","memory":1073741824}}' \
+    '{"jsonrpc":"2.0","id":3,"method":"limits.set","params":{"reserve_memory":0}}' \
+    '{"jsonrpc":"2.0","id":4,"method":"agents.start","params":{"project":"app","profile":"software-eng-linux","prompt":"commit"}}')
+  echo "start: $out"
+  case $out in *'"error"'*) echo "a call failed"; return 1 ;; esac
+  ref=$(json_field "$out" 4 ref)
+  worktree=$(json_field "$out" 4 worktree)
+  session=$(json_field "$out" 4 session_id)
+  echo "agent $ref in $worktree, session $session"
+  [ -n "$ref" ] && [ -d "$worktree" ] || { echo "no worktree"; return 1; }
+  [ "$(git -C "$worktree" rev-parse --abbrev-ref HEAD)" = "$ref" ] || { echo "not on its branch"; return 1; }
+  # Its transcript, where Claude Code writes it: its Claude home's
+  # projects/, in a directory named after the worktree, by session id.
+  transcript="$home/VibeOS/agents/$ref/claude/projects/$(printf '%s' "$worktree" | tr -c 'A-Za-z0-9' '-')/$session.jsonl"
+  wait_file "$transcript"
+  grep -q "\"sessionId\":\"$session\"" "$transcript"
+  for i in $(seq 1 200); do
+    [ "$(git -C "$repo" log -1 --format=%s "$ref")" = work ] && break
+    sleep 0.1
+  done
+  [ "$(git -C "$repo" log -1 --format=%s "$ref")" = work ] || { echo "the agent never committed"; return 1; }
+
+  # Killed mid-work, vibed takes nothing with it.
+  kill -KILL "$VIBED_PID"
+  wait "$VIBED_PID" 2>/dev/null || true
+  start_vibed "$socket" "$WORK/ag-vibed-2.log"
+  # The killed one's socket is still there until the new one replaces it.
+  wait_for "$WORK/ag-vibed-2.log" "listening on"
+  out=$(rpc '{"jsonrpc":"2.0","id":5,"method":"agents.list","params":{}}')
+  echo "after a restart: $out"
+  expect "\"ref\":\"$ref\"" "the agent"
+  expect '"state":"busy"' "its running session"
+
+  out=$(rpc "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"agents.delete\",\"params\":{\"ref\":\"$ref\"}}")
+  echo "delete with an unpushed commit: $out"
+  expect "1 commit that isn't pushed" "the refusal"
+  [ -d "$worktree" ] || { echo "the refused delete removed the worktree"; return 1; }
+
+  git -C "$worktree" push -q origin "$ref"
+  out=$(rpc "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"agents.delete\",\"params\":{\"ref\":\"$ref\"}}")
+  echo "delete once pushed: $out"
+  expect '"state":"exited"' "the deleted agent"
+  [ ! -e "$worktree" ] || { echo "the worktree is left"; return 1; }
+  [ ! -e "$home/VibeOS/agents/$ref" ] || { echo "its directory is left"; return 1; }
+  # Nothing of it in VibeOS's folders, nor a socket or lock in run/.
+  left=$(find "$home/VibeOS/worktrees" "$home/VibeOS/agents" "$run" -mindepth 1 2>/dev/null)
+  [ -z "$left" ] || { echo "left behind: $left"; return 1; }
+  git -C "$repo" rev-parse --verify --quiet "refs/heads/$ref" >/dev/null || { echo "the branch went"; return 1; }
+  git -C "$origin" rev-parse --verify --quiet "refs/heads/$ref" >/dev/null || { echo "the push didn't land"; return 1; }
+  stop_vibed
+}
+
 s_swift_app_build() { swift build --package-path swift/VibeOS; }
 
 # The Swift half of the contract test runs here; the live suite stays off.
@@ -431,6 +528,7 @@ step cross "cargo check for macOS and Linux, arm64 and x86_64" s_cross
 step smoke "vibed hello world via vibe hello and vibe rpc" s_smoke build
 step registry "registry via vibe rpc survives a vibed restart" s_registry build
 step sessions "a session outlives a killed vibed and is re-adopted" s_sessions build
+step agents "agents start, outlive vibed, and delete to nothing but the branch" s_agents build
 mac_step swift-app-build "swift build swift/VibeOS" s_swift_app_build
 mac_step swift-app-test "swift test swift/VibeOS (Swift contract tests)" s_swift_app_test swift-app-build
 mac_step swift-vm-build "swift build swift/vibe-vm" s_swift_vm_build

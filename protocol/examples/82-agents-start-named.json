@@ -1,0 +1,48 @@
+{
+  "description": "An agent with a name of its own, which is its ref and its branch, cut `from` another agent's branch.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 82,
+    "method": "agents.start",
+    "params": {
+      "host": "local",
+      "project": "app",
+      "profile": "software-eng-linux",
+      "prompt": "Review the dark mode change",
+      "from": "honest-lilac-marten",
+      "name": "dark-mode-review"
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 82,
+    "result": {
+      "host": "local",
+      "ref": "dark-mode-review",
+      "project": "app",
+      "profile": "software-eng-linux",
+      "environment": "linux",
+      "state": "busy",
+      "worktree": "/Users/me/VibeOS/worktrees/app/dark-mode-review",
+      "branch": "dark-mode-review",
+      "session_id": "60616263-6465-4667-a869-6a6b6c6d6e6f",
+      "created_at": "2026-10-30T12:00:00Z",
+      "attach": "vibe attach dark-mode-review"
+    }
+  },
+  "events": [
+    {
+      "jsonrpc": "2.0",
+      "method": "events.event",
+      "params": {
+        "seq": 14,
+        "at": "2026-10-30T12:00:00Z",
+        "host": "local",
+        "kind": "agent.added",
+        "project": "app",
+        "ref": "dark-mode-review",
+        "state": "busy"
+      }
+    }
+  ]
+}

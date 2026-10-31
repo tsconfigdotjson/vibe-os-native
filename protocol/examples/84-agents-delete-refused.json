@@ -1,0 +1,19 @@
+{
+  "description": "Deleting an agent is refused while its worktree has uncommitted changes (here `.env.local`, which its setup made) or its branch has unpushed commits.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 84,
+    "method": "agents.delete",
+    "params": {
+      "ref": "honest-lilac-marten"
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 84,
+    "error": {
+      "code": -32002,
+      "message": "honest-lilac-marten has unsaved work: /Users/me/VibeOS/worktrees/app/honest-lilac-marten has 1 uncommitted change. Commit and push it, or delete with force"
+    }
+  }
+}

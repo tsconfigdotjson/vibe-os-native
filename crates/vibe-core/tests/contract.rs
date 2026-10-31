@@ -9,7 +9,8 @@ use serde::de::{self, DeserializeOwned, Deserializer, Visitor};
 use serde::{Serialize, forward_to_deserialize_any};
 use serde_json::Value;
 use vibe_core::model::{
-    Environment, EventKind, GhState, Mode, Model, ProjectSource, Reasoning, SessionState,
+    AgentState, Environment, EventKind, GhState, Mode, Model, ProjectSource, Reasoning,
+    SessionState,
 };
 use vibe_core::paths;
 use vibe_core::rpc::*;
@@ -183,6 +184,10 @@ fn rust_types() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
         entry::<SessionInfo>(),
         entry::<SessionExit>(),
         entry::<SessionAttach>(),
+        entry::<AgentStartParams>(),
+        entry::<AgentDeleteParams>(),
+        entry::<Agent>(),
+        entry::<AgentList>(),
     ])
 }
 
@@ -239,6 +244,9 @@ fn rust_methods() -> BTreeMap<&'static str, MethodTypes> {
         method::<EventsSubscribe>(),
         method::<SessionsList>(),
         method::<SessionsAttach>(),
+        method::<AgentsStart>(),
+        method::<AgentsList>(),
+        method::<AgentsDelete>(),
     ])
 }
 
@@ -271,6 +279,7 @@ fn rust_enums() -> BTreeMap<&'static str, Vec<&'static str>> {
             "SessionState",
             names(SessionState::ALL, SessionState::as_str),
         ),
+        ("AgentState", names(AgentState::ALL, AgentState::as_str)),
     ])
 }
 

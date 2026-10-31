@@ -17,7 +17,7 @@ use std::time::Duration;
 use rusqlite::types::Type;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
-use crate::model::{Environment, Profile, ProjectSource};
+use crate::model::{AgentState, Environment, Mode, Model, Profile, ProjectSource, Reasoning};
 use crate::rpc::{ApiKey, HostInfo, Project};
 use crate::time::rfc3339;
 
@@ -85,6 +85,20 @@ const MIGRATIONS: &[&str] = &[
         last_used_at INTEGER
     ) STRICT;
     ",
+    // 2: what an agent was started with. A profile can change or go after
+    // the start, but the agent keeps its settings for life, so a resume
+    // launches the same Claude. Its compartment's handle, which only its
+    // backend reads. And whether its start is still under way: a row is
+    // added before anything else is made, so a start cut short by a crash
+    // can be undone when vibed starts again.
+    "
+    ALTER TABLE agents ADD COLUMN model TEXT NOT NULL DEFAULT 'opus';
+    ALTER TABLE agents ADD COLUMN reasoning TEXT NOT NULL DEFAULT 'high';
+    ALTER TABLE agents ADD COLUMN mode TEXT NOT NULL DEFAULT 'auto';
+    ALTER TABLE agents ADD COLUMN memory INTEGER NOT NULL DEFAULT 4294967296;
+    ALTER TABLE agents ADD COLUMN compartment TEXT NOT NULL DEFAULT '{}';
+    ALTER TABLE agents ADD COLUMN starting INTEGER NOT NULL DEFAULT 0;
+    ",
 ];
 
 /// The schema version this build reads and writes.
@@ -143,21 +157,61 @@ pub struct NewProject {
     pub path: String,
 }
 
-/// An agent's row. #4 creates and deletes them; #2 only needs to know they
-/// exist, so a project with agents can't be removed.
+/// An agent's row. A project with agents can't be removed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentRecord {
     pub host: String,
     pub agent_ref: String,
     pub project: String,
+    /// The profile it was started from, by name. Its settings are copied
+    /// below, so they hold even if the profile changes or goes.
     pub profile: String,
     pub environment: Environment,
+    pub model: Model,
+    pub reasoning: Reasoning,
+    pub mode: Mode,
+    pub memory: u64,
     pub worktree: String,
     pub branch: String,
     pub session_id: String,
     pub shim_socket: Option<String>,
-    pub state: String,
+    pub state: AgentState,
     pub created_at: i64,
+    /// The compartment's handle as its backend wrote it (JSON); nothing
+    /// else reads it.
+    pub compartment: String,
+    /// Its start hasn't finished. Once `vibed` is up, that means the start
+    /// was cut short, and what it made is undone.
+    pub starting: bool,
+}
+
+const AGENT_COLUMNS: &str = "a.host, a.ref, p.name, a.profile, a.environment, a.model, \
+     a.reasoning, a.mode, a.memory, a.worktree, a.branch, a.session_id, a.shim_socket, a.state, \
+     a.created_at, a.compartment, a.starting";
+
+fn agent_row(r: &Row<'_>) -> rusqlite::Result<AgentRecord> {
+    let memory: i64 = r.get(8)?;
+    Ok(AgentRecord {
+        host: r.get(0)?,
+        agent_ref: r.get(1)?,
+        project: r.get(2)?,
+        profile: r.get(3)?,
+        environment: parse(r, 4)?,
+        model: parse(r, 5)?,
+        reasoning: parse(r, 6)?,
+        mode: parse(r, 7)?,
+        memory: u64::try_from(memory).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(8, Type::Integer, Box::new(e))
+        })?,
+        worktree: r.get(9)?,
+        branch: r.get(10)?,
+        session_id: r.get(11)?,
+        shim_socket: r.get(12)?,
+        state: parse(r, 13)?,
+        created_at: r.get(14)?,
+        compartment: r.get(15)?,
+        starting: r.get(16)?,
+    })
 }
 
 #[derive(Debug)]
@@ -472,21 +526,29 @@ impl Store {
             )));
         }
         tx.execute(
-            "INSERT INTO agents (host, ref, project_id, profile, environment, worktree, branch,
-                 session_id, shim_socket, state, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT INTO agents (host, ref, project_id, profile, environment, model, reasoning,
+                 mode, memory, worktree, branch, session_id, shim_socket, state, created_at,
+                 compartment, starting)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+                 ?17)",
             params![
                 a.host,
                 a.agent_ref,
                 id,
                 a.profile,
                 a.environment.as_str(),
+                a.model.as_str(),
+                a.reasoning.as_str(),
+                a.mode.as_str(),
+                memory_column(a.memory)?,
                 a.worktree,
                 a.branch,
                 a.session_id,
                 a.shim_socket,
-                a.state,
-                a.created_at
+                a.state.as_str(),
+                a.created_at,
+                a.compartment,
+                a.starting,
             ],
         )?;
         tx.commit()?;
@@ -495,30 +557,95 @@ impl Store {
 
     /// A host's agents, oldest first.
     pub fn agents(&self, host: &str) -> Result<Vec<AgentRecord>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT a.host, a.ref, p.name, a.profile, a.environment, a.worktree, a.branch,
-                 a.session_id, a.shim_socket, a.state, a.created_at
-             FROM agents a JOIN projects p ON p.id = a.project_id
-             WHERE a.host = ?1 ORDER BY a.id",
-        )?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {AGENT_COLUMNS} FROM agents a JOIN projects p ON p.id = a.project_id
+             WHERE a.host = ?1 ORDER BY a.id"
+        ))?;
         let agents = stmt
-            .query_map([host], |r| {
-                Ok(AgentRecord {
-                    host: r.get(0)?,
-                    agent_ref: r.get(1)?,
-                    project: r.get(2)?,
-                    profile: r.get(3)?,
-                    environment: parse(r, 4)?,
-                    worktree: r.get(5)?,
-                    branch: r.get(6)?,
-                    session_id: r.get(7)?,
-                    shim_socket: r.get(8)?,
-                    state: r.get(9)?,
-                    created_at: r.get(10)?,
-                })
-            })?
+            .query_map([host], agent_row)?
             .collect::<rusqlite::Result<_>>()?;
         Ok(agents)
+    }
+
+    pub fn agent(&self, host: &str, agent_ref: &str) -> Result<AgentRecord> {
+        self.conn
+            .query_row(
+                &format!(
+                    "SELECT {AGENT_COLUMNS} FROM agents a JOIN projects p ON p.id = a.project_id
+                     WHERE a.host = ?1 AND a.ref = ?2"
+                ),
+                params![host, agent_ref],
+                agent_row,
+            )
+            .optional()?
+            .ok_or_else(|| no_agent(host, agent_ref))
+    }
+
+    /// Records an agent's state, and returns whether it changed.
+    pub fn set_agent_state(
+        &mut self,
+        host: &str,
+        agent_ref: &str,
+        state: AgentState,
+    ) -> Result<bool> {
+        let found = self
+            .conn
+            .query_row(
+                "SELECT state FROM agents WHERE host = ?1 AND ref = ?2",
+                params![host, agent_ref],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or_else(|| no_agent(host, agent_ref))?;
+        if found == state.as_str() {
+            return Ok(false);
+        }
+        self.conn.execute(
+            "UPDATE agents SET state = ?3 WHERE host = ?1 AND ref = ?2",
+            params![host, agent_ref, state.as_str()],
+        )?;
+        Ok(true)
+    }
+
+    /// Records an agent's compartment handle, as its backend changed it.
+    pub fn set_agent_compartment(
+        &mut self,
+        host: &str,
+        agent_ref: &str,
+        compartment: &str,
+    ) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE agents SET compartment = ?3 WHERE host = ?1 AND ref = ?2",
+            params![host, agent_ref, compartment],
+        )?;
+        if n == 0 {
+            return Err(no_agent(host, agent_ref));
+        }
+        Ok(())
+    }
+
+    /// Records that an agent's start has finished.
+    pub fn finish_agent_start(&mut self, host: &str, agent_ref: &str) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE agents SET starting = 0 WHERE host = ?1 AND ref = ?2",
+            params![host, agent_ref],
+        )?;
+        if n == 0 {
+            return Err(no_agent(host, agent_ref));
+        }
+        Ok(())
+    }
+
+    /// Records where an agent's session now is, after a new shim started.
+    pub fn set_agent_socket(&mut self, host: &str, agent_ref: &str, socket: &str) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE agents SET shim_socket = ?3 WHERE host = ?1 AND ref = ?2",
+            params![host, agent_ref, socket],
+        )?;
+        if n == 0 {
+            return Err(no_agent(host, agent_ref));
+        }
+        Ok(())
     }
 
     pub fn remove_agent(&mut self, host: &str, agent_ref: &str) -> Result<()> {
@@ -527,9 +654,7 @@ impl Store {
             params![host, agent_ref],
         )?;
         if n == 0 {
-            return Err(StoreError::NotFound(format!(
-                "no agent {agent_ref} on {host}"
-            )));
+            return Err(no_agent(host, agent_ref));
         }
         Ok(())
     }
@@ -606,6 +731,10 @@ const KEY_COLUMNS: &str = "name, prefix, created_at, last_used_at";
 
 fn no_project(host: &str, name: &str) -> StoreError {
     StoreError::NotFound(format!("no project named {name} on {host}"))
+}
+
+fn no_agent(host: &str, agent_ref: &str) -> StoreError {
+    StoreError::NotFound(format!("no agent {agent_ref} on {host}"))
 }
 
 fn no_profile(project: &str, name: &str) -> StoreError {
@@ -702,7 +831,7 @@ fn parse<T: FromStr<Err = String>>(r: &Row<'_>, i: usize) -> rusqlite::Result<T>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{LOCAL_HOST, Mode, Model, Reasoning, starter_profiles};
+    use crate::model::{LOCAL_HOST, starter_profiles};
     use crate::units::GIB;
 
     fn store() -> Store {
@@ -728,12 +857,18 @@ mod tests {
             project: project.into(),
             profile: "software-eng-linux".into(),
             environment: Environment::Linux,
+            model: Model::Sonnet,
+            reasoning: Reasoning::Max,
+            mode: Mode::Bypass,
+            memory: 8 * GIB,
             worktree: format!("/w/{r}"),
             branch: r.into(),
             session_id: "0b5c3f6e-0000-4000-8000-000000000000".into(),
             shim_socket: None,
-            state: "busy".into(),
+            state: AgentState::Busy,
             created_at: 5,
+            compartment: r#"{"x":1}"#.into(),
+            starting: true,
         }
     }
 
@@ -882,6 +1017,55 @@ mod tests {
             s.agents(LOCAL_HOST).unwrap()[0],
             agent("web", "quiet-amber-otter")
         );
+        assert_eq!(
+            s.agent(LOCAL_HOST, "brave-copper-lynx").unwrap(),
+            agent("web", "brave-copper-lynx")
+        );
+        assert!(matches!(
+            s.agent(LOCAL_HOST, "nope"),
+            Err(StoreError::NotFound(_))
+        ));
+        assert!(matches!(
+            s.agent("vps", "quiet-amber-otter"),
+            Err(StoreError::NotFound(_))
+        ));
+
+        // State and socket changes; the same state twice is no change.
+        assert!(
+            s.set_agent_state(LOCAL_HOST, "quiet-amber-otter", AgentState::Exited)
+                .unwrap()
+        );
+        assert!(
+            !s.set_agent_state(LOCAL_HOST, "quiet-amber-otter", AgentState::Exited)
+                .unwrap()
+        );
+        s.set_agent_socket(LOCAL_HOST, "quiet-amber-otter", "/run/q.sock")
+            .unwrap();
+        s.set_agent_compartment(LOCAL_HOST, "quiet-amber-otter", r#"{"y":2}"#)
+            .unwrap();
+        s.finish_agent_start(LOCAL_HOST, "quiet-amber-otter")
+            .unwrap();
+        let q = s.agent(LOCAL_HOST, "quiet-amber-otter").unwrap();
+        assert_eq!(q.compartment, r#"{"y":2}"#);
+        assert!(!q.starting);
+        assert!(matches!(
+            s.finish_agent_start(LOCAL_HOST, "nope"),
+            Err(StoreError::NotFound(_))
+        ));
+        assert_eq!(q.state, AgentState::Exited);
+        assert_eq!(q.shim_socket.as_deref(), Some("/run/q.sock"));
+        assert!(matches!(
+            s.set_agent_state(LOCAL_HOST, "nope", AgentState::Busy),
+            Err(StoreError::NotFound(_))
+        ));
+        assert!(matches!(
+            s.set_agent_socket(LOCAL_HOST, "nope", "/x"),
+            Err(StoreError::NotFound(_))
+        ));
+        assert!(matches!(
+            s.set_agent_compartment(LOCAL_HOST, "nope", "{}"),
+            Err(StoreError::NotFound(_))
+        ));
 
         let err = s.remove_project(LOCAL_HOST, "web").unwrap_err();
         assert_eq!(err.to_string(), "web still has 2 agents; delete them first");
@@ -946,6 +1130,37 @@ mod tests {
             starter_profiles("linux")
         );
         assert_eq!(s.keys().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_version_1_registry_is_migrated() {
+        // An agents table as #2 made it, with a row in it: the new columns
+        // get their defaults.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vibe.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.pragma_update(None, "foreign_keys", true).unwrap();
+            conn.execute_batch(MIGRATIONS[0]).unwrap();
+            conn.pragma_update(None, "user_version", 1).unwrap();
+            conn.execute_batch(
+                "INSERT INTO hosts VALUES ('local', 'macos', 'm', NULL, 1);
+                 INSERT INTO projects VALUES (1, 'local', 'web', 'path', NULL, '/p/web', 1);
+                 INSERT INTO agents (host, ref, project_id, profile, environment, worktree,
+                     branch, session_id, state, created_at)
+                 VALUES ('local', 'q', 1, 'p', 'macos', '/w/q', 'q', 's', 'busy', 1);",
+            )
+            .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.schema_version().unwrap(), SCHEMA_VERSION as i64);
+        let a = s.agent(LOCAL_HOST, "q").unwrap();
+        assert_eq!(
+            (a.model, a.reasoning, a.mode, a.memory),
+            (Model::Opus, Reasoning::High, Mode::Auto, 4 * GIB)
+        );
+        assert_eq!(a.compartment, "{}");
+        assert!(!a.starting);
     }
 
     #[test]

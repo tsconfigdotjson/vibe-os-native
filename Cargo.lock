@@ -571,6 +571,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "vibe-core",
+ "vibe-env",
  "vibed",
 ]
 
@@ -651,6 +652,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "vibe-core",
+ "vibe-env",
 ]
 
 [[package]]
