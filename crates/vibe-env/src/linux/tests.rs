@@ -5,7 +5,6 @@ use super::*;
 use crate::images::Images;
 use serde_json::json;
 use std::collections::BTreeMap;
-use std::io::Read;
 
 const TOKEN: &str = "sk-ant-oat01-test-token-for-the-linux-backend-0123456789";
 
@@ -30,6 +29,7 @@ struct State {
     run_output: Option<(String, i32)>,
     /// A share the guest fails to mount.
     unmounted: Option<String>,
+    runs: Vec<proto::Run>,
 }
 
 #[derive(Debug, Default)]
@@ -218,33 +218,29 @@ impl Machine for Fake {
         Ok(())
     }
 
-    fn attach(&self, socket: &Path) -> Result<UnixStream> {
-        let (ours, theirs) = UnixStream::pair().unwrap();
-        let output = lock(&self.state).run_output.clone();
-        lock(&self.state)
-            .calls
-            .push(format!("attach {}", socket.display()));
-        std::thread::spawn(move || {
-            let mut s = theirs;
-            let frame = |k, p: &[u8]| proto::Frame::new(k, p.to_vec());
-            // The screen first, which the command hasn't written to.
-            proto::write_frame(&mut s, &frame(proto::FrameKind::Output, b"\x1b[H\x1b[2J")).unwrap();
-            let go = proto::read_frame(&mut s).unwrap().unwrap();
-            assert_eq!(
-                (go.kind, go.payload.as_slice()),
-                (proto::FrameKind::Input, &b"\n"[..])
-            );
-            let Some((text, code)) = output else {
-                // Hangs until the VM is stopped.
-                let _ = s.read(&mut [0u8; 1]);
-                return;
-            };
-            let text = text.replace('\n', "\r\n");
-            proto::write_frame(&mut s, &frame(proto::FrameKind::Output, text.as_bytes())).unwrap();
-            let exit = proto::Frame::json(proto::FrameKind::Exit, &json!({"code": code}));
-            proto::write_frame(&mut s, &exit).unwrap();
-        });
-        Ok(ours)
+    fn run(&self, socket: &Path, run: &proto::Run) -> Result<proto::Ran> {
+        let mut st = lock(&self.state);
+        st.calls.push("run".into());
+        st.runs.push(run.clone());
+        let vm = st.vms.get(socket).cloned().unwrap_or_default();
+        if !vm.running {
+            return Err(refused("not running"));
+        }
+        // As vibe-guest says it went; out of time, killed.
+        Ok(match st.run_output.clone() {
+            Some((output, code)) => proto::Ran {
+                code: Some(code),
+                signal: None,
+                timed_out: false,
+                output,
+            },
+            None => proto::Ran {
+                code: None,
+                signal: Some("SIGKILL".into()),
+                timed_out: true,
+                output: String::new(),
+            },
+        })
     }
 }
 
@@ -616,58 +612,119 @@ fn a_snapshot_that_wont_restore_is_dropped_for_a_resume() {
 }
 
 #[test]
-fn a_command_runs_to_completion_inside() {
+fn a_command_runs_to_completion_inside_beside_claude() {
     let s = Setup::new();
     let h = s.backend.create(&s.spec("quiet-amber-otter")).unwrap();
     lock(&s.fake.state).run_output = Some(("installing\ndone\n".into(), 3));
-    let out = s
-        .backend
-        .run(
-            &h,
-            &Run {
-                argv: vec!["/bin/sh".into(), ".vibe/setup.sh".into()],
-                env: vec![("X".into(), "1".into())],
-                cwd: h.worktree.clone(),
-                timeout: Duration::from_secs(10),
-            },
-        )
-        .unwrap();
+    let run = |argv: &[&str], timeout| {
+        s.backend
+            .run(
+                &h,
+                &Run {
+                    argv: argv.iter().map(|a| (*a).to_owned()).collect(),
+                    env: vec![("X".into(), "1".into())],
+                    cwd: h.worktree.clone(),
+                    timeout,
+                },
+            )
+            .unwrap()
+    };
+    let out = run(&["/bin/sh", ".vibe/setup.sh"], Duration::from_secs(10));
     assert_eq!(out.code, Some(3));
     assert!(!out.timed_out);
     assert_eq!(String::from_utf8(out.output).unwrap(), "installing\ndone\n");
-    let launch = lock(&s.fake.state).launches[0].clone();
-    assert_eq!(&launch.command[..2], ["/bin/sh", "-c"]);
     assert_eq!(
-        &launch.command[3..],
-        ["vibe-run", "/bin/sh", ".vibe/setup.sh"]
+        s.fake.calls(),
+        ["create", "boot", "run"],
+        "it boots the VM first"
     );
-    assert_eq!(launch.env["X"], "1");
+    let sent = lock(&s.fake.state).runs[0].clone();
+    assert_eq!(sent.command, ["/bin/sh", ".vibe/setup.sh"]);
+    assert_eq!(sent.cwd.as_deref(), h.worktree.to_str());
+    assert_eq!(sent.timeout_ms, 10_000);
+    assert_eq!(sent.env["X"], "1");
     assert!(
-        !launch.env.contains_key("CLAUDE_CODE_OAUTH_TOKEN"),
-        "setup gets no token"
+        !sent.env.contains_key("CLAUDE_CODE_OAUTH_TOKEN"),
+        "a run gets no token"
     );
 
-    // One that runs out of time takes the VM with it.
-    s.fake.with(&s.socket("quiet-amber-otter"), "-", |vm| {
-        vm.session = Some(Some(3))
-    });
+    // With Claude running, a run goes ahead beside it, and the VM stays.
+    s.launch(&h).unwrap();
     lock(&s.fake.state).run_output = None;
-    let started = Instant::now();
-    let out = s
-        .backend
-        .run(
-            &h,
-            &Run {
-                argv: vec!["sleep".into(), "60".into()],
-                env: vec![],
-                cwd: h.worktree.clone(),
-                timeout: Duration::from_millis(300),
-            },
-        )
-        .unwrap();
+    let out = run(&["sleep", "60"], Duration::from_millis(300));
     assert!(out.timed_out && !out.success(), "{out:?}");
-    assert!(started.elapsed() < Duration::from_secs(5));
-    assert_eq!(s.fake.calls().last().unwrap(), "stop");
+    assert_eq!(out.signal, Some(9));
+    let vm = s.fake.vm(&s.socket("quiet-amber-otter"));
+    assert!(vm.running && vm.session == Some(None), "Claude goes on");
+    assert_eq!(s.fake.calls().last().unwrap(), "run");
+}
+
+#[test]
+fn the_dirs_it_makes_are_private_whatever_the_umask() {
+    use std::os::unix::fs::PermissionsExt;
+    let s = Setup::new();
+    let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    // Made open before, as a umask of 022 leaves a new directory.
+    for dir in [s.layout.snapshots_dir(), s.layout.cache_dir().join("npm")] {
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let h = s.backend.create(&s.spec("quiet-amber-otter")).unwrap();
+    assert_eq!(mode(&s.layout.snapshots_dir()), 0o700);
+    assert_eq!(mode(&h.claude.dir), 0o700);
+    for (_, name, _) in CACHES {
+        assert_eq!(mode(&s.layout.cache_dir().join(name)), 0o700, "{name}");
+    }
+}
+
+#[test]
+fn a_sleep_returns_once_the_shim_has_gone() {
+    // A real shim on a command that ends a moment later, as one on a VM's
+    // stream ends once vibe-vm has.
+    let shim = {
+        let exe = std::env::current_exe().unwrap();
+        exe.parent().unwrap().parent().unwrap().join("vibe-shim")
+    };
+    assert!(shim.is_file(), "{} isn't built", shim.display());
+    let s = Setup::new();
+    let mut h = s.backend.create(&s.spec("quiet-amber-otter")).unwrap();
+    s.launch(&h).unwrap();
+    let run = s.tmp.path().join("r");
+    fs::create_dir_all(&run).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&run, fs::Permissions::from_mode(0o700)).unwrap();
+    let out = std::process::Command::new(&shim)
+        .args(["--ref", "quiet-amber-otter", "--socket"])
+        .arg(run.join("q.sock"))
+        .arg("--state")
+        .arg(s.tmp.path().join("shim-state"))
+        .arg("--cwd")
+        .arg(s.tmp.path())
+        .args(["--", "sleep", "1"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let sid: u32 = String::from_utf8(out.stdout)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    h.session = Some(sid);
+    let started = Instant::now();
+    s.backend.sleep(&h).unwrap();
+    assert!(
+        started.elapsed() >= Duration::from_millis(500),
+        "it didn't wait"
+    );
+    let tree = SessionTree::new(sid);
+    assert!(
+        !tree.all().iter().any(|p| p.pid == sid),
+        "the shim is still there"
+    );
 }
 
 #[test]

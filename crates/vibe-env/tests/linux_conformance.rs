@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use vibe_core::limits::HostLimits;
-use vibe_core::paths::Layout;
+use vibe_core::paths::{Layout, private_dir};
 use vibe_env::conformance::{self, Harness, LimitCase};
 use vibe_env::images::{self, Images};
 use vibe_env::linux::{LinuxVm, Real, TokenSource};
@@ -76,7 +76,9 @@ impl VmHarness {
         images
             .add_managed("0.0.1", &tools.join("claude"), "stand-in")
             .unwrap();
-        fs::create_dir_all(root.join("scratch")).unwrap();
+        // The shims' sockets are here, and a shim refuses a directory other
+        // users can open, whatever the umask made it.
+        private_dir(&root.join("scratch")).unwrap();
         fs::create_dir_all(layout.config_dir()).unwrap();
         // Small VMs, quick to save, and a small writable disk.
         fs::write(layout.host_config(), "vm_disk = \"2G\"\ncpu_cores = 2\n").unwrap();
@@ -112,9 +114,9 @@ impl Harness for VmHarness {
     fn spec(&self, agent_ref: &str) -> AgentSpec {
         let worktree = self.root().join("worktrees").join(agent_ref);
         let agent_dir = self.layout.agent_dir(agent_ref);
-        for d in [&worktree, &agent_dir] {
-            fs::create_dir_all(d).unwrap();
-        }
+        fs::create_dir_all(&worktree).unwrap();
+        // As vibed makes it: this user's alone.
+        private_dir(&agent_dir).unwrap();
         AgentSpec {
             agent_ref: agent_ref.into(),
             project: "web".into(),

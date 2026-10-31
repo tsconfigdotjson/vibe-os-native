@@ -30,9 +30,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::fs;
-use std::io::{self, Write};
-use std::os::unix::fs::DirBuilderExt;
-use std::os::unix::net::UnixStream;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -40,7 +38,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use vibe_core::claude_token::{TOKEN_ENV, TokenStore};
 use vibe_core::limits::{self, HostLimits};
-use vibe_core::paths::Layout;
+use vibe_core::paths::{Layout, private_dir};
 use vibe_core::units::MIB;
 
 use crate::claude::{CONFIG_DIR_ENV, ClaudeHome};
@@ -85,10 +83,6 @@ const POWEROFF_PATIENCE: Duration = Duration::from_secs(15);
 /// How often the worktree is measured against `disk_hard` (PRD: Disk).
 const DISK_EVERY: Duration = Duration::from_secs(60);
 
-/// A command `run` starts waits for this line before it runs, so the host
-/// is attached by then and sees all it writes. The terminal doesn't echo it.
-const RUN_WRAPPER: &str = "stty -echo 2>/dev/null; read -r _; stty echo 2>/dev/null; exec \"$@\"";
-
 /// What talks to `vibe-vm` and `vibe-guest` for the backend: [`Real`] on a
 /// Mac, a fake in tests. Sockets are `run/<ref>.vm`.
 pub trait Machine: Send + Sync + fmt::Debug {
@@ -115,8 +109,8 @@ pub trait Machine: Send + Sync + fmt::Debug {
     fn thaw(&self, socket: &Path, now: SystemTime) -> Result<guest::Thawed>;
     /// Ends the agent, syncs and powers off; `vibe-vm` then exits.
     fn poweroff(&self, socket: &Path) -> Result<()>;
-    /// The guest's terminal, past the welcome: the screen comes next.
-    fn attach(&self, socket: &Path) -> Result<UnixStream>;
+    /// Runs a command to completion in the guest, beside the agent's.
+    fn run(&self, socket: &Path, run: &proto::Run) -> Result<proto::Ran>;
 }
 
 /// The real thing: `vibe-vm` and the guest behind it.
@@ -227,10 +221,8 @@ impl Machine for Real {
         guest::poweroff(socket).map_err(env_err("vibe-guest couldn't power off"))
     }
 
-    fn attach(&self, socket: &Path) -> Result<UnixStream> {
-        guest::attach(socket, "vibed-run", None)
-            .map(|t| t.stream)
-            .map_err(env_err("vibe-guest's terminal"))
+    fn run(&self, socket: &Path, run: &proto::Run) -> Result<proto::Ran> {
+        guest::run(socket, run).map_err(env_err("vibe-guest couldn't run it"))
     }
 }
 
@@ -607,21 +599,25 @@ impl Compartment for LinuxVm {
         let layers = self.images.layers()?;
         let config = self.config(spec, &layers, &host)?;
         let home = ClaudeHome::own(spec.agent_dir.join("claude"));
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&home.dir)
+        private_dir(&home.dir)
             .map_err(|e| EnvError::new(format!("can't create {}: {e}", home.dir.display())))?;
         home.seed(&self.layout.linux_claude_dir())
             .and_then(|()| home.mark_managed())
             .map_err(|e| EnvError::new(format!("can't set up the agent's Claude home: {e}")))?;
+        // The caches, like the agent's own directories, are this user's
+        // alone, whatever the umask; the worktree and `.git` are as they are.
         for share in &config.shares {
-            fs::create_dir_all(&share.path).map_err(|e| {
-                EnvError::new(format!("can't create {}: {e}", share.path.display()))
-            })?;
+            let made = if share.tag.starts_with("cache-") {
+                private_dir(&share.path)
+            } else {
+                fs::create_dir_all(&share.path)
+            };
+            made.map_err(|e| EnvError::new(format!("can't create {}: {e}", share.path.display())))?;
         }
+        // Snapshots hold all of a VM's memory, the Claude token included.
         if let Some(parent) = config.snapshot.parent() {
-            fs::create_dir_all(parent)?;
+            private_dir(parent)
+                .map_err(|e| EnvError::new(format!("can't create {}: {e}", parent.display())))?;
         }
         let disk = spec.agent_dir.join("disk.img");
         vm::create_disk(&disk, host.vm_disk)
@@ -645,92 +641,21 @@ impl Compartment for LinuxVm {
             return Err(EnvError::new("nothing to run"));
         }
         self.ensure_running(h)?;
-        let socket = self.socket(h);
-        let mut command = vec![
-            "/bin/sh".to_owned(),
-            "-c".to_owned(),
-            RUN_WRAPPER.to_owned(),
-            "vibe-run".to_owned(),
-        ];
-        command.extend(r.argv.iter().cloned());
-        let launch = guest::Launch {
-            command,
-            env: r.env.iter().cloned().collect(),
-            cwd: Some(r.cwd.to_string_lossy().into_owned()),
-            size: None,
-            time_ms: Some(guest::millis(SystemTime::now())),
-        };
-        self.machine.launch(&socket, &launch)?;
-        let mut stream = self.machine.attach(&socket)?;
-        let deadline = Instant::now() + r.timeout;
-        let mut output = Vec::new();
-        // The screen as it was when we attached: the wrapper hasn't written
-        // anything yet, so it's nothing of the command's.
-        let mut screen_sent = false;
-        let go = proto::Frame::new(proto::FrameKind::Input, b"\n".to_vec());
-        let mut exit = None;
-        let mut timed_out = false;
-        loop {
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                timed_out = true;
-                break;
-            }
-            stream
-                .set_read_timeout(Some(left.max(Duration::from_millis(1))))
-                .ok();
-            match proto::read_frame(&mut stream) {
-                Ok(Some(f)) => match f.kind {
-                    proto::FrameKind::Output if !screen_sent => {
-                        screen_sent = true;
-                        proto::write_frame(&mut stream, &go)
-                            .and_then(|()| stream.flush())
-                            .map_err(|e| EnvError::new(format!("can't start the command: {e}")))?;
-                    }
-                    proto::FrameKind::Output => {
-                        output.extend_from_slice(&f.payload);
-                        if output.len() > crate::native::MAX_OUTPUT {
-                            let cut = output.len() - crate::native::MAX_OUTPUT;
-                            output.drain(..cut);
-                        }
-                    }
-                    proto::FrameKind::Exit => {
-                        exit = f.decode::<proto::Exit>().ok();
-                        break;
-                    }
-                    _ => {}
-                },
-                Ok(None) => break,
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                    ) =>
-                {
-                    timed_out = true;
-                    break;
-                }
-                Err(e) => return Err(EnvError::new(format!("the command's terminal: {e}"))),
-            }
-        }
-        drop(stream);
-        if timed_out {
-            // vibe-guest can't end one command on its own, so the VM goes:
-            // the next launch boots it fresh.
-            self.machine.stop(&socket)?;
-        }
-        let text = String::from_utf8_lossy(&output).replace("\r\n", "\n");
-        Ok(RunOutput {
-            code: exit.as_ref().and_then(|e| e.code),
-            signal: if timed_out {
-                Some(9)
-            } else {
-                exit.as_ref()
-                    .and_then(|e| e.signal.as_deref())
-                    .and_then(linux_signal)
+        // Beside Claude, if it runs: vibe-guest runs it and says how it went.
+        let ran = self.machine.run(
+            &self.socket(h),
+            &proto::Run {
+                command: r.argv.clone(),
+                env: r.env.iter().cloned().collect(),
+                cwd: Some(r.cwd.to_string_lossy().into_owned()),
+                timeout_ms: (r.timeout.as_millis() as u64).max(1),
             },
-            timed_out,
-            output: text.into_bytes(),
+        )?;
+        Ok(RunOutput {
+            code: ran.code,
+            signal: ran.signal.as_deref().and_then(linux_signal),
+            timed_out: ran.timed_out,
+            output: ran.output.into_bytes(),
         })
     }
 
@@ -897,6 +822,21 @@ impl Sleeper for LinuxVm {
         }
         // Its limits are held again when it wakes on a new shim.
         self.unsupervise(h);
+        // The shim on its terminal goes once vibe-vm has: until then, a wake
+        // would find its session still running, or its socket still taken.
+        if let Some(sid) = h.session {
+            let tree = SessionTree::new(sid);
+            let deadline = Instant::now() + POWEROFF_PATIENCE;
+            while tree.is_shims() && tree.all().iter().any(|p| p.pid == sid) {
+                if Instant::now() >= deadline {
+                    return Err(EnvError::new(format!(
+                        "{} is saved, but its shim (pid {sid}) didn't exit",
+                        h.agent_ref
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
         Ok(())
     }
 

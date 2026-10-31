@@ -158,6 +158,15 @@ pub fn launch(socket: &Path, launch: &Launch) -> Result<Launched, GuestError> {
     call(socket, &Request::Launch(launch.clone()), CALL_TIMEOUT)
 }
 
+/// Runs a command to completion in the guest, beside the agent's: it
+/// waits as long as the command may run, and a little more.
+pub fn run(socket: &Path, run: &proto::Run) -> Result<proto::Ran, GuestError> {
+    run.validate()
+        .map_err(|e| GuestError::Refused(Failure::new(ErrorCode::BadRequest, e)))?;
+    let timeout = CALL_TIMEOUT + Duration::from_millis(run.timeout_ms) + Duration::from_secs(10);
+    call(socket, &Request::Run(run.clone()), timeout)
+}
+
 pub fn processes(socket: &Path) -> Result<Processes, GuestError> {
     call(socket, &Request::Processes, CALL_TIMEOUT)
 }

@@ -7,7 +7,7 @@
 //! screen as it is and carries on from there. Output is read whether or not
 //! a shim is connected, so the command never blocks on a missing one.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::CStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -18,12 +18,12 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
 use vibe_guest::proto::{
-    ErrorCode, Exit, Failure, Frame, FrameKind, Frozen, GuestState, Launch, Launched, PROTOCOL,
-    Process, Processes, Refused, Session, TermSize, TermWelcome, output_frames,
+    self, ErrorCode, Exit, Failure, Frame, FrameKind, Frozen, GuestState, Launch, Launched,
+    PROTOCOL, Process, Processes, Ran, Refused, Session, TermSize, TermWelcome, output_frames,
 };
 
 use crate::init::log;
@@ -126,6 +126,9 @@ pub(crate) struct Agent {
     /// can end it even while a write to it holds `state`.
     current: Mutex<Option<Arc<Conn>>>,
     next_conn: AtomicU64,
+    /// Commands a `run` waits for, by pid: the reaper hands each its wait
+    /// status, as it collects every child.
+    runs: Mutex<HashMap<u32, mpsc::Sender<libc::c_int>>>,
 }
 
 impl std::fmt::Debug for Agent {
@@ -209,6 +212,7 @@ impl Agent {
             changed: Condvar::new(),
             current: Mutex::new(None),
             next_conn: AtomicU64::new(1),
+            runs: Mutex::new(HashMap::new()),
         }
     }
 
@@ -426,8 +430,138 @@ impl Agent {
         }
     }
 
+    /// Runs `run` to completion beside the agent's command (`Request::Run`):
+    /// as `vibe`, in a process group of its own, with stdout and stderr on
+    /// one pipe. Past its time it's killed with its group, and whatever it
+    /// leaves in the group is killed when it ends.
+    pub(crate) fn run(&self, run: &proto::Run) -> Result<Ran, Failure> {
+        run.validate()
+            .map_err(|e| Failure::new(ErrorCode::BadRequest, e))?;
+        let cwd = run
+            .cwd
+            .as_deref()
+            .map_or_else(|| self.settings.home.clone(), PathBuf::from);
+        let (mut reader, writer) = io::pipe().map_err(failed(ErrorCode::LaunchFailed))?;
+        let mut env: BTreeMap<&str, &str> = BTreeMap::new();
+        for (k, v) in &self.settings.env {
+            env.insert(k, v);
+        }
+        for (k, v) in &run.env {
+            env.insert(k, v);
+        }
+        let mut cmd = Command::new(&run.command[0]);
+        cmd.args(&run.command[1..])
+            .env_clear()
+            .envs(env)
+            .stdin(Stdio::null())
+            .stdout(
+                writer
+                    .try_clone()
+                    .map_err(failed(ErrorCode::LaunchFailed))?,
+            )
+            .stderr(writer);
+        let user = self.settings.user;
+        let cwd_c = sys::cstr(&cwd).map_err(failed(ErrorCode::LaunchFailed))?;
+        // SAFETY: only async-signal-safe calls between fork and exec, on
+        // values made before the fork.
+        unsafe {
+            cmd.pre_exec(move || {
+                check(libc::setpgid(0, 0))?;
+                if let Some((uid, gid)) = user {
+                    let groups = [gid];
+                    check(libc::setgroups(1, groups.as_ptr()))?;
+                    check(libc::setgid(gid))?;
+                    check(libc::setuid(uid))?;
+                }
+                check(libc::chdir(cwd_c.as_ptr()))?;
+                Ok(())
+            });
+        }
+        let (tx, rx) = mpsc::channel();
+        let pid = {
+            // The reaper waits while this holds, so the pid is known before
+            // the reaper can collect it.
+            let _spawning = lock(&SPAWN);
+            let child = cmd.spawn().map_err(|e| {
+                Failure::new(
+                    ErrorCode::LaunchFailed,
+                    format!("can't start {}: {e}", run.command[0]),
+                )
+            })?;
+            let pid = child.id();
+            lock(&self.runs).insert(pid, tx);
+            pid
+        };
+        // Our ends of the pipe go, so it ends once the command's do.
+        drop(cmd);
+        log!(
+            "running {:?} in {} as pid {pid}",
+            run.command,
+            cwd.display()
+        );
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let (done_tx, done_rx) = mpsc::channel();
+        {
+            let output = Arc::clone(&output);
+            std::thread::Builder::new()
+                .name("run".into())
+                .spawn(move || {
+                    let mut buf = [0u8; 8192];
+                    while let Ok(n) = reader.read(&mut buf) {
+                        if n == 0 {
+                            break;
+                        }
+                        let mut out = lock(&output);
+                        out.extend_from_slice(&buf[..n]);
+                        if out.len() > proto::MAX_RUN_OUTPUT {
+                            let cut = out.len() - proto::MAX_RUN_OUTPUT;
+                            out.drain(..cut);
+                        }
+                    }
+                    let _ = done_tx.send(());
+                })
+                .map_err(failed(ErrorCode::LaunchFailed))?;
+        }
+        let group = pid as libc::pid_t;
+        let kill_group = || {
+            // SAFETY: killpg has no memory effects; an empty group fails.
+            unsafe { libc::killpg(group, libc::SIGKILL) };
+        };
+        let mut timed_out = false;
+        let status = match rx.recv_timeout(Duration::from_millis(run.timeout_ms)) {
+            Ok(status) => Some(status),
+            Err(_) => {
+                timed_out = true;
+                kill_group();
+                rx.recv_timeout(Duration::from_secs(5)).ok()
+            }
+        };
+        kill_group();
+        lock(&self.runs).remove(&pid);
+        let _ = done_rx.recv_timeout(Duration::from_secs(2));
+        let exit = status.map(exit_of).unwrap_or(Exit {
+            code: None,
+            signal: None,
+        });
+        let output = String::from_utf8_lossy(&lock(&output)).into_owned();
+        log!(
+            "pid {pid} ran: {exit:?}{}",
+            if timed_out { ", out of time" } else { "" }
+        );
+        Ok(Ran {
+            code: exit.code,
+            signal: exit.signal,
+            timed_out,
+            output,
+        })
+    }
+
     /// Called by the reaper for every child it collects.
     pub(crate) fn reaped(self: &Arc<Self>, pid: u32, status: libc::c_int) {
+        if let Some(run) = lock(&self.runs).remove(&pid) {
+            let _ = run.send(status);
+            return;
+        }
         let mut state = lock(&self.state);
         let Some(s) = state.session.as_mut() else {
             return;

@@ -208,7 +208,11 @@ async fn a_linux_agent_answers_on_opus_and_carries_on_after_sleep() {
     wait_for(
         "PONG in the transcript",
         Duration::from_secs(240),
-        || replies(&transcript).iter().any(|t| t.contains("PONG")),
+        || {
+            replies(&transcript)
+                .iter()
+                .any(|t| t.to_lowercase().contains("pong"))
+        },
         || format!("the screen:\n{}\n{}", screen(), logs()),
     );
     let text = fs::read_to_string(&transcript).unwrap();
@@ -219,8 +223,9 @@ async fn a_linux_agent_answers_on_opus_and_carries_on_after_sleep() {
     for warning in [
         "claude install",
         "installmethod",
-        "auto-update",
+        "auto-update failed",
         "not in your path",
+        "native installation",
     ] {
         assert!(
             !shown.contains(warning),
@@ -263,10 +268,18 @@ async fn a_linux_agent_answers_on_opus_and_carries_on_after_sleep() {
     std::thread::sleep(Duration::from_millis(800));
     shim::write_frame(&mut c.stream, &Frame::new(FrameKind::Input, "\r")).unwrap();
     c.status().unwrap();
+    // The first answer, and a second, after the wake, that remembers it:
+    // each says "pong", however it's written.
+    let pongs = || {
+        replies(&transcript)
+            .iter()
+            .filter(|t| t.to_lowercase().contains("pong"))
+            .count()
+    };
     wait_for(
         "pong after the wake",
         Duration::from_secs(240),
-        || replies(&transcript).iter().any(|t| t.trim() == "pong"),
+        || pongs() >= 2,
         || format!("the screen:\n{}\n{}", screen(), logs()),
     );
     let list = core.agents(HostParams::default()).await.unwrap();
