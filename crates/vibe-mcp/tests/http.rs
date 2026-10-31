@@ -1143,3 +1143,50 @@ async fn a_2026_client_needs_no_initialize() {
     let t = text(&r.response()["result"]);
     assert!(t.starts_with("vps:quiet-amber-otter"), "{t}");
 }
+
+/// A request refused before it's served is still read whole before the
+/// answer: closing a socket with a request still unread in it resets the
+/// connection, and the client may never see the answer. macOS showed it
+/// with a small body sent in a second write; a body far larger than one
+/// read shows it everywhere.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_request_is_read_before_it_is_answered() {
+    let fake = Arc::new(Fake::default());
+    let addr = serve(Arc::clone(&fake)).await;
+    let pad = "x".repeat(2 << 20);
+    let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {"pad": pad}})
+        .to_string();
+    let good = format!("Bearer {KEY}");
+    for (path, auth, status) in [
+        ("/mcp", None, 401),
+        ("/mcp", Some("Bearer vk_wrong"), 401),
+        ("/elsewhere", Some(good.as_str()), 404),
+    ] {
+        let headers: Vec<(&str, &str)> = auth.iter().map(|a| ("Authorization", *a)).collect();
+        let r = post_raw(addr, path, &headers, &body).await;
+        assert_eq!(r.status, status, "{path} {auth:?}: {}", r.body);
+    }
+    // rmcp's own refusals, of a browser and of a rebound host, too.
+    for (name, value) in [("Origin", "https://evil.example"), ("Host", "evil.example")] {
+        let r = post_raw(
+            addr,
+            "/mcp",
+            &[("Authorization", &good), (name, value)],
+            &body,
+        )
+        .await;
+        assert!(
+            (400..500).contains(&r.status),
+            "{name}: {} {}",
+            r.status,
+            r.body
+        );
+    }
+    // A small body sent after its head, as macOS split it.
+    let r = post_raw(addr, "/mcp", &[], "{}").await;
+    assert_eq!(r.status, 401);
+    // One past the limit is refused as too large.
+    let huge = "y".repeat(5 << 20);
+    let r = post_raw(addr, "/mcp", &[("Authorization", &good)], &huge).await;
+    assert_eq!(r.status, 413, "{}", r.body);
+}

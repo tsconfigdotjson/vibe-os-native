@@ -37,6 +37,9 @@ type Body = BoxBody<Bytes, Infallible>;
 /// How long an idle event stream goes between keep-alives.
 const KEEP_ALIVE: Duration = Duration::from_secs(15);
 
+/// How long a request's body may take to arrive, once its headers have.
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// The most connections open at once on one listener.
 const MAX_CONNECTIONS: usize = 256;
 
@@ -79,17 +82,68 @@ fn plain(status: StatusCode, text: &str) -> Response<Body> {
 }
 
 /// The key a request carries, as `Authorization: Bearer <key>`.
-fn bearer(req: &Request<Incoming>) -> Option<&str> {
+fn bearer<B>(req: &Request<B>) -> Option<&str> {
     let value = req.headers().get(header::AUTHORIZATION)?.to_str().ok()?;
     let (scheme, key) = value.trim().split_once(' ')?;
     scheme.eq_ignore_ascii_case("bearer").then(|| key.trim())
 }
 
+/// A request as `rmcp` gets it: read whole first.
+type FullRequest = Request<Full<Bytes>>;
+
+/// Reads a request's body whole, up to [`MAX_BODY`] and within
+/// [`READ_TIMEOUT`], before anything answers it. A socket closed with a
+/// request still unread in it is reset, not closed, and the reset can lose
+/// the answer before the client reads it; macOS does so even for a small
+/// body that came in a write of its own. Every refusal, the key gate's
+/// and `rmcp`'s own Host and Origin checks, comes after this.
+async fn read_whole(req: Request<Incoming>) -> Result<FullRequest, Box<Response<Body>>> {
+    let (parts, mut body) = req.into_parts();
+    let read = async {
+        let mut kept = bytes::BytesMut::new();
+        let mut too_large = false;
+        while let Some(frame) = body.frame().await {
+            let Ok(data) = frame.map(|f| f.into_data()) else {
+                return Err(Box::new(plain(
+                    StatusCode::BAD_REQUEST,
+                    "the request ended early",
+                )));
+            };
+            let Ok(data) = data else { continue };
+            // Past the limit it's still read, and dropped, so the answer
+            // isn't lost to a reset.
+            too_large |= kept.len() + data.len() > MAX_BODY;
+            if !too_large {
+                kept.extend_from_slice(&data);
+            }
+        }
+        if too_large {
+            return Err(Box::new(plain(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "the request is too large",
+            )));
+        }
+        Ok(Request::from_parts(parts, Full::new(kept.freeze())))
+    };
+    tokio::time::timeout(READ_TIMEOUT, read)
+        .await
+        .unwrap_or_else(|_| {
+            Err(Box::new(plain(
+                StatusCode::REQUEST_TIMEOUT,
+                "the request took too long to arrive",
+            )))
+        })
+}
+
 async fn handle<D: Daemon>(
-    mut req: Request<Incoming>,
+    req: Request<Incoming>,
     svc: StreamableHttpService<Server<D>, NeverSessionManager>,
     daemon: Arc<D>,
 ) -> Response<Body> {
+    let mut req = match read_whole(req).await {
+        Ok(r) => r,
+        Err(refused) => return *refused,
+    };
     if req.uri().path() != PATH {
         return plain(StatusCode::NOT_FOUND, "VibeOS serves MCP at /mcp");
     }
