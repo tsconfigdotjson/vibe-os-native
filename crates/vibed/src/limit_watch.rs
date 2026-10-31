@@ -49,9 +49,11 @@ impl Core {
         for mut a in agents {
             // Asleep, its backend may have nothing to ask (a VM saved to
             // disk); exited, nothing runs.
+            // Paused for memory pressure, it's that watch's to let go.
             if a.starting
                 || self.is_busy(&a.agent_ref)
                 || matches!(a.state, AgentState::Asleep | AgentState::Exited)
+                || crate::core::lock(&self.pressure_paused).contains_key(&a.agent_ref)
             {
                 continue;
             }
@@ -141,7 +143,7 @@ impl Core {
         }
     }
 
-    fn announce(&self, a: &AgentRecord, limit: Limit, message: String) {
+    pub(crate) fn announce(&self, a: &AgentRecord, limit: Limit, message: String) {
         crate::log!("vibed: {}: {message}", a.agent_ref);
         let mut e = self.event(EventKind::AgentLimit);
         e.project = Some(a.project.clone());

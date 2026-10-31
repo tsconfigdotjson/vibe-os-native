@@ -209,8 +209,11 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
             PathBuf::from(&claude).display()
         );
         config.backends = Backends::all(Arc::new(TestBackend::new(PathBuf::from(claude))));
-        // Tests' agents start whatever the machine running them is doing.
+        // Tests' agents start whatever the machine running them is doing,
+        // its memory and its disk, and never hold it awake.
         config.pressure = Arc::new(vibed::pressure::NoPressure);
+        config.free_disk = Arc::new(|_: &std::path::Path| None);
+        config.power = Arc::new(vibed::power::NoPower);
         // Its toolbox shell is a plain shell, and keeps empty versions.
         config.toolbox = Some(Arc::new(TestToolbox::new(
             config.layout.clone(),
@@ -311,8 +314,11 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
     let toolbox = core.spawn_toolbox(TOOLBOX_POLL, vibed::toolbox::UPDATE_CHECK_EVERY);
     // MCP on loopback, and on the Tailscale address when host.toml says.
     let mcp = core.spawn_mcp(vibed::mcp::LISTEN_CHECK_EVERY);
-    // Memory pressure: refuse starts, then end frozen agents.
+    // Memory pressure: refuse starts, sleep idle agents early, then pause
+    // or end agents.
     let pressure = core.spawn_pressure_watch(vibed::pressure::PRESSURE_EVERY);
+    // Idle agents sleep; a due /loop wakes one; the Mac stays up meanwhile.
+    let sleep = core.spawn_sleep_watch();
     // The links to Linux hosts, each kept up on its own.
     core.spawn_links();
     vibed::log!(
@@ -334,6 +340,7 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
     maintenance.abort();
     limit_watch.abort();
     pressure.abort();
+    sleep.abort();
     adopting.abort();
     if let Some(toolbox) = toolbox {
         toolbox.abort();

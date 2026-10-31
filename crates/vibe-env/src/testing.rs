@@ -5,7 +5,10 @@
 //! with a Claude home of its own, so nothing touches the real `~/.claude`.
 //! Its "Claude" is any program, normally [`STAND_IN`]. A supervisor thread
 //! per agent holds it to its memory and process limits by pausing it, and
-//! sleep is `SIGSTOP` on its tree.
+//! sleep is `SIGSTOP` on its tree. It can also stand in for a backend whose
+//! sleep saves the agent to disk and frees its memory, as a VM's does
+//! ([`TestBackend::sleeping_to_disk`]): its tree is still frozen, but it
+//! keeps a snapshot file while it sleeps, and goes when that's dropped.
 
 use std::collections::HashMap;
 use std::fs;
@@ -36,6 +39,12 @@ use crate::{
 /// - `dirty`: leaves `notes.txt` uncommitted in its directory;
 /// - `commit`: commits `work.txt` on its branch;
 /// - `env`: shows its `TMPDIR` and the git settings agents get;
+/// - `talk`: answers its prompt at once, coming to a firm rest, and then
+///   each line it's sent as a turn of its own;
+/// - `loop N`: as `talk`, but first arms a `/loop` wakeup due in `N`
+///   seconds, as Claude Code's `ScheduleWakeup` records one, and fires it
+///   then by the wall clock: the fire, its prompt and "Loop fired." go to
+///   the transcript, and "Loop fired at <epoch seconds>." to the screen;
 /// - anything else: says what it's working on.
 ///
 /// Then it prints "Ready." and echoes each line it's sent until its
@@ -59,7 +68,14 @@ pub struct TestBackend {
     /// What [`Limiter::usage`] says each running agent's memory is, in
     /// place of what its processes use.
     memory: Option<u64>,
+    /// How big a snapshot its sleep writes, when it sleeps to disk.
+    snapshot: Option<u64>,
+    capabilities: Capabilities,
 }
+
+/// The snapshot a test backend that sleeps to disk keeps, in the agent's
+/// directory.
+pub const TEST_SNAPSHOT: &str = "test-snapshot";
 
 /// One agent's limits, held by a thread of its own.
 #[derive(Debug)]
@@ -86,7 +102,37 @@ impl TestBackend {
             supervisors: Mutex::new(HashMap::new()),
             gate: Arc::new(Mutex::new(())),
             memory: None,
+            snapshot: None,
+            capabilities: Capabilities {
+                sleep_frees_memory: false,
+                exact_after_reboot: false,
+                kernel_limits: false,
+                file_containment: false,
+                wake_cost: Duration::from_millis(10),
+            },
         }
+    }
+
+    /// Says it has `capabilities`, so policy that reads them can be tested
+    /// on each kind of backend.
+    pub fn with_capabilities(mut self, capabilities: Capabilities) -> TestBackend {
+        self.capabilities = capabilities;
+        self
+    }
+
+    /// Sleeps the way a VM does: each sleep keeps a snapshot of `bytes`
+    /// (sparse) in the agent's directory, and frees the agent's memory, as
+    /// its capabilities say. A snapshot dropped while it sleeps takes its
+    /// processes with it, so it wakes with `claude --resume`.
+    pub fn sleeping_to_disk(mut self, bytes: u64) -> TestBackend {
+        self.snapshot = Some(bytes);
+        self.capabilities.sleep_frees_memory = true;
+        self.capabilities.exact_after_reboot = true;
+        self
+    }
+
+    fn snapshot_path(h: &Handle) -> PathBuf {
+        h.agent_dir.join(TEST_SNAPSHOT)
     }
 
     /// Reports `bytes` as each running agent's memory, so listings that
@@ -171,7 +217,11 @@ impl Compartment for TestBackend {
                 h.agent_ref
             )));
         }
-        Ok(())
+        // Asleep, its processes were in the snapshot: they end with it.
+        match fs::remove_file(TestBackend::snapshot_path(h)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+            _ => Ok(()),
+        }
     }
 
     fn delete(&self, h: &Handle) -> Result<()> {
@@ -267,6 +317,14 @@ impl Sleeper for TestBackend {
             .filter(|t| !t.is_empty())
             .ok_or_else(|| EnvError::new(format!("{} isn't running", h.agent_ref)))?;
         tree.freeze()?;
+        if let Some(bytes) = self.snapshot {
+            let saved =
+                fs::File::create(TestBackend::snapshot_path(h)).and_then(|f| f.set_len(bytes));
+            if let Err(e) = saved {
+                tree.thaw();
+                return Err(EnvError::new(format!("can't save {}: {e}", h.agent_ref)));
+            }
+        }
         Ok(())
     }
 
@@ -274,6 +332,12 @@ impl Sleeper for TestBackend {
         let Some(tree) = TestBackend::tree(h) else {
             return Ok(Woke::Resume);
         };
+        // Saved to disk, it's restored from its snapshot, which is then
+        // used up. One whose snapshot was dropped has no tree left.
+        match fs::remove_file(TestBackend::snapshot_path(h)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+            _ => {}
+        }
         // Without its shim the agent has no terminal: its tree is hung up.
         if !tree.all().iter().any(|p| p.pid == tree.sid) {
             tree.end(STOP_GRACE);
@@ -286,17 +350,39 @@ impl Sleeper for TestBackend {
         tree.thaw();
         Ok(Woke::Exact)
     }
+
+    fn sleep_size(&self, h: &Handle) -> Result<Option<u64>> {
+        if self.snapshot.is_some() && TestBackend::tree(h).is_none_or(|t| t.is_empty()) {
+            return Err(EnvError::new(format!("{} isn't running", h.agent_ref)));
+        }
+        Ok(self.snapshot)
+    }
+
+    fn saved(&self, h: &Handle) -> Option<crate::Saved> {
+        self.snapshot?;
+        let meta = fs::metadata(TestBackend::snapshot_path(h)).ok()?;
+        Some(crate::Saved {
+            bytes: meta.len(),
+            at: meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+        })
+    }
+
+    fn drop_saved(&self, h: &Handle) -> Result<()> {
+        match fs::remove_file(TestBackend::snapshot_path(h)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+            _ => {}
+        }
+        self.unsupervise(h);
+        if let Some(tree) = TestBackend::tree(h) {
+            tree.end(STOP_GRACE);
+        }
+        Ok(())
+    }
 }
 
 impl Backend for TestBackend {
     fn capabilities(&self) -> Capabilities {
-        Capabilities {
-            sleep_frees_memory: false,
-            exact_after_reboot: false,
-            kernel_limits: false,
-            file_containment: false,
-            wake_cost: Duration::from_millis(10),
-        }
+        self.capabilities
     }
 }
 

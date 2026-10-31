@@ -16,9 +16,21 @@
 #     for Claude Code: a start makes the worktree, the branch and the
 #     transcript where Claude writes it; the status engine reads the
 #     question in that transcript as `question`; the agent outlives a killed
-#     vibed, and the new one rebuilds that state from the transcript; a
-#     delete is refused while a commit is unpushed, and once it's pushed,
-#     leaves nothing behind but the branch
+#     vibed, and the new one rebuilds that state from the transcript; at
+#     rest with nothing attached it falls asleep on vibed's own watch once
+#     a 1 s idle_debounce has passed, and a send wakes it to answer its
+#     question; a delete is refused while a commit is unpushed, and once
+#     it's pushed, leaves nothing behind but the branch
+#   - sleep, wake and admission (#6), one scripted scenario on every
+#     backend (crates/vibed/tests/sleep.rs): idle -> asleep once the
+#     debounce has passed; a send, and an attach, wake it; a start the
+#     host has no room for sleeps an idle agent first where sleep frees
+#     memory (refused otherwise, unless it's max_awake_agents that's full);
+#     a firm /loop wakeup fires on time from a sleeping agent. The test
+#     step runs it on the test backend (keeping memory, and saving to
+#     disk) and, on a Mac, the macos backend; the cgroups step on this
+#     machine's cgroups; the linux-vm step on real VMs. The test step also
+#     covers the snapshot budget, low disk and critical memory pressure
 #   - MCP, as a client drives it, on the test backend: vibed serves it on
 #     the port host.toml names and refuses a call without an API key;
 #     mcp.get gives its URL and mcp.set turns Tailscale on and off; then,
@@ -50,7 +62,8 @@
 #     systemd user manager (N/A otherwise; on a Mac, the real-host step runs
 #     it on a server): the same tests, and a linux agent through vibed in a
 #     cgroup of its own, held to an edited max_processes by the kernel,
-#     paused, frozen asleep and woken where it was, then deleted to nothing
+#     paused, frozen asleep and woken where it was, then deleted to nothing;
+#     and the sleep scenario on its cgroups
 #   - the macos backend (crates/vibe-env/tests/macos.rs, which the test step
 #     runs everywhere): on a Mac again, with a fork bomb of about a thousand
 #     processes, and PRIO_DARWIN_BG seen in `ps` as the memory warning
@@ -59,9 +72,11 @@
 #     stand-in for Claude Code (VIBE_CLAUDE), with vibed in a LaunchAgent's
 #     bare environment: the agent has the PATH of the owner's interactive
 #     login shell, not launchd's; its transcript lands in the
-#     Mac's own ~/.claude, the status engine reads its question, a
-#     max_processes edited in host.toml pauses it at once, and a delete
-#     leaves nothing of it there or in VibeOS's folders but the branch
+#     Mac's own ~/.claude, the status engine reads its question, vibed holds
+#     an IOPM assertion against idle sleep while it's awake (pmset says so)
+#     and lets go once it falls asleep, a send wakes it, a max_processes
+#     edited in host.toml pauses it at once, and a delete leaves nothing of
+#     it there or in VibeOS's folders but the branch
 #   - both Swift packages (swift/VibeOS, swift/vibe-vm): build and test,
 #     including the Swift half of the Rust<->Swift contract test, and the
 #     menu's model, Terminal attach and notifications against stand-ins
@@ -94,8 +109,11 @@
 #     (gh, git, an SSH key), an agent asleep on the old template restores,
 #     and [update] and
 #     Rebuild template make new templates (crates/vibed/tests/toolbox_vm.rs,
-#     which needs the network). N/A on a Mac that is itself a VM, like
-#     vm-cycle.
+#     which needs the network). And the sleep scenario on real VMs, with the
+#     stand-in for Claude: saved to disk once idle, restored by a send and
+#     an attach, slept early to make room for a start, and woken 30 s ahead
+#     of its /loop, which fires on time. N/A on a Mac that is itself a VM,
+#     like vm-cycle.
 #   - the Swift client against a live vibed, its event stream included
 #   - the menu against a live vibed on the test backend: an agent started
 #     over the socket appears in it and turns `question`, from vibed's events
@@ -472,6 +490,29 @@ s_agents() {
   expect '"state":"question"' "its state, rebuilt from its transcript"
   expect '"activity":"awaiting_answer"' "its activity, rebuilt"
 
+  # On a question with nothing attached, it's idle: once the debounce has
+  # passed, vibed's own watch puts it to sleep, and a send wakes it where
+  # it was, to answer.
+  out=$(rpc '{"jsonrpc":"2.0","id":9,"method":"limits.set","params":{"idle_debounce":1}}')
+  case $out in *'"error"'*) echo "limits.set failed: $out"; return 1 ;; esac
+  for i in $(seq 1 150); do
+    out=$(rpc '{"jsonrpc":"2.0","id":10,"method":"agents.list","params":{}}')
+    case $out in *'"state":"asleep"'*) break ;; esac
+    sleep 0.1
+  done
+  echo "idle: $out"
+  expect '"state":"asleep"' "the agent asleep once idle"
+  grep -q "$ref is asleep (idle for 1s, nothing attached)" "$WORK/ag-vibed-2.log" ||
+    { echo "vibed didn't say why it slept"; return 1; }
+  out=$(rpc "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"agents.send\",\"params\":{\"ref\":\"$ref\",\"keys\":[\"r\",\"e\",\"d\",\"Enter\"]}}")
+  echo "send: $out"
+  expect '"woke":true' "the wake"
+  wait_for "$transcript" "User answered: red"
+  out=$(rpc '{"jsonrpc":"2.0","id":12,"method":"limits.set","params":{"idle_debounce":600}}' \
+    '{"jsonrpc":"2.0","id":13,"method":"agents.list","params":{}}')
+  echo "woken: $out"
+  case $out in *'"state":"asleep"'*) echo "still asleep after the send"; return 1 ;; esac
+
   out=$(rpc "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"agents.delete\",\"params\":{\"ref\":\"$ref\"}}")
   echo "delete with an unpushed commit: $out"
   expect "1 commit that isn't pushed" "the refusal"
@@ -641,6 +682,28 @@ s_macos_agents() {
   echo "asking: $out"
   expect '"state":"question"' "the question, from the transcript"
 
+  # Awake, it holds the Mac from idle sleep, as pmset shows for this
+  # vibed's pid; asleep once idle (SIGSTOP), it lets go; a send wakes it.
+  held() { pmset -g assertions | grep -E "pid $VIBED_PID\(.*VibeOS: agents are awake" >/dev/null; }
+  for i in $(seq 1 100); do held && break; sleep 0.1; done
+  held || { echo "no IOPM assertion from vibed (pid $VIBED_PID) while an agent is awake"; pmset -g assertions; return 1; }
+  out=$(rpc '{"jsonrpc":"2.0","id":51,"method":"limits.set","params":{"idle_debounce":1}}')
+  case $out in *'"error"'*) echo "limits.set failed: $out"; return 1 ;; esac
+  for i in $(seq 1 150); do
+    out=$(rpc '{"jsonrpc":"2.0","id":52,"method":"agents.list","params":{}}')
+    case $out in *'"state":"asleep"'*) break ;; esac
+    sleep 0.1
+  done
+  echo "idle: $out"
+  expect '"state":"asleep"' "the agent asleep once idle"
+  for i in $(seq 1 100); do held || break; sleep 0.1; done
+  if held; then echo "the IOPM assertion outlived every awake agent"; pmset -g assertions; return 1; fi
+  out=$(rpc "{\"jsonrpc\":\"2.0\",\"id\":53,\"method\":\"agents.send\",\"params\":{\"ref\":\"$ref\",\"keys\":[\"r\",\"e\",\"d\",\"Enter\"]}}")
+  echo "send: $out"
+  expect '"woke":true' "the wake"
+  wait_for "$transcript" "User answered: red"
+  out=$(rpc '{"jsonrpc":"2.0","id":54,"method":"limits.set","params":{"idle_debounce":600}}')
+
   # Four processes against an edited limit of two: paused at once.
   out=$(rpc '{"jsonrpc":"2.0","id":6,"method":"limits.set","params":{"max_processes":2}}')
   case $out in *'"error"'*) echo "limits.set failed: $out"; return 1 ;; esac
@@ -761,6 +824,7 @@ s_linux_vm() {
   cargo test -p vibe-env --locked --test linux_conformance --no-run
   cargo test -p vibed --locked --test linux_vm --no-run
   cargo test -p vibed --locked --test toolbox_vm --no-run
+  cargo test -p vibed --locked --test sleep --no-run
   settle
   export VIBE_VM_BIN="$ROOT/build/vibe-vm" VIBE_BASE_RELEASES="file://$ROOT/build/base-image"
   export VIBE_VM_MARKER="$marker"
@@ -768,7 +832,8 @@ s_linux_vm() {
   CLAUDE_CODE_OAUTH_TOKEN="$token" \
     cargo test -p vibed --locked --test linux_vm -- --test-threads=1 --nocapture
   cargo test -p vibed --locked --test toolbox_vm -- --test-threads=1 --nocapture
-  for t in linux_conformance linux_agent toolbox_vm; do
+  cargo test -p vibed --locked --test sleep -- --test-threads=1 --nocapture on_real_vms
+  for t in linux_conformance linux_agent toolbox_vm sleep_scenario; do
     [ -f "$marker/$t" ] || { echo "$t was skipped, not run"; return 1; }
   done
 }
@@ -976,6 +1041,7 @@ s_cgroups() {
   fi
   VIBE_TEST_CGROUPS=1 cargo test -p vibe-env --test cgroups --locked -- --test-threads=1
   VIBE_TEST_CGROUPS=1 cargo test -p vibed --test agents --locked -- --test-threads=1 a_linux_agent_on_a_linux_host
+  VIBE_TEST_CGROUPS=1 cargo test -p vibed --test sleep --locked -- --test-threads=1 on_a_linux_hosts_cgroups
 }
 
 step tools "toolchain versions" s_tools

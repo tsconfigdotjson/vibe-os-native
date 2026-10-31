@@ -617,7 +617,8 @@ async fn admission_refuses_with_a_reason() {
     assert_eq!(
         err.message,
         "can't start an agent: there's no room for an agent with 1G of memory: this host has \
-         6G, keeps 4G for itself (reserve_memory), and its awake agents hold 2G"
+         6G, keeps 4G for itself (reserve_memory), and its agents hold 2G. No idle agent would \
+         free memory by going to sleep"
     );
     // An agent whose session has gone holds nothing.
     w.session(&b.agent).end(Duration::from_secs(5));
@@ -1647,81 +1648,35 @@ async fn a_macos_agent_runs_on_the_governor_in_the_owners_own_claude_home() {
 
 /// Memory pressure as a test sets it.
 #[derive(Debug, Default)]
-struct Pressure(std::sync::Mutex<Option<vibed::pressure::Psi>>);
+struct Pressure(std::sync::Mutex<Option<vibed::pressure::Reading>>);
 
 impl Pressure {
     fn set(&self, some10: f64) {
-        *self.0.lock().unwrap() = Some(vibed::pressure::Psi {
-            some10,
-            full10: 0.0,
-        });
+        *self.0.lock().unwrap() = Some(
+            vibed::pressure::Psi {
+                some10,
+                full10: 0.0,
+            }
+            .into(),
+        );
     }
 }
 
 impl vibed::pressure::MemoryPressure for Pressure {
-    fn read(&self) -> Option<vibed::pressure::Psi> {
+    fn read(&self) -> Option<vibed::pressure::Reading> {
         *self.0.lock().unwrap()
     }
 }
 
-/// The test backend, but its sleep gives memory back, as a VM's does.
-#[derive(Debug)]
-struct FreesMemory(vibe_env::testing::TestBackend);
-
-impl vibe_env::Compartment for FreesMemory {
-    fn create(&self, spec: &vibe_env::AgentSpec) -> vibe_env::Result<vibe_env::Handle> {
-        self.0.create(spec)
-    }
-    fn run(
-        &self,
-        h: &vibe_env::Handle,
-        r: &vibe_env::Run,
-    ) -> vibe_env::Result<vibe_env::RunOutput> {
-        self.0.run(h, r)
-    }
-    fn launch(
-        &self,
-        h: &vibe_env::Handle,
-        l: &vibe_env::Launch,
-    ) -> vibe_env::Result<vibe_env::TerminalEnd> {
-        self.0.launch(h, l)
-    }
-    fn processes(&self, h: &vibe_env::Handle) -> vibe_env::Result<Vec<vibe_env::Proc>> {
-        self.0.processes(h)
-    }
-    fn stop(&self, h: &vibe_env::Handle) -> vibe_env::Result<()> {
-        self.0.stop(h)
-    }
-    fn delete(&self, h: &vibe_env::Handle) -> vibe_env::Result<()> {
-        self.0.delete(h)
-    }
-}
-
-impl vibe_env::Limiter for FreesMemory {
-    fn apply(&self, h: &vibe_env::Handle, l: &vibe_env::Limits) -> vibe_env::Result<()> {
-        self.0.apply(h, l)
-    }
-    fn usage(&self, h: &vibe_env::Handle) -> vibe_env::Result<vibe_env::Usage> {
-        self.0.usage(h)
-    }
-}
-
-impl vibe_env::Sleeper for FreesMemory {
-    fn sleep(&self, h: &vibe_env::Handle) -> vibe_env::Result<()> {
-        self.0.sleep(h)
-    }
-    fn wake(&self, h: &vibe_env::Handle) -> vibe_env::Result<vibe_env::Woke> {
-        self.0.wake(h)
-    }
-}
-
-impl vibe_env::Backend for FreesMemory {
-    fn capabilities(&self) -> vibe_env::Capabilities {
-        vibe_env::Capabilities {
-            sleep_frees_memory: true,
-            ..self.0.capabilities()
-        }
-    }
+/// The test backend, held to its limits by "the kernel", as a Linux
+/// host's cgroups are.
+fn kernel_limited(claude: &Path) -> vibe_env::testing::TestBackend {
+    let b = vibe_env::testing::TestBackend::new(claude);
+    let caps = vibe_env::Capabilities {
+        kernel_limits: true,
+        ..vibe_env::Backend::capabilities(&b)
+    };
+    b.with_capabilities(caps)
 }
 
 #[tokio::test]
@@ -1737,16 +1692,16 @@ async fn memory_pressure_refuses_starts_then_ends_frozen_agents_oldest_first() {
         world_with(move |c| {
             c.pressure = pressure;
             // linux agents here sleep the way VMs do, giving their memory
-            // back; macos agents keep theirs.
+            // back; macos agents keep theirs, held by the kernel as a Linux
+            // host's are.
             c.backends = Backends::new()
                 .with(
                     Environment::Linux,
-                    Arc::new(FreesMemory(vibe_env::testing::TestBackend::new(&claude))),
+                    Arc::new(
+                        vibe_env::testing::TestBackend::new(&claude).sleeping_to_disk(1 << 20),
+                    ),
                 )
-                .with(
-                    Environment::Macos,
-                    Arc::new(vibe_env::testing::TestBackend::new(&claude)),
-                );
+                .with(Environment::Macos, Arc::new(kernel_limited(&claude)));
         })
         .await
     };
@@ -1851,9 +1806,9 @@ async fn sleep_needs_a_running_agent() {
     w.core.delete_agent(delete(&a.agent, true)).await.unwrap();
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[tokio::test]
-async fn after_a_reboot_every_agent_is_asleep_and_a_send_resumes_it() {
+async fn after_a_reboot_every_agent_is_asleep_and_an_attach_resumes_it() {
     let w = world().await;
     let a = w.core.start_agent(start("question")).await.unwrap();
     w.wait_screen(&a.agent, "Red or blue?");
@@ -1891,9 +1846,20 @@ async fn after_a_reboot_every_agent_is_asleep_and_a_send_resumes_it() {
     let core = Arc::new(Core::open(golden.config()).unwrap());
     core.adopt_sessions().await;
     assert_eq!(state(&core).await, AgentState::Asleep);
-    // And a send resumes it with `claude --resume`.
-    core.resume_agent(None, &a.agent).await.unwrap();
+    // And an attach resumes it with `claude --resume`.
+    let attach = core
+        .attach_session(vibe_core::rpc::SessionParams {
+            host: None,
+            agent: a.agent.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        attach.socket,
+        w.layout.session_socket(&a.agent).to_string_lossy()
+    );
     wait_screen_of(&w.layout, &a.agent, &format!("Resumed {}.", a.session_id));
+    assert_ne!(state(&core).await, AgentState::Asleep);
     core.delete_agent(delete(&a.agent, true)).await.unwrap();
 }
 
@@ -2111,9 +2077,15 @@ async fn memory_pressure_ends_an_agent_a_limit_froze_too() {
     use std::time::Instant;
     use vibed::pressure::{END_AFTER, PressureWatch};
     let pressure = Arc::new(Pressure::default());
+    let bin = common::short_tempdir();
+    let claude = common::stand_in(bin.path());
     let w = {
         let pressure = Arc::clone(&pressure);
-        world_with(move |c| c.pressure = pressure).await
+        world_with(move |c| {
+            c.pressure = pressure;
+            c.backends = Backends::all(Arc::new(kernel_limited(&claude)));
+        })
+        .await
     };
     let a = w.core.start_agent(start("fork 3 question")).await.unwrap();
     w.wait_screen(&a.agent, "Red or blue?");

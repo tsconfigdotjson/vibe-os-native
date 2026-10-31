@@ -360,6 +360,43 @@ fn sleep_saves_and_wake_restores_on_a_new_shim() {
 }
 
 #[test]
+fn processes_start_in_the_hosts_time_not_the_guests_uptime() {
+    let s = Setup::new();
+    let h = s.backend.create(&s.spec("quiet-amber-otter")).unwrap();
+    s.launch(&h).unwrap();
+    let procs = s.backend.processes(&h).unwrap();
+    assert_eq!(procs.len(), 1);
+    let now = guest::millis(SystemTime::now());
+    // Started as the guest came up, which was just now.
+    assert!(now - procs[0].started_ms < 60_000, "{procs:?}");
+}
+
+#[test]
+fn a_snapshot_is_counted_and_can_be_dropped_for_a_resume() {
+    let s = Setup::new();
+    let h = s.backend.create(&s.spec("quiet-amber-otter")).unwrap();
+    // Not running, it has nothing to save.
+    assert!(s.backend.sleep_size(&h).is_err());
+    s.launch(&h).unwrap();
+    // 1G used of 4G: that plus the balloon's headroom is what's saved.
+    let size = s.backend.sleep_size(&h).unwrap().unwrap();
+    assert!(size > 1 << 30 && size < 2 << 30, "{size}");
+    assert_eq!(s.backend.saved(&h), None);
+    // Its own snapshot isn't dropped while its VM runs.
+    assert!(s.backend.drop_saved(&h).is_err());
+    s.backend.sleep(&h).unwrap();
+    let saved = s.backend.saved(&h).unwrap();
+    assert_eq!(saved.bytes, "ram".len() as u64);
+    s.backend.drop_saved(&h).unwrap();
+    assert_eq!(s.backend.saved(&h), None);
+    assert!(!s.layout.snapshot("quiet-amber-otter").exists());
+    // Dropped, it wakes with `claude --resume` in a fresh boot.
+    assert_eq!(s.backend.wake(&h).unwrap(), Woke::Resume);
+    s.launch(&h).unwrap();
+    assert_eq!(s.fake.calls().last().unwrap(), "launch");
+}
+
+#[test]
 fn a_snapshot_that_wont_restore_is_dropped_for_a_resume() {
     let s = Setup::new();
     let h = s.backend.create(&s.spec("quiet-amber-otter")).unwrap();

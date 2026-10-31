@@ -67,6 +67,10 @@ pub type Entropy = Arc<dyn Fn() -> io::Result<[u8; keys::KEY_BYTES]> + Send + Sy
 /// This machine's Tailscale addresses now.
 pub type TailscaleAddresses = Arc<dyn Fn() -> Vec<std::net::IpAddr> + Send + Sync>;
 
+/// The free disk on the filesystem a path is on, or would be on; none
+/// where that can't be told.
+pub type FreeDisk = Arc<dyn Fn(&Path) -> Option<u64> + Send + Sync>;
+
 /// Everything [`Core::open`] needs. Tests swap the clock, the randomness and
 /// `gh` for fixed ones.
 pub struct Config {
@@ -97,6 +101,13 @@ pub struct Config {
     pub remote: Arc<dyn Remote>,
     /// How their links are timed.
     pub link_timing: Timing,
+    /// What holds the host awake while agents are: an IOPM assertion on a
+    /// Mac, by default.
+    pub power: Arc<dyn crate::power::Power>,
+    /// The free disk, for admission and snapshots: `statvfs`, by default.
+    pub free_disk: FreeDisk,
+    /// How the sleep watch is timed.
+    pub sleep_timing: crate::sleep::Timing,
 }
 
 impl std::fmt::Debug for Config {
@@ -112,6 +123,8 @@ impl std::fmt::Debug for Config {
             .field("pressure", &self.pressure)
             .field("toolbox", &self.toolbox)
             .field("remote", &self.remote)
+            .field("power", &self.power)
+            .field("sleep_timing", &self.sleep_timing)
             .finish_non_exhaustive()
     }
 }
@@ -138,6 +151,9 @@ impl Config {
             tailscale: Arc::new(vibe_mcp::net::tailscale_addresses),
             remote: Arc::new(Ssh::new()),
             link_timing: Timing::default(),
+            power: Arc::new(crate::power::HostPower::default()),
+            free_disk: Arc::new(crate::sleep::free_space),
+            sleep_timing: crate::sleep::Timing::default(),
         }
     }
 }
@@ -245,6 +261,17 @@ pub struct Core {
     /// When each agent asleep went to sleep, since this `vibed` started, and
     /// in which order: memory pressure ends the one asleep longest first.
     pub(crate) asleep_since: Mutex<crate::pressure::Sleeps>,
+    /// Agents memory pressure paused, and when: it ends each after a grace
+    /// period if the pressure lasts, and lets it go if it eases.
+    pub(crate) pressure_paused: Mutex<HashMap<String, std::time::Instant>>,
+    /// What the sleep watch keeps of each agent between looks.
+    pub(crate) sleep_watch: Mutex<crate::sleep::Watch>,
+    /// Held by a sleep that saves to disk, from making room for its
+    /// snapshot until it's saved.
+    pub(crate) snapshotting: tokio::sync::Mutex<()>,
+    pub(crate) sleep_timing: crate::sleep::Timing,
+    pub(crate) power: Arc<dyn crate::power::Power>,
+    pub(crate) free_disk: FreeDisk,
     /// Refs being started, deleted or resumed, one thing at a time each.
     pub(crate) agents_busy: Mutex<HashSet<String>>,
     /// One edit of Claude's state at a time: agents may share its file.
@@ -408,6 +435,12 @@ impl Core {
             admission: config.admission,
             pressure: config.pressure,
             asleep_since: Mutex::new(crate::pressure::Sleeps::default()),
+            pressure_paused: Mutex::new(HashMap::new()),
+            sleep_watch: Mutex::new(crate::sleep::Watch::default()),
+            snapshotting: tokio::sync::Mutex::new(()),
+            sleep_timing: config.sleep_timing,
+            power: config.power,
+            free_disk: config.free_disk,
             agents_busy: Mutex::new(HashSet::new()),
             claude_lock: Arc::new(Mutex::new(())),
             admitting: tokio::sync::Mutex::new(()),
@@ -443,6 +476,7 @@ impl Core {
             runtime: OnceLock::new(),
             _state_lock: state_lock,
         };
+        core.load_pressure_pauses();
         core.load_links().map_err(|e| {
             OpenError::Store(StoreError::Conflict(format!(
                 "can't read the Linux hosts: {}",
@@ -961,7 +995,29 @@ impl Core {
         let host = self.host(p.host.as_deref())?;
         validate_ref(&p.agent).map_err(invalid)?;
         let socket = self.layout.session_socket(&p.agent);
-        // Waking an asleep agent first comes with sleep and wake (#6).
+        // An attach wakes an agent asleep, or frozen by memory pressure
+        // (PRD: Going to sleep; How a click becomes a Terminal window),
+        // exactly where it was, or with `claude --resume` where it can't
+        // be. One going to sleep right now is waited for, then woken.
+        let agent = self
+            .store()
+            .agent(host, &p.agent)
+            .ok()
+            .filter(|a| !a.starting);
+        if agent.is_some() {
+            self.wait_not_busy(&p.agent).await;
+            let a = self.store().agent(host, &p.agent).map_err(store_error)?;
+            let frozen = a.state == vibe_core::model::AgentState::Asleep
+                || (a.state == vibe_core::model::AgentState::Paused
+                    && lock(&self.pressure_paused).contains_key(&p.agent));
+            if frozen {
+                self.resume_agent(Some(host), &p.agent).await?;
+                crate::log!("vibed: {} was {}, and an attach woke it", p.agent, a.state);
+            }
+            // The client connects in a moment; until then, and for its
+            // debounce after, it's not idle.
+            lock(&self.sleep_watch).woke(&p.agent);
+        }
         match sessions::probe(&socket).await {
             Probe::Running(status) => {
                 let title = self
