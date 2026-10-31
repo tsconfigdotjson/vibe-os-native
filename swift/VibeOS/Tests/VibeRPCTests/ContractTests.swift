@@ -146,6 +146,7 @@ let swiftTypes: [String: Set<String>] = [
     "SessionAttach": keys(SessionAttach.CodingKeys.self),
     "AgentStartParams": keys(AgentStartParams.CodingKeys.self),
     "AgentDeleteParams": keys(AgentDeleteParams.CodingKeys.self),
+    "AgentParams": keys(AgentParams.CodingKeys.self),
     "Agent": keys(Agent.CodingKeys.self),
     "AgentStatus": keys(AgentStatus.CodingKeys.self),
     "Wakeup": keys(Wakeup.CodingKeys.self),
@@ -163,6 +164,7 @@ let swiftEnums: [String: [String]] = [
     "ProjectSource": ProjectSource.allCases.map(\.rawValue),
     "GhState": GhState.allCases.map(\.rawValue),
     "EventKind": EventKind.allCases.map(\.rawValue),
+    "HostLink": HostLink.allCases.map(\.rawValue),
     "SessionState": SessionState.allCases.map(\.rawValue),
     "AgentState": AgentState.allCases.map(\.rawValue),
     "Activity": AgentActivity.allCases.map(\.rawValue),
@@ -218,6 +220,7 @@ func methodChecks() -> [String: MethodCheck] {
         check(AgentsStart.self),
         check(AgentsList.self),
         check(AgentsDelete.self),
+        check(AgentsInterrupt.self),
         check(ToolboxStatusGet.self),
         check(ToolboxOpen.self),
         check(ToolboxUpdate.self),
@@ -417,6 +420,25 @@ let swiftErrorData: [RPCErrorCode: String] = [.protocolMismatch: "ProtocolMismat
 @Suite(.enabled(if: ProcessInfo.processInfo.environment["VIBE_TEST_SOCKET"] != nil))
 struct LiveDaemonTests {
     let client = VibedClient(socketPath: ProcessInfo.processInfo.environment["VIBE_TEST_SOCKET"] ?? "")
+
+    /// The menu's event stream: subscribed, then an event a call causes.
+    @Test(.timeLimit(.minutes(1))) func eventsFromALiveDaemon() async throws {
+        var subscribed = false
+        for try await message in client.events(client: "VibeRPCTests events") {
+            switch message {
+            case .subscribed:
+                subscribed = true
+                // The default, so the other live test still finds it.
+                var params = LimitsSetParams()
+                params.maxAwakeAgents = 16
+                _ = try client.call(LimitsSet.self, params)
+            case .event(let event):
+                #expect(subscribed)
+                if event.kind == .limitsChanged { return }
+            }
+        }
+        Issue.record("the event stream ended before the limits.changed event")
+    }
 
     @Test func helloAgainstALiveDaemon() throws {
         let hello = try client.hello(client: "VibeRPCTests")

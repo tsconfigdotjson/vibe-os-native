@@ -36,6 +36,10 @@ pub fn golden_info() -> DaemonInfo {
 /// one when they're replayed.
 pub const GOLDEN_HOME: &str = "/Users/me";
 
+/// What the test backend says every running agent uses: about what a real
+/// Claude Code does (PRD: Spike results).
+pub const AGENT_MEMORY_USED: u64 = 340 * 1024 * 1024;
+
 /// 2026-10-30T12:00:00Z: the time in every example.
 pub const GOLDEN_NOW: i64 = 1_793_361_600;
 
@@ -285,7 +289,9 @@ impl Golden {
         config.label = "mac-mini".into();
         config.gh = self.gh.clone().into();
         config.shim = workspace_bin("vibe-shim").into_os_string();
-        config.backends = Backends::all(Arc::new(TestBackend::new(&self.claude)));
+        config.backends = Backends::all(Arc::new(
+            TestBackend::new(&self.claude).reporting_memory(AGENT_MEMORY_USED),
+        ));
         config.toolbox = Some(Arc::new(
             TestToolbox::new(
                 Layout::new(&self.home, "macos"),

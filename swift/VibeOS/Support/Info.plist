@@ -20,6 +20,10 @@
 	<string>1</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>26.0</string>
+	<!-- Asked the first time a row is clicked: Terminal is scripted to
+	     open, or raise, the window attached to that agent. -->
+	<key>NSAppleEventsUsageDescription</key>
+	<string>VibeOS opens Terminal attached to an agent's session, and brings forward the window already attached to it.</string>
 	<!-- A menu bar app: no Dock icon, no main window. -->
 	<key>LSUIElement</key>
 	<true/>

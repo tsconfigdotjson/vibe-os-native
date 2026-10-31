@@ -17,8 +17,9 @@ use serde_json::Value;
 
 pub use crate::limits::HostLimits;
 pub use crate::model::{
-    Activity, AgentState, Certainty, Environment, EventKind, GhState, Mode, Model, Profile,
-    ProjectSource, Reasoning, SessionState, StopReason, ToolboxAction, ToolboxState, WakeupKind,
+    Activity, AgentState, Certainty, Environment, EventKind, GhState, HostLink, Mode, Model,
+    Profile, ProjectSource, Reasoning, SessionState, StopReason, ToolboxAction, ToolboxState,
+    WakeupKind,
 };
 
 /// Bumped on any incompatible change to the contract. Clients send theirs in
@@ -347,6 +348,7 @@ pub const METHODS: &[&str] = &[
     AgentsStart::NAME,
     AgentsList::NAME,
     AgentsDelete::NAME,
+    AgentsInterrupt::NAME,
     ToolboxStatusGet::NAME,
     ToolboxOpen::NAME,
     ToolboxUpdate::NAME,
@@ -544,6 +546,13 @@ method! {
 }
 
 method! {
+    /// `agents.interrupt`: presses Escape in the agent's terminal, which
+    /// stops Claude's turn, as the menu's Interrupt does. Refused unless its
+    /// session runs; it never wakes an agent.
+    AgentsInterrupt = "agents.interrupt", AgentParams => Agent
+}
+
+method! {
     /// `toolbox.status`: the toolbox's state, the template and Linux home
     /// versions new agents boot, the base images, and how the last toolbox
     /// run went.
@@ -598,6 +607,13 @@ pub struct HostInfo {
     pub os: String,
     /// For people: the machine's hostname.
     pub label: String,
+    /// How this daemon reaches it: `local` for itself; for another host,
+    /// whether its SSH link is up (#16).
+    pub link: HostLink,
+    /// Whether it's the external address for outside MCP callers (#18).
+    pub external: bool,
+    /// Whether it serves MCP (#12).
+    pub mcp: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -945,6 +961,16 @@ pub struct AgentDeleteParams {
     pub force: Option<bool>,
 }
 
+/// Names one agent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(rename = "ref")]
+    pub agent: String,
+}
+
 /// An agent: one Claude Code in its own worktree and compartment.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Agent {
@@ -965,6 +991,12 @@ pub struct Agent {
     pub created_at: String,
     /// The command that attaches a terminal to it.
     pub attach: String,
+    /// Its memory limit, in bytes: its profile's memory when it started.
+    pub memory: u64,
+    /// What it uses now, in bytes, while its session runs and its backend
+    /// can tell. Only `agents.list` and `agents.interrupt` measure it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_used: Option<u64>,
     /// What its transcript says it's doing.
     pub status: AgentStatus,
 }

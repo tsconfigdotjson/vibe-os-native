@@ -40,6 +40,7 @@ public enum VibeRPC {
         AgentsStart.name,
         AgentsList.name,
         AgentsDelete.name,
+        AgentsInterrupt.name,
         ToolboxStatusGet.name,
         ToolboxOpen.name,
         ToolboxUpdate.name,
@@ -394,6 +395,11 @@ public enum EventKind: String, Codable, CaseIterable, Hashable, Sendable {
 }
 
 /// Whether a session's shim still holds its terminal.
+/// How vibed reaches a host: `local` for itself, else whether its link is up.
+public enum HostLink: String, Codable, CaseIterable, Hashable, Sendable {
+    case local, connected, down
+}
+
 public enum SessionState: String, Codable, CaseIterable, Hashable, Sendable {
     case running, exited
 }
@@ -599,6 +605,14 @@ public enum AgentsDelete: RPCMethod {
     public static let name = "agents.delete"
 }
 
+/// `agents.interrupt`: presses Escape in the agent's terminal, which stops
+/// Claude's turn. Refused unless its session runs; it never wakes one.
+public enum AgentsInterrupt: RPCMethod {
+    public typealias Params = AgentParams
+    public typealias Result = Agent
+    public static let name = "agents.interrupt"
+}
+
 /// `toolbox.status`: the versions new agents boot, and the last toolbox run.
 public enum ToolboxStatusGet: RPCMethod {
     public typealias Params = NoParams
@@ -680,9 +694,15 @@ public struct HostInfo: Codable, Hashable, Sendable {
     public var os: String
     /// The hostname, for people.
     public var label: String
+    /// `local` for vibed's own host; another's link is `connected` or `down`.
+    public var link: HostLink
+    /// Whether it's the external address for outside MCP callers.
+    public var external: Bool
+    /// Whether it serves MCP.
+    public var mcp: Bool
 
     public enum CodingKeys: String, CodingKey, CaseIterable {
-        case name, os, label
+        case name, os, label, link, external, mcp
     }
 }
 
@@ -1189,6 +1209,21 @@ public struct AgentDeleteParams: Codable, Hashable, Sendable {
     }
 }
 
+/// Names one agent.
+public struct AgentParams: Codable, Hashable, Sendable {
+    public var host: String?
+    public var ref: String
+
+    public init(host: String? = nil, ref: String) {
+        self.host = host
+        self.ref = ref
+    }
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case host, ref
+    }
+}
+
 /// One Claude Code in its own worktree and compartment.
 public struct Agent: Codable, Hashable, Sendable {
     public var host: String
@@ -1204,6 +1239,11 @@ public struct Agent: Codable, Hashable, Sendable {
     public var createdAt: String
     /// The command that attaches a terminal, such as `vibe attach <ref>`.
     public var attach: String
+    /// Its memory limit in bytes: its profile's when it started.
+    public var memory: Int
+    /// What it uses now, in bytes, while its session runs; only
+    /// `agents.list` and `agents.interrupt` measure it.
+    public var memoryUsed: Int?
     /// What its transcript says it's doing.
     public var status: AgentStatus
 
@@ -1211,7 +1251,9 @@ public struct Agent: Codable, Hashable, Sendable {
         case host, ref, project, profile, environment, state, worktree, branch
         case sessionId = "session_id"
         case createdAt = "created_at"
-        case attach, status
+        case attach, memory
+        case memoryUsed = "memory_used"
+        case status
     }
 }
 

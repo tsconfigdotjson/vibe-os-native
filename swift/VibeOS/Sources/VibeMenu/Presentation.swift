@@ -1,0 +1,231 @@
+import Foundation
+import VibeRPC
+
+// What the menu shows, worked out from vibed's answers alone (PRD: Menu bar
+// and Terminal attach). Nothing here keeps state.
+
+extension AgentState {
+    /// Holding memory on its host: everything but asleep and exited.
+    public var isAwake: Bool {
+        switch self {
+        case .asleep, .exited: false
+        case .busy, .idle, .question, .paused: true
+        }
+    }
+}
+
+extension Agent {
+    /// Unique across hosts: `vps:quiet-amber-otter`.
+    public var key: String { "\(host):\(ref)" }
+
+    public var isLocal: Bool { host == VibeRPC.localHost }
+}
+
+/// How an agent's state dot looks.
+public enum StateDot: Equatable, Sendable {
+    /// Pulsing.
+    case busy
+    /// Amber.
+    case question
+    /// Grey.
+    case idle
+    /// Hollow.
+    case asleep
+    /// Red: paused by a limit, or exited.
+    case stopped
+
+    public init(_ state: AgentState) {
+        switch state {
+        case .busy: self = .busy
+        case .question: self = .question
+        case .idle: self = .idle
+        case .asleep: self = .asleep
+        case .paused, .exited: self = .stopped
+        }
+    }
+}
+
+/// The menu bar icon: a glyph, the count of awake agents, an amber dot when
+/// any has a question, and a red dot when any is paused by a limit.
+public struct IconSummary: Equatable, Sendable {
+    public var awake: Int
+    public var question: Bool
+    public var paused: Bool
+
+    public init(agents: [Agent]) {
+        awake = agents.filter { $0.state.isAwake }.count
+        question = agents.contains { $0.state == .question }
+        paused = agents.contains { $0.state == .paused }
+    }
+}
+
+/// A host's agents in the menu, by project.
+public struct HostGroup: Identifiable, Equatable, Sendable {
+    public var host: String
+    public var projects: [ProjectGroup]
+    public var id: String { host }
+}
+
+public struct ProjectGroup: Identifiable, Equatable, Sendable {
+    public var host: String
+    public var project: String
+    /// Oldest first, as vibed lists them.
+    public var agents: [Agent]
+    public var id: String { "\(host)/\(project)" }
+}
+
+/// Groups agents by host, then project: this host first, then the others
+/// in `hosts` order, and projects by name.
+public func groupAgents(_ agents: [Agent], hosts: [String]) -> [HostGroup] {
+    var order = [VibeRPC.localHost]
+    for host in hosts + agents.map(\.host) where !order.contains(host) {
+        order.append(host)
+    }
+    return order.compactMap { host in
+        let mine = agents.filter { $0.host == host }
+        guard !mine.isEmpty else { return nil }
+        let projects = Set(mine.map(\.project)).sorted()
+        return HostGroup(
+            host: host,
+            projects: projects.map { project in
+                ProjectGroup(host: host, project: project, agents: mine.filter { $0.project == project })
+            })
+    }
+}
+
+/// Reads vibed's times: RFC 3339 in UTC, with or without fractions.
+public func parseTime(_ text: String) -> Date? {
+    if let date = try? Date(text, strategy: .iso8601) { return date }
+    return try? Date(text, strategy: Date.ISO8601FormatStyle(includingFractionalSeconds: true))
+}
+
+/// A duration for a row: `45s`, `12m`, `3h 5m`, `2d 4h`.
+public func formatElapsed(_ seconds: TimeInterval) -> String {
+    let s = max(0, Int(seconds))
+    if s < 60 { return "\(s)s" }
+    let m = s / 60
+    if m < 60 { return "\(m)m" }
+    let h = m / 60
+    if h < 24 { return m % 60 == 0 ? "\(h)h" : "\(h)h \(m % 60)m" }
+    let d = h / 24
+    return h % 24 == 0 ? "\(d)d" : "\(d)d \(h % 24)h"
+}
+
+/// How long an agent has been going, since it started.
+public func elapsed(_ agent: Agent, now: Date) -> String? {
+    parseTime(agent.createdAt).map { formatElapsed(now.timeIntervalSince($0)) }
+}
+
+private let kib = 1024
+private let mib = 1024 * kib
+private let gib = 1024 * mib
+private let tib = 1024 * gib
+
+/// Bytes the way vibed writes them in `host.toml`: `4G`, `512M`, `1.5G`.
+public func formatBytes(_ bytes: Int) -> String {
+    let units: [(Int, String)] = [(tib, "T"), (gib, "G"), (mib, "M"), (kib, "K")]
+    for (size, suffix) in units where bytes >= size {
+        let value = Double(bytes) / Double(size)
+        if bytes % size == 0 { return "\(bytes / size)\(suffix)" }
+        if value >= 100 { return "\(Int(value.rounded()))\(suffix)" }
+        return String(format: "%.1f", value) + suffix
+    }
+    return "\(bytes)B"
+}
+
+/// Bytes exactly, for a field to edit: the largest unit that divides them,
+/// such as `4G` or `1500M`, so what's shown reads back as the same number.
+public func formatSize(_ bytes: Int) -> String {
+    let units: [(Int, String)] = [(tib, "T"), (gib, "G"), (mib, "M"), (kib, "K")]
+    for (size, suffix) in units where bytes >= size && bytes % size == 0 {
+        return "\(bytes / size)\(suffix)"
+    }
+    return "\(bytes)"
+}
+
+/// Reads a size as `host.toml` writes one: bytes, or a whole or decimal
+/// number with K, M, G or T (and an optional B or iB). Nil if it isn't one.
+public func parseBytes(_ text: String) -> Int? {
+    var s = text.trimmingCharacters(in: .whitespaces).uppercased()
+    for suffix in ["IB", "B"] where s.hasSuffix(suffix) && s.count > suffix.count {
+        s.removeLast(suffix.count)
+        break
+    }
+    let units: [Character: Int] = ["K": kib, "M": mib, "G": gib, "T": tib]
+    var unit = 1
+    if let last = s.last, let size = units[last] {
+        unit = size
+        s.removeLast()
+    }
+    s = s.trimmingCharacters(in: .whitespaces)
+    if let whole = Int(s), whole >= 0 {
+        let (bytes, overflow) = whole.multipliedReportingOverflow(by: unit)
+        return overflow ? nil : bytes
+    }
+    guard unit > 1, let value = Double(s), value >= 0, value.isFinite,
+        value * Double(unit) < Double(Int.max)
+    else { return nil }
+    return Int((value * Double(unit)).rounded())
+}
+
+/// Reads a duration as `host.toml` writes one: seconds, or a number with
+/// `s`, `m` or `h`.
+public func parseSeconds(_ text: String) -> Int? {
+    var s = text.trimmingCharacters(in: .whitespaces).lowercased()
+    let units: [Character: Int] = ["s": 1, "m": 60, "h": 3600]
+    var unit = 1
+    if let last = s.last, let size = units[last] {
+        unit = size
+        s.removeLast()
+    }
+    guard let n = Int(s.trimmingCharacters(in: .whitespaces)), n >= 0 else { return nil }
+    let (seconds, overflow) = n.multipliedReportingOverflow(by: unit)
+    return overflow ? nil : seconds
+}
+
+/// The memory bar: what the agent uses against its limit, 0 to 1, with a
+/// label. Nil while nothing measured it (asleep, exited, starting).
+public struct MemoryGauge: Equatable, Sendable {
+    public var fraction: Double
+    public var label: String
+
+    public init?(_ agent: Agent) {
+        guard let used = agent.memoryUsed, agent.memory > 0 else { return nil }
+        fraction = min(1, max(0, Double(used) / Double(agent.memory)))
+        label = "\(formatBytes(used)) / \(formatBytes(agent.memory))"
+    }
+}
+
+/// The second and third lines of a row: the session's title, and the latest
+/// activity line, or "limited until …" while a usage limit holds it.
+public func rowLines(_ agent: Agent, timeZone: TimeZone = .current) -> (title: String?, line: String?) {
+    let status = agent.status
+    var line = status.line
+    if status.stopReason == .usageLimit {
+        if let resets = status.resetsAt.flatMap(parseTime) {
+            var style = Date.FormatStyle(date: .omitted, time: .shortened)
+            style.timeZone = timeZone
+            line = "limited until \(resets.formatted(style))"
+        } else {
+            line = "limited by a usage limit"
+        }
+    } else if status.activity == .errored, let error = status.error {
+        line = "error: \(error)"
+    }
+    return (status.title, line)
+}
+
+/// The MCP setup line a new key's Copy setup command gives (PRD: MCP
+/// interface, Auth). The port is the PRD's placeholder until #12 settles it.
+public enum MCPSetup {
+    public static let url = "http://127.0.0.1:7878/mcp"
+
+    public static func command(secret: String) -> String {
+        "claude mcp add --transport http vibeos \(url) --header \"Authorization: Bearer \(secret)\""
+    }
+}
+
+/// Quotes `word` for a POSIX shell.
+public func shellQuote(_ word: String) -> String {
+    "'" + word.replacingOccurrences(of: "'", with: "'\\''") + "'"
+}

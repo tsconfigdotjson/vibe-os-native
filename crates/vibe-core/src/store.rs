@@ -17,7 +17,9 @@ use std::time::Duration;
 use rusqlite::types::Type;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
-use crate::model::{AgentState, Environment, Mode, Model, Profile, ProjectSource, Reasoning};
+use crate::model::{
+    AgentState, Environment, HostLink, Mode, Model, Profile, ProjectSource, Reasoning,
+};
 use crate::rpc::{ApiKey, HostInfo, Project};
 use crate::time::rfc3339;
 
@@ -291,15 +293,27 @@ impl Store {
 
     /// Every host, this one first.
     pub fn hosts(&self) -> Result<Vec<HostInfo>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT name, os, label FROM hosts ORDER BY address IS NOT NULL, name")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT name, os, label, address IS NULL FROM hosts \
+                 ORDER BY address IS NOT NULL, name",
+        )?;
         let hosts = stmt
             .query_map([], |r| {
+                // Another host's link is down until a link to it is up
+                // (#16); MCP (#12) and the external address (#18) are off
+                // until they come.
+                let local: bool = r.get(3)?;
                 Ok(HostInfo {
                     name: r.get(0)?,
                     os: r.get(1)?,
                     label: r.get(2)?,
+                    link: if local {
+                        HostLink::Local
+                    } else {
+                        HostLink::Down
+                    },
+                    external: false,
+                    mcp: false,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
@@ -899,7 +913,10 @@ mod tests {
             [HostInfo {
                 name: "local".into(),
                 os: "macos".into(),
-                label: "renamed".into()
+                label: "renamed".into(),
+                link: HostLink::Local,
+                external: false,
+                mcp: false,
             }]
         );
         assert!(s.has_host("local").unwrap());

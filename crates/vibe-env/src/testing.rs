@@ -56,6 +56,9 @@ pub struct TestBackend {
     /// Held to pause, to replace a supervisor and to wake, so a supervisor
     /// that was just replaced can't pause the agent a wake has continued.
     gate: Arc<Mutex<()>>,
+    /// What [`Limiter::usage`] says each running agent's memory is, in
+    /// place of what its processes use.
+    memory: Option<u64>,
 }
 
 /// One agent's limits, held by a thread of its own.
@@ -82,7 +85,16 @@ impl TestBackend {
             claude: claude.into(),
             supervisors: Mutex::new(HashMap::new()),
             gate: Arc::new(Mutex::new(())),
+            memory: None,
         }
+    }
+
+    /// Reports `bytes` as each running agent's memory, so listings that
+    /// show it are the same every time. Limits still see what its
+    /// processes really use.
+    pub fn reporting_memory(mut self, bytes: u64) -> TestBackend {
+        self.memory = Some(bytes);
+        self
     }
 
     /// The agent's session, unless its pid now names someone else's.
@@ -202,8 +214,9 @@ impl Limiter for TestBackend {
         let paused = lock(&self.supervisors)
             .get(&h.agent_ref)
             .and_then(|s| *lock(&s.paused));
+        let memory = procs.iter().map(|p| p.memory).sum();
         Ok(Usage {
-            memory: procs.iter().map(|p| p.memory).sum(),
+            memory: self.memory.filter(|_| !procs.is_empty()).unwrap_or(memory),
             cpu_ms: procs.iter().map(|p| p.cpu_ms).sum(),
             processes: procs.len() as u32,
             paused,

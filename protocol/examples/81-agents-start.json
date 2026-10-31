@@ -25,6 +25,7 @@
       "session_id": "40414243-4445-4647-8849-4a4b4c4d4e4f",
       "created_at": "2026-10-30T12:00:00Z",
       "attach": "vibe attach honest-lilac-marten",
+      "memory": 4294967296,
       "status": {
         "activity": "unknown",
         "certainty": "firm",

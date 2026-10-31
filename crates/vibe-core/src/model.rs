@@ -133,6 +133,18 @@ names! {
 }
 
 names! {
+    /// How a host's `vibed` is reached from this one.
+    HostLink {
+        /// It's this host.
+        Local = "local",
+        /// Another host, whose link is up.
+        Connected = "connected",
+        /// Another host, whose link is down: its agents are unavailable.
+        Down = "down",
+    }
+}
+
+names! {
     /// Whether a session's shim is still holding its terminal.
     SessionState {
         /// Its shim is up, and clients can attach.

@@ -79,7 +79,8 @@ fn lock_held(socket: &Path) -> bool {
     }
 }
 
-async fn ask_status(socket: &Path) -> io::Result<Status> {
+/// A control connection to the shim at `socket`, welcomed.
+async fn control(socket: &Path) -> io::Result<UnixStream> {
     let mut stream = UnixStream::connect(socket).await?;
     let hello = shim::control_hello("vibed");
     stream
@@ -87,16 +88,20 @@ async fn ask_status(socket: &Path) -> io::Result<Status> {
         .await?;
     let welcome = read_frame(&mut stream).await?;
     match welcome.kind {
-        FrameKind::Welcome => {}
+        FrameKind::Welcome => Ok(stream),
         FrameKind::Refused => {
             let refused: Refused = welcome.decode()?;
-            return Err(io::Error::other(format!(
+            Err(io::Error::other(format!(
                 "the shim refused vibed: {}",
                 refused.message
-            )));
+            )))
         }
-        other => return Err(unexpected(other)),
+        other => Err(unexpected(other)),
     }
+}
+
+async fn ask_status(socket: &Path) -> io::Result<Status> {
+    let mut stream = control(socket).await?;
     stream
         .write_all(&Frame::json(FrameKind::Request, &Request::Status).encode())
         .await?;
@@ -109,6 +114,35 @@ async fn ask_status(socket: &Path) -> io::Result<Status> {
         Reply::Error(e) => Err(io::Error::other(e)),
         other => Err(io::Error::other(format!("{other:?} instead of a status"))),
     }
+}
+
+/// Types `bytes` into the session at `socket`, as a control client: they
+/// reach its command as if typed, and nobody counts as attached.
+pub async fn send_input(socket: &Path, bytes: &[u8]) -> io::Result<()> {
+    let send = async {
+        let mut stream = control(socket).await?;
+        stream
+            .write_all(&Frame::new(FrameKind::Input, bytes.to_vec()).encode())
+            .await?;
+        // A status after the input: the shim answers in order, so once it
+        // has, the input has reached the terminal's queue.
+        stream
+            .write_all(&Frame::json(FrameKind::Request, &Request::Status).encode())
+            .await?;
+        let reply = read_frame(&mut stream).await?;
+        if reply.kind != FrameKind::Reply {
+            return Err(unexpected(reply.kind));
+        }
+        Ok(())
+    };
+    tokio::time::timeout(PROBE_TIMEOUT, send)
+        .await
+        .unwrap_or_else(|_| {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("no answer in {}s", PROBE_TIMEOUT.as_secs()),
+            ))
+        })
 }
 
 fn unexpected(kind: FrameKind) -> io::Error {

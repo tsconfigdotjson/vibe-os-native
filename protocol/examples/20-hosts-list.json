@@ -1,5 +1,5 @@
 {
-  "description": "Every host this daemon knows. Each vibed calls itself `local`; other hosts come with #16. Examples from here on are one session, in file order, on a Mac whose home is /Users/me.",
+  "description": "Every host this daemon knows. Each vibed calls itself `local`, with the link `local`; other hosts come with #16, and their links are `connected` or `down`. `external` says which host is the external address (#18), and `mcp` whether a host serves MCP (#12). Examples from here on are one session, in file order, on a Mac whose home is /Users/me.",
   "request": {"jsonrpc": "2.0", "id": 20, "method": "hosts.list", "params": {}},
-  "response": {"jsonrpc": "2.0", "id": 20, "result": {"hosts": [{"name": "local", "os": "macos", "label": "mac-mini"}]}}
+  "response": {"jsonrpc": "2.0", "id": 20, "result": {"hosts": [{"name": "local", "os": "macos", "label": "mac-mini", "link": "local", "external": false, "mcp": false}]}}
 }
