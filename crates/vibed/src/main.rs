@@ -13,6 +13,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use vibe_core::model::Environment;
 use vibe_core::paths::{self, Layout};
 use vibe_core::rpc::MAX_MESSAGE_BYTES;
+use vibe_env::cgroups::Cgroups;
 use vibe_env::linux::{self, LinuxVm};
 use vibe_env::macos::Macos;
 use vibe_env::testing::{TestBackend, TestToolbox};
@@ -47,8 +48,10 @@ environment:
                   where the Linux base image and Claude Code for linux agents
                   come from (default: their published releases; a file://
                   directory works too)
-  VIBE_CLAUDE     on a Mac, the claude macos agents run (default: the one on
-                  the login shell's PATH)
+  VIBE_CLAUDE     the claude native agents run: macos agents on a Mac, linux
+                  agents on a Linux host (default: the one on the login
+                  shell's PATH on a Mac, on vibed's PATH or in ~/.local/bin
+                  on a Linux host)
   VIBE_SSH        the ssh that reaches Linux hosts (default: ssh on PATH)
   VIBE_HOST_BUNDLE
                   the Linux builds of vibed, vibe and vibe-shim that Add Linux
@@ -206,14 +209,16 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
             PathBuf::from(&claude).display()
         );
         config.backends = Backends::all(Arc::new(TestBackend::new(PathBuf::from(claude))));
+        // Tests' agents start whatever the machine running them is doing.
+        config.pressure = Arc::new(vibed::pressure::NoPressure);
         // Its toolbox shell is a plain shell, and keeps empty versions.
         config.toolbox = Some(Arc::new(TestToolbox::new(
             config.layout.clone(),
             vec!["/bin/sh".into()],
         )));
     }
-    // linux agents on a Mac run in VMs; a Linux host's run under cgroups
-    // (#17).
+    // linux agents on a Mac run in VMs; a Linux host's run natively, each in
+    // a cgroup of its own.
     let mut images = None;
     if config.backends.get(Environment::Linux).is_none() && cfg!(target_os = "macos") {
         match vibe_vm() {
@@ -239,6 +244,29 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
                 "vibed: no vibe-vm beside vibed, nor in VIBE_VM, so linux agents can't start"
             ),
         }
+    }
+    let mut cgroups = None;
+    if config.backends.get(Environment::Linux).is_none() && cfg!(target_os = "linux") {
+        let mut backend = Cgroups::new(config.layout.home());
+        if let Some(claude) = std::env::var_os("VIBE_CLAUDE").filter(|v| !v.is_empty()) {
+            backend = backend.with_claude(PathBuf::from(claude));
+        }
+        match backend.check() {
+            Ok((systemd, warnings)) => {
+                vibed::log!(
+                    "vibed: linux agents run natively, each in a cgroup of its own under systemd {}'s {}",
+                    systemd.version,
+                    backend.slice()
+                );
+                for w in warnings {
+                    vibed::log!("vibed: warning: {w}");
+                }
+            }
+            Err(e) => vibed::log!("vibed: linux agents can't start here: {e}"),
+        }
+        let backend = Arc::new(backend);
+        cgroups = Some(Arc::clone(&backend));
+        config.backends = config.backends.with(Environment::Linux, backend);
     }
     // macos agents run natively, under the governor.
     let mut macos = None;
@@ -283,6 +311,8 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
     let toolbox = core.spawn_toolbox(TOOLBOX_POLL, vibed::toolbox::UPDATE_CHECK_EVERY);
     // MCP on loopback, and on the Tailscale address when host.toml says.
     let mcp = core.spawn_mcp(vibed::mcp::LISTEN_CHECK_EVERY);
+    // Memory pressure: refuse starts, then end frozen agents.
+    let pressure = core.spawn_pressure_watch(vibed::pressure::PRESSURE_EVERY);
     // The links to Linux hosts, each kept up on its own.
     core.spawn_links();
     vibed::log!(
@@ -303,6 +333,7 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
     status.abort();
     maintenance.abort();
     limit_watch.abort();
+    pressure.abort();
     adopting.abort();
     if let Some(toolbox) = toolbox {
         toolbox.abort();
@@ -314,6 +345,10 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
     // their agents run on as themselves.
     if let Some(macos) = macos {
         macos.release();
+    }
+    // The kernel holds cgroups to their limits without vibed.
+    if let Some(cgroups) = cgroups {
+        cgroups.release();
     }
     drop(guard);
     vibed::log!("vibed: stopped");

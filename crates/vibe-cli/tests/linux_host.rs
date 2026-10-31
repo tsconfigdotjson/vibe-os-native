@@ -180,8 +180,9 @@ esac
                 tools.display()
             ),
         );
-        // Its vibed runs agents under the test backend, as a Linux host's
-        // cgroups backend (#17) isn't needed to show the link.
+        // Its vibed runs agents under the test backend: a Linux host's
+        // cgroups backend has tests of its own (vibe-env's tests/cgroups.rs),
+        // and isn't needed to show the link.
         fs::write(
             d.join("env"),
             format!(
@@ -657,9 +658,9 @@ fn real_linux_host() {
     let mut mcp = Bridge::start(mac.mcp, &key);
     let projects = mcp.call("vibe_list_projects", json!({"host": "testhost"}));
     eprintln!("{projects}");
-    // An agent needs a project there and a backend for linux agents (#17);
-    // when the server has a project named by VIBE_TEST_LINUX_PROJECT, start
-    // one and see it in the menu's listing.
+    // An agent needs a project there; when the server has a project named
+    // by VIBE_TEST_LINUX_PROJECT, start one, in a cgroup of its own, and
+    // see it in the menu's listing.
     if let Ok(project) = std::env::var("VIBE_TEST_LINUX_PROJECT") {
         let started = mcp.call(
             "vibe_start_agent",

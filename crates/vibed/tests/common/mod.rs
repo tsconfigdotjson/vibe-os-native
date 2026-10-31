@@ -313,6 +313,8 @@ impl Golden {
         config.admission = Arc::new(HostAdmission {
             total_memory: 64 * GIB,
         });
+        // Whatever this machine's memory is doing.
+        config.pressure = Arc::new(vibed::pressure::NoPressure);
         config.clock = Arc::new(|| GOLDEN_NOW);
         config.remote = Arc::new(GoldenRemote);
         // One Tailscale address, whatever this machine has.

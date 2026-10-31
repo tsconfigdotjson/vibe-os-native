@@ -70,6 +70,9 @@ impl Core {
                 }
             };
             let limits = Limits::new(a.memory, &host);
+            // A supervisor puts an agent near its memory in the background;
+            // the kernel just holds it to the limit.
+            let backgrounds = !backend.capabilities().kernel_limits;
             // Seen for the first time, it's held to the limits there are
             // now, whatever it started with; one recorded paused was
             // announced before a restart of vibed.
@@ -114,7 +117,7 @@ impl Core {
                 .filter(|w| !before.warnings.contains(w))
             {
                 if usage.paused.is_none() {
-                    self.announce(&a, w, warning_message(w, &usage, &limits));
+                    self.announce(&a, w, warning_message(w, &usage, &limits, backgrounds));
                 }
             }
             match usage.paused {
@@ -179,12 +182,17 @@ fn pause_message(limit: Limit, u: &Usage, l: &Limits) -> String {
     }
 }
 
-fn warning_message(limit: Limit, u: &Usage, l: &Limits) -> String {
+fn warning_message(limit: Limit, u: &Usage, l: &Limits, backgrounds: bool) -> String {
     match limit {
         Limit::Memory => format!(
-            "at {}% of its {}, so it runs in the background",
+            "at {}% of its {}{}",
             (u128::from(u.memory) * 100 / u128::from(l.memory.max(1))),
-            size(l.memory)
+            size(l.memory),
+            if backgrounds {
+                ", so it runs in the background"
+            } else {
+                ""
+            }
         ),
         Limit::Disk => format!(
             "its worktree and temp files take {}, past disk_soft ({})",
@@ -227,15 +235,19 @@ mod tests {
             "paused: its worktree and temp files take 31G, past disk_hard (30G)"
         );
         assert_eq!(
-            warning_message(Limit::Memory, &u, &l),
+            warning_message(Limit::Memory, &u, &l, true),
             "at 80% of its 4G, so it runs in the background"
+        );
+        assert_eq!(
+            warning_message(Limit::Memory, &u, &l, false),
+            "at 80% of its 4G"
         );
         let u = Usage {
             disk: Some(21 * GIB),
             ..u
         };
         assert_eq!(
-            warning_message(Limit::Disk, &u, &l),
+            warning_message(Limit::Disk, &u, &l, true),
             "its worktree and temp files take 21G, past disk_soft (20G)"
         );
     }

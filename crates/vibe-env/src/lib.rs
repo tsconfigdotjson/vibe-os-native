@@ -18,14 +18,17 @@
 //! - [`native`], what backends whose agents run natively share;
 //! - [`macos`], the `macos` backend: native agents under a resource
 //!   governor, whose decisions are [`governor`]'s;
+//! - [`cgroups`], the `linux` backend on a Linux host: native agents, each
+//!   in a cgroup v2 of its own under the owner's systemd user manager;
 //! - [`testing`], a backend for tests, so the core doesn't wait on the real
-//!   ones (#9, #17);
+//!   ones;
 //! - [`conformance`], the suite every backend must pass;
 //! - the `linux` backend's plumbing on the Mac: [`vm`] drives `vibe-vm`,
 //!   the helper that runs each agent's VM, and [`guest`] drives
 //!   `vibe-guest`, PID 1 inside it; [`images`] keeps the disks they boot,
 //!   and [`toolbox`] makes new template and Linux home versions.
 
+pub mod cgroups;
 pub mod claude;
 pub mod conformance;
 pub mod ext4;

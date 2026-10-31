@@ -40,7 +40,17 @@
 #     VIBE_HOST_BUNDLE), installed over real ssh, linked, listed through
 #     the Mac's MCP, and a hung link noticed and taken up again. With
 #     VIBE_TEST_LINUX_PROJECT naming a project on the server, an agent
-#     started there through MCP too (its linux agents need #17's backend)
+#     started there through MCP too, in a cgroup of its own. Then the
+#     cgroups backend's own tests (crates/vibe-env/tests/cgroups.rs), built
+#     for the server with cargo-zigbuild and run there with the bundle's
+#     vibe-shim: the conformance suite on its real cgroups, and a memory hog
+#     stopped by its own limit while its neighbour runs on. Every test agent
+#     there has a memory limit of tens of MB, and nothing is left behind
+#   - the Linux host's cgroups backend on this machine, on Linux with a
+#     systemd user manager (N/A otherwise; on a Mac, the real-host step runs
+#     it on a server): the same tests, and a linux agent through vibed in a
+#     cgroup of its own, held to an edited max_processes by the kernel,
+#     paused, frozen asleep and woken where it was, then deleted to nothing
 #   - the macos backend (crates/vibe-env/tests/macos.rs, which the test step
 #     runs everywhere): on a Mac again, with a fork bomb of about a thousand
 #     processes, and PRIO_DARWIN_BG seen in `ps` as the memory warning
@@ -914,12 +924,58 @@ s_real_host() {
     return $NOT_APPLICABLE
   fi
   local bundle=${VIBE_HOST_BUNDLE:-} arch
+  arch=$(ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -- "$VIBE_TEST_LINUX_HOST" uname -m)
+  case $arch in amd64) arch=x86_64 ;; arm64) arch=aarch64 ;; esac
   if [ -z "$bundle" ]; then
-    arch=$(ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -- "$VIBE_TEST_LINUX_HOST" uname -m)
     bundle="$WORK/host-bundle"
     scripts/host-bundle.sh --out "$bundle" --target "$arch"
   fi
   VIBE_HOST_BUNDLE="$bundle" cargo test -p vibe-cli --test linux_host --locked -- real_linux_host --ignored --nocapture
+  real_host_cgroups "$VIBE_TEST_LINUX_HOST" "$arch" "$bundle"
+}
+
+# real_host_cgroups <ssh destination> <arch> <bundle>: the cgroups backend's
+# tests on the server's own cgroups, built for it statically as the bundle
+# is, run there with the bundle's vibe-shim, and removed after.
+real_host_cgroups() {
+  local dest=$1 arch=$2 bundle=$3 target json bin dir rc
+  local ssh_opts=(-o BatchMode=yes -o StrictHostKeyChecking=accept-new)
+  command -v cargo-zigbuild >/dev/null || {
+    echo "the cgroups tests are built for the server with cargo-zigbuild and zig (brew install zig; cargo install cargo-zigbuild)"
+    return 1
+  }
+  [ -x "$bundle/$arch/vibe-shim" ] || { echo "no $bundle/$arch/vibe-shim"; return 1; }
+  target=$arch-unknown-linux-musl
+  rustup target add "$target"
+  json=$(cargo zigbuild --locked --release --target "$target" -p vibe-env --test cgroups --message-format=json)
+  bin=$(printf '%s\n' "$json" | sed -n 's/.*"name":"cgroups".*"executable":"\([^"]*\)".*/\1/p' | tail -n 1)
+  [ -n "$bin" ] && [ -f "$bin" ] || { echo "cargo built no cgroups test for $target"; return 1; }
+  dir=$(ssh "${ssh_opts[@]}" -- "$dest" 'mktemp -d /tmp/vibe-cgroups.XXXXXX')
+  case $dir in /tmp/vibe-cgroups.*) ;; *) echo "no temp dir on $dest: $dir"; return 1 ;; esac
+  rc=0
+  scp -q "${ssh_opts[@]}" "$bin" "$dest:$dir/cgroups" &&
+    scp -q "${ssh_opts[@]}" "$bundle/$arch/vibe-shim" "$dest:$dir/vibe-shim" &&
+    ssh "${ssh_opts[@]}" -- "$dest" \
+      "cd $dir && chmod +x cgroups vibe-shim && VIBE_TEST_CGROUPS=1 VIBE_SHIM=$dir/vibe-shim ./cgroups --test-threads=1" ||
+    rc=$?
+  ssh "${ssh_opts[@]}" -- "$dest" "rm -rf $dir" || true
+  return $rc
+}
+
+# The Linux host's cgroups backend on this machine's own cgroups, where it
+# has them. Every test agent's memory limit is tens of MB, and the tests
+# keep to slices of their own, which they stop when they're done.
+s_cgroups() {
+  if [ "$OS" != Linux ]; then
+    echo "cgroups are Linux's: on a Mac the real-host step runs these on a Linux server"
+    return $NOT_APPLICABLE
+  fi
+  if ! systemctl --user show --property=Version >/dev/null 2>&1; then
+    echo "no systemd user manager here to make agents' cgroups through"
+    return $NOT_APPLICABLE
+  fi
+  VIBE_TEST_CGROUPS=1 cargo test -p vibe-env --test cgroups --locked -- --test-threads=1
+  VIBE_TEST_CGROUPS=1 cargo test -p vibed --test agents --locked -- --test-threads=1 a_linux_agent_on_a_linux_host
 }
 
 step tools "toolchain versions" s_tools
@@ -936,7 +992,8 @@ step sessions "a session outlives a killed vibed and is re-adopted" s_sessions b
 step agents "agents start, outlive vibed, and delete to nothing but the branch" s_agents build
 step mcp "MCP: no key refused; VibeOS's round over vibe mcp, start to delete" s_mcp build
 step linux-host "a Linux host over SSH: install, link, an agent via MCP, a pulled network" s_linux_host build
-step real-host "a real Linux server over SSH (VIBE_TEST_LINUX_HOST)" s_real_host build
+step real-host "a real Linux server over SSH (VIBE_TEST_LINUX_HOST), its cgroups too" s_real_host build
+step cgroups "the Linux host's backend: conformance on real cgroups, a memory hog, an agent" s_cgroups build
 mac_step macos-governor "the macos backend: conformance, fork bomb, memory, nohup, CPU, disk" s_macos_governor build
 mac_step macos-agents "a macos agent on the governor: Mac's ~/.claude, a limit pause, delete" s_macos_agents build
 mac_step swift-app-build "swift build swift/VibeOS" s_swift_app_build
