@@ -36,6 +36,16 @@
 #     transcript as a firm question, before the sleep and after. The check
 #     across a reboot is scripts/vm-reboot-test.sh, which can't run here. On a Mac that is
 #     itself a VM, such as a CI runner, this step is N/A: it can't nest VMs.
+#   - the Linux base image (scripts/base-image.sh, with Docker): its kernel,
+#     initrd and Debian image, built into build/base-image/
+#   - linux agents in real VMs on that image: the linux backend passes the
+#     vibe-env conformance suite (crates/vibe-env/tests/linux_conformance.rs),
+#     and an agent from the starter profile answers on Opus in auto mode,
+#     sleeps, and carries on its conversation after the wake, with Claude
+#     Code's managed layer downloaded from downloads.claude.ai
+#     (crates/vibed/tests/linux_vm.rs). It needs the Claude token: from
+#     CLAUDE_CODE_OAUTH_TOKEN, or what `vibe setup-token` kept in the
+#     Keychain. N/A on a Mac that is itself a VM, like vm-cycle.
 #   - the Swift client against a live vibed
 #   - VibeOS.app launching and saying hello to a live vibed
 #
@@ -500,6 +510,34 @@ s_vm_cycle() {
   done
 }
 
+s_base_image() { scripts/base-image.sh build/base-image; }
+
+s_linux_vm() {
+  local marker="$WORK/linux-marker" t token=${CLAUDE_CODE_OAUTH_TOKEN:-}
+  if [ "$(sysctl -n kern.hv_vmm_present 2>/dev/null || echo 0)" = 1 ]; then
+    echo "this Mac is a VM, so it can't run linux agents"
+    return $NOT_APPLICABLE
+  fi
+  if [ -z "$token" ]; then
+    token=$(security find-generic-password -s VibeOS -a claude-setup-token -w 2>/dev/null) || {
+      echo "no Claude token: run \`target/debug/vibe setup-token\` or set CLAUDE_CODE_OAUTH_TOKEN"
+      return 1
+    }
+  fi
+  rm -rf "$marker"
+  cargo test -p vibe-env --locked --test linux_conformance --no-run
+  cargo test -p vibed --locked --test linux_vm --no-run
+  settle
+  export VIBE_VM_BIN="$ROOT/build/vibe-vm" VIBE_BASE_RELEASES="file://$ROOT/build/base-image"
+  export VIBE_VM_MARKER="$marker"
+  cargo test -p vibe-env --locked --test linux_conformance -- --test-threads=1 --nocapture
+  CLAUDE_CODE_OAUTH_TOKEN="$token" \
+    cargo test -p vibed --locked --test linux_vm -- --test-threads=1 --nocapture
+  for t in linux_conformance linux_agent; do
+    [ -f "$marker/$t" ] || { echo "$t was skipped, not run"; return 1; }
+  done
+}
+
 s_live_contract() {
   local log="$WORK/live-vibed.log" marker="$WORK/live-marker"
   start_vibed "$WORK/live/run/vibed.sock" "$log"
@@ -546,6 +584,8 @@ mac_step swift-vm-test "swift test swift/vibe-vm" s_swift_vm_test swift-vm-build
 mac_step sign "ad hoc signing; vibe-vm gets the virtualization entitlement" s_sign swift-app-build swift-vm-build
 mac_step vm-check "vibe-vm check, signed and unsigned" s_vm_check sign
 mac_step vm-cycle "VMs boot, save and restore; vibe-guest's question survives" s_vm_cycle build sign test-guest
+mac_step base-image "the Linux base image: kernel, initrd, Debian image" s_base_image
+mac_step linux-vm "linux agents in VMs: conformance, and Claude on Opus across a sleep" s_linux_vm build sign base-image
 mac_step live-contract "Swift client against a live vibed" s_live_contract build swift-app-test
 mac_step app-launch "VibeOS.app launches and says hello to vibed" s_app_launch build sign
 

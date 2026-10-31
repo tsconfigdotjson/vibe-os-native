@@ -196,6 +196,23 @@ impl Layout {
 
     /// Sleeping `linux` agents' snapshots, which share the `snapshot_disk`
     /// budget.
+    /// The disk images `linux` agents boot: the base, the managed layer,
+    /// the template and the Linux home (`vibe_env::images`).
+    pub fn linux_dir(&self) -> PathBuf {
+        self.home.join("VibeOS/linux")
+    }
+
+    /// The Linux Claude config, made in the toolbox and copied into each
+    /// `linux` agent's own Claude home when it starts.
+    pub fn linux_claude_dir(&self) -> PathBuf {
+        self.home.join("VibeOS/linux-claude")
+    }
+
+    /// The package caches `linux` agents share, one directory per tool.
+    pub fn cache_dir(&self) -> PathBuf {
+        self.home.join("VibeOS/cache")
+    }
+
     pub fn snapshots_dir(&self) -> PathBuf {
         self.home.join("VibeOS/snapshots")
     }
@@ -301,6 +318,9 @@ mod tests {
         );
         assert_eq!(l.vm_log("x"), p("/Users/u/VibeOS/agents/x/vibe-vm.log"));
         assert_eq!(l.snapshot("x"), p("/Users/u/VibeOS/snapshots/x"));
+        assert_eq!(l.linux_dir(), p("/Users/u/VibeOS/linux"));
+        assert_eq!(l.linux_claude_dir(), p("/Users/u/VibeOS/linux-claude"));
+        assert_eq!(l.cache_dir(), p("/Users/u/VibeOS/cache"));
     }
 
     #[test]

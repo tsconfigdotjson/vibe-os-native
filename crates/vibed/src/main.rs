@@ -10,8 +10,10 @@ use std::time::Duration;
 
 use tokio::net::UnixListener;
 use tokio::signal::unix::{SignalKind, signal};
+use vibe_core::model::Environment;
 use vibe_core::paths::{self, Layout};
 use vibe_core::rpc::MAX_MESSAGE_BYTES;
+use vibe_env::linux::LinuxVm;
 use vibe_env::testing::TestBackend;
 use vibed::agents::Backends;
 use vibed::core::{Config, Core, DaemonInfo};
@@ -35,6 +37,12 @@ environment:
   VIBE_GH         the gh to run (default: gh on PATH)
   VIBE_SHIM       the vibe-shim to start sessions with (default: the one
                   beside vibed, or on PATH)
+  VIBE_VM         on a Mac, the vibe-vm that runs linux agents' VMs
+                  (default: the one beside vibed)
+  VIBE_BASE_RELEASES, VIBE_CLAUDE_RELEASES
+                  where the Linux base image and Claude Code for linux agents
+                  come from (default: their published releases; a file://
+                  directory works too)
   VIBE_TEST_BACKEND
                   for tests only: run every environment's agents natively,
                   unlimited but for a supervisor, with this program as
@@ -179,6 +187,26 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
         );
         config.backends = Backends::all(Arc::new(TestBackend::new(PathBuf::from(claude))));
     }
+    // linux agents on a Mac run in VMs; a Linux host's run under cgroups
+    // (#17).
+    let mut images = None;
+    if config.backends.get(Environment::Linux).is_none() && cfg!(target_os = "macos") {
+        match vibe_vm() {
+            Some(vibe_vm) => {
+                vibed::log!("vibed: linux agents run in VMs, with {}", vibe_vm.display());
+                let backend = LinuxVm::new(config.layout.clone(), vibe_vm);
+                config.backends = config.backends.with(Environment::Linux, Arc::new(backend));
+                images = Some(vibed::linux::spawn(
+                    config.layout.clone(),
+                    vibed::linux::Sources::from_env(),
+                    vibed::linux::CHECK_EVERY,
+                ));
+            }
+            None => vibed::log!(
+                "vibed: no vibe-vm beside vibed, nor in VIBE_VM, so linux agents can't start"
+            ),
+        }
+    }
     let gh: OsString = config.gh.clone();
     let core = Arc::new(Core::open(config)?);
     vibed::log!(
@@ -220,9 +248,21 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
     status.abort();
     maintenance.abort();
     adopting.abort();
+    if let Some(images) = images {
+        images.abort();
+    }
     drop(guard);
     vibed::log!("vibed: stopped");
     Ok(())
+}
+
+/// The `vibe-vm` to run VMs with: `VIBE_VM`, or the one beside `vibed`.
+fn vibe_vm() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("VIBE_VM").filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(path));
+    }
+    let beside = std::env::current_exe().ok()?.parent()?.join("vibe-vm");
+    beside.is_file().then_some(beside)
 }
 
 #[cfg(test)]

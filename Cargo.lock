@@ -630,6 +630,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "vibe-core",
  "vibe-guest",

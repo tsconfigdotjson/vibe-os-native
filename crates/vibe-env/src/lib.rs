@@ -25,7 +25,10 @@
 
 pub mod claude;
 pub mod conformance;
+pub mod ext4;
 pub mod guest;
+pub mod images;
+pub mod linux;
 pub mod native;
 pub mod testing;
 pub mod tree;

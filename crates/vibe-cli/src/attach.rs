@@ -81,12 +81,12 @@ fn check(rc: libc::c_int) -> io::Result<libc::c_int> {
     }
 }
 
-fn is_tty(fd: libc::c_int) -> bool {
+pub(crate) fn is_tty(fd: libc::c_int) -> bool {
     // SAFETY: isatty only inspects the descriptor.
     unsafe { libc::isatty(fd) == 1 }
 }
 
-fn window_size() -> Option<Size> {
+pub(crate) fn window_size() -> Option<Size> {
     // SAFETY: ws is written by the ioctl and read only if it succeeds.
     unsafe {
         let mut ws: libc::winsize = std::mem::zeroed();
@@ -113,10 +113,10 @@ fn tty_name() -> Option<String> {
 }
 
 /// The terminal in raw mode, back as it was when dropped.
-struct RawMode(libc::termios);
+pub(crate) struct RawMode(libc::termios);
 
 impl RawMode {
-    fn enter() -> io::Result<RawMode> {
+    pub(crate) fn enter() -> io::Result<RawMode> {
         // SAFETY: termios is plain data, filled in by tcgetattr.
         unsafe {
             let mut saved: libc::termios = std::mem::zeroed();

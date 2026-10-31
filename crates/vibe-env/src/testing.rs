@@ -32,6 +32,7 @@ use crate::{
 ///   turn of its own;
 /// - `tick`: counts in `.vibe-ticks` in its directory, ten times a second;
 /// - `fork N`: leaves `N` sleeping processes running;
+/// - `fill N`: writes `N` MiB to `.vibe-fill` in its directory;
 /// - `dirty`: leaves `notes.txt` uncommitted in its directory;
 /// - `commit`: commits `work.txt` on its branch;
 /// - `env`: shows its `TMPDIR` and the git settings agents get;

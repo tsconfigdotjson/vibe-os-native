@@ -5,6 +5,7 @@ pub mod agents;
 pub mod core;
 pub mod dispatch;
 pub mod gh;
+pub mod linux;
 pub mod logging;
 pub mod projects;
 pub mod server;

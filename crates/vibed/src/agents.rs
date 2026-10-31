@@ -1061,12 +1061,24 @@ impl Core {
         self.agent_status(&mut record, self.idle_debounce()).await;
         let backend = self.backend(record.environment)?;
         let mut handle = Core::handle_of(&record)?;
-        // What's left of its tree, if anything, ends: it has no terminal.
         if handle.session.is_some() {
             let (b, h) = (Arc::clone(&backend), handle.clone());
             match blocking(move || b.wake(&h)).await? {
                 Woke::Resume => {}
-                Woke::Exact | Woke::Reattach(_) => {
+                // Claude is still where it was, in a VM that slept or
+                // whose shim died: a new shim takes its terminal (PRD:
+                // Failures, A shim dies).
+                Woke::Reattach(end) => {
+                    let _ = remove_session_files(&self.layout.session_socket(agent_ref));
+                    self.hold_terminal(&backend, &mut handle, &record, &end)
+                        .await?;
+                    crate::log!("vibed: {agent_ref} woke where it was");
+                    let status = self.agent_status(&mut record, self.idle_debounce()).await;
+                    self.set_state(&mut record, status.state());
+                    return Ok(self.agent_info(&record, &status));
+                }
+                // What's left of its tree ends: it has no terminal.
+                Woke::Exact => {
                     let (b, h) = (Arc::clone(&backend), handle.clone());
                     blocking(move || b.stop(&h)).await?;
                 }

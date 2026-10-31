@@ -43,7 +43,19 @@ pub struct HostLimits {
     pub idle_debounce: u64,
     /// The disk budget shared by every sleeping `linux` agent's snapshot.
     pub snapshot_disk: u64,
+    /// Whether `linux` agents share the npm, pnpm, cargo and pip caches
+    /// (PRD: Mounts). It's the opt-out, so it's set in `host.toml` only,
+    /// not over the socket.
+    #[serde(skip, default = "yes")]
+    pub package_caches: bool,
 }
+
+fn yes() -> bool {
+    true
+}
+
+/// The one setting that's true or false, and only in `host.toml`.
+pub const PACKAGE_CACHES: &str = "package_caches";
 
 impl Default for HostLimits {
     fn default() -> Self {
@@ -58,6 +70,7 @@ impl Default for HostLimits {
             vm_disk: 20 * GIB,
             idle_debounce: 60,
             snapshot_disk: 20 * GIB,
+            package_caches: true,
         }
     }
 }
@@ -296,12 +309,19 @@ fn encode(kind: Kind, v: u64) -> Value {
 fn interpret(doc: &DocumentMut) -> Result<HostLimits, String> {
     let mut limits = HostLimits::default();
     for (key, item) in doc.iter() {
+        if key == PACKAGE_CACHES {
+            limits.package_caches = item
+                .as_value()
+                .and_then(Value::as_bool)
+                .ok_or_else(|| format!("{key} must be true or false"))?;
+            continue;
+        }
         let kind = SETTINGS
             .iter()
             .find(|(k, _)| *k == key)
             .map(|(_, kind)| *kind)
             .ok_or_else(|| {
-                let known: Vec<&str> = HostLimits::keys().collect();
+                let known: Vec<&str> = HostLimits::keys().chain([PACKAGE_CACHES]).collect();
                 format!(
                     "unknown setting `{key}`; the settings are {}",
                     known.join(", ")
@@ -400,6 +420,7 @@ disk_hard        = "30G"
 vm_disk          = "20G"   # a linux agent's own writable layer
 idle_debounce    = "60s"
 snapshot_disk    = "20G"   # total for all sleeping linux agents
+package_caches   = true    # linux agents share npm, pnpm, cargo and pip caches
 "#;
         let (_d, path) = file(prd);
         assert_eq!(load(&path).unwrap(), HostLimits::default());
@@ -424,6 +445,27 @@ snapshot_disk    = "20G"   # total for all sleeping linux agents
         assert_eq!(l.reserve_memory, 6 * GIB);
         assert_eq!(l.idle_debounce, 300);
         assert_eq!(l.max_awake_agents, 16);
+        assert!(l.package_caches);
+    }
+
+    #[test]
+    fn package_caches_are_opted_out_of_in_the_file_only() {
+        let (_d, path) = file("package_caches = false\ncpu_cores = 2\n");
+        let l = load(&path).unwrap();
+        assert!(!l.package_caches);
+        // An edit over the socket keeps it, and it isn't on the socket.
+        let l = update(&path, &[("cpu_cores", 3)]).unwrap();
+        assert!(!l.package_caches);
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains("package_caches = false")
+        );
+        let json = serde_json::to_value(l).unwrap();
+        assert!(json.get("package_caches").is_none(), "{json}");
+        let back: HostLimits = serde_json::from_value(json).unwrap();
+        assert!(back.package_caches, "the socket's limits say nothing of it");
+        assert!(update(&path, &[("package_caches", 1)]).is_err());
     }
 
     #[test]
@@ -438,6 +480,7 @@ snapshot_disk    = "20G"   # total for all sleeping linux agents
             ("[disk]\nsoft = 1", "unknown setting `disk`"),
             ("[cpu_cores]\nx = 1", "cpu_cores must be a single value"),
             ("cpu_cores = ", "invalid"),
+            ("package_caches = 1", "package_caches must be true or false"),
             (
                 "max_awake_agents = 0",
                 "max_awake_agents must be more than 0",

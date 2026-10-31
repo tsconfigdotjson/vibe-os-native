@@ -103,7 +103,7 @@ An agent's life runs setup → start (worktree and compartment included) → wor
    - Tailscale (optional, for remote MCP)
 
    Meanwhile it downloads the Linux base image and the current Claude Code. Then it offers two last steps:
-   - **Set up Linux.** Log in to Claude for Linux agents: the app runs `claude setup-token`, which opens the same browser sign-in as `/login`, and keeps the long-lived token in Keychain. Then the toolbox shell opens in Terminal: run `gh auth login`, and anything else you want every Linux agent to have (`gcloud auth login`, `apt install …`, your Claude settings). Exit to save.
+   - **Set up Linux.** Log in to Claude for Linux agents: the app runs `claude setup-token` (through `vibe setup-token`), which opens the same browser sign-in as `/login`, and keeps the long-lived token in Keychain. Then the toolbox shell opens in Terminal: run `gh auth login`, and anything else you want every Linux agent to have (`gcloud auth login`, `apt install …`, your Claude settings). Exit to save.
    - **Settings → API keys → New key**, with a ready `claude mcp add …` line to copy.
 2. **Add a project.** Settings → Projects → Add takes a GitHub `owner/name`, cloned with the Mac's `gh` login into `~/VibeOS/projects/`, or a local path. The project starts with two profiles, one per environment (see Profiles), which you can edit or add to. Removing a project forgets it and its profiles but leaves its files on disk; adding the same repo again picks up its existing clone. A project with agents can't be removed.
 3. **Start an agent.** `vibe_start_agent {project, profile, prompt}`, or New agent… in the menu. One call does it all:
@@ -133,7 +133,7 @@ A Rust daemon owns all state and logic. Every other part is a thin client of it.
 | `vibe-shim` | Rust | One per awake agent, on the host, detached (its own session) | Owns the agent's terminal end: PTY (`macos`) or a vsock stream to `vibe-guest` (`linux`), a scrollback ring buffer, and a screen model (`vt100` crate) for `read_output` and redraw on attach. Serves `run/<ref>.sock`. |
 | `vibe-vm` | Swift (Virtualization.framework) | One per awake `linux` agent, detached | Boots the agent's VM, or restores it from its snapshot. Serves `run/<ref>.vm`, which carries vsock streams into the guest for the shim. To sleep, it pauses the VM, saves its state to disk and exits. Holds the `com.apple.security.virtualization` entitlement. |
 | `vibe-guest` | Rust, static Linux binary | PID 1 inside each VM | Starts Claude as the unprivileged user `vibe` on a PTY. Reports the process tree for the idle rules. Freezes Claude's tree before a save. After a restore, sets the clock from the host, waits for the shared folders to answer, then thaws Claude. If the vsock link drops, Claude keeps running until the shim reconnects. Its contract, the kernel command line it boots with and its two vsock ports, is in `protocol/vibe-guest/`. |
-| `vibe` CLI | Rust | On demand; linked into `/usr/local/bin` at setup | `vibe attach <ref>`, `vibe ls`, `vibe doctor`, `vibe toolbox`, `vibe mcp` (a stdio bridge for clients that can only start a command), `vibe rpc` (the socket API over stdio, which the Mac uses through SSH), and `vibe key`, `vibe project` and `vibe profile` for setting up a Linux host without the menu bar. |
+| `vibe` CLI | Rust | On demand; linked into `/usr/local/bin` at setup | `vibe attach <ref>`, `vibe ls`, `vibe doctor`, `vibe toolbox`, `vibe setup-token` (the Claude login for `linux` agents), `vibe mcp` (a stdio bridge for clients that can only start a command), `vibe rpc` (the socket API over stdio, which the Mac uses through SSH), and `vibe key`, `vibe project` and `vibe profile` for setting up a Linux host without the menu bar. |
 
 **Restarts.** Shims and `vibe-vm` processes are detached from `vibed`. A daemon crash or upgrade leaves every agent running, and on start `vibed` re-adopts them by scanning `run/`: a shim serves `<ref>.sock` there and a `vibe-vm` `<ref>.vm`. Each shim leads its own session and process group, so launchd ending `vibed`'s job leaves them alone; on a Linux host the systemd unit (#16) must use `KillMode=process`, or restarting `vibed` would kill the shims in its cgroup.
 
@@ -249,7 +249,10 @@ disk_hard        = "30G"
 vm_disk          = "20G"   # a linux agent's own writable layer
 idle_debounce    = "60s"
 snapshot_disk    = "20G"   # total for all sleeping linux agents
+package_caches   = true    # linux agents share npm, pnpm, cargo and pip caches
 ```
+
+`package_caches` is the opt-out from the shared caches (Mounts, below), so it's set in this file only, not over the socket.
 
 Admission reserves the profile's memory for each awake agent. If host headroom minus the reserve can't cover a new agent, agents still inside their idle debounce go to sleep early, oldest first. If there's still no room, the start is refused with a clear reason. Starts never queue.
 

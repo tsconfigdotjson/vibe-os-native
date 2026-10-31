@@ -120,6 +120,54 @@ impl ClaudeHome {
         self.write_state(&state)
     }
 
+    /// Seeds an own home from `config`, the Linux Claude config made in the
+    /// toolbox (PRD: Mounts): CLAUDE.md, settings, skills, agents, commands
+    /// and the rest of what's there, but not Claude's records of sessions or
+    /// logins ([`NOT_CONFIG`]); and from its state file only the MCP servers
+    /// and display preferences ([`STATE_CONFIG`]). A missing `config` seeds
+    /// nothing. What's in the home already stays, unless `config` has it too.
+    pub fn seed(&self, config: &Path) -> io::Result<()> {
+        fs::create_dir_all(&self.dir)?;
+        let entries = match fs::read_dir(config) {
+            Ok(e) => e,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(text) = name.to_str() else { continue };
+            if NOT_CONFIG.contains(&text) || text == STATE_FILE {
+                continue;
+            }
+            copy_tree(&entry.path(), &self.dir.join(&name))?;
+        }
+        let from = config.join(STATE_FILE);
+        if !from.is_file() {
+            return Ok(());
+        }
+        let theirs = ClaudeHome::own(config.to_owned()).read_state()?;
+        let mut state = self.read_state()?;
+        for key in STATE_CONFIG {
+            if let Some(v) = theirs.get(*key) {
+                state.insert((*key).into(), v.clone());
+            }
+        }
+        self.write_state(&state)
+    }
+
+    /// Marks Claude as installed by its native installer and its updater
+    /// off, as the managed layer keeps it current instead (PRD: Exceptions;
+    /// Spike results: Claude otherwise warns about where it runs from).
+    pub fn mark_managed(&self) -> io::Result<()> {
+        fs::create_dir_all(&self.dir)?;
+        let mut state = self.read_state()?;
+        state.insert("installMethod".into(), Value::String("native".into()));
+        state.insert("autoUpdates".into(), Value::Bool(false));
+        state.insert("autoUpdatesProtectedForNative".into(), Value::Bool(true));
+        self.write_state(&state)
+    }
+
     /// Forgets `worktree`: an own home goes whole; from a shared one go the
     /// worktree's transcripts, the files Claude keeps for each of those
     /// sessions, and the worktree's entry in the state file.
@@ -204,6 +252,75 @@ impl ClaudeHome {
         fs::rename(&tmp, &target).inspect_err(|_| {
             let _ = fs::remove_file(&tmp);
         })
+    }
+}
+
+/// The state file's name in an own home.
+const STATE_FILE: &str = ".claude.json";
+
+/// What in a Claude config directory is Claude's record of its sessions,
+/// logins and caches rather than configuration: never copied from the Linux
+/// Claude config into an agent's home.
+pub const NOT_CONFIG: &[&str] = &[
+    "projects",
+    "todos",
+    "file-history",
+    "session-env",
+    "shell-snapshots",
+    "debug",
+    "logs",
+    "statsig",
+    "telemetry",
+    "ide",
+    "downloads",
+    "cache",
+    "paste-cache",
+    "plans",
+    "backups",
+    "history.jsonl",
+    ".credentials.json",
+    ".claude.json.backup",
+];
+
+/// What's copied from the Linux Claude config's state file: the user's MCP
+/// servers and display preferences, never its account or projects.
+pub const STATE_CONFIG: &[&str] = &[
+    "mcpServers",
+    "theme",
+    "editorMode",
+    "verbose",
+    "preferredNotifChannel",
+    "autoCompactEnabled",
+];
+
+/// Copies `from` to `to`: directories and their files, symlinks as
+/// symlinks, permissions kept. What's at `to` is replaced.
+fn copy_tree(from: &Path, to: &Path) -> io::Result<()> {
+    let meta = fs::symlink_metadata(from)?;
+    if meta.is_dir() {
+        if fs::symlink_metadata(to).is_ok_and(|m| !m.is_dir()) {
+            fs::remove_file(to)?;
+        }
+        fs::create_dir_all(to)?;
+        fs::set_permissions(to, meta.permissions())?;
+        for entry in fs::read_dir(from)? {
+            let entry = entry?;
+            copy_tree(&entry.path(), &to.join(entry.file_name()))?;
+        }
+        return Ok(());
+    }
+    match fs::symlink_metadata(to) {
+        Ok(m) if m.is_dir() => fs::remove_dir_all(to)?,
+        Ok(_) => fs::remove_file(to)?,
+        Err(_) => {}
+    }
+    if meta.file_type().is_symlink() {
+        std::os::unix::fs::symlink(fs::read_link(from)?, to)
+    } else if meta.is_file() {
+        fs::copy(from, to).map(drop)
+    } else {
+        // Sockets and the like aren't configuration.
+        Ok(())
     }
 }
 
@@ -399,6 +516,72 @@ mod tests {
         assert!(state["projects"].get("/w/other").is_some());
         // Again, with nothing left, is fine.
         home.forget(wt).unwrap();
+    }
+
+    #[test]
+    fn the_linux_claude_config_seeds_an_agents_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("linux-claude");
+        fs::create_dir_all(config.join("skills/review")).unwrap();
+        fs::write(config.join("CLAUDE.md"), "Be brief.").unwrap();
+        fs::write(config.join("settings.json"), r#"{"model":"opus"}"#).unwrap();
+        fs::write(config.join("skills/review/SKILL.md"), "review").unwrap();
+        std::os::unix::fs::symlink("CLAUDE.md", config.join("AGENTS.md")).unwrap();
+        // The toolbox's own sessions and login stay behind.
+        fs::create_dir_all(config.join("projects/-x")).unwrap();
+        fs::write(config.join("projects/-x/s.jsonl"), "{}").unwrap();
+        fs::write(config.join("history.jsonl"), "{}").unwrap();
+        fs::write(config.join(".credentials.json"), "secret").unwrap();
+        fs::write(
+            config.join(".claude.json"),
+            json!({
+                "mcpServers": {"docs": {"command": "docs-mcp"}},
+                "theme": "light",
+                "oauthAccount": {"emailAddress": "me@example.com"},
+                "userID": "abc",
+                "projects": {"/toolbox": {"hasTrustDialogAccepted": true}},
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let home = ClaudeHome::own(tmp.path().join("agent/claude"));
+        home.seed(&config).unwrap();
+        home.mark_managed().unwrap();
+        home.prefill(Path::new("/w/q"), false).unwrap();
+        assert_eq!(
+            fs::read_to_string(home.dir.join("CLAUDE.md")).unwrap(),
+            "Be brief."
+        );
+        assert_eq!(
+            fs::read_to_string(home.dir.join("skills/review/SKILL.md")).unwrap(),
+            "review"
+        );
+        assert!(
+            fs::symlink_metadata(home.dir.join("AGENTS.md"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(home.dir.join("settings.json").is_file());
+        for left in ["projects", "history.jsonl", ".credentials.json"] {
+            assert!(!home.dir.join(left).exists(), "{left} was copied");
+        }
+        let state = read(&home.state);
+        assert_eq!(state["mcpServers"]["docs"]["command"], "docs-mcp");
+        assert_eq!(state["theme"], "light", "the owner's theme");
+        assert!(state.get("oauthAccount").is_none());
+        assert!(state.get("userID").is_none());
+        assert!(state["projects"].get("/toolbox").is_none());
+        assert_eq!(state["projects"]["/w/q"]["hasTrustDialogAccepted"], true);
+        assert_eq!(state["installMethod"], "native");
+        assert_eq!(state["autoUpdates"], false);
+        assert_eq!(state["autoUpdatesProtectedForNative"], true);
+
+        // No Linux Claude config yet: nothing to seed, and that's fine.
+        let bare = ClaudeHome::own(tmp.path().join("bare/claude"));
+        bare.seed(&tmp.path().join("missing")).unwrap();
+        assert!(bare.dir.is_dir());
     }
 
     #[test]
