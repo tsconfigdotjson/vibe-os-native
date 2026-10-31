@@ -698,7 +698,7 @@ async fn agents_outlive_vibed() {
 /// Waits up to 20 s for `answered`.
 async fn wait_answered(core: &Core, r: &str, mark: &vibe_status::Mark) {
     for _ in 0..1000 {
-        if core.answered(None, r, mark).unwrap() {
+        if core.answered(None, r, mark).await.unwrap() {
             return;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -723,8 +723,8 @@ async fn the_status_follows_the_transcript_through_a_question_and_its_answer() {
 
     // Waiting on the answer to a send: quiet isn't an answer, and the old
     // question isn't one either.
-    let mark = w.core.mark_send(None, &a.agent).unwrap();
-    assert!(!w.core.answered(None, &a.agent, &mark).unwrap());
+    let mark = w.core.mark_send(None, &a.agent).await.unwrap();
+    assert!(!w.core.answered(None, &a.agent, &mark).await.unwrap());
     w.type_line(&a.agent, "red");
     wait_answered(&w.core, &a.agent, &mark).await;
     let list = w.list().await;
@@ -732,9 +732,9 @@ async fn the_status_follows_the_transcript_through_a_question_and_its_answer() {
     assert_eq!(list[0].status.activity, Activity::Done);
 
     // A turn after it is waited for the same way.
-    let mark = w.core.mark_send(None, &a.agent).unwrap();
+    let mark = w.core.mark_send(None, &a.agent).await.unwrap();
     assert!(
-        !w.core.answered(None, &a.agent, &mark).unwrap(),
+        !w.core.answered(None, &a.agent, &mark).await.unwrap(),
         "done with the last turn isn't an answer to this one"
     );
     w.type_line(&a.agent, "and now green");
@@ -754,7 +754,7 @@ async fn the_status_follows_the_transcript_through_a_question_and_its_answer() {
     }
     assert_eq!(w.list().await[0].state, AgentState::Asleep);
     w.core.delete_agent(delete(&a.agent, false)).await.unwrap();
-    assert!(w.core.mark_send(None, &a.agent).is_err());
+    assert!(w.core.mark_send(None, &a.agent).await.is_err());
 }
 
 #[tokio::test]
@@ -855,8 +855,10 @@ async fn after_a_clear_the_agent_follows_its_new_session() {
     let claude = w.claude(&a.agent);
     let worktree = Path::new(&a.worktree);
     let new_id = "c1ea4ed0-0000-4000-8000-00000000c1ea";
+    // It began after the first, whose entries the stand-in dates now.
+    let later = vibe_core::time::rfc3339(vibe_core::time::now() + 60);
     let line = serde_json::json!({"type": "user", "sessionId": new_id, "cwd": a.worktree,
-        "timestamp": "2026-10-30T12:00:00.000Z",
+        "timestamp": later,
         "message": {"role": "user", "content": "after the clear"}});
     std::thread::sleep(Duration::from_millis(20));
     fs::write(claude.transcript(worktree, new_id), format!("{line}\n")).unwrap();

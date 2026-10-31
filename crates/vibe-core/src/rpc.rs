@@ -904,8 +904,7 @@ pub struct AgentStatus {
     /// When the activity began.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub since: Option<String>,
-    /// The session's title: Claude's own, or its opening prompt's first
-    /// line.
+    /// The session's title, once Claude has written one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     /// The latest thing it did, as a line: `› fix the build`, `$ cargo

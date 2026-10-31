@@ -847,7 +847,7 @@ impl Core {
             profile.name,
             worktree.display()
         );
-        let status = self.agent_status(&mut record);
+        let status = self.agent_status(&mut record, self.idle_debounce()).await;
         let agent = self.agent_info(&record, &status);
         let mut e = self.event(EventKind::AgentAdded);
         e.project = Some(p.project.clone());
@@ -1008,9 +1008,10 @@ impl Core {
     pub async fn agents(&self, p: HostParams) -> Result<AgentList, ErrorObject> {
         let host = self.host(p.host.as_deref())?;
         let records = self.store().agents(host).map_err(store_error)?;
+        let debounce = self.idle_debounce();
         let mut agents = Vec::new();
         for mut a in records {
-            let status = self.agent_status(&mut a);
+            let status = self.agent_status(&mut a, debounce).await;
             // One being started, deleted or resumed is left as it's
             // recorded until that's done.
             if lock(&self.agents_busy).contains(&a.agent_ref) {
@@ -1053,11 +1054,11 @@ impl Core {
         let _held = self.hold(agent_ref)?;
         let mut record = self.store().agent(host, agent_ref).map_err(store_error)?;
         if self.session_runs(agent_ref).await {
-            let status = self.agent_status(&mut record);
+            let status = self.agent_status(&mut record, self.idle_debounce()).await;
             return Ok(self.agent_info(&record, &status));
         }
         // The session it's in now, after a `/clear`, is the one to resume.
-        self.agent_status(&mut record);
+        self.agent_status(&mut record, self.idle_debounce()).await;
         let backend = self.backend(record.environment)?;
         let mut handle = Core::handle_of(&record)?;
         // What's left of its tree, if anything, ends: it has no terminal.
@@ -1089,7 +1090,7 @@ impl Core {
                 "had no transcript, so it started again"
             }
         );
-        let status = self.agent_status(&mut record);
+        let status = self.agent_status(&mut record, self.idle_debounce()).await;
         self.set_state(&mut record, status.state());
         Ok(self.agent_info(&record, &status))
     }
@@ -1102,7 +1103,7 @@ impl Core {
         let _held = self.hold(&p.agent)?;
         let mut record = self.store().agent(host, &p.agent).map_err(store_error)?;
         // What it was doing, as its transcript is about to go.
-        let status = self.agent_status(&mut record);
+        let status = self.agent_status(&mut record, self.idle_debounce()).await;
         let project = self
             .store()
             .project(host, &record.project)

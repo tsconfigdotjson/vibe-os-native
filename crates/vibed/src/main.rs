@@ -129,7 +129,35 @@ fn main() -> ExitCode {
     }
 }
 
+/// The descriptors `vibed` asks for: the status engine watches a
+/// transcript or two per agent, and on macOS each watch holds one open,
+/// where launchd starts jobs with a soft limit of 256.
+const OPEN_FILES: u64 = 8192;
+
+/// Raises the soft limit on open files towards [`OPEN_FILES`], as far as
+/// the hard limit allows.
+fn raise_open_files() {
+    // SAFETY: getrlimit and setrlimit only read and write the struct.
+    unsafe {
+        let mut lim = std::mem::zeroed::<libc::rlimit>();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 {
+            return;
+        }
+        let want = (OPEN_FILES as libc::rlim_t).min(lim.rlim_max);
+        if lim.rlim_cur < want {
+            lim.rlim_cur = want;
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &lim) != 0 {
+                vibed::log!(
+                    "vibed: warning: can't raise the open-file limit: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+    }
+}
+
 async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Error>> {
+    raise_open_files();
     // Install the handlers before the socket exists, so a client that sees
     // the socket can always stop the daemon cleanly.
     let mut term = signal(SignalKind::terminate())?;

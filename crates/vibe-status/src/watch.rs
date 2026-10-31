@@ -152,11 +152,8 @@ mod imp {
     use std::os::unix::fs::MetadataExt;
     use std::path::PathBuf;
 
-    const NOTES: u32 = libc::NOTE_WRITE
-        | libc::NOTE_EXTEND
-        | libc::NOTE_DELETE
-        | libc::NOTE_RENAME
-        | libc::NOTE_ATTRIB;
+    // Not NOTE_ATTRIB: the poll's own reads change access times.
+    const NOTES: u32 = libc::NOTE_WRITE | libc::NOTE_EXTEND | libc::NOTE_DELETE | libc::NOTE_RENAME;
 
     #[derive(Debug)]
     pub(super) struct Watcher {

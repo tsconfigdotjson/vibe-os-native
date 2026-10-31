@@ -14,7 +14,7 @@ mod tail;
 mod watch;
 
 pub use agent_tail::Timestamp;
-pub use tail::{Mark, Status, Tail, Wakeup, state_of};
+pub use tail::{INFERRED_QUIET, Mark, Status, Tail, Wakeup, state_of};
 pub use watch::Watcher;
 
 /// How often every transcript is polled even without a file-system event

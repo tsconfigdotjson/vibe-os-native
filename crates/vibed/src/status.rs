@@ -12,7 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::io::unix::AsyncFd;
@@ -33,8 +33,10 @@ impl Core {
         Timestamp::from_secs_f64(self.now() as f64)
     }
 
-    /// The idle debounce, which is agent-tail's idle window.
-    fn idle_debounce(&self) -> Duration {
+    /// The idle debounce, which is agent-tail's idle window. `host.toml` is
+    /// read on every use; one that can't be read gives the default, as
+    /// admission says why it can't be.
+    pub(crate) fn idle_debounce(&self) -> Duration {
         let secs = limits::load(&self.layout.host_config())
             .map_or(HostLimits::default().idle_debounce, |l| l.idle_debounce);
         Duration::from_secs(secs)
@@ -43,33 +45,50 @@ impl Core {
     /// What `a`'s transcript says it's doing now: what was written since
     /// it was last read is read first. If a `/clear` moved it to another
     /// session, the agent's record follows, so a resume continues that one.
-    pub(crate) fn agent_status(&self, a: &mut AgentRecord) -> Status {
-        let debounce = self.idle_debounce();
+    pub(crate) async fn agent_status(&self, a: &mut AgentRecord, debounce: Duration) -> Status {
+        self.with_tail(a, debounce, |t, now| t.status(now))
+            .await
+            .unwrap_or_else(Status::unknown)
+    }
+
+    /// Reads `a`'s transcript up to now, then runs `f` on its tail. Each
+    /// agent's tail has a lock of its own, and is read on the blocking
+    /// pool: the first read after a restart is the whole transcript. None
+    /// until its compartment's handle, which says where its Claude home is,
+    /// is written.
+    async fn with_tail<T: Send + 'static>(
+        &self,
+        a: &mut AgentRecord,
+        debounce: Duration,
+        f: impl FnOnce(&Tail, Timestamp) -> T + Send + 'static,
+    ) -> Option<T> {
+        let claude = Core::handle_of(a).ok()?.claude;
+        let worktree = PathBuf::from(&a.worktree);
+        let tail = Arc::clone(
+            lock(&self.tails)
+                .entry(a.agent_ref.clone())
+                .or_insert_with(|| {
+                    Arc::new(Mutex::new(Tail::new(
+                        claude.project_dir(&worktree),
+                        &worktree,
+                        &a.session_id,
+                        debounce,
+                    )))
+                }),
+        );
         let now = self.now_ts();
-        let (status, session_id) = {
-            let mut tails = lock(&self.tails);
-            // Its Claude home is in its compartment's handle; until that's
-            // written, there's nothing to read.
-            let Ok(handle) = Core::handle_of(a) else {
-                return Status::unknown();
-            };
-            let worktree = PathBuf::from(&a.worktree);
-            let tail = tails.entry(a.agent_ref.clone()).or_insert_with(|| {
-                Tail::new(
-                    handle.claude.project_dir(&worktree),
-                    &worktree,
-                    &a.session_id,
-                    debounce,
-                )
-            });
-            if tail.transcript().is_none() {
+        let (out, session_id) = tokio::task::spawn_blocking(move || {
+            let mut t = lock(&tail);
+            if t.transcript().is_none() {
                 // Claude's directory for a long path is known once it's made.
-                tail.set_project_dir(handle.claude.project_dir(&worktree));
+                t.set_project_dir(claude.project_dir(&worktree));
             }
-            tail.set_idle_debounce(debounce);
-            tail.poll();
-            (tail.status(now), tail.session_id().to_owned())
-        };
+            t.set_idle_debounce(debounce);
+            t.poll();
+            (f(&t, now), t.session_id().to_owned())
+        })
+        .await
+        .ok()?;
         if session_id != a.session_id {
             match self
                 .store()
@@ -86,7 +105,7 @@ impl Core {
                 Err(e) => crate::log!("vibed: can't record {}'s session: {e}", a.agent_ref),
             }
         }
-        status
+        Some(out)
     }
 
     /// Forgets an agent's tail, once the agent is gone.
@@ -98,10 +117,13 @@ impl Core {
     /// they hold, `exited` once its session has gone, and otherwise what
     /// its transcript says.
     pub(crate) async fn observed_state(&self, a: &AgentRecord, status: &Status) -> AgentState {
+        // Frozen or saved to disk; a send wakes it (#6). Its session isn't
+        // asked: a saved one has none.
+        if a.state == AgentState::Asleep {
+            return AgentState::Asleep;
+        }
         let runs = self.session_runs(&a.agent_ref).await;
         match (runs, a.state) {
-            // Frozen or saved to disk; a send wakes it (#6).
-            (_, AgentState::Asleep) => AgentState::Asleep,
             (true, AgentState::Paused) => AgentState::Paused,
             (false, _) => AgentState::Exited,
             (true, _) => status.state(),
@@ -111,21 +133,24 @@ impl Core {
     /// Where `agent_ref`'s transcript is now, to wait for the answer to a
     /// send from: take it just before the send (PRD: MCP interface,
     /// `vibe_wait`).
-    pub fn mark_send(&self, host: Option<&str>, agent_ref: &str) -> Result<Mark, ErrorObject> {
+    pub async fn mark_send(
+        &self,
+        host: Option<&str>,
+        agent_ref: &str,
+    ) -> Result<Mark, ErrorObject> {
         let host = self.host(host)?;
         let mut a = self.store().agent(host, agent_ref).map_err(store_error)?;
-        self.agent_status(&mut a);
-        Ok(lock(&self.tails)
-            .get(agent_ref)
-            .map(Tail::mark)
+        let debounce = self.idle_debounce();
+        Ok(self
+            .with_tail(&mut a, debounce, |t, now| t.mark(now))
+            .await
             .unwrap_or_default())
     }
 
-    /// Whether `agent_ref` has answered the send `mark` was taken before:
-    /// its transcript has moved on since, and it's at rest or asking
-    /// something. Quiet alone isn't an answer. An agent that exited won't
-    /// answer; its state says so.
-    pub fn answered(
+    /// Whether `agent_ref` has answered the send `mark` was taken before
+    /// (see [`Tail::answered`]). Quiet alone isn't an answer. An agent that
+    /// exited won't answer; its state says so.
+    pub async fn answered(
         &self,
         host: Option<&str>,
         agent_ref: &str,
@@ -133,11 +158,12 @@ impl Core {
     ) -> Result<bool, ErrorObject> {
         let host = self.host(host)?;
         let mut a = self.store().agent(host, agent_ref).map_err(store_error)?;
-        self.agent_status(&mut a);
-        let now = self.now_ts();
-        Ok(lock(&self.tails)
-            .get(agent_ref)
-            .is_some_and(|t| t.answered(mark, now)))
+        let debounce = self.idle_debounce();
+        let mark = mark.clone();
+        Ok(self
+            .with_tail(&mut a, debounce, move |t, now| t.answered(&mark, now))
+            .await
+            .unwrap_or(false))
     }
 
     /// Reads every agent's transcript, records and publishes what changed,
@@ -156,15 +182,17 @@ impl Core {
         let refs: HashSet<&str> = records.iter().map(|a| a.agent_ref.as_str()).collect();
         lock(&self.tails).retain(|r, _| refs.contains(r.as_str()));
         published.retain(|r, _| refs.contains(r.as_str()));
+        let debounce = self.idle_debounce();
         let mut paths = Vec::new();
         for mut a in records {
             // A start, delete or resume under way records its own state.
             if a.starting || self.is_busy(&a.agent_ref) {
                 continue;
             }
-            let status = self.agent_status(&mut a);
-            if let Some(tail) = lock(&self.tails).get(&a.agent_ref) {
-                paths.extend(tail.watch_paths());
+            let status = self.agent_status(&mut a, debounce).await;
+            let tail = lock(&self.tails).get(&a.agent_ref).cloned();
+            if let Some(tail) = tail {
+                paths.extend(lock(&tail).watch_paths());
             }
             let wire = status.to_rpc();
             let changed = published.get(&a.agent_ref) != Some(&wire);
@@ -172,8 +200,13 @@ impl Core {
                 continue;
             }
             let state = self.observed_state(&a, &status).await;
+            // A delete may have finished meanwhile, or a wake changed it.
             if self.is_busy(&a.agent_ref) {
                 continue;
+            }
+            match self.store().agent(&a.host, &a.agent_ref) {
+                Ok(now) => a.state = now.state,
+                Err(_) => continue,
             }
             if state != a.state {
                 self.set_state(&mut a, state);

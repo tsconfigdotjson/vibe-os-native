@@ -219,7 +219,7 @@ pub struct Core {
     /// The memory of starts admitted but not yet running, by a token each.
     pub(crate) starting: Mutex<HashMap<u64, u64>>,
     /// Each agent's transcript, as the status engine follows it.
-    pub(crate) tails: Mutex<HashMap<String, vibe_status::Tail>>,
+    pub(crate) tails: Mutex<HashMap<String, Arc<Mutex<vibe_status::Tail>>>>,
     /// One fetch at a time per project, as concurrent fetches of the same
     /// refs fail on each other's locks.
     pub(crate) fetching: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
