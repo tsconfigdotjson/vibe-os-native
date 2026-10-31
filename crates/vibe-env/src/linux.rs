@@ -80,6 +80,10 @@ const RESTORE_PATIENCE: Duration = Duration::from_secs(30);
 /// How long a power-off may take before the VM is stopped outright.
 const POWEROFF_PATIENCE: Duration = Duration::from_secs(15);
 
+/// How long a stop waits for the shim to exit on its own, once the VM has,
+/// before it ends it.
+const SHIM_PATIENCE: Duration = Duration::from_secs(3);
+
 /// How often the worktree is measured against `disk_hard` (PRD: Disk).
 const DISK_EVERY: Duration = Duration::from_secs(60);
 
@@ -490,6 +494,20 @@ impl LinuxVm {
             .and_then(|s| *lock(&s.paused))
     }
 
+    /// Waits up to `timeout` for the shim on the agent's terminal to exit,
+    /// as it does a moment after the VM's stream goes. True once it has, or
+    /// if there's none.
+    fn shim_gone_within(h: &Handle, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while LinuxVm::shim_alive(h) {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        true
+    }
+
     /// Whether the shim that held the agent's terminal is still there.
     fn shim_alive(h: &Handle) -> bool {
         h.session.is_some_and(|sid| {
@@ -727,6 +745,18 @@ impl Compartment for LinuxVm {
                 self.machine.stop(&socket)?;
             }
         }
+        // Its shim goes too (Compartment::stop): on its own once the VM's
+        // stream has, or it's ended. Until then its socket is still served,
+        // and a delete can't remove it.
+        if !LinuxVm::shim_gone_within(h, SHIM_PATIENCE)
+            && let Some(sid) = h.session
+            && !SessionTree::new(sid).end(Duration::from_secs(2))
+        {
+            return Err(EnvError::new(format!(
+                "{}'s shim (pid {sid}) didn't end",
+                h.agent_ref
+            )));
+        }
         // Asleep, its processes are in the snapshot: they end with it.
         remove_file(&self.snapshot(h))
     }
@@ -824,18 +854,12 @@ impl Sleeper for LinuxVm {
         self.unsupervise(h);
         // The shim on its terminal goes once vibe-vm has: until then, a wake
         // would find its session still running, or its socket still taken.
-        if let Some(sid) = h.session {
-            let tree = SessionTree::new(sid);
-            let deadline = Instant::now() + POWEROFF_PATIENCE;
-            while tree.is_shims() && tree.all().iter().any(|p| p.pid == sid) {
-                if Instant::now() >= deadline {
-                    return Err(EnvError::new(format!(
-                        "{} is saved, but its shim (pid {sid}) didn't exit",
-                        h.agent_ref
-                    )));
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
+        if !LinuxVm::shim_gone_within(h, POWEROFF_PATIENCE) {
+            return Err(EnvError::new(format!(
+                "{} is saved, but its shim (pid {}) didn't exit",
+                h.agent_ref,
+                h.session.unwrap_or_default()
+            )));
         }
         Ok(())
     }

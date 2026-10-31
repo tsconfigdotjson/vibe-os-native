@@ -677,30 +677,28 @@ fn the_dirs_it_makes_are_private_whatever_the_umask() {
     }
 }
 
-#[test]
-fn a_sleep_returns_once_the_shim_has_gone() {
-    // A real shim on a command that ends a moment later, as one on a VM's
-    // stream ends once vibe-vm has.
+/// A real `vibe-shim` on `command`, as on an agent's terminal: its pid,
+/// which leads its session, and its socket.
+fn real_shim(s: &Setup, command: &[&str]) -> (u32, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
     let shim = {
         let exe = std::env::current_exe().unwrap();
         exe.parent().unwrap().parent().unwrap().join("vibe-shim")
     };
     assert!(shim.is_file(), "{} isn't built", shim.display());
-    let s = Setup::new();
-    let mut h = s.backend.create(&s.spec("quiet-amber-otter")).unwrap();
-    s.launch(&h).unwrap();
     let run = s.tmp.path().join("r");
     fs::create_dir_all(&run).unwrap();
-    use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(&run, fs::Permissions::from_mode(0o700)).unwrap();
+    let socket = run.join("q.sock");
     let out = std::process::Command::new(&shim)
         .args(["--ref", "quiet-amber-otter", "--socket"])
-        .arg(run.join("q.sock"))
+        .arg(&socket)
         .arg("--state")
         .arg(s.tmp.path().join("shim-state"))
         .arg("--cwd")
         .arg(s.tmp.path())
-        .args(["--", "sleep", "1"])
+        .arg("--")
+        .args(command)
         .output()
         .unwrap();
     assert!(
@@ -708,11 +706,26 @@ fn a_sleep_returns_once_the_shim_has_gone() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let sid: u32 = String::from_utf8(out.stdout)
+    let pid = String::from_utf8(out.stdout)
         .unwrap()
         .trim()
         .parse()
         .unwrap();
+    (pid, socket)
+}
+
+fn shim_runs(sid: u32) -> bool {
+    SessionTree::new(sid).all().iter().any(|p| p.pid == sid)
+}
+
+#[test]
+fn a_sleep_returns_once_the_shim_has_gone() {
+    // A shim on a command that ends a moment later, as one on a VM's
+    // stream ends once vibe-vm has.
+    let s = Setup::new();
+    let mut h = s.backend.create(&s.spec("quiet-amber-otter")).unwrap();
+    s.launch(&h).unwrap();
+    let (sid, _) = real_shim(&s, &["sleep", "1"]);
     h.session = Some(sid);
     let started = Instant::now();
     s.backend.sleep(&h).unwrap();
@@ -720,11 +733,31 @@ fn a_sleep_returns_once_the_shim_has_gone() {
         started.elapsed() >= Duration::from_millis(500),
         "it didn't wait"
     );
-    let tree = SessionTree::new(sid);
-    assert!(
-        !tree.all().iter().any(|p| p.pid == sid),
-        "the shim is still there"
-    );
+    assert!(!shim_runs(sid), "the shim is still there");
+}
+
+#[test]
+fn a_stop_ends_the_shim_so_a_delete_can_remove_its_socket() {
+    // After a wake, a shim holds the VM's terminal; a forced delete stops
+    // the agent and then removes the shim's socket, which must be free.
+    let s = Setup::new();
+    let mut h = s.backend.create(&s.spec("quiet-amber-otter")).unwrap();
+    s.launch(&h).unwrap();
+    // One that goes on its own a moment after the VM: waited for.
+    let (sid, socket) = real_shim(&s, &["sleep", "1"]);
+    h.session = Some(sid);
+    s.backend.stop(&h).unwrap();
+    assert!(!shim_runs(sid), "stop returned with the shim running");
+    assert!(!socket.exists(), "its socket is still served");
+    // One that wouldn't go: ended.
+    let (sid, socket) = real_shim(&s, &["sleep", "60"]);
+    h.session = Some(sid);
+    s.launch(&h).unwrap();
+    let started = Instant::now();
+    s.backend.delete(&h).unwrap();
+    assert!(!shim_runs(sid), "delete left the shim running");
+    assert!(!socket.exists(), "its socket is still served");
+    assert!(started.elapsed() < Duration::from_secs(10));
 }
 
 #[test]

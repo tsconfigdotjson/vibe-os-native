@@ -12,11 +12,18 @@
 //! `macos` sleeper and governor and the test backend all use it. The shim,
 //! the session's leader, is never frozen, because it must keep answering.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::io;
 use std::time::{Duration, Instant};
 
 use crate::Proc;
+
+/// How long a freeze may take to stop every member.
+pub const FREEZE_SETTLE: Duration = Duration::from_secs(5);
+
+/// How long a member may take to say it's stopped before it's sent the
+/// signal again.
+const FREEZE_RESEND: Duration = Duration::from_millis(200);
 
 /// The kernel's name for a shim, which leads each native agent's session.
 pub const SHIM_NAME: &str = "vibe-shim";
@@ -64,29 +71,43 @@ impl SessionTree {
         self.all().is_empty()
     }
 
-    /// Stops every member with `SIGSTOP` and returns how many there were.
-    /// A process can fork between being listed and being stopped, so the
-    /// session is listed again until a pass finds nothing new.
+    /// Stops every member with `SIGSTOP`, and returns how many there were
+    /// once every one says it's stopped. A process can fork between being
+    /// listed and being stopped, so the session is listed again until a
+    /// pass finds nothing running; and a member a stop hasn't reached yet
+    /// (or that was continued meanwhile) is sent it again. A tree that
+    /// won't all stop within [`FREEZE_SETTLE`] is an error naming those
+    /// left: a freeze that's only been asked for isn't one.
     pub fn freeze(&self) -> io::Result<usize> {
-        let mut stopped = HashSet::new();
-        for _ in 0..100 {
-            let new: Vec<u32> = self
-                .members()
-                .into_iter()
-                .map(|p| p.pid)
-                .filter(|pid| !stopped.contains(pid))
-                .collect();
-            if new.is_empty() {
-                return Ok(stopped.len());
+        let deadline = Instant::now() + FREEZE_SETTLE;
+        let mut sent: HashMap<u32, Instant> = HashMap::new();
+        loop {
+            let members = self.members();
+            let running: Vec<&Proc> = members.iter().filter(|p| !p.stopped).collect();
+            if running.is_empty() {
+                return Ok(members.len());
             }
-            for pid in new {
-                signal(pid, libc::SIGSTOP);
-                stopped.insert(pid);
+            if Instant::now() >= deadline {
+                let left: Vec<String> = running
+                    .iter()
+                    .map(|p| format!("{} ({})", p.pid, p.name))
+                    .collect();
+                return Err(io::Error::other(format!(
+                    "the agent's processes didn't all stop: {} still running",
+                    left.join(", ")
+                )));
             }
+            for p in running {
+                let due = sent
+                    .get(&p.pid)
+                    .is_none_or(|at| at.elapsed() >= FREEZE_RESEND);
+                if due {
+                    signal(p.pid, libc::SIGSTOP);
+                    sent.insert(p.pid, Instant::now());
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
         }
-        Err(io::Error::other(
-            "the agent's processes kept forking while it was being frozen",
-        ))
     }
 
     /// Continues every member with `SIGCONT`.
@@ -438,9 +459,9 @@ mod tests {
         }
 
         assert_eq!(tree.freeze().unwrap(), 4);
-        wait_for("every member stopped", || {
-            tree.members().iter().all(|p| p.stopped)
-        });
+        // A freeze returns once they all say so.
+        let members = tree.members();
+        assert!(members.iter().all(|p| p.stopped), "{members:?}");
         // The leader keeps running.
         assert!(
             !tree
@@ -450,6 +471,15 @@ mod tests {
                 .unwrap()
                 .stopped
         );
+        // One continued behind the freeze's back is stopped again by the
+        // next.
+        let one = members[0].pid;
+        unsafe { libc::kill(one as i32, libc::SIGCONT) };
+        wait_for("it to run again", || {
+            tree.members().iter().any(|p| p.pid == one && !p.stopped)
+        });
+        assert_eq!(tree.freeze().unwrap(), 4);
+        assert!(tree.members().iter().all(|p| p.stopped));
         tree.thaw();
         wait_for("every member running", || {
             tree.members().iter().all(|p| !p.stopped)
