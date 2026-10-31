@@ -229,6 +229,12 @@ pub struct Core {
     pub(crate) starting: Mutex<HashMap<u64, u64>>,
     /// Each agent's transcript, as the status engine follows it.
     pub(crate) tails: Mutex<HashMap<String, Arc<Mutex<vibe_status::Tail>>>>,
+    /// Where each agent's transcript was at its last send over MCP: what
+    /// `vibe_wait` waits for an answer after. None yet means its start's
+    /// prompt was the last.
+    pub(crate) sends: Mutex<HashMap<String, vibe_status::Mark>>,
+    /// Held while a send types into an agent, so two can't interleave.
+    pub(crate) typing: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// One fetch at a time per project, as concurrent fetches of the same
     /// refs fail on each other's locks.
     pub(crate) fetching: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
@@ -361,6 +367,8 @@ impl Core {
             starting: Mutex::new(HashMap::new()),
             fetching: Mutex::new(HashMap::new()),
             tails: Mutex::new(HashMap::new()),
+            sends: Mutex::new(HashMap::new()),
+            typing: Mutex::new(HashMap::new()),
             store: Mutex::new(store),
             limits_lock: Mutex::new(()),
             adding: Mutex::new(HashSet::new()),

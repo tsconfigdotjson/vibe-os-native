@@ -146,6 +146,7 @@ impl Screen {
             cursor,
             dropped: start - after,
             more: cursor < h.total,
+            bracketed_paste: self.parser.screen().bracketed_paste(),
         }
     }
 }
@@ -156,6 +157,16 @@ mod tests {
 
     fn screen(rows: u16, history: usize) -> Screen {
         Screen::new(Size { rows, cols: 20 }, history)
+    }
+
+    #[test]
+    fn bracketed_paste_is_reported() {
+        let mut s = screen(3, 10);
+        assert!(!s.output(None, 1 << 20).bracketed_paste);
+        s.process(b"\x1b[?2004h");
+        assert!(s.output(None, 1 << 20).bracketed_paste);
+        s.process(b"\x1b[?2004l");
+        assert!(!s.output(None, 1 << 20).bracketed_paste);
     }
 
     #[test]

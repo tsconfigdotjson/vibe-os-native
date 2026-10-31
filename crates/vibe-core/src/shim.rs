@@ -316,6 +316,10 @@ pub struct Output {
     /// the rest.
     #[serde(default)]
     pub more: bool,
+    /// The program has turned on bracketed paste (`CSI ? 2004 h`), so a
+    /// paste should be wrapped in its markers, as a terminal would.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bracketed_paste: bool,
 }
 
 /// What a shim leaves in its state directory when its command exits, so the

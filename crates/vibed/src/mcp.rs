@@ -1,0 +1,154 @@
+//! MCP on this daemon's core (PRD: MCP interface). `vibe-mcp` is the
+//! façade; this gives it the same handlers the socket API calls, so the two
+//! can't drift apart.
+//!
+//! Only this host's agents are reachable until Linux hosts (#16) connect
+//! others: a call for another host gets the core's "no host named …".
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::task::JoinHandle;
+use vibe_core::limits::{self, HostLimits};
+use vibe_core::model::AgentState;
+use vibe_core::rpc::{
+    Agent, AgentDeleteParams, AgentStartParams, ErrorObject, HostParams, Project,
+};
+use vibe_mcp::http::Settings;
+use vibe_mcp::{AgentView, Check, Daemon, Input, Message, Screen, Sent, Target};
+
+use crate::agents::blocking;
+use crate::core::Core;
+
+/// How often the MCP listeners are checked against `host.toml`.
+pub const LISTEN_CHECK_EVERY: Duration = Duration::from_secs(5);
+
+/// This machine's name, for the attach line from another machine.
+fn machine_name() -> String {
+    let mut buf = [0u8; 256];
+    // SAFETY: gethostname writes at most `buf.len()` bytes into `buf`.
+    let ok = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) } == 0;
+    let end = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
+    match std::str::from_utf8(&buf[..end]) {
+        Ok(name) if ok && !name.is_empty() => name.to_owned(),
+        _ => "this-host".to_owned(),
+    }
+}
+
+impl Core {
+    /// The MCP port and whether it's served on Tailscale too, from
+    /// `host.toml` as it is now. One that can't be read gives the
+    /// defaults, so MCP stays up on loopback while it's fixed.
+    pub fn mcp_settings(&self) -> (u16, bool) {
+        let l = limits::load(&self.layout.host_config()).unwrap_or_else(|_| HostLimits::default());
+        (l.mcp_port, l.mcp_tailscale)
+    }
+
+    /// Serves MCP where `host.toml` says, until the task is aborted.
+    pub fn spawn_mcp(self: &Arc<Self>, every: Duration) -> JoinHandle<()> {
+        let core = Arc::clone(self);
+        let settings: Arc<Settings> = Arc::new(move || core.mcp_settings());
+        vibe_mcp::http::spawn_listeners(Arc::clone(self), settings, every)
+    }
+
+    /// What `vibe_list_agents` shows of a host's agents: what `agents.list`
+    /// does, with each one's memory now and its limit.
+    pub async fn agent_views(&self, host: &str) -> Result<Vec<AgentView>, ErrorObject> {
+        let list = self
+            .agents(HostParams {
+                host: Some(host.to_owned()),
+            })
+            .await?;
+        let machine = machine_name();
+        let mut views = Vec::new();
+        for agent in list.agents {
+            let record = self.store().agent(&agent.host, &agent.agent).ok();
+            let memory_limit = record.as_ref().map_or(0, |r| r.memory);
+            let awake = !matches!(agent.state, AgentState::Asleep | AgentState::Exited);
+            let memory = match (&record, awake) {
+                (Some(r), true) => self.memory_of(r).await,
+                _ => None,
+            };
+            views.push(AgentView {
+                attach_remote: format!("ssh -t {machine} {}", agent.attach),
+                agent,
+                memory,
+                memory_limit,
+            });
+        }
+        Ok(views)
+    }
+
+    /// What `r`'s compartment uses now, if its backend can say.
+    async fn memory_of(&self, r: &vibe_core::store::AgentRecord) -> Option<u64> {
+        let backend = self.backend(r.environment).ok()?;
+        let handle = Core::handle_of(r).ok()?;
+        blocking(move || backend.usage(&handle))
+            .await
+            .ok()
+            .map(|u| u.memory)
+    }
+}
+
+impl Daemon for Core {
+    fn log(&self, line: &str) {
+        crate::log!("vibed: {line}");
+    }
+
+    fn verify_key(&self, secret: &str) -> Option<String> {
+        match Core::verify_key(self, secret) {
+            Ok(Some(key)) => Some(key.name),
+            Ok(None) => None,
+            Err(e) => {
+                crate::log!("vibed: can't check an API key: {}", e.message);
+                None
+            }
+        }
+    }
+
+    async fn hosts(&self) -> Result<Vec<String>, ErrorObject> {
+        Ok(Core::hosts(self)?
+            .hosts
+            .into_iter()
+            .map(|h| h.name)
+            .collect())
+    }
+
+    async fn projects(&self, host: &str) -> Result<Vec<Project>, ErrorObject> {
+        Ok(Core::projects(
+            self,
+            HostParams {
+                host: Some(host.to_owned()),
+            },
+        )?
+        .projects)
+    }
+
+    async fn agents(&self, host: &str) -> Result<Vec<AgentView>, ErrorObject> {
+        self.agent_views(host).await
+    }
+
+    async fn start_agent(&self, p: AgentStartParams) -> Result<Agent, ErrorObject> {
+        Core::start_agent(self, p).await
+    }
+
+    async fn delete_agent(&self, p: AgentDeleteParams) -> Result<Agent, ErrorObject> {
+        Core::delete_agent(self, p).await
+    }
+
+    async fn send(&self, t: &Target, input: Input) -> Result<Sent, ErrorObject> {
+        self.send_input(Some(&t.host), &t.agent, input).await
+    }
+
+    async fn check(&self, t: &Target, background: bool) -> Result<Check, ErrorObject> {
+        self.check_agent(Some(&t.host), &t.agent, background).await
+    }
+
+    async fn read_output(&self, t: &Target, after: Option<u64>) -> Result<Screen, ErrorObject> {
+        self.agent_output(Some(&t.host), &t.agent, after).await
+    }
+
+    async fn read_messages(&self, t: &Target, last: usize) -> Result<Vec<Message>, ErrorObject> {
+        self.agent_messages(Some(&t.host), &t.agent, last).await
+    }
+}

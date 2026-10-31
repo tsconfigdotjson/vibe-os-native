@@ -250,9 +250,11 @@ vm_disk          = "20G"   # a linux agent's own writable layer
 idle_debounce    = "60s"
 snapshot_disk    = "20G"   # total for all sleeping linux agents
 package_caches   = true    # linux agents share npm, pnpm, cargo and pip caches
+mcp_port         = 7878    # MCP on http://127.0.0.1:<port>/mcp
+mcp_tailscale    = false   # MCP on this host's Tailscale address too
 ```
 
-`package_caches` is the opt-out from the shared caches (Mounts, below), so it's set in this file only, not over the socket.
+`package_caches` is the opt-out from the shared caches (Mounts, below). It, `mcp_port` and `mcp_tailscale` are set in this file only, not over the socket.
 
 Admission reserves the profile's memory for each awake agent. If host headroom minus the reserve can't cover a new agent, agents still inside their idle debounce go to sleep early, oldest first. If there's still no room, the start is refused with a clear reason. Starts never queue.
 
@@ -380,7 +382,7 @@ outside caller ──HTTPS + API key──▶ Linux host (public, vibed) ══ 
 
 MCP is the product. It keeps the shape of VibeOS's MCP, which already drives a working orchestrator: start an agent with a prompt, `vibe_wait`, read what it said, and answer its questions with `vibe_send`. Where VibeOS split one job across a workspace and its windows, this server has one tool, because each worktree has exactly one agent. Every call needs an API key. Host setup (API keys, projects, profiles, host limits, the Linux template) is in the menu on the Mac, and in the `vibe` CLI on a Linux host.
 
-**Transport.** Streamable HTTP at `http://127.0.0.1:7878/mcp` (port to be decided). The Tailscale interface can be turned on in Settings, and a Linux host can serve it publicly (see External access). There's also stdio through `vibe mcp` for clients that can only launch a command. Built with `rmcp`.
+**Transport.** Streamable HTTP at `http://127.0.0.1:7878/mcp` (the port is `mcp_port` in `host.toml`). The Tailscale interface can be turned on in Settings (`mcp_tailscale`), and a Linux host can serve it publicly (see External access). There's also stdio through `vibe mcp` for clients that can only launch a command: a bridge to that endpoint, with the key in `VIBE_API_KEY`. Built with `rmcp`.
 
 **Auth is always on.** There's no unauthenticated mode, not even on loopback.
 

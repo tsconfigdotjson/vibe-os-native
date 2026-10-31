@@ -48,14 +48,36 @@ pub struct HostLimits {
     /// not over the socket.
     #[serde(skip, default = "yes")]
     pub package_caches: bool,
+    /// The loopback port MCP is served on, `http://127.0.0.1:<port>/mcp`
+    /// (PRD: MCP interface). Set in `host.toml` only, not over the socket.
+    #[serde(skip, default = "mcp_port")]
+    pub mcp_port: u16,
+    /// Whether MCP is also served on this host's Tailscale address, on the
+    /// same port. Set in `host.toml` only, not over the socket.
+    #[serde(skip)]
+    pub mcp_tailscale: bool,
 }
 
 fn yes() -> bool {
     true
 }
 
-/// The one setting that's true or false, and only in `host.toml`.
+/// The default MCP port.
+pub const MCP_PORT: u16 = 7878;
+
+fn mcp_port() -> u16 {
+    MCP_PORT
+}
+
+/// A setting that's true or false, and only in `host.toml`.
 pub const PACKAGE_CACHES: &str = "package_caches";
+
+/// The MCP settings, which are in `host.toml` only.
+pub const MCP_PORT_KEY: &str = "mcp_port";
+pub const MCP_TAILSCALE: &str = "mcp_tailscale";
+
+/// The settings that are in `host.toml` only.
+const FILE_ONLY: [&str; 3] = [PACKAGE_CACHES, MCP_PORT_KEY, MCP_TAILSCALE];
 
 impl Default for HostLimits {
     fn default() -> Self {
@@ -71,6 +93,8 @@ impl Default for HostLimits {
             idle_debounce: 60,
             snapshot_disk: 20 * GIB,
             package_caches: true,
+            mcp_port: MCP_PORT,
+            mcp_tailscale: false,
         }
     }
 }
@@ -316,12 +340,28 @@ fn interpret(doc: &DocumentMut) -> Result<HostLimits, String> {
                 .ok_or_else(|| format!("{key} must be true or false"))?;
             continue;
         }
+        if key == MCP_TAILSCALE {
+            limits.mcp_tailscale = item
+                .as_value()
+                .and_then(Value::as_bool)
+                .ok_or_else(|| format!("{key} must be true or false"))?;
+            continue;
+        }
+        if key == MCP_PORT_KEY {
+            limits.mcp_port = item
+                .as_value()
+                .and_then(Value::as_integer)
+                .and_then(|p| u16::try_from(p).ok())
+                .filter(|p| *p != 0)
+                .ok_or_else(|| format!("{key} must be a port, from 1 to 65535"))?;
+            continue;
+        }
         let kind = SETTINGS
             .iter()
             .find(|(k, _)| *k == key)
             .map(|(_, kind)| *kind)
             .ok_or_else(|| {
-                let known: Vec<&str> = HostLimits::keys().chain([PACKAGE_CACHES]).collect();
+                let known: Vec<&str> = HostLimits::keys().chain(FILE_ONLY).collect();
                 format!(
                     "unknown setting `{key}`; the settings are {}",
                     known.join(", ")
@@ -466,6 +506,36 @@ package_caches   = true    # linux agents share npm, pnpm, cargo and pip caches
         let back: HostLimits = serde_json::from_value(json).unwrap();
         assert!(back.package_caches, "the socket's limits say nothing of it");
         assert!(update(&path, &[("package_caches", 1)]).is_err());
+    }
+
+    #[test]
+    fn mcp_settings_are_in_the_file_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let l = load(&dir.path().join("host.toml")).unwrap();
+        assert_eq!((l.mcp_port, l.mcp_tailscale), (MCP_PORT, false));
+        let (_d, path) = file("mcp_port = 9000\nmcp_tailscale = true\ncpu_cores = 2\n");
+        let l = load(&path).unwrap();
+        assert_eq!((l.mcp_port, l.mcp_tailscale), (9000, true));
+        // An edit over the socket keeps them, and they aren't on the socket.
+        let l = update(&path, &[("cpu_cores", 3)]).unwrap();
+        assert_eq!((l.mcp_port, l.mcp_tailscale), (9000, true));
+        let json = serde_json::to_value(l).unwrap();
+        assert!(json.get("mcp_port").is_none(), "{json}");
+        assert!(json.get("mcp_tailscale").is_none(), "{json}");
+        assert!(update(&path, &[("mcp_port", 1)]).is_err());
+        for (text, expect) in [
+            ("mcp_port = 0", "mcp_port must be a port"),
+            ("mcp_port = 70000", "mcp_port must be a port"),
+            ("mcp_port = \"7878\"", "mcp_port must be a port"),
+            ("mcp_tailscale = 1", "mcp_tailscale must be true or false"),
+        ] {
+            let (_d, path) = file(text);
+            let e = load(&path).unwrap_err().to_string();
+            assert!(e.contains(expect), "{text}: {e}");
+        }
+        let (_d, path) = file("mcp_ports = 1");
+        let e = load(&path).unwrap_err().to_string();
+        assert!(e.contains("mcp_port, mcp_tailscale"), "{e}");
     }
 
     #[test]

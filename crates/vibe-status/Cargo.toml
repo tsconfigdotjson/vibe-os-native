@@ -14,9 +14,10 @@ repository.workspace = true
 agent-tail = { git = "https://github.com/tsconfigdotjson/agent-tail", rev = "0b5c3f6d9b624e3e22493bfdfbb442067367459f", default-features = false, features = ["fs"] }
 vibe-core.workspace = true
 libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
-serde_json.workspace = true
 tempfile.workspace = true
 
 [lints]

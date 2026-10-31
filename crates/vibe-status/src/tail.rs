@@ -259,6 +259,14 @@ impl Tail {
     /// on what may be a permission prompt for [`INFERRED_QUIET`], as a long
     /// silent tool run looks the same until then.
     pub fn answered(&self, mark: &Mark, now: Timestamp) -> bool {
+        self.answered_after(mark, now, true)
+    }
+
+    /// [`Tail::answered`], except that unless `background` is set, a turn
+    /// that ended with commands still running in the background counts as
+    /// answered too, as `vibe_wait` does by default: a server left running
+    /// never finishes.
+    pub fn answered_after(&self, mark: &Mark, now: Timestamp, background: bool) -> bool {
         let Some(f) = &self.followed else {
             return false;
         };
@@ -269,7 +277,8 @@ impl Tail {
                 f.reducer.received() > mark.received
                     && f.reducer.state(Timestamp::EPOCH).last_at != mark.last_at
             };
-        moved && self.status(now).settled(now)
+        let status = self.status(now);
+        moved && (status.settled(now) || !background && status.activity == Activity::BackgroundWork)
     }
 
     /// Picks the transcript to follow, and says whether it changed.
@@ -1133,6 +1142,38 @@ mod tests {
             tail.status(t("2026-10-30T12:00:06Z")).activity,
             Activity::Done
         );
+    }
+
+    #[test]
+    fn background_work_answers_unless_waited_for() {
+        let w = world();
+        let path = w.project.join(format!("{ID}.jsonl"));
+        let mut tail = Tail::new(w.project.clone(), &w.worktree, ID, Duration::from_secs(60));
+        let mark = tail.mark(t("2026-10-30T12:00:00Z"));
+        append(&path, &user("/w/app", "2026-10-30T12:00:00Z", "go"));
+        append(
+            &path,
+            &reply("/w/app", "2026-10-30T12:00:01Z", "started a helper"),
+        );
+        let helpers = w.project.join(ID).join("subagents");
+        fs::create_dir_all(&helpers).unwrap();
+        let helper = helpers.join("agent-a1.jsonl");
+        let call = serde_json::json!({"type": "assistant", "isSidechain": true, "sessionId": ID,
+            "cwd": "/w/app", "timestamp": "2026-10-30T12:00:02Z", "message": {"id": "h1",
+            "role": "assistant", "stop_reason": "tool_use", "content": [{"type": "tool_use",
+            "id": "toolu_h", "name": "Bash", "input": {"command": "sleep 100"}}]}});
+        append(&helper, &format!("{call}\n"));
+        tail.poll();
+        let now = t("2026-10-30T12:00:05Z");
+        assert_eq!(tail.status(now).activity, Activity::BackgroundWork);
+        assert!(tail.answered_after(&mark, now, false));
+        assert!(!tail.answered_after(&mark, now, true));
+        assert!(!tail.answered(&mark, now));
+        fs::write(helper.with_extension("meta.json"), r#"{"finished":true}"#).unwrap();
+        tail.poll();
+        let now = t("2026-10-30T12:00:06Z");
+        assert!(tail.answered_after(&mark, now, true));
+        assert!(tail.answered(&mark, now));
     }
 
     fn bash(at: &str, id: &str) -> String {

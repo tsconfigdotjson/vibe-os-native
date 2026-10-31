@@ -19,6 +19,11 @@
 #     vibed, and the new one rebuilds that state from the transcript; a
 #     delete is refused while a commit is unpushed, and once it's pushed,
 #     leaves nothing behind but the branch
+#   - MCP, as a client drives it, on the test backend: vibed serves it on
+#     the port host.toml names and refuses a call without an API key; then,
+#     with a key from `vibe key create`, `vibe mcp` carries VibeOS's round
+#     over stdio: start an agent on a question, wait for it, read it, answer
+#     it with keys, wait for that answer, read it, and delete the agent
 #   - the macos backend (crates/vibe-env/tests/macos.rs, which the test step
 #     runs everywhere): on a Mac again, with a fork bomb of about a thousand
 #     processes, and PRIO_DARWIN_BG seen in `ps` as the memory warning
@@ -449,6 +454,81 @@ s_agents() {
   stop_vibed
 }
 
+# mcp_call <id> <json> <text>: sends a request down the bridge, waits for
+# its response in the bridge's output, and checks it holds <text>.
+mcp_call() {
+  printf '%s\n' "$2" >&7
+  local i line
+  for i in $(seq 1 600); do
+    line=$(grep -E "\"id\":$1[,}]" "$MCP_OUT" | grep -v '"method"' | head -n 1 || true)
+    [ -n "$line" ] && break
+    sleep 0.1
+  done
+  echo "$1: $line"
+  [ -n "$line" ] || { echo "no response to $1 in 60 s; the bridge said:"; cat "$MCP_OUT"; return 1; }
+  case $line in *"$3"*) ;; *) echo "response $1 doesn't say: $3"; return 1 ;; esac
+  case $line in *'"isError":true'*|*'"error":'*) echo "response $1 is an error"; return 1 ;; esac
+}
+
+s_mcp() {
+  local socket="$WORK/mc/run/vibed.sock" home="$WORK/mc/home" origin="$WORK/mc/origin"
+  local repo="$WORK/mc/src/app" port key out code bridge
+  git init -q "$origin"
+  git -C "$origin" -c user.name=t -c user.email=t@example.com commit -q --allow-empty -m first
+  git clone -q "$origin" "$repo"
+  # A port of its own, so a vibed already serving 7878 here isn't the one
+  # asked; and nothing kept back, so a 1G agent fits anywhere.
+  port=$((20000 + RANDOM % 30000))
+  mkdir -p "$home/.config/vibeos"
+  printf 'mcp_port = %s\nreserve_memory = 0\n' "$port" >"$home/.config/vibeos/host.toml"
+  export VIBE_TEST_BACKEND="$ROOT/crates/vibe-env/src/stand-in.sh"
+  start_vibed "$socket" "$WORK/mc-vibed.log"
+  wait_for "$WORK/mc-vibed.log" "mcp: serving http://127.0.0.1:$port/mcp"
+  out=$(rpc \
+    "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"projects.add\",\"params\":{\"path\":\"$repo\"}}" \
+    '{"jsonrpc":"2.0","id":2,"method":"profiles.update","params":{"project":"app","profile":"software-eng-linux","memory":1073741824}}')
+  case $out in *'"error"'*) echo "setup failed: $out"; return 1 ;; esac
+  # No key, no MCP, even on loopback.
+  code=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
+    -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' "http://127.0.0.1:$port/mcp")
+  echo "without a key: HTTP $code"
+  [ "$code" = 401 ] || { echo "a call without a key wasn't refused"; return 1; }
+  key=$(HOME="$home" target/debug/vibe --socket "$socket" key create check)
+  case $key in vk_*) ;; *) echo "no key made: $key"; return 1 ;; esac
+
+  MCP_OUT="$WORK/mc-bridge.out"
+  mkfifo "$WORK/mc-in"
+  HOME="$home" VIBE_API_KEY="$key" target/debug/vibe mcp <"$WORK/mc-in" >"$MCP_OUT" 2>"$WORK/mc-bridge.err" &
+  bridge=$!
+  echo "$bridge" >>"$WORK/pids"
+  exec 7>"$WORK/mc-in"
+  mcp_call 101 '{"jsonrpc":"2.0","id":101,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"check-full","version":"1"}}}' '"vibe-os-native"'
+  printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized"}' >&7
+  mcp_call 102 '{"jsonrpc":"2.0","id":102,"method":"tools/call","params":{"name":"vibe_list_projects","arguments":{}}}' 'app (on local)'
+  mcp_call 103 '{"jsonrpc":"2.0","id":103,"method":"tools/call","params":{"name":"vibe_start_agent","arguments":{"project":"app","profile":"software-eng-linux","prompt":"question","name":"mcp-check"}}}' 'started mcp-check'
+  mcp_call 104 '{"jsonrpc":"2.0","id":104,"method":"tools/call","params":{"name":"vibe_wait","arguments":{"agents":"mcp-check","timeout":60}}}' 'has answered: it is question'
+  mcp_call 105 '{"jsonrpc":"2.0","id":105,"method":"tools/call","params":{"name":"vibe_read_output","arguments":{"agent":"mcp-check"}}}' 'Red or blue?'
+  mcp_call 106 '{"jsonrpc":"2.0","id":106,"method":"tools/call","params":{"name":"vibe_send","arguments":{"agent":"mcp-check","keys":["B","l","u","e","Enter"]}}}' 'pressed B l u e Enter'
+  mcp_call 107 '{"jsonrpc":"2.0","id":107,"method":"tools/call","params":{"name":"vibe_wait","arguments":{"agents":"mcp-check","timeout":60}}}' 'has answered: it is idle'
+  mcp_call 108 '{"jsonrpc":"2.0","id":108,"method":"tools/call","params":{"name":"vibe_read_messages","arguments":{"agent":"mcp-check","last":1}}}' 'assistant: You chose Blue.'
+  mcp_call 109 '{"jsonrpc":"2.0","id":109,"method":"tools/call","params":{"name":"vibe_delete_agent","arguments":{"agent":"mcp-check"}}}' 'deleted mcp-check; its branch mcp-check is kept'
+  # stdin's end ends the bridge.
+  exec 7>&-
+  wait "$bridge" || { echo "vibe mcp exited with $?"; cat "$WORK/mc-bridge.err"; return 1; }
+  [ ! -e "$home/VibeOS/worktrees/app/mcp-check" ] || { echo "the worktree is left"; return 1; }
+  git -C "$repo" rev-parse --verify --quiet refs/heads/mcp-check >/dev/null || { echo "the branch went"; return 1; }
+  out=$(HOME="$home" target/debug/vibe --socket "$socket" key list)
+  echo "keys: $out"
+  case $out in *"check  vk_"*"last used"*) ;; *) echo "the key doesn't say it was used"; return 1 ;; esac
+  # The log names the key that called, and never holds the key itself.
+  grep -q 'mcp: key "check" called vibe_start_agent' "$WORK/mc-vibed.log" || { echo "calls aren't logged"; return 1; }
+  if grep -qF "$key" "$WORK/mc-vibed.log" "$home/.local/share/vibeos/logs/vibed.log" "$home/Library/Logs/VibeOS/vibed.log" 2>/dev/null; then
+    echo "the key is in a log"
+    return 1
+  fi
+  stop_vibed
+}
+
 # The macos backend's own tests, with a bigger fork bomb than the test
 # step's, still bounded so a governor that failed wouldn't take the Mac down.
 s_macos_governor() {
@@ -684,6 +764,7 @@ step smoke "vibed hello world via vibe hello and vibe rpc" s_smoke build
 step registry "registry via vibe rpc survives a vibed restart" s_registry build
 step sessions "a session outlives a killed vibed and is re-adopted" s_sessions build
 step agents "agents start, outlive vibed, and delete to nothing but the branch" s_agents build
+step mcp "MCP: no key refused; VibeOS's round over vibe mcp, start to delete" s_mcp build
 mac_step macos-governor "the macos backend: conformance, fork bomb, memory, nohup, CPU, disk" s_macos_governor build
 mac_step macos-agents "a macos agent on the governor: Mac's ~/.claude, a limit pause, delete" s_macos_agents build
 mac_step swift-app-build "swift build swift/VibeOS" s_swift_app_build
