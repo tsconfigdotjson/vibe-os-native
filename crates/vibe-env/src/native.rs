@@ -1,7 +1,6 @@
 //! What backends whose agents run natively on the host share: the test
-//! backend now, and `macos` (#11) and the Linux host's cgroups (#17) later.
-//! Their agents run under the shim's PTY, in the shim's session, so their
-//! tree is a [`crate::tree::SessionTree`].
+//! backend, `macos` and the Linux host's cgroups ([`crate::cgroups`]).
+//! Their agents run under the shim's PTY, in the shim's session.
 
 use std::io::Read;
 use std::os::unix::process::{CommandExt, ExitStatusExt};

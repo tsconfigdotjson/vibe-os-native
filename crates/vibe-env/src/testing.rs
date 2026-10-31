@@ -1,5 +1,5 @@
 //! A backend for tests, so the core and the conformance suite don't wait on
-//! the real backends (#9, #11, #17). Never used for real agents.
+//! the real backends. Never used for real agents.
 //!
 //! It runs the agent natively under the shim's PTY, like `macos` does,
 //! with a Claude home of its own, so nothing touches the real `~/.claude`.

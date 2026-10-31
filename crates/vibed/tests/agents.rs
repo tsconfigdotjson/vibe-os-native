@@ -97,23 +97,42 @@ fn code(e: &ErrorObject) -> ErrorCode {
     ErrorCode::from_code(e.code).unwrap()
 }
 
+/// `r`'s screen, from its shim.
+fn screen_of(layout: &Layout, r: &str) -> String {
+    shim::connect(
+        &layout.session_socket(r),
+        &control_hello("test"),
+        Duration::from_secs(10),
+    )
+    .unwrap()
+    .read_output(None)
+    .unwrap()
+    .screen
+}
+
+fn wait_screen_of(layout: &Layout, r: &str, text: &str) {
+    wait_until(&format!("{text:?} on {r}'s screen"), || {
+        screen_of(layout, r).contains(text)
+    });
+}
+
 impl World {
     fn screen(&self, r: &str) -> String {
-        shim::connect(
-            &self.layout.session_socket(r),
-            &control_hello("test"),
-            Duration::from_secs(10),
-        )
-        .unwrap()
-        .read_output(None)
-        .unwrap()
-        .screen
+        screen_of(&self.layout, r)
     }
 
     fn wait_screen(&self, r: &str, text: &str) {
-        wait_until(&format!("{text:?} on {r}'s screen"), || {
-            self.screen(r).contains(text)
-        });
+        wait_screen_of(&self.layout, r, text);
+    }
+
+    /// Whether `r`'s shim answers.
+    fn runs(&self, r: &str) -> bool {
+        shim::connect(
+            &self.layout.session_socket(r),
+            &control_hello("test"),
+            Duration::from_secs(2),
+        )
+        .is_ok()
     }
 
     fn type_line(&self, r: &str, line: &str) {
@@ -1624,4 +1643,515 @@ async fn a_macos_agent_runs_on_the_governor_in_the_owners_own_claude_home() {
     assert!(!state.contains(&a.worktree), "{state}");
     assert!(state.contains("hasCompletedOnboarding"), "{state}");
     assert!(w.agent_files().is_empty(), "{:?}", w.agent_files());
+}
+
+/// Memory pressure as a test sets it.
+#[derive(Debug, Default)]
+struct Pressure(std::sync::Mutex<Option<vibed::pressure::Psi>>);
+
+impl Pressure {
+    fn set(&self, some10: f64) {
+        *self.0.lock().unwrap() = Some(vibed::pressure::Psi {
+            some10,
+            full10: 0.0,
+        });
+    }
+}
+
+impl vibed::pressure::MemoryPressure for Pressure {
+    fn read(&self) -> Option<vibed::pressure::Psi> {
+        *self.0.lock().unwrap()
+    }
+}
+
+/// The test backend, but its sleep gives memory back, as a VM's does.
+#[derive(Debug)]
+struct FreesMemory(vibe_env::testing::TestBackend);
+
+impl vibe_env::Compartment for FreesMemory {
+    fn create(&self, spec: &vibe_env::AgentSpec) -> vibe_env::Result<vibe_env::Handle> {
+        self.0.create(spec)
+    }
+    fn run(
+        &self,
+        h: &vibe_env::Handle,
+        r: &vibe_env::Run,
+    ) -> vibe_env::Result<vibe_env::RunOutput> {
+        self.0.run(h, r)
+    }
+    fn launch(
+        &self,
+        h: &vibe_env::Handle,
+        l: &vibe_env::Launch,
+    ) -> vibe_env::Result<vibe_env::TerminalEnd> {
+        self.0.launch(h, l)
+    }
+    fn processes(&self, h: &vibe_env::Handle) -> vibe_env::Result<Vec<vibe_env::Proc>> {
+        self.0.processes(h)
+    }
+    fn stop(&self, h: &vibe_env::Handle) -> vibe_env::Result<()> {
+        self.0.stop(h)
+    }
+    fn delete(&self, h: &vibe_env::Handle) -> vibe_env::Result<()> {
+        self.0.delete(h)
+    }
+}
+
+impl vibe_env::Limiter for FreesMemory {
+    fn apply(&self, h: &vibe_env::Handle, l: &vibe_env::Limits) -> vibe_env::Result<()> {
+        self.0.apply(h, l)
+    }
+    fn usage(&self, h: &vibe_env::Handle) -> vibe_env::Result<vibe_env::Usage> {
+        self.0.usage(h)
+    }
+}
+
+impl vibe_env::Sleeper for FreesMemory {
+    fn sleep(&self, h: &vibe_env::Handle) -> vibe_env::Result<()> {
+        self.0.sleep(h)
+    }
+    fn wake(&self, h: &vibe_env::Handle) -> vibe_env::Result<vibe_env::Woke> {
+        self.0.wake(h)
+    }
+}
+
+impl vibe_env::Backend for FreesMemory {
+    fn capabilities(&self) -> vibe_env::Capabilities {
+        vibe_env::Capabilities {
+            sleep_frees_memory: true,
+            ..self.0.capabilities()
+        }
+    }
+}
+
+#[tokio::test]
+async fn memory_pressure_refuses_starts_then_ends_frozen_agents_oldest_first() {
+    use std::time::Instant;
+    use vibe_core::model::Environment;
+    use vibed::pressure::{END_AFTER, END_EVERY, PressureWatch};
+    let pressure = Arc::new(Pressure::default());
+    let bin = common::short_tempdir();
+    let claude = common::stand_in(bin.path());
+    let w = {
+        let pressure = Arc::clone(&pressure);
+        world_with(move |c| {
+            c.pressure = pressure;
+            // linux agents here sleep the way VMs do, giving their memory
+            // back; macos agents keep theirs.
+            c.backends = Backends::new()
+                .with(
+                    Environment::Linux,
+                    Arc::new(FreesMemory(vibe_env::testing::TestBackend::new(&claude))),
+                )
+                .with(
+                    Environment::Macos,
+                    Arc::new(vibe_env::testing::TestBackend::new(&claude)),
+                );
+        })
+        .await
+    };
+    let mac = |prompt: &str| AgentStartParams {
+        profile: "software-eng-mac".into(),
+        ..start(prompt)
+    };
+    let first = w.core.start_agent(mac("question")).await.unwrap();
+    let second = w.core.start_agent(mac("question")).await.unwrap();
+    let saved = w.core.start_agent(start("question")).await.unwrap();
+    for a in [&first, &second, &saved] {
+        w.wait_screen(&a.agent, "Red or blue?");
+    }
+    // Asleep in this order; the first was asleep longest.
+    for a in [&saved, &first, &second] {
+        let asleep = w.core.sleep_agent(None, &a.agent).await.unwrap();
+        assert_eq!(asleep.state, AgentState::Asleep);
+    }
+    let awake = w.core.start_agent(mac("hello")).await.unwrap();
+    w.wait_screen(&awake.agent, "Working on: hello");
+
+    // Short of memory, nothing new starts, and it says why.
+    pressure.set(45.0);
+    let err = w.core.start_agent(mac("more")).await.unwrap_err();
+    assert_eq!(code(&err), ErrorCode::Conflict);
+    assert!(
+        err.message.contains("short of memory right now")
+            && err.message.contains("45% of the last 10 s"),
+        "{}",
+        err.message
+    );
+    // Once it has lasted, the frozen agent asleep longest is ended, then
+    // one more per interval while it lasts. One whose sleep gave its memory
+    // back, and one awake, are left as they are.
+    let mut watch = PressureWatch::default();
+    let t0 = Instant::now();
+    assert_eq!(w.core.check_pressure(&mut watch, t0).await, None);
+    let t = t0 + END_AFTER;
+    assert_eq!(
+        w.core.check_pressure(&mut watch, t).await,
+        Some(first.agent.clone())
+    );
+    assert!(w.runs(&second.agent));
+    assert_eq!(
+        w.core.check_pressure(&mut watch, t + END_EVERY / 2).await,
+        None
+    );
+    assert_eq!(
+        w.core.check_pressure(&mut watch, t + END_EVERY).await,
+        Some(second.agent.clone())
+    );
+    assert_eq!(
+        w.core.check_pressure(&mut watch, t + END_EVERY * 2).await,
+        None,
+        "nothing frozen is left to end"
+    );
+    let by_ref = |list: &[Agent], r: &str| list.iter().find(|a| a.agent == r).unwrap().state;
+    let list = w.list().await;
+    assert_eq!(by_ref(&list, &first.agent), AgentState::Asleep);
+    assert_eq!(by_ref(&list, &second.agent), AgentState::Asleep);
+    assert_eq!(by_ref(&list, &saved.agent), AgentState::Asleep);
+    assert_ne!(by_ref(&list, &awake.agent), AgentState::Asleep);
+    assert!(!w.runs(&first.agent));
+    assert!(w.runs(&saved.agent));
+    assert!(w.runs(&awake.agent));
+
+    // Eased, starts go ahead again, and a pressure that comes back waits
+    // its time before anything more is ended.
+    *pressure.0.lock().unwrap() = None;
+    assert_eq!(
+        w.core.check_pressure(&mut watch, t + END_EVERY * 3).await,
+        None
+    );
+    pressure.set(45.0);
+    let t1 = t + END_EVERY * 4;
+    assert_eq!(w.core.check_pressure(&mut watch, t1).await, None);
+    *pressure.0.lock().unwrap() = None;
+    let later = w.core.start_agent(mac("later")).await.unwrap();
+    w.wait_screen(&later.agent, "Working on: later");
+
+    // An ended agent resumes its session; its question went with it.
+    let back = w.core.resume_agent(None, &first.agent).await.unwrap();
+    assert_eq!(back.session_id, first.session_id);
+    w.wait_screen(&first.agent, &format!("Resumed {}.", first.session_id));
+    for a in [&first, &second, &saved, &awake, &later] {
+        w.core.delete_agent(delete(&a.agent, true)).await.unwrap();
+    }
+    assert!(w.agent_files().is_empty(), "{:?}", w.agent_files());
+}
+
+#[tokio::test]
+async fn sleep_needs_a_running_agent() {
+    let w = world().await;
+    let a = w.core.start_agent(start("question")).await.unwrap();
+    w.wait_screen(&a.agent, "Red or blue?");
+    w.session(&a.agent).end(Duration::from_secs(5));
+    let err = w.core.sleep_agent(None, &a.agent).await.unwrap_err();
+    assert_eq!(code(&err), ErrorCode::Conflict);
+    assert!(err.message.contains("isn't running"), "{}", err.message);
+    let err = w.core.sleep_agent(None, "no-such-agent").await.unwrap_err();
+    assert_eq!(code(&err), ErrorCode::NotFound);
+    w.core.delete_agent(delete(&a.agent, true)).await.unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn after_a_reboot_every_agent_is_asleep_and_a_send_resumes_it() {
+    let w = world().await;
+    let a = w.core.start_agent(start("question")).await.unwrap();
+    w.wait_screen(&a.agent, "Red or blue?");
+    let golden = &w.golden;
+    let data = w.layout.data_dir();
+    drop(w.core);
+    // A restart of vibed alone changes nothing: an agent whose session
+    // ended is exited.
+    let tree = SessionTree::new(
+        shim::connect(
+            &w.layout.session_socket(&a.agent),
+            &control_hello("test"),
+            Duration::from_secs(10),
+        )
+        .unwrap()
+        .status()
+        .unwrap()
+        .pid,
+    );
+    tree.end(Duration::from_secs(5));
+    let core = Arc::new(Core::open(golden.config()).unwrap());
+    core.adopt_sessions().await;
+    let state = |core: &Arc<Core>| {
+        let core = Arc::clone(core);
+        async move { core.agents(HostParams::default()).await.unwrap().agents[0].state }
+    };
+    assert_eq!(state(&core).await, AgentState::Exited);
+    drop(core);
+    // After a reboot, a new boot ID, it's asleep.
+    fs::write(
+        data.join(vibed::agents::BOOT_FILE),
+        "00000000-0000-0000-0000-000000000000\n",
+    )
+    .unwrap();
+    let core = Arc::new(Core::open(golden.config()).unwrap());
+    core.adopt_sessions().await;
+    assert_eq!(state(&core).await, AgentState::Asleep);
+    // And a send resumes it with `claude --resume`.
+    core.resume_agent(None, &a.agent).await.unwrap();
+    wait_screen_of(&w.layout, &a.agent, &format!("Resumed {}.", a.session_id));
+    core.delete_agent(delete(&a.agent, true)).await.unwrap();
+}
+
+/// The Linux host's backend, with every agent's memory kept to tens of MB
+/// whatever its profile says (profiles start at 1 GB).
+#[derive(Debug)]
+struct Tiny(vibe_env::cgroups::Cgroups);
+
+const TINY: u64 = 48 << 20;
+
+fn tiny(l: &vibe_env::Limits) -> vibe_env::Limits {
+    vibe_env::Limits {
+        memory: l.memory.min(TINY),
+        ..*l
+    }
+}
+
+impl vibe_env::Compartment for Tiny {
+    fn create(&self, spec: &vibe_env::AgentSpec) -> vibe_env::Result<vibe_env::Handle> {
+        self.0.create(&vibe_env::AgentSpec {
+            limits: tiny(&spec.limits),
+            ..spec.clone()
+        })
+    }
+    fn run(
+        &self,
+        h: &vibe_env::Handle,
+        r: &vibe_env::Run,
+    ) -> vibe_env::Result<vibe_env::RunOutput> {
+        self.0.run(h, r)
+    }
+    fn launch(
+        &self,
+        h: &vibe_env::Handle,
+        l: &vibe_env::Launch,
+    ) -> vibe_env::Result<vibe_env::TerminalEnd> {
+        self.0.launch(h, l)
+    }
+    fn processes(&self, h: &vibe_env::Handle) -> vibe_env::Result<Vec<vibe_env::Proc>> {
+        self.0.processes(h)
+    }
+    fn stop(&self, h: &vibe_env::Handle) -> vibe_env::Result<()> {
+        self.0.stop(h)
+    }
+    fn delete(&self, h: &vibe_env::Handle) -> vibe_env::Result<()> {
+        self.0.delete(h)
+    }
+}
+
+impl vibe_env::Limiter for Tiny {
+    fn apply(&self, h: &vibe_env::Handle, l: &vibe_env::Limits) -> vibe_env::Result<()> {
+        self.0.apply(h, &tiny(l))
+    }
+    fn usage(&self, h: &vibe_env::Handle) -> vibe_env::Result<vibe_env::Usage> {
+        self.0.usage(h)
+    }
+}
+
+impl vibe_env::Sleeper for Tiny {
+    fn sleep(&self, h: &vibe_env::Handle) -> vibe_env::Result<()> {
+        self.0.sleep(h)
+    }
+    fn wake(&self, h: &vibe_env::Handle) -> vibe_env::Result<vibe_env::Woke> {
+        self.0.wake(h)
+    }
+}
+
+impl vibe_env::Backend for Tiny {
+    fn capabilities(&self) -> vibe_env::Capabilities {
+        self.0.capabilities()
+    }
+}
+
+/// Stops a test's slice, and whatever a failed test left in it.
+struct StopSlice(String);
+
+impl Drop for StopSlice {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "stop", &self.0])
+            .status();
+    }
+}
+
+#[tokio::test]
+async fn a_linux_agent_on_a_linux_host_runs_in_a_cgroup_of_its_own() {
+    let must = std::env::var_os("VIBE_TEST_CGROUPS").is_some_and(|v| !v.is_empty());
+    let bin = common::short_tempdir();
+    let claude = common::stand_in(bin.path());
+    let slice = format!("vibedtest{}.slice", std::process::id());
+    let _stop = StopSlice(slice.clone());
+    let probe = vibe_env::cgroups::Cgroups::new("/").with_slice(slice.clone());
+    if !cfg!(target_os = "linux") || probe.check().is_err() {
+        assert!(!must, "VIBE_TEST_CGROUPS is set, but: {:?}", probe.check());
+        eprintln!("no cgroups here to test a Linux host's agents on");
+        return;
+    }
+    let w = {
+        let slice = slice.clone();
+        world_with(move |c| {
+            let backend = vibe_env::cgroups::Cgroups::new(c.layout.home())
+                .with_claude(&claude)
+                .with_path(std::env::var("PATH").unwrap())
+                .with_slice(slice);
+            c.backends = Backends::new().with(
+                vibe_core::model::Environment::Linux,
+                Arc::new(Tiny(backend)),
+            );
+        })
+        .await
+    };
+    let a = w.core.start_agent(start("fork 3 question")).await.unwrap();
+    assert_eq!(a.environment, vibe_core::model::Environment::Linux);
+    w.wait_screen(&a.agent, "Red or blue?");
+    // It's in its own cgroup, held to its limits by the kernel.
+    let cgroup = vibe_env::cgroups::Cgroups::new("/")
+        .with_slice(slice.clone())
+        .cgroup(&a.agent)
+        .unwrap();
+    assert!(cgroup.dir.ends_with(format!(
+        "{slice}/vibedtest{}-{}.scope",
+        std::process::id(),
+        a.agent
+    )));
+    assert_eq!(
+        fs::read_to_string(cgroup.dir.join("memory.max"))
+            .unwrap()
+            .trim(),
+        TINY.to_string()
+    );
+    assert_eq!(
+        fs::read_to_string(cgroup.dir.join("pids.max"))
+            .unwrap()
+            .trim(),
+        "4096",
+        "512 processes, with room for their threads"
+    );
+    assert!(!cgroup.pids().is_empty());
+    // Its transcript is in the server's own ~/.claude.
+    let claude_home = ClaudeHome::user(&w.golden.home);
+    let worktree = PathBuf::from(&a.worktree);
+    let transcript = claude_home.transcript(&worktree, &a.session_id);
+    wait_until("the transcript", || transcript.is_file());
+    assert!(!w.layout.agent_dir(&a.agent).join("claude").exists());
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while w.list().await[0].state != AgentState::Question {
+        assert!(std::time::Instant::now() < deadline, "never a question");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // A max_processes edited in host.toml is the kernel's at once; under
+    // it, a fork is refused and the agent paused, and it says so.
+    let (_, mut events) = w.core.subscribe();
+    let watching = w.core.spawn_limit_watch(Duration::from_millis(100));
+    w.core
+        .set_limits(vibe_core::rpc::LimitsSetParams {
+            max_processes: Some(2),
+            ..Default::default()
+        })
+        .unwrap();
+    let e = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let e = events.recv().await.unwrap();
+            if e.kind == EventKind::AgentLimit {
+                return e;
+            }
+        }
+    })
+    .await
+    .expect("an agent.limit event");
+    assert_eq!(e.limit.as_deref(), Some("processes"));
+    assert_eq!(
+        fs::read_to_string(cgroup.dir.join("pids.max"))
+            .unwrap()
+            .trim(),
+        "16"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while w.list().await[0].state != AgentState::Paused {
+        assert!(std::time::Instant::now() < deadline, "never paused");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(cgroup.frozen());
+    w.core
+        .set_limits(vibe_core::rpc::LimitsSetParams {
+            max_processes: Some(100),
+            ..Default::default()
+        })
+        .unwrap();
+    let resumed = w.core.resume_agent(None, &a.agent).await.unwrap();
+    assert_eq!(resumed.state, AgentState::Question, "{resumed:?}");
+    assert!(!cgroup.frozen());
+    watching.abort();
+
+    // Asleep, it's frozen whole; woken, it's exactly where it was.
+    let asleep = w.core.sleep_agent(None, &a.agent).await.unwrap();
+    assert_eq!(asleep.state, AgentState::Asleep);
+    assert!(cgroup.frozen());
+    w.core.resume_agent(None, &a.agent).await.unwrap();
+    assert!(!cgroup.frozen());
+    w.type_line(&a.agent, "red");
+    w.wait_screen(&a.agent, "You chose red.");
+
+    // A delete leaves nothing of it: no scope, no transcript, no trust.
+    w.core.delete_agent(delete(&a.agent, true)).await.unwrap();
+    assert!(!cgroup.dir.exists());
+    assert!(!transcript.parent().unwrap().exists());
+    let state = fs::read_to_string(&claude_home.state).unwrap();
+    assert!(!state.contains(&a.worktree), "{state}");
+    assert!(w.agent_files().is_empty(), "{:?}", w.agent_files());
+}
+
+#[tokio::test]
+async fn memory_pressure_ends_an_agent_a_limit_froze_too() {
+    use std::time::Instant;
+    use vibed::pressure::{END_AFTER, PressureWatch};
+    let pressure = Arc::new(Pressure::default());
+    let w = {
+        let pressure = Arc::clone(&pressure);
+        world_with(move |c| c.pressure = pressure).await
+    };
+    let a = w.core.start_agent(start("fork 3 question")).await.unwrap();
+    w.wait_screen(&a.agent, "Red or blue?");
+    let watching = w.core.spawn_limit_watch(Duration::from_millis(100));
+    w.core
+        .set_limits(vibe_core::rpc::LimitsSetParams {
+            max_processes: Some(2),
+            ..Default::default()
+        })
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while w.list().await[0].state != AgentState::Paused {
+        assert!(std::time::Instant::now() < deadline, "never paused");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    watching.abort();
+    // Paused, it's frozen with its memory held, and sleep leaves it paused.
+    w.core.sleep_agent(None, &a.agent).await.unwrap();
+    assert_eq!(w.list().await[0].state, AgentState::Paused);
+    pressure.set(60.0);
+    let mut watch = PressureWatch::default();
+    let t0 = Instant::now();
+    assert_eq!(w.core.check_pressure(&mut watch, t0).await, None);
+    assert_eq!(
+        w.core.check_pressure(&mut watch, t0 + END_AFTER).await,
+        Some(a.agent.clone())
+    );
+    assert!(!w.runs(&a.agent));
+    // Ended, it's asleep, and a send resumes it.
+    assert_eq!(w.list().await[0].state, AgentState::Asleep);
+    *pressure.0.lock().unwrap() = None;
+    w.core
+        .set_limits(vibe_core::rpc::LimitsSetParams {
+            max_processes: Some(512),
+            ..Default::default()
+        })
+        .unwrap();
+    w.core.resume_agent(None, &a.agent).await.unwrap();
+    w.wait_screen(&a.agent, &format!("Resumed {}.", a.session_id));
+    w.core.delete_agent(delete(&a.agent, true)).await.unwrap();
 }

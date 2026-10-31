@@ -11,6 +11,7 @@ pub mod link;
 pub mod linux;
 pub mod logging;
 pub mod mcp;
+pub mod pressure;
 pub mod projects;
 pub mod remote;
 pub mod server;

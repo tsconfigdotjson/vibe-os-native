@@ -84,6 +84,9 @@ pub struct Config {
     pub backends: Backends,
     /// Whether a new agent may start.
     pub admission: Arc<dyn Admission>,
+    /// How short of memory the host is: the kernel's pressure stall
+    /// information on Linux, by default.
+    pub pressure: Arc<dyn crate::pressure::MemoryPressure>,
     /// The Linux toolbox: on a Mac that runs `linux` agents in VMs, none
     /// on a Linux host.
     pub toolbox: Option<Arc<dyn vibe_env::toolbox::ToolboxHost>>,
@@ -106,6 +109,7 @@ impl std::fmt::Debug for Config {
             .field("shim", &self.shim)
             .field("backends", &self.backends)
             .field("admission", &self.admission)
+            .field("pressure", &self.pressure)
             .field("toolbox", &self.toolbox)
             .field("remote", &self.remote)
             .finish_non_exhaustive()
@@ -115,8 +119,8 @@ impl std::fmt::Debug for Config {
 impl Config {
     /// The real thing: the system clock, the OS's randomness, the `gh`
     /// [`find_program`] finds, the `vibe-shim` [`find_shim`] finds, and
-    /// admission by this machine's memory. No backends yet: those come with
-    /// each environment's own (#9, #11, #17).
+    /// admission by this machine's memory and its memory pressure. No
+    /// backends: `vibed`'s `main` picks them for the machine it's on.
     pub fn new(info: DaemonInfo, layout: Layout) -> Self {
         let path = std::env::var_os("PATH");
         Config {
@@ -129,6 +133,7 @@ impl Config {
             entropy: Arc::new(keys::random_bytes),
             backends: Backends::new(),
             admission: Arc::new(HostAdmission::current()),
+            pressure: Arc::new(crate::pressure::HostPressure),
             toolbox: None,
             tailscale: Arc::new(vibe_mcp::net::tailscale_addresses),
             remote: Arc::new(Ssh::new()),
@@ -236,6 +241,10 @@ pub struct Core {
     entropy: Entropy,
     pub(crate) backends: Backends,
     pub(crate) admission: Arc<dyn Admission>,
+    pub(crate) pressure: Arc<dyn crate::pressure::MemoryPressure>,
+    /// When each agent asleep went to sleep, since this `vibed` started, and
+    /// in which order: memory pressure ends the one asleep longest first.
+    pub(crate) asleep_since: Mutex<crate::pressure::Sleeps>,
     /// Refs being started, deleted or resumed, one thing at a time each.
     pub(crate) agents_busy: Mutex<HashSet<String>>,
     /// One edit of Claude's state at a time: agents may share its file.
@@ -397,6 +406,8 @@ impl Core {
             entropy: config.entropy,
             backends: config.backends,
             admission: config.admission,
+            pressure: config.pressure,
+            asleep_since: Mutex::new(crate::pressure::Sleeps::default()),
             agents_busy: Mutex::new(HashSet::new()),
             claude_lock: Arc::new(Mutex::new(())),
             admitting: tokio::sync::Mutex::new(()),
@@ -889,6 +900,7 @@ impl Core {
     /// every start (PRD: Restarts), and returns how many there are.
     pub async fn adopt_sessions(&self) -> usize {
         self.undo_cut_short_starts().await;
+        self.asleep_after_reboot().await;
         let mut adopted = 0;
         for (r, probe) in self.scan_sessions().await {
             if let Probe::Running(status) = probe {

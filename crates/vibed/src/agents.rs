@@ -560,7 +560,7 @@ impl Core {
 
     /// Holds `agent_ref` for a start, delete or resume until dropped, so
     /// two never run on one agent at once.
-    fn hold(&self, agent_ref: &str) -> Result<Held<'_>, ErrorObject> {
+    pub(crate) fn hold(&self, agent_ref: &str) -> Result<Held<'_>, ErrorObject> {
         if !lock(&self.agents_busy).insert(agent_ref.to_owned()) {
             return Err(error(
                 ErrorCode::Conflict,
@@ -693,8 +693,15 @@ impl Core {
             check_from(from)?;
         }
 
-        // 1. Admission. Starts admitted earlier and still under way count as
+        // 1. Admission. Not while the host is short of memory (PRD:
+        // Failures). Starts admitted earlier and still under way count as
         // awake, and so does this one until its session runs.
+        if let Some(why) = self.short_of_memory() {
+            return Err(error(
+                ErrorCode::Conflict,
+                format!("can't start an agent: {why}"),
+            ));
+        }
         let _reserved = {
             let _one_at_a_time = self.admitting.lock().await;
             let mut awake = self.awake(host).await?;
@@ -1106,6 +1113,11 @@ impl Core {
     }
 
     pub(crate) fn set_state(&self, a: &mut AgentRecord, state: AgentState) {
+        if matches!(state, AgentState::Asleep | AgentState::Paused) {
+            lock(&self.asleep_since).frozen(&a.agent_ref, self.now());
+        } else {
+            lock(&self.asleep_since).running(&a.agent_ref);
+        }
         match self.store().set_agent_state(&a.host, &a.agent_ref, state) {
             Ok(true) => {
                 a.state = state;
@@ -1203,6 +1215,80 @@ impl Core {
         let status = self.agent_status(&mut record, self.idle_debounce()).await;
         self.set_state(&mut record, status.state());
         Ok(self.agent_info(&record, &status))
+    }
+
+    /// Puts a running agent to sleep through its backend's `Sleeper`: frozen,
+    /// or saved to disk, as the backend does it. It's `asleep` until a send
+    /// or an attach wakes it. The idle rules that decide when come with #6.
+    pub async fn sleep_agent(
+        &self,
+        host: Option<&str>,
+        agent_ref: &str,
+    ) -> Result<Agent, ErrorObject> {
+        let host = self.host(host)?;
+        let _held = self.hold(agent_ref)?;
+        let mut record = self.store().agent(host, agent_ref).map_err(store_error)?;
+        if !self.session_runs(agent_ref).await {
+            return Err(error(
+                ErrorCode::Conflict,
+                format!("{agent_ref} isn't running, so it can't sleep"),
+            ));
+        }
+        let backend = self.backend(record.environment)?;
+        let handle = Core::handle_of(&record)?;
+        blocking(move || backend.sleep(&handle)).await?;
+        // Paused by a limit, it stays paused: that's what a wake must clear.
+        if record.state != AgentState::Paused {
+            self.set_state(&mut record, AgentState::Asleep);
+        }
+        crate::log!("vibed: {agent_ref} is asleep");
+        let status = self.agent_status(&mut record, self.idle_debounce()).await;
+        Ok(self.agent_info(&record, &status))
+    }
+
+    /// After a reboot, every agent is `asleep` (PRD: Key user flows,
+    /// Reboot): its processes are gone, and a send or an attach brings it
+    /// back, with `claude --resume` where its backend can't wake it exactly.
+    /// A reboot is a new boot ID since `vibed` last ran, which Linux says;
+    /// elsewhere this does nothing yet (#6). Returns how many it put to
+    /// sleep.
+    pub async fn asleep_after_reboot(&self) -> usize {
+        let Some(boot) = boot_id() else {
+            return 0;
+        };
+        let file = self.layout.data_dir().join(BOOT_FILE);
+        let keep = || {
+            if let Err(e) = fs::write(&file, &boot) {
+                crate::log!("vibed: can't keep {}: {e}", file.display());
+            }
+        };
+        let before = fs::read_to_string(&file).ok();
+        if before.as_deref().is_none_or(|b| b.trim() == boot.trim()) {
+            keep();
+            return 0;
+        }
+        // Kept only once they're marked, so a failure here is tried again
+        // at the next start.
+        let Ok(agents) = self.store().agents(LOCAL_HOST) else {
+            return 0;
+        };
+        let mut asleep = 0;
+        for mut a in agents {
+            if a.starting || a.state == AgentState::Asleep || self.session_runs(&a.agent_ref).await
+            {
+                continue;
+            }
+            self.set_state(&mut a, AgentState::Asleep);
+            asleep += 1;
+        }
+        keep();
+        if asleep > 0 {
+            crate::log!(
+                "vibed: this host restarted, so its {asleep} agent{} asleep; a send or an attach resumes each",
+                if asleep == 1 { " is" } else { "s are" }
+            );
+        }
+        asleep
     }
 
     /// Deletes an agent and everything VibeOS made for it but its branch
@@ -1427,6 +1513,17 @@ impl Core {
             }
         })
     }
+}
+
+/// Where `vibed` keeps the boot ID it last ran under, in its state
+/// directory.
+pub const BOOT_FILE: &str = "boot_id";
+
+/// This boot's ID, where the OS says: Linux's.
+fn boot_id() -> Option<String> {
+    let id = fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    let id = id.trim();
+    (!id.is_empty()).then(|| format!("{id}\n"))
 }
 
 /// Memory reserved for a start until it's dropped.

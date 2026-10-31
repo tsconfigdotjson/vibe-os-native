@@ -113,6 +113,7 @@ impl Core {
         lock(&self.tails).remove(agent_ref);
         lock(&self.sends).remove(agent_ref);
         lock(&self.typing).remove(agent_ref);
+        lock(&self.asleep_since).running(agent_ref);
     }
 
     /// The state clients see: `vibed`'s own `asleep` and `paused` while
