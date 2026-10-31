@@ -17,9 +17,9 @@ use serde_json::Value;
 
 pub use crate::limits::HostLimits;
 pub use crate::model::{
-    Activity, AgentState, Certainty, Environment, EventKind, GhState, HostLink, LoginTool, Mode,
-    Model, Profile, ProjectSource, Reasoning, SessionState, StopReason, ToolboxAction,
-    ToolboxState, WakeupKind,
+    Activity, AgentState, Certainty, Environment, EventKind, GhState, HostLink, LoginTool,
+    MessageRole, Mode, Model, Profile, ProjectSource, Reasoning, SessionState, StopReason,
+    ToolboxAction, ToolboxState, WakeupKind,
 };
 
 /// Bumped on any incompatible change to the contract. Clients send theirs in
@@ -211,10 +211,13 @@ pub enum ErrorCode {
     /// A command `vibed` ran, such as `gh repo clone`, failed; the message
     /// has its error.
     CommandFailed,
+    /// The call is for a Linux host whose link is down: its agents are
+    /// unavailable until the link is back.
+    HostUnavailable,
 }
 
 impl ErrorCode {
-    pub const ALL: [ErrorCode; 10] = [
+    pub const ALL: [ErrorCode; 11] = [
         ErrorCode::ParseError,
         ErrorCode::InvalidRequest,
         ErrorCode::MethodNotFound,
@@ -225,6 +228,7 @@ impl ErrorCode {
         ErrorCode::Conflict,
         ErrorCode::HostConfigInvalid,
         ErrorCode::CommandFailed,
+        ErrorCode::HostUnavailable,
     ];
 
     pub fn code(self) -> i64 {
@@ -239,6 +243,7 @@ impl ErrorCode {
             ErrorCode::Conflict => -32002,
             ErrorCode::HostConfigInvalid => -32003,
             ErrorCode::CommandFailed => -32004,
+            ErrorCode::HostUnavailable => -32005,
         }
     }
 
@@ -255,6 +260,7 @@ impl ErrorCode {
             ErrorCode::Conflict => "conflict",
             ErrorCode::HostConfigInvalid => "host_config_invalid",
             ErrorCode::CommandFailed => "command_failed",
+            ErrorCode::HostUnavailable => "host_unavailable",
         }
     }
 
@@ -326,6 +332,9 @@ macro_rules! method {
 pub const METHODS: &[&str] = &[
     Hello::NAME,
     HostsList::NAME,
+    HostsAdd::NAME,
+    HostsUpgrade::NAME,
+    HostsRemove::NAME,
     ProjectsList::NAME,
     ProjectsAdd::NAME,
     ProjectsRemove::NAME,
@@ -341,6 +350,7 @@ pub const METHODS: &[&str] = &[
     KeysCreate::NAME,
     KeysRevoke::NAME,
     KeysVerify::NAME,
+    KeysSync::NAME,
     GhStatusGet::NAME,
     EventsSubscribe::NAME,
     SessionsList::NAME,
@@ -349,6 +359,10 @@ pub const METHODS: &[&str] = &[
     AgentsList::NAME,
     AgentsDelete::NAME,
     AgentsInterrupt::NAME,
+    AgentsSend::NAME,
+    AgentsCheck::NAME,
+    AgentsOutput::NAME,
+    AgentsMessages::NAME,
     ToolboxStatusGet::NAME,
     ToolboxOpen::NAME,
     ToolboxUpdate::NAME,
@@ -407,11 +421,33 @@ pub struct ProtocolMismatchData {
 pub struct NoParams {}
 
 // Every method that acts on one host takes an optional `host`: absent means
-// this one, `local`. Other hosts come with #16.
+// this one, `local`. A call for a Linux host this one has added goes to that
+// host over its link, and its answer comes back with the host's name in it.
 
 method! {
-    /// `hosts.list`: every host this daemon knows; for now, itself.
+    /// `hosts.list`: every host this daemon knows: itself first, then the
+    /// Linux hosts added to it, each with its link.
     HostsList = "hosts.list", NoParams => HostList
+}
+
+method! {
+    /// `hosts.add`: Add Linux host. Over SSH, installs or upgrades `vibed`
+    /// on the server (static binaries and a systemd user service, with
+    /// lingering on), checks `git`, `gh` and `claude` there, and starts the
+    /// link. The server's logins stay its own.
+    HostsAdd = "hosts.add", HostAddParams => HostInstall
+}
+
+method! {
+    /// `hosts.upgrade`: installs this build's `vibed` on a host added
+    /// already, if it runs another, and checks its tools again.
+    HostsUpgrade = "hosts.upgrade", HostNameParams => HostInstall
+}
+
+method! {
+    /// `hosts.remove`: forgets a Linux host and ends its link. Nothing on
+    /// the server changes: its `vibed` and agents run on, on their own.
+    HostsRemove = "hosts.remove", HostNameParams => HostInfo
 }
 
 method! {
@@ -497,6 +533,13 @@ method! {
 method! {
     /// `keys.verify`: checks a key and records that it was used.
     KeysVerify = "keys.verify", KeyVerifyParams => ApiKey
+}
+
+method! {
+    /// `keys.sync`: replaces the keys pushed to this host by the Mac it's
+    /// linked to, by their hashes, so one key works on every host. The
+    /// host's own keys, made with `vibe key create`, are kept.
+    KeysSync = "keys.sync", KeySyncParams => KeyList
 }
 
 method! {
@@ -592,6 +635,33 @@ method! {
     ToolboxLoginsGet = "toolbox.logins", NoParams => ToolboxLogins
 }
 
+method! {
+    /// `agents.send`: types text into the agent's terminal and submits it,
+    /// or presses keys, as `vibe_send` does. An agent asleep, paused or
+    /// exited is woken or resumed first. Text is refused while it's on a
+    /// question, unless `force`.
+    AgentsSend = "agents.send", AgentSendParams => AgentSent
+}
+
+method! {
+    /// `agents.check`: where the agent is, and whether it has answered the
+    /// last send to it, for `vibe_wait`. Never wakes it.
+    AgentsCheck = "agents.check", AgentCheckParams => AgentCheck
+}
+
+method! {
+    /// `agents.output`: what its terminal shows, and what scrolled off it
+    /// since `after`, as `vibe_read_output` gives it. Never wakes it.
+    AgentsOutput = "agents.output", AgentOutputParams => AgentOutput
+}
+
+method! {
+    /// `agents.messages`: the last messages of its conversation, from its
+    /// transcript on its host, as `vibe_read_messages` gives them. Never
+    /// wakes it.
+    AgentsMessages = "agents.messages", AgentMessagesParams => MessageList
+}
+
 /// `events.event`: one event, sent to subscribed connections.
 #[derive(Debug)]
 pub enum EventNotice {}
@@ -617,12 +687,54 @@ pub struct HostInfo {
     /// For people: the machine's hostname.
     pub label: String,
     /// How this daemon reaches it: `local` for itself; for another host,
-    /// whether its SSH link is up (#16).
+    /// whether its SSH link is up.
     pub link: HostLink,
     /// Whether it's the external address for outside MCP callers (#18).
     pub external: bool,
     /// Whether it serves MCP now: on loopback, at least.
     pub mcp: bool,
+    /// A Linux host's SSH destination, such as `me@vps.example.com`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    /// The `vibed` it runs, when it's known: this one's, or what another
+    /// host said when its link last came up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// What a Linux host lacks of `git`, `gh` and `claude`, which its agents
+    /// need; empty when it has them all, or isn't known.
+    pub missing: Vec<String>,
+    /// For a host whose link is down, why.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostAddParams {
+    /// What the host goes by, such as `vps`: it's how its agents' refs read
+    /// (`vps:quiet-amber-otter`).
+    pub name: String,
+    /// Its SSH destination, as after `ssh`: `me@vps.example.com`, a
+    /// Tailscale name, or a name from `~/.ssh/config`.
+    pub address: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostNameParams {
+    pub host: String,
+}
+
+/// How an install over SSH went.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostInstall {
+    pub host: HostInfo,
+    /// Whether this install changed what the server runs: new binaries, or
+    /// a new service file. False when it had this build already.
+    pub changed: bool,
+    /// What the owner should know, in sentences: such as that lingering
+    /// couldn't be turned on, and how to.
+    pub notes: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -818,6 +930,28 @@ pub struct ApiKey {
     pub created_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_used_at: Option<String>,
+    /// It was made on the Mac this host is linked to, and pushed here by its
+    /// hash: revoke it there.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pushed: bool,
+}
+
+/// A key as the Mac pushes it to its hosts: its hash, never the key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeyHash {
+    pub name: String,
+    pub prefix: String,
+    /// SHA-256 of the key, in lowercase hex.
+    pub hash: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeySyncParams {
+    /// Every key the Mac has now; any pushed before and not here is gone.
+    pub keys: Vec<KeyHash>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1162,6 +1296,116 @@ pub struct Login {
     /// account for `gcloud`, `Name <email>` for git, the key's file and
     /// comment for SSH.
     pub account: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentSendParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(rename = "ref")]
+    pub agent: String,
+    /// Text to paste. Give this or `keys`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// Whether Enter follows the text; true unless false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submit: Option<bool>,
+    /// Paste even while the agent is on a question.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub force: Option<bool>,
+    /// Keys to press, one at a time, by name: `"2"`, `"Enter"`, `"Down"`,
+    /// `"Ctrl+C"`, as `vibe_send` takes them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keys: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSent {
+    /// It was asleep, paused or exited, and was woken or resumed first.
+    pub woke: bool,
+    pub state: AgentState,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentCheckParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(rename = "ref")]
+    pub agent: String,
+    /// Count a turn as answered only once the commands it left running in
+    /// the background are done too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentCheck {
+    pub state: AgentState,
+    pub activity: Activity,
+    /// The latest thing it did, as a line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<String>,
+    /// It has answered the last send to it, or its start's prompt.
+    pub answered: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentOutputParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(rename = "ref")]
+    pub agent: String,
+    /// A cursor from an earlier read: only what scrolled off since.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentOutput {
+    /// The screen, one line per row.
+    pub screen: String,
+    /// Lines that scrolled off the screen since the cursor asked for.
+    pub history: Vec<String>,
+    /// Pass as `after` next time for only what's new.
+    pub cursor: u64,
+    /// Lines after the cursor asked for that are no longer kept.
+    pub dropped: u64,
+    /// More history is waiting from `cursor`.
+    pub more: bool,
+    /// The live terminal, or the last one saved: its session has ended, or
+    /// the agent is asleep.
+    pub live: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentMessagesParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(rename = "ref")]
+    pub agent: String,
+    /// How many of the last messages; 10 if absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last: Option<u32>,
+}
+
+/// One message of an agent's conversation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Message {
+    pub role: MessageRole,
+    pub text: String,
+    /// When it was written, as the transcript has it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageList {
+    /// Oldest first.
+    pub messages: Vec<Message>,
 }
 
 #[cfg(test)]

@@ -341,7 +341,7 @@ A Linux server runs the same `vibed`, so it joins the Mac as another host. Its a
 
 ### Adding a Linux host
 
-- **Menu → Add Linux host…** takes an SSH destination, such as `me@vps.example.com` or a Tailscale name. The app installs or upgrades `vibed` over SSH (one static binary plus a systemd user service), checks `git`, `gh` and `claude` there, and lists what's missing.
+- **Menu → Add Linux host…** takes an SSH destination, such as `me@vps.example.com` or a Tailscale name. The app installs or upgrades `vibed` over SSH (static builds of `vibed`, `vibe` and `vibe-shim` in `~/.local/lib/vibeos`, plus a systemd user service with lingering on), checks `git`, `gh` and `claude` there, and lists what's missing.
 - The server has its own logins, set up on the server itself: `gh auth login`, and `claude` with `/login`. It's one machine with one `~/.claude`, like a VibeOS box, so plain `/login` works; the cross-VM problem that forced `setup-token` doesn't apply.
 - Projects are cloned on the host that runs their agents. The same GitHub repo can be a project on the Mac and on a server.
 - There's no toolbox or Linux template on a server: install tools on it directly, as you would on any server.

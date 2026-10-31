@@ -20,7 +20,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use crate::model::{
     AgentState, Environment, HostLink, Mode, Model, Profile, ProjectSource, Reasoning,
 };
-use crate::rpc::{ApiKey, HostInfo, Project};
+use crate::rpc::{ApiKey, HostInfo, KeyHash, Project};
 use crate::time::rfc3339;
 
 /// Each entry moves the schema up one version.
@@ -100,6 +100,24 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE agents ADD COLUMN memory INTEGER NOT NULL DEFAULT 4294967296;
     ALTER TABLE agents ADD COLUMN compartment TEXT NOT NULL DEFAULT '{}';
     ALTER TABLE agents ADD COLUMN starting INTEGER NOT NULL DEFAULT 0;
+    ",
+    // 3: Linux hosts (#16). What each one said of itself when its link last
+    // came up, and its agents as it last listed them, for while its link is
+    // down. And the API keys a Mac pushed to this host, by their hashes:
+    // apart from the host's own, as the Mac replaces them all at once.
+    "
+    ALTER TABLE hosts ADD COLUMN version TEXT;
+    ALTER TABLE hosts ADD COLUMN missing TEXT NOT NULL DEFAULT '';
+    ALTER TABLE hosts ADD COLUMN agents TEXT NOT NULL DEFAULT '[]';
+
+    CREATE TABLE pushed_keys (
+        id           INTEGER PRIMARY KEY,
+        name         TEXT NOT NULL,
+        hash         TEXT NOT NULL UNIQUE,
+        prefix       TEXT NOT NULL,
+        created_at   TEXT NOT NULL,
+        last_used_at INTEGER
+    ) STRICT;
     ",
 ];
 
@@ -291,33 +309,150 @@ impl Store {
         Ok(())
     }
 
-    /// Every host, this one first.
+    /// Every host, this one first, then the Linux hosts added to it by
+    /// name. Another host's link is down here, and nothing says whether it
+    /// serves MCP or is the external address (#18): those are the daemon's
+    /// to say.
     pub fn hosts(&self) -> Result<Vec<HostInfo>> {
         let mut stmt = self.conn.prepare(
-            "SELECT name, os, label, address IS NULL FROM hosts \
+            "SELECT name, os, label, address, version, missing FROM hosts \
                  ORDER BY address IS NOT NULL, name",
         )?;
         let hosts = stmt
             .query_map([], |r| {
-                // Another host's link is down until a link to it is up
-                // (#16), and the external address (#18) is off until it
-                // comes. Whether MCP is served is the daemon's to say.
-                let local: bool = r.get(3)?;
+                let address: Option<String> = r.get(3)?;
+                let missing: String = r.get(5)?;
                 Ok(HostInfo {
                     name: r.get(0)?,
                     os: r.get(1)?,
                     label: r.get(2)?,
-                    link: if local {
+                    link: if address.is_none() {
                         HostLink::Local
                     } else {
                         HostLink::Down
                     },
                     external: false,
                     mcp: false,
+                    address,
+                    version: r.get(4)?,
+                    missing: split_list(&missing),
+                    detail: None,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
         Ok(hosts)
+    }
+
+    /// One host, as [`Store::hosts`] gives it.
+    pub fn host(&self, name: &str) -> Result<HostInfo> {
+        self.hosts()?
+            .into_iter()
+            .find(|h| h.name == name)
+            .ok_or_else(|| StoreError::NotFound(format!("no host named {name}")))
+    }
+
+    /// Records a Linux host reached over SSH at `address`.
+    pub fn add_host(&mut self, host: &HostInfo, now: i64) -> Result<HostInfo> {
+        let Some(address) = &host.address else {
+            return Err(StoreError::Conflict(
+                "a Linux host needs an SSH address".into(),
+            ));
+        };
+        let tx = self.conn.transaction()?;
+        let taken = tx
+            .query_row("SELECT 1 FROM hosts WHERE name = ?1", [&host.name], |_| {
+                Ok(())
+            })
+            .optional()?
+            .is_some();
+        if taken {
+            return Err(StoreError::Conflict(format!(
+                "a host named {} already exists",
+                host.name
+            )));
+        }
+        tx.execute(
+            "INSERT INTO hosts (name, os, label, address, added_at, version, missing)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                host.name,
+                host.os,
+                host.label,
+                address,
+                now,
+                host.version,
+                host.missing.join(",")
+            ],
+        )?;
+        tx.commit()?;
+        self.host(&host.name)
+    }
+
+    /// Updates what a Linux host says of itself: its OS, hostname, `vibed`
+    /// version and missing tools.
+    pub fn set_host_report(&mut self, host: &HostInfo) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE hosts SET os = ?2, label = ?3, version = ?4, missing = ?5
+             WHERE name = ?1 AND address IS NOT NULL",
+            params![
+                host.name,
+                host.os,
+                host.label,
+                host.version,
+                host.missing.join(",")
+            ],
+        )?;
+        if n == 0 {
+            return Err(StoreError::NotFound(format!(
+                "no Linux host named {}",
+                host.name
+            )));
+        }
+        Ok(())
+    }
+
+    /// Forgets a Linux host, and its agents as it last listed them. This
+    /// host can't be removed, nor one with projects or agents recorded here.
+    pub fn remove_host(&mut self, name: &str) -> Result<HostInfo> {
+        let host = self.host(name)?;
+        if host.address.is_none() {
+            return Err(StoreError::Conflict(format!(
+                "{name} is this host, which can't be removed"
+            )));
+        }
+        let used: i64 = self.conn.query_row(
+            "SELECT (SELECT count(*) FROM projects WHERE host = ?1)
+                  + (SELECT count(*) FROM agents WHERE host = ?1)",
+            [name],
+            |r| r.get(0),
+        )?;
+        if used > 0 {
+            return Err(StoreError::Conflict(format!(
+                "{name} has projects recorded on this host; remove them first"
+            )));
+        }
+        self.conn
+            .execute("DELETE FROM hosts WHERE name = ?1", [name])?;
+        Ok(host)
+    }
+
+    /// A Linux host's agents as it last listed them (JSON), kept for while
+    /// its link is down.
+    pub fn host_agents(&self, name: &str) -> Result<String> {
+        self.conn
+            .query_row("SELECT agents FROM hosts WHERE name = ?1", [name], |r| {
+                r.get(0)
+            })
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(format!("no host named {name}")))
+    }
+
+    pub fn set_host_agents(&mut self, name: &str, agents: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE hosts SET agents = ?2 WHERE name = ?1 AND address IS NOT NULL",
+            params![name, agents],
+        )?;
+        Ok(())
     }
 
     pub fn has_host(&self, name: &str) -> Result<bool> {
@@ -712,15 +847,77 @@ impl Store {
         self.key(name)
     }
 
-    /// Every key, oldest first.
+    /// Every key, oldest first: this host's own, then those a Mac pushed.
     pub fn keys(&self) -> Result<Vec<ApiKey>> {
         let mut stmt = self
             .conn
             .prepare(&format!("SELECT {KEY_COLUMNS} FROM api_keys ORDER BY id"))?;
-        let keys = stmt
+        let mut keys: Vec<ApiKey> = stmt
             .query_map([], key_row)?
             .collect::<rusqlite::Result<_>>()?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {PUSHED_KEY_COLUMNS} FROM pushed_keys ORDER BY id"
+        ))?;
+        keys.extend(
+            stmt.query_map([], pushed_key_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+        );
         Ok(keys)
+    }
+
+    /// This host's own keys, by their hashes, as a Mac pushes them to the
+    /// hosts it's linked to. Keys pushed here aren't passed on.
+    pub fn key_hashes(&self) -> Result<Vec<KeyHash>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT name, prefix, hash, created_at FROM api_keys ORDER BY id")?;
+        let keys = stmt
+            .query_map([], |r| {
+                Ok(KeyHash {
+                    name: r.get(0)?,
+                    prefix: r.get(1)?,
+                    hash: r.get(2)?,
+                    created_at: rfc3339(r.get(3)?),
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(keys)
+    }
+
+    /// Replaces every pushed key with `keys`, all at once. A key that stays
+    /// keeps when it was last used here.
+    pub fn sync_pushed_keys(&mut self, keys: &[KeyHash]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        let hashes: Vec<&str> = keys.iter().map(|k| k.hash.as_str()).collect();
+        let mut kept = std::collections::HashMap::new();
+        {
+            let mut stmt = tx.prepare("SELECT hash, last_used_at FROM pushed_keys")?;
+            for row in stmt.query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?))
+            })? {
+                let (hash, used) = row?;
+                if hashes.contains(&hash.as_str()) {
+                    kept.insert(hash, used);
+                }
+            }
+        }
+        tx.execute("DELETE FROM pushed_keys", [])?;
+        for k in keys {
+            tx.execute(
+                "INSERT INTO pushed_keys (name, hash, prefix, created_at, last_used_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT (hash) DO NOTHING",
+                params![
+                    k.name,
+                    k.hash,
+                    k.prefix,
+                    k.created_at,
+                    kept.get(&k.hash).copied().flatten()
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     fn key(&self, name: &str) -> Result<ApiKey> {
@@ -734,9 +931,29 @@ impl Store {
             .ok_or_else(|| StoreError::NotFound(format!("no key named {name}")))
     }
 
-    /// Deletes a key, so its hash matches nothing from now on.
+    /// Deletes a key, so its hash matches nothing from now on. A key pushed
+    /// by a Mac is revoked there, which pushes the change.
     pub fn revoke_key(&mut self, name: &str) -> Result<ApiKey> {
-        let key = self.key(name)?;
+        let key = match self.key(name) {
+            Err(StoreError::NotFound(m)) => {
+                let pushed = self
+                    .conn
+                    .query_row("SELECT 1 FROM pushed_keys WHERE name = ?1", [name], |_| {
+                        Ok(())
+                    })
+                    .optional()?
+                    .is_some();
+                return Err(if pushed {
+                    StoreError::Conflict(format!(
+                        "{name} was made on the Mac this host is linked to: revoke it there, in \
+                         Settings → API keys"
+                    ))
+                } else {
+                    StoreError::NotFound(m)
+                });
+            }
+            other => other?,
+        };
         self.conn
             .execute("DELETE FROM api_keys WHERE name = ?1", [name])?;
         Ok(key)
@@ -745,7 +962,7 @@ impl Store {
     /// The key with this hash, now marked as used, or `None` if there's no
     /// such key (it never existed, or it was revoked).
     pub fn use_key(&mut self, hash: &str, now: i64) -> Result<Option<ApiKey>> {
-        Ok(self
+        let own = self
             .conn
             .query_row(
                 &format!(
@@ -754,12 +971,35 @@ impl Store {
                 params![hash, now],
                 key_row,
             )
+            .optional()?;
+        if own.is_some() {
+            return Ok(own);
+        }
+        Ok(self
+            .conn
+            .query_row(
+                &format!(
+                    "UPDATE pushed_keys SET last_used_at = ?2 WHERE hash = ?1 \
+                     RETURNING {PUSHED_KEY_COLUMNS}"
+                ),
+                params![hash, now],
+                pushed_key_row,
+            )
             .optional()?)
     }
 }
 
 const PROFILE_COLUMNS: &str = "name, environment, model, reasoning, mode, memory";
 const KEY_COLUMNS: &str = "name, prefix, created_at, last_used_at";
+const PUSHED_KEY_COLUMNS: &str = "name, prefix, created_at, last_used_at";
+
+/// A comma-separated list, as `hosts.missing` is kept; empty for none.
+fn split_list(s: &str) -> Vec<String> {
+    s.split(',')
+        .filter(|w| !w.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
 
 fn no_project(host: &str, name: &str) -> StoreError {
     StoreError::NotFound(format!("no project named {name} on {host}"))
@@ -850,6 +1090,17 @@ fn key_row(r: &Row<'_>) -> rusqlite::Result<ApiKey> {
         prefix: r.get(1)?,
         created_at: rfc3339(r.get(2)?),
         last_used_at: r.get::<_, Option<i64>>(3)?.map(rfc3339),
+        pushed: false,
+    })
+}
+
+fn pushed_key_row(r: &Row<'_>) -> rusqlite::Result<ApiKey> {
+    Ok(ApiKey {
+        name: r.get(0)?,
+        prefix: r.get(1)?,
+        created_at: r.get(2)?,
+        last_used_at: r.get::<_, Option<i64>>(3)?.map(rfc3339),
+        pushed: true,
     })
 }
 
@@ -917,10 +1168,120 @@ mod tests {
                 link: HostLink::Local,
                 external: false,
                 mcp: false,
+                address: None,
+                version: None,
+                missing: vec![],
+                detail: None,
             }]
         );
         assert!(s.has_host("local").unwrap());
         assert!(!s.has_host("vps").unwrap());
+    }
+
+    fn linux_host(name: &str) -> HostInfo {
+        HostInfo {
+            name: name.into(),
+            os: "linux".into(),
+            label: "vps-1".into(),
+            link: HostLink::Down,
+            external: false,
+            mcp: false,
+            address: Some(format!("me@{name}.example.com")),
+            version: Some("0.1.0".into()),
+            missing: vec!["gh".into(), "claude".into()],
+            detail: None,
+        }
+    }
+
+    #[test]
+    fn linux_hosts() {
+        let mut s = store();
+        let added = s.add_host(&linux_host("vps"), 3).unwrap();
+        assert_eq!(added, linux_host("vps"));
+        assert!(matches!(
+            s.add_host(&linux_host("vps"), 4),
+            Err(StoreError::Conflict(_))
+        ));
+        let mut no_address = linux_host("x");
+        no_address.address = None;
+        assert!(s.add_host(&no_address, 4).is_err());
+        s.add_host(&linux_host("build"), 5).unwrap();
+        let names: Vec<_> = s.hosts().unwrap().into_iter().map(|h| h.name).collect();
+        assert_eq!(names, ["local", "build", "vps"], "this host first");
+
+        let mut report = linux_host("vps");
+        report.version = Some("0.2.0".into());
+        report.missing = vec![];
+        report.label = "renamed".into();
+        s.set_host_report(&report).unwrap();
+        assert_eq!(s.host("vps").unwrap(), report);
+        let mut local = report.clone();
+        local.name = "local".into();
+        assert!(s.set_host_report(&local).is_err(), "only Linux hosts");
+
+        assert_eq!(s.host_agents("vps").unwrap(), "[]");
+        s.set_host_agents("vps", r#"[{"ref":"x"}]"#).unwrap();
+        assert_eq!(s.host_agents("vps").unwrap(), r#"[{"ref":"x"}]"#);
+
+        assert!(matches!(
+            s.remove_host("local"),
+            Err(StoreError::Conflict(_))
+        ));
+        assert_eq!(s.remove_host("vps").unwrap().name, "vps");
+        assert!(matches!(s.remove_host("vps"), Err(StoreError::NotFound(_))));
+        assert!(matches!(s.host_agents("vps"), Err(StoreError::NotFound(_))));
+    }
+
+    #[test]
+    fn pushed_keys() {
+        let mut s = store();
+        s.create_key("own", "h0", "vk_own", 1).unwrap();
+        let pushed = |name: &str, hash: &str| KeyHash {
+            name: name.into(),
+            prefix: format!("vk_{name}"),
+            hash: hash.into(),
+            created_at: "2026-10-30T12:00:00Z".into(),
+        };
+        s.sync_pushed_keys(&[pushed("laptop", "h1"), pushed("ci", "h2")])
+            .unwrap();
+        let keys = s.keys().unwrap();
+        let shown: Vec<_> = keys.iter().map(|k| (k.name.as_str(), k.pushed)).collect();
+        assert_eq!(shown, [("own", false), ("laptop", true), ("ci", true)]);
+        assert_eq!(keys[1].created_at, "2026-10-30T12:00:00Z");
+
+        let used = s.use_key("h1", 20).unwrap().unwrap();
+        assert!(used.pushed);
+        assert_eq!(used.last_used_at.as_deref(), Some("1970-01-01T00:00:20Z"));
+        // Only this host's own keys go on to other hosts.
+        let hashes: Vec<_> = s
+            .key_hashes()
+            .unwrap()
+            .into_iter()
+            .map(|k| k.hash)
+            .collect();
+        assert_eq!(hashes, ["h0"]);
+
+        // A pushed key is revoked on the Mac, not here.
+        let refused = s.revoke_key("laptop").unwrap_err();
+        assert!(matches!(refused, StoreError::Conflict(_)), "{refused}");
+        assert!(matches!(s.revoke_key("nope"), Err(StoreError::NotFound(_))));
+
+        // The next push replaces them all; a key kept keeps its last use.
+        s.sync_pushed_keys(&[pushed("laptop", "h1")]).unwrap();
+        assert_eq!(s.use_key("h2", 30).unwrap(), None, "dropped from the push");
+        let laptop = s
+            .keys()
+            .unwrap()
+            .into_iter()
+            .find(|k| k.name == "laptop")
+            .unwrap();
+        assert_eq!(laptop.last_used_at.as_deref(), Some("1970-01-01T00:00:20Z"));
+        s.sync_pushed_keys(&[]).unwrap();
+        assert_eq!(s.keys().unwrap().len(), 1);
+        assert!(
+            s.use_key("h0", 40).unwrap().is_some(),
+            "the host's own stay"
+        );
     }
 
     #[test]

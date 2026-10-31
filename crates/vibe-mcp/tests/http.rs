@@ -41,6 +41,8 @@ struct Fake {
     backgrounds: Mutex<Vec<bool>>,
     /// History given with `after`.
     history: Mutex<Option<Vec<String>>>,
+    /// Checks of an agent, by their count, that find its host's link down.
+    link_down: Mutex<HashMap<String, std::ops::RangeInclusive<u32>>>,
 }
 
 fn not_found(m: String) -> ErrorObject {
@@ -149,6 +151,7 @@ impl Daemon for Fake {
             .filter(|a| a.host == host)
             .map(|a| AgentView {
                 attach_remote: format!("ssh -t mac {}", a.attach),
+                available: true,
                 agent: a,
             })
             .collect())
@@ -195,6 +198,18 @@ impl Daemon for Fake {
             *n += 1;
             *n
         };
+        if self
+            .link_down
+            .lock()
+            .unwrap()
+            .get(&t.agent)
+            .is_some_and(|down| down.contains(&n))
+        {
+            return Err(ErrorObject::new(
+                ErrorCode::HostUnavailable,
+                format!("{} is unavailable: its link is down", t.host),
+            ));
+        }
         let state = self
             .states
             .lock()
@@ -626,13 +641,13 @@ async fn sends_route_by_ref_and_type_text_or_keys() {
             (
                 t("vps", "quiet-amber-otter"),
                 Input::Keys(vec![
-                    b"2".to_vec(),
-                    b"\x1b[B".to_vec(),
-                    b"\r".to_vec(),
-                    b"\x03".to_vec()
+                    "2".into(),
+                    "Down".into(),
+                    "Enter".into(),
+                    "Ctrl+C".into()
                 ])
             ),
-            (t("local", "sleepy"), Input::Keys(vec![b"y".to_vec()])),
+            (t("local", "sleepy"), Input::Keys(vec!["y".into()])),
         ]
     );
     for (args, expect) in [
@@ -995,6 +1010,32 @@ async fn listeners_follow_the_settings() {
         )),
         "{log}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_wait_rides_out_a_link_that_drops_for_a_moment() {
+    let (fake, mut c) = client().await;
+    fake.busy_for.lock().unwrap().insert("slow".into(), 6);
+    // Checks 2 to 4 find the host's link down, as a network blip would.
+    fake.link_down.lock().unwrap().insert("slow".into(), 2..=4);
+    let r = text(
+        &c.call("vibe_wait", json!({"agents": "slow", "lines": 0}))
+            .await,
+    );
+    assert!(r.starts_with("slow has answered"), "{r}");
+    // One down the whole time is said to be unavailable when the wait ends.
+    fake.checks.lock().unwrap().clear();
+    fake.link_down
+        .lock()
+        .unwrap()
+        .insert("slow".into(), 1..=u32::MAX);
+    let e = c
+        .fails(
+            "vibe_wait",
+            json!({"agents": "slow", "lines": 0, "timeout": 1}),
+        )
+        .await;
+    assert!(e.contains("unavailable"), "{e}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

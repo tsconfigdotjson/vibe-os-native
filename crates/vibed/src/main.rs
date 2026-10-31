@@ -49,6 +49,11 @@ environment:
                   directory works too)
   VIBE_CLAUDE     on a Mac, the claude macos agents run (default: the one on
                   the login shell's PATH)
+  VIBE_SSH        the ssh that reaches Linux hosts (default: ssh on PATH)
+  VIBE_HOST_BUNDLE
+                  the Linux builds of vibed, vibe and vibe-shim that Add Linux
+                  host installs, as <dir>/<x86_64|aarch64>/<binary> (default:
+                  linux/ beside vibed, or in the app's Resources)
   VIBE_TEST_BACKEND
                   for tests only: run every environment's agents natively,
                   unlimited but for a supervisor, with this program as
@@ -188,6 +193,12 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
     if let Some(shim) = std::env::var_os("VIBE_SHIM").filter(|v| !v.is_empty()) {
         config.shim = shim;
     }
+    if let Some(ssh) = std::env::var_os("VIBE_SSH").filter(|v| !v.is_empty()) {
+        config.remote = Arc::new(vibed::remote::Ssh {
+            program: ssh,
+            bundle: vibed::remote::default_bundle(),
+        });
+    }
     if let Some(claude) = std::env::var_os("VIBE_TEST_BACKEND").filter(|v| !v.is_empty()) {
         vibed::log!(
             "vibed: VIBE_TEST_BACKEND is set: agents run under the test backend, with {} as \
@@ -272,6 +283,8 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
     let toolbox = core.spawn_toolbox(TOOLBOX_POLL, vibed::toolbox::UPDATE_CHECK_EVERY);
     // MCP on loopback, and on the Tailscale address when host.toml says.
     let mcp = core.spawn_mcp(vibed::mcp::LISTEN_CHECK_EVERY);
+    // The links to Linux hosts, each kept up on its own.
+    core.spawn_links();
     vibed::log!(
         "vibed {} listening on {}",
         env!("CARGO_PKG_VERSION"),
@@ -283,7 +296,8 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
             _ = int.recv() => {}
         }
     };
-    server::serve(listener, core, MAX_MESSAGE_BYTES, shutdown).await;
+    server::serve(listener, Arc::clone(&core), MAX_MESSAGE_BYTES, shutdown).await;
+    core.stop_links();
     mcp.abort();
     gh_checks.abort();
     status.abort();

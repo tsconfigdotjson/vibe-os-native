@@ -47,13 +47,18 @@ pub(crate) fn setup_line(url: &str, secret: &str) -> String {
 
 fn describe(k: &ApiKey) -> String {
     format!(
-        "{}  {}…  made {}  {}",
+        "{}  {}…  made {}  {}{}",
         k.name,
         k.prefix,
         k.created_at,
         match &k.last_used_at {
             Some(at) => format!("last used {at}"),
             None => "never used".into(),
+        },
+        if k.pushed {
+            "  from the Mac this host is linked to (revoke it there)"
+        } else {
+            ""
         }
     )
 }

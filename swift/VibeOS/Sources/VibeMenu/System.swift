@@ -7,10 +7,25 @@ import VibeRPC
 /// block; the model makes them off the main actor.
 public protocol DaemonConnection: Sendable {
     func call<M: RPCMethod>(_ method: M.Type, _ params: M.Params) throws -> M.Result
+    /// A call that may take minutes, such as an install over SSH: it waits
+    /// up to `timeout` seconds for the answer.
+    func call<M: RPCMethod>(_ method: M.Type, _ params: M.Params, timeout: TimeInterval) throws -> M.Result
     func events(client: String) -> AsyncThrowingStream<EventMessage, any Error>
 }
 
-extension VibedClient: DaemonConnection {}
+extension DaemonConnection {
+    public func call<M: RPCMethod>(_ method: M.Type, _ params: M.Params, timeout: TimeInterval) throws -> M.Result {
+        try call(method, params)
+    }
+}
+
+extension VibedClient: DaemonConnection {
+    public func call<M: RPCMethod>(_ method: M.Type, _ params: M.Params, timeout: TimeInterval) throws -> M.Result {
+        var patient = self
+        patient.timeout = timeout
+        return try patient.call(method, params)
+    }
+}
 
 /// The Mac's memory, for the menu's header: used as Activity Monitor counts
 /// it (app memory, wired and compressed), and the total.

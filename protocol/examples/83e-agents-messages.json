@@ -1,0 +1,31 @@
+{
+  "description": "The last messages of an agent's conversation, from its transcript on its host, oldest first: what was asked, what it answered, and its tool calls in short form. It works while the agent sleeps, and never wakes it.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 833,
+    "method": "agents.messages",
+    "params": {
+      "host": "local",
+      "ref": "dark-mode-review",
+      "last": 5
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 833,
+    "result": {
+      "messages": [
+        {
+          "at": "2026-10-30T11:59:00.001Z",
+          "role": "user",
+          "text": "Review the dark mode change"
+        },
+        {
+          "at": "2026-10-30T11:59:30.002Z",
+          "role": "assistant",
+          "text": "The toggle works. One nit: its label isn't localized."
+        }
+      ]
+    }
+  }
+}

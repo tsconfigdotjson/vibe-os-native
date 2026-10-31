@@ -1,0 +1,48 @@
+{
+  "description": "Add Linux host…: over SSH, installs or upgrades `vibed` on the server (static binaries and a systemd user service, with lingering on so it runs while you're logged out), checks `git`, `gh` and `claude` there, records the host under its name and starts its link. `missing` lists what the server still needs, and `notes` what the owner should know. The server's logins stay its own.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 991,
+    "method": "hosts.add",
+    "params": {
+      "name": "vps",
+      "address": "me@vps.example.com"
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 991,
+    "result": {
+      "changed": true,
+      "host": {
+        "address": "me@vps.example.com",
+        "detail": "not connected yet",
+        "external": false,
+        "label": "vps-1",
+        "link": "down",
+        "mcp": false,
+        "missing": [
+          "claude"
+        ],
+        "name": "vps",
+        "os": "linux",
+        "version": "0.1.0"
+      },
+      "notes": [
+        "Lingering is on for you on me@vps.example.com, so vibed runs when you're logged out and starts again after a reboot."
+      ]
+    }
+  },
+  "events": [
+    {
+      "jsonrpc": "2.0",
+      "method": "events.event",
+      "params": {
+        "at": "2026-10-30T12:00:00Z",
+        "host": "vps",
+        "kind": "host.added",
+        "seq": 23
+      }
+    }
+  ]
+}

@@ -23,6 +23,7 @@ use vibe_env::images::Images;
 use vibe_env::testing::{STAND_IN, TestBackend, TestToolbox};
 use vibed::agents::{Backends, HostAdmission};
 use vibed::core::{Config, Core, DaemonInfo};
+use vibed::remote::{BoxFuture, Channel, Installed, Remote};
 use vibed::server::{self, SocketGuard};
 
 /// The daemon the contract examples were recorded against.
@@ -296,9 +297,9 @@ impl Golden {
         config.label = "mac-mini".into();
         config.gh = self.gh.clone().into();
         config.shim = workspace_bin("vibe-shim").into_os_string();
-        config.backends = Backends::all(Arc::new(
+        config.backends = Backends::all(Arc::new(Seeding(
             TestBackend::new(&self.claude).reporting_memory(AGENT_MEMORY_USED),
-        ));
+        )));
         config.toolbox = Some(Arc::new(
             TestToolbox::new(
                 Layout::new(&self.home, "macos"),
@@ -311,6 +312,7 @@ impl Golden {
             total_memory: 64 * GIB,
         });
         config.clock = Arc::new(|| GOLDEN_NOW);
+        config.remote = Arc::new(GoldenRemote);
         // One Tailscale address, whatever this machine has.
         config.tailscale = Arc::new(|| vec![GOLDEN_TAILSCALE.parse().unwrap()]);
         // Bytes 0, 1, 2, … for the first key, 32, 33, … for the next.
@@ -334,28 +336,150 @@ impl Drop for Golden {
     /// it: every shim serving in its `run/` is killed, which hangs up its
     /// command.
     fn drop(&mut self) {
-        let run = Layout::new(&self.home, "macos").run_dir();
-        let Ok(entries) = fs::read_dir(&run) else {
-            return;
-        };
-        for e in entries.filter_map(Result::ok) {
-            let path = e.path();
-            if path.extension().is_none_or(|x| x != "sock") {
-                continue;
-            }
-            let status = vibe_core::shim::connect(
-                &path,
-                &vibe_core::shim::control_hello("test cleanup"),
-                Duration::from_secs(2),
-            )
-            .and_then(|mut c| Ok(c.status()?));
-            if let Ok(status) = status
-                && let Ok(pid) = i32::try_from(status.pid)
-            {
-                // SAFETY: a signal to a shim this test's daemon started.
-                unsafe { libc::kill(pid, libc::SIGKILL) };
-            }
+        // As a Mac lays its home out, and as a Linux host does.
+        for os in ["macos", "linux"] {
+            kill_shims(&Layout::new(&self.home, os).run_dir());
         }
+    }
+}
+
+/// Kills every shim serving in `run`, which hangs up its command.
+pub fn kill_shims(run: &Path) {
+    let Ok(entries) = fs::read_dir(run) else {
+        return;
+    };
+    for e in entries.filter_map(Result::ok) {
+        let path = e.path();
+        if path.extension().is_none_or(|x| x != "sock") {
+            continue;
+        }
+        let status = vibe_core::shim::connect(
+            &path,
+            &vibe_core::shim::control_hello("test cleanup"),
+            Duration::from_secs(2),
+        )
+        .and_then(|mut c| Ok(c.status()?));
+        if let Ok(status) = status
+            && let Ok(pid) = i32::try_from(status.pid)
+        {
+            // SAFETY: a signal to a shim this test's daemon started.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+    }
+}
+
+/// The golden world's backend: the test backend, but `dark-mode-review`'s
+/// Claude home has a turn in its transcript before its Claude starts, so
+/// its conversation reads the same every time.
+#[derive(Debug)]
+pub struct Seeding(pub TestBackend);
+
+/// The session `dark-mode-review` gets in the examples.
+pub const SEEDED_SESSION: &str = "60616263-6465-4667-a869-6a6b6c6d6e6f";
+
+impl vibe_env::Compartment for Seeding {
+    fn create(&self, spec: &vibe_env::AgentSpec) -> vibe_env::Result<vibe_env::Handle> {
+        let h = self.0.create(spec)?;
+        if spec.agent_ref == "dark-mode-review" {
+            let path = h.claude.transcript(&spec.worktree, SEEDED_SESSION);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let cwd = spec.worktree.to_string_lossy();
+            let entry = |kind: &str, at: &str, uuid: &str, message: &str| {
+                format!(
+                    "{{\"type\":\"{kind}\",\"sessionId\":\"{SEEDED_SESSION}\",\"cwd\":\"{cwd}\",\
+                     \"timestamp\":\"{at}\",\"uuid\":\"{uuid}\",\"message\":{message}}}\n"
+                )
+            };
+            let text = entry(
+                "user",
+                "2026-10-30T11:59:00.001Z",
+                "seed-1",
+                r#"{"role":"user","content":"Review the dark mode change"}"#,
+            ) + &entry(
+                "assistant",
+                "2026-10-30T11:59:30.002Z",
+                "seed-2",
+                r#"{"id":"msg-seed","role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"The toggle works. One nit: its label isn't localized."}]}"#,
+            );
+            fs::write(&path, text).unwrap();
+        }
+        Ok(h)
+    }
+    fn run(
+        &self,
+        h: &vibe_env::Handle,
+        run: &vibe_env::Run,
+    ) -> vibe_env::Result<vibe_env::RunOutput> {
+        self.0.run(h, run)
+    }
+    fn launch(
+        &self,
+        h: &vibe_env::Handle,
+        l: &vibe_env::Launch,
+    ) -> vibe_env::Result<vibe_env::TerminalEnd> {
+        self.0.launch(h, l)
+    }
+    fn processes(&self, h: &vibe_env::Handle) -> vibe_env::Result<Vec<vibe_env::Proc>> {
+        self.0.processes(h)
+    }
+    fn stop(&self, h: &vibe_env::Handle) -> vibe_env::Result<()> {
+        self.0.stop(h)
+    }
+    fn delete(&self, h: &vibe_env::Handle) -> vibe_env::Result<()> {
+        self.0.delete(h)
+    }
+}
+
+impl vibe_env::Limiter for Seeding {
+    fn apply(&self, h: &vibe_env::Handle, limits: &vibe_env::Limits) -> vibe_env::Result<()> {
+        self.0.apply(h, limits)
+    }
+    fn usage(&self, h: &vibe_env::Handle) -> vibe_env::Result<vibe_env::Usage> {
+        self.0.usage(h)
+    }
+}
+
+impl vibe_env::Sleeper for Seeding {
+    fn sleep(&self, h: &vibe_env::Handle) -> vibe_env::Result<()> {
+        self.0.sleep(h)
+    }
+    fn wake(&self, h: &vibe_env::Handle) -> vibe_env::Result<vibe_env::Woke> {
+        self.0.wake(h)
+    }
+}
+
+impl vibe_env::Backend for Seeding {
+    fn capabilities(&self) -> vibe_env::Capabilities {
+        self.0.capabilities()
+    }
+}
+
+/// How the golden Mac reaches Linux hosts: every install finds an x86_64
+/// server called `vps-1` with no `claude` yet, and its links never come up
+/// (the examples don't run links).
+#[derive(Debug)]
+pub struct GoldenRemote;
+
+impl Remote for GoldenRemote {
+    fn dial<'a>(&'a self, address: &'a str) -> BoxFuture<'a, Result<Channel, String>> {
+        Box::pin(async move { Err(format!("can't reach {address} over SSH")) })
+    }
+
+    fn install<'a>(&'a self, address: &'a str) -> BoxFuture<'a, Result<Installed, String>> {
+        Box::pin(async move {
+            Ok(Installed {
+                os: "linux".into(),
+                arch: "x86_64".into(),
+                label: "vps-1".into(),
+                version: "0.1.0".into(),
+                missing: vec!["claude".into()],
+                changed: true,
+                notes: vec![format!(
+                    "Lingering is on for you on {address}, so vibed runs when you're logged \
+                     out and starts again after a reboot."
+                )],
+            })
+        })
     }
 }
 

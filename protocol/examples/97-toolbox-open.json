@@ -12,8 +12,8 @@
     "result": {
       "host": "local",
       "ref": "toolbox",
-      "title": "Linux toolbox",
       "socket": "/Users/me/Library/Application Support/VibeOS/run/toolbox.sock",
+      "title": "Linux toolbox",
       "ttys": []
     }
   },
@@ -22,11 +22,11 @@
       "jsonrpc": "2.0",
       "method": "events.event",
       "params": {
-        "seq": 21,
         "at": "2026-10-30T12:00:00Z",
         "host": "local",
         "kind": "toolbox.changed",
-        "message": "The Linux toolbox is open: exit its shell to save the template and Linux home"
+        "message": "The Linux toolbox is open: exit its shell to save the template and Linux home",
+        "seq": 22
       }
     }
   ]

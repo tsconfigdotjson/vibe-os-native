@@ -145,6 +145,41 @@ fn rpc_bridges_the_whole_contract() {
     assert_eq!(got, expected);
 }
 
+/// `ssh <host> vibe rpc` is a conversation: each reply comes as soon as
+/// it's made, while stdin is still open, not when it ends.
+#[test]
+fn rpc_answers_while_stdin_stays_open() {
+    let s = start(DaemonInfo {
+        version: "9.9.9".into(),
+        os: "linux".into(),
+        arch: "x86_64".into(),
+        pid: 1,
+    });
+    let mut child = Command::new(VIBE)
+        .arg("rpc")
+        .env("VIBE_SOCKET", &s.path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut out = std::io::BufReader::new(child.stdout.take().unwrap());
+    for id in 1..=3 {
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"daemon.hello","params":{{"client":"t","protocol":1}}}}"#
+        )
+        .unwrap();
+        stdin.flush().unwrap();
+        let mut line = String::new();
+        std::io::BufRead::read_line(&mut out, &mut line).unwrap();
+        let reply: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(reply["id"], id, "{line}");
+    }
+    drop(stdin);
+    assert!(child.wait().unwrap().success());
+}
+
 #[test]
 fn version_and_usage() {
     let out = Command::new(VIBE).arg("--version").output().unwrap();
@@ -297,4 +332,82 @@ fn setup_token_asks_for_a_paste_on_a_terminal_when_it_saw_none() {
     let status = child.wait().unwrap();
     assert!(status.success());
     assert_eq!(fs::read_to_string(&token).unwrap().trim(), TOKEN);
+}
+
+#[test]
+fn project_and_profile_set_up_a_host_without_the_menu() {
+    // A standalone Linux host: its projects start with one linux profile.
+    let s = start(DaemonInfo {
+        version: "9.9.9".into(),
+        os: "linux".into(),
+        arch: "x86_64".into(),
+        pid: 1,
+    });
+    let repo = s._dir.path().join("src/web");
+    common::repo(&repo);
+    let run = |args: &[&str]| {
+        let out = vibe(args, &s.path, b"");
+        assert!(out.status.success(), "{args:?}: {}", text(&out.stderr));
+        text(&out.stdout)
+    };
+    let fails = |args: &[&str]| {
+        let out = vibe(args, &s.path, b"");
+        assert!(!out.status.success(), "{args:?} should fail");
+        text(&out.stderr)
+    };
+    assert!(run(&["project"]).starts_with("no projects"));
+    // A relative path is the checkout under this directory.
+    let out = Command::new(VIBE)
+        .args(["project", "add", "./web"])
+        .current_dir(repo.parent().unwrap())
+        .env("VIBE_SOCKET", &s.path)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let added = text(&out.stdout);
+    assert!(added.starts_with("added web  /"), "{added}");
+    assert!(
+        added.contains("software-eng-linux  linux, opus, high reasoning, auto mode, 4G"),
+        "{added}"
+    );
+    assert!(!added.contains("software-eng-mac"), "{added}");
+
+    let made = run(&[
+        "profile", "create", "web", "reviewer", "--model", "sonnet", "--memory", "2G",
+    ]);
+    assert_eq!(
+        made,
+        "created reviewer  linux, sonnet, high reasoning, auto mode, 2G\n"
+    );
+    let set = run(&[
+        "profile", "set", "web", "reviewer", "--name", "critic", "--mode", "bypass",
+    ]);
+    assert_eq!(
+        set,
+        "critic  linux, sonnet, high reasoning, bypass mode, 2G\n"
+    );
+    let listed = run(&["profile", "list", "web"]);
+    assert_eq!(
+        listed,
+        "software-eng-linux  linux, opus, high reasoning, auto mode, 4G\n\
+         critic  linux, sonnet, high reasoning, bypass mode, 2G\n"
+    );
+    // A Linux host has no macos environment.
+    let why = fails(&["profile", "create", "web", "mac", "--environment", "macos"]);
+    assert!(why.contains("only a Mac host has"), "{why}");
+    assert_eq!(
+        run(&["profile", "delete", "web", "critic"]),
+        "deleted critic\n"
+    );
+    assert!(run(&["project"]).starts_with("web  /"));
+    let why = fails(&["project", "--host", "vps"]);
+    assert!(why.contains("no host named vps"), "{why}");
+    let removed = run(&["project", "remove", "web"]);
+    assert!(removed.starts_with("removed web; "), "{removed}");
+
+    let hosts = run(&["host"]);
+    assert!(hosts.starts_with("local  "), "{hosts}");
+    assert!(hosts.contains("(linux)  this host  vibed 9.9.9"), "{hosts}");
+    let why = fails(&["host", "remove", "local"]);
+    assert!(why.contains("local is this host"), "{why}");
 }

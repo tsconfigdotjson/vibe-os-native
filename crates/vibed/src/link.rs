@@ -1,0 +1,570 @@
+//! The link to a Linux host (PRD: The link between the Mac and a host). This
+//! `vibed` keeps one channel open to the host's `vibed` for its events, and
+//! opens more as calls need them, all through [`Remote::dial`], which is
+//! `ssh <host> vibe rpc`. It supervises the link: it pings the host, notices
+//! when it stops answering, reconnects with backoff, and says whether the
+//! link is connected or down. While it's down the host's agents are
+//! unavailable here; nothing on either side stops.
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, Instant};
+
+use serde_json::{Value, json};
+use tokio::sync::{Notify, watch};
+use tokio::task::JoinHandle;
+use vibe_core::model::{HostLink, LOCAL_HOST};
+use vibe_core::rpc::{
+    ErrorCode, ErrorObject, Event, Hello, HostInfo, HostList, HostsList, Method, PROTOCOL_VERSION,
+};
+
+use crate::core::{Core, error, lock};
+use crate::remote::Channel;
+
+/// How often the host is pinged (with `hosts.list`, whose answer also says
+/// whether it serves MCP).
+pub const PING_EVERY: Duration = Duration::from_secs(10);
+
+/// How long a ping may go unanswered before the link counts as down.
+pub const PING_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a new channel gets to answer its hello.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The first wait before reconnecting, and the longest.
+pub const MIN_BACKOFF: Duration = Duration::from_secs(1);
+pub const MAX_BACKOFF: Duration = Duration::from_secs(60);
+
+/// Channels kept open between calls, and for how long: less than the host
+/// lets a quiet link's connection stay ([`crate::dispatch::LINK_QUIET`]).
+const MAX_IDLE: usize = 4;
+const IDLE_FOR: Duration = Duration::from_secs(30);
+
+/// What a channel for calls says it is, in its hello.
+const LINK_CALLS: &str = "vibed link calls from";
+
+/// How the link is timed; tests make it quicker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Timing {
+    pub ping_every: Duration,
+    pub ping_timeout: Duration,
+    pub connect_timeout: Duration,
+    pub min_backoff: Duration,
+    pub max_backoff: Duration,
+}
+
+impl Default for Timing {
+    fn default() -> Self {
+        Timing {
+            ping_every: PING_EVERY,
+            ping_timeout: PING_TIMEOUT,
+            connect_timeout: CONNECT_TIMEOUT,
+            min_backoff: MIN_BACKOFF,
+            max_backoff: MAX_BACKOFF,
+        }
+    }
+}
+
+/// What the link knows now.
+#[derive(Debug, Clone, Default)]
+struct Status {
+    connected: bool,
+    /// Why it's down, when it is.
+    detail: Option<String>,
+    /// Whether the host serves MCP, as it last said.
+    mcp: bool,
+}
+
+/// One Linux host's link.
+pub struct Link {
+    pub name: String,
+    pub address: String,
+    status: Mutex<Status>,
+    /// Whether it's connected, for calls to give up on when it goes down.
+    up: watch::Sender<bool>,
+    idle: Mutex<Vec<(Channel, Instant)>>,
+    /// Wakes the supervisor from its backoff, to reconnect now.
+    kick: Notify,
+    task: Mutex<Option<JoinHandle<()>>>,
+    /// Whether this run has tried to upgrade the host already.
+    pub(crate) upgrade_tried: AtomicBool,
+    /// A read of its agents is wanted: one runs at a time.
+    pub(crate) refresh_wanted: AtomicBool,
+    /// The last push of this host's keys there failed: the next ping tries
+    /// again.
+    pub(crate) keys_stale: AtomicBool,
+}
+
+impl std::fmt::Debug for Link {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Link")
+            .field("name", &self.name)
+            .field("address", &self.address)
+            .field("status", &*lock(&self.status))
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for Link {
+    fn drop(&mut self) {
+        if let Some(task) = lock(&self.task).take() {
+            task.abort();
+        }
+    }
+}
+
+/// What a call gets when the host can't be reached.
+pub fn unavailable(name: &str, why: Option<&str>) -> ErrorObject {
+    error(
+        ErrorCode::HostUnavailable,
+        match why {
+            Some(why) => format!("{name} is unavailable: {why}"),
+            None => format!("{name} is unavailable: its link is down"),
+        },
+    )
+}
+
+impl Link {
+    pub fn new(name: &str, address: &str) -> Link {
+        Link {
+            name: name.to_owned(),
+            address: address.to_owned(),
+            status: Mutex::new(Status {
+                connected: false,
+                detail: Some("not connected yet".into()),
+                mcp: false,
+            }),
+            up: watch::channel(false).0,
+            idle: Mutex::new(Vec::new()),
+            kick: Notify::new(),
+            task: Mutex::new(None),
+            upgrade_tried: AtomicBool::new(false),
+            refresh_wanted: AtomicBool::new(false),
+            keys_stale: AtomicBool::new(false),
+        }
+    }
+
+    pub fn connected(&self) -> bool {
+        lock(&self.status).connected
+    }
+
+    /// `info` with what the link knows: its state, why it's down, and
+    /// whether the host serves MCP.
+    pub fn describe(&self, mut info: HostInfo) -> HostInfo {
+        let s = lock(&self.status);
+        info.link = if s.connected {
+            HostLink::Connected
+        } else {
+            HostLink::Down
+        };
+        info.detail = if s.connected { None } else { s.detail.clone() };
+        info.mcp = s.connected && s.mcp;
+        info
+    }
+
+    /// Reconnects now rather than at the end of the backoff.
+    pub fn kick(&self) {
+        self.kick.notify_one();
+    }
+
+    /// Ends the link for good.
+    pub fn stop(&self) {
+        if let Some(task) = lock(&self.task).take() {
+            task.abort();
+        }
+        lock(&self.idle).clear();
+        self.set_down(Some("removed".into()));
+    }
+
+    /// Notes whether the host serves MCP, and returns whether that changed.
+    fn set_mcp(&self, mcp: bool) -> bool {
+        let mut s = lock(&self.status);
+        let changed = s.connected && s.mcp != mcp;
+        if s.connected {
+            s.mcp = mcp;
+        }
+        changed
+    }
+
+    fn set_up(&self, mcp: bool) {
+        *lock(&self.status) = Status {
+            connected: true,
+            detail: None,
+            mcp,
+        };
+        self.up.send_replace(true);
+    }
+
+    /// Marks it down, and returns whether that changed anything.
+    fn set_down(&self, detail: Option<String>) -> bool {
+        let changed = {
+            let mut s = lock(&self.status);
+            let changed = s.connected || s.detail != detail;
+            *s = Status {
+                connected: false,
+                detail,
+                mcp: false,
+            };
+            changed
+        };
+        self.up.send_replace(false);
+        lock(&self.idle).clear();
+        changed
+    }
+
+    /// Calls `method` on the host, over a channel of its own, so a slow
+    /// call doesn't hold up the others. It gives up after `timeout`, or as
+    /// soon as the link goes down.
+    pub async fn call(
+        &self,
+        core: &Core,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, ErrorObject> {
+        if !self.connected() {
+            let detail = lock(&self.status).detail.clone();
+            return Err(unavailable(&self.name, detail.as_deref()));
+        }
+        // One kept too long may have been closed by the host as quiet.
+        let idle = {
+            let mut idle = lock(&self.idle);
+            idle.retain(|(_, since)| since.elapsed() < IDLE_FOR);
+            idle.pop()
+        };
+        let (mut channel, fresh) = match idle {
+            Some((c, _)) => (c, false),
+            None => (
+                core.remote
+                    .dial(&self.address)
+                    .await
+                    .map_err(|e| unavailable(&self.name, Some(&e)))?,
+                true,
+            ),
+        };
+        let mut up = self.up.subscribe();
+        let went_down = async move {
+            while *up.borrow_and_update() {
+                if up.changed().await.is_err() {
+                    break;
+                }
+            }
+        };
+        let exchange = async {
+            // A new channel says it's a link's, so the host closes it once
+            // it's quiet, as it would be left by a pulled network.
+            if fresh {
+                channel
+                    .call(
+                        Hello::NAME,
+                        json!({"client": format!("{LINK_CALLS} {}", core.label()), "protocol": PROTOCOL_VERSION}),
+                    )
+                    .await?
+                    .map_err(|e| std::io::Error::other(e.message))?;
+            }
+            channel.call(method, params).await
+        };
+        let answer = tokio::select! {
+            a = tokio::time::timeout(timeout, exchange) => a,
+            () = went_down => return Err(unavailable(&self.name, None)),
+        };
+        match answer {
+            Ok(Ok(outcome)) => {
+                let mut idle = lock(&self.idle);
+                if idle.len() < MAX_IDLE && self.connected() {
+                    idle.push((channel, Instant::now()));
+                }
+                outcome
+            }
+            Ok(Err(e)) => Err(unavailable(&self.name, Some(&e.to_string()))),
+            Err(_) => Err(unavailable(
+                &self.name,
+                Some(&format!(
+                    "it didn't answer {method} in {} s",
+                    timeout.as_secs()
+                )),
+            )),
+        }
+    }
+}
+
+impl Core {
+    /// Runs `task` in the background, on the links' runtime, with this core;
+    /// nothing, unless links run (see [`Core::spawn_links`]).
+    pub(crate) fn in_background<F>(&self, task: impl FnOnce(Arc<Core>) -> F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let (Some(core), Some(rt)) = (self.me.get().and_then(Weak::upgrade), self.runtime.get())
+        else {
+            return;
+        };
+        rt.spawn(task(core));
+    }
+
+    /// Starts the link to `link`'s host, unless this core isn't running
+    /// links (see [`Core::spawn_links`]).
+    pub(crate) fn start_link(&self, link: &Arc<Link>) {
+        let (Some(core), Some(rt)) = (self.me.get().cloned(), self.runtime.get()) else {
+            return;
+        };
+        let task = rt.spawn(supervise(core, Arc::downgrade(link), self.link_timing));
+        if let Some(old) = lock(&link.task).replace(task) {
+            old.abort();
+        }
+    }
+
+    /// Ends every link, as `vibed` does when it stops: each `ssh` it ran
+    /// goes with it. The hosts and their agents run on.
+    pub fn stop_links(&self) {
+        let links: Vec<Arc<Link>> = lock(&self.links).values().cloned().collect();
+        for link in links {
+            if let Some(task) = lock(&link.task).take() {
+                task.abort();
+            }
+            lock(&link.idle).clear();
+        }
+    }
+
+    /// Starts every Linux host's link, and from now on each one added. It
+    /// must be called on the runtime they're to run on.
+    pub fn spawn_links(self: &Arc<Self>) {
+        let _ = self.runtime.set(tokio::runtime::Handle::current());
+        let _ = self.me.set(Arc::downgrade(self));
+        let links: Vec<Arc<Link>> = lock(&self.links).values().cloned().collect();
+        for link in links {
+            self.start_link(&link);
+        }
+    }
+}
+
+/// Keeps `link` connected, for as long as the core and the link are there.
+async fn supervise(core: Weak<Core>, link: Weak<Link>, timing: Timing) {
+    let mut backoff = timing.min_backoff;
+    loop {
+        let Some(l) = link.upgrade() else {
+            return;
+        };
+        let began = Instant::now();
+        let ended = session(&core, &l, timing).await;
+        let Some(c) = core.upgrade() else {
+            return;
+        };
+        let why = match &ended {
+            Ok(()) => "the link closed".to_owned(),
+            Err(why) => why.clone(),
+        };
+        let was_up = l.connected();
+        if l.set_down(Some(why.clone())) {
+            if was_up {
+                crate::log!("vibed: the link to {} is down: {why}", l.name);
+            } else {
+                crate::log!("vibed: can't link to {}: {why}", l.name);
+            }
+            c.host_link_changed(&l);
+        }
+        // A link that held for a while starts over quickly; one that keeps
+        // dropping as soon as it's up backs off.
+        if was_up && began.elapsed() >= timing.ping_every {
+            backoff = timing.min_backoff;
+        }
+        let wait = backoff;
+        backoff = (backoff * 2).min(timing.max_backoff);
+        drop(c);
+        let kicked = async {
+            if let Some(l) = link.upgrade() {
+                // Holds the link only while waiting on it; removing the host
+                // aborts this task.
+                l.kick.notified().await;
+            }
+        };
+        tokio::select! {
+            () = tokio::time::sleep(wait) => {}
+            () = kicked => backoff = timing.min_backoff,
+        }
+    }
+}
+
+/// One connection's life: hello, the host's report, the event
+/// subscription, then events and pings until it ends, or the core does. It
+/// holds the core only while it uses it, so a core that's dropped goes.
+async fn session(core: &Weak<Core>, link: &Arc<Link>, timing: Timing) -> Result<(), String> {
+    let Some(c) = core.upgrade() else {
+        return Ok(());
+    };
+    let started = opening(&c, link, timing).await;
+    drop(c);
+    let mut channel = started?;
+    let mut pings = tokio::time::interval(timing.ping_every);
+    pings.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    pings.tick().await;
+    let mut waiting: Option<(i64, Instant)> = None;
+    loop {
+        tokio::select! {
+            message = channel.read() => {
+                let message = message.map_err(|e| e.to_string())?;
+                let Some(message) = message else {
+                    return Err(channel.why().unwrap_or_else(|| "its vibed closed the link".into()));
+                };
+                if let Some((id, _)) = waiting
+                    && message.get("id") == Some(&json!(id))
+                {
+                    waiting = None;
+                    // The ping's answer is the host's own listing: whether
+                    // it serves MCP now.
+                    let serving = message
+                        .get("result")
+                        .cloned()
+                        .and_then(|r| serde_json::from_value::<HostList>(r).ok())
+                        .and_then(|l| l.hosts.into_iter().find(|h| h.name == LOCAL_HOST))
+                        .map(|h| h.mcp);
+                    if let Some(c) = core.upgrade() {
+                        if let Some(mcp) = serving
+                            && link.set_mcp(mcp)
+                        {
+                            c.host_link_changed(link);
+                        }
+                        // A push that failed is tried again.
+                        if link.keys_stale.load(Ordering::SeqCst) {
+                            c.push_keys_to(link);
+                        }
+                    }
+                    continue;
+                }
+                if message.get("method").and_then(Value::as_str) == Some("events.event")
+                    && let Some(params) = message.get("params")
+                {
+                    let Some(c) = core.upgrade() else {
+                        return Ok(());
+                    };
+                    c.remote_event(link, params.clone());
+                }
+            }
+            // A ping unanswered for `ping_timeout` ends it, then and there.
+            () = overdue(waiting.map(|(_, since)| since + timing.ping_timeout)) => {
+                return Err(format!(
+                    "it stopped answering (no answer for {} s)",
+                    timing.ping_timeout.as_secs()
+                ));
+            }
+            _ = pings.tick() => {
+                if core.strong_count() == 0 {
+                    return Ok(());
+                }
+                if waiting.is_some() {
+                    continue;
+                }
+                let id = channel
+                    .request(HostsList::NAME, json!({}))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                waiting = Some((id, Instant::now()));
+            }
+        }
+    }
+}
+
+/// Resolves at `at`, or never without one.
+async fn overdue(at: Option<Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at.into()).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Dials the host and opens the session: hello, its report, the event
+/// subscription. Then the link is up.
+async fn opening(core: &Arc<Core>, link: &Arc<Link>, timing: Timing) -> Result<Channel, String> {
+    let mut channel = tokio::time::timeout(timing.connect_timeout, core.remote.dial(&link.address))
+        .await
+        .map_err(|_| {
+            format!(
+                "ssh didn't connect in {} s",
+                timing.connect_timeout.as_secs()
+            )
+        })??;
+    let opening = async {
+        let hello = channel
+            .call(
+                Hello::NAME,
+                json!({"client": format!("vibed link from {}", core.label()), "protocol": PROTOCOL_VERSION}),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        if let Err(e) = hello {
+            if e.code == ErrorCode::ProtocolMismatch.code() {
+                let theirs = e
+                    .data
+                    .as_ref()
+                    .and_then(|d| d.get("protocol"))
+                    .and_then(Value::as_u64);
+                // Only up: this build's vibed speaks this build's protocol,
+                // and a newer one's registry is one it can't read.
+                if theirs.is_some_and(|p| p < u64::from(PROTOCOL_VERSION)) {
+                    core.upgrade_in_background(link);
+                    return Err(format!(
+                        "its vibed is older, and speaks protocol {}; it's being upgraded",
+                        theirs.unwrap_or_default()
+                    ));
+                }
+                return Err(format!(
+                    "its vibed is newer than this Mac's and speaks protocol {}: update VibeOS on \
+                     this Mac",
+                    theirs.map_or_else(|| "?".into(), |p| p.to_string())
+                ));
+            }
+            return Err(e.message);
+        }
+        let hosts = channel
+            .call(HostsList::NAME, json!({}))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.message)?;
+        let subscribed = channel
+            .call("events.subscribe", json!({}))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.message)?;
+        Ok((hello.ok(), hosts, subscribed))
+    };
+    let (hello, hosts, _) = tokio::time::timeout(timing.connect_timeout, opening)
+        .await
+        .map_err(|_| {
+            channel.why().unwrap_or_else(|| {
+                format!(
+                    "its vibed didn't answer in {} s",
+                    timing.connect_timeout.as_secs()
+                )
+            })
+        })??;
+    let own = serde_json::from_value::<HostList>(hosts)
+        .ok()
+        .and_then(|l| l.hosts.into_iter().find(|h| h.name == LOCAL_HOST));
+    let version = hello
+        .as_ref()
+        .and_then(|h| h.get("version"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    core.host_reported(link, own.as_ref(), version);
+    link.set_up(own.as_ref().is_some_and(|h| h.mcp));
+    crate::log!("vibed: linked to {} ({})", link.name, link.address);
+    core.host_link_changed(link);
+    core.link_came_up(link);
+    Ok(channel)
+}
+
+/// Copies an event from a host's stream to this one's, under the host's
+/// name. Events about other hosts the host knows are left out.
+pub(crate) fn relabel_event(name: &str, mut params: Value) -> Option<Event> {
+    if params.get("host").and_then(Value::as_str) != Some(LOCAL_HOST) {
+        return None;
+    }
+    params["host"] = json!(name);
+    let mut event: Event = serde_json::from_value(params).ok()?;
+    event.seq = 0;
+    Some(event)
+}
+
+pub(crate) fn tried_upgrade(link: &Link) -> bool {
+    link.upgrade_tried.swap(true, Ordering::SeqCst)
+}

@@ -348,6 +348,7 @@ fn agent_json(v: &AgentView) -> Value {
     let mut j = agent_value(&v.agent);
     if let Value::Object(m) = &mut j {
         m.insert("attach_remote".into(), json!(v.attach_remote));
+        m.insert("available".into(), json!(v.available));
     }
     j
 }
@@ -386,6 +387,12 @@ fn agent_line(v: &AgentView) -> String {
         parts.push(line.clone());
     }
     parts.push(format!("attach: {}", v.attach_remote));
+    if !v.available {
+        parts.push(format!(
+            "unavailable: {}'s link is down, so this is how it was last seen",
+            a.host
+        ));
+    }
     parts.join("  ")
 }
 
@@ -616,11 +623,10 @@ impl<D: Daemon> Server<D> {
                 if submit.is_some() {
                     return Err("submit goes with text; press [\"Enter\"] with keys".into());
                 }
-                Input::Keys(
-                    keys.iter()
-                        .map(|k| keys::bytes(k))
-                        .collect::<Result<Vec<_>, _>>()?,
-                )
+                for k in &keys {
+                    keys::bytes(k)?;
+                }
+                Input::Keys(keys.iter().map(|k| (*k).to_owned()).collect())
             }
         };
         let t = self.resolve(&name).await?;
@@ -851,15 +857,36 @@ impl<D: Daemon> Server<D> {
                 .collect::<Vec<_>>()
                 .join("; ")
         };
+        // What each agent last said, for while its host's link is down: a
+        // blip of the network doesn't end the wait, as nothing stopped.
+        let mut last: HashMap<Target, Check> = HashMap::new();
         let (target, check, reached, checks) = loop {
             let mut checks = Vec::new();
             for t in &targets {
-                let c = self
-                    .daemon
-                    .check(t, background)
-                    .await
-                    .map_err(|e| explain(&e, Some(&t.agent)))?;
-                checks.push((t.clone(), c));
+                match self.daemon.check(t, background).await {
+                    Ok(c) => {
+                        last.insert(t.clone(), c.clone());
+                        checks.push((t.clone(), c));
+                    }
+                    Err(e)
+                        if e.code == vibe_core::rpc::ErrorCode::HostUnavailable.code()
+                            && Instant::now() < deadline =>
+                    {
+                        if let Some(c) = last.get(t) {
+                            checks.push((t.clone(), c.clone()));
+                        }
+                    }
+                    Err(e) => return Err(explain(&e, Some(&t.agent))),
+                }
+            }
+            if checks.is_empty() {
+                // Every host asked is out of reach for now; ask again.
+                let pause = WAIT_POLL.min(deadline.saturating_duration_since(Instant::now()));
+                tokio::select! {
+                    _ = ctx.ct.cancelled() => return Err("the wait was cancelled".into()),
+                    _ = tokio::time::sleep(pause) => {}
+                }
+                continue;
             }
             let mut changed = false;
             for (t, c) in &checks {

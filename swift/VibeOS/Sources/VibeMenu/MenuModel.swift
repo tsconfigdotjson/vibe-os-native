@@ -122,6 +122,21 @@ public final class MenuModel: ObservableObject {
         return try await Task.detached { try daemon.call(method, params) }.value
     }
 
+    /// The same, for a call that may take minutes: one that goes to a Linux
+    /// host over SSH, or that clones, cuts a worktree or runs setup there.
+    public func call<M: RPCMethod>(_ method: M.Type, _ params: M.Params, timeout: TimeInterval) async throws
+        -> M.Result
+    {
+        let daemon = self.daemon
+        return try await Task.detached { try daemon.call(method, params, timeout: timeout) }.value
+    }
+
+    /// How long a call that does real work, on `host`, may take: a Linux
+    /// host's starts, adds and deletes run over its link, and dial it first.
+    public nonisolated static func patience(for host: String?) -> TimeInterval {
+        (host ?? VibeRPC.localHost) == VibeRPC.localHost ? 5 * 60 : 60 * 60
+    }
+
     /// Reads everything the menu shows again, and returns once a read that
     /// began after the call is done. Calls that come while one runs are
     /// folded into one more after it.
@@ -158,18 +173,19 @@ public final class MenuModel: ObservableObject {
         var agents: [Agent] = []
         var unavailable = Set<String>()
         for host in hosts {
-            if host.link != .down {
-                do {
-                    agents += try await call(AgentsList.self, HostParams(host: host.name)).agents
-                    continue
-                } catch {
-                    if host.link == .local {
-                        connection = .unavailable(describe(error))
-                        return
-                    }
+            // A host whose link is down is listed as vibed last saw it, so
+            // its rows show, unavailable, even after the app restarts.
+            if host.link == .down { unavailable.insert(host.name) }
+            do {
+                agents += try await call(AgentsList.self, HostParams(host: host.name)).agents
+                continue
+            } catch {
+                if host.link == .local {
+                    connection = .unavailable(describe(error))
+                    return
                 }
             }
-            // A host out of reach keeps its last known rows, unavailable.
+            // One vibed can't list keeps the rows the menu had, unavailable.
             unavailable.insert(host.name)
             agents += self.agents.filter { $0.host == host.name }
         }
@@ -195,7 +211,9 @@ public final class MenuModel: ObservableObject {
         attaching.insert(key)
         defer { attaching.remove(key) }
         do {
-            let session = try await call(SessionsAttach.self, SessionParams(host: agent.host, ref: agent.ref))
+            let session = try await call(
+                SessionsAttach.self, SessionParams(host: agent.host, ref: agent.ref),
+                timeout: agent.isLocal ? 30 : 5 * 60)
             _ = try attacher.attach(agent, attached: session.ttys)
             message = nil
         } catch {
@@ -226,7 +244,8 @@ public final class MenuModel: ObservableObject {
     public func delete(_ agent: Agent, force: Bool) async -> DeleteOutcome {
         do {
             _ = try await call(
-                AgentsDelete.self, AgentDeleteParams(host: agent.host, ref: agent.ref, force: force ? true : nil))
+                AgentsDelete.self, AgentDeleteParams(host: agent.host, ref: agent.ref, force: force ? true : nil),
+                timeout: MenuModel.patience(for: agent.host))
             attacher.forget(agent.key)
             agents.removeAll { $0.key == agent.key }
             message = nil
@@ -292,9 +311,41 @@ public final class MenuModel: ObservableObject {
         mcp = try await call(McpSet.self, McpSetParams(tailscale: on))
     }
 
+    // MARK: Linux hosts
+
+    /// How long Add Linux Host may take: it uploads vibed over SSH, which
+    /// on a slow link takes minutes.
+    public nonisolated static let installTimeout: TimeInterval = 30 * 60
+
+    /// Add Linux Host…: vibed installs itself on the server over SSH and
+    /// links to it. The answer says what the server still needs.
+    public func addHost(name: String, address: String) async throws -> HostInstall {
+        let installed = try await call(
+            HostsAdd.self, HostAddParams(name: name, address: address), timeout: MenuModel.installTimeout)
+        settingsRevision += 1
+        await refresh()
+        return installed
+    }
+
+    /// Installs this Mac's vibed on a Linux host again, if it runs another.
+    public func upgradeHost(_ name: String) async throws -> HostInstall {
+        let installed = try await call(
+            HostsUpgrade.self, HostNameParams(host: name), timeout: MenuModel.installTimeout)
+        await refresh()
+        return installed
+    }
+
+    /// Forgets a Linux host; it runs on there, on its own.
+    public func removeHost(_ name: String) async throws {
+        _ = try await call(HostsRemove.self, HostNameParams(host: name))
+        agents.removeAll { $0.host == name }
+        settingsRevision += 1
+        await refresh()
+    }
+
     /// Starts an agent, as New agent… does.
     public func start(_ params: AgentStartParams) async throws -> Agent {
-        let agent = try await call(AgentsStart.self, params)
+        let agent = try await call(AgentsStart.self, params, timeout: MenuModel.patience(for: params.host))
         if self.agent(host: agent.host, ref: agent.ref) == nil { agents.append(agent) }
         return agent
     }
@@ -356,6 +407,10 @@ public final class MenuModel: ObservableObject {
             toolbox = (try? await call(ToolboxStatusGet.self, NoParams())) ?? toolbox
         case .mcpChanged:
             // Where it's served, and whether it is, for the header.
+            settingsRevision += 1
+            await refresh()
+        case .hostAdded, .hostRemoved, .hostLink:
+            // A host's link came or went: its rows, and the header.
             settingsRevision += 1
             await refresh()
         }

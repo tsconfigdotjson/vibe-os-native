@@ -1,0 +1,41 @@
+{
+  "description": "Every host: this one first, with the `vibed` it runs, then each Linux host with its SSH address, the `vibed` it last said it runs, what it's missing, and its link. While a link is down, `detail` says why, and that host's agents are unavailable here; nothing on either side stops.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 992,
+    "method": "hosts.list",
+    "params": {}
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 992,
+    "result": {
+      "hosts": [
+        {
+          "external": false,
+          "label": "mac-mini",
+          "link": "local",
+          "mcp": false,
+          "missing": [],
+          "name": "local",
+          "os": "macos",
+          "version": "0.1.0"
+        },
+        {
+          "address": "me@vps.example.com",
+          "detail": "not connected yet",
+          "external": false,
+          "label": "vps-1",
+          "link": "down",
+          "mcp": false,
+          "missing": [
+            "claude"
+          ],
+          "name": "vps",
+          "os": "linux",
+          "version": "0.1.0"
+        }
+      ]
+    }
+  }
+}

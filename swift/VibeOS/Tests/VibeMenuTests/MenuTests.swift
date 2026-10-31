@@ -596,14 +596,119 @@ import VibeRPC
         #expect(model.localHost?.mcp == true)
         #expect(model.otherHosts.map(\.name) == ["vps"])
         #expect(model.groups.map(\.host) == ["local", "vps"])
-        // Down, it isn't asked; its rows stay as they were, unavailable.
-        let askedVps = { daemon.params(of: AgentsList.name).filter { ($0["host"] as? String) == "vps" }.count }
-        let asked = askedVps()
+        // Down, its rows are as vibed last saw them, unavailable.
         vpsLink.value = .down
         await model.refresh()
         #expect(model.agents.map(\.key) == ["local:a", "vps:b"])
         #expect(model.unavailableHosts == ["vps"])
-        #expect(askedVps() == asked)
+        // And if vibed can't list them, the menu keeps the rows it had.
+        daemon.on(AgentsList.name) { params in
+            if (params["host"] as? String) == "vps" {
+                throw VibedClientError.rpc(RPCError(code: RPCErrorCode.hostUnavailable.rawValue, message: "vps is unavailable"))
+            }
+            return ["agents": [agentJSON("a")]]
+        }
+        await model.refresh()
+        #expect(model.agents.map(\.key) == ["local:a", "vps:b"])
+        #expect(model.unavailableHosts == ["vps"])
+    }
+
+    @Test func aDownHostsRowsShowAfterTheAppRestarts() async throws {
+        // vibed keeps a down host's agents as it last listed them.
+        let daemon = fakeDaemon(agents: ["vps": [agentJSON("b", host: "vps")]])
+        daemon.on(HostsList.name) { _ in
+            ["hosts": [hostJSON("local"), hostJSON("vps", link: .down, detail: "it stopped answering")]]
+        }
+        let model = makeModel(daemon)
+        await model.refresh()
+        #expect(model.agents.map(\.key) == ["vps:b"])
+        #expect(model.unavailableHosts == ["vps"])
+        #expect(model.otherHosts.first?.detail == "it stopped answering")
+    }
+
+    @Test func addingAHostInstallsOverSSHAndRereads() async throws {
+        let daemon = fakeDaemon()
+        let hosts = Box([hostJSON("local")])
+        daemon.on(HostsList.name) { _ in ["hosts": hosts.value] }
+        daemon.on(HostsAdd.name) { params in
+            #expect(params["name"] as? String == "vps")
+            #expect(params["address"] as? String == "me@vps.example.com")
+            let vps = hostJSON("vps", link: .down, missing: ["claude"], detail: "not connected yet")
+            hosts.value.append(vps)
+            return ["host": vps, "changed": true, "notes": ["Lingering is on."]]
+        }
+        let model = makeModel(daemon)
+        await model.refresh()
+        let revision = model.settingsRevision
+        let installed = try await model.addHost(name: "vps", address: "me@vps.example.com")
+        #expect(installed.host.missing == ["claude"])
+        #expect(installed.notes == ["Lingering is on."])
+        // An install can take minutes, so it isn't held to the usual timeout.
+        #expect(daemon.timeout(of: HostsAdd.name) == MenuModel.installTimeout)
+        #expect(model.otherHosts.map(\.name) == ["vps"])
+        #expect(model.settingsRevision > revision)
+
+        daemon.on(HostsUpgrade.name) { _ in ["host": hosts.value[1], "changed": false, "notes": []] }
+        let again = try await model.upgradeHost("vps")
+        #expect(!again.changed)
+        #expect(daemon.timeout(of: HostsUpgrade.name) == MenuModel.installTimeout)
+
+        daemon.on(HostsRemove.name) { params in
+            #expect(params["host"] as? String == "vps")
+            let removed = hosts.value.removeLast()
+            return removed
+        }
+        try await model.removeHost("vps")
+        #expect(model.otherHosts.isEmpty)
+    }
+
+    @Test func aFailedInstallSaysWhy() async throws {
+        let daemon = fakeDaemon()
+        daemon.on(HostsAdd.name) { _ in
+            throw VibedClientError.rpc(
+                RPCError(code: RPCErrorCode.commandFailed.rawValue, message: "can't reach me@vps over SSH: Permission denied"))
+        }
+        let model = makeModel(daemon)
+        do {
+            _ = try await model.addHost(name: "vps", address: "me@vps")
+            Issue.record("the install didn't fail")
+        } catch {
+            #expect(describe(error) == "can't reach me@vps over SSH: Permission denied")
+        }
+    }
+
+    @Test func hostEventsRereadTheHosts() async throws {
+        let link = Box(HostLink.connected)
+        let daemon = fakeDaemon()
+        daemon.on(HostsList.name) { _ in ["hosts": [hostJSON("local"), hostJSON("vps", link: link.value)]] }
+        let model = makeModel(daemon)
+        await model.refresh()
+        #expect(model.otherHosts.first?.link == .connected)
+        link.value = .down
+        await model.handle(try event(.hostLink, host: "vps", extra: ["state": "down", "message": "it stopped answering"]))
+        #expect(model.otherHosts.first?.link == .down)
+        #expect(model.unavailableHosts == ["vps"])
+        let revision = model.settingsRevision
+        await model.handle(try event(.hostRemoved, host: "vps"))
+        #expect(model.settingsRevision > revision)
+    }
+
+    @Test func aRemoteRowAttachesOverSSH() async throws {
+        let daemon = fakeDaemon(agents: ["vps": [agentJSON("b", host: "vps")]])
+        daemon.on(HostsList.name) { _ in ["hosts": [hostJSON("local"), hostJSON("vps", link: .connected)]] }
+        daemon.on(SessionsAttach.name) { params in
+            ["host": "vps", "ref": params["ref"] as? String ?? "", "title": "t", "socket": "/home/me/s.sock",
+             "ttys": ["/dev/pts/3"]]
+        }
+        let terminal = FakeTerminal()
+        let model = makeModel(daemon, terminal: terminal)
+        await model.refresh()
+        let b = try #require(model.agent(host: "vps", ref: "b"))
+        await model.attach(b)
+        // The host's ttys are its own, so nothing here is raised for them.
+        #expect(terminal.raised.isEmpty)
+        #expect(terminal.ran == ["exec ssh -t vps vibe attach b"])
+        #expect(daemon.params(of: SessionsAttach.name).first?["host"] as? String == "vps")
     }
 
     @Test func clickingARowTwiceGivesOneTab() async throws {

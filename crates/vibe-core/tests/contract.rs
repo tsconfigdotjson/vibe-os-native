@@ -9,9 +9,9 @@ use serde::de::{self, DeserializeOwned, Deserializer, Visitor};
 use serde::{Serialize, forward_to_deserialize_any};
 use serde_json::Value;
 use vibe_core::model::{
-    Activity, AgentState, Certainty, Environment, EventKind, GhState, HostLink, LoginTool, Mode,
-    Model, ProjectSource, Reasoning, SessionState, StopReason, ToolboxAction, ToolboxState,
-    WakeupKind,
+    Activity, AgentState, Certainty, Environment, EventKind, GhState, HostLink, LoginTool,
+    MessageRole, Mode, Model, ProjectSource, Reasoning, SessionState, StopReason, ToolboxAction,
+    ToolboxState, WakeupKind,
 };
 use vibe_core::paths;
 use vibe_core::rpc::*;
@@ -159,6 +159,9 @@ fn rust_types() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
         entry::<HostParams>(),
         entry::<HostInfo>(),
         entry::<HostList>(),
+        entry::<HostAddParams>(),
+        entry::<HostNameParams>(),
+        entry::<HostInstall>(),
         entry::<Project>(),
         entry::<ProjectList>(),
         entry::<ProjectAddParams>(),
@@ -178,6 +181,8 @@ fn rust_types() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
         entry::<KeyCreated>(),
         entry::<KeyParams>(),
         entry::<KeyVerifyParams>(),
+        entry::<KeyHash>(),
+        entry::<KeySyncParams>(),
         entry::<GhStatusParams>(),
         entry::<GhStatus>(),
         entry::<Subscribed>(),
@@ -194,6 +199,15 @@ fn rust_types() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
         entry::<AgentStatus>(),
         entry::<Wakeup>(),
         entry::<AgentList>(),
+        entry::<AgentSendParams>(),
+        entry::<AgentSent>(),
+        entry::<AgentCheckParams>(),
+        entry::<AgentCheck>(),
+        entry::<AgentOutputParams>(),
+        entry::<AgentOutput>(),
+        entry::<AgentMessagesParams>(),
+        entry::<Message>(),
+        entry::<MessageList>(),
         entry::<ToolboxStatus>(),
         entry::<ToolboxRun>(),
         entry::<ToolboxLogins>(),
@@ -237,6 +251,9 @@ fn rust_methods() -> BTreeMap<&'static str, MethodTypes> {
     BTreeMap::from([
         method::<Hello>(),
         method::<HostsList>(),
+        method::<HostsAdd>(),
+        method::<HostsUpgrade>(),
+        method::<HostsRemove>(),
         method::<ProjectsList>(),
         method::<ProjectsAdd>(),
         method::<ProjectsRemove>(),
@@ -252,6 +269,7 @@ fn rust_methods() -> BTreeMap<&'static str, MethodTypes> {
         method::<KeysCreate>(),
         method::<KeysRevoke>(),
         method::<KeysVerify>(),
+        method::<KeysSync>(),
         method::<GhStatusGet>(),
         method::<EventsSubscribe>(),
         method::<SessionsList>(),
@@ -260,6 +278,10 @@ fn rust_methods() -> BTreeMap<&'static str, MethodTypes> {
         method::<AgentsList>(),
         method::<AgentsDelete>(),
         method::<AgentsInterrupt>(),
+        method::<AgentsSend>(),
+        method::<AgentsCheck>(),
+        method::<AgentsOutput>(),
+        method::<AgentsMessages>(),
         method::<ToolboxStatusGet>(),
         method::<ToolboxOpen>(),
         method::<ToolboxUpdate>(),
@@ -312,6 +334,7 @@ fn rust_enums() -> BTreeMap<&'static str, Vec<&'static str>> {
             names(ToolboxAction::ALL, ToolboxAction::as_str),
         ),
         ("LoginTool", names(LoginTool::ALL, LoginTool::as_str)),
+        ("MessageRole", names(MessageRole::ALL, MessageRole::as_str)),
     ])
 }
 

@@ -2,8 +2,9 @@
 //! façade; this gives it the same handlers the socket API calls, so the two
 //! can't drift apart.
 //!
-//! Only this host's agents are reachable until Linux hosts (#16) connect
-//! others: a call for another host gets the core's "no host named …".
+//! A call for a Linux host's agent goes to that host's `vibed` over its
+//! link, as the socket's do; while the link is down, its agents are listed
+//! as they were last seen, unavailable.
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -15,8 +16,9 @@ use tokio::task::JoinHandle;
 use vibe_core::limits::{self, HostLimits};
 use vibe_core::model::EventKind;
 use vibe_core::rpc::{
-    Agent, AgentDeleteParams, AgentStartParams, ErrorObject, HostParams, McpSetParams, McpSettings,
-    Project,
+    Agent, AgentCheckParams, AgentDeleteParams, AgentMessagesParams, AgentOutputParams,
+    AgentStartParams, AgentsCheck, AgentsDelete, AgentsMessages, AgentsOutput, AgentsSend,
+    AgentsStart, ErrorObject, HostParams, McpSetParams, McpSettings, Project, ProjectsList,
 };
 use vibe_mcp::http::Settings;
 use vibe_mcp::{AgentView, Check, Daemon, Input, Message, Screen, Sent, Target};
@@ -142,6 +144,20 @@ impl Core {
     /// does (its memory now and its limit included), with the line that
     /// attaches from another machine.
     pub async fn agent_views(&self, host: &str) -> Result<Vec<AgentView>, ErrorObject> {
+        if let Some(link) = self.link(host) {
+            let available = link.connected();
+            return Ok(self
+                .remote_agents(&link)
+                .await
+                .into_iter()
+                .map(|agent| AgentView {
+                    // Its attach line is the one that reaches it from here.
+                    attach_remote: agent.attach.clone(),
+                    available,
+                    agent,
+                })
+                .collect());
+        }
         let list = self
             .agents(HostParams {
                 host: Some(host.to_owned()),
@@ -154,6 +170,7 @@ impl Core {
             .into_iter()
             .map(|agent| AgentView {
                 attach_remote: format!("ssh -t {machine} {vibe} attach {}", agent.agent),
+                available: true,
                 agent,
             })
             .collect())
@@ -201,6 +218,12 @@ impl Daemon for Core {
     }
 
     async fn projects(&self, host: &str) -> Result<Vec<Project>, ErrorObject> {
+        if let Some(link) = self.link(host) {
+            return Ok(self
+                .forward_typed::<ProjectsList>(&link, &HostParams::default())
+                .await?
+                .projects);
+        }
         Ok(Core::projects(
             self,
             HostParams {
@@ -215,26 +238,81 @@ impl Daemon for Core {
     }
 
     async fn start_agent(&self, p: AgentStartParams) -> Result<Agent, ErrorObject> {
+        if let Some(link) = p.host.as_deref().and_then(|h| self.link(h)) {
+            return self.forward_typed::<AgentsStart>(&link, &p).await;
+        }
         Core::start_agent(self, p).await
     }
 
     async fn delete_agent(&self, p: AgentDeleteParams) -> Result<Agent, ErrorObject> {
+        if let Some(link) = p.host.as_deref().and_then(|h| self.link(h)) {
+            return self.forward_typed::<AgentsDelete>(&link, &p).await;
+        }
         Core::delete_agent(self, p).await
     }
 
     async fn send(&self, t: &Target, input: Input) -> Result<Sent, ErrorObject> {
+        if let Some(link) = self.link(&t.host) {
+            let params = crate::talk::send_params(&t.host, &t.agent, &input);
+            let sent = self.forward_typed::<AgentsSend>(&link, &params).await?;
+            return Ok(Sent {
+                woke: sent.woke,
+                state: sent.state,
+            });
+        }
         self.send_input(Some(&t.host), &t.agent, input).await
     }
 
     async fn check(&self, t: &Target, background: bool) -> Result<Check, ErrorObject> {
+        if let Some(link) = self.link(&t.host) {
+            let params = AgentCheckParams {
+                host: Some(t.host.clone()),
+                agent: t.agent.clone(),
+                background: background.then_some(true),
+            };
+            let c = self.forward_typed::<AgentsCheck>(&link, &params).await?;
+            return Ok(Check {
+                state: c.state,
+                activity: c.activity,
+                line: c.line,
+                answered: c.answered,
+            });
+        }
         self.check_agent(Some(&t.host), &t.agent, background).await
     }
 
     async fn read_output(&self, t: &Target, after: Option<u64>) -> Result<Screen, ErrorObject> {
+        if let Some(link) = self.link(&t.host) {
+            let params = AgentOutputParams {
+                host: Some(t.host.clone()),
+                agent: t.agent.clone(),
+                after,
+            };
+            let o = self.forward_typed::<AgentsOutput>(&link, &params).await?;
+            return Ok(Screen {
+                screen: o.screen,
+                history: o.history,
+                cursor: o.cursor,
+                dropped: o.dropped,
+                more: o.more,
+                live: o.live,
+            });
+        }
         self.agent_output(Some(&t.host), &t.agent, after).await
     }
 
     async fn read_messages(&self, t: &Target, last: usize) -> Result<Vec<Message>, ErrorObject> {
+        if let Some(link) = self.link(&t.host) {
+            let params = AgentMessagesParams {
+                host: Some(t.host.clone()),
+                agent: t.agent.clone(),
+                last: Some(u32::try_from(last).unwrap_or(u32::MAX)),
+            };
+            return Ok(self
+                .forward_typed::<AgentsMessages>(&link, &params)
+                .await?
+                .messages);
+        }
         self.agent_messages(Some(&t.host), &t.agent, last).await
     }
 }

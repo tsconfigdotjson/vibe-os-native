@@ -25,6 +25,22 @@
 #     with a key from `vibe key create`, `vibe mcp` carries VibeOS's round
 #     over stdio: start an agent on a question, wait for it, read it, answer
 #     it with keys, wait for that answer, read it, and delete the agent
+#   - a Linux host over SSH, with every process real but the network
+#     (crates/vibe-cli/tests/linux_host.rs): a stand-in ssh runs commands in a
+#     home of the host's own and a stand-in systemctl runs its vibed; Add
+#     Linux host installs over it with the real install scripts, the link
+#     comes up over `ssh <host> vibe rpc`, an agent started there through the
+#     Mac's MCP shows in the Mac's listing with its ssh attach line, the
+#     Mac's API key is pushed to the host, whose own MCP serves it with that
+#     key, and a pulled network shows the host down and its agent
+#     unavailable until it reconnects on its own
+#   - a real Linux server, when VIBE_TEST_LINUX_HOST is an SSH destination
+#     that logs in with a key (N/A otherwise): the Linux builds of vibed
+#     (scripts/host-bundle.sh, which needs zig and cargo-zigbuild, or
+#     VIBE_HOST_BUNDLE), installed over real ssh, linked, listed through
+#     the Mac's MCP, and a hung link noticed and taken up again. With
+#     VIBE_TEST_LINUX_PROJECT naming a project on the server, an agent
+#     started there through MCP too (its linux agents need #17's backend)
 #   - the macos backend (crates/vibe-env/tests/macos.rs, which the test step
 #     runs everywhere): on a Mac again, with a fork bomb of about a thousand
 #     processes, and PRIO_DARWIN_BG seen in `ps` as the memory warning
@@ -888,6 +904,24 @@ s_app_launch() {
   echo "VibeOS.app launched and said hello to vibed"
 }
 
+s_linux_host() {
+  cargo test -p vibe-cli --test linux_host --locked -- a_linux_host an_unreachable --test-threads=1
+}
+
+s_real_host() {
+  if [ -z "${VIBE_TEST_LINUX_HOST:-}" ]; then
+    echo "no real Linux server: set VIBE_TEST_LINUX_HOST to an SSH destination that logs in with a key"
+    return $NOT_APPLICABLE
+  fi
+  local bundle=${VIBE_HOST_BUNDLE:-} arch
+  if [ -z "$bundle" ]; then
+    arch=$(ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -- "$VIBE_TEST_LINUX_HOST" uname -m)
+    bundle="$WORK/host-bundle"
+    scripts/host-bundle.sh --out "$bundle" --target "$arch"
+  fi
+  VIBE_HOST_BUNDLE="$bundle" cargo test -p vibe-cli --test linux_host --locked -- real_linux_host --ignored --nocapture
+}
+
 step tools "toolchain versions" s_tools
 step fmt "cargo fmt --check" s_fmt
 step clippy "cargo clippy, warnings denied" s_clippy
@@ -901,6 +935,8 @@ step registry "registry via vibe rpc survives a vibed restart" s_registry build
 step sessions "a session outlives a killed vibed and is re-adopted" s_sessions build
 step agents "agents start, outlive vibed, and delete to nothing but the branch" s_agents build
 step mcp "MCP: no key refused; VibeOS's round over vibe mcp, start to delete" s_mcp build
+step linux-host "a Linux host over SSH: install, link, an agent via MCP, a pulled network" s_linux_host build
+step real-host "a real Linux server over SSH (VIBE_TEST_LINUX_HOST)" s_real_host build
 mac_step macos-governor "the macos backend: conformance, fork bomb, memory, nohup, CPU, disk" s_macos_governor build
 mac_step macos-agents "a macos agent on the governor: Mac's ~/.claude, a limit pause, delete" s_macos_agents build
 mac_step swift-app-build "swift build swift/VibeOS" s_swift_app_build

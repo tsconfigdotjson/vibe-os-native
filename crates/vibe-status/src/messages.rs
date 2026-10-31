@@ -7,7 +7,6 @@ use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
-use serde::Serialize;
 use serde_json::Value;
 
 /// How much of the end of a transcript is read first, and the most read: a
@@ -19,24 +18,10 @@ const MAX_READ: u64 = 16 * 1024 * 1024;
 /// The longest a tool call's input is shown.
 const TOOL_INPUT_CHARS: usize = 200;
 
-/// Who said a message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Role {
-    User,
-    Assistant,
-    /// A tool call, as one short line.
-    Tool,
-}
-
-/// One message of the conversation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct Message {
-    pub role: Role,
-    pub text: String,
-    /// When it was written, RFC 3339, as the transcript has it.
-    pub at: Option<String>,
-}
+/// Who said a message, and one message of the conversation: the socket
+/// contract's types, so `agents.messages` carries them as they are.
+pub use vibe_core::model::MessageRole as Role;
+pub use vibe_core::rpc::Message;
 
 /// The last `last` messages of the transcript at `path`, oldest first.
 pub fn last_messages(path: &Path, last: usize) -> io::Result<Vec<Message>> {

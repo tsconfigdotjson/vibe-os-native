@@ -5,9 +5,10 @@
 use serde_json::Value;
 use tokio::sync::broadcast;
 use vibe_core::rpc::{
-    AgentsDelete, AgentsInterrupt, AgentsList, AgentsStart, ErrorCode, ErrorObject, Event,
-    EventsSubscribe, GhStatusGet, Hello, HelloParams, HelloResult, HostsList, Id, KeysCreate,
-    KeysList, KeysRevoke, KeysVerify, LimitsGet, LimitsSet, McpGet, McpSet, Method,
+    AgentsCheck, AgentsDelete, AgentsInterrupt, AgentsList, AgentsMessages, AgentsOutput,
+    AgentsSend, AgentsStart, ErrorCode, ErrorObject, Event, EventsSubscribe, GhStatusGet, Hello,
+    HelloParams, HelloResult, HostsAdd, HostsList, HostsRemove, HostsUpgrade, Id, KeysCreate,
+    KeysList, KeysRevoke, KeysSync, KeysVerify, LimitsGet, LimitsSet, McpGet, McpSet, Method,
     PROTOCOL_VERSION, ProfilesCreate, ProfilesDelete, ProfilesList, ProfilesUpdate, ProjectsAdd,
     ProjectsList, ProjectsRemove, ProtocolMismatchData, Request, Response, SessionsAttach,
     SessionsList, Subscribed, ToolboxLoginsGet, ToolboxOpen, ToolboxRebuild, ToolboxStatusGet,
@@ -21,6 +22,9 @@ pub use crate::core::DaemonInfo;
 #[derive(Debug, Default)]
 pub struct Session {
     subscribed: bool,
+    /// It's another host's link (its hello says so), which pings: one that
+    /// goes quiet was cut off, as by a pulled network.
+    link: bool,
     /// A subscription made by the last message, for the connection to start
     /// forwarding once that message's response is out.
     new_subscription: Option<(u64, broadcast::Receiver<Event>)>,
@@ -32,6 +36,28 @@ impl Session {
     /// in it.
     pub fn take_subscription(&mut self) -> Option<(u64, broadcast::Receiver<Event>)> {
         self.new_subscription.take()
+    }
+
+    /// How long the connection may stay quiet before it's taken for gone:
+    /// for a link, a few of its pings; otherwise for ever.
+    pub fn quiet_limit(&self) -> Option<std::time::Duration> {
+        self.link.then_some(LINK_QUIET)
+    }
+}
+
+/// How long a link may send nothing before its connection is closed: its
+/// pings come every [`crate::link::PING_EVERY`], and an `ssh` cut off by a
+/// pulled network leaves its `vibe rpc` here, connected, until then.
+pub const LINK_QUIET: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// What a link's hello says it is.
+const LINK_CLIENT: &str = "vibed link";
+
+impl Session {
+    fn hello_from(&mut self, client: &str) {
+        if client.starts_with(LINK_CLIENT) {
+            self.link = true;
+        }
     }
 }
 
@@ -105,6 +131,22 @@ async fn call(
     method: &str,
     params: Option<Value>,
 ) -> Result<Value, ErrorObject> {
+    // A call for a Linux host goes to its vibed, over its link. While the
+    // link is down, its agents are listed as they were last seen.
+    if crate::hosts::FORWARDED.contains(&method)
+        && let Some(link) = core.link_for(params.as_ref())
+    {
+        if method == AgentsList::NAME {
+            // Its params are checked here, as no host will.
+            decode::<AgentsList>(params)?;
+            return encode_result(Ok(core.remote_agent_list(&link).await));
+        }
+        let params = params.unwrap_or_else(|| Value::Object(Default::default()));
+        if !params.is_object() {
+            return Err(invalid_params("params must be an object"));
+        }
+        return core.forward(&link, method, params).await;
+    }
     match method {
         Hello::NAME => {
             // The version is checked before the params are decoded strictly,
@@ -118,12 +160,19 @@ async fn call(
             {
                 return Err(protocol_mismatch(theirs));
             }
-            encode_result(hello(core.info(), decode::<Hello>(params)?))
+            let params = decode::<Hello>(params)?;
+            session.hello_from(&params.client);
+            encode_result(hello(core.info(), params))
         }
         HostsList::NAME => {
             decode::<HostsList>(params)?;
             encode_result(core.hosts())
         }
+        HostsAdd::NAME => encode_result(core.add_host(decode::<HostsAdd>(params)?).await),
+        HostsUpgrade::NAME => {
+            encode_result(core.upgrade_host(decode::<HostsUpgrade>(params)?).await)
+        }
+        HostsRemove::NAME => encode_result(core.remove_host(decode::<HostsRemove>(params)?).await),
         ProjectsList::NAME => encode_result(core.projects(decode::<ProjectsList>(params)?)),
         ProjectsAdd::NAME => encode_result(core.add_project(decode::<ProjectsAdd>(params)?).await),
         ProjectsRemove::NAME => {
@@ -150,6 +199,7 @@ async fn call(
         KeysCreate::NAME => encode_result(core.create_key(decode::<KeysCreate>(params)?)),
         KeysRevoke::NAME => encode_result(core.revoke_key(decode::<KeysRevoke>(params)?)),
         KeysVerify::NAME => encode_result(core.verify_key_call(decode::<KeysVerify>(params)?)),
+        KeysSync::NAME => encode_result(core.sync_keys(decode::<KeysSync>(params)?)),
         GhStatusGet::NAME => {
             let p = decode::<GhStatusGet>(params)?;
             encode_result(Ok(core.gh_status(p).await))
@@ -180,6 +230,14 @@ async fn call(
             core.interrupt_agent(decode::<AgentsInterrupt>(params)?)
                 .await,
         ),
+        AgentsSend::NAME => encode_result(core.send_call(decode::<AgentsSend>(params)?).await),
+        AgentsCheck::NAME => encode_result(core.check_call(decode::<AgentsCheck>(params)?).await),
+        AgentsOutput::NAME => {
+            encode_result(core.output_call(decode::<AgentsOutput>(params)?).await)
+        }
+        AgentsMessages::NAME => {
+            encode_result(core.messages_call(decode::<AgentsMessages>(params)?).await)
+        }
         ToolboxStatusGet::NAME => encode_result(
             core.toolbox_status(decode::<ToolboxStatusGet>(params)?)
                 .await,
@@ -393,6 +451,37 @@ mod tests {
             .unwrap();
         assert!(second.contains("-32002"), "{second}");
         assert!(session.take_subscription().is_none());
+    }
+
+    #[test]
+    fn a_links_connection_may_go_quiet_only_so_long() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = core(&dir);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let hello = |client: &str| {
+            format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"daemon.hello","params":{{"client":"{client}","protocol":1}}}}"#
+            )
+        };
+        for (client, limit) in [
+            ("VibeOS.app", None),
+            ("vibe-cli", None),
+            ("vibed link from mac-mini", Some(LINK_QUIET)),
+            ("vibed link calls from mac-mini", Some(LINK_QUIET)),
+        ] {
+            let mut session = Session::default();
+            assert_eq!(session.quiet_limit(), None);
+            rt.block_on(handle_message(
+                &core,
+                &mut session,
+                hello(client).as_bytes(),
+            ))
+            .unwrap();
+            assert_eq!(session.quiet_limit(), limit, "{client}");
+        }
+        assert!(LINK_QUIET > 2 * crate::link::PING_EVERY);
     }
 
     #[test]

@@ -130,6 +130,14 @@ names! {
         /// address on or off, or MCP started or stopped being served on
         /// loopback (`HostInfo.mcp`).
         McpChanged = "mcp.changed",
+        /// A Linux host was added under `host`'s name, and its link starts.
+        HostAdded = "host.added",
+        /// A Linux host was forgotten; it runs on there, on its own.
+        HostRemoved = "host.removed",
+        /// A Linux host's link came up or went down, or what it reports
+        /// changed; `state` is the new [`HostLink`], `message` why it's
+        /// down.
+        HostLink = "host.link",
     }
 }
 
@@ -142,6 +150,16 @@ names! {
         Connected = "connected",
         /// Another host, whose link is down: its agents are unavailable.
         Down = "down",
+    }
+}
+
+names! {
+    /// Who said a message of an agent's conversation.
+    MessageRole {
+        User = "user",
+        Assistant = "assistant",
+        /// A tool call, as one short line.
+        Tool = "tool",
     }
 }
 
@@ -330,6 +348,55 @@ pub fn validate_name(what: &str, name: &str) -> Result<(), String> {
     } else {
         Err(format!(
             "`{name}` isn't a valid {what} name: use up to 100 letters, digits, `.`, `_` and `-`, starting with a letter or digit"
+        ))
+    }
+}
+
+/// The longest host name: it goes in front of refs (`vps:quiet-amber-otter`)
+/// and in menus, so it stays short.
+pub const MAX_HOST_NAME_LEN: usize = 32;
+
+/// A Linux host's name, such as `vps`: like a project's (see
+/// [`validate_name`]) but at most [`MAX_HOST_NAME_LEN`] characters, and never
+/// `local`, which every `vibed` calls itself.
+pub fn validate_host_name(name: &str) -> Result<(), String> {
+    let ok = !name.is_empty()
+        && name.len() <= MAX_HOST_NAME_LEN
+        && name.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if !ok {
+        return Err(format!(
+            "`{name}` isn't a valid host name: use up to {MAX_HOST_NAME_LEN} letters, digits, `.`, `_` and `-`, starting with a letter or digit"
+        ));
+    }
+    if name == LOCAL_HOST {
+        return Err(format!(
+            "`{LOCAL_HOST}` is what every vibed calls itself; pick another name"
+        ));
+    }
+    Ok(())
+}
+
+/// An SSH destination as `ssh` takes it: `host`, `user@host`,
+/// `ssh://user@host:port` or a name from `~/.ssh/config`. It may not start
+/// with `-`, so it can't be read as an
+/// option, and holds no spaces, quotes or control characters, so it's one
+/// word in every shell.
+pub fn validate_ssh_destination(dest: &str) -> Result<(), String> {
+    let ok = !dest.is_empty()
+        && dest.len() <= 255
+        && !dest.starts_with('-')
+        && dest.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, '.' | '_' | '-' | '@' | ':' | '/' | '[' | ']' | '%')
+        });
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "`{dest}` isn't an SSH destination: write it as you would after `ssh`, such as me@vps.example.com"
         ))
     }
 }
@@ -530,6 +597,28 @@ mod tests {
         assert_eq!(EventKind::AgentState.to_string(), "agent.state");
         assert!("Linux".parse::<Environment>().is_err());
         assert!(serde_json::from_str::<Mode>("\"plan\"").is_err());
+    }
+
+    #[test]
+    fn host_names_and_destinations() {
+        for good in ["vps", "build-1", "a.b_c"] {
+            assert_eq!(validate_host_name(good), Ok(()), "{good}");
+        }
+        for bad in ["", "local", "-x", "a:b", "a b", &"x".repeat(33)] {
+            assert!(validate_host_name(bad).is_err(), "{bad}");
+        }
+        for good in [
+            "vps",
+            "me@vps.example.com",
+            "ssh://me@vps:2222",
+            "me@[::1]",
+            "box.tail1234.ts.net",
+        ] {
+            assert_eq!(validate_ssh_destination(good), Ok(()), "{good}");
+        }
+        for bad in ["", "-oProxyCommand=x", "a b", "a;b", "a'b", "$(x)", "a\nb"] {
+            assert!(validate_ssh_destination(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

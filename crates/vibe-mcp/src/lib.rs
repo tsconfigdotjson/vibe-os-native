@@ -47,9 +47,10 @@ pub enum Input {
         submit: bool,
         force: bool,
     },
-    /// Keys, each the bytes a terminal sends for it ([`keys::bytes`]),
-    /// pressed one at a time.
-    Keys(Vec<Vec<u8>>),
+    /// Keys by name, as `vibe_send` takes them (`"2"`, `"Down"`,
+    /// `"Ctrl+C"`), each checked with [`keys::bytes`], which gives the
+    /// bytes a terminal sends for it. Pressed one at a time.
+    Keys(Vec<String>),
 }
 
 /// What a send did.
@@ -100,6 +101,9 @@ pub struct AgentView {
     pub agent: Agent,
     /// The line that attaches a terminal from another machine.
     pub attach_remote: String,
+    /// False while its host's link is down: it's the agent as its host
+    /// last listed it, and calls for it fail until the link is back.
+    pub available: bool,
 }
 
 /// A message of an agent's conversation.
@@ -109,8 +113,8 @@ pub use vibe_status::{Message, Role};
 pub type Error = ErrorObject;
 
 /// What the MCP server needs from `vibed`: the core handlers, by host.
-/// Hosts other than `local` come with Linux hosts (#16); until then, a
-/// `Daemon` knows only its own.
+/// Hosts other than `local` are Linux hosts this one is linked to, reached
+/// over their links.
 pub trait Daemon: Send + Sync + 'static {
     /// Writes a line to the daemon's log.
     fn log(&self, line: &str) {
