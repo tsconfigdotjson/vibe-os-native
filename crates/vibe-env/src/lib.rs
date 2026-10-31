@@ -11,13 +11,15 @@
 //!
 //! - the traits and the types they pass;
 //! - [`tree`], a process tree by session ID and the one way to freeze it,
-//!   which the `macos` sleeper and governor (#11) and the test backend use;
+//!   which the `macos` sleeper and governor and the test backend use;
 //! - [`claude`], Claude Code's state in a compartment: where its
 //!   transcripts go, the pre-fill that opens it straight to its prompt, and
 //!   forgetting a worktree;
 //! - [`native`], what backends whose agents run natively share;
+//! - [`macos`], the `macos` backend: native agents under a resource
+//!   governor, whose decisions are [`governor`]'s;
 //! - [`testing`], a backend for tests, so the core doesn't wait on the real
-//!   ones (#9, #11, #17);
+//!   ones (#9, #17);
 //! - [`conformance`], the suite every backend must pass;
 //! - the `linux` backend's plumbing on the Mac: [`vm`] drives `vibe-vm`,
 //!   the helper that runs each agent's VM, and [`guest`] drives
@@ -27,9 +29,11 @@
 pub mod claude;
 pub mod conformance;
 pub mod ext4;
+pub mod governor;
 pub mod guest;
 pub mod images;
 pub mod linux;
+pub mod macos;
 pub mod native;
 pub mod sparse;
 pub mod testing;
@@ -254,13 +258,21 @@ pub struct Proc {
 }
 
 /// What an agent is using now.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
     pub memory: u64,
     pub cpu_ms: u64,
     pub processes: u32,
     /// The limit it hit, while that has it paused.
     pub paused: Option<Limit>,
+    /// The soft limits it's past, which it's warned about: memory at 80%,
+    /// `disk_soft`. Only a governor that measures them says.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<Limit>,
+    /// Bytes its worktree and temp dir took when last measured, where the
+    /// backend measures them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk: Option<u64>,
 }
 
 /// How a wake went.

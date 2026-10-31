@@ -19,6 +19,15 @@
 #     vibed, and the new one rebuilds that state from the transcript; a
 #     delete is refused while a commit is unpushed, and once it's pushed,
 #     leaves nothing behind but the branch
+#   - the macos backend (crates/vibe-env/tests/macos.rs, which the test step
+#     runs everywhere): on a Mac again, with a fork bomb of about a thousand
+#     processes, and PRIO_DARWIN_BG seen in `ps` as the memory warning
+#     puts an agent in the background and lets it go
+#   - a macos agent through `vibe rpc`, on the real macos backend with the
+#     stand-in for Claude Code (VIBE_CLAUDE): its transcript lands in the
+#     Mac's own ~/.claude, the status engine reads its question, a
+#     max_processes edited in host.toml pauses it at once, and a delete
+#     leaves nothing of it there or in VibeOS's folders but the branch
 #   - both Swift packages (swift/VibeOS, swift/vibe-vm): build and test,
 #     including the Swift half of the Rust<->Swift contract test
 #   - ad hoc signing, with the virtualization entitlement on vibe-vm
@@ -438,6 +447,76 @@ s_agents() {
   stop_vibed
 }
 
+# The macos backend's own tests, with a bigger fork bomb than the test
+# step's, still bounded so a governor that failed wouldn't take the Mac down.
+s_macos_governor() {
+  VIBE_FORK_BOMB_DEPTH=8 cargo test -p vibe-env --locked --test macos -- --test-threads=1 --nocapture
+}
+
+s_macos_agents() {
+  local socket="$WORK/ma/run/vibed.sock" home="$WORK/ma/home" origin="$WORK/ma/origin"
+  local repo="$WORK/ma/src/app" ref worktree session transcript i left run
+  run="$home/Library/Application Support/VibeOS/run"
+  git init -q "$origin"
+  git -C "$origin" -c user.name=t -c user.email=t@example.com commit -q --allow-empty -m first
+  git clone -q "$origin" "$repo"
+  # The Mac's own Claude state, as the owner has it before any agent.
+  mkdir -p "$home/.claude/projects"
+  echo '{}' >"$home/.claude.json"
+  export VIBE_CLAUDE="$ROOT/crates/vibe-env/src/stand-in.sh"
+  start_vibed "$socket" "$WORK/ma-vibed.log"
+  out=$(rpc \
+    "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"projects.add\",\"params\":{\"path\":\"$repo\"}}" \
+    '{"jsonrpc":"2.0","id":2,"method":"profiles.update","params":{"project":"app","profile":"software-eng-mac","memory":1073741824}}' \
+    '{"jsonrpc":"2.0","id":3,"method":"limits.set","params":{"reserve_memory":0}}' \
+    '{"jsonrpc":"2.0","id":4,"method":"agents.start","params":{"project":"app","profile":"software-eng-mac","prompt":"fork 3 commit question"}}')
+  echo "start: $out"
+  case $out in *'"error"'*) echo "a call failed"; return 1 ;; esac
+  expect '"environment":"macos"' "a macos agent"
+  ref=$(json_field "$out" 4 ref)
+  worktree=$(json_field "$out" 4 worktree)
+  session=$(json_field "$out" 4 session_id)
+  echo "agent $ref in $worktree, session $session"
+  grep -q "macos agents run natively" "$WORK/ma-vibed.log"
+  # In the Mac's own ~/.claude, not one of its own.
+  transcript="$home/.claude/projects/$(printf '%s' "$worktree" | tr -c 'A-Za-z0-9' '-')/$session.jsonl"
+  wait_file "$transcript"
+  [ ! -e "$home/VibeOS/agents/$ref/claude" ] || { echo "it has a Claude home of its own"; return 1; }
+  wait_for "$transcript" AskUserQuestion
+  for i in $(seq 1 200); do
+    [ "$(git -C "$repo" log -1 --format=%s "$ref")" = work ] && break
+    sleep 0.1
+  done
+  out=$(rpc '{"jsonrpc":"2.0","id":5,"method":"agents.list","params":{}}')
+  echo "asking: $out"
+  expect '"state":"question"' "the question, from the transcript"
+
+  # Four processes against an edited limit of two: paused at once.
+  out=$(rpc '{"jsonrpc":"2.0","id":6,"method":"limits.set","params":{"max_processes":2}}')
+  case $out in *'"error"'*) echo "limits.set failed: $out"; return 1 ;; esac
+  for i in $(seq 1 200); do
+    out=$(rpc '{"jsonrpc":"2.0","id":7,"method":"agents.list","params":{}}')
+    case $out in *'"state":"paused"'*) break ;; esac
+    sleep 0.1
+  done
+  echo "over its limit: $out"
+  expect '"state":"paused"' "the pause"
+  grep -q "$ref: paused with" "$WORK/ma-vibed.log"
+  [ -f "$home/VibeOS/agents/$ref/governor.json" ] || { echo "the pause isn't kept"; return 1; }
+
+  git -C "$worktree" push -q origin "$ref"
+  out=$(rpc "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"agents.delete\",\"params\":{\"ref\":\"$ref\"}}")
+  echo "delete: $out"
+  expect '"state":"exited"' "the deleted agent"
+  [ ! -e "$worktree" ] || { echo "the worktree is left"; return 1; }
+  [ ! -e "$(dirname "$transcript")" ] || { echo "its transcripts are left"; return 1; }
+  if grep -q "$worktree" "$home/.claude.json"; then echo "Claude still trusts its worktree"; return 1; fi
+  left=$(find "$home/VibeOS/worktrees" "$home/VibeOS/agents" "$run" "$home/.claude/projects" -mindepth 1 2>/dev/null)
+  [ -z "$left" ] || { echo "left behind: $left"; return 1; }
+  git -C "$repo" rev-parse --verify --quiet "refs/heads/$ref" >/dev/null || { echo "the branch went"; return 1; }
+  stop_vibed
+}
+
 s_swift_app_build() { swift build --package-path swift/VibeOS; }
 
 # The Swift half of the contract test runs here; the live suite stays off.
@@ -583,6 +662,8 @@ step smoke "vibed hello world via vibe hello and vibe rpc" s_smoke build
 step registry "registry via vibe rpc survives a vibed restart" s_registry build
 step sessions "a session outlives a killed vibed and is re-adopted" s_sessions build
 step agents "agents start, outlive vibed, and delete to nothing but the branch" s_agents build
+mac_step macos-governor "the macos backend: conformance, fork bomb, memory, nohup, CPU, disk" s_macos_governor build
+mac_step macos-agents "a macos agent on the governor: Mac's ~/.claude, a limit pause, delete" s_macos_agents build
 mac_step swift-app-build "swift build swift/VibeOS" s_swift_app_build
 mac_step swift-app-test "swift test swift/VibeOS (Swift contract tests)" s_swift_app_test swift-app-build
 mac_step swift-vm-build "swift build swift/vibe-vm" s_swift_vm_build

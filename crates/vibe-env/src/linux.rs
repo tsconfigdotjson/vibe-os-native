@@ -854,6 +854,7 @@ impl Limiter for LinuxVm {
             cpu_ms: procs.iter().map(|p| p.cpu_ms).sum(),
             processes: procs.len() as u32,
             paused: self.paused(h),
+            ..Usage::default()
         })
     }
 }

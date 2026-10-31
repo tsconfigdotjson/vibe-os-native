@@ -8,11 +8,17 @@
 //! tags aren't used: on macOS 26, `KERN_PROCARGS2` hides the environment of
 //! Apple's own binaries.
 //!
-//! [`SessionTree::freeze`] is the one way a native tree is frozen: the
-//! `macos` sleeper and governor and the test backend all use it. The shim,
-//! the session's leader, is never frozen, because it must keep answering.
+//! A tree [`SessionTree::with_descendants`] also takes in what the
+//! session's processes started that has since left the session but not the
+//! tree, found by walking each process's children (`proc_listchildpids` on
+//! macOS), as the `macos` governor counts an agent (#11).
+//!
+//! [`freeze`] is the one way a native tree is frozen: the `macos` sleeper
+//! and governor and the test backend all use it, through
+//! [`SessionTree::freeze`]. The shim, the session's leader, is never
+//! frozen, because it must keep answering.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::time::{Duration, Instant};
 
@@ -33,17 +39,36 @@ pub const SHIM_NAME: &str = "vibe-shim";
 pub struct SessionTree {
     /// The session ID: its leader's pid, which is the shim's.
     pub sid: u32,
+    /// Whether descendants that left the session count too.
+    pub descendants: bool,
 }
 
 impl SessionTree {
     pub fn new(sid: u32) -> SessionTree {
-        SessionTree { sid }
+        SessionTree {
+            sid,
+            descendants: false,
+        }
+    }
+
+    /// The session, plus every descendant of its processes that has since
+    /// started a session of its own without leaving the tree.
+    pub fn with_descendants(sid: u32) -> SessionTree {
+        SessionTree {
+            sid,
+            descendants: true,
+        }
     }
 
     /// Every live process in the session, its leader included. Zombies
     /// are left out: they've ended.
     pub fn all(&self) -> Vec<Proc> {
-        os::session(self.sid)
+        let procs = os::session(self.sid);
+        if self.descendants {
+            with_descendants(procs)
+        } else {
+            procs
+        }
     }
 
     /// Every live process in the session but its leader.
@@ -71,43 +96,9 @@ impl SessionTree {
         self.all().is_empty()
     }
 
-    /// Stops every member with `SIGSTOP`, and returns how many there were
-    /// once every one says it's stopped. A process can fork between being
-    /// listed and being stopped, so the session is listed again until a
-    /// pass finds nothing running; and a member a stop hasn't reached yet
-    /// (or that was continued meanwhile) is sent it again. A tree that
-    /// won't all stop within [`FREEZE_SETTLE`] is an error naming those
-    /// left: a freeze that's only been asked for isn't one.
+    /// Stops every member with `SIGSTOP`; see [`freeze`].
     pub fn freeze(&self) -> io::Result<usize> {
-        let deadline = Instant::now() + FREEZE_SETTLE;
-        let mut sent: HashMap<u32, Instant> = HashMap::new();
-        loop {
-            let members = self.members();
-            let running: Vec<&Proc> = members.iter().filter(|p| !p.stopped).collect();
-            if running.is_empty() {
-                return Ok(members.len());
-            }
-            if Instant::now() >= deadline {
-                let left: Vec<String> = running
-                    .iter()
-                    .map(|p| format!("{} ({})", p.pid, p.name))
-                    .collect();
-                return Err(io::Error::other(format!(
-                    "the agent's processes didn't all stop: {} still running",
-                    left.join(", ")
-                )));
-            }
-            for p in running {
-                let due = sent
-                    .get(&p.pid)
-                    .is_none_or(|at| at.elapsed() >= FREEZE_RESEND);
-                if due {
-                    signal(p.pid, libc::SIGSTOP);
-                    sent.insert(p.pid, Instant::now());
-                }
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        freeze(|| self.members())
     }
 
     /// Continues every member with `SIGCONT`.
@@ -150,14 +141,94 @@ impl SessionTree {
     }
 }
 
-fn signal(pid: u32, sig: i32) {
+/// Stops every process `list` gives with `SIGSTOP`, and returns how many
+/// there were once every one says it's stopped. A process can fork between
+/// being listed and being stopped, so `list` is asked again until a pass
+/// finds nothing running; and a process a stop hasn't reached yet (or that
+/// was continued meanwhile) is sent it again. A tree that won't all stop
+/// within [`FREEZE_SETTLE`] is an error naming those left: a freeze that's
+/// only been asked for isn't one.
+pub fn freeze(mut list: impl FnMut() -> Vec<Proc>) -> io::Result<usize> {
+    let deadline = Instant::now() + FREEZE_SETTLE;
+    let mut sent: HashMap<u32, Instant> = HashMap::new();
+    loop {
+        let members = list();
+        let running: Vec<&Proc> = members.iter().filter(|p| !p.stopped).collect();
+        if running.is_empty() {
+            return Ok(members.len());
+        }
+        if Instant::now() >= deadline {
+            let left: Vec<String> = running
+                .iter()
+                .map(|p| format!("{} ({})", p.pid, p.name))
+                .collect();
+            return Err(io::Error::other(format!(
+                "the agent's processes didn't all stop: {} still running",
+                left.join(", ")
+            )));
+        }
+        for p in running {
+            let due = sent
+                .get(&p.pid)
+                .is_none_or(|at| at.elapsed() >= FREEZE_RESEND);
+            if due {
+                signal(p.pid, libc::SIGSTOP);
+                sent.insert(p.pid, Instant::now());
+            }
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// `procs` and every live descendant of theirs, each once.
+fn with_descendants(mut procs: Vec<Proc>) -> Vec<Proc> {
+    let mut seen: HashSet<u32> = procs.iter().map(|p| p.pid).collect();
+    let mut next: Vec<u32> = procs.iter().map(|p| p.pid).collect();
+    while let Some(pid) = next.pop() {
+        for child in os::children(pid) {
+            if seen.insert(child)
+                && let Some(p) = os::process(child)
+            {
+                next.push(child);
+                procs.push(p);
+            }
+        }
+    }
+    procs
+}
+
+/// The live children of `pid`.
+pub fn children(pid: u32) -> Vec<u32> {
+    os::children(pid)
+}
+
+/// What `pid` is now, unless it has gone or is a zombie; and its session.
+pub fn process(pid: u32) -> Option<(Proc, u32)> {
+    let p = os::process(pid)?;
+    // SAFETY: getsid has no memory-safety preconditions.
+    let sid = unsafe { libc::getsid(i32::try_from(pid).ok()?) };
+    Some((p, u32::try_from(sid).ok()?))
+}
+
+/// Puts `pid` in the background, or brings it back: on macOS,
+/// `PRIO_DARWIN_BG`, which runs it on the efficiency cores with its I/O
+/// throttled, enforced by the kernel. Elsewhere there's no unprivileged
+/// way back from a lower priority, so it's unsupported.
+pub fn set_background(pid: u32, on: bool) -> io::Result<()> {
+    os::set_background(pid, on)
+}
+
+/// Sends `sig` to `pid`, unless it's init or no pid at all; whether it was
+/// sent.
+pub fn signal(pid: u32, sig: i32) -> bool {
     if let Ok(pid) = i32::try_from(pid)
         && pid > 1
     {
         // SAFETY: kill has no memory-safety preconditions; a process that
         // has gone just makes it fail with ESRCH.
-        unsafe { libc::kill(pid, sig) };
+        return unsafe { libc::kill(pid, sig) } == 0;
     }
+    false
 }
 
 #[cfg(target_os = "linux")]
@@ -208,6 +279,36 @@ mod os {
                 page: u64::try_from(page).ok().filter(|p| *p > 0).unwrap_or(4096),
             }
         }
+    }
+
+    /// The live children of `pid`, from every one of its threads.
+    pub(super) fn children(pid: u32) -> Vec<u32> {
+        let Ok(tasks) = fs::read_dir(format!("/proc/{pid}/task")) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for t in tasks.filter_map(Result::ok) {
+            if let Ok(text) = fs::read_to_string(t.path().join("children")) {
+                out.extend(
+                    text.split_whitespace()
+                        .filter_map(|c| c.parse::<u32>().ok()),
+                );
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    pub(super) fn process(pid: u32) -> Option<Proc> {
+        let clock = Clock::now();
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let (s, _) = parse_stat(pid, &stat, &clock)?;
+        read(pid, s, &clock).map(|(_, p)| p)
+    }
+
+    pub(super) fn set_background(_pid: u32, _on: bool) -> std::io::Result<()> {
+        Err(std::io::ErrorKind::Unsupported.into())
     }
 
     /// A process's session and what it is, unless it has gone or is a
@@ -308,6 +409,44 @@ mod os {
             .collect()
     }
 
+    /// The live children of `pid`, from `proc_listchildpids`.
+    pub(super) fn children(pid: u32) -> Vec<u32> {
+        let Ok(pid) = i32::try_from(pid) else {
+            return Vec::new();
+        };
+        // SAFETY: with a null buffer, proc_listchildpids only counts.
+        let n = unsafe { libc::proc_listchildpids(pid, std::ptr::null_mut(), 0) };
+        let Ok(n) = usize::try_from(n) else {
+            return Vec::new();
+        };
+        // Room for some that start meanwhile.
+        let mut pids = vec![0i32; n + 16];
+        let bytes = i32::try_from(pids.len() * size_of::<i32>()).unwrap_or(i32::MAX);
+        // SAFETY: the buffer holds `bytes` bytes.
+        let got = unsafe { libc::proc_listchildpids(pid, pids.as_mut_ptr().cast(), bytes) };
+        pids.truncate(usize::try_from(got).unwrap_or(0).min(pids.len()));
+        pids.into_iter()
+            .filter_map(|p| u32::try_from(p).ok())
+            .filter(|&p| p > 0)
+            .collect()
+    }
+
+    pub(super) fn process(pid: u32) -> Option<Proc> {
+        read(i32::try_from(pid).ok()?, timebase())
+    }
+
+    /// `PRIO_DARWIN_BG` on, or off again (PRD: How macos is governed).
+    pub(super) fn set_background(pid: u32, on: bool) -> std::io::Result<()> {
+        let pid = libc::id_t::from(pid);
+        let prio = if on { libc::PRIO_DARWIN_BG } else { 0 };
+        // SAFETY: setpriority has no memory-safety preconditions.
+        if unsafe { libc::setpriority(libc::PRIO_DARWIN_PROCESS, pid, prio) } == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
     fn all_pids() -> Vec<i32> {
         // SAFETY: with a null buffer, proc_listallpids only counts.
         let n = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
@@ -398,6 +537,18 @@ mod os {
 
     pub(super) fn session(_sid: u32) -> Vec<Proc> {
         Vec::new()
+    }
+
+    pub(super) fn children(_pid: u32) -> Vec<u32> {
+        Vec::new()
+    }
+
+    pub(super) fn process(_pid: u32) -> Option<Proc> {
+        None
+    }
+
+    pub(super) fn set_background(_pid: u32, _on: bool) -> std::io::Result<()> {
+        Err(std::io::ErrorKind::Unsupported.into())
     }
 }
 

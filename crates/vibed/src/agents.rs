@@ -169,7 +169,7 @@ impl Admission for HostAdmission {
 }
 
 /// A size for people: `4G`, `1.5G`, `512M`.
-fn size(bytes: u64) -> String {
+pub(crate) fn size(bytes: u64) -> String {
     if bytes >= GIB {
         let tenths = (bytes * 10 + GIB / 2) / GIB;
         if tenths.is_multiple_of(10) {
@@ -194,7 +194,7 @@ fn internal(message: impl fmt::Display) -> ErrorObject {
 }
 
 /// Runs a backend call on a thread that may block.
-async fn blocking<T: Send + 'static>(
+pub(crate) async fn blocking<T: Send + 'static>(
     f: impl FnOnce() -> vibe_env::Result<T> + Send + 'static,
 ) -> Result<T, ErrorObject> {
     tokio::task::spawn_blocking(f)
@@ -501,7 +501,10 @@ struct Undo {
 }
 
 impl Core {
-    fn backend(&self, environment: Environment) -> Result<Arc<dyn Backend>, ErrorObject> {
+    pub(crate) fn backend(
+        &self,
+        environment: Environment,
+    ) -> Result<Arc<dyn Backend>, ErrorObject> {
         self.backends.get(environment).ok_or_else(|| {
             error(
                 ErrorCode::Conflict,

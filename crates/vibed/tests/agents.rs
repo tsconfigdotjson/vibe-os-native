@@ -1356,3 +1356,186 @@ async fn a_wake_that_reattaches_starts_a_shim_and_no_new_claude() {
     w.core.delete_agent(delete(&a.agent, true)).await.unwrap();
     wait_until("the new shim to go", || new.is_empty());
 }
+
+#[tokio::test]
+async fn a_limit_hit_makes_the_agent_paused_and_says_so() {
+    // A backend of its own, kept to wake the agent with.
+    let bin = common::short_tempdir();
+    let backend = Arc::new(vibe_env::testing::TestBackend::new(common::stand_in(
+        bin.path(),
+    )));
+    let w = {
+        let backend = Arc::clone(&backend);
+        world_with(move |c| {
+            c.backends = Backends::all(backend.clone());
+        })
+        .await
+    };
+    // The stand-in's twenty sleeps against a limit of eight.
+    w.core
+        .set_limits(vibe_core::rpc::LimitsSetParams {
+            max_processes: Some(8),
+            ..Default::default()
+        })
+        .unwrap();
+    let (_, mut events) = w.core.subscribe();
+    let a = w.core.start_agent(start("fork 20")).await.unwrap();
+    let watching = w.core.spawn_limit_watch(Duration::from_millis(100));
+    let mut next = async |what: &str, ok: &dyn Fn(&vibe_core::rpc::Event) -> bool| {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let e = events.recv().await.unwrap();
+                if e.agent.as_deref() == Some(a.agent.as_str()) && ok(&e) {
+                    return e;
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("no {what} event"))
+    };
+    let e = next("agent.limit", &|e| e.kind == EventKind::AgentLimit).await;
+    assert_eq!(e.limit.as_deref(), Some("processes"));
+    assert_eq!(e.project.as_deref(), Some("app"));
+    let message = e.message.unwrap();
+    assert!(
+        message.starts_with("paused with ") && message.ends_with("over its limit of 8"),
+        "{message}"
+    );
+    next("paused", &|e| {
+        e.kind == EventKind::AgentState && e.state.as_deref() == Some("paused")
+    })
+    .await;
+    let listed = w.list().await;
+    assert_eq!(listed[0].state, AgentState::Paused);
+
+    // Raised and woken, it's what its transcript says again, and not
+    // announced twice.
+    let record = vibe_core::store::Store::open(&w.layout.db())
+        .unwrap()
+        .agent("local", &a.agent)
+        .unwrap();
+    let handle: vibe_env::Handle = serde_json::from_str(&record.compartment).unwrap();
+    use vibe_env::{Limiter, Sleeper};
+    backend
+        .apply(
+            &handle,
+            &vibe_env::Limits::new(GIB, &vibe_core::limits::HostLimits::default()),
+        )
+        .unwrap();
+    backend.wake(&handle).unwrap();
+    let e = next("a state after the pause", &|e| {
+        e.kind == EventKind::AgentLimit || e.kind == EventKind::AgentState
+    })
+    .await;
+    assert_eq!(e.kind, EventKind::AgentState, "{e:?}");
+    assert_ne!(e.state.as_deref(), Some("paused"));
+    assert_ne!(w.list().await[0].state, AgentState::Paused);
+    watching.abort();
+    w.core.delete_agent(delete(&a.agent, true)).await.unwrap();
+}
+
+#[tokio::test]
+async fn host_limits_edited_while_an_agent_runs_hold_it_at_once() {
+    let w = world().await;
+    let a = w.core.start_agent(start("fork 3")).await.unwrap();
+    w.wait_screen(&a.agent, "Ready.");
+    let watching = w.core.spawn_limit_watch(Duration::from_millis(100));
+    // Room enough: it runs on.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_ne!(w.list().await[0].state, AgentState::Paused);
+    w.core
+        .set_limits(vibe_core::rpc::LimitsSetParams {
+            max_processes: Some(2),
+            ..Default::default()
+        })
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while w.list().await[0].state != AgentState::Paused {
+        assert!(std::time::Instant::now() < deadline, "never paused");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    watching.abort();
+    w.core.delete_agent(delete(&a.agent, true)).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_macos_agent_runs_on_the_governor_in_the_owners_own_claude_home() {
+    let bin = common::short_tempdir();
+    let claude = common::stand_in(bin.path());
+    let w = world_with(move |c| {
+        let backend = vibe_env::macos::Macos::new(c.layout.home())
+            .with_claude(&claude)
+            .with_path(std::env::var("PATH").unwrap());
+        c.backends = Backends::new().with(vibe_core::model::Environment::Macos, Arc::new(backend));
+    })
+    .await;
+    let a = w
+        .core
+        .start_agent(AgentStartParams {
+            profile: "software-eng-mac".into(),
+            ..start("fork 3 question")
+        })
+        .await
+        .unwrap();
+    assert_eq!(a.environment, vibe_core::model::Environment::Macos);
+    w.wait_screen(&a.agent, "Red or blue?");
+    // Its transcript is in the owner's ~/.claude, and it has no Claude
+    // home of its own.
+    let claude_home = ClaudeHome::user(&w.golden.home);
+    let worktree = PathBuf::from(&a.worktree);
+    let transcript = claude_home.transcript(&worktree, &a.session_id);
+    wait_until("the transcript", || transcript.is_file());
+    assert!(!w.layout.agent_dir(&a.agent).join("claude").exists());
+    let state = fs::read_to_string(&claude_home.state).unwrap();
+    assert!(
+        state.contains(&a.worktree),
+        "the worktree is trusted: {state}"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while w.list().await[0].state != AgentState::Question {
+        assert!(std::time::Instant::now() < deadline, "never a question");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // An edited limit pauses it, and says so.
+    let (_, mut events) = w.core.subscribe();
+    let watching = w.core.spawn_limit_watch(Duration::from_millis(100));
+    w.core
+        .set_limits(vibe_core::rpc::LimitsSetParams {
+            max_processes: Some(2),
+            ..Default::default()
+        })
+        .unwrap();
+    let e = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let e = events.recv().await.unwrap();
+            if e.kind == EventKind::AgentLimit {
+                return e;
+            }
+        }
+    })
+    .await
+    .expect("an agent.limit event");
+    assert_eq!(e.limit.as_deref(), Some("processes"));
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while w.list().await[0].state != AgentState::Paused {
+        assert!(std::time::Instant::now() < deadline, "never paused");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        w.layout
+            .agent_dir(&a.agent)
+            .join(vibe_env::macos::STATE_FILE)
+            .is_file()
+    );
+    watching.abort();
+
+    // A delete takes its transcripts and its trust from the owner's
+    // Claude state, and leaves the rest of it.
+    w.core.delete_agent(delete(&a.agent, true)).await.unwrap();
+    assert!(!transcript.parent().unwrap().exists());
+    let state = fs::read_to_string(&claude_home.state).unwrap();
+    assert!(!state.contains(&a.worktree), "{state}");
+    assert!(state.contains("hasCompletedOnboarding"), "{state}");
+    assert!(w.agent_files().is_empty(), "{:?}", w.agent_files());
+}

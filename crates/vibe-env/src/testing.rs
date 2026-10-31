@@ -207,6 +207,7 @@ impl Limiter for TestBackend {
             cpu_ms: procs.iter().map(|p| p.cpu_ms).sum(),
             processes: procs.len() as u32,
             paused,
+            ..Usage::default()
         })
     }
 }
