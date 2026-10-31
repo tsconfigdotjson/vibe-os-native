@@ -139,7 +139,6 @@ impl Config {
     pub fn new(info: DaemonInfo, layout: Layout) -> Self {
         let path = std::env::var_os("PATH");
         Config {
-            info,
             label: hostname(),
             layout,
             gh: find_program("gh", path.as_deref()),
@@ -156,7 +155,11 @@ impl Config {
             power: Arc::new(crate::power::HostPower::default()),
             free_disk: Arc::new(crate::sleep::free_space),
             sleep_timing: crate::sleep::Timing::default(),
-            external: crate::external::ExternalConfig::default(),
+            external: crate::external::ExternalConfig {
+                serve_here: info.os == "linux",
+                ..crate::external::ExternalConfig::default()
+            },
+            info,
         }
     }
 }
@@ -335,6 +338,10 @@ pub struct Core {
     pub(crate) peer: crate::external::MacPeer,
     /// On a Mac, the tunnel to the Linux host that's its external address.
     pub(crate) tunnel: Mutex<Option<crate::tunnel::Tunnel>>,
+    /// On a Mac, the tunnel's socket, served while a host is the external
+    /// address.
+    pub(crate) tunnel_socket_served:
+        Mutex<Option<(tokio::task::JoinHandle<()>, vibe_core::socket::SocketGuard)>>,
     /// On a Mac, when a host last came through the tunnel.
     pub(crate) tunnel_seen: Mutex<Option<std::time::Instant>>,
     _state_lock: File,
@@ -492,6 +499,7 @@ impl Core {
             external: config.external,
             public: Mutex::new(None),
             tunnel: Mutex::new(None),
+            tunnel_socket_served: Mutex::new(None),
             tunnel_seen: Mutex::new(None),
             _state_lock: state_lock,
         };

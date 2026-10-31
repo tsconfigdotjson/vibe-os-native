@@ -67,6 +67,10 @@ environment:
   VIBE_EXTERNAL_CERT, VIBE_EXTERNAL_KEY
                   for tests only: a PEM certificate chain and key the
                   external address serves, instead of one from ACME
+  VIBE_TEST_SERVE_EXTERNAL
+                  for tests only, with VIBE_TEST_BACKEND: 1 lets this host be
+                  the external address whatever its OS, as a stand-in Linux
+                  host on a Mac
   VIBE_TEST_BACKEND
                   for tests only: run every environment's agents natively,
                   unlimited but for a supervisor, with this program as
@@ -233,6 +237,18 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
     ) {
         config.external.fixed_cert = Some((PathBuf::from(cert), PathBuf::from(key)));
     }
+    let stand_in = env_text("VIBE_TEST_SERVE_EXTERNAL");
+    let serve = serve_here(
+        &config.info.os,
+        env_text("VIBE_TEST_BACKEND").is_some(),
+        stand_in.as_deref(),
+    );
+    if serve && config.info.os != "linux" {
+        vibed::log!(
+            "vibed: VIBE_TEST_SERVE_EXTERNAL is set: this host may be the external address"
+        );
+    }
+    config.external.serve_here = serve;
     if let Some(claude) = std::env::var_os("VIBE_TEST_BACKEND").filter(|v| !v.is_empty()) {
         vibed::log!(
             "vibed: VIBE_TEST_BACKEND is set: agents run under the test backend, with {} as \
@@ -352,20 +368,8 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
     let sleep = core.spawn_sleep_watch();
     // The links to Linux hosts, each kept up on its own.
     core.spawn_links();
-    // On a Mac, the socket the external address's tunnel reaches, which
-    // checks every call's API key itself.
-    let tunnel_socket = if cfg!(target_os = "macos") {
-        match core.spawn_tunnel_socket() {
-            Ok(served) => Some(served),
-            Err(e) => {
-                vibed::log!("vibed: the external address can't reach this Mac: {e}");
-                None
-            }
-        }
-    } else {
-        None
-    };
-    // External access: a Linux host's public endpoint, a Mac's tunnel.
+    // External access: a Linux host's public endpoint; a Mac's tunnel, and
+    // the socket it reaches, which checks every call's API key itself.
     core.spawn_external();
     vibed::log!(
         "vibed {} listening on {}",
@@ -381,10 +385,6 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
     server::serve(listener, Arc::clone(&core), MAX_MESSAGE_BYTES, shutdown).await;
     core.stop_links();
     core.stop_external();
-    if let Some((task, guard)) = tunnel_socket {
-        task.abort();
-        drop(guard);
-    }
     mcp.abort();
     gh_checks.abort();
     status.abort();
@@ -413,6 +413,13 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
+/// Whether this host may serve the external address: a Linux host may, a
+/// Mac never; except, in tests, a stand-in Linux host on a Mac, which runs
+/// the test backend and asks with `VIBE_TEST_SERVE_EXTERNAL=1`.
+fn serve_here(os: &str, test_backend: bool, stand_in: Option<&str>) -> bool {
+    os == "linux" || (test_backend && stand_in == Some("1"))
+}
+
 /// An environment variable's value, if it's set to text.
 fn env_text(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
@@ -433,6 +440,18 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Args, String> {
         parse_args(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn a_mac_never_serves_the_external_address() {
+        assert!(serve_here("linux", false, None));
+        assert!(!serve_here("macos", false, None));
+        // The variable alone does nothing: only a test's stand-in host,
+        // on the test backend, may.
+        assert!(!serve_here("macos", false, Some("1")));
+        assert!(!serve_here("macos", true, None));
+        assert!(!serve_here("macos", true, Some("yes")));
+        assert!(serve_here("macos", true, Some("1")));
     }
 
     #[test]

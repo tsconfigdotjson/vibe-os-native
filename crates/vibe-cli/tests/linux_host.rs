@@ -307,7 +307,7 @@ esac
             .unwrap();
         writeln!(
             env,
-            "export VIBE_EXTERNAL_PORT={port} VIBE_EXTERNAL_LISTEN=127.0.0.1 \
+            "export VIBE_TEST_SERVE_EXTERNAL=1 VIBE_EXTERNAL_PORT={port} VIBE_EXTERNAL_LISTEN=127.0.0.1 \
              VIBE_EXTERNAL_CERT='{}' VIBE_EXTERNAL_KEY='{}'",
             c.display(),
             k.display()
@@ -348,14 +348,12 @@ fn bundle(dir: &Path) -> PathBuf {
     dir.join("bundle")
 }
 
-/// The Mac: a vibed in this process, on a socket and serving MCP, with its
-/// tunnel socket for the external address.
+/// The Mac: a vibed in this process, on a socket and serving MCP.
 struct Mac {
     core: Arc<Core>,
     socket: PathBuf,
     mcp: SocketAddr,
     _guard: server::SocketGuard,
-    _tunnel: server::SocketGuard,
     rt: tokio::runtime::Runtime,
 }
 
@@ -378,13 +376,11 @@ fn mac(golden: &common::Golden, ssh: &Path, bundle: PathBuf) -> Mac {
         max_backoff: Duration::from_secs(1),
     };
     let core = Arc::new(Core::open(config).unwrap());
-    let tunnel = {
+    {
         let _in = rt.enter();
         core.spawn_links();
-        let (_, guard) = core.spawn_tunnel_socket().unwrap();
         core.spawn_external();
-        guard
-    };
+    }
     let listener = rt
         .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
         .unwrap();
@@ -402,7 +398,6 @@ fn mac(golden: &common::Golden, ssh: &Path, bundle: PathBuf) -> Mac {
         socket,
         mcp,
         _guard: guard,
-        _tunnel: tunnel,
         rt,
     }
 }

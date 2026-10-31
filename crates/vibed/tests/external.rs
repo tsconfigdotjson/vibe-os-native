@@ -215,7 +215,6 @@ struct World {
     public: SocketAddr,
     cert: CertificateDer<'static>,
     _server: TestServer,
-    _tunnel_socket: (tokio::task::JoinHandle<()>, vibe_core::socket::SocketGuard),
     _certs: tempfile::TempDir,
 }
 
@@ -231,7 +230,6 @@ async fn world(limits: Limits) -> World {
     config.link_timing = quick();
     let mac = Arc::new(Core::open(config).unwrap());
     mac.spawn_links();
-    let tunnel_socket = mac.spawn_tunnel_socket().unwrap();
     mac.spawn_external();
 
     let certs = common::short_tempdir();
@@ -246,6 +244,7 @@ async fn world(limits: Limits) -> World {
     // Its own keys aren't the Mac's.
     config.entropy = Arc::new(vibe_core::keys::random_bytes);
     config.external = ExternalConfig {
+        serve_here: true,
         port,
         // Loopback only: the tests open nothing to the network.
         listen: Some(std::net::Ipv4Addr::LOCALHOST.into()),
@@ -276,7 +275,6 @@ async fn world(limits: Limits) -> World {
         public: SocketAddr::from(([127, 0, 0, 1], port)),
         cert,
         _server: server,
-        _tunnel_socket: tunnel_socket,
         _certs: certs,
     };
     w.mac
@@ -696,6 +694,10 @@ async fn one_url_and_one_key_reach_agents_on_the_host_and_the_mac() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(TcpStream::connect(w.public).await.is_err(), "still serving");
+    // Nothing of the tunnel is left on the Mac: no socket, no lock.
+    let socket = w.mac.tunnel_socket();
+    assert!(!socket.exists(), "{} is left", socket.display());
+    assert!(!vibe_core::socket::lock_path(&socket).exists());
     assert!(!w.host.hosts().unwrap().hosts[0].external);
 }
 

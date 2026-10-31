@@ -48,6 +48,9 @@ pub const TUNNEL_END: &str = "mac.sock";
 /// the environment (see its `--help`).
 #[derive(Debug, Clone)]
 pub struct ExternalConfig {
+    /// Whether this host may serve the external address: a Linux host may,
+    /// a Mac never ([`crate::core::Config::new`] says which by its OS).
+    pub serve_here: bool,
     pub port: u16,
     /// The one address to listen on; every address by default. Tests keep
     /// to loopback.
@@ -65,6 +68,7 @@ pub struct ExternalConfig {
 impl Default for ExternalConfig {
     fn default() -> Self {
         ExternalConfig {
+            serve_here: false,
             port: HTTPS_PORT,
             listen: None,
             acme_directory: acme::LETS_ENCRYPT.into(),
@@ -528,7 +532,7 @@ async fn probe_mac(core: Weak<Core>, every: Duration) {
 impl Core {
     /// The public name this Linux host is the external address at, if it is.
     pub(crate) fn public_domain(&self) -> Option<String> {
-        if self.info().os != "linux" {
+        if !self.external.serve_here {
             return None;
         }
         self.store().host_external(LOCAL_HOST).ok().flatten()
@@ -599,6 +603,7 @@ impl Core {
     pub fn stop_external(&self) {
         lock(&self.public).take();
         lock(&self.tunnel).take();
+        self.close_tunnel_socket();
     }
 
     // tunnel.prepare
@@ -739,7 +744,7 @@ impl Core {
     }
 
     fn set_external_here(&self, domain: Option<String>) -> Result<HostInfo, ErrorObject> {
-        if self.info().os != "linux" {
+        if !self.external.serve_here {
             return Err(invalid(
                 "this Mac never listens publicly: make a Linux host with a public address the external address",
             ));

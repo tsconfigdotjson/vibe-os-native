@@ -37,9 +37,9 @@
 #     with a key from `vibe key create`, `vibe mcp` carries VibeOS's round
 #     over stdio: start an agent on a question, wait for it, read it, answer
 #     it with keys, wait for that answer, read it, and delete the agent. On
-#     a Mac, vibed also serves the external address's tunnel socket
-#     (run/tunnel.sock), private to the owner, and listens on no TCP port
-#     beyond loopback (lsof says so)
+#     a Mac, vibed serves no tunnel socket (run/tunnel.sock) while no host is
+#     the external address, and listens on no TCP port beyond loopback
+#     (lsof says so)
 #   - a Linux host over SSH, with every process real but the network
 #     (crates/vibe-cli/tests/linux_host.rs): a stand-in ssh runs commands in a
 #     home of the host's own and a stand-in systemctl runs its vibed; Add
@@ -329,15 +329,43 @@ s_test_guest() { scripts/test-guest.sh build/test-guest; }
 # Every crate type-checks for the hosts vibed runs on, whatever this machine
 # is. Checking needs each target's std but no linker, so it works anywhere.
 s_cross() {
-  local host target
+  local host target var
   host=$(rustc -vV | sed -n 's/^host: //p')
+  # C that dependencies build (ring, for the external address's TLS) needs
+  # the target's C toolchain, which a Mac checking Linux doesn't have. A
+  # check links nothing, so a stand-in compiler and archiver that make
+  # empty outputs are enough, as the target's C is never used.
+  write_c_stub "$WORK/cross-cc"
   for target in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
     [ "$target" = "$host" ] && continue
     rustup target add "$target"
-    # The bundled SQLite is C, which needs the target's C toolchain to
-    # build. A check links nothing, so skip it and use the bindings alone.
-    LIBSQLITE3_SYS_USE_PKG_CONFIG=1 cargo check --workspace --all-targets --locked --target "$target"
+    var=$(printf '%s' "$target" | tr - _)
+    # The bundled SQLite is C too: skip it and use the bindings alone.
+    env "CC_$var=$WORK/cross-cc" "AR_$var=$WORK/cross-cc" LIBSQLITE3_SYS_USE_PKG_CONFIG=1 \
+      cargo check --workspace --all-targets --locked --target "$target"
   done
+}
+
+# write_c_stub <path>: a C compiler and archiver for `cargo check` of
+# another target. It makes whatever output it's asked for, empty: `-o FILE`
+# for a compile, the `.a` for an archive; `-E` (cc-rs asking what it is)
+# prints nothing.
+write_c_stub() {
+  cat >"$1" <<'STUB'
+#!/bin/sh
+out=
+while [ $# -gt 0 ]; do
+  case $1 in
+    -o) out=$2; shift 2 ;;
+    -o?*) out=${1#-o}; shift ;;
+    *.a) [ -n "$out" ] || out=$1; shift ;;
+    *) shift ;;
+  esac
+done
+if [ -n "$out" ]; then : >"$out"; fi
+exit 0
+STUB
+  chmod +x "$1"
 }
 
 s_smoke() {
@@ -632,13 +660,10 @@ s_mcp() {
   wait "$bridge" || { echo "vibe mcp exited with $?"; cat "$WORK/mc-bridge.err"; return 1; }
   [ ! -e "$home/VibeOS/worktrees/app/mcp-check" ] || { echo "the worktree is left"; return 1; }
   git -C "$repo" rev-parse --verify --quiet refs/heads/mcp-check >/dev/null || { echo "the branch went"; return 1; }
-  # External access: on a Mac, the tunnel's socket is there, the owner's
-  # alone, and nothing listens beyond loopback.
+  # External access: with no host the external address, the tunnel's
+  # socket isn't there at all, and nothing listens beyond loopback.
   local tunnel="$home/Library/Application Support/VibeOS/run/tunnel.sock" listening
-  if [ "$OS" = Darwin ]; then
-    [ -S "$tunnel" ] || { echo "no tunnel socket at $tunnel"; return 1; }
-    [ "$(stat -f %Lp "$tunnel")" = 600 ] || { echo "the tunnel socket isn't private"; return 1; }
-  fi
+  [ ! -e "$tunnel" ] || { echo "$tunnel is served with no external address"; return 1; }
   if [ "$OS" = Darwin ] && ! command -v lsof >/dev/null; then
     echo "no lsof to see what vibed listens on"
     return 1

@@ -213,7 +213,7 @@ async fn connection(core: Arc<Core>, stream: UnixStream) {
 }
 
 /// Serves the tunnel's socket on `listener` until the task is aborted.
-pub async fn serve_tunnel_socket(core: Arc<Core>, listener: UnixListener) {
+pub async fn serve_tunnel_socket(core: Weak<Core>, listener: UnixListener) {
     let room = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     let mut failing = false;
     loop {
@@ -223,7 +223,7 @@ pub async fn serve_tunnel_socket(core: Arc<Core>, listener: UnixListener) {
         match listener.accept().await {
             Ok((stream, _)) => {
                 failing = false;
-                let core = Arc::clone(&core);
+                let Some(core) = core.upgrade() else { return };
                 tokio::spawn(async move {
                     connection(core, stream).await;
                     drop(permit);
@@ -270,24 +270,42 @@ impl Core {
         self.layout.run_dir().join(TUNNEL_SOCKET)
     }
 
-    /// Binds the tunnel's socket (private, with a lock beside it, as
-    /// `vibed.sock` is) and serves it on this runtime until the task is
-    /// aborted. The guard removes it.
-    pub fn spawn_tunnel_socket(
-        self: &Arc<Self>,
-    ) -> Result<(JoinHandle<()>, vibe_core::socket::SocketGuard), vibe_core::socket::BindError>
-    {
+    /// Serves the tunnel's socket (private, with a lock beside it, as
+    /// `vibed.sock` is), unless it's served already. It's there only while
+    /// a host is the external address.
+    fn open_tunnel_socket(&self, me: &Weak<Core>, rt: &tokio::runtime::Handle) {
+        let mut served = lock(&self.tunnel_socket_served);
+        if served.is_some() {
+            return;
+        }
         let path = self.tunnel_socket();
-        let (listener, guard) = vibe_core::socket::bind(&path)?;
-        let io = |source| vibe_core::socket::BindError::Io {
-            what: "serve",
-            path: path.clone(),
-            source,
-        };
-        listener.set_nonblocking(true).map_err(io)?;
-        let listener = UnixListener::from_std(listener).map_err(io)?;
-        let task = tokio::spawn(serve_tunnel_socket(Arc::clone(self), listener));
-        Ok((task, guard))
+        let bound = vibe_core::socket::bind(&path).and_then(|(listener, guard)| {
+            let io = |source| vibe_core::socket::BindError::Io {
+                what: "serve",
+                path: path.clone(),
+                source,
+            };
+            listener.set_nonblocking(true).map_err(io)?;
+            let _in = rt.enter();
+            let listener = UnixListener::from_std(listener).map_err(io)?;
+            Ok((listener, guard))
+        });
+        match bound {
+            Ok((listener, guard)) => {
+                let task = rt.spawn(serve_tunnel_socket(me.clone(), listener));
+                *served = Some((task, guard));
+            }
+            Err(e) => crate::log!("vibed: the external address can't reach this Mac: {e}"),
+        }
+    }
+
+    /// Stops serving the tunnel's socket, and removes it and its lock.
+    pub(crate) fn close_tunnel_socket(&self) {
+        if let Some((task, guard)) = lock(&self.tunnel_socket_served).take() {
+            task.abort();
+            drop(guard);
+            let _ = std::fs::remove_file(vibe_core::socket::lock_path(&self.tunnel_socket()));
+        }
     }
 
     /// The tunnel to `host`, if this Mac keeps one to it.
@@ -314,10 +332,15 @@ impl Core {
         if let Some(old) = tunnel.take() {
             crate::log!("vibed: closing the tunnel to {}", old.host);
         }
-        let (Some(name), Some(me), Some(rt)) = (want, self.me.get(), self.runtime.get()) else {
+        let Some(name) = want else {
+            self.close_tunnel_socket();
+            return;
+        };
+        let (Some(me), Some(rt)) = (self.me.get(), self.runtime.get()) else {
             return;
         };
         let Some(link) = self.link(&name) else { return };
+        self.open_tunnel_socket(me, rt);
         let view = Arc::new(Mutex::new(TunnelView {
             state: TunnelState::Connecting,
             detail: None,
