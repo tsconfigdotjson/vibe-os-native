@@ -17,7 +17,7 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::oneshot;
 use vibe_core::paths::Layout;
 use vibe_core::units::GIB;
-use vibe_env::testing::{STAND_IN, TestBackend};
+use vibe_env::testing::{STAND_IN, TestBackend, TestToolbox};
 use vibed::agents::{Backends, HostAdmission};
 use vibed::core::{Config, Core, DaemonInfo};
 use vibed::server::{self, SocketGuard};
@@ -259,6 +259,21 @@ impl Golden {
         );
         self.sessions
             .push(start_shim(&layout, "quiet-amber-otter", &["sleep", "600"]));
+        // The toolbox's: base release 1, a Linux home, and a recipe whose
+        // update works and whose install fails the first time only.
+        let base = layout.linux_dir().join("base-1");
+        fs::create_dir_all(&base).unwrap();
+        for f in ["Image", "initrd", "base.img"] {
+            fs::write(base.join(f), f).unwrap();
+        }
+        fs::write(layout.linux_dir().join("home-1.img"), "").unwrap();
+        fs::create_dir_all(layout.config_dir()).unwrap();
+        fs::write(
+            layout.toolbox_config(),
+            "[[install]]\nname = \"gcloud\"\nrun = \"test -e .tried || { touch .tried; exit 3; }\"\n\n\
+             [update]\nrun = [\"true\"]\n",
+        )
+        .unwrap();
         self
     }
 
@@ -268,6 +283,13 @@ impl Golden {
         config.gh = self.gh.clone().into();
         config.shim = workspace_bin("vibe-shim").into_os_string();
         config.backends = Backends::all(Arc::new(TestBackend::new(&self.claude)));
+        config.toolbox = Some(Arc::new(
+            TestToolbox::new(
+                Layout::new(&self.home, "macos"),
+                vec!["sleep".into(), "600".into()],
+            )
+            .with_uncovered(vec!["apt: htop".into()]),
+        ));
         config.admission = Arc::new(HostAdmission {
             total_memory: 64 * GIB,
         });

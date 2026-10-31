@@ -50,8 +50,12 @@ a real `vibe-shim` running `sleep`, and the records of two that exited:
 has an `origin` to fetch, and a `.vibe/setup.sh` that copies `.env.example`
 to `.env.local`. Agents run under `vibe-env`'s test backend, with its
 stand-in for Claude Code, on a host with 64G of memory; randomness is fixed,
-so refs and session ids are too. The Rust replays build that world in a temp
-directory and put its path in place of `/Users/me`.
+so refs and session ids are too. Its toolbox is `vibe-env`'s test toolbox
+(a shell of `sleep 600`, empty images for versions), with base release 1
+installed, a Linux home (version 1) and a `toolbox.toml` whose `[update]`
+runs `true` and whose one `[[install]]` fails the first time it's run. The
+Rust replays build that world in a temp directory and put its path in place
+of `/Users/me`.
 
 **`vibe-vm` has a contract of its own**, in `vibe-vm/`: the configuration
 `vibed` gives it, the line it prints as it starts, and its control socket.
@@ -76,9 +80,10 @@ daemon doesn't require it, so one-call clients (`vibe hello`, the Swift
 
 **Events.** After `events.subscribe` answers, that connection also gets an
 `events.event` notification (no `id`) for every event, in `seq` order,
-interleaved with the responses to its own calls. An event a call causes may
-arrive before that call's response, so match responses by `id`, or better,
-use a connection of its own for events. A subscriber that falls too far
+interleaved with the responses to its own calls: a call's response comes
+after the events published before the call, and before those published
+while it ran, such as those it caused. Still, match responses by `id`, or
+better, use a connection of its own for events. A subscriber that falls too far
 behind gets a `lagged` event in place of what it missed, carrying the `seq`
 of the last event it missed, and should read everything again. `seq`s only
 go up. When the client closes

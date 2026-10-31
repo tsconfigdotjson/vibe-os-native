@@ -9,7 +9,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use vibe_core::rpc::{ErrorCode, ErrorObject, Event, EventNotice, Id, Request, Response};
 
@@ -21,6 +21,24 @@ pub use vibe_core::socket::{BindError, SocketGuard, bind, lock_path};
 /// How long a closing connection may take to send what's queued to a client
 /// that has stopped reading, before it's dropped.
 const FLUSH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a response waits for the events published before its call to
+/// go out first, to a client that may have stopped reading.
+const ORDER_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// A subscribed connection's event forwarder, and what keeps its events in
+/// order with the responses: a call's response goes out after the events
+/// published before the call, and before those published during it, as the
+/// examples in `protocol/` show. An idle subscription isn't held back.
+struct Forwarder {
+    closing: oneshot::Sender<()>,
+    task: JoinHandle<()>,
+    /// The last `seq` the forwarder may send now: everything, between
+    /// calls; while a call runs, what was published before it.
+    gate: watch::Sender<u64>,
+    /// The last `seq` it has queued.
+    sent: watch::Receiver<u64>,
+}
 
 /// Lines queued for a connection's writer. When a client stops reading, its
 /// queue fills, and then its events lag rather than pile up.
@@ -59,14 +77,17 @@ pub async fn serve(
 
 /// Serves one connection. Responses and events go through one writer task,
 /// so lines never interleave, and a subscription's events start after the
-/// response to `events.subscribe`.
+/// response to `events.subscribe` ([`Forwarder`] keeps the rest in order).
 async fn connection(stream: UnixStream, core: Arc<Core>, max_bytes: usize) -> io::Result<()> {
     let (read, write) = stream.into_split();
     let (tx, rx) = mpsc::channel(QUEUE);
     let writer = tokio::spawn(write_lines(write, rx));
     let mut forwarder = None;
     let read_result = read_messages(read, &core, max_bytes, &tx, &mut forwarder).await;
-    if let Some((closing, mut task)) = forwarder {
+    if let Some(Forwarder {
+        closing, mut task, ..
+    }) = forwarder
+    {
         // Events already waiting, such as those the last message caused,
         // still go out; then the forwarder stops.
         let _ = closing.send(());
@@ -104,7 +125,7 @@ async fn read_messages(
     core: &Arc<Core>,
     max_bytes: usize,
     tx: &mpsc::Sender<String>,
-    forwarder: &mut Option<(oneshot::Sender<()>, JoinHandle<()>)>,
+    forwarder: &mut Option<Forwarder>,
 ) -> io::Result<()> {
     let mut reader = BufReader::new(read);
     let mut session = Session::default();
@@ -139,23 +160,46 @@ async fn read_messages(
         }
         // Without a newline the peer has closed its end: answer what it
         // sent, then stop.
-        if !line.iter().all(u8::is_ascii_whitespace)
-            && let Some(reply) = dispatch::handle_message(core, &mut session, &line).await
-            && tx.send(reply).await.is_err()
-        {
-            // The writer is gone: the client stopped listening.
-            return Ok(());
+        if !line.iter().all(u8::is_ascii_whitespace) {
+            // Events published from here on wait for this call's response.
+            let start = core.last_event_seq();
+            if let Some(f) = forwarder.as_ref() {
+                let _ = f.gate.send(start);
+            }
+            let reply = dispatch::handle_message(core, &mut session, &line).await;
+            if let Some(f) = forwarder.as_mut() {
+                // Those published before it go first.
+                let _ = tokio::time::timeout(ORDER_TIMEOUT, f.sent.wait_for(|s| *s >= start)).await;
+            }
+            if let Some(reply) = reply
+                && tx.send(reply).await.is_err()
+            {
+                // The writer is gone: the client stopped listening.
+                return Ok(());
+            }
+            if let Some(f) = forwarder.as_ref() {
+                let _ = f.gate.send(u64::MAX);
+            }
         }
         if let Some((seq, events)) = session.take_subscription() {
             let (closing, closed) = oneshot::channel();
+            let (gate, gated) = watch::channel(u64::MAX);
+            let (sent_tx, sent) = watch::channel(seq);
             let task = tokio::spawn(forward_events(
                 seq,
                 events,
                 closed,
+                gated,
+                sent_tx,
                 core.clone(),
                 tx.clone(),
             ));
-            *forwarder = Some((closing, task));
+            *forwarder = Some(Forwarder {
+                closing,
+                task,
+                gate,
+                sent,
+            });
         }
         if !complete {
             return Ok(());
@@ -164,11 +208,14 @@ async fn read_messages(
 }
 
 /// Sends each event as an `events.event` notification, starting after
-/// `seq`. Once `closed` fires, it sends the events already waiting and stops.
+/// `seq`, none past what `gate` allows, and says in `sent` how far it got.
+/// Once `closed` fires, it sends the events already waiting and stops.
 async fn forward_events(
     mut seq: u64,
     mut events: broadcast::Receiver<Event>,
     mut closed: oneshot::Receiver<()>,
+    mut gate: watch::Receiver<u64>,
+    sent: watch::Sender<u64>,
     core: Arc<Core>,
     tx: mpsc::Sender<String>,
 ) {
@@ -195,11 +242,21 @@ async fn forward_events(
                 }
             }
         };
+        // Published during a call: after its response. Closing, the
+        // connection's last response is out already.
+        if !closing && event.seq > *gate.borrow() {
+            tokio::select! {
+                biased;
+                _ = gate.wait_for(|allowed| *allowed >= event.seq) => {}
+                _ = &mut closed => closing = true,
+            }
+        }
         seq = event.seq;
         let line = dispatch::encode(&Request::notification::<EventNotice>(&event));
         if tx.send(line).await.is_err() {
             return;
         }
+        let _ = sent.send(seq);
     }
 }
 

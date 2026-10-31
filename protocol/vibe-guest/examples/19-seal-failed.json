@@ -1,0 +1,10 @@
+{
+  "request": {
+    "op": "seal"
+  },
+  "reply": {
+    "ok": false,
+    "code": "seal_failed",
+    "error": "can't freeze home: Device or resource busy (os error 16)"
+  }
+}

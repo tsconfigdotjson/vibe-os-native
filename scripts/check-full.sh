@@ -45,7 +45,11 @@
 #     Code's managed layer downloaded from downloads.claude.ai
 #     (crates/vibed/tests/linux_vm.rs). It needs the Claude token: from
 #     CLAUDE_CODE_OAUTH_TOKEN, or what `vibe setup-token` kept in the
-#     Keychain. N/A on a Mac that is itself a VM, like vm-cycle.
+#     Keychain. Then the toolbox: gcloud and a login made in it reach a new
+#     agent, an agent asleep on the old template restores, and [update] and
+#     Rebuild template make new templates (crates/vibed/tests/toolbox_vm.rs,
+#     which needs the network). N/A on a Mac that is itself a VM, like
+#     vm-cycle.
 #   - the Swift client against a live vibed
 #   - VibeOS.app launching and saying hello to a live vibed
 #
@@ -527,13 +531,15 @@ s_linux_vm() {
   rm -rf "$marker"
   cargo test -p vibe-env --locked --test linux_conformance --no-run
   cargo test -p vibed --locked --test linux_vm --no-run
+  cargo test -p vibed --locked --test toolbox_vm --no-run
   settle
   export VIBE_VM_BIN="$ROOT/build/vibe-vm" VIBE_BASE_RELEASES="file://$ROOT/build/base-image"
   export VIBE_VM_MARKER="$marker"
   cargo test -p vibe-env --locked --test linux_conformance -- --test-threads=1 --nocapture
   CLAUDE_CODE_OAUTH_TOKEN="$token" \
     cargo test -p vibed --locked --test linux_vm -- --test-threads=1 --nocapture
-  for t in linux_conformance linux_agent; do
+  cargo test -p vibed --locked --test toolbox_vm -- --test-threads=1 --nocapture
+  for t in linux_conformance linux_agent toolbox_vm; do
     [ -f "$marker/$t" ] || { echo "$t was skipped, not run"; return 1; }
   done
 }
@@ -585,7 +591,7 @@ mac_step sign "ad hoc signing; vibe-vm gets the virtualization entitlement" s_si
 mac_step vm-check "vibe-vm check, signed and unsigned" s_vm_check sign
 mac_step vm-cycle "VMs boot, save and restore; vibe-guest's question survives" s_vm_cycle build sign test-guest
 mac_step base-image "the Linux base image: kernel, initrd, Debian image" s_base_image
-mac_step linux-vm "linux agents in VMs: conformance, and Claude on Opus across a sleep" s_linux_vm build sign base-image
+mac_step linux-vm "linux agents in VMs: conformance, Claude on Opus across a sleep, the toolbox" s_linux_vm build sign base-image
 mac_step live-contract "Swift client against a live vibed" s_live_contract build swift-app-test
 mac_step app-launch "VibeOS.app launches and says hello to vibed" s_app_launch build sign
 

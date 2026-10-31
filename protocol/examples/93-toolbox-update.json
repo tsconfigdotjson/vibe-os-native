@@ -1,0 +1,32 @@
+{
+  "description": "Runs toolbox.toml's [update] commands on the template now, as the weekly update does, and keeps the result as a new template version: the first here, as there was none.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 93,
+    "method": "toolbox.update",
+    "params": {}
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 93,
+    "result": {
+      "action": "update",
+      "at": "2026-10-30T12:00:00Z",
+      "template": 1,
+      "uncovered": []
+    }
+  },
+  "events": [
+    {
+      "jsonrpc": "2.0",
+      "method": "events.event",
+      "params": {
+        "seq": 17,
+        "at": "2026-10-30T12:00:00Z",
+        "host": "local",
+        "kind": "toolbox.changed",
+        "message": "The update saved template 1"
+      }
+    }
+  ]
+}

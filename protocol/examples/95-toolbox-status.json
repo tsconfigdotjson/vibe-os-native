@@ -1,0 +1,26 @@
+{
+  "description": "The toolbox closed: the template and Linux home versions new agents boot, the base image under them and the newest installed, and how the last run went.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 95,
+    "method": "toolbox.status",
+    "params": {}
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 95,
+    "result": {
+      "state": "closed",
+      "template": 1,
+      "home": 1,
+      "base": 1,
+      "newest_base": 1,
+      "last": {
+        "action": "rebuild",
+        "at": "2026-10-30T12:00:00Z",
+        "uncovered": [],
+        "error": "installing gcloud exited with code 3"
+      }
+    }
+  }
+}

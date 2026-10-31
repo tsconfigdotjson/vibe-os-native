@@ -7,6 +7,9 @@
 //! ```text
 //! vibe.layers=managed,home,template,base   the read-only disks, top first
 //! vibe.upper=agent                         the agent's writable disk
+//! vibe.home=home                           a writable disk for `vibe`'s home
+//!                                          alone: the toolbox's Linux home
+//! vibe.sudo=1                              `vibe` may use sudo: the toolbox
 //! vibe.share=worktree:/Users/me/VibeOS/worktrees/app/quiet-amber-otter
 //! vibe.share=claude:/home/vibe/.claude     a share's tag, and where it goes
 //! vibe.uid=501 vibe.gid=20                 who `vibe` is
@@ -27,6 +30,14 @@ pub struct Boot {
     /// The disk that takes the agent's writes: overlayfs's upper directory.
     /// It's formatted on the first boot. Needs `layers`.
     pub upper: Option<String>,
+    /// A writable disk that takes the writes to `vibe`'s home instead, in its
+    /// own `upper/home/vibe`, so it can be stacked later as a layer of its
+    /// own: the toolbox writes the Linux home this way, and the template on
+    /// `upper`. Formatted on the first boot, like `upper`. Needs `upper`.
+    pub home: Option<String>,
+    /// Whether `vibe` may run anything as root with `sudo`, for the toolbox
+    /// shell; agents never may.
+    pub sudo: bool,
     pub shares: Vec<Share>,
     /// The uid and gid of `vibe`, who runs the agent: the host user's, so
     /// files in the shares, which virtio-fs shows with their host owner, are
@@ -59,6 +70,12 @@ impl Boot {
         }
         if let Some(upper) = &self.upper {
             words.push(format!("vibe.upper={upper}"));
+        }
+        if let Some(home) = &self.home {
+            words.push(format!("vibe.home={home}"));
+        }
+        if self.sudo {
+            words.push("vibe.sudo=1".into());
         }
         for share in &self.shares {
             words.push(format!("vibe.share={}:{}", share.tag, encode(&share.path)));
@@ -93,7 +110,7 @@ impl Boot {
 
     pub fn validate(&self) -> Result<(), String> {
         let mut disks: Vec<&str> = Vec::new();
-        for id in self.layers.iter().chain(&self.upper) {
+        for id in self.layers.iter().chain(&self.upper).chain(&self.home) {
             label("disk id", id)?;
             if disks.contains(&id.as_str()) {
                 return Err(format!("disk `{id}` is stacked twice"));
@@ -102,6 +119,9 @@ impl Boot {
         }
         if self.upper.is_some() && self.layers.is_empty() {
             return Err("a writable disk needs layers to stack it on".into());
+        }
+        if self.home.is_some() && self.upper.is_none() {
+            return Err("a writable home needs a writable disk under it".into());
         }
         let mut tags: Vec<&str> = Vec::new();
         for share in &self.shares {
@@ -138,6 +158,18 @@ impl Boot {
                     boot.upper = Some(value.to_owned());
                     Ok(())
                 }
+                "vibe.home" => {
+                    boot.home = Some(value.to_owned());
+                    Ok(())
+                }
+                "vibe.sudo" => match value {
+                    "1" => {
+                        boot.sudo = true;
+                        Ok(())
+                    }
+                    "0" => Ok(()),
+                    _ => Err("is 1 or 0".to_owned()),
+                },
                 "vibe.share" => parse_share(value).map(|s| boot.shares.push(s)),
                 "vibe.uid" => parse_id(value).map(|id| boot.uid = Some(id)),
                 "vibe.gid" => parse_id(value).map(|id| boot.gid = Some(id)),
@@ -154,6 +186,7 @@ impl Boot {
             // sense; booting from the initrd still lets the host see why.
             boot.layers.clear();
             boot.upper = None;
+            boot.home = None;
             let mut seen = Vec::new();
             boot.shares.retain(|s| {
                 let first = !seen.contains(&s.tag);
@@ -268,6 +301,8 @@ mod tests {
                 .map(String::from)
                 .into(),
             upper: Some("agent".into()),
+            home: None,
+            sudo: false,
             shares: vec![
                 Share {
                     tag: "worktree".into(),
@@ -306,6 +341,34 @@ mod tests {
     }
 
     #[test]
+    fn the_toolbox_writes_its_home_apart_and_may_sudo() {
+        let toolbox = Boot {
+            layers: vec!["managed".into(), "base".into()],
+            upper: Some("template".into()),
+            home: Some("home".into()),
+            sudo: true,
+            ..Boot::default()
+        };
+        let line = toolbox.to_cmdline().unwrap();
+        assert_eq!(
+            line,
+            "vibe.layers=managed,base vibe.upper=template vibe.home=home vibe.sudo=1"
+        );
+        assert_eq!(Boot::parse(&line), (toolbox, vec![]));
+        assert_eq!(Boot::parse("vibe.sudo=0").0, Boot::default());
+        let (boot, problems) = Boot::parse("vibe.sudo=yes");
+        assert!(!boot.sudo);
+        assert!(problems[0].contains("is 1 or 0"), "{problems:?}");
+        // A home with nothing to stack it on isn't stacked, nor the rest.
+        let (boot, problems) = Boot::parse("vibe.layers=base vibe.home=home");
+        assert_eq!((boot.layers.len(), boot.home), (0, None));
+        assert!(
+            problems[0].contains("a writable home needs"),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
     fn paths_with_odd_bytes_survive() {
         for path in [
             "/a b/c",
@@ -330,9 +393,17 @@ mod tests {
     #[test]
     fn bad_settings_are_refused_on_the_host() {
         type Change = fn(&mut Boot);
-        let cases: [(Change, &str); 8] = [
+        let cases: [(Change, &str); 10] = [
             (|b| b.layers.push("base".into()), "stacked twice"),
             (|b| b.upper = Some("base".into()), "stacked twice"),
+            (|b| b.home = Some("agent".into()), "stacked twice"),
+            (
+                |b| {
+                    b.upper = None;
+                    b.home = Some("home2".into());
+                },
+                "a writable home needs",
+            ),
             (|b| b.layers[0] = "a b".into(), "disk id"),
             (|b| b.layers.clear(), "needs layers"),
             (|b| b.shares[1].tag = "worktree".into(), "mounted twice"),

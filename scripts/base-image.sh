@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Builds base release N of the Linux image every linux agent boots (PRD:
-# What's inside linux), into OUT/base-N/ (default build/base-image/base-1/):
+# What's inside linux), into OUT/base-N/ (default build/base-image/base-2/):
 #
 #   Image        an arm64 kernel (Linux 6.18 LTS) with everything vibe-guest
 #                needs built in: scripts/base-image/kernel.config
@@ -30,7 +30,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 export PATH="$HOME/.cargo/bin:$PATH"
 
-N=${BASE_RELEASE:-1}
+N=${BASE_RELEASE:-2}
 OUT=${1:-build/base-image}
 DOCKER=${DOCKER:-docker}
 TARGET=aarch64-unknown-linux-musl
@@ -166,27 +166,62 @@ container=$("$DOCKER" create --platform linux/arm64 "vibeos-base-rootfs:$N" /bin
 versions=$("$DOCKER" run --rm --platform linux/arm64 "vibeos-base-rootfs:$N" sh -c \
   'echo "debian $(cat /etc/debian_version); $(git --version); gh $(gh --version | head -n1 | cut -d" " -f3); node $(node --version); mise $(mise --version | cut -d" " -f1); $(python3 --version)"')
 
+# The toolbox's sudo works in this root: vibe set up as vibe-guest sets it
+# up (its passwd, group and shadow entries, and the toolbox's sudo rule,
+# read from crates/vibe-guest/src/init/root.rs), sudo runs as root for it
+# with no password.
+rule=$(sed -n 's/^pub(crate) const SUDO_RULE: &str = "\(.*\)";$/\1/p' crates/vibe-guest/src/init/root.rs)
+shadow=$(sed -n 's/^pub(crate) const SHADOW_ENTRY: &str = "\(.*\)";$/\1/p' crates/vibe-guest/src/init/root.rs)
+[ -n "$rule" ] && [ -n "$shadow" ] || { say "can't find SUDO_RULE and SHADOW_ENTRY in vibe-guest"; exit 1; }
+say "checking sudo for vibe in the toolbox"
+"$DOCKER" run --rm --platform linux/arm64 -e RULE="$rule" -e SHADOW="$shadow" \
+  "vibeos-base-rootfs:$N" bash -euo pipefail -c '
+  echo "vibe:x:501:20:vibe:/home/vibe:/bin/bash" >>/etc/passwd
+  grep -q "^vibe:" /etc/group || echo "vibe:x:20:" >>/etc/group
+  echo "$SHADOW" >>/etc/shadow
+  echo "$RULE" >/etc/sudoers.d/vibe-toolbox
+  chmod 440 /etc/sudoers.d/vibe-toolbox
+  [ "$(setpriv --reuid=501 --regid=20 --clear-groups sudo -n id -u)" = 0 ]
+' || { say "sudo doesn't work for vibe as vibe-guest sets it up"; exit 1; }
+
 say "making the images"
 "$DOCKER" run --rm -v "$WORK:/work" vibeos-base-builder bash -euo pipefail -c '
   cd /work
   ./gen_init_cpio initrd.list | gzip -9 >initrd
-  mkdir rootfs
-  tar -xpf rootfs.tar -C rootfs --numeric-owner
+  # Unpacked inside the container, never in /work: on a Mac, /work is the
+  # host directory through Docker Desktop'"'"'s file sharing, which keeps
+  # neither root ownership nor setuid bits, and mke2fs copies what it sees
+  # (sudo then refuses to run).
+  rootfs=/rootfs
+  mkdir "$rootfs"
+  tar -xpf rootfs.tar -C "$rootfs" --numeric-owner --same-owner
   rm rootfs.tar
   # What docker leaves to the runtime, and vibe-guest fills in at boot.
-  echo vibe >rootfs/etc/hostname
-  printf "127.0.0.1\tlocalhost\n::1\tlocalhost\n127.0.1.1\tvibe\n" >rootfs/etc/hosts
-  : >rootfs/etc/resolv.conf
-  rm -f rootfs/.dockerenv
-  used=$(du -sk --apparent-size rootfs | cut -f1)
-  inodes=$(find rootfs | wc -l)
+  echo vibe >"$rootfs/etc/hostname"
+  printf "127.0.0.1\tlocalhost\n::1\tlocalhost\n127.0.1.1\tvibe\n" >"$rootfs/etc/hosts"
+  : >"$rootfs/etc/resolv.conf"
+  rm -f "$rootfs/.dockerenv"
+  used=$(du -sk --apparent-size "$rootfs" | cut -f1)
+  inodes=$(find "$rootfs" | wc -l)
   # A quarter more than it holds, for ext4'"'"'s own, and nothing reserved:
   # nobody writes to it.
   size=$(( (used + used / 4 + 65536) / 1024 ))M
   mke2fs -q -t ext4 -b 4096 -m 0 -O ^has_journal -N $(( inodes + inodes / 4 + 1024 )) \
-    -L base -d rootfs base.img "$size"
+    -L base -d "$rootfs" base.img "$size"
   e2fsck -fn base.img
-  rm -rf rootfs
+  rm -rf "$rootfs"
+  # The image keeps owners and modes: sudo is root'"'"'s and setuid.
+  check() {
+    debugfs -R "stat $1" base.img 2>/dev/null >stat.txt
+    grep -Eq "Mode: +0*$2 " stat.txt && grep -Eq "^User: +0 +Group: +0 " stat.txt || {
+      echo "base.img: $1 isn'"'"'t mode $2, owned by root:" >&2
+      head -3 stat.txt >&2
+      exit 1
+    }
+  }
+  check /usr/bin/sudo 4755
+  check /etc 755
+  rm -f stat.txt
   gzip -6 base.img
 '
 

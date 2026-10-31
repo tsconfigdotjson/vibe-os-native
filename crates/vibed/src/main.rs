@@ -13,8 +13,9 @@ use tokio::signal::unix::{SignalKind, signal};
 use vibe_core::model::Environment;
 use vibe_core::paths::{self, Layout};
 use vibe_core::rpc::MAX_MESSAGE_BYTES;
-use vibe_env::linux::LinuxVm;
-use vibe_env::testing::TestBackend;
+use vibe_env::linux::{self, LinuxVm};
+use vibe_env::testing::{TestBackend, TestToolbox};
+use vibe_env::toolbox::Toolbox;
 use vibed::agents::Backends;
 use vibed::core::{Config, Core, DaemonInfo};
 use vibed::{logging, server};
@@ -50,6 +51,9 @@ environment:
 
 /// How often `gh auth status` runs (PRD: Auth, security and trust).
 const GH_CHECK_EVERY: Duration = Duration::from_secs(60 * 60);
+
+/// How often an open toolbox's shell is checked, to save it once it exits.
+const TOOLBOX_POLL: Duration = Duration::from_secs(1);
 
 /// How often projects whose agents are all at rest get `git maintenance`.
 const MAINTENANCE_EVERY: Duration = Duration::from_secs(60 * 60);
@@ -186,6 +190,11 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
             PathBuf::from(&claude).display()
         );
         config.backends = Backends::all(Arc::new(TestBackend::new(PathBuf::from(claude))));
+        // Its toolbox shell is a plain shell, and keeps empty versions.
+        config.toolbox = Some(Arc::new(TestToolbox::new(
+            config.layout.clone(),
+            vec!["/bin/sh".into()],
+        )));
     }
     // linux agents on a Mac run in VMs; a Linux host's run under cgroups
     // (#17).
@@ -194,6 +203,14 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
         match vibe_vm() {
             Some(vibe_vm) => {
                 vibed::log!("vibed: linux agents run in VMs, with {}", vibe_vm.display());
+                let machine = Arc::new(linux::Real {
+                    vibe_vm: vibe_vm.clone(),
+                });
+                config.toolbox = Some(Arc::new(Toolbox::new(
+                    config.layout.clone(),
+                    machine,
+                    linux::keychain_token(),
+                )));
                 let backend = LinuxVm::new(config.layout.clone(), vibe_vm);
                 config.backends = config.backends.with(Environment::Linux, Arc::new(backend));
                 images = Some(vibed::linux::spawn(
@@ -232,6 +249,8 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
     // restart, rebuilt.
     let status = core.spawn_status();
     let maintenance = core.spawn_maintenance(MAINTENANCE_EVERY);
+    // Saves the toolbox when its shell exits, and runs the weekly update.
+    let toolbox = core.spawn_toolbox(TOOLBOX_POLL, vibed::toolbox::UPDATE_CHECK_EVERY);
     vibed::log!(
         "vibed {} listening on {}",
         env!("CARGO_PKG_VERSION"),
@@ -248,6 +267,9 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
     status.abort();
     maintenance.abort();
     adopting.abort();
+    if let Some(toolbox) = toolbox {
+        toolbox.abort();
+    }
     if let Some(images) = images {
         images.abort();
     }

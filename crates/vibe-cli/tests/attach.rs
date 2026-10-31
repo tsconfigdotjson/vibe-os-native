@@ -488,3 +488,107 @@ fn ls_lists_sessions() {
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("is vibed running?"));
 }
+
+/// A vibed with the test toolbox, whose shell is `sh`, and its supervisor,
+/// which saves the toolbox when the shell exits.
+fn toolbox_world() -> World {
+    let dir = short_tempdir();
+    let home = dir.path().canonicalize().unwrap().join("home");
+    let layout = Layout::new(&home, std::env::consts::OS);
+    let base = layout.linux_dir().join("base-1");
+    std::fs::create_dir_all(&base).unwrap();
+    for f in ["Image", "initrd", "base.img"] {
+        std::fs::write(base.join(f), f).unwrap();
+    }
+    let mut config = Config::new(DaemonInfo::current(), layout.clone());
+    config.gh = "/nonexistent/gh".into();
+    config.shim = common::workspace_bin("vibe-shim").into_os_string();
+    config.toolbox = Some(Arc::new(vibe_env::testing::TestToolbox::new(
+        layout.clone(),
+        vec!["sh".into()],
+    )));
+    let core = Arc::new(Core::open(config).unwrap());
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let socket = dir.path().join("run/vibed.sock");
+    let (listener, guard) = server::bind(&socket).unwrap();
+    let supervised = core.clone();
+    rt.spawn(async move {
+        supervised.spawn_toolbox(Duration::from_millis(100), Duration::from_secs(3600));
+        let listener = tokio::net::UnixListener::from_std(listener).unwrap();
+        server::serve(listener, core, MAX_MESSAGE_BYTES, std::future::pending()).await;
+    });
+    World {
+        layout,
+        socket,
+        _guard: guard,
+        _rt: rt,
+        _dir: dir,
+    }
+}
+
+#[test]
+fn the_toolbox_shell_detaches_open_and_saves_on_exit() {
+    let w = toolbox_world();
+    let size = Size { rows: 24, cols: 80 };
+    let toolbox = || {
+        let mut cmd = w.vibe();
+        cmd.arg("toolbox");
+        Term::spawn(cmd, size)
+    };
+    let mut term = toolbox();
+    term.expect("Exit the shell to save");
+    term.attached();
+    term.type_line("echo in-the-$((6*7))-toolbox");
+    term.expect("in-the-42-toolbox");
+    // Ctrl-\ leaves it open.
+    term.type_bytes(b"\x1c");
+    assert_eq!(term.wait(), Some(0));
+    term.expect("The toolbox is still open");
+    assert!(!w.layout.linux_dir().join("template-1.img").exists());
+
+    // Opening again attaches to the same shell; exiting it saves.
+    let mut term = toolbox();
+    term.attached();
+    term.type_line("echo $((6*7))-again");
+    term.expect("42-again");
+    term.type_line("exit");
+    assert_eq!(term.wait(), Some(0), "{}", term.text());
+    term.expect("Saved template 1 and Linux home 1");
+    assert!(term.cooked());
+    for f in ["template-1.img", "template-1.base", "home-1.img"] {
+        assert!(w.layout.linux_dir().join(f).exists(), "{f}");
+    }
+
+    let out = w.vibe().args(["toolbox", "status"]).output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("state     closed\ntemplate  1\nhome      1\nbase      1\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("The toolbox shell saved template 1"),
+        "{text}"
+    );
+
+    // It needs a terminal, and says so before booting anything.
+    let out = w
+        .vibe()
+        .arg("toolbox")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("needs a terminal"));
+    // An update with no toolbox.toml says what's missing.
+    let out = w.vibe().args(["toolbox", "update"]).output().unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("has no [update] commands"),
+        "{out:?}"
+    );
+}

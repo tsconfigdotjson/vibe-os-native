@@ -18,7 +18,7 @@ use serde_json::Value;
 pub use crate::limits::HostLimits;
 pub use crate::model::{
     Activity, AgentState, Certainty, Environment, EventKind, GhState, Mode, Model, Profile,
-    ProjectSource, Reasoning, SessionState, StopReason, WakeupKind,
+    ProjectSource, Reasoning, SessionState, StopReason, ToolboxAction, ToolboxState, WakeupKind,
 };
 
 /// Bumped on any incompatible change to the contract. Clients send theirs in
@@ -345,6 +345,10 @@ pub const METHODS: &[&str] = &[
     AgentsStart::NAME,
     AgentsList::NAME,
     AgentsDelete::NAME,
+    ToolboxStatusGet::NAME,
+    ToolboxOpen::NAME,
+    ToolboxUpdate::NAME,
+    ToolboxRebuild::NAME,
 ];
 
 /// Every notification the daemon sends.
@@ -522,6 +526,37 @@ method! {
     /// for it; its branch is kept. Refused while its worktree has
     /// uncommitted changes or unpushed commits, unless `force`.
     AgentsDelete = "agents.delete", AgentDeleteParams => Agent
+}
+
+method! {
+    /// `toolbox.status`: the toolbox's state, the template and Linux home
+    /// versions new agents boot, the base images, and how the last toolbox
+    /// run went.
+    ToolboxStatusGet = "toolbox.status", NoParams => ToolboxStatus
+}
+
+method! {
+    /// `toolbox.open`: opens the toolbox shell, a terminal in a VM where the
+    /// template and the Linux home are writable, and says how to attach to
+    /// it, as `sessions.attach` does. Exiting the shell saves a new version
+    /// of each. There's one toolbox at a time: while it's open, this gives
+    /// the same shell.
+    ToolboxOpen = "toolbox.open", NoParams => SessionAttach
+}
+
+method! {
+    /// `toolbox.update`: runs `toolbox.toml`'s `[update]` commands on the
+    /// template now, as the weekly update does, and keeps the result as a
+    /// new template version.
+    ToolboxUpdate = "toolbox.update", NoParams => ToolboxRun
+}
+
+method! {
+    /// `toolbox.rebuild`: **Rebuild template**. Boots the newest base image,
+    /// replays `toolbox.toml`'s recipe into a fresh template, and lists
+    /// what the old template has that the recipe doesn't cover. The Linux
+    /// home carries over.
+    ToolboxRebuild = "toolbox.rebuild", NoParams => ToolboxRun
 }
 
 /// `events.event`: one event, sent to subscribed connections.
@@ -975,6 +1010,47 @@ pub struct Event {
     /// An agent's new status, for `agent.status`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<AgentStatus>,
+}
+
+/// The toolbox, for `toolbox.status`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolboxStatus {
+    pub state: ToolboxState,
+    /// The newest template version, which new agents boot; absent until
+    /// the toolbox makes one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<u32>,
+    /// The newest Linux home version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home: Option<u32>,
+    /// The base release new agents boot: the one the template was built
+    /// on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<u32>,
+    /// The newest base release installed. Newer than `base`, the template
+    /// wants a rebuild.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub newest_base: Option<u32>,
+    /// The last shell, update or rebuild to finish.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last: Option<ToolboxRun>,
+}
+
+/// How a toolbox run went.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolboxRun {
+    pub action: ToolboxAction,
+    /// When it finished.
+    pub at: String,
+    /// The template version it saved; absent if it saved none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<u32>,
+    /// After a rebuild: what the old template has that the recipe doesn't
+    /// cover, such as `apt: htop` or `/opt/google-cloud-sdk`.
+    pub uncovered: Vec<String>,
+    /// Why it failed, in which case nothing was kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[cfg(test)]

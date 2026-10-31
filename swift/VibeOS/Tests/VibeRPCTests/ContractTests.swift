@@ -148,6 +148,8 @@ let swiftTypes: [String: Set<String>] = [
     "AgentStatus": keys(AgentStatus.CodingKeys.self),
     "Wakeup": keys(Wakeup.CodingKeys.self),
     "AgentList": keys(AgentList.CodingKeys.self),
+    "ToolboxStatus": keys(ToolboxStatus.CodingKeys.self),
+    "ToolboxRun": keys(ToolboxRun.CodingKeys.self),
 ]
 
 /// The index's enums, from the Swift ones.
@@ -165,6 +167,8 @@ let swiftEnums: [String: [String]] = [
     "Certainty": Certainty.allCases.map(\.rawValue),
     "WakeupKind": WakeupKind.allCases.map(\.rawValue),
     "StopReason": StopReason.allCases.map(\.rawValue),
+    "ToolboxState": ToolboxState.allCases.map(\.rawValue),
+    "ToolboxAction": ToolboxAction.allCases.map(\.rawValue),
 ]
 
 /// A method's Swift types, and a typed round trip of an example of it.
@@ -210,6 +214,10 @@ func methodChecks() -> [String: MethodCheck] {
         check(AgentsStart.self),
         check(AgentsList.self),
         check(AgentsDelete.self),
+        check(ToolboxStatusGet.self),
+        check(ToolboxOpen.self),
+        check(ToolboxUpdate.self),
+        check(ToolboxRebuild.self),
     ])
 }
 

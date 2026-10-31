@@ -54,7 +54,7 @@ Claude with the token `vibe setup-token` keeps in the Keychain. Until a base
 release is published, build one and point `vibed` at it:
 
 ```sh
-scripts/base-image.sh           # build/base-image/base-1: kernel, initrd, Debian image
+scripts/base-image.sh           # build/base-image/base-2: kernel, initrd, Debian image
 target/debug/vibe setup-token   # the Claude login for linux agents
 VIBE_BASE_RELEASES=file://$PWD/build/base-image target/debug/vibed
 ```

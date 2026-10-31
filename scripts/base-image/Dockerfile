@@ -1,6 +1,8 @@
 # The base image's root filesystem (PRD: What's inside linux): Debian slim
 # with git, gh, curl, ripgrep, jq, build-essential, Python 3, Node LTS and
-# mise; and bubblewrap and socat, for Claude Code's own sandbox.
+# mise; bubblewrap and socat, for Claude Code's own sandbox; and sudo, which
+# vibe-guest lets the user `vibe` use in the toolbox shell only (vibe.sudo),
+# for `sudo apt install …` there.
 # scripts/base-image.sh builds it for linux/arm64 and exports it into
 # a read-only ext4 image. Downloads are pinned by checksum.
 FROM debian:trixie-slim
@@ -16,7 +18,7 @@ RUN apt-get update \
       git gh curl ca-certificates ripgrep jq build-essential \
       python3 python3-pip python3-venv \
       openssh-client less procps psmisc unzip xz-utils zstd file \
-      bubblewrap socat \
+      bubblewrap socat sudo \
  && rm -rf /var/lib/apt/lists/*
 
 # Node LTS, from nodejs.org.

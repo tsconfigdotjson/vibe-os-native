@@ -28,7 +28,7 @@ use crate::vm::{self, VmError};
 pub use vibe_guest::boot;
 pub use vibe_guest::proto::{
     self, ClockSet, Done, ErrorCode, Exit, Failure, Frozen, GuestState, Launch, Launched, Memory,
-    Process, Processes, Request, Session, Status, TermSize, TermWelcome, Thawed,
+    Process, Processes, Request, Sealed, Session, Status, TermSize, TermWelcome, Thawed,
 };
 
 /// How long the guest may take to answer anything but a thaw.
@@ -209,6 +209,16 @@ pub fn set_clock(socket: &Path, now: SystemTime) -> Result<ClockSet, GuestError>
 /// exits.
 pub fn poweroff(socket: &Path) -> Result<(), GuestError> {
     call::<Done>(socket, &Request::Poweroff, CALL_TIMEOUT).map(drop)
+}
+
+/// How long a seal may take: ending the command, then flushing everything
+/// the toolbox wrote, which after a big install is a lot.
+const SEAL_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Ends the command and leaves every writable disk clean and frozen, for
+/// the host to keep; then only a [`poweroff`] is left.
+pub fn seal(socket: &Path) -> Result<Sealed, GuestError> {
+    call(socket, &Request::Seal, SEAL_TIMEOUT)
 }
 
 /// Milliseconds since the Unix epoch, as the guest's clock takes them.

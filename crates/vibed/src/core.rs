@@ -78,6 +78,9 @@ pub struct Config {
     pub backends: Backends,
     /// Whether a new agent may start.
     pub admission: Arc<dyn Admission>,
+    /// The Linux toolbox: on a Mac that runs `linux` agents in VMs, none
+    /// on a Linux host.
+    pub toolbox: Option<Arc<dyn vibe_env::toolbox::ToolboxHost>>,
 }
 
 impl std::fmt::Debug for Config {
@@ -90,6 +93,7 @@ impl std::fmt::Debug for Config {
             .field("shim", &self.shim)
             .field("backends", &self.backends)
             .field("admission", &self.admission)
+            .field("toolbox", &self.toolbox)
             .finish_non_exhaustive()
     }
 }
@@ -111,6 +115,7 @@ impl Config {
             entropy: Arc::new(keys::random_bytes),
             backends: Backends::new(),
             admission: Arc::new(HostAdmission::current()),
+            toolbox: None,
         }
     }
 }
@@ -236,6 +241,11 @@ pub struct Core {
     adding: Mutex<HashSet<String>>,
     events: EventBus,
     gh_status: Mutex<GhStatus>,
+    pub(crate) toolbox: Option<Arc<dyn vibe_env::toolbox::ToolboxHost>>,
+    /// What the toolbox is doing, for `toolbox.status`.
+    pub(crate) toolbox_state: Mutex<vibe_core::model::ToolboxState>,
+    /// Held for one toolbox operation at a time.
+    pub(crate) toolbox_op: tokio::sync::Mutex<()>,
     _state_lock: File,
 }
 
@@ -364,6 +374,9 @@ impl Core {
                 detail: None,
                 checked_at: None,
             }),
+            toolbox: config.toolbox,
+            toolbox_state: Mutex::new(vibe_core::model::ToolboxState::Closed),
+            toolbox_op: tokio::sync::Mutex::new(()),
             _state_lock: state_lock,
         })
     }
@@ -436,6 +449,11 @@ impl Core {
     }
 
     /// A new subscription, and the `seq` of the last event before it.
+    /// The `seq` of the last event published.
+    pub fn last_event_seq(&self) -> u64 {
+        *lock(&self.events.last)
+    }
+
     pub fn subscribe(&self) -> (u64, broadcast::Receiver<Event>) {
         let last = lock(&self.events.last);
         (*last, self.events.tx.subscribe())

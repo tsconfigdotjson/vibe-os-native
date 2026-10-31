@@ -3,6 +3,7 @@
 mod attach;
 mod client;
 mod setup_token;
+mod toolbox;
 
 use std::io::{self, Write};
 use std::net::Shutdown;
@@ -29,6 +30,11 @@ commands:
   rpc         the vibed socket API on stdin and stdout, one JSON-RPC message per line
   setup-token log linux agents in to Claude: runs `claude setup-token` and keeps
               its long-lived token in the Keychain, for vibed to hand each VM
+  toolbox     open the Linux toolbox shell, where what you install and log in to
+              every new linux agent gets; exiting saves it, Ctrl-\\ leaves it open
+  toolbox status   the template and Linux home versions, and the last run
+  toolbox update   run toolbox.toml's [update] commands on the template now
+  toolbox rebuild  rebuild the template on the newest base image from toolbox.toml
 
 options:
   --socket PATH   vibed's socket (default: $VIBE_SOCKET, or the platform default)
@@ -45,6 +51,7 @@ enum Command {
     Hello,
     Rpc,
     SetupToken,
+    Toolbox(toolbox::Command),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -74,6 +81,16 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
             "hello" => Command::Hello,
             "rpc" => Command::Rpc,
             "setup-token" => Command::SetupToken,
+            "toolbox" => {
+                let sub = iter
+                    .as_slice()
+                    .first()
+                    .and_then(|w| toolbox::Command::parse(w));
+                if sub.is_some() {
+                    iter.next();
+                }
+                Command::Toolbox(sub.unwrap_or(toolbox::Command::Open))
+            }
             other => match other.strip_prefix("--socket=") {
                 Some(path) => {
                     socket = Some(PathBuf::from(path));
@@ -141,6 +158,15 @@ fn main() -> ExitCode {
         Command::Hello => hello(&socket),
         Command::Rpc => rpc(&socket),
         Command::SetupToken => unreachable!("handled above"),
+        Command::Toolbox(command) => {
+            return match toolbox::run(&socket, command) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("vibe: {e}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -288,6 +314,34 @@ mod tests {
             })
         );
         assert!(parse(&["ls", "attach", "x"]).is_err());
+        let toolbox = |command| {
+            Ok(Args::Run {
+                socket: None,
+                command: Command::Toolbox(command),
+            })
+        };
+        assert_eq!(parse(&["toolbox"]), toolbox(toolbox::Command::Open));
+        assert_eq!(
+            parse(&["toolbox", "status"]),
+            toolbox(toolbox::Command::Status)
+        );
+        assert_eq!(
+            parse(&["toolbox", "update"]),
+            toolbox(toolbox::Command::Update)
+        );
+        assert_eq!(
+            parse(&["toolbox", "rebuild"]),
+            toolbox(toolbox::Command::Rebuild)
+        );
+        assert_eq!(
+            parse(&["toolbox", "--socket", "/s"]),
+            Ok(Args::Run {
+                socket: Some("/s".into()),
+                command: Command::Toolbox(toolbox::Command::Open),
+            })
+        );
+        assert!(parse(&["toolbox", "rebiuld"]).is_err());
+        assert!(parse(&["toolbox", "status", "update"]).is_err());
     }
 
     #[test]

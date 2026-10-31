@@ -113,6 +113,12 @@ pub trait Machine: Send + Sync + fmt::Debug {
     fn thaw(&self, socket: &Path, now: SystemTime) -> Result<guest::Thawed>;
     /// Ends the agent, syncs and powers off; `vibe-vm` then exits.
     fn poweroff(&self, socket: &Path) -> Result<()>;
+    /// Ends the command and leaves the writable disks clean, to be kept:
+    /// the ids of those it sealed.
+    fn seal(&self, socket: &Path) -> Result<Vec<String>>;
+    /// Sets the guest's clock to `now`: a VM has none of its own to boot
+    /// with, and TLS and apt's signatures fail on a wrong one.
+    fn set_clock(&self, socket: &Path, now: SystemTime) -> Result<()>;
     /// Runs a command to completion in the guest, beside the agent's.
     fn run(&self, socket: &Path, run: &proto::Run) -> Result<proto::Ran>;
 }
@@ -227,6 +233,18 @@ impl Machine for Real {
 
     fn run(&self, socket: &Path, run: &proto::Run) -> Result<proto::Ran> {
         guest::run(socket, run).map_err(env_err("vibe-guest couldn't run it"))
+    }
+
+    fn set_clock(&self, socket: &Path, now: SystemTime) -> Result<()> {
+        guest::set_clock(socket, now)
+            .map(drop)
+            .map_err(env_err("vibe-guest couldn't set the clock"))
+    }
+
+    fn seal(&self, socket: &Path) -> Result<Vec<String>> {
+        guest::seal(socket)
+            .map(|s| s.disks)
+            .map_err(env_err("vibe-guest couldn't seal the disks"))
     }
 }
 
@@ -399,6 +417,8 @@ impl LinuxVm {
         let boot = boot::Boot {
             layers: Vec::new(),
             upper: Some("agent".into()),
+            home: None,
+            sudo: false,
             shares: shares
                 .iter()
                 .map(|(tag, _, at)| boot::Share {
@@ -479,6 +499,12 @@ impl LinuxVm {
                 missing.join(", "),
                 status.problems.join("; ")
             )));
+        }
+        // Before anything runs in it: `.vibe/setup.sh` comes before the
+        // launch, which sets the clock too.
+        if let Err(e) = self.machine.set_clock(&socket, SystemTime::now()) {
+            let _ = self.machine.stop(&socket);
+            return Err(e);
         }
         Ok(())
     }
@@ -925,5 +951,7 @@ impl Backend for LinuxVm {
     }
 }
 
+#[cfg(test)]
+pub(crate) mod fake;
 #[cfg(test)]
 mod tests;

@@ -21,7 +21,8 @@
 //! - [`conformance`], the suite every backend must pass;
 //! - the `linux` backend's plumbing on the Mac: [`vm`] drives `vibe-vm`,
 //!   the helper that runs each agent's VM, and [`guest`] drives
-//!   `vibe-guest`, PID 1 inside it.
+//!   `vibe-guest`, PID 1 inside it; [`images`] keeps the disks they boot,
+//!   and [`toolbox`] makes new template and Linux home versions.
 
 pub mod claude;
 pub mod conformance;
@@ -32,6 +33,7 @@ pub mod linux;
 pub mod native;
 pub mod sparse;
 pub mod testing;
+pub mod toolbox;
 pub mod tree;
 pub mod vm;
 

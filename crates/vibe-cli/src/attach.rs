@@ -345,6 +345,15 @@ pub(crate) fn attach(socket: &Path, agent: &str) -> Result<End, AttachError> {
     }
     validate_ref(agent).map_err(AttachError::BadRef)?;
     let found = locate(socket, agent)?;
+    attach_to(&found)
+}
+
+/// Joins this terminal to the session `found` says, as [`attach`] does.
+pub(crate) fn attach_to(found: &SessionAttach) -> Result<End, AttachError> {
+    if !is_tty(libc::STDIN_FILENO) || !is_tty(libc::STDOUT_FILENO) {
+        return Err(AttachError::NotATerminal);
+    }
+    let agent = found.agent.as_str();
     // Caught before the size is read, so a resize in between isn't lost.
     // SIGHUP too: closing the window must detach even if whoever started
     // this left hangups ignored.

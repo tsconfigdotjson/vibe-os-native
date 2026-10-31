@@ -1,0 +1,28 @@
+{
+  "description": "The toolbox open, after the rebuild.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 98,
+    "method": "toolbox.status",
+    "params": {}
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 98,
+    "result": {
+      "state": "open",
+      "template": 2,
+      "home": 1,
+      "base": 1,
+      "newest_base": 1,
+      "last": {
+        "action": "rebuild",
+        "at": "2026-10-30T12:00:00Z",
+        "template": 2,
+        "uncovered": [
+          "apt: htop"
+        ]
+      }
+    }
+  }
+}
