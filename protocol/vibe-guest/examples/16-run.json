@@ -1,0 +1,22 @@
+{
+  "request": {
+    "op": "run",
+    "command": [
+      "/bin/sh",
+      ".vibe/setup.sh"
+    ],
+    "env": {
+      "GIT_CONFIG_COUNT": "1",
+      "GIT_CONFIG_KEY_0": "push.autoSetupRemote",
+      "GIT_CONFIG_VALUE_0": "true"
+    },
+    "cwd": "/Users/me/VibeOS/worktrees/app/quiet-amber-otter",
+    "timeout_ms": 1800000
+  },
+  "reply": {
+    "ok": true,
+    "code": 0,
+    "timed_out": false,
+    "output": "added 214 packages in 9s\n"
+  }
+}

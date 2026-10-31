@@ -194,6 +194,23 @@ impl Layout {
         self.agent_dir(agent_ref).join("vibe-vm.log")
     }
 
+    /// The disk images `linux` agents boot: the base, the managed layer,
+    /// the template and the Linux home (`vibe_env::images`).
+    pub fn linux_dir(&self) -> PathBuf {
+        self.home.join("VibeOS/linux")
+    }
+
+    /// The Linux Claude config, made in the toolbox and copied into each
+    /// `linux` agent's own Claude home when it starts.
+    pub fn linux_claude_dir(&self) -> PathBuf {
+        self.home.join("VibeOS/linux-claude")
+    }
+
+    /// The package caches `linux` agents share, one directory per tool.
+    pub fn cache_dir(&self) -> PathBuf {
+        self.home.join("VibeOS/cache")
+    }
+
     /// Sleeping `linux` agents' snapshots, which share the `snapshot_disk`
     /// budget.
     pub fn snapshots_dir(&self) -> PathBuf {
@@ -207,6 +224,19 @@ impl Layout {
 }
 
 /// [`resolve_socket`] for this process: its environment and its OS.
+/// Makes `dir`, and the directories on the way, if they're missing, and
+/// leaves `dir` itself `0700` whatever the umask: for what only this user
+/// may read, such as sockets, snapshots and session state.
+pub fn private_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(dir)?;
+    let mode = std::fs::metadata(dir)?.permissions().mode() & 0o777;
+    if mode != 0o700 {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
 pub fn socket_path(explicit: Option<PathBuf>) -> Result<PathBuf, NoHomeError> {
     resolve_socket(
         explicit,
@@ -222,6 +252,27 @@ mod tests {
 
     fn os(s: &str) -> Option<OsString> {
         Some(OsString::from(s))
+    }
+
+    #[test]
+    fn private_dirs_are_0700_whatever_the_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        // One made open, as a umask of 022 or 002 makes it, is closed.
+        let open = tmp.path().join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o775)).unwrap();
+        private_dir(&open).unwrap();
+        assert_eq!(mode(&open), 0o700);
+        // One made here is private, however deep.
+        let deep = tmp.path().join("a/b/scratch");
+        private_dir(&deep).unwrap();
+        assert_eq!(mode(&deep), 0o700);
+        // One too closed is opened to its owner.
+        std::fs::set_permissions(&deep, std::fs::Permissions::from_mode(0o500)).unwrap();
+        private_dir(&deep).unwrap();
+        assert_eq!(mode(&deep), 0o700);
     }
 
     #[test]
@@ -301,6 +352,9 @@ mod tests {
         );
         assert_eq!(l.vm_log("x"), p("/Users/u/VibeOS/agents/x/vibe-vm.log"));
         assert_eq!(l.snapshot("x"), p("/Users/u/VibeOS/snapshots/x"));
+        assert_eq!(l.linux_dir(), p("/Users/u/VibeOS/linux"));
+        assert_eq!(l.linux_claude_dir(), p("/Users/u/VibeOS/linux-claude"));
+        assert_eq!(l.cache_dir(), p("/Users/u/VibeOS/cache"));
     }
 
     #[test]

@@ -12,7 +12,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use vibe_guest::boot::Boot;
 use vibe_guest::proto::{
-    ClockSet, Done, ErrorCode, Exit, Frozen, Launched, Processes, Refused, Request, Status,
+    ClockSet, Done, ErrorCode, Exit, Frozen, Launched, Processes, Ran, Refused, Request, Status,
     TermHello, TermSize, TermWelcome, Thawed, decode_reply, decode_request, encode_reply,
 };
 
@@ -88,6 +88,7 @@ fn every_example_round_trips() {
             Request::Thaw { .. } => round_trip::<Thawed>(&name, reply),
             Request::Clock { .. } => round_trip::<ClockSet>(&name, reply),
             Request::Poweroff => round_trip::<Done>(&name, reply),
+            Request::Run(_) => round_trip::<Ran>(&name, reply),
         };
         if let Some(code) = code {
             codes.insert(format!("{code:?}"));
@@ -101,6 +102,7 @@ fn every_example_round_trips() {
         "thaw",
         "clock",
         "poweroff",
+        "run",
     ]
     .map(String::from)
     .into();

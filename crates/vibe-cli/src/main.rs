@@ -2,6 +2,7 @@
 
 mod attach;
 mod client;
+mod setup_token;
 
 use std::io::{self, Write};
 use std::net::Shutdown;
@@ -9,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
+use vibe_core::claude_token::TokenStore;
 use vibe_core::paths;
 use vibe_core::rpc::{
     Hello, HelloParams, HostParams, PROTOCOL_VERSION, SessionInfo, SessionState, SessionsList,
@@ -25,11 +27,16 @@ commands:
   ls          list the sessions on this host
   hello       check that vibed is up, and print what it reports
   rpc         the vibed socket API on stdin and stdout, one JSON-RPC message per line
+  setup-token log linux agents in to Claude: runs `claude setup-token` and keeps
+              its long-lived token in the Keychain, for vibed to hand each VM
 
 options:
   --socket PATH   vibed's socket (default: $VIBE_SOCKET, or the platform default)
   -V, --version   print the version
-  -h, --help      print this help";
+  -h, --help      print this help
+
+environment:
+  VIBE_CLAUDE     the claude that setup-token runs (default: claude on PATH)";
 
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
@@ -37,6 +44,7 @@ enum Command {
     Ls,
     Hello,
     Rpc,
+    SetupToken,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -65,6 +73,7 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
             "ls" => Command::Ls,
             "hello" => Command::Hello,
             "rpc" => Command::Rpc,
+            "setup-token" => Command::SetupToken,
             other => match other.strip_prefix("--socket=") {
                 Some(path) => {
                     socket = Some(PathBuf::from(path));
@@ -98,6 +107,18 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if command == Command::SetupToken {
+        let claude = std::env::var_os("VIBE_CLAUDE")
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "claude".into());
+        return match setup_token::setup_token(&claude, &TokenStore::current()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("vibe: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let socket = match paths::socket_path(socket) {
         Ok(s) => s,
         Err(e) => {
@@ -119,6 +140,7 @@ fn main() -> ExitCode {
         Command::Ls => ls(&socket),
         Command::Hello => hello(&socket),
         Command::Rpc => rpc(&socket),
+        Command::SetupToken => unreachable!("handled above"),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -243,6 +265,13 @@ mod tests {
         assert!(parse(&[]).is_err());
         assert!(parse(&["hello", "rpc"]).is_err());
         assert!(parse(&["attach"]).is_err());
+        assert_eq!(
+            parse(&["setup-token"]),
+            Ok(Args::Run {
+                socket: None,
+                command: Command::SetupToken
+            })
+        );
         assert!(parse(&["hello", "--socket"]).is_err());
         assert_eq!(
             parse(&["attach", "quiet-amber-otter"]),

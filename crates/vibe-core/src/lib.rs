@@ -2,6 +2,7 @@
 //! the JSON-RPC contract that every client of `vibed` speaks, and the
 //! protocol of the per-agent `vibe-shim` sockets.
 
+pub mod claude_token;
 pub mod keys;
 pub mod limits;
 pub mod model;

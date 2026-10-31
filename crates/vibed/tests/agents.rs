@@ -1255,3 +1255,104 @@ async fn a_start_cut_short_by_a_crash_is_undone_by_the_next_vibed() {
     let worktrees = git_out(&w.project, &["worktree", "list"]);
     assert!(!worktrees.contains("cut-short"), "{worktrees}");
 }
+
+/// The test backend, but whose agents go on without their shim, as a
+/// `linux` agent goes on in its VM: a wake asks for a new shim on the
+/// terminal it had.
+#[derive(Debug)]
+struct Reattaches(vibe_env::testing::TestBackend);
+
+impl vibe_env::Compartment for Reattaches {
+    fn create(&self, spec: &vibe_env::AgentSpec) -> vibe_env::Result<vibe_env::Handle> {
+        self.0.create(spec)
+    }
+    fn run(
+        &self,
+        h: &vibe_env::Handle,
+        r: &vibe_env::Run,
+    ) -> vibe_env::Result<vibe_env::RunOutput> {
+        self.0.run(h, r)
+    }
+    fn launch(
+        &self,
+        h: &vibe_env::Handle,
+        l: &vibe_env::Launch,
+    ) -> vibe_env::Result<vibe_env::TerminalEnd> {
+        self.0.launch(h, l)
+    }
+    fn processes(&self, h: &vibe_env::Handle) -> vibe_env::Result<Vec<vibe_env::Proc>> {
+        self.0.processes(h)
+    }
+    fn stop(&self, h: &vibe_env::Handle) -> vibe_env::Result<()> {
+        self.0.stop(h)
+    }
+    fn delete(&self, h: &vibe_env::Handle) -> vibe_env::Result<()> {
+        self.0.delete(h)
+    }
+}
+
+impl vibe_env::Limiter for Reattaches {
+    fn apply(&self, h: &vibe_env::Handle, l: &vibe_env::Limits) -> vibe_env::Result<()> {
+        self.0.apply(h, l)
+    }
+    fn usage(&self, h: &vibe_env::Handle) -> vibe_env::Result<vibe_env::Usage> {
+        self.0.usage(h)
+    }
+}
+
+impl vibe_env::Sleeper for Reattaches {
+    fn sleep(&self, h: &vibe_env::Handle) -> vibe_env::Result<()> {
+        self.0.sleep(h)
+    }
+    fn wake(&self, h: &vibe_env::Handle) -> vibe_env::Result<vibe_env::Woke> {
+        Ok(vibe_env::Woke::Reattach(vibe_env::TerminalEnd::Pty {
+            command: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "echo 'Where it was.'; exec cat".into(),
+            ],
+            cwd: h.worktree.clone(),
+            env: vec![],
+        }))
+    }
+}
+
+impl vibe_env::Backend for Reattaches {
+    fn capabilities(&self) -> vibe_env::Capabilities {
+        self.0.capabilities()
+    }
+}
+
+#[tokio::test]
+async fn a_wake_that_reattaches_starts_a_shim_and_no_new_claude() {
+    let w = world().await;
+    let backend = Arc::new(Reattaches(vibe_env::testing::TestBackend::new(
+        &w.golden.claude,
+    )));
+    let w = World {
+        core: {
+            let mut config = w.golden.config();
+            config.backends = Backends::all(backend);
+            drop(w.core);
+            Arc::new(Core::open(config).unwrap())
+        },
+        ..w
+    };
+    let a = w.core.start_agent(start("hello")).await.unwrap();
+    w.wait_screen(&a.agent, "Working on: hello");
+    let old = w.session(&a.agent);
+    unsafe { libc::kill(old.sid as i32, libc::SIGKILL) };
+    wait_until("the shim to go", || old.is_empty());
+    let back = w.core.resume_agent(None, &a.agent).await.unwrap();
+    assert_eq!(back.agent, a.agent);
+    w.wait_screen(&a.agent, "Where it was.");
+    assert!(
+        !w.screen(&a.agent).contains("Resumed"),
+        "Claude was launched again"
+    );
+    let new = w.session(&a.agent);
+    assert_ne!(new.sid, old.sid);
+    // The new shim is the agent's session now: a delete ends it.
+    w.core.delete_agent(delete(&a.agent, true)).await.unwrap();
+    wait_until("the new shim to go", || new.is_empty());
+}

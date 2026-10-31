@@ -73,9 +73,83 @@ pub enum Request {
     /// Sets the clock: a [`ClockSet`]. A VM has no clock of its own to
     /// boot with.
     Clock { time_ms: u64 },
+    /// Runs a command to completion, as `vibe`, beside the agent's own,
+    /// and says how it ended: a [`Ran`]. For `.vibe/setup.sh`, and anything
+    /// else the host runs in the VM, Claude running or not. It isn't in the
+    /// agent's cgroup, so a freeze doesn't stop it nor a launch clear it
+    /// out; past `timeout_ms` it's killed with everything in its process
+    /// group, and what it leaves running there is killed when it ends.
+    Run(Run),
     /// Ends the command and everything it started, flushes the disks and
     /// powers the VM off, after replying [`Done`]. `vibe-vm` then exits 0.
     Poweroff,
+}
+
+/// What a [`Request::Run`] runs. Its environment may carry secrets, so
+/// [`fmt::Debug`] shows only its names.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Run {
+    /// The program and its arguments; a bare name is looked up on the
+    /// guest's `PATH`.
+    pub command: Vec<String>,
+    /// Added to the guest's own environment, as for a launch.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    /// Where it runs; absent for `vibe`'s home.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// How long it may run, in milliseconds.
+    pub timeout_ms: u64,
+}
+
+impl fmt::Debug for Run {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Run")
+            .field("command", &self.command)
+            .field("env", &self.env.keys().collect::<Vec<_>>())
+            .field("cwd", &self.cwd)
+            .field("timeout_ms", &self.timeout_ms)
+            .finish()
+    }
+}
+
+impl Run {
+    /// Why the guest would refuse it, if it would: as for a launch, and a
+    /// timeout of at least a millisecond.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.timeout_ms == 0 {
+            return Err("timeout_ms must be more than 0".into());
+        }
+        Launch {
+            command: self.command.clone(),
+            env: self.env.clone(),
+            cwd: self.cwd.clone(),
+            size: None,
+            time_ms: None,
+        }
+        .validate()
+    }
+}
+
+/// The most of a run's output a reply carries: the end of it. A reply line
+/// is at most [`MAX_LINE`], and escaping can make text six times longer.
+pub const MAX_RUN_OUTPUT: usize = 32 * 1024;
+
+/// How a [`Request::Run`] ended.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ran {
+    /// Its exit code, if it exited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<i32>,
+    /// The signal that ended it, by name, if one did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<String>,
+    /// Whether it ran out of time and was killed.
+    pub timed_out: bool,
+    /// What it wrote to stdout and stderr, together, as UTF-8 (anything
+    /// else replaced): the last [`MAX_RUN_OUTPUT`] bytes.
+    pub output: String,
 }
 
 /// How long a thaw waits for the shares by default. They answer about
@@ -431,15 +505,16 @@ pub fn decode_request(line: &str) -> Result<Request, Failure> {
     }
     let request: Request = serde_json::from_value(value)
         .map_err(|e| Failure::new(ErrorCode::BadRequest, e.to_string()))?;
-    if let Request::Launch(launch) = &request {
-        launch
-            .validate()
-            .map_err(|e| Failure::new(ErrorCode::BadRequest, e))?;
-    }
+    let checked = match &request {
+        Request::Launch(launch) => launch.validate(),
+        Request::Run(run) => run.validate(),
+        _ => Ok(()),
+    };
+    checked.map_err(|e| Failure::new(ErrorCode::BadRequest, e))?;
     Ok(request)
 }
 
-const KNOWN_OPS: [&str; 7] = [
+const KNOWN_OPS: [&str; 8] = [
     "status",
     "launch",
     "processes",
@@ -447,6 +522,7 @@ const KNOWN_OPS: [&str; 7] = [
     "thaw",
     "clock",
     "poweroff",
+    "run",
 ];
 
 // ---------------------------------------------------------------------------

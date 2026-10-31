@@ -1,0 +1,18 @@
+{
+  "request": {
+    "op": "run",
+    "command": [
+      "/bin/sh",
+      "-c",
+      "npm install"
+    ],
+    "cwd": "/Users/me/VibeOS/worktrees/app/quiet-amber-otter",
+    "timeout_ms": 1800000
+  },
+  "reply": {
+    "ok": true,
+    "signal": "SIGKILL",
+    "timed_out": true,
+    "output": "npm warn deprecated inflight@1.0.6\n"
+  }
+}

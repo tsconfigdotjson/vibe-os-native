@@ -181,7 +181,10 @@ impl Term {
 
     /// Reads one frame into the screen; false once the guest closed.
     fn pump(&mut self, timeout: Duration) -> bool {
-        self.stream.set_read_timeout(Some(timeout)).unwrap();
+        // Never zero, which a socket refuses.
+        self.stream
+            .set_read_timeout(Some(timeout.max(Duration::from_millis(1))))
+            .unwrap();
         match read_frame(&mut self.stream) {
             Ok(Some(f)) => {
                 match f.kind {
@@ -598,4 +601,79 @@ impl Term {
             self.pump(Duration::from_millis(100));
         }
     }
+}
+
+#[test]
+fn a_run_goes_to_completion_beside_the_command() {
+    let g = Guest::start("run", false, &[]);
+    // Claude, as it were, runs; a run goes ahead beside it.
+    g.launch(&["sh", "-c", "echo agent; exec cat"]);
+    let cwd = g.dir.path().canonicalize().unwrap();
+    let ran = g.ok(json!({
+        "op": "run",
+        "command": ["sh", "-c", "echo \"$VIBE_X in $(pwd -P)\"; echo oops >&2; exit 3"],
+        "env": {"VIBE_X": "x"},
+        "cwd": cwd,
+        "timeout_ms": 20_000,
+    }));
+    assert_eq!(ran["code"], 3, "{ran}");
+    assert_eq!(ran["timed_out"], false);
+    assert_eq!(
+        ran["output"],
+        format!("x in {}\noops\n", cwd.display()),
+        "{ran}"
+    );
+    assert_eq!(
+        g.status()["state"],
+        "running",
+        "the agent's command goes on"
+    );
+
+    // Out of time: killed, with what it started, and the reply says so.
+    let started = Instant::now();
+    let ran = g.ok(json!({
+        "op": "run",
+        "command": ["sh", "-c", "sleep 30 & echo started; wait"],
+        "timeout_ms": 500,
+    }));
+    assert_eq!(ran["timed_out"], true, "{ran}");
+    assert_eq!(ran["signal"], "SIGKILL", "{ran}");
+    assert_eq!(ran["output"], "started\n");
+    assert!(started.elapsed() < Duration::from_secs(10));
+
+    // What it leaves running when it ends is killed too.
+    let ran = g.ok(json!({
+        "op": "run",
+        "command": ["sh", "-c", "sleep 30 & echo $! >left; echo done"],
+        "cwd": cwd,
+        "timeout_ms": 20_000,
+    }));
+    assert_eq!(ran["code"], 0, "{ran}");
+    let left: u32 = std::fs::read_to_string(cwd.join("left"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    wait_until("what it left to be killed", || !alive(left));
+
+    // Only the end of a lot of output comes back.
+    let ran = g.ok(json!({
+        "op": "run",
+        "command": ["sh", "-c", "head -c 100000 /dev/zero | tr '\\0' a; echo; echo last"],
+        "timeout_ms": 20_000,
+    }));
+    let out = ran["output"].as_str().unwrap();
+    assert_eq!(
+        out.len(),
+        vibe_guest::proto::MAX_RUN_OUTPUT,
+        "{}",
+        out.len()
+    );
+    assert!(out.ends_with("a\nlast\n"));
+
+    // A command that can't start, or a run without a timeout, is refused.
+    let r = g.ask(json!({"op": "run", "command": ["/nonexistent/x"], "timeout_ms": 1000}));
+    assert_eq!(r["code"], "launch_failed", "{r}");
+    let r = g.ask(json!({"op": "run", "command": ["true"], "timeout_ms": 0}));
+    assert_eq!(r["code"], "bad_request", "{r}");
 }

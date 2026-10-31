@@ -192,6 +192,10 @@ impl std::error::Error for OpenError {}
 /// Events kept for a subscriber that's slow to read them.
 const EVENT_BACKLOG: usize = 1024;
 
+/// How long `Core::open` waits for the state lock before it takes it for
+/// another `vibed`'s.
+const LOCK_PATIENCE: Duration = Duration::from_secs(3);
+
 #[derive(Debug)]
 struct EventBus {
     tx: broadcast::Sender<Event>,
@@ -305,15 +309,25 @@ impl Core {
                 path: lock_path.clone(),
                 source,
             })?;
-        match state_lock.try_lock() {
-            Ok(()) => {}
-            Err(TryLockError::WouldBlock) => return Err(OpenError::AlreadyRunning { dir }),
-            Err(TryLockError::Error(source)) => {
-                return Err(OpenError::Io {
-                    what: "lock",
-                    path: lock_path,
-                    source,
-                });
+        // A vibed that just stopped may not have let go yet in every
+        // process: a child forked before it closed the lock, and not yet
+        // replaced by its program, holds the lock too until it is. So the
+        // lock gets a moment before it counts as another vibed's.
+        let deadline = std::time::Instant::now() + LOCK_PATIENCE;
+        loop {
+            match state_lock.try_lock() {
+                Ok(()) => break,
+                Err(TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(TryLockError::WouldBlock) => return Err(OpenError::AlreadyRunning { dir }),
+                Err(TryLockError::Error(source)) => {
+                    return Err(OpenError::Io {
+                        what: "lock",
+                        path: lock_path,
+                        source,
+                    });
+                }
             }
         }
         let mut store = Store::open(&config.layout.db()).map_err(OpenError::Store)?;

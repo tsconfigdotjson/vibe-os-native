@@ -218,6 +218,7 @@ fn answer(guest: &Guest, request: Request) -> (Result<Value, Failure>, Option<Th
         Request::Thaw { .. } => "thaw",
         Request::Clock { .. } => "clock",
         Request::Poweroff => "poweroff",
+        Request::Run(_) => "run",
     };
     if op != "status" && op != "processes" {
         log!("control: {op}");
@@ -236,6 +237,7 @@ fn answer(guest: &Guest, request: Request) -> (Result<Value, Failure>, Option<Th
             .map_err(|e| Failure::new(ErrorCode::ClockFailed, format!("can't set the clock: {e}")))
             .and_then(json),
         Request::Poweroff => return (json(Done {}), Some(poweroff)),
+        Request::Run(run) => guest.agent.run(&run).and_then(json),
     };
     if let Err(f) = &reply {
         log!("control: {op} failed: {f}");

@@ -37,6 +37,10 @@ case " $prompt " in *" fork "*)
   while [ "$i" -lt "$n" ]; do sleep 600 & i=$((i+1)); done
   echo "Forked $n."
 esac
+case " $prompt " in *" fill "*)
+  n=${prompt#*fill }; n=${n%% *}
+  head -c $((n * 1048576)) /dev/zero >.vibe-fill && echo "Filled $n MiB."
+esac
 case " $prompt " in *" dirty "*)
   echo scratch >notes.txt; echo "Left notes.txt."
 esac
