@@ -36,19 +36,65 @@ fn write_exe(path: &Path, body: &str) {
     common::write_script(path, body);
 }
 
+/// `ssh -R`'s forward, for [`fake_ssh`]: binds the host's end of the
+/// tunnel, refusing one that's there as sshd does, and relays each
+/// connection to it to the socket here. It says `ready` once it's bound.
+const RELAY: &str = r#"
+import os, socket, sys, threading
+remote, local = sys.argv[1], sys.argv[2]
+if os.path.exists(remote):
+    print("Error: remote port forwarding failed for listen path " + remote, flush=True)
+    sys.exit(1)
+srv = socket.socket(socket.AF_UNIX)
+srv.bind(remote)
+os.chmod(remote, 0o600)
+srv.listen(16)
+print("ready", flush=True)
+def pipe(a, b):
+    try:
+        while True:
+            d = a.recv(65536)
+            if not d:
+                break
+            b.sendall(d)
+    except OSError:
+        pass
+    for s in (a, b):
+        try:
+            s.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+while True:
+    c, _ = srv.accept()
+    l = socket.socket(socket.AF_UNIX)
+    try:
+        l.connect(local)
+    except OSError:
+        c.close()
+        continue
+    threading.Thread(target=pipe, args=(c, l), daemon=True).start()
+    threading.Thread(target=pipe, args=(l, c), daemon=True).start()
+"#;
+
 /// `ssh` for the test: options are taken and ignored, and the command runs
 /// here, with `$HOME` the host's own home, `<hosts>/<destination>`, and
-/// the host's tools first on `PATH`. While `<hosts>/<destination>.d/down`
-/// exists, it can't connect, and what it carries is dropped.
+/// the host's tools first on `PATH`. With `-R remote:local`, a relay
+/// forwards the host's socket to the one here, failing as
+/// `ExitOnForwardFailure` does when it can't. While
+/// `<hosts>/<destination>.d/down` exists, it can't connect, and what it
+/// carries is dropped.
 fn fake_ssh(hosts: &Path) -> PathBuf {
+    fs::write(hosts.join("relay.py"), RELAY).unwrap();
     let ssh = hosts.join("ssh");
     write_exe(
         &ssh,
         &format!(
             r#"#!/bin/sh
+fwd=
 while [ $# -gt 0 ]; do
   case "$1" in
     -o) shift 2 ;;
+    -R) fwd=$2; shift 2 ;;
     --) shift; break ;;
     -*) shift ;;
     *) break ;;
@@ -63,6 +109,17 @@ fi
 if [ -e "$d/down" ]; then
   echo "ssh: connect to host $dest port 22: Network is unreachable" >&2; exit 255
 fi
+relay=
+if [ -n "$fwd" ]; then
+  said=$(mktemp)
+  python3 "{hosts}/relay.py" "${{fwd%%:*}}" "${{fwd#*:}}" >"$said" 2>&1 &
+  relay=$!
+  until grep -q ready "$said"; do
+    if ! kill -0 "$relay" 2>/dev/null; then cat "$said" >&2; rm -f "$said"; exit 255; fi
+    sleep 0.05
+  done
+  rm -f "$said"
+fi
 export HOME="$home" SHELL="$d/bin/login-shell" PATH="$d/bin:$PATH"
 . "$d/env"
 cd "$HOME" || exit 255
@@ -74,11 +131,13 @@ while kill -0 "$child" 2>/dev/null; do
   if [ -e "$d/down" ]; then
     pkill -TERM -P "$child" 2>/dev/null
     kill "$child" 2>/dev/null
+    [ -n "$relay" ] && kill "$relay" 2>/dev/null
     echo "Connection to $dest closed by remote host." >&2
     exit 255
   fi
   sleep 0.1
 done
+[ -n "$relay" ] && kill "$relay" 2>/dev/null
 wait "$child"
 "#,
             hosts = hosts.display()
@@ -229,6 +288,33 @@ esac
     fn log(&self) -> String {
         fs::read_to_string(self.d.join("vibed.log")).unwrap_or_default()
     }
+
+    /// Its public endpoint, once it's the external address: on `port`
+    /// (as 443 isn't the test's), with a certificate for `domain` made
+    /// here, as Let's Encrypt would give. Returns the certificate's file.
+    fn serve_publicly(&self, port: u16, domain: &str) -> PathBuf {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec![domain.to_owned()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let (c, k) = (self.d.join("cert.pem"), self.d.join("key.pem"));
+        fs::write(&c, cert.pem()).unwrap();
+        fs::write(&k, key.serialize_pem()).unwrap();
+        let mut env = fs::OpenOptions::new()
+            .append(true)
+            .open(self.d.join("env"))
+            .unwrap();
+        writeln!(
+            env,
+            "export VIBE_TEST_SERVE_EXTERNAL=1 VIBE_EXTERNAL_PORT={port} VIBE_EXTERNAL_LISTEN=127.0.0.1 \
+             VIBE_EXTERNAL_CERT='{}' VIBE_EXTERNAL_KEY='{}'",
+            c.display(),
+            k.display()
+        )
+        .unwrap();
+        c
+    }
 }
 
 impl Drop for FakeHost {
@@ -293,6 +379,7 @@ fn mac(golden: &common::Golden, ssh: &Path, bundle: PathBuf) -> Mac {
     {
         let _in = rt.enter();
         core.spawn_links();
+        core.spawn_external();
     }
     let listener = rt
         .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
@@ -696,6 +783,417 @@ fn real_linux_host() {
     wait_for("the link to come back", Duration::from_secs(90), || {
         link_is("  connected")
     });
+    ok(vibe(&mac.socket, &["host", "remove", "testhost"]));
+    drop(mac.rt);
+}
+
+/// An MCP client on the internet: `curl` over HTTPS to the external
+/// address, with an API key, trusting the certificate `ca` (none: the
+/// system's, as for Let's Encrypt's), and reaching `domain` at `resolve`
+/// when it's given (`host:port:addr`, as `curl --resolve` takes it).
+struct Outside {
+    url: String,
+    ca: Option<PathBuf>,
+    resolve: Option<String>,
+    key: Option<String>,
+    next: u64,
+}
+
+impl Outside {
+    /// Posts a JSON-RPC request, and gives its HTTP status and body. The
+    /// key goes to curl on its stdin, never on its command line.
+    fn request(&mut self, method: &str, params: Value) -> (u16, String) {
+        self.next += 1;
+        let body = json!({"jsonrpc": "2.0", "id": self.next, "method": method, "params": params});
+        let mut config = String::from(
+            "header = \"Content-Type: application/json\"\n\
+             header = \"Accept: application/json, text/event-stream\"\n\
+             header = \"MCP-Protocol-Version: 2025-06-18\"\n",
+        );
+        if let Some(key) = &self.key {
+            config.push_str(&format!("header = \"Authorization: Bearer {key}\"\n"));
+        }
+        let mut cmd = Command::new("curl");
+        cmd.args([
+            "-sS",
+            "--max-time",
+            "300",
+            "-o",
+            "-",
+            "-w",
+            "\n%{http_code}",
+        ]);
+        if let Some(ca) = &self.ca {
+            cmd.arg("--cacert").arg(ca);
+        }
+        if let Some(r) = &self.resolve {
+            cmd.args(["--resolve", r]);
+        }
+        let mut child = cmd
+            .args([
+                "--config",
+                "-",
+                "--data-binary",
+                &body.to_string(),
+                &self.url,
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("curl");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(config.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        let (body, code) = text.rsplit_once('\n').unwrap_or(("", &text));
+        let code = code.trim().parse().unwrap_or_else(|_| {
+            panic!(
+                "curl {method}: {text} {}",
+                String::from_utf8_lossy(&out.stderr)
+            )
+        });
+        (code, body.to_owned())
+    }
+
+    fn tool(&mut self, name: &str, arguments: Value) -> (bool, String) {
+        let (code, body) =
+            self.request("tools/call", json!({"name": name, "arguments": arguments}));
+        assert_eq!(code, 200, "{name}: {body}");
+        let v: Value = serde_json::from_str(&body).unwrap_or_else(|e| panic!("{e}: {body}"));
+        let r = &v["result"];
+        (
+            r["isError"] == true,
+            r["content"][0]["text"].as_str().unwrap_or("").to_owned(),
+        )
+    }
+
+    fn call(&mut self, name: &str, arguments: Value) -> String {
+        let (error, text) = self.tool(name, arguments.clone());
+        assert!(!error, "{name} {arguments}: {text}");
+        text
+    }
+
+    /// Starts nothing new: sends a line to `agent`, waits for its answer,
+    /// and reads it back, as an orchestrator's round does.
+    fn talk(&mut self, agent: &str) {
+        let waited = self.call("vibe_wait", json!({"agents": agent, "timeout": 120}));
+        assert!(waited.contains("has answered"), "{agent}: {waited}");
+        let line = format!("hello from outside to {agent}");
+        let sent = self.call("vibe_send", json!({"agent": agent, "text": line}));
+        assert!(sent.contains("submitted"), "{sent}");
+        let waited = self.call("vibe_wait", json!({"agents": agent, "timeout": 120}));
+        assert!(waited.contains("has answered"), "{agent}: {waited}");
+        let read = self.call("vibe_read_messages", json!({"agent": agent, "last": 2}));
+        assert!(read.contains(&line), "{agent}: {read}");
+    }
+}
+
+/// The TCP ports process `pid` listens on beyond loopback, as `lsof` sees
+/// them: none, for a Mac with external access on.
+fn public_listeners(pid: u32) -> Vec<String> {
+    let out = Command::new("lsof")
+        .args(["-nP", "-a", "-p", &pid.to_string(), "-iTCP", "-sTCP:LISTEN"])
+        .output()
+        .expect("lsof");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .skip(1)
+        .filter_map(|l| l.split_whitespace().nth(8).map(str::to_owned))
+        .filter(|addr| {
+            !(addr.starts_with("127.")
+                || addr.starts_with("[::1]")
+                || addr.starts_with("localhost"))
+        })
+        .collect()
+}
+
+#[test]
+fn external_access_through_a_linux_host() {
+    let golden = common::Golden::new();
+    let hosts = common::short_tempdir();
+    let ssh = fake_ssh(hosts.path());
+    let host = FakeHost::new(hosts.path(), "me@vps", &golden.claude);
+    let port = free_port().port();
+    let ca = host.serve_publicly(port, "vps.test");
+    let mac = mac(&golden, &ssh, bundle(golden.dir.path()));
+    ok(vibe(&mac.socket, &["host", "add", "vps", "me@vps"]));
+    let vps_line = || {
+        ok(vibe(&mac.socket, &["host"]))
+            .lines()
+            .find(|l| l.starts_with("vps  "))
+            .unwrap_or_default()
+            .to_owned()
+    };
+    wait_for("the link", Duration::from_secs(30), || {
+        vps_line().contains("  connected")
+    });
+    // `app` on each: a small profile on the host, so its agent fits beside
+    // whatever this machine runs.
+    ok(vibe(
+        &mac.socket,
+        &[
+            "project",
+            "add",
+            golden.home.join("src/app").to_str().unwrap(),
+        ],
+    ));
+    ok(vibe(
+        &mac.socket,
+        &[
+            "project",
+            "add",
+            "--host",
+            "vps",
+            host.home.join("src/app").to_str().unwrap(),
+        ],
+    ));
+    ok(vibe(
+        &mac.socket,
+        &[
+            "profile", "create", "app", "small", "--memory", "1G", "--host", "vps",
+        ],
+    ));
+
+    // Settings → Hosts → Use as external address, as the CLI does it.
+    let on = ok(vibe(&mac.socket, &["host", "external", "vps", "vps.test"]));
+    assert!(on.contains("external address https://vps.test/mcp"), "{on}");
+    wait_for("the tunnel", Duration::from_secs(60), || {
+        vps_line().contains("tunnel up")
+    });
+    let key = mac
+        .core
+        .create_key(KeyCreateParams {
+            name: "laptop".into(),
+        })
+        .unwrap()
+        .secret;
+    let socket = host.socket();
+    wait_for("the key pushed", Duration::from_secs(20), || {
+        ok(vibe(&socket, &["key"])).contains("laptop")
+    });
+
+    let outside = |key: Option<&str>| Outside {
+        url: format!("https://vps.test:{port}/mcp"),
+        ca: Some(ca.clone()),
+        resolve: Some(format!("vps.test:{port}:127.0.0.1")),
+        key: key.map(str::to_owned),
+        next: 0,
+    };
+    // Nothing without a key.
+    let (code, _) = outside(None).request("tools/list", json!({}));
+    assert_eq!(code, 401);
+    let mut c = outside(Some(&key));
+    let (code, body) = c.request(
+        "initialize",
+        json!({"protocolVersion": "2025-06-18", "capabilities": {},
+               "clientInfo": {"name": "outside", "version": "1"}}),
+    );
+    assert_eq!(code, 200, "{body}");
+    // An agent on the VPS and one on the Mac, through the one URL.
+    let started = c.call(
+        "vibe_start_agent",
+        json!({"project": "app", "profile": "small", "prompt": "talk", "host": "local",
+               "name": "on-vps"}),
+    );
+    assert!(started.contains("started on-vps"), "{started}");
+    let started = c.call(
+        "vibe_start_agent",
+        json!({"project": "app", "profile": "software-eng-mac", "prompt": "talk", "host": "mac",
+               "name": "on-mac"}),
+    );
+    assert!(started.contains("started mac:on-mac"), "{started}");
+    c.talk("on-vps");
+    c.talk("mac:on-mac");
+    let listed = c.call("vibe_list_agents", json!({}));
+    assert!(
+        listed.contains("on-vps") && listed.contains("mac:on-mac"),
+        "{listed}"
+    );
+
+    // The public endpoint logs every call, by the key's name; the key
+    // itself is in no log.
+    let log = host.log();
+    assert!(
+        log.contains("public: 127.0.0.1 key \"laptop\" tools/call vibe_start_agent"),
+        "{log}"
+    );
+    assert!(
+        log.contains("public: 127.0.0.1 POST: refused, no key"),
+        "{log}"
+    );
+    assert!(!log.contains(&key), "the key is in the host's log");
+
+    // The Mac goes offline: the host still answers for its own agents, and
+    // the Mac's are unavailable.
+    host.pull();
+    wait_for("the tunnel down", Duration::from_secs(60), || {
+        !vps_line().contains("tunnel up")
+    });
+    wait_for("the Mac to go", Duration::from_secs(30), || {
+        ok(vibe(&socket, &["host"])).contains("tunnel down")
+    });
+    let listed = c.call("vibe_list_agents", json!({}));
+    assert!(listed.contains("on-vps"), "{listed}");
+    let mac_row = listed
+        .lines()
+        .find(|l| l.starts_with("mac:on-mac"))
+        .unwrap_or_else(|| panic!("{listed}"));
+    assert!(mac_row.contains("unavailable"), "{listed}");
+    let read = c.call("vibe_read_messages", json!({"agent": "on-vps", "last": 1}));
+    assert!(read.contains("hello from outside"), "{read}");
+    host.plug_in();
+    wait_for("the tunnel back", Duration::from_secs(60), || {
+        vps_line().contains("tunnel up")
+    });
+    for agent in ["mac:on-mac", "on-vps"] {
+        let deleted = c.call("vibe_delete_agent", json!({"agent": agent, "force": true}));
+        assert!(deleted.contains("deleted"), "{deleted}");
+    }
+
+    // Revoked on the Mac: refused on the host too.
+    ok(vibe(&mac.socket, &["key", "revoke", "laptop"]));
+    wait_for(
+        "the revoke to reach the host",
+        Duration::from_secs(20),
+        || c.request("tools/list", json!({})).0 == 401,
+    );
+
+    // Nothing listens publicly on the Mac, external access or not.
+    assert_eq!(public_listeners(std::process::id()), Vec::<String>::new());
+    let off = ok(vibe(&mac.socket, &["host", "external", "vps", "off"]));
+    assert!(!off.contains("external address"), "{off}");
+    drop(mac.rt);
+}
+
+/// External access through a real server (`VIBE_TEST_LINUX_HOST`, with the
+/// Linux builds in `VIBE_HOST_BUNDLE`) at a public name pointing at it
+/// (`VIBE_TEST_EXTERNAL_DOMAIN`), with a real certificate from Let's
+/// Encrypt: a client on the internet with the URL and a key starts and
+/// talks to an agent on this Mac, and one on the server when
+/// `VIBE_TEST_LINUX_PROJECT` names a project there; it gets nothing
+/// without a key; and nothing listens publicly on the Mac.
+/// scripts/check-full.sh runs it on the Mac.
+#[test]
+#[ignore = "needs a real Linux server with a public name: VIBE_TEST_LINUX_HOST, VIBE_HOST_BUNDLE and VIBE_TEST_EXTERNAL_DOMAIN"]
+fn real_external_access() {
+    let need = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| panic!("{name} is needed"))
+    };
+    let dest = need("VIBE_TEST_LINUX_HOST");
+    let domain = need("VIBE_TEST_EXTERNAL_DOMAIN");
+    let bundle = PathBuf::from(need("VIBE_HOST_BUNDLE"));
+    let golden = common::Golden::new();
+    let mac = mac(&golden, Path::new("ssh"), bundle);
+    eprintln!(
+        "{}",
+        ok(vibe(&mac.socket, &["host", "add", "testhost", &dest]))
+    );
+    let line = || {
+        ok(vibe(&mac.socket, &["host"]))
+            .lines()
+            .find(|l| l.starts_with("testhost  "))
+            .unwrap_or_default()
+            .to_owned()
+    };
+    wait_for("the link", Duration::from_secs(60), || {
+        line().contains("  connected")
+    });
+    ok(vibe(
+        &mac.socket,
+        &[
+            "project",
+            "add",
+            golden.home.join("src/app").to_str().unwrap(),
+        ],
+    ));
+    eprintln!(
+        "{}",
+        ok(vibe(
+            &mac.socket,
+            &["host", "external", "testhost", &domain]
+        ))
+    );
+    // A certificate from Let's Encrypt, and the tunnel. It's kept on the
+    // server, so a second run doesn't ask for another.
+    wait_for("the external address", Duration::from_secs(300), || {
+        let l = line();
+        eprintln!("{l}");
+        l.contains("tunnel up") && !l.contains("tunnel up:")
+    });
+    let key = mac
+        .core
+        .create_key(KeyCreateParams {
+            name: "external-test".into(),
+        })
+        .unwrap()
+        .secret;
+    let mut c = Outside {
+        url: format!("https://{domain}/mcp"),
+        ca: None,
+        resolve: None,
+        key: Some(key.clone()),
+        next: 0,
+    };
+    // The key reaches the server with the next push.
+    wait_for("the key pushed", Duration::from_secs(60), || {
+        c.request("tools/list", json!({})).0 == 200
+    });
+    let mut nobody = Outside {
+        key: None,
+        url: c.url.clone(),
+        ca: None,
+        resolve: None,
+        next: 0,
+    };
+    assert_eq!(nobody.request("tools/list", json!({})).0, 401);
+    let started = c.call(
+        "vibe_start_agent",
+        json!({"project": "app", "profile": "software-eng-mac", "prompt": "talk", "host": "mac",
+               "name": "external-mac"}),
+    );
+    assert!(started.contains("started mac:external-mac"), "{started}");
+    c.talk("mac:external-mac");
+    if let Ok(project) = std::env::var("VIBE_TEST_LINUX_PROJECT") {
+        let started = c.call(
+            "vibe_start_agent",
+            json!({"project": project, "profile": "software-eng-linux", "prompt": "Say hi",
+                   "host": "local", "name": "external-vps"}),
+        );
+        assert!(started.contains("started external-vps"), "{started}");
+        let waited = c.call(
+            "vibe_wait",
+            json!({"agents": "external-vps", "timeout": 240}),
+        );
+        eprintln!("{waited}");
+        let read = c.call(
+            "vibe_read_messages",
+            json!({"agent": "external-vps", "last": 2}),
+        );
+        eprintln!("{read}");
+        c.call(
+            "vibe_delete_agent",
+            json!({"agent": "external-vps", "force": true}),
+        );
+    }
+    c.call(
+        "vibe_delete_agent",
+        json!({"agent": "mac:external-mac", "force": true}),
+    );
+    // Nothing listens publicly on the Mac.
+    assert_eq!(public_listeners(std::process::id()), Vec::<String>::new());
+    ok(vibe(&mac.socket, &["key", "revoke", "external-test"]));
+    wait_for("the revoke", Duration::from_secs(60), || {
+        c.request("tools/list", json!({})).0 == 401
+    });
+    ok(vibe(&mac.socket, &["host", "external", "testhost", "off"]));
     ok(vibe(&mac.socket, &["host", "remove", "testhost"]));
     drop(mac.rt);
 }

@@ -23,6 +23,11 @@ use crate::model::{
 use crate::rpc::{ApiKey, HostInfo, KeyHash, Project};
 use crate::time::rfc3339;
 
+/// The URL outside MCP callers reach the external address at.
+pub fn external_url(domain: &str) -> String {
+    format!("https://{domain}/mcp")
+}
+
 /// Each entry moves the schema up one version.
 const MIGRATIONS: &[&str] = &[
     // 1: the registry as #2 left it. Agents are filled in by #4.
@@ -118,6 +123,12 @@ const MIGRATIONS: &[&str] = &[
         created_at   TEXT NOT NULL,
         last_used_at INTEGER
     ) STRICT;
+    ",
+    // 4: external access (#18). The public name a host is the external
+    // address at: on a Mac, for a Linux host it chose; on a Linux host, its
+    // own (this host's row). NULL while it isn't.
+    "
+    ALTER TABLE hosts ADD COLUMN external TEXT;
     ",
 ];
 
@@ -311,17 +322,18 @@ impl Store {
 
     /// Every host, this one first, then the Linux hosts added to it by
     /// name. Another host's link is down here, and nothing says whether it
-    /// serves MCP or is the external address (#18): those are the daemon's
-    /// to say.
+    /// serves MCP, nor how its tunnel is: those are the daemon's to say.
+    /// Whether it's the external address, and at what URL, is recorded.
     pub fn hosts(&self) -> Result<Vec<HostInfo>> {
         let mut stmt = self.conn.prepare(
-            "SELECT name, os, label, address, version, missing FROM hosts \
+            "SELECT name, os, label, address, version, missing, external FROM hosts \
                  ORDER BY address IS NOT NULL, name",
         )?;
         let hosts = stmt
             .query_map([], |r| {
                 let address: Option<String> = r.get(3)?;
                 let missing: String = r.get(5)?;
+                let external: Option<String> = r.get(6)?;
                 Ok(HostInfo {
                     name: r.get(0)?,
                     os: r.get(1)?,
@@ -331,12 +343,15 @@ impl Store {
                     } else {
                         HostLink::Down
                     },
-                    external: false,
+                    external: external.is_some(),
                     mcp: false,
                     address,
                     version: r.get(4)?,
                     missing: split_list(&missing),
                     detail: None,
+                    url: external.as_deref().map(external_url),
+                    tunnel: None,
+                    external_detail: None,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
@@ -434,6 +449,35 @@ impl Store {
         self.conn
             .execute("DELETE FROM hosts WHERE name = ?1", [name])?;
         Ok(host)
+    }
+
+    /// The public name `name` is the external address at, if it is.
+    pub fn host_external(&self, name: &str) -> Result<Option<String>> {
+        self.conn
+            .query_row("SELECT external FROM hosts WHERE name = ?1", [name], |r| {
+                r.get(0)
+            })
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(format!("no host named {name}")))
+    }
+
+    /// Records that `name` is the external address at `domain`, or with
+    /// `None` that it isn't. On a Mac, at most one host is: choosing one
+    /// turns any other off, in the same transaction.
+    pub fn set_host_external(&mut self, name: &str, domain: Option<&str>) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        if domain.is_some() {
+            tx.execute("UPDATE hosts SET external = NULL WHERE name != ?1", [name])?;
+        }
+        let n = tx.execute(
+            "UPDATE hosts SET external = ?2 WHERE name = ?1",
+            params![name, domain],
+        )?;
+        if n == 0 {
+            return Err(StoreError::NotFound(format!("no host named {name}")));
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// A Linux host's agents as it last listed them (JSON), kept for while
@@ -1172,6 +1216,9 @@ mod tests {
                 version: None,
                 missing: vec![],
                 detail: None,
+                url: None,
+                tunnel: None,
+                external_detail: None,
             }]
         );
         assert!(s.has_host("local").unwrap());
@@ -1190,7 +1237,46 @@ mod tests {
             version: Some("0.1.0".into()),
             missing: vec!["gh".into(), "claude".into()],
             detail: None,
+            url: None,
+            tunnel: None,
+            external_detail: None,
         }
+    }
+
+    #[test]
+    fn one_external_address() {
+        let mut s = store();
+        s.add_host(&linux_host("vps"), 3).unwrap();
+        s.add_host(&linux_host("edge"), 3).unwrap();
+        assert_eq!(s.host_external("vps").unwrap(), None);
+        s.set_host_external("vps", Some("vps.example.com")).unwrap();
+        let vps = s.host("vps").unwrap();
+        assert!(vps.external);
+        assert_eq!(vps.url.as_deref(), Some("https://vps.example.com/mcp"));
+        // Choosing another turns the first off.
+        s.set_host_external("edge", Some("edge.example.com"))
+            .unwrap();
+        assert_eq!(s.host_external("vps").unwrap(), None);
+        assert!(!s.host("vps").unwrap().external);
+        assert_eq!(
+            s.host_external("edge").unwrap().as_deref(),
+            Some("edge.example.com")
+        );
+        s.set_host_external("edge", None).unwrap();
+        assert!(
+            s.hosts()
+                .unwrap()
+                .iter()
+                .all(|h| !h.external && h.url.is_none())
+        );
+        assert!(matches!(
+            s.set_host_external("nope", None),
+            Err(StoreError::NotFound(_))
+        ));
+        assert!(matches!(
+            s.host_external("nope"),
+            Err(StoreError::NotFound(_))
+        ));
     }
 
     #[test]

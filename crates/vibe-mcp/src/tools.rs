@@ -22,7 +22,8 @@ use vibe_core::model::{AgentState, LOCAL_HOST};
 use vibe_core::rpc::{Agent, AgentDeleteParams, AgentStartParams, ErrorCode};
 
 use crate::{
-    AgentView, Check, Daemon, Error, Input, Message, Role, Target, display_ref, keys, split_ref,
+    AgentView, Caller, Check, Daemon, Error, Input, Message, Role, Target, display_ref, keys,
+    split_ref,
 };
 
 /// The most text one result carries, about 8k tokens: Claude Code warns
@@ -67,10 +68,6 @@ const INSTRUCTIONS: &str = "VibeOS Native runs coding agents (Claude Code), each
 To hand an agent a task: vibe_list_projects to find a project and its profiles, vibe_start_agent with a prompt, then vibe_wait until it has answered, then vibe_read_messages for its answer (or vibe_read_output for its screen). Answer its questions with vibe_send. When it's done, vibe_delete_agent; its branch is kept.
 
 An agent is named by its ref, like quiet-amber-otter, or vps:quiet-amber-otter on another host. Its state is busy, idle, question (stopped on a menu, a yes/no or a permission prompt), asleep, paused (a limit hit) or exited. An agent on a question needs an answer: read it with vibe_read_output, then vibe_send keys, like [\"2\"] or [\"y\"] for a numbered menu or a yes/no, or [\"Down\", \"Enter\"] to move the ❯ marker. A send wakes an agent that is asleep or exited; reads never do.";
-
-/// Who called, for the log: the name of the API key the request carried.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Caller(pub(crate) String);
 
 /// Cuts text to [`MAX_RESULT_CHARS`] from the start, keeping the end, with
 /// a note saying how much was cut.
@@ -389,7 +386,7 @@ fn agent_line(v: &AgentView) -> String {
     parts.push(format!("attach: {}", v.attach_remote));
     if !v.available {
         parts.push(format!(
-            "unavailable: {}'s link is down, so this is how it was last seen",
+            "unavailable: {} can't be reached now, so this is how it was last seen",
             a.host
         ));
     }
@@ -427,7 +424,7 @@ impl<D: Daemon> Server<D> {
 
     /// The host and ref `name` names. A bare ref is this host's, unless
     /// another host has it and this one doesn't.
-    async fn resolve(&self, name: &str) -> Result<Target, String> {
+    async fn resolve(&self, c: &Caller, name: &str) -> Result<Target, String> {
         let (host, agent) = split_ref(name);
         if agent.is_empty() {
             return Err("agent must be a ref, like quiet-amber-otter".into());
@@ -445,7 +442,7 @@ impl<D: Daemon> Server<D> {
         }
         let mut found = Vec::new();
         for h in &hosts {
-            if let Ok(list) = self.daemon.agents(h).await
+            if let Ok(list) = self.daemon.agents(c, h).await
                 && list.iter().any(|v| v.agent.agent == agent)
             {
                 found.push(h.clone());
@@ -466,7 +463,7 @@ impl<D: Daemon> Server<D> {
         }
     }
 
-    async fn list_projects(&self, args: &JsonObject) -> Outcome {
+    async fn list_projects(&self, c: &Caller, args: &JsonObject) -> Outcome {
         let only = string(args, "host")?;
         let hosts = match &only {
             Some(h) => vec![h.clone()],
@@ -475,7 +472,7 @@ impl<D: Daemon> Server<D> {
         let mut projects = Vec::new();
         let mut unreachable = Vec::new();
         for h in &hosts {
-            match self.daemon.projects(h).await {
+            match self.daemon.projects(c, h).await {
                 Ok(p) => projects.extend(p),
                 Err(e) if only.is_some() => return Err(e.message),
                 Err(e) => unreachable.push(format!("{h} is unavailable: {}", e.message)),
@@ -506,7 +503,7 @@ impl<D: Daemon> Server<D> {
         ok(&text.join("\n"), json!({ "projects": projects }))
     }
 
-    async fn start_agent(&self, args: &JsonObject) -> Outcome {
+    async fn start_agent(&self, c: &Caller, args: &JsonObject) -> Outcome {
         let project = required(args, "project")?;
         let profile = required(args, "profile")?;
         let prompt = required(args, "prompt")?;
@@ -514,18 +511,21 @@ impl<D: Daemon> Server<D> {
         let name = string(args, "name")?.filter(|s| !s.is_empty());
         let host = match string(args, "host")?.filter(|s| !s.is_empty()) {
             Some(h) => h,
-            None => self.project_host(&project).await?,
+            None => self.project_host(c, &project).await?,
         };
         let a = self
             .daemon
-            .start_agent(AgentStartParams {
-                host: Some(host.clone()),
-                project,
-                profile,
-                prompt,
-                from,
-                name,
-            })
+            .start_agent(
+                c,
+                AgentStartParams {
+                    host: Some(host.clone()),
+                    project,
+                    profile,
+                    prompt,
+                    from,
+                    name,
+                },
+            )
             .await
             .map_err(|e| e.message)?;
         let r = display_ref(&a.host, &a.agent);
@@ -537,11 +537,11 @@ impl<D: Daemon> Server<D> {
     }
 
     /// The one host `project` is on.
-    async fn project_host(&self, project: &str) -> Result<String, String> {
+    async fn project_host(&self, c: &Caller, project: &str) -> Result<String, String> {
         let hosts = self.daemon.hosts().await.map_err(|e| e.message)?;
         let mut on = Vec::new();
         for h in &hosts {
-            if let Ok(list) = self.daemon.projects(h).await
+            if let Ok(list) = self.daemon.projects(c, h).await
                 && list.iter().any(|p| p.name == project)
             {
                 on.push(h.clone());
@@ -561,7 +561,7 @@ impl<D: Daemon> Server<D> {
         }
     }
 
-    async fn list_agents(&self, args: &JsonObject) -> Outcome {
+    async fn list_agents(&self, c: &Caller, args: &JsonObject) -> Outcome {
         let only = string(args, "host")?;
         let project = string(args, "project")?;
         let state = match string(args, "state")? {
@@ -577,7 +577,7 @@ impl<D: Daemon> Server<D> {
         let mut agents = Vec::new();
         let mut unreachable = Vec::new();
         for h in &hosts {
-            match self.daemon.agents(h).await {
+            match self.daemon.agents(c, h).await {
                 Ok(list) => agents.extend(list),
                 Err(e) if only.is_some() => return Err(e.message),
                 Err(e) => unreachable.push(format!("{h} is unavailable: {}", e.message)),
@@ -596,7 +596,7 @@ impl<D: Daemon> Server<D> {
         ok(&text.join("\n"), json!({ "agents": list }))
     }
 
-    async fn send(&self, args: &JsonObject) -> Outcome {
+    async fn send(&self, c: &Caller, args: &JsonObject) -> Outcome {
         let name = agent_arg(args)?;
         let text = string(args, "text")?;
         let submit = boolean(args, "submit")?;
@@ -629,7 +629,7 @@ impl<D: Daemon> Server<D> {
                 Input::Keys(keys.iter().map(|k| (*k).to_owned()).collect())
             }
         };
-        let t = self.resolve(&name).await?;
+        let t = self.resolve(c, &name).await?;
         let r = display_ref(&t.host, &t.agent);
         let what = match &input {
             Input::Keys(_) => {
@@ -646,7 +646,7 @@ impl<D: Daemon> Server<D> {
         };
         let sent = self
             .daemon
-            .send(&t, input)
+            .send(c, &t, input)
             .await
             .map_err(|e| explain(&e, Some(&t.agent)))?;
         ok(
@@ -658,13 +658,13 @@ impl<D: Daemon> Server<D> {
         )
     }
 
-    async fn read_messages(&self, args: &JsonObject) -> Outcome {
+    async fn read_messages(&self, c: &Caller, args: &JsonObject) -> Outcome {
         let name = agent_arg(args)?;
         let last = integer(args, "last", 1, MAX_MESSAGES)?.map_or(DEFAULT_MESSAGES, |n| n as usize);
-        let t = self.resolve(&name).await?;
+        let t = self.resolve(c, &name).await?;
         let messages = self
             .daemon
-            .read_messages(&t, last)
+            .read_messages(c, &t, last)
             .await
             .map_err(|e| explain(&e, Some(&t.agent)))?;
         let text = messages
@@ -698,20 +698,20 @@ impl<D: Daemon> Server<D> {
         )
     }
 
-    async fn read_output(&self, args: &JsonObject) -> Outcome {
+    async fn read_output(&self, c: &Caller, args: &JsonObject) -> Outcome {
         let name = agent_arg(args)?;
         let lines = integer(args, "lines", 1, MAX_LINES)?;
         let after = integer(args, "after", 0, u64::MAX)?;
-        let t = self.resolve(&name).await?;
+        let t = self.resolve(c, &name).await?;
         let r = display_ref(&t.host, &t.agent);
         let out = self
             .daemon
-            .read_output(&t, after)
+            .read_output(c, &t, after)
             .await
             .map_err(|e| explain(&e, Some(&t.agent)))?;
         let state = self
             .daemon
-            .check(&t, false)
+            .check(c, &t, false)
             .await
             .map(|c| c.state.to_string())
             .unwrap_or_else(|_| "unknown".into());
@@ -774,17 +774,20 @@ impl<D: Daemon> Server<D> {
         )
     }
 
-    async fn delete_agent(&self, args: &JsonObject) -> Outcome {
+    async fn delete_agent(&self, c: &Caller, args: &JsonObject) -> Outcome {
         let name = agent_arg(args)?;
         let force = boolean(args, "force")?;
-        let t = self.resolve(&name).await?;
+        let t = self.resolve(c, &name).await?;
         let a = self
             .daemon
-            .delete_agent(AgentDeleteParams {
-                host: Some(t.host.clone()),
-                agent: t.agent.clone(),
-                force,
-            })
+            .delete_agent(
+                c,
+                AgentDeleteParams {
+                    host: Some(t.host.clone()),
+                    agent: t.agent.clone(),
+                    force,
+                },
+            )
             .await
             .map_err(|e| explain(&e, Some(&t.agent)))?;
         let r = display_ref(&a.host, &a.agent);
@@ -794,7 +797,12 @@ impl<D: Daemon> Server<D> {
         )
     }
 
-    async fn wait(&self, args: &JsonObject, ctx: &RequestContext<RoleServer>) -> Outcome {
+    async fn wait(
+        &self,
+        c: &Caller,
+        args: &JsonObject,
+        ctx: &RequestContext<RoleServer>,
+    ) -> Outcome {
         let names: Vec<String> = match arg(args, "agents", Some("windows"))
             .or_else(|| arg(args, "agent", Some("window")))
         {
@@ -827,7 +835,7 @@ impl<D: Daemon> Server<D> {
             integer(args, "lines", 0, MAX_LINES)?.map_or(DEFAULT_WAIT_LINES, |n| n as usize);
         let mut targets = Vec::new();
         for n in &names {
-            let t = self.resolve(n).await?;
+            let t = self.resolve(c, n).await?;
             if !targets.contains(&t) {
                 targets.push(t);
             }
@@ -863,7 +871,7 @@ impl<D: Daemon> Server<D> {
         let (target, check, reached, checks) = loop {
             let mut checks = Vec::new();
             for t in &targets {
-                match self.daemon.check(t, background).await {
+                match self.daemon.check(c, t, background).await {
                     Ok(c) => {
                         last.insert(t.clone(), c.clone());
                         checks.push((t.clone(), c));
@@ -990,7 +998,7 @@ impl<D: Daemon> Server<D> {
             String::new()
         };
         let screen = if lines > 0 {
-            match self.daemon.read_output(&target, None).await {
+            match self.daemon.read_output(c, &target, None).await {
                 Ok(out) => last_lines(&out.history, &out.screen, lines),
                 Err(_) => String::new(),
             }
@@ -1023,19 +1031,20 @@ impl<D: Daemon> Server<D> {
     /// Runs the tool `name`, which is one of [`tools`].
     async fn run(
         &self,
+        c: &Caller,
         name: &str,
         args: &JsonObject,
         ctx: &RequestContext<RoleServer>,
     ) -> Outcome {
         match name {
-            "vibe_list_projects" => self.list_projects(args).await,
-            "vibe_start_agent" => self.start_agent(args).await,
-            "vibe_list_agents" => self.list_agents(args).await,
-            "vibe_send" => self.send(args).await,
-            "vibe_wait" => self.wait(args, ctx).await,
-            "vibe_read_messages" => self.read_messages(args).await,
-            "vibe_read_output" => self.read_output(args).await,
-            "vibe_delete_agent" => self.delete_agent(args).await,
+            "vibe_list_projects" => self.list_projects(c, args).await,
+            "vibe_start_agent" => self.start_agent(c, args).await,
+            "vibe_list_agents" => self.list_agents(c, args).await,
+            "vibe_send" => self.send(c, args).await,
+            "vibe_wait" => self.wait(c, args, ctx).await,
+            "vibe_read_messages" => self.read_messages(c, args).await,
+            "vibe_read_output" => self.read_output(c, args).await,
+            "vibe_delete_agent" => self.delete_agent(c, args).await,
             other => Err(format!("no tool called {other}")),
         }
     }
@@ -1068,21 +1077,35 @@ impl<D: Daemon> ServerHandler for Server<D> {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
         let args: JsonObject = request.arguments.clone().unwrap_or_default();
-        let caller = context
+        // The gate in front put it there: no request reaches a tool without
+        // a key.
+        let Some(caller) = context
             .extensions
             .get::<http::request::Parts>()
             .and_then(|p| p.extensions.get::<Caller>())
-            .map_or("an unknown key", |c| c.0.as_str())
-            .to_owned();
+            .cloned()
+        else {
+            return Err(ErrorData::invalid_request("an API key is needed", None));
+        };
         let name = request.name.as_ref();
         let about = arg(&args, "agent", Some("window"))
             .or_else(|| arg(&args, "agents", Some("windows")))
             .or_else(|| args.get("project"))
             .map(|v| format!(" {v}"))
             .unwrap_or_default();
-        self.daemon
-            .log(&format!("mcp: key {caller:?} called {name}{about}"));
-        if !tools().iter().any(|t| t.name == name) {
+        // A tool's name as it is, and anything else quoted, so nothing a
+        // caller sends can start a log line of its own.
+        let known = tools().iter().any(|t| t.name == name);
+        let shown = if known {
+            name.to_owned()
+        } else {
+            format!("{name:?}")
+        };
+        self.daemon.log(&format!(
+            "mcp: key {:?} called {shown}{about}",
+            caller.name()
+        ));
+        if !known {
             return Err(ErrorData::invalid_params(
                 format!("no tool called {name}"),
                 None,
@@ -1091,12 +1114,13 @@ impl<D: Daemon> ServerHandler for Server<D> {
         // On a task of its own, so a handler that panics fails its call
         // instead of leaving the client waiting on a response.
         let (server, tool) = (self.clone(), name.to_owned());
-        let outcome = tokio::spawn(async move { server.run(&tool, &args, &context).await })
-            .await
-            .unwrap_or_else(|e| Err(format!("Internal error: the call failed: {e}")));
+        let outcome =
+            tokio::spawn(async move { server.run(&caller, &tool, &args, &context).await })
+                .await
+                .unwrap_or_else(|e| Err(format!("Internal error: the call failed: {e}")));
         Ok(outcome
             .unwrap_or_else(|e| {
-                self.daemon.log(&format!("mcp: {name} failed: {e}"));
+                self.daemon.log(&format!("mcp: {name} failed: {e:?}"));
                 fail(e)
             })
             .into())

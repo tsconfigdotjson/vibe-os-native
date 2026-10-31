@@ -23,12 +23,52 @@ use vibe_core::rpc::{Agent, AgentDeleteParams, AgentStartParams, ErrorObject, Pr
 pub mod http;
 pub mod keys;
 pub mod net;
+pub mod public;
 mod tools;
 
 pub use tools::{MAX_RESULT_CHARS, MAX_WAIT_SECS, Server, clip};
 
 /// The path MCP is served at.
 pub const PATH: &str = "/mcp";
+
+/// Who's calling: the name of the API key the request carried, and the key.
+/// A call for an agent on the Mac carries the key down the tunnel, so the
+/// Mac checks it itself (PRD: External access, keys are checked where the
+/// agent lives). It never reaches a log: its `Debug` shows the key's
+/// first characters only.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Caller {
+    name: String,
+    key: String,
+}
+
+impl Caller {
+    pub fn new(name: impl Into<String>, key: impl Into<String>) -> Caller {
+        Caller {
+            name: name.into(),
+            key: key.into(),
+        }
+    }
+
+    /// The key's name, such as `laptop`.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The key itself, as the caller sent it.
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+}
+
+impl std::fmt::Debug for Caller {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Caller")
+            .field("name", &self.name)
+            .field("key", &vibe_core::keys::shown_prefix(&self.key))
+            .finish()
+    }
+}
 
 /// An agent on a host: what every call after a start names.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -114,7 +154,9 @@ pub type Error = ErrorObject;
 
 /// What the MCP server needs from `vibed`: the core handlers, by host.
 /// Hosts other than `local` are Linux hosts this one is linked to, reached
-/// over their links.
+/// over their links, or, on the Linux host that's the external address,
+/// the Mac behind it (`mac`), reached down its tunnel. Each call has its
+/// [`Caller`], whose key a host checks again where an agent lives.
 pub trait Daemon: Send + Sync + 'static {
     /// Writes a line to the daemon's log.
     fn log(&self, line: &str) {
@@ -132,26 +174,44 @@ pub trait Daemon: Send + Sync + 'static {
     /// Every host this one can reach now, itself (`local`) first.
     fn hosts(&self) -> impl Future<Output = Result<Vec<String>, Error>> + Send;
 
-    fn projects(&self, host: &str) -> impl Future<Output = Result<Vec<Project>, Error>> + Send;
+    fn projects(
+        &self,
+        c: &Caller,
+        host: &str,
+    ) -> impl Future<Output = Result<Vec<Project>, Error>> + Send;
 
-    fn agents(&self, host: &str) -> impl Future<Output = Result<Vec<AgentView>, Error>> + Send;
+    fn agents(
+        &self,
+        c: &Caller,
+        host: &str,
+    ) -> impl Future<Output = Result<Vec<AgentView>, Error>> + Send;
 
-    fn start_agent(&self, p: AgentStartParams)
-    -> impl Future<Output = Result<Agent, Error>> + Send;
+    fn start_agent(
+        &self,
+        c: &Caller,
+        p: AgentStartParams,
+    ) -> impl Future<Output = Result<Agent, Error>> + Send;
 
     fn delete_agent(
         &self,
+        c: &Caller,
         p: AgentDeleteParams,
     ) -> impl Future<Output = Result<Agent, Error>> + Send;
 
     /// Types `input` into the agent's terminal, waking it first if it's
     /// asleep, paused or exited. Whatever answers afterwards is what
     /// [`Daemon::check`] waits for.
-    fn send(&self, t: &Target, input: Input) -> impl Future<Output = Result<Sent, Error>> + Send;
+    fn send(
+        &self,
+        c: &Caller,
+        t: &Target,
+        input: Input,
+    ) -> impl Future<Output = Result<Sent, Error>> + Send;
 
     /// Never wakes it.
     fn check(
         &self,
+        c: &Caller,
         t: &Target,
         background: bool,
     ) -> impl Future<Output = Result<Check, Error>> + Send;
@@ -159,6 +219,7 @@ pub trait Daemon: Send + Sync + 'static {
     /// The screen, and what scrolled off it since `after`. Never wakes it.
     fn read_output(
         &self,
+        c: &Caller,
         t: &Target,
         after: Option<u64>,
     ) -> impl Future<Output = Result<Screen, Error>> + Send;
@@ -167,6 +228,7 @@ pub trait Daemon: Send + Sync + 'static {
     /// Never wakes it.
     fn read_messages(
         &self,
+        c: &Caller,
         t: &Target,
         last: usize,
     ) -> impl Future<Output = Result<Vec<Message>, Error>> + Send;
@@ -194,6 +256,16 @@ pub fn split_ref(name: &str) -> (Option<&str>, &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_callers_key_never_shows() {
+        let key = vibe_core::keys::encode(&[7; 32]);
+        let c = Caller::new("laptop", key.clone());
+        assert_eq!(c.key(), key);
+        let shown = format!("{c:?}");
+        assert!(!shown.contains(&key), "{shown}");
+        assert!(shown.contains("laptop") && shown.contains("vk_"), "{shown}");
+    }
 
     #[test]
     fn refs_say_their_host() {

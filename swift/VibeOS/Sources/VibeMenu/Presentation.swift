@@ -323,3 +323,83 @@ public struct LoginsSummary: Equatable, Sendable {
         }
     }
 }
+
+// MARK: External access
+
+/// How the external address is doing, as the menu and Settings say it
+/// (PRD: External access).
+public struct ExternalStatus: Equatable, Sendable {
+    public enum Tone: Equatable, Sendable {
+        /// Outside clients reach it.
+        case working
+        /// On its way: the tunnel is opening, or a certificate is coming.
+        case pending
+        /// Something keeps it from working; `detail` says what.
+        case trouble
+    }
+
+    /// A few words, for the menu: "public", "connecting…".
+    public var short: String
+    /// A sentence, for Settings.
+    public var summary: String
+    /// What's wrong or what it waits for, and how to fix it, as the host or
+    /// the tunnel says.
+    public var detail: String?
+    /// An SF Symbol.
+    public var symbol: String
+    public var tone: Tone
+}
+
+/// How `host` is doing as the external address, if it is the one.
+public func externalStatus(_ host: HostInfo) -> ExternalStatus? {
+    guard host.external else { return nil }
+    let detail = host.externalDetail
+    switch host.tunnel {
+    case .up? where detail == nil:
+        return ExternalStatus(
+            short: "public", summary: "Outside MCP clients reach agents on \(host.name) and on this Mac.",
+            detail: nil, symbol: "globe", tone: .working)
+    case .up?:
+        return ExternalStatus(
+            short: "almost public", summary: "The tunnel is up; \(host.name) isn't serving yet.",
+            detail: detail, symbol: "globe", tone: .pending)
+    case .connecting?:
+        return ExternalStatus(
+            short: "connecting…", summary: "Opening the tunnel from this Mac to \(host.name)…",
+            detail: detail, symbol: "globe", tone: .pending)
+    case .down?, nil:
+        return ExternalStatus(
+            short: "not reachable", summary: "Outside clients can't reach this Mac's agents through \(host.name) yet.",
+            detail: detail, symbol: "exclamationmark.triangle.fill", tone: .trouble)
+    }
+}
+
+/// The public name a server is likely reached at, from its SSH destination:
+/// `me@vps.example.com:22` gives `vps.example.com`. Empty when it's an IP
+/// address or a single name from `~/.ssh/config`.
+public func suggestedDomain(fromSSH address: String) -> String {
+    var host = address
+    if host.hasPrefix("ssh://") { host.removeFirst("ssh://".count) }
+    if let at = host.lastIndex(of: "@") { host = String(host[host.index(after: at)...]) }
+    if host.hasPrefix("[") { return "" }
+    if let colon = host.firstIndex(of: ":") { host = String(host[..<colon]) }
+    return normalizedDomain(host) ?? ""
+}
+
+/// `text` as the public DNS name Let's Encrypt can certify, in lowercase,
+/// or nil if it isn't one: as vibed checks it (`validate_domain`).
+public func normalizedDomain(_ text: String) -> String? {
+    var name = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    if name.hasSuffix(".") { name.removeLast() }
+    let labels = name.split(separator: ".", omittingEmptySubsequences: false)
+    guard name.count <= 253, labels.count >= 2 else { return nil }
+    let allowed = Set("abcdefghijklmnopqrstuvwxyz0123456789-")
+    for label in labels {
+        guard !label.isEmpty, label.count <= 63, !label.hasPrefix("-"), !label.hasSuffix("-"),
+            label.allSatisfy(allowed.contains)
+        else { return nil }
+    }
+    // An IPv4 address's last part is all digits; a name's never is.
+    if let last = labels.last, last.allSatisfy(\.isNumber) { return nil }
+    return name
+}

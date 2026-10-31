@@ -69,6 +69,18 @@ pub struct Installed {
     pub notes: Vec<String>,
 }
 
+/// An SSH reverse tunnel, kept up until it ends or is dropped.
+pub struct TunnelChild {
+    /// Resolves, with why, once the tunnel has ended.
+    pub ended: BoxFuture<'static, String>,
+}
+
+impl fmt::Debug for TunnelChild {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TunnelChild").finish_non_exhaustive()
+    }
+}
+
 /// How this `vibed` reaches Linux hosts.
 pub trait Remote: Send + Sync + fmt::Debug {
     /// Opens a JSON-RPC connection to `vibed` on the host at `address`.
@@ -77,6 +89,18 @@ pub trait Remote: Send + Sync + fmt::Debug {
     /// Installs or upgrades `vibed` on the host at `address`, and checks
     /// its tools.
     fn install<'a>(&'a self, address: &'a str) -> BoxFuture<'a, Result<Installed, String>>;
+
+    /// Forwards the Unix socket `remote` on the host at `address` to the
+    /// socket `local` here (`ssh -R remote:local`), until the tunnel ends or
+    /// is dropped (PRD: External access, the Mac dials out).
+    fn tunnel<'a>(
+        &'a self,
+        address: &'a str,
+        _remote: &'a str,
+        _local: &'a std::path::Path,
+    ) -> BoxFuture<'a, Result<TunnelChild, String>> {
+        Box::pin(async move { Err(format!("can't keep a tunnel to {address}")) })
+    }
 
     /// The command a terminal here runs to attach to `agent` on `address`
     /// (PRD: The link, "Clicking a remote agent opens Terminal with …").
@@ -269,8 +293,18 @@ fn keep_last_line(
 /// so a password or passphrase it can't get from the agent fails at once.
 /// A server's first key is taken, as a first `ssh` by hand would ask to;
 /// a changed one never is. Keepalives notice a pulled network within
-/// half a minute, and the link pings on top of that.
-const SSH_OPTIONS: [&str; 12] = [
+/// half a minute, and the link pings on top of that. Nothing of the Mac's
+/// goes to the server but the connection itself: not its SSH agent, nor X11,
+/// whatever `~/.ssh/config` says, as the server may not deserve them.
+const SSH_OPTIONS: [&str; 20] = [
+    "-a",
+    "-x",
+    "-o",
+    "ForwardAgent=no",
+    "-o",
+    "ForwardX11=no",
+    "-o",
+    "PermitLocalCommand=no",
     "-o",
     "BatchMode=yes",
     "-o",
@@ -516,6 +550,85 @@ impl Remote for Ssh {
     fn install<'a>(&'a self, address: &'a str) -> BoxFuture<'a, Result<Installed, String>> {
         Box::pin(self.install_on(address))
     }
+
+    fn tunnel<'a>(
+        &'a self,
+        address: &'a str,
+        remote: &'a str,
+        local: &'a std::path::Path,
+    ) -> BoxFuture<'a, Result<TunnelChild, String>> {
+        Box::pin(async move {
+            let mut child = tokio::process::Command::new(&self.program)
+                .args(tunnel_args(address, remote, local))
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .map_err(|e| format!("can't run {}: {e}", self.program.to_string_lossy()))?;
+            let stdin = child.stdin.take().expect("stdin is piped");
+            let why = keep_last_line(child.stderr.take().expect("stderr is piped"));
+            let address = address.to_owned();
+            Ok(TunnelChild {
+                ended: Box::pin(async move {
+                    // Held open while the tunnel is up: once vibed is gone,
+                    // however it went, `cat` there reads its end, and the
+                    // tunnel closes with it.
+                    let _stdin = stdin;
+                    let status = child.wait().await;
+                    // stderr's last line may come just after the exit.
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    let said = why.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    match status {
+                        Ok(s) if s.code() == Some(255) && !said.is_empty() => {
+                            tunnel_failure(&address, &said)
+                        }
+                        Ok(s) if said.is_empty() => format!("ssh ended ({s})"),
+                        Ok(_) => format!("ssh ended: {said}"),
+                        Err(e) => format!("ssh ended: {e}"),
+                    }
+                }),
+            })
+        })
+    }
+}
+
+/// `ssh`'s arguments for the tunnel to `address`: its own connection (not
+/// one shared through a control master, which would outlive it), that
+/// fails when the forward can't be made, and runs `cat` there to end when
+/// its input does.
+pub fn tunnel_args(address: &str, remote: &str, local: &std::path::Path) -> Vec<OsString> {
+    let mut args: Vec<OsString> = SSH_OPTIONS.iter().map(OsString::from).collect();
+    for o in [
+        "ExitOnForwardFailure=yes",
+        "ControlMaster=no",
+        "ControlPath=none",
+    ] {
+        args.push("-o".into());
+        args.push(o.into());
+    }
+    args.push("-T".into());
+    args.push("-R".into());
+    let mut forward = OsString::from(remote);
+    forward.push(":");
+    forward.push(local.as_os_str());
+    args.push(forward);
+    args.push("--".into());
+    args.push(address.into());
+    args.push("cat >/dev/null".into());
+    args
+}
+
+/// Why a tunnel couldn't be made, with how to fix the usual reason.
+fn tunnel_failure(address: &str, said: &str) -> String {
+    if said.contains("remote port forwarding failed") || said.contains("forwarding failed") {
+        format!(
+            "{address}'s sshd refused to forward a Unix socket: {said}. Allow it in its \
+             /etc/ssh/sshd_config with AllowStreamLocalForwarding yes (the default), then restart sshd"
+        )
+    } else {
+        unreachable_message(address, said)
+    }
 }
 
 /// What a step printed: `key=value` lines. A key may come more than once.
@@ -750,6 +863,43 @@ fn configure_script(uploads: &[(&str, String)], unit: &str, path: &str) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_tunnel_is_its_own_ssh_and_fails_when_its_forward_does() {
+        let args: Vec<String> = tunnel_args(
+            "me@vps",
+            "/home/me/.local/share/vibeos/run/mac.sock",
+            std::path::Path::new("/Users/me/Library/Application Support/VibeOS/run/tunnel.sock"),
+        )
+        .into_iter()
+        .map(|a| a.into_string().unwrap())
+        .collect();
+        let joined = args.join(" ");
+        for want in [
+            "BatchMode=yes",
+            "ForwardAgent=no",
+            "ExitOnForwardFailure=yes",
+            "ControlMaster=no",
+            "ControlPath=none",
+        ] {
+            assert!(joined.contains(want), "{joined}");
+        }
+        let r = args.iter().position(|a| a == "-R").unwrap();
+        assert_eq!(
+            args[r + 1],
+            "/home/me/.local/share/vibeos/run/mac.sock:/Users/me/Library/Application Support/VibeOS/run/tunnel.sock"
+        );
+        // The destination comes after `--`, so it's never read as an option.
+        let dd = args.iter().position(|a| a == "--").unwrap();
+        assert_eq!(&args[dd + 1..], ["me@vps", "cat >/dev/null"]);
+        assert!(
+            tunnel_failure(
+                "me@vps",
+                "Error: remote port forwarding failed for listen path x"
+            )
+            .contains("AllowStreamLocalForwarding")
+        );
+    }
 
     #[test]
     fn quoting() {

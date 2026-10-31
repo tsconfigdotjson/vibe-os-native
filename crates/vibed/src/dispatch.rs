@@ -7,12 +7,12 @@ use tokio::sync::broadcast;
 use vibe_core::rpc::{
     AgentsCheck, AgentsDelete, AgentsInterrupt, AgentsList, AgentsMessages, AgentsOutput,
     AgentsSend, AgentsStart, ErrorCode, ErrorObject, Event, EventsSubscribe, GhStatusGet, Hello,
-    HelloParams, HelloResult, HostsAdd, HostsList, HostsRemove, HostsUpgrade, Id, KeysCreate,
-    KeysList, KeysRevoke, KeysSync, KeysVerify, LimitsGet, LimitsSet, McpGet, McpSet, Method,
-    PROTOCOL_VERSION, ProfilesCreate, ProfilesDelete, ProfilesList, ProfilesUpdate, ProjectsAdd,
-    ProjectsList, ProjectsRemove, ProtocolMismatchData, Request, Response, SessionsAttach,
-    SessionsList, Subscribed, ToolboxLoginsGet, ToolboxOpen, ToolboxRebuild, ToolboxStatusGet,
-    ToolboxUpdate,
+    HelloParams, HelloResult, HostsAdd, HostsExternal, HostsList, HostsRemove, HostsUpgrade, Id,
+    KeysCreate, KeysList, KeysRevoke, KeysSync, KeysVerify, LimitsGet, LimitsSet, McpGet, McpSet,
+    Method, PROTOCOL_VERSION, ProfilesCreate, ProfilesDelete, ProfilesList, ProfilesUpdate,
+    ProjectsAdd, ProjectsList, ProjectsRemove, ProtocolMismatchData, Request, Response,
+    SessionsAttach, SessionsList, Subscribed, ToolboxLoginsGet, ToolboxOpen, ToolboxRebuild,
+    ToolboxStatusGet, ToolboxUpdate, TunnelPrepare,
 };
 
 use crate::core::Core;
@@ -173,6 +173,13 @@ async fn call(
             encode_result(core.upgrade_host(decode::<HostsUpgrade>(params)?).await)
         }
         HostsRemove::NAME => encode_result(core.remove_host(decode::<HostsRemove>(params)?).await),
+        HostsExternal::NAME => {
+            encode_result(core.set_external(decode::<HostsExternal>(params)?).await)
+        }
+        TunnelPrepare::NAME => {
+            decode::<TunnelPrepare>(params)?;
+            encode_result(core.prepare_tunnel())
+        }
         ProjectsList::NAME => encode_result(core.projects(decode::<ProjectsList>(params)?)),
         ProjectsAdd::NAME => encode_result(core.add_project(decode::<ProjectsAdd>(params)?).await),
         ProjectsRemove::NAME => {
@@ -261,6 +268,17 @@ async fn call(
     }
 }
 
+/// Calls `method` on this host, with `params`, as a connection of its own
+/// would. The tunnel's socket runs its calls through this, with no `host`
+/// in them, so none goes on to a Linux host.
+pub(crate) async fn call_here(
+    core: &Core,
+    method: &str,
+    params: Value,
+) -> Result<Value, ErrorObject> {
+    call(core, &mut Session::default(), method, Some(params)).await
+}
+
 /// Decodes `M`'s params, by name only; absent means `{}`.
 fn decode<M: Method>(params: Option<Value>) -> Result<M::Params, ErrorObject> {
     let params = match params {
@@ -290,7 +308,7 @@ fn protocol_mismatch(theirs: u64) -> ErrorObject {
     })
 }
 
-fn hello(info: &DaemonInfo, params: HelloParams) -> Result<HelloResult, ErrorObject> {
+pub(crate) fn hello(info: &DaemonInfo, params: HelloParams) -> Result<HelloResult, ErrorObject> {
     if params.protocol != PROTOCOL_VERSION {
         return Err(protocol_mismatch(params.protocol.into()));
     }

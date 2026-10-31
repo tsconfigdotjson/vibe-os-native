@@ -71,8 +71,9 @@ struct Status {
     connected: bool,
     /// Why it's down, when it is.
     detail: Option<String>,
-    /// Whether the host serves MCP, as it last said.
-    mcp: bool,
+    /// What the host last said of itself, its own row of `hosts.list`:
+    /// whether it serves MCP, and how its external address is.
+    own: Option<HostInfo>,
 }
 
 /// One Linux host's link.
@@ -132,7 +133,7 @@ impl Link {
             status: Mutex::new(Status {
                 connected: false,
                 detail: Some("not connected yet".into()),
-                mcp: false,
+                own: None,
             }),
             up: watch::channel(false).0,
             idle: Mutex::new(Vec::new()),
@@ -158,8 +159,25 @@ impl Link {
             HostLink::Down
         };
         info.detail = if s.connected { None } else { s.detail.clone() };
-        info.mcp = s.connected && s.mcp;
+        info.mcp = s.connected && s.own.as_ref().is_some_and(|o| o.mcp);
         info
+    }
+
+    /// What the host last said of itself while its link was up.
+    pub fn reported(&self) -> Option<HostInfo> {
+        let s = lock(&self.status);
+        s.connected.then(|| s.own.clone()).flatten()
+    }
+
+    /// The public name the host says it serves the external address at, if
+    /// it says it does.
+    pub fn reported_domain(&self) -> Option<String> {
+        let own = self.reported()?;
+        own.external.then_some(())?;
+        own.url?
+            .strip_prefix("https://")?
+            .strip_suffix(vibe_mcp::PATH)
+            .map(str::to_owned)
     }
 
     /// Reconnects now rather than at the end of the backoff.
@@ -176,21 +194,29 @@ impl Link {
         self.set_down(Some("removed".into()));
     }
 
-    /// Notes whether the host serves MCP, and returns whether that changed.
-    fn set_mcp(&self, mcp: bool) -> bool {
+    /// Notes what the host just answered of itself, as `hosts.external`
+    /// does, under the name it calls itself.
+    pub(crate) fn note_report(&self, mut own: HostInfo) {
+        own.name = LOCAL_HOST.to_owned();
+        self.set_report(own);
+    }
+
+    /// Notes what the host says of itself, and returns whether that
+    /// changed.
+    fn set_report(&self, own: HostInfo) -> bool {
         let mut s = lock(&self.status);
-        let changed = s.connected && s.mcp != mcp;
+        let changed = s.connected && s.own.as_ref() != Some(&own);
         if s.connected {
-            s.mcp = mcp;
+            s.own = Some(own);
         }
         changed
     }
 
-    fn set_up(&self, mcp: bool) {
+    fn set_up(&self, own: Option<HostInfo>) {
         *lock(&self.status) = Status {
             connected: true,
             detail: None,
-            mcp,
+            own,
         };
         self.up.send_replace(true);
     }
@@ -203,7 +229,7 @@ impl Link {
             *s = Status {
                 connected: false,
                 detail,
-                mcp: false,
+                own: None,
             };
             changed
         };
@@ -411,16 +437,15 @@ async fn session(core: &Weak<Core>, link: &Arc<Link>, timing: Timing) -> Result<
                 {
                     waiting = None;
                     // The ping's answer is the host's own listing: whether
-                    // it serves MCP now.
-                    let serving = message
+                    // it serves MCP now, and its external address.
+                    let own = message
                         .get("result")
                         .cloned()
                         .and_then(|r| serde_json::from_value::<HostList>(r).ok())
-                        .and_then(|l| l.hosts.into_iter().find(|h| h.name == LOCAL_HOST))
-                        .map(|h| h.mcp);
+                        .and_then(|l| l.hosts.into_iter().find(|h| h.name == LOCAL_HOST));
                     if let Some(c) = core.upgrade() {
-                        if let Some(mcp) = serving
-                            && link.set_mcp(mcp)
+                        if let Some(own) = own
+                            && link.set_report(own)
                         {
                             c.host_link_changed(link);
                         }
@@ -546,7 +571,7 @@ async fn opening(core: &Arc<Core>, link: &Arc<Link>, timing: Timing) -> Result<C
         .and_then(Value::as_str)
         .map(str::to_owned);
     core.host_reported(link, own.as_ref(), version);
-    link.set_up(own.as_ref().is_some_and(|h| h.mcp));
+    link.set_up(own);
     crate::log!("vibed: linked to {} ({})", link.name, link.address);
     core.host_link_changed(link);
     core.link_came_up(link);

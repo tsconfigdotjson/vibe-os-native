@@ -11,7 +11,7 @@ use serde_json::Value;
 use vibe_core::model::{
     Activity, AgentState, Certainty, Environment, EventKind, GhState, HostLink, LoginTool,
     MessageRole, Mode, Model, ProjectSource, Reasoning, SessionState, StopReason, ToolboxAction,
-    ToolboxState, WakeupKind,
+    ToolboxState, TunnelState, WakeupKind,
 };
 use vibe_core::paths;
 use vibe_core::rpc::*;
@@ -162,6 +162,8 @@ fn rust_types() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
         entry::<HostAddParams>(),
         entry::<HostNameParams>(),
         entry::<HostInstall>(),
+        entry::<HostExternalParams>(),
+        entry::<TunnelPrepared>(),
         entry::<Project>(),
         entry::<ProjectList>(),
         entry::<ProjectAddParams>(),
@@ -254,6 +256,8 @@ fn rust_methods() -> BTreeMap<&'static str, MethodTypes> {
         method::<HostsAdd>(),
         method::<HostsUpgrade>(),
         method::<HostsRemove>(),
+        method::<HostsExternal>(),
+        method::<TunnelPrepare>(),
         method::<ProjectsList>(),
         method::<ProjectsAdd>(),
         method::<ProjectsRemove>(),
@@ -316,6 +320,7 @@ fn rust_enums() -> BTreeMap<&'static str, Vec<&'static str>> {
         ("GhState", names(GhState::ALL, GhState::as_str)),
         ("EventKind", names(EventKind::ALL, EventKind::as_str)),
         ("HostLink", names(HostLink::ALL, HostLink::as_str)),
+        ("TunnelState", names(TunnelState::ALL, TunnelState::as_str)),
         (
             "SessionState",
             names(SessionState::ALL, SessionState::as_str),
@@ -681,11 +686,12 @@ fn examples_cover_the_contract() {
         );
     }
     for code in ErrorCode::ALL {
-        // An internal error can't be provoked on purpose, and an invalid
-        // host.toml needs a broken file; vibed's own tests cover that one.
+        // An internal error can't be provoked on purpose, an invalid
+        // host.toml needs a broken file, and only the tunnel's socket says
+        // unauthorized; vibed's own tests cover those.
         if !matches!(
             code,
-            ErrorCode::InternalError | ErrorCode::HostConfigInvalid
+            ErrorCode::InternalError | ErrorCode::HostConfigInvalid | ErrorCode::Unauthorized
         ) {
             assert!(
                 seen.codes.contains(&code.code()),

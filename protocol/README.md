@@ -92,6 +92,32 @@ do. A Linux host's events come onto the Mac's stream under its name. The Mac
 pushes its API keys to each linked host by their hashes (`keys.sync`), so
 one key works on every host.
 
+**External access.** `hosts.external` makes one Linux host the external
+address: it serves MCP publicly at `https://<domain>/mcp` (port 443, with a
+certificate from Let's Encrypt, every call rate-limited and logged), and
+the Mac keeps an SSH reverse tunnel to it. While it is, `hosts.list` gives
+its `url`, its `tunnel` (`connecting`, `up` or `down`) and, when something
+keeps it from working or holds it up, `external_detail`. On the Mac the
+choice is recorded and the host is told, now or once its link is back; on
+a Linux host, `hosts.external` for `local` turns it on there. A Mac never
+serves it itself. Before each tunnel the Mac calls `tunnel.prepare` on the
+host over the link, which gives the Unix socket in the host's private
+`run/` (`mac.sock`) the tunnel ends at, cleared of any an earlier tunnel
+left; the Mac forwards it with `ssh -R` to its own `run/tunnel.sock`.
+
+**The tunnel socket isn't this contract.** The Mac's `run/tunnel.sock`
+takes two methods only, in the same framing: `daemon.hello`, and
+`tunnel.call {key, method, params}`. That runs `method` on the Mac, for its
+own agents only (a `host` other than `local` is `invalid_params`), after
+the Mac checks `key`, the outside caller's API key, itself: a key it
+doesn't know, revoked here though a host hasn't heard yet, or a host's own,
+gets `unauthorized` (-32006), after a pause. `method` is one of the calls
+MCP's tools stand on: `projects.list`, `agents.list`, `agents.start`,
+`agents.delete`, `agents.send`, `agents.check`, `agents.output`,
+`agents.messages`; anything else is `method_not_found`. Its result is that
+call's. On the external host the Mac goes by `mac`, so its agents are
+`mac:<ref>` to outside callers.
+
 The methods MCP's `vibe_send`, `vibe_wait`, `vibe_read_output` and
 `vibe_read_messages` stand on are here too, as `agents.send`,
 `agents.check`, `agents.output` and `agents.messages`, so the Mac can reach

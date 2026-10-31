@@ -46,9 +46,10 @@ struct KeysTab: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("A key is equivalent to a shell on this Mac. Every key has full access; revoke one that leaks.")
+            Text(keysNote)
                 .font(.callout)
                 .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
             Table(keys) {
                 TableColumn("Name", value: \.name)
                 TableColumn("Key") { key in Text("\(key.prefix)…").font(.system(.body, design: .monospaced)) }
@@ -84,6 +85,13 @@ struct KeysTab: View {
                                     WorktreeActions.copy(MCPSetup.command(secret: created.secret, url: tailscale))
                                 }
                             }
+                            // For a client anywhere, through the external address.
+                            if let external = model.externalHost?.url {
+                                Button("Copy External Setup Command") {
+                                    WorktreeActions.copy(MCPSetup.command(secret: created.secret, url: external))
+                                }
+                                .help("Sets up a client anywhere on the internet, at \(external)")
+                            }
                             Spacer()
                             Button("Done") { self.created = nil }
                         }
@@ -93,6 +101,15 @@ struct KeysTab: View {
             ErrorText(error: error)
         }
         .task(id: model.settingsRevision) { await load() }
+    }
+
+    private var keysNote: String {
+        var note = "A key is equivalent to a shell on this Mac. Every key has full access; revoke one that leaks."
+        if let host = model.externalHost {
+            note += " Keys also work from the internet, through \(host.name). Revoking one cuts it off there "
+                + "and on this Mac at once."
+        }
+        return note
     }
 
     private func load() async {
@@ -119,7 +136,8 @@ struct KeysTab: View {
     private func revoke(_ key: ApiKey) async {
         guard
             confirm(
-                "Revoke \(key.name)?", detail: "Anything using \(key.prefix)… stops working at once.",
+                "Revoke \(key.name)?",
+                detail: "Anything using \(key.prefix)… stops working at once, on this Mac and every Linux host.",
                 action: "Revoke")
         else { return }
         do {
@@ -149,6 +167,8 @@ struct HostsTab: View {
     @State private var hostError: String?
     @State private var selected: HostInfo.ID?
     @State private var working = false
+    /// The host Use as External Address is being turned on for.
+    @State private var externalFor: HostInfo?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -191,10 +211,26 @@ struct HostsTab: View {
                     }
                 }
                 TableColumn("MCP") { host in Text(host.mcp ? "on" : "off") }
-                TableColumn("External address") { host in
-                    Toggle("", isOn: .constant(host.external))
+                TableColumn("External Address") { host in
+                    if host.link == .local {
+                        Text("—")
+                            .foregroundStyle(.secondary)
+                            .help("This Mac never listens publicly; a Linux host with a public address can")
+                            .accessibilityLabel("Not available for this Mac")
+                    } else {
+                        Toggle(
+                            "Use \(host.name) as the external address",
+                            isOn: Binding(
+                                get: { host.external },
+                                set: { on in
+                                    if on { externalFor = host } else { Task { await turnOffExternal(host) } }
+                                })
+                        )
                         .labelsHidden()
-                        .disabled(true)
+                        .toggleStyle(.switch)
+                        .controlSize(.mini)
+                        .help(host.external ? "Outside MCP clients reach agents through \(host.name)" : "Use \(host.name) as the external address")
+                    }
                 }
             }
             .contextMenu(forSelectionType: HostInfo.ID.self) { names in
@@ -202,6 +238,9 @@ struct HostsTab: View {
                     Button("Update vibed on \(name)") { Task { await upgrade(name) } }
                     Button("Remove \(name)…", role: .destructive) { Task { await remove(name) } }
                 }
+            }
+            if let host = model.externalHost {
+                ExternalAddressBox(host: host)
             }
             Text("A Linux host runs its agents itself, under its own logins; this Mac's menu and MCP show them too. "
                 + "Removing a host only forgets it here: its vibed and agents run on, on their own.")
@@ -224,6 +263,24 @@ struct HostsTab: View {
                 Spacer()
                 Button("Refresh") { Task { await model.refresh() } }
             }
+        }
+        .sheet(item: $externalFor) { host in
+            ExternalAddressSheet(model: model, host: host)
+        }
+    }
+
+    private func turnOffExternal(_ host: HostInfo) async {
+        guard confirm(
+            "Stop using \(host.name) as the external address?",
+            detail: "Outside MCP clients lose their way in to every agent, on \(host.name) and on this Mac. "
+                + "The tunnel closes, and \(host.name) stops listening publicly. Keys stay as they are.",
+            action: "Stop Using")
+        else { return }
+        do {
+            _ = try await model.setExternal(host.name, domain: nil)
+            hostError = nil
+        } catch {
+            hostError = describe(error)
         }
     }
 
@@ -272,6 +329,144 @@ struct HostsTab: View {
 
 extension HostInfo: @retroactive Identifiable {
     public var id: String { name }
+}
+
+/// The external address, under the hosts: where outside clients reach it,
+/// and how it's doing.
+struct ExternalAddressBox: View {
+    let host: HostInfo
+
+    var body: some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 8) {
+                if let url = host.url {
+                    HStack(alignment: .firstTextBaseline) {
+                        Text(url)
+                            .font(.system(.body, design: .monospaced))
+                            .textSelection(.enabled)
+                            .accessibilityLabel("External address: \(url)")
+                        Spacer()
+                        Button("Copy URL") { WorktreeActions.copy(url) }
+                    }
+                }
+                if let status = externalStatus(host) {
+                    Label(status.summary, systemImage: status.symbol)
+                        .symbolRenderingMode(.hierarchical)
+                        .foregroundStyle(status.tone.color)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if let detail = status.detail {
+                        Text(detail)
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                Text("Clients send an API key with every call. \(host.name) checks it, and this Mac checks it "
+                    + "again for its own agents. \(host.name) sees the keys sent to it, so a key used there is "
+                    + "only as safe as \(host.name) is. Nothing listens publicly on this Mac: it reaches "
+                    + "\(host.name) through an SSH tunnel of its own.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        } label: {
+            Label("External Address on \(host.name)", systemImage: "globe")
+        }
+    }
+}
+
+extension ExternalStatus.Tone {
+    var color: Color {
+        switch self {
+        case .working: .green
+        case .pending: .secondary
+        case .trouble: .orange
+        }
+    }
+}
+
+/// Use as External Address: the public name the host is reached at. vibed
+/// checks it too, and the host gets its certificate for it.
+struct ExternalAddressSheet: View {
+    @ObservedObject var model: MenuModel
+    let host: HostInfo
+    @Environment(\.dismiss) private var dismiss
+    @State private var domain: String
+    @State private var working = false
+    @State private var error: String?
+
+    init(model: MenuModel, host: HostInfo) {
+        self.model = model
+        self.host = host
+        _domain = State(initialValue: suggestedDomain(fromSSH: host.address ?? ""))
+    }
+
+    private var name: String? { normalizedDomain(domain) }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Form {
+                Section {
+                    TextField("Public name", text: $domain, prompt: Text("vps.example.com"))
+                        .autocorrectionDisabled()
+                        .onSubmit { Task { await turnOn() } }
+                } header: {
+                    Text("Use \(host.name) as the External Address")
+                } footer: {
+                    Text("Outside MCP clients, such as an orchestrator in the cloud, reach agents on \(host.name) "
+                        + "and on this Mac at https://\(name ?? "<public name>")/mcp, with an API key. "
+                        + "\(host.name) gets its certificate from Let's Encrypt, so the name must point at it and "
+                        + "port 443 must be open there. Nothing opens on this Mac.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .formStyle(.grouped)
+            .disabled(working)
+            if let other = model.externalHost, other.name != host.name {
+                Label("\(other.name) stops being the external address.", systemImage: "info.circle")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal)
+            }
+            if let error {
+                Label(error, systemImage: "exclamationmark.triangle.fill")
+                    .symbolRenderingMode(.multicolor)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+                    .padding(.horizontal)
+            }
+            HStack {
+                if working {
+                    ProgressView().controlSize(.small)
+                    Text("Telling \(host.name)…").font(.callout).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Cancel") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Button("Turn On") { Task { await turnOn() } }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(working || name == nil)
+            }
+            .padding([.horizontal, .bottom])
+        }
+        .frame(width: 480)
+    }
+
+    private func turnOn() async {
+        guard let name, !working else { return }
+        working = true
+        defer { working = false }
+        do {
+            _ = try await model.setExternal(host.name, domain: name)
+            dismiss()
+        } catch {
+            self.error = describe(error)
+        }
+    }
 }
 
 /// A host's link, with why it's down when it is.

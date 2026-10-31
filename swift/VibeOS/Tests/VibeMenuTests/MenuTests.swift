@@ -203,6 +203,52 @@ import VibeRPC
     }
 }
 
+@Suite struct ExternalAddressTests {
+    func host(_ tunnel: TunnelState?, external: Bool = true, detail: String? = nil) throws -> HostInfo {
+        try decode(
+            HostInfo.self,
+            hostJSON("vps", link: .connected, external: external, tunnel: tunnel, externalDetail: detail))
+    }
+
+    @Test func itsStatusSaysWhetherOutsideClientsGetThrough() throws {
+        #expect(externalStatus(try host(.up, external: false)) == nil)
+        let working = try #require(externalStatus(try host(.up)))
+        #expect(working.tone == .working)
+        #expect(working.short == "public")
+        #expect(working.summary == "Outside MCP clients reach agents on vps and on this Mac.")
+        #expect(working.detail == nil)
+        let certificate = try #require(
+            externalStatus(try host(.up, detail: "getting a certificate for vps.example.com from Let's Encrypt")))
+        #expect(certificate.tone == .pending)
+        #expect(certificate.detail?.contains("Let's Encrypt") == true)
+        #expect(try externalStatus(host(.connecting))?.tone == .pending)
+        let down = try #require(externalStatus(try host(.down, detail: "can't listen on port 443")))
+        #expect(down.tone == .trouble)
+        #expect(down.short == "not reachable")
+        #expect(down.detail == "can't listen on port 443")
+    }
+
+    @Test func aPublicNameIsSuggestedFromTheSSHAddress() {
+        #expect(suggestedDomain(fromSSH: "me@vps.example.com") == "vps.example.com")
+        #expect(suggestedDomain(fromSSH: "ssh://me@VPS.Example.com:2222") == "vps.example.com")
+        #expect(suggestedDomain(fromSSH: "vps.example.com") == "vps.example.com")
+        // A name from ~/.ssh/config, or an address, isn't a public name.
+        #expect(suggestedDomain(fromSSH: "vps") == "")
+        #expect(suggestedDomain(fromSSH: "root@203.0.113.7") == "")
+        #expect(suggestedDomain(fromSSH: "me@[2001:db8::1]") == "")
+    }
+
+    @Test func onlyAPublicDNSNameIsTaken() {
+        #expect(normalizedDomain(" VPS.example.com. ") == "vps.example.com")
+        #expect(normalizedDomain("x-1.example.co.uk") == "x-1.example.co.uk")
+        for bad in ["", "vps", "203.0.113.7", "*.example.com", "-a.example.com", "a..example.com",
+            "https://vps.example.com", "vps.example.com:443", "vps example.com", String(repeating: "a", count: 64) + ".com"]
+        {
+            #expect(normalizedDomain(bad) == nil, "\(bad)")
+        }
+    }
+}
+
 @Suite struct NotificationTests {
     @Test func aQuestionAnErrorAndALimitNotify() throws {
         let before = try agent("a", state: .busy, activity: .thinking, title: "Dark mode")
@@ -660,6 +706,31 @@ import VibeRPC
         }
         try await model.removeHost("vps")
         #expect(model.otherHosts.isEmpty)
+    }
+
+    @Test func aHostBecomesTheExternalAddressAndStops() async throws {
+        let external = Box(false)
+        let daemon = fakeDaemon()
+        daemon.on(HostsList.name) { _ in
+            ["hosts": [hostJSON("local"), hostJSON("vps", link: .connected, external: external.value)]]
+        }
+        daemon.on(HostsExternal.name) { params in
+            #expect(params["host"] as? String == "vps")
+            external.value = params["on"] as? Bool == true
+            if external.value { #expect(params["domain"] as? String == "vps.example.com") }
+            return hostJSON("vps", link: .connected, external: external.value)
+        }
+        let model = makeModel(daemon)
+        await model.refresh()
+        #expect(model.externalHost == nil)
+        let on = try await model.setExternal("vps", domain: "vps.example.com")
+        #expect(on.url == "https://vps.example.com/mcp")
+        #expect(on.tunnel == .up)
+        #expect(model.externalHost?.name == "vps")
+        let off = try await model.setExternal("vps", domain: nil)
+        #expect(!off.external)
+        #expect(daemon.params(of: HostsExternal.name).last?["domain"] == nil)
+        #expect(model.externalHost == nil)
     }
 
     @Test func aFailedInstallSaysWhy() async throws {

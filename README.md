@@ -72,6 +72,18 @@ target/debug/vibe host add vps me@vps.example.com   # or Add Linux Host… in th
 On the server, `vibe project`, `vibe profile` and `vibe key` set it up
 without the menu bar, and it serves its own MCP when the Mac is off.
 
+A Linux host with a public DNS name can be the external address: outside MCP
+clients reach agents on it and on the Mac at `https://<name>/mcp` with an
+API key, and the Mac keeps an SSH tunnel to it, so nothing opens on the Mac.
+
+```sh
+target/debug/vibe host external vps vps.example.com   # or Settings → Hosts → Use as External Address
+```
+
+The server gets its certificate from Let's Encrypt on port 443, which
+`vibed`, running as you, may use once the server allows it (as root:
+`echo 'net.ipv4.ip_unprivileged_port_start=443' | sudo tee /etc/sysctl.d/60-vibeos.conf && sudo sysctl --system`).
+
 `VIBE_SOCKET` (or `--socket`) points `vibed`, `vibe` and the app at another
 socket. The app's rows attach Terminal with `/usr/local/bin/vibe`, or
 `$VIBE_CLI` when it's set, such as `VIBE_CLI=$PWD/target/debug/vibe`.
@@ -88,7 +100,9 @@ the Swift contract tests, signing with the virtualization entitlement,
 smoke tests of `vibe-vm` and `VibeOS.app` against a live `vibed`, the menu
 following a live agent and two clicks giving one Terminal tab; a Linux host
 added over SSH and linked, on stand-ins for `ssh` and `systemctl` (and on a
-real server with `VIBE_TEST_LINUX_HOST` set); real
+real server with `VIBE_TEST_LINUX_HOST` set), and external access through it
+(with a real certificate and tunnel when `VIBE_TEST_EXTERNAL_DOMAIN` names
+it too); real
 VMs booted, saved and restored through `vibe-vm`, the Linux base image, and
 `linux` agents on it: the backend's conformance suite, and real Claude across
 a sleep. It prints a

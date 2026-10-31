@@ -1,0 +1,21 @@
+{
+  "description": "The external address is reached by a public DNS name that Let's Encrypt can certify: not an IP address.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 9972,
+    "method": "hosts.external",
+    "params": {
+      "host": "vps",
+      "on": true,
+      "domain": "203.0.113.7"
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 9972,
+    "error": {
+      "code": -32602,
+      "message": "Invalid params: `203.0.113.7` isn't a public name Let's Encrypt can certify: give the server's DNS name in lowercase, such as vps.example.com"
+    }
+  }
+}

@@ -75,16 +75,35 @@ struct HeaderView: View {
                         Circle()
                             .fill(host.link == .connected ? Color.green : Color.red)
                             .frame(width: 6, height: 6)
+                            .accessibilityHidden(true)
                         Text("\(host.name): \(host.link == .connected ? "connected" : "down")")
-                        if host.external { Text("· external address") }
+                        if let external = externalStatus(host) {
+                            Text("·").accessibilityHidden(true)
+                            Label(external.short, systemImage: external.symbol)
+                                .labelStyle(.titleAndIcon)
+                                .foregroundStyle(external.tone == .trouble ? Color.orange : Color.secondary)
+                                .accessibilityLabel("external address, \(external.short)")
+                        }
                     }
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                    .help(host.link == .down ? (host.detail ?? "Its link is down; it reconnects on its own") : host.label)
+                    .help(hostHelp(host))
                     .accessibilityElement(children: .combine)
                 }
             }
         }
+    }
+
+    /// A host's tooltip: why its link is down, or its hostname; and while
+    /// it's the external address, where and how that is.
+    private func hostHelp(_ host: HostInfo) -> String {
+        var lines = [host.link == .down ? (host.detail ?? "Its link is down; it reconnects on its own") : host.label]
+        if let external = externalStatus(host) {
+            lines.append(host.url.map { "External address: \($0)" } ?? "External address")
+            lines.append(external.summary)
+            if let detail = external.detail { lines.append(detail) }
+        }
+        return lines.joined(separator: "\n")
     }
 
     private var agentCount: String {

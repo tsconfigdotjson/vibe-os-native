@@ -66,6 +66,12 @@ commands:
               does) and link it, as NAME
   host upgrade NAME    install this build's vibed there, if it runs another
   host remove NAME     forget a Linux host; it runs on there, on its own
+  host external NAME DOMAIN
+              make a Linux host the external address: it serves
+              https://DOMAIN/mcp to outside MCP callers, and this Mac keeps
+              a tunnel to it (on a Linux host on its own, NAME is local)
+  host external NAME off
+              stop it being the external address
 
 options:
   --socket PATH   vibed's socket (default: $VIBE_SOCKET, or the platform default)

@@ -369,10 +369,10 @@ Outside MCP callers (an API-based agent, a cloud orchestrator) need a public URL
 outside caller ──HTTPS + API key──▶ Linux host (public, vibed) ══ tunnel the Mac opened ══▶ Mac (vibed)
 ```
 
-- **Turn it on per host:** Settings → Hosts → *Use as external address*. The host serves `https://<host>/mcp`, with a certificate from Let's Encrypt.
+- **Turn it on per host:** Settings → Hosts → *Use as external address*, one host at a time. The host serves `https://<host>/mcp`, with a certificate from Let's Encrypt. It proves its name on port 443 itself (TLS-ALPN-01), so nothing else need be open; as `vibed` runs as the user, the server must let unprivileged programs use port 443, a one-time `sysctl` that Settings shows when it's needed.
 - **The Mac dials out.** It keeps a supervised SSH reverse tunnel to the host, forwarded to a Unix socket on the server (not a TCP port, so other users there can't reach it).
-- **One URL for everything.** The host's MCP lists agents on itself and on the Mac, each tagged with its host. Calls for the Mac go down the tunnel; calls for the host's own agents are answered there.
-- **Keys are checked where the agent lives.** API keys are made on the Mac, and their hashes are pushed to connected hosts, so one key works everywhere. The Mac verifies every call forwarded to it, so a compromised server can't drive the Mac without a key.
+- **One URL for everything.** The host's MCP lists agents on itself and on the Mac, each tagged with its host; there the Mac goes by `mac`, so its agents are `mac:<ref>`. Calls for the Mac go down the tunnel; calls for the host's own agents are answered there.
+- **Keys are checked where the agent lives.** API keys are made on the Mac, and their hashes are pushed to connected hosts, so one key works everywhere. The Mac verifies every call forwarded to it, so a compromised server can't drive the Mac without a key: the tunnel reaches a socket of its own on the Mac, not `vibed.sock`, which takes only the agent calls MCP makes, each with its caller's key.
 - The public endpoint rate-limits and logs every call.
 - If the Mac is offline or the tunnel is down, the host still answers for its own agents, and Mac agents show as unavailable.
 - Every key has full access; there are no scopes. Treat a key like an SSH key to the Mac and revoke it in Settings if it leaks. A revoke is pushed to every connected host at once, and the Mac rejects the key itself even if a host hasn't caught up.
