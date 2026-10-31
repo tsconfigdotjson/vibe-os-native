@@ -299,6 +299,7 @@ pub struct TestToolbox {
     shell: Vec<String>,
     uncovered: Vec<String>,
     outlives_shim: bool,
+    discard_takes: Duration,
 }
 
 impl TestToolbox {
@@ -309,7 +310,15 @@ impl TestToolbox {
             shell,
             uncovered: Vec::new(),
             outlives_shim: false,
+            discard_takes: Duration::ZERO,
         }
+    }
+
+    /// Its discard takes `how_long`, as stopping a VM an interrupted
+    /// update left can, so tests can catch an open racing it.
+    pub fn with_slow_discard(mut self, how_long: Duration) -> TestToolbox {
+        self.discard_takes = how_long;
+        self
     }
 
     /// Its shell counts as running while it's open, as a VM's shell runs
@@ -418,6 +427,7 @@ impl crate::toolbox::ToolboxHost for TestToolbox {
     }
 
     fn discard(&self) -> Result<()> {
+        std::thread::sleep(self.discard_takes);
         match fs::remove_file(self.marker()) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(EnvError::new(e.to_string())),
             _ => Ok(()),

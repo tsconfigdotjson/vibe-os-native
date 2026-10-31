@@ -296,7 +296,20 @@ impl Core {
     /// `toolbox.open`.
     pub async fn open_toolbox(&self, _: NoParams) -> Result<SessionAttach, ErrorObject> {
         let host = self.toolbox_host()?;
-        let _op = self.take_toolbox()?;
+        // An update or a rebuild can take many minutes: refused, not
+        // queued. Anything else that holds the toolbox (vibed's tidying at
+        // start, a save, another open) is brief, and the open waits for it.
+        let doing = match *lock(&self.toolbox_state) {
+            ToolboxState::Updating => Some("updating"),
+            ToolboxState::Rebuilding => Some("rebuilding"),
+            _ => None,
+        };
+        if let Some(doing) = doing {
+            return Err(conflict(format!(
+                "the toolbox is busy {doing} the template; try again when it's done"
+            )));
+        }
+        let _op = self.toolbox_op.lock().await;
         let socket = self.layout.session_socket(TOOLBOX_REF);
         let attach = |ttys| SessionAttach {
             host: LOCAL_HOST.into(),
@@ -508,12 +521,18 @@ impl Core {
         let host = self.toolbox.clone()?;
         let core = Arc::clone(self);
         Some(tokio::spawn(async move {
-            if host.is_open() {
-                core.set_toolbox(ToolboxState::Open);
-            } else {
-                let h = Arc::clone(&host);
-                if let Ok(Err(e)) = blocking(move || h.discard()).await {
-                    crate::log!("vibed: can't clear what the toolbox left: {e}");
+            // Under the toolbox's lock, as every call that changes it is, so
+            // an open that comes first is seen here and left alone, and one
+            // that comes after waits for this.
+            {
+                let _op = core.toolbox_op.lock().await;
+                if host.is_open() {
+                    core.set_toolbox(ToolboxState::Open);
+                } else {
+                    let h = Arc::clone(&host);
+                    if let Ok(Err(e)) = blocking(move || h.discard()).await {
+                        crate::log!("vibed: can't clear what the toolbox left: {e}");
+                    }
                 }
             }
             let mut checked = None::<Instant>;

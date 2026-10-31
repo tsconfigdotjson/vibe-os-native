@@ -449,6 +449,11 @@ impl Core {
     }
 
     /// A new subscription, and the `seq` of the last event before it.
+    /// The `seq` of the last event published.
+    pub fn last_event_seq(&self) -> u64 {
+        *lock(&self.events.last)
+    }
+
     pub fn subscribe(&self) -> (u64, broadcast::Receiver<Event>) {
         let last = lock(&self.events.last);
         (*last, self.events.tx.subscribe())

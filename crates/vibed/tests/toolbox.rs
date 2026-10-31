@@ -359,6 +359,67 @@ async fn a_restarted_vibed_saves_a_shell_that_exited_while_it_was_down() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_open_as_vibed_starts_waits_for_its_tidying_and_isnt_undone() {
+    // Opened just after the supervisor starts, while its tidying runs; the
+    // shell ends a while after the tidying would have, and is saved.
+    let w = world();
+    let toolbox = w
+        .toolbox(&["sh", "-c", "sleep 1.5"])
+        .with_slow_discard(Duration::from_millis(500));
+    let core = w.core_with(Some(toolbox));
+    let supervisor = core
+        .spawn_toolbox(Duration::from_millis(50), Duration::from_secs(3600))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    core.open_toolbox(NoParams {}).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let status = core.toolbox_status(NoParams {}).await.unwrap();
+    assert_eq!(status.state, ToolboxState::Open);
+    assert!(running(&w.socket()).await.is_some(), "the shell runs");
+    let watched = core.clone();
+    tokio::task::spawn_blocking(move || {
+        wait_until("the shell to be saved", || {
+            let s = watched.toolbox_status_now();
+            s.template == Some(1) && s.last.is_some()
+        })
+    })
+    .await
+    .unwrap();
+    supervisor.abort();
+
+    // Opened before the supervisor starts: its tidying leaves it alone.
+    let w = world();
+    let toolbox = w
+        .toolbox(&["sleep", "600"])
+        .with_slow_discard(Duration::from_millis(200));
+    let core = w.core_with(Some(toolbox));
+    core.open_toolbox(NoParams {}).await.unwrap();
+    let supervisor = core
+        .spawn_toolbox(Duration::from_millis(50), Duration::from_secs(3600))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let status = core.toolbox_status(NoParams {}).await.unwrap();
+    assert_eq!(status.state, ToolboxState::Open);
+    let pid = running(&w.socket()).await.expect("the shell runs on");
+    supervisor.abort();
+    kill_shim(pid);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_open_during_an_update_is_refused_not_queued() {
+    let w = world();
+    let core = w.core(&["sleep", "600"]);
+    w.recipe("[update]\nrun = [\"sleep 1\"]\n");
+    let updating = core.clone();
+    let update = tokio::spawn(async move { updating.update_toolbox(NoParams {}).await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let e = core.open_toolbox(NoParams {}).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::Conflict.code());
+    assert!(e.message.contains("busy updating"), "{}", e.message);
+    assert_eq!(update.await.unwrap().unwrap().template, Some(1));
+}
+
 #[tokio::test]
 async fn a_host_without_a_toolbox_says_so() {
     let w = world();

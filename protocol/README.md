@@ -80,9 +80,10 @@ daemon doesn't require it, so one-call clients (`vibe hello`, the Swift
 
 **Events.** After `events.subscribe` answers, that connection also gets an
 `events.event` notification (no `id`) for every event, in `seq` order,
-interleaved with the responses to its own calls. An event a call causes may
-arrive before that call's response, so match responses by `id`, or better,
-use a connection of its own for events. A subscriber that falls too far
+interleaved with the responses to its own calls: a call's response comes
+after the events published before the call, and before those published
+while it ran, such as those it caused. Still, match responses by `id`, or
+better, use a connection of its own for events. A subscriber that falls too far
 behind gets a `lagged` event in place of what it missed, carrying the `seq`
 of the last event it missed, and should read everything again. `seq`s only
 go up. When the client closes
