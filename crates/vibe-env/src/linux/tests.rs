@@ -360,6 +360,18 @@ fn sleep_saves_and_wake_restores_on_a_new_shim() {
 }
 
 #[test]
+fn processes_start_in_the_hosts_time_not_the_guests_uptime() {
+    let s = Setup::new();
+    let h = s.backend.create(&s.spec("quiet-amber-otter")).unwrap();
+    s.launch(&h).unwrap();
+    let procs = s.backend.processes(&h).unwrap();
+    assert_eq!(procs.len(), 1);
+    let now = guest::millis(SystemTime::now());
+    // Started as the guest came up, which was just now.
+    assert!(now - procs[0].started_ms < 60_000, "{procs:?}");
+}
+
+#[test]
 fn a_snapshot_is_counted_and_can_be_dropped_for_a_resume() {
     let s = Setup::new();
     let h = s.backend.create(&s.spec("quiet-amber-otter")).unwrap();

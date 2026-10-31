@@ -187,7 +187,7 @@ impl Core {
     }
 
     /// One send at a time to each agent, so two can't interleave.
-    fn typing(&self, agent_ref: &str) -> Arc<tokio::sync::Mutex<()>> {
+    pub(crate) fn typing(&self, agent_ref: &str) -> Arc<tokio::sync::Mutex<()>> {
         Arc::clone(lock(&self.typing).entry(agent_ref.to_owned()).or_default())
     }
 
@@ -201,14 +201,17 @@ impl Core {
         agent_ref: &str,
         input: Input,
     ) -> Result<Sent, ErrorObject> {
-        let mut record = self.named(host, agent_ref)?;
+        let record = self.named(host, agent_ref)?;
         let host = record.host.clone();
-        if record.starting || self.is_busy(agent_ref) {
+        // A sleep or a wake under way is waited for: then it's woken, or
+        // typed to, as that left it.
+        if record.starting || !self.wait_not_busy(agent_ref).await {
             return Err(error(
                 ErrorCode::Conflict,
-                format!("{agent_ref} is being started, resumed or deleted; try again in a moment"),
+                format!("{agent_ref} is being started, woken or deleted; try again in a moment"),
             ));
         }
+        let mut record = self.named(Some(&host), agent_ref)?;
         if let Input::Keys(keys) = &input {
             if keys.is_empty() {
                 return Err(invalid("give keys to press"));
@@ -280,6 +283,9 @@ impl Core {
             })?;
         // A delete may have run meanwhile: then there's nothing to wait on,
         // and a new agent by the same name mustn't inherit this mark.
+        // Its debounce starts again from the send: Claude may not have
+        // written what it read yet, and it mustn't sleep with it unread.
+        lock(&self.sleep_watch).woke(agent_ref);
         let state = match self.store().agent(&host, agent_ref) {
             Ok(r) => {
                 lock(&self.sends).insert(agent_ref.to_owned(), mark);

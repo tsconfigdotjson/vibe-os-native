@@ -28,6 +28,9 @@ pub struct HostPower {
     /// The assertion held, by its IOPM id.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     held: Mutex<Option<u32>>,
+    /// The last error taking it gave, so it's said once.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    failed: Mutex<Option<i32>>,
 }
 
 impl Power for HostPower {
@@ -38,9 +41,14 @@ impl Power for HostPower {
             (true, None) => match iopm::hold() {
                 Ok(id) => {
                     *held = Some(id);
+                    *lock(&self.failed) = None;
                     crate::log!("vibed: agents are awake, so this Mac won't sleep while idle");
                 }
-                Err(code) => crate::log!("vibed: can't keep this Mac awake: IOPM error {code:#x}"),
+                Err(code) => {
+                    if lock(&self.failed).replace(code) != Some(code) {
+                        crate::log!("vibed: can't keep this Mac awake: IOPM error {code:#x}");
+                    }
+                }
             },
             (false, Some(id)) => {
                 iopm::release(id);

@@ -114,7 +114,7 @@ impl Core {
         lock(&self.sends).remove(agent_ref);
         lock(&self.typing).remove(agent_ref);
         lock(&self.asleep_since).running(agent_ref);
-        lock(&self.pressure_paused).remove(agent_ref);
+        self.pressure_unpause(agent_ref);
     }
 
     /// The state clients see: `vibed`'s own `asleep` and `paused` while
@@ -204,17 +204,15 @@ impl Core {
             if !full && !changed {
                 continue;
             }
+            let was = a.state;
             let state = self.observed_state(&a, &status).await;
-            // A delete may have finished meanwhile, or a wake changed it.
+            // A delete may have finished meanwhile, or a sleep or a wake
+            // changed it: then it's left as that made it.
             if self.is_busy(&a.agent_ref) {
                 continue;
             }
-            match self.store().agent(&a.host, &a.agent_ref) {
-                Ok(now) => a.state = now.state,
-                Err(_) => continue,
-            }
-            if state != a.state {
-                self.set_state(&mut a, state);
+            if state != was && !self.set_state_if(&mut a, was, state) {
+                continue;
             }
             if changed {
                 let was_limited = published

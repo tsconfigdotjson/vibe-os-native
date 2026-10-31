@@ -745,6 +745,11 @@ impl Compartment for LinuxVm {
             .map(|s| s.frozen)
             .unwrap_or(false);
         let procs = self.machine.processes(&socket)?;
+        // The guest says when each started by its uptime; a Proc says it in
+        // the host's time, as the transcript does.
+        let now = guest::millis(SystemTime::now());
+        let uptime = procs.uptime_ms;
+        let started = |at: u64| now.saturating_sub(uptime.saturating_sub(at));
         Ok(procs
             .processes
             .into_iter()
@@ -754,7 +759,7 @@ impl Compartment for LinuxVm {
                 name: p.name,
                 args: p.args,
                 stopped: frozen || p.state == "T",
-                started_ms: p.started_ms,
+                started_ms: started(p.started_ms),
                 cpu_ms: p.cpu_ms,
                 memory: p.rss,
             })

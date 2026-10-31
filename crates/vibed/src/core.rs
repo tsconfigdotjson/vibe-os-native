@@ -266,6 +266,9 @@ pub struct Core {
     pub(crate) pressure_paused: Mutex<HashMap<String, std::time::Instant>>,
     /// What the sleep watch keeps of each agent between looks.
     pub(crate) sleep_watch: Mutex<crate::sleep::Watch>,
+    /// Held by a sleep that saves to disk, from making room for its
+    /// snapshot until it's saved.
+    pub(crate) snapshotting: tokio::sync::Mutex<()>,
     pub(crate) sleep_timing: crate::sleep::Timing,
     pub(crate) power: Arc<dyn crate::power::Power>,
     pub(crate) free_disk: FreeDisk,
@@ -434,6 +437,7 @@ impl Core {
             asleep_since: Mutex::new(crate::pressure::Sleeps::default()),
             pressure_paused: Mutex::new(HashMap::new()),
             sleep_watch: Mutex::new(crate::sleep::Watch::default()),
+            snapshotting: tokio::sync::Mutex::new(()),
             sleep_timing: config.sleep_timing,
             power: config.power,
             free_disk: config.free_disk,
@@ -472,6 +476,7 @@ impl Core {
             runtime: OnceLock::new(),
             _state_lock: state_lock,
         };
+        core.load_pressure_pauses();
         core.load_links().map_err(|e| {
             OpenError::Store(StoreError::Conflict(format!(
                 "can't read the Linux hosts: {}",
@@ -990,15 +995,28 @@ impl Core {
         let host = self.host(p.host.as_deref())?;
         validate_ref(&p.agent).map_err(invalid)?;
         let socket = self.layout.session_socket(&p.agent);
-        // An attach wakes an agent asleep (PRD: Going to sleep), exactly
-        // where it was, or with `claude --resume` where it can't be.
-        let asleep = match self.store().agent(host, &p.agent) {
-            Ok(a) => a.state == vibe_core::model::AgentState::Asleep && !a.starting,
-            Err(_) => false,
-        };
-        if asleep {
-            self.resume_agent(Some(host), &p.agent).await?;
-            crate::log!("vibed: {} was asleep, and an attach woke it", p.agent);
+        // An attach wakes an agent asleep, or frozen by memory pressure
+        // (PRD: Going to sleep; How a click becomes a Terminal window),
+        // exactly where it was, or with `claude --resume` where it can't
+        // be. One going to sleep right now is waited for, then woken.
+        let agent = self
+            .store()
+            .agent(host, &p.agent)
+            .ok()
+            .filter(|a| !a.starting);
+        if agent.is_some() {
+            self.wait_not_busy(&p.agent).await;
+            let a = self.store().agent(host, &p.agent).map_err(store_error)?;
+            let frozen = a.state == vibe_core::model::AgentState::Asleep
+                || (a.state == vibe_core::model::AgentState::Paused
+                    && lock(&self.pressure_paused).contains_key(&p.agent));
+            if frozen {
+                self.resume_agent(Some(host), &p.agent).await?;
+                crate::log!("vibed: {} was {}, and an attach woke it", p.agent, a.state);
+            }
+            // The client connects in a moment; until then, and for its
+            // debounce after, it's not idle.
+            lock(&self.sleep_watch).woke(&p.agent);
         }
         match sessions::probe(&socket).await {
             Probe::Running(status) => {

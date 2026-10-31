@@ -82,7 +82,7 @@ case " $prompt " in *" question "*)
     (
       who="$$-loop"
       while [ "$(date +%s)" -lt "$due" ]; do sleep 1; done
-      printf '{"type":"system","subtype":"scheduled_task_fire","sessionId":"%s","cwd":"%s","timestamp":"%s.999Z","uuid":"%s-fire","taskKind":"loop","cronKind":"loop","prompt":"loop check"}\n' \
+      printf '{"type":"system","subtype":"scheduled_task_fire","sessionId":"%s","cwd":"%s","timestamp":"%s.000Z","uuid":"%s-fire","taskKind":"loop","cronKind":"loop","prompt":"loop check"}\n' \
         "$id" "$cwd" "$(date -u +%Y-%m-%dT%H:%M:%S)" "$who" >>"$transcript"
       prompt "loop check"
       reply "Loop fired."

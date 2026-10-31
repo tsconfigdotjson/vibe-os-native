@@ -68,6 +68,41 @@ pub const RETRY_AFTER: Duration = Duration::from_secs(60);
 /// Disk left free beside a new snapshot.
 pub const SNAPSHOT_MARGIN: u64 = 1 << 30;
 
+/// A `/loop` wakeup this long past due that's still pending never fired,
+/// and won't: it's left out, rather than keep its agent awake for good.
+pub const STALE_LOOP: Duration = Duration::from_secs(10 * 60);
+
+/// The shortest stretch CPU is measured over: the kernel counts it in
+/// ticks, so a shorter one is mostly noise.
+const CPU_WINDOW: Duration = Duration::from_secs(1);
+
+/// Which idle agents may sleep early.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Early {
+    /// Any: to make room under `max_awake_agents`.
+    Any,
+    /// Only one whose sleep frees its memory.
+    FreesMemory,
+    /// One whose sleep frees memory, or a supervised one, which its OS can
+    /// swap out once frozen: under memory pressure.
+    UnderPressure,
+}
+
+impl Early {
+    fn allows(self, caps: vibe_env::Capabilities) -> bool {
+        match self {
+            Early::Any => true,
+            Early::FreesMemory => caps.sleep_frees_memory,
+            Early::UnderPressure => caps.sleep_frees_memory || !caps.kernel_limits,
+        }
+    }
+}
+
+/// Why an automatic sleep was called off at the last moment: news to no
+/// one, and tried again on the next look.
+pub(crate) const TYPING: &str = "a send is typing into it";
+pub(crate) const ATTACHED: &str = "a client attached";
+
 /// How the watch is timed. Tests shorten it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Timing {
@@ -170,6 +205,8 @@ pub fn rest(f: &Facts<'_>) -> Rest {
     }
     for w in &s.pending_wakeups {
         match (w.kind, w.certainty, w.due_at) {
+            (WakeupKind::Loop, Certainty::Firm, Some(due))
+                if due.as_secs_f64() < f.now - STALE_LOOP.as_secs_f64() => {}
             (WakeupKind::Loop, Certainty::Firm, Some(due)) => {
                 if due.as_secs_f64() - f.now <= f.wake_before.as_secs_f64() {
                     return Rest::Awake(Awake::LoopDueSoon);
@@ -191,13 +228,15 @@ pub fn rest(f: &Facts<'_>) -> Rest {
 }
 
 /// When the first firm `/loop` wakeup an agent has armed is due, in
-/// seconds since the epoch.
-pub fn next_loop(status: &Status) -> Option<f64> {
+/// seconds since the epoch, as of `now`; one [`STALE_LOOP`] past due is
+/// left out.
+pub fn next_loop(status: &Status, now: f64) -> Option<f64> {
     status
         .pending_wakeups
         .iter()
         .filter(|w| w.kind == WakeupKind::Loop && w.certainty == Certainty::Firm)
         .filter_map(|w| w.due_at.map(Timestamp::as_secs_f64))
+        .filter(|due| *due >= now - STALE_LOOP.as_secs_f64())
         .reduce(f64::min)
 }
 
@@ -307,6 +346,15 @@ impl Watch {
             .is_some_and(|(t, _)| t.elapsed() < RETRY_AFTER)
     }
 
+    /// Why its last sleep or wake failed, if it did lately.
+    fn failed_why(&self, agent_ref: &str) -> Option<String> {
+        self.agents
+            .get(agent_ref)
+            .and_then(|w| w.failed.as_ref())
+            .filter(|(t, _)| t.elapsed() < RETRY_AFTER)
+            .map(|(_, why)| why.clone())
+    }
+
     /// Notes a failure; true if it's news, to be logged.
     fn failure(&mut self, agent_ref: &str, why: String) -> bool {
         let w = self.agents.entry(agent_ref.to_owned()).or_default();
@@ -321,13 +369,26 @@ impl Watch {
 pub struct Looked {
     /// Agents it put to sleep.
     pub slept: Vec<String>,
-    /// Agents it woke for their `/loop`.
+    /// Agents it woke: for their `/loop`, or a client that attached.
     pub woke: Vec<String>,
     /// How many agents are awake now.
     pub awake: usize,
 }
 
+/// What an asleep agent's look found.
+enum Asleep {
+    Woke,
+    /// A `/loop` is pending for later: the host must stay up for it.
+    LoopPending,
+    Resting,
+}
+
 impl Core {
+    /// Why the watch couldn't put `agent_ref` to sleep, or wake it, lately.
+    pub fn sleep_refusal(&self, agent_ref: &str) -> Option<String> {
+        lock(&self.sleep_watch).failed_why(agent_ref)
+    }
+
     /// Whether a send is typing into `agent_ref` now.
     fn typing_into(&self, agent_ref: &str) -> bool {
         lock(&self.typing)
@@ -354,12 +415,16 @@ impl Core {
         let cpu_share = {
             let mut watch = lock(&self.sleep_watch);
             let w = watch.agents.entry(a.agent_ref.clone()).or_default();
-            if let Some((was, at)) = w.cpu {
-                let wall = at.elapsed().as_millis() as f64;
-                // A process that ended takes its CPU time with it.
-                w.cpu_share = (cpu >= was && wall > 0.0).then(|| (cpu - was) as f64 / wall);
+            match w.cpu {
+                Some((was, at)) if at.elapsed() >= CPU_WINDOW => {
+                    let wall = at.elapsed().as_millis() as f64;
+                    // A process that ended takes its CPU time with it.
+                    w.cpu_share = (cpu >= was).then(|| (cpu - was) as f64 / wall);
+                    w.cpu = Some((cpu, Instant::now()));
+                }
+                Some(_) => {}
+                None => w.cpu = Some((cpu, Instant::now())),
             }
-            w.cpu = Some((cpu, Instant::now()));
             w.cpu_share
         };
         rest(&Facts {
@@ -373,8 +438,9 @@ impl Core {
     }
 
     /// Looks at every agent once: puts the idle ones whose debounce has
-    /// passed to sleep, wakes the asleep ones whose `/loop` is due, and
-    /// holds the Mac awake while any agent is.
+    /// passed to sleep, wakes the asleep ones whose `/loop` is due or that a
+    /// client attached to, and holds the Mac awake while any agent is, or
+    /// has a `/loop` to wake for.
     pub async fn check_sleep(&self) -> Looked {
         let mut looked = Looked::default();
         let Ok(records) = self.store().agents(LOCAL_HOST) else {
@@ -389,6 +455,7 @@ impl Core {
             toolbox,
             vibe_core::model::ToolboxState::Closed | vibe_core::model::ToolboxState::Unavailable
         );
+        let mut loops = false;
         for mut a in records {
             let r = a.agent_ref.clone();
             if a.starting || self.is_busy(&r) {
@@ -397,9 +464,13 @@ impl Core {
             }
             match a.state {
                 AgentState::Asleep => {
-                    if self.wake_if_due(&mut a).await {
-                        looked.woke.push(r);
-                        looked.awake += 1;
+                    match self.look_asleep(&mut a).await {
+                        Asleep::Woke => {
+                            looked.woke.push(r);
+                            looked.awake += 1;
+                        }
+                        Asleep::LoopPending => loops = true,
+                        Asleep::Resting => {}
                     }
                     continue;
                 }
@@ -445,11 +516,13 @@ impl Core {
                 continue;
             }
             let why = format!("idle for {debounce}s, nothing attached");
-            match self.sleep_for(Some(LOCAL_HOST), &r, &why).await {
+            match self.sleep_for(Some(LOCAL_HOST), &r, &why, true).await {
                 Ok(_) => {
                     looked.slept.push(r);
                     looked.awake -= 1;
                 }
+                // Called off at the last moment: it's simply not idle now.
+                Err(e) if e.message.ends_with(TYPING) || e.message.ends_with(ATTACHED) => {}
                 Err(e) => {
                     if lock(&self.sleep_watch).failure(&r, e.message.clone()) {
                         crate::log!("vibed: {r} can't sleep: {}", e.message);
@@ -457,8 +530,44 @@ impl Core {
                 }
             }
         }
-        self.power.keep_awake(looked.awake > 0 || toolbox_awake);
+        self.power
+            .keep_awake(looked.awake > 0 || loops || toolbox_awake);
         looked
+    }
+
+    /// Wakes `a`, asleep, if a client has attached to its terminal (an
+    /// attach that raced its sleep), or if its firm `/loop` wakeup is due
+    /// within the lead a wake gets.
+    async fn look_asleep(&self, a: &mut AgentRecord) -> Asleep {
+        let r = a.agent_ref.clone();
+        if let Probe::Running(s) = sessions::probe(&self.layout.session_socket(&r)).await
+            && !s.clients.is_empty()
+            && !lock(&self.sleep_watch).failed_lately(&r)
+        {
+            match self.resume_agent(Some(LOCAL_HOST), &r).await {
+                Ok(_) => {
+                    crate::log!("vibed: {r} was asleep with a client attached, so it woke");
+                    return Asleep::Woke;
+                }
+                Err(e) => {
+                    if lock(&self.sleep_watch).failure(&r, e.message.clone()) {
+                        crate::log!(
+                            "vibed: {r} has a client attached, but can't wake: {}",
+                            e.message
+                        );
+                    }
+                }
+            }
+        }
+        if self.wake_if_due(a).await {
+            return Asleep::Woke;
+        }
+        let status = self.agent_status(a, self.idle_debounce()).await;
+        if next_loop(&status, self.now() as f64).is_some() {
+            Asleep::LoopPending
+        } else {
+            Asleep::Resting
+        }
     }
 
     /// Wakes `a`, asleep, if its firm `/loop` wakeup is due within the
@@ -466,7 +575,7 @@ impl Core {
     async fn wake_if_due(&self, a: &mut AgentRecord) -> bool {
         let r = a.agent_ref.clone();
         let status = self.agent_status(a, self.idle_debounce()).await;
-        let Some(due) = next_loop(&status) else {
+        let Some(due) = next_loop(&status, self.now() as f64) else {
             return false;
         };
         let lead = self.sleep_timing.wake_before.as_secs_f64();
@@ -494,8 +603,8 @@ impl Core {
     }
 
     /// The agents that are idle now but for the debounce, idle longest
-    /// first, each with whether its sleep frees its memory.
-    pub(crate) async fn idle_now(&self) -> Vec<(String, bool)> {
+    /// first, each with what its backend can do.
+    pub(crate) async fn idle_now(&self) -> Vec<(String, vibe_env::Capabilities)> {
         let Ok(records) = self.store().agents(LOCAL_HOST) else {
             return Vec::new();
         };
@@ -521,22 +630,21 @@ impl Core {
                 continue;
             }
             if let Rest::Idle { since } = self.rest_of(&mut a, &backend, &handle).await {
-                idle.push((since, r, backend.capabilities().sleep_frees_memory));
+                idle.push((since, r, backend.capabilities()));
             }
         }
         idle.sort_by(|x, y| x.0.total_cmp(&y.0).then_with(|| x.1.cmp(&y.1)));
-        idle.into_iter().map(|(_, r, frees)| (r, frees)).collect()
+        idle.into_iter().map(|(_, r, caps)| (r, caps)).collect()
     }
 
-    /// Puts the agent idle longest to sleep before its debounce is up:
-    /// only one whose sleep frees its memory if `frees` says so. Returns
-    /// the one it put to sleep.
-    pub(crate) async fn sleep_one_early(&self, frees: bool, why: &str) -> Option<String> {
-        for (r, frees_memory) in self.idle_now().await {
-            if frees && !frees_memory {
+    /// Puts the agent idle longest that `early` allows to sleep before its
+    /// debounce is up. Returns the one it put to sleep.
+    pub(crate) async fn sleep_one_early(&self, early: Early, why: &str) -> Option<String> {
+        for (r, caps) in self.idle_now().await {
+            if !early.allows(caps) {
                 continue;
             }
-            match self.sleep_for(Some(LOCAL_HOST), &r, why).await {
+            match self.sleep_for(Some(LOCAL_HOST), &r, why, true).await {
                 Ok(_) => return Some(r),
                 Err(e) => crate::log!("vibed: {r} can't sleep early: {}", e.message),
             }
@@ -800,14 +908,14 @@ mod tests {
         let lead = WAKE_BEFORE_DUE.as_secs_f64();
         let s = with(vec![wakeup(WakeupKind::Loop, Certainty::Firm, Some(600.0))]);
         assert!(matches!(rest(&facts(&s, &procs)), Rest::Idle { .. }));
-        assert_eq!(next_loop(&s), Some(NOW + 600.0));
+        assert_eq!(next_loop(&s, NOW), Some(NOW + 600.0));
         // Due within the lead: the wake would come at once.
         let s = with(vec![
             wakeup(WakeupKind::Loop, Certainty::Firm, Some(600.0)),
             wakeup(WakeupKind::Loop, Certainty::Firm, Some(lead)),
         ]);
         assert_eq!(rest(&facts(&s, &procs)), Rest::Awake(Awake::LoopDueSoon));
-        assert_eq!(next_loop(&s), Some(NOW + lead));
+        assert_eq!(next_loop(&s, NOW), Some(NOW + lead));
         for w in [
             wakeup(WakeupKind::Loop, Certainty::Inferred, Some(600.0)),
             wakeup(WakeupKind::Loop, Certainty::Firm, None),
@@ -824,13 +932,23 @@ mod tests {
                 "{w:?}"
             );
         }
+        // One long past due never fired: it's left out, so it neither keeps
+        // the agent awake nor wakes it.
+        let stale = -(STALE_LOOP.as_secs_f64() + 1.0);
+        let s = with(vec![wakeup(WakeupKind::Loop, Certainty::Firm, Some(stale))]);
+        assert!(matches!(rest(&facts(&s, &procs)), Rest::Idle { .. }));
+        assert_eq!(next_loop(&s, NOW), None);
+        // One just past due is due: woken at once, never slept on.
+        let s = with(vec![wakeup(WakeupKind::Loop, Certainty::Firm, Some(-5.0))]);
+        assert_eq!(rest(&facts(&s, &procs)), Rest::Awake(Awake::LoopDueSoon));
+        assert_eq!(next_loop(&s, NOW), Some(NOW - 5.0));
         // An inferred loop isn't one to wake for.
         let s = with(vec![wakeup(
             WakeupKind::Loop,
             Certainty::Inferred,
             Some(5.0),
         )]);
-        assert_eq!(next_loop(&s), None);
+        assert_eq!(next_loop(&s, NOW), None);
     }
 
     #[test]

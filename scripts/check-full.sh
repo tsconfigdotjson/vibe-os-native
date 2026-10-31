@@ -682,14 +682,11 @@ s_macos_agents() {
   echo "asking: $out"
   expect '"state":"question"' "the question, from the transcript"
 
-  # Awake, it holds the Mac from idle sleep, as pmset shows; asleep once
-  # idle (SIGSTOP), it lets go; a send wakes it.
-  for i in $(seq 1 100); do
-    pmset -g assertions | grep -q "VibeOS: agents are awake" && break
-    sleep 0.1
-  done
-  pmset -g assertions | grep "VibeOS: agents are awake" ||
-    { echo "no IOPM assertion while an agent is awake"; pmset -g assertions; return 1; }
+  # Awake, it holds the Mac from idle sleep, as pmset shows for this
+  # vibed's pid; asleep once idle (SIGSTOP), it lets go; a send wakes it.
+  held() { pmset -g assertions | grep -E "pid $VIBED_PID\(.*VibeOS: agents are awake" >/dev/null; }
+  for i in $(seq 1 100); do held && break; sleep 0.1; done
+  held || { echo "no IOPM assertion from vibed (pid $VIBED_PID) while an agent is awake"; pmset -g assertions; return 1; }
   out=$(rpc '{"jsonrpc":"2.0","id":51,"method":"limits.set","params":{"idle_debounce":1}}')
   case $out in *'"error"'*) echo "limits.set failed: $out"; return 1 ;; esac
   for i in $(seq 1 150); do
@@ -699,13 +696,8 @@ s_macos_agents() {
   done
   echo "idle: $out"
   expect '"state":"asleep"' "the agent asleep once idle"
-  for i in $(seq 1 100); do
-    pmset -g assertions | grep -q "VibeOS: agents are awake" || break
-    sleep 0.1
-  done
-  if pmset -g assertions | grep -q "VibeOS: agents are awake"; then
-    echo "the IOPM assertion outlived every awake agent"; return 1
-  fi
+  for i in $(seq 1 100); do held || break; sleep 0.1; done
+  if held; then echo "the IOPM assertion outlived every awake agent"; pmset -g assertions; return 1; fi
   out=$(rpc "{\"jsonrpc\":\"2.0\",\"id\":53,\"method\":\"agents.send\",\"params\":{\"ref\":\"$ref\",\"keys\":[\"r\",\"e\",\"d\",\"Enter\"]}}")
   echo "send: $out"
   expect '"woke":true' "the wake"

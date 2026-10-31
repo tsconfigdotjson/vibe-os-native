@@ -317,6 +317,10 @@ impl Sleeps {
     }
 }
 
+/// Where the agents memory pressure paused are kept, in the state
+/// directory, so a restarted `vibed` still knows they're its to let go.
+pub const PAUSED_FILE: &str = "pressure-paused";
+
 /// How long pressure has lasted, and when an agent was last paused or
 /// ended for it.
 #[derive(Debug, Default, Clone)]
@@ -326,6 +330,57 @@ pub struct PressureWatch {
 }
 
 impl Core {
+    /// Notes that pressure paused `r` at `at`, and keeps the note.
+    pub(crate) fn pressure_pause(&self, r: &str, at: Instant) {
+        let mut paused = lock(&self.pressure_paused);
+        paused.insert(r.to_owned(), at);
+        self.keep_pressure_pauses(&paused);
+    }
+
+    /// Forgets that pressure paused `r`, if it did.
+    pub(crate) fn pressure_unpause(&self, r: &str) {
+        let mut paused = lock(&self.pressure_paused);
+        if paused.remove(r).is_some() {
+            self.keep_pressure_pauses(&paused);
+        }
+    }
+
+    fn keep_pressure_pauses(&self, paused: &HashMap<String, Instant>) {
+        let path = self.layout.data_dir().join(PAUSED_FILE);
+        let mut refs: Vec<&str> = paused.keys().map(String::as_str).collect();
+        refs.sort();
+        let kept = if refs.is_empty() {
+            match std::fs::remove_file(&path) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+                _ => Ok(()),
+            }
+        } else {
+            std::fs::write(&path, refs.join("\n") + "\n")
+        };
+        if let Err(e) = kept {
+            crate::log!("vibed: can't keep {}: {e}", path.display());
+        }
+    }
+
+    /// The agents pressure paused before this `vibed` started, still
+    /// paused: their grace before they're ended starts again now.
+    pub(crate) fn load_pressure_pauses(&self) {
+        let Ok(text) = std::fs::read_to_string(self.layout.data_dir().join(PAUSED_FILE)) else {
+            return;
+        };
+        let agents = self.store().agents(LOCAL_HOST).unwrap_or_default();
+        let mut paused = lock(&self.pressure_paused);
+        for r in text.lines().map(str::trim).filter(|r| !r.is_empty()) {
+            if agents
+                .iter()
+                .any(|a| a.agent_ref == r && a.state == AgentState::Paused)
+            {
+                paused.insert(r.to_owned(), Instant::now());
+            }
+        }
+        self.keep_pressure_pauses(&paused);
+    }
+
     /// Why a start must be refused now, if memory is short.
     pub(crate) fn short_of_memory(&self) -> Option<String> {
         let reading = self.pressure.read().filter(Reading::high)?;
@@ -351,10 +406,16 @@ impl Core {
             }
         };
         let since = *w.since.get_or_insert(now);
-        // Every idle agent, debounce or not: one whose sleep frees memory
-        // gives it back, and one frozen can be swapped out.
+        // Idle agents sleep early, debounce or not: one whose sleep frees
+        // memory gives it back, and a supervised one frozen can be swapped
+        // out. On a Linux host's cgroups that frees nothing, and ending
+        // frozen agents is what makes room there.
         let why = format!("early: memory is short ({reading})");
-        while self.sleep_one_early(false, &why).await.is_some() {}
+        while self
+            .sleep_one_early(crate::sleep::Early::UnderPressure, &why)
+            .await
+            .is_some()
+        {}
         if now.duration_since(since) < END_AFTER
             || w.last_end
                 .is_some_and(|t| now.duration_since(t) < END_EVERY)
@@ -387,7 +448,7 @@ impl Core {
             let Ok(_held) = self.hold(&r) else {
                 continue;
             };
-            lock(&self.pressure_paused).remove(&r);
+            self.pressure_unpause(&r);
             let Ok(mut a) = self.store().agent(LOCAL_HOST, &r) else {
                 continue;
             };
@@ -481,7 +542,7 @@ impl Core {
                 );
                 continue;
             }
-            lock(&self.pressure_paused).insert(a.agent_ref.clone(), now);
+            self.pressure_pause(&a.agent_ref, now);
             self.set_state(&mut a, AgentState::Paused);
             let message = format!(
                 "paused: memory is short ({reading}), and it's at {:.0}% of its {} ({}). It's \
@@ -504,7 +565,7 @@ impl Core {
             let Ok(_held) = self.hold(&r) else {
                 continue;
             };
-            lock(&self.pressure_paused).remove(&r);
+            self.pressure_unpause(&r);
             let Ok(mut a) = self.store().agent(LOCAL_HOST, &r) else {
                 continue;
             };

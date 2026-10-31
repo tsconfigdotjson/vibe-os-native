@@ -61,7 +61,7 @@ struct Times {
 const QUICK: Times = Times {
     debounce: 3,
     wake_before: Duration::from_secs(4),
-    loop_in: 12,
+    loop_in: 20,
     slack: 3,
 };
 
@@ -346,10 +346,12 @@ async fn scenario(w: &World) {
     // 1. At rest with nothing attached, it sleeps once the debounce has
     // passed, and not before.
     let a = w.core.start_agent(w.start("talk")).await.unwrap();
+    // The watch counts from when it first sees it idle, once it's started.
+    let started = secs(SystemTime::now());
     let r = a.agent.clone();
+    w.wait_power(true).await;
     w.wait_screen(&r, "Ready.", wait(60)).await;
     w.wait_state(&r, AgentState::Idle, wait(30)).await;
-    w.wait_power(true).await;
     let rested = parse_time(
         &w.agent(&r)
             .await
@@ -360,11 +362,14 @@ async fn scenario(w: &World) {
     w.wait_state(&r, AgentState::Asleep, wait(t.debounce + t.slack + 10))
         .await;
     let slept = secs(w.went(&r, "asleep").unwrap());
+    let from = rested.max(started);
     assert!(
         slept - rested >= t.debounce as f64 - 1.0
-            && slept - rested <= (t.debounce + t.slack) as f64 + 1.0,
-        "asleep {:.1}s after it came to rest, with a debounce of {}s",
+            && slept - from <= (t.debounce + t.slack) as f64 + 1.0,
+        "asleep {:.1}s after it came to rest and {:.1}s after its start returned, with a \
+         debounce of {}s",
         slept - rested,
+        slept - started,
         t.debounce
     );
     // Nothing of it runs; saved to disk, its snapshot is there.
@@ -713,7 +718,8 @@ async fn snapshots_share_a_budget_and_the_oldest_goes_first() {
     });
     for x in [a, b] {
         w.core.sleep_agent(None, &x.agent).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // A second apart, as some filesystems keep times only to the second.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
     }
     let snapshot = |x: &Agent| w.layout.agent_dir(&x.agent).join(TEST_SNAPSHOT);
     assert!(snapshot(a).is_file() && snapshot(b).is_file());
@@ -786,7 +792,22 @@ async fn low_disk_refuses_starts_and_keeps_an_agent_awake() {
         idle_debounce: Some(1),
         ..Default::default()
     });
-    tokio::time::sleep(Duration::from_secs(4)).await;
+    // The watch tries each, and says why it can't.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    for x in &agents {
+        loop {
+            let why = w.core.sleep_refusal(&x.agent).unwrap_or_default();
+            if why.contains("stays awake") && why.contains("the disk has only 512M free") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{} never refused: {why:?}",
+                x.agent
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
     for x in &agents {
         assert_ne!(w.state(&x.agent).await, AgentState::Asleep, "{}", x.agent);
         assert!(!w.layout.agent_dir(&x.agent).join(TEST_SNAPSHOT).exists());
@@ -918,4 +939,221 @@ async fn critical_pressure_sleeps_idle_agents_then_pauses_and_ends_the_hog() {
     assert!(procs.iter().all(|p| !p.stopped), "{procs:?}");
     w.delete(&idle.agent).await;
     w.delete(&hog.agent).await;
+}
+
+/// An attach client on `r`'s terminal, as `vibe attach` is.
+fn attach_client(w: &World, r: &str) -> shim::Connection {
+    let hello = shim::Hello {
+        protocol: shim::PROTOCOL,
+        role: shim::Role::Attach,
+        client: "sleep test".into(),
+        tty: Some("/dev/ttys099".into()),
+        size: None,
+    };
+    shim::connect(&w.layout.session_socket(r), &hello, Duration::from_secs(5)).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_wake_must_fit_too_and_sleeps_another_to_make_room() {
+    let (_bin, claude) = stand_in();
+    let make = |_: &Golden| -> Arc<dyn Backend> { Arc::new(TestBackend::new(&claude)) };
+    let w = world(make, Environment::Linux, QUICK, |_| {}).await;
+    w.set(LimitsSetParams {
+        idle_debounce: Some(600),
+        max_awake_agents: Some(1),
+        ..Default::default()
+    });
+    let a = w.core.start_agent(w.start("talk")).await.unwrap();
+    w.wait_state(&a.agent, AgentState::Idle, Duration::from_secs(20))
+        .await;
+    tokio::time::sleep(vibed::sleep::AFTER_WAKE).await;
+    // Only one may be awake: a sleeps early for b.
+    let b = w.core.start_agent(w.start("talk")).await.unwrap();
+    assert_eq!(w.state(&a.agent).await, AgentState::Asleep);
+    w.wait_state(&b.agent, AgentState::Idle, Duration::from_secs(20))
+        .await;
+    tokio::time::sleep(vibed::sleep::AFTER_WAKE).await;
+    // A send to a must fit as a start does: b, idle, sleeps for it.
+    let sent = w.core.send_input(None, &a.agent, text("hi")).await.unwrap();
+    assert!(sent.woke);
+    assert_eq!(w.state(&b.agent).await, AgentState::Asleep);
+    assert_ne!(w.state(&a.agent).await, AgentState::Asleep);
+    w.wait_screen(&a.agent, "> hi", Duration::from_secs(10))
+        .await;
+    // With a attached it isn't idle, so b's wake is refused, and says why.
+    let _client = attach_client(&w, &a.agent);
+    tokio::time::sleep(vibed::sleep::AFTER_WAKE).await;
+    let err = w
+        .core
+        .send_input(None, &b.agent, text("hi"))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::Conflict.code());
+    assert!(
+        err.message.contains(&format!("can't wake {}: ", b.agent))
+            && err.message.contains("1 agent is awake already")
+            && err.message.contains("No agent is idle"),
+        "{}",
+        err.message
+    );
+    assert_eq!(w.state(&b.agent).await, AgentState::Asleep);
+    for x in [&a, &b] {
+        w.delete(&x.agent).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_on_an_asleep_agent_wakes_it() {
+    let (_bin, claude) = stand_in();
+    let make = |_: &Golden| -> Arc<dyn Backend> { Arc::new(TestBackend::new(&claude)) };
+    let w = world(make, Environment::Linux, QUICK, |_| {}).await;
+    w.set(LimitsSetParams {
+        idle_debounce: Some(600),
+        ..Default::default()
+    });
+    let a = w.core.start_agent(w.start("talk")).await.unwrap();
+    w.wait_screen(&a.agent, "Ready.", Duration::from_secs(20))
+        .await;
+    // As when a terminal connects just as its agent goes to sleep: it
+    // doesn't stay frozen under the client.
+    let _client = attach_client(&w, &a.agent);
+    w.core.sleep_agent(None, &a.agent).await.unwrap();
+    w.wait_state(&a.agent, AgentState::Idle, Duration::from_secs(10))
+        .await;
+    let procs = w.backend.processes(&w.handle(&a.agent)).unwrap();
+    assert!(procs.iter().all(|p| !p.stopped), "{procs:?}");
+    w.delete(&a.agent).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_send_starts_the_debounce_again() {
+    let (_bin, claude) = stand_in();
+    let make = |_: &Golden| -> Arc<dyn Backend> { Arc::new(TestBackend::new(&claude)) };
+    let w = world(make, Environment::Linux, QUICK, |_| {}).await;
+    let a = w.core.start_agent(w.start("talk")).await.unwrap();
+    w.wait_state(&a.agent, AgentState::Idle, Duration::from_secs(20))
+        .await;
+    tokio::time::sleep(Duration::from_secs(QUICK.debounce - 1)).await;
+    // Keys that write nothing to its transcript: as far as that says,
+    // Claude hasn't read them yet.
+    let sent = w
+        .core
+        .send_input(None, &a.agent, Input::Keys(vec!["x".into()]))
+        .await
+        .unwrap();
+    assert!(!sent.woke);
+    let at = Instant::now();
+    // Well past the debounce from when it came to rest, it's still awake.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_ne!(w.state(&a.agent).await, AgentState::Asleep);
+    // Then it sleeps, the debounce after the send.
+    w.wait_state(
+        &a.agent,
+        AgentState::Asleep,
+        vibed::sleep::AFTER_WAKE + Duration::from_secs(QUICK.debounce + 5),
+    )
+    .await;
+    assert!(at.elapsed() >= Duration::from_secs(QUICK.debounce));
+    w.delete(&a.agent).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pressure_pause_outlives_a_restart_of_vibed() {
+    let (_bin, claude) = stand_in();
+    let golden = Golden::new();
+    let pressure = Arc::new(Pressure::default());
+    let config = || {
+        let mut c = golden.config();
+        c.clock = Arc::new(vibe_core::time::now);
+        c.pressure = pressure.clone();
+        c.backends = Backends::all(Arc::new(
+            TestBackend::new(&claude).reporting_memory(900 * MIB),
+        ));
+        c.admission = Arc::new(HostAdmission {
+            total_memory: 8 * GIB,
+        });
+        c
+    };
+    let core = Arc::new(Core::open(config()).unwrap());
+    core.add_project(ProjectAddParams {
+        path: Some(golden.home.join("src/app").to_str().unwrap().into()),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    core.set_limits(LimitsSetParams {
+        reserve_memory: Some(0),
+        ..Default::default()
+    })
+    .unwrap();
+    core.update_profile(ProfileUpdateParams {
+        project: "app".into(),
+        profile: "software-eng-mac".into(),
+        memory: Some(GIB),
+        ..Default::default()
+    })
+    .unwrap();
+    let hog = core
+        .start_agent(AgentStartParams {
+            project: "app".into(),
+            profile: "software-eng-mac".into(),
+            prompt: "hello".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let state = |core: &Arc<Core>| {
+        let core = Arc::clone(core);
+        let r = hog.agent.clone();
+        async move {
+            core.agents(HostParams::default())
+                .await
+                .unwrap()
+                .agents
+                .into_iter()
+                .find(|a| a.agent == r)
+                .unwrap()
+                .state
+        }
+    };
+    pressure.set(Some(Level::Critical.into()));
+    let mut watch = PressureWatch::default();
+    let t0 = Instant::now();
+    core.check_pressure(&mut watch, t0).await;
+    core.check_pressure(&mut watch, t0 + END_AFTER).await;
+    assert_eq!(state(&core).await, AgentState::Paused);
+    drop(core);
+
+    // A new vibed knows the pause is the pressure's: the limit watch
+    // leaves it, and its grace starts again.
+    let core = Arc::new(Core::open(config()).unwrap());
+    core.adopt_sessions().await;
+    core.check_limits(&mut Default::default()).await;
+    assert_eq!(state(&core).await, AgentState::Paused);
+    let mut watch = PressureWatch::default();
+    let t1 = Instant::now();
+    core.check_pressure(&mut watch, t1).await;
+    assert_eq!(
+        core.check_pressure(&mut watch, t1 + END_AFTER).await,
+        None,
+        "not ended before its grace"
+    );
+    assert_eq!(state(&core).await, AgentState::Paused);
+    // Eased, it runs again.
+    pressure.set(None);
+    core.check_pressure(&mut watch, t1 + END_AFTER * 2).await;
+    assert_ne!(state(&core).await, AgentState::Paused);
+    assert!(
+        !Layout::new(&golden.home, "macos")
+            .data_dir()
+            .join(vibed::pressure::PAUSED_FILE)
+            .exists()
+    );
+    core.delete_agent(AgentDeleteParams {
+        host: None,
+        agent: hog.agent.clone(),
+        force: Some(true),
+    })
+    .await
+    .unwrap();
 }
