@@ -112,6 +112,28 @@ fn one_daemon_per_state_directory() {
 }
 
 #[test]
+fn a_lock_let_go_of_a_moment_later_is_taken() {
+    // As when a child forked before the last vibed closed its lock still
+    // holds it, until it runs its own program.
+    let golden = Golden::new();
+    drop(golden.core());
+    let layout = vibe_core::paths::Layout::new(&golden.home, "macos");
+    let held = std::fs::OpenOptions::new()
+        .write(true)
+        .open(layout.data_dir().join("vibed.lock"))
+        .unwrap();
+    held.try_lock().unwrap();
+    let let_go = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(500));
+        drop(held);
+    });
+    let started = std::time::Instant::now();
+    Core::open(golden.config()).unwrap();
+    assert!(started.elapsed() >= Duration::from_millis(400));
+    let_go.join().unwrap();
+}
+
+#[test]
 fn the_state_directory_is_private() {
     use std::os::unix::fs::PermissionsExt;
     let golden = Golden::new();

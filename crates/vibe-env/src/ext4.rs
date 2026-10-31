@@ -251,7 +251,11 @@ pub fn write(tree: &Tree, out: &Path, label: &str, time: u32) -> io::Result<u64>
             .collect::<io::Result<_>>()?;
     }
 
-    let file = OpenOptions::new().write(true).create_new(true).open(out)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(out)?;
     let written = write_image(&file, &nodes, &geo, label, time);
     if written.is_err() {
         drop(file);
@@ -606,6 +610,8 @@ fn write_image(
             Kind::File(Source::Path(path)) => copy_in(file, path, n, &at)?,
         }
     }
+    // Holes where APFS wrote the gaps out (vibe_env::sparse).
+    crate::sparse::punch_zeros(file)?;
     file.sync_all()
 }
 

@@ -326,7 +326,10 @@ impl TestVm {
     fn ask_within(&self, command: &str, timeout: Duration) -> Result<Value, String> {
         let mut stream =
             vm::connect_within(&self.socket, PORT, timeout).map_err(|e| e.to_string())?;
-        stream.set_read_timeout(Some(timeout)).unwrap();
+        // Never zero, which a socket refuses.
+        stream
+            .set_read_timeout(Some(timeout.max(Duration::from_millis(1))))
+            .unwrap();
         stream
             .write_all(format!("{command}\n").as_bytes())
             .map_err(|e| e.to_string())?;
@@ -1017,7 +1020,11 @@ impl Screen {
     /// Reads a frame; false once the shim has closed.
     fn pump(&mut self, timeout: Duration) -> bool {
         use vibe_core::shim::{FrameKind, read_frame};
-        self.stream.set_read_timeout(Some(timeout)).unwrap();
+        // Never zero, which a socket refuses: a deadline just past gives
+        // one last short read.
+        self.stream
+            .set_read_timeout(Some(timeout.max(Duration::from_millis(1))))
+            .unwrap();
         match read_frame(&mut self.stream) {
             Ok(Some(f)) => {
                 match f.kind {

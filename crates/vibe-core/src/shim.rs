@@ -403,6 +403,8 @@ pub fn connect(
         io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => ConnectError::Gone(e),
         _ => ConnectError::Io(e),
     })?;
+    // Never zero, which a socket refuses.
+    let timeout = timeout.max(Duration::from_millis(1));
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
     write_frame(&mut stream, &Frame::json(FrameKind::Hello, hello))?;

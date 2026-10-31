@@ -676,7 +676,9 @@ impl Compartment for LinuxVm {
                 timed_out = true;
                 break;
             }
-            stream.set_read_timeout(Some(left)).ok();
+            stream
+                .set_read_timeout(Some(left.max(Duration::from_millis(1))))
+                .ok();
             match proto::read_frame(&mut stream) {
                 Ok(Some(f)) => match f.kind {
                     proto::FrameKind::Output if !screen_sent => {

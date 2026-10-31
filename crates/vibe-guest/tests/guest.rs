@@ -181,7 +181,10 @@ impl Term {
 
     /// Reads one frame into the screen; false once the guest closed.
     fn pump(&mut self, timeout: Duration) -> bool {
-        self.stream.set_read_timeout(Some(timeout)).unwrap();
+        // Never zero, which a socket refuses.
+        self.stream
+            .set_read_timeout(Some(timeout.max(Duration::from_millis(1))))
+            .unwrap();
         match read_frame(&mut self.stream) {
             Ok(Some(f)) => {
                 match f.kind {

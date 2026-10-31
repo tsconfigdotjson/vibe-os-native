@@ -672,9 +672,11 @@ fn readonly(path: &Path) -> Result<()> {
 }
 
 /// Unpacks a gzip file with `gzip -dc`, writing only blocks that aren't all
-/// zeros, so an ext4 image stays as sparse as it was made.
+/// zeros, and then punching holes where the filesystem wrote zeros anyway,
+/// so an ext4 image stays as sparse as it was made.
 fn gunzip_sparse(src: &Path, dest: &Path) -> Result<()> {
     let out = OpenOptions::new()
+        .read(true)
         .write(true)
         .create_new(true)
         .open(dest)
@@ -696,6 +698,8 @@ fn gunzip_sparse(src: &Path, dest: &Path) -> Result<()> {
     let mut stdout = child.stdout.take().expect("piped");
     let mut buf = vec![0u8; ext4::BLOCK as usize];
     let mut at = 0u64;
+    // How far the file reaches.
+    let mut written = 0u64;
     let copied = (|| -> io::Result<()> {
         loop {
             let mut got = 0;
@@ -709,7 +713,13 @@ fn gunzip_sparse(src: &Path, dest: &Path) -> Result<()> {
                 break;
             }
             if buf[..got].iter().any(|&b| b != 0) {
+                // The file reaches this far first, so the write leaves no
+                // gap behind it to fill.
+                if written < at {
+                    out.set_len(at)?;
+                }
                 out.write_all_at(&buf[..got], at)?;
+                written = at + got as u64;
             }
             at += got as u64;
             if got < buf.len() {
@@ -717,6 +727,8 @@ fn gunzip_sparse(src: &Path, dest: &Path) -> Result<()> {
             }
         }
         out.set_len(at)?;
+        // And APFS's zeros given back, if it wrote any (vibe_env::sparse).
+        crate::sparse::punch_zeros(&out)?;
         out.sync_all()
     })();
     // Stopped early (a full disk, say), gzip may be blocked on the pipe.

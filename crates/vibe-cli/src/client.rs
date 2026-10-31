@@ -57,6 +57,8 @@ pub(crate) fn call<M: Method>(
     timeout: Duration,
 ) -> Result<M::Result, ClientError> {
     let stream = connect(socket)?;
+    // Never zero, which a socket refuses.
+    let timeout = timeout.max(Duration::from_millis(1));
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
 

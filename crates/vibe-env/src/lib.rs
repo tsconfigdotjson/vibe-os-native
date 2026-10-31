@@ -30,6 +30,7 @@ pub mod guest;
 pub mod images;
 pub mod linux;
 pub mod native;
+pub mod sparse;
 pub mod testing;
 pub mod tree;
 pub mod vm;
