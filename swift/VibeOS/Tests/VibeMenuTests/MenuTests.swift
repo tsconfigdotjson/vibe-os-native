@@ -405,6 +405,27 @@ import VibeRPC
         await eventually("the delete") { model.agents.map(\.ref) == ["brave-copper-lynx"] }
     }
 
+    @Test func aSlowListingDoesntUndoAnEventThatCameMeanwhile() async throws {
+        let slow = Box(false)
+        let daemon = fakeDaemon()
+        daemon.on(AgentsList.name) { _ in
+            // Read before the question, answered after it.
+            if slow.value { Thread.sleep(forTimeInterval: 0.3) }
+            return ["agents": [agentJSON("a", state: .busy)]]
+        }
+        let model = makeModel(daemon)
+        await model.refresh()
+        slow.value = true
+        let lists = daemon.params(of: AgentsList.name).count
+        let refreshing = Task { await model.refresh() }
+        await eventually("the slow listing") { daemon.params(of: AgentsList.name).count > lists }
+        await model.handle(try event(.agentState, ref: "a", seq: 2, extra: ["state": "question"]))
+        #expect(model.agents.first?.state == .question)
+        await refreshing.value
+        #expect(model.agents.first?.state == .question)
+        #expect(model.icon.question)
+    }
+
     @Test func settingsEventsBumpTheRevision() async throws {
         let daemon = fakeDaemon()
         let model = makeModel(daemon)
@@ -448,22 +469,23 @@ import VibeRPC
     }
 
     @Test func openShellGivesOneTabAndRaisesAnOpenOne() async throws {
-        let state = Box("closed")
+        let sessions = Box([[String: Any]]())
         let daemon = fakeDaemon()
-        daemon.on(ToolboxStatusGet.name) { _ in ["state": state.value] }
-        daemon.on(ToolboxOpen.name) { _ in
-            ["host": "local", "ref": "toolbox", "title": "Linux toolbox", "socket": "/s", "ttys": ["/dev/ttys007"]]
-        }
+        daemon.on(SessionsList.name) { _ in ["sessions": sessions.value] }
         let terminal = FakeTerminal()
         let model = makeModel(daemon, terminal: terminal)
-        // Closed: `vibe toolbox` opens it, in Terminal, once for two clicks.
+        // Not running: `vibe toolbox` opens it, in Terminal, once for two
+        // clicks. The app never opens it itself, which could boot it.
         await model.openToolbox()
         await model.openToolbox()
         #expect(terminal.ran == ["exec '/usr/local/bin/vibe' toolbox"])
         #expect(terminal.raised == ["/dev/ttys001"])
-        #expect(daemon.params(of: ToolboxOpen.name).isEmpty)
-        // Open, in a tab vibed knows of: that one is raised.
-        state.value = "open"
+        #expect(!daemon.calls.contains(ToolboxOpen.name))
+        // Running, in a tab vibed knows of: that one is raised.
+        sessions.value = [
+            ["host": "local", "ref": "toolbox", "state": "running", "title": "Linux toolbox", "clients": 1,
+             "ttys": ["/dev/ttys007"]],
+        ]
         terminal.tabs["/dev/ttys007"] = "vibe toolbox"
         await model.openToolbox()
         #expect(terminal.raised.last == "/dev/ttys007")

@@ -209,8 +209,10 @@ struct AgentRow: View {
         .onHover { hovering = $0 }
         .help(unavailable ? "\(agent.host) is unavailable" : "Open in Terminal")
         .contextMenu {
+            // Not while paused: its tree is stopped, so the Escape would
+            // wait, and cancel the turn it resumes into.
             Button("Interrupt") { Task { await model.interrupt(agent) } }
-                .disabled(!agent.state.isAwake || unavailable)
+                .disabled(!agent.state.isAwake || agent.state == .paused || unavailable)
             Button("Reveal Worktree in Finder") { WorktreeActions.reveal(agent.worktree) }
                 .disabled(!agent.isLocal)
             Button("Open in Editor") {

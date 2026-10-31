@@ -65,6 +65,10 @@ public final class MenuModel: ObservableObject {
     private var pollWait = 0
     private var refreshTask: Task<Void, Never>?
     private var refreshAgain = false
+    /// While a refresh is reading, the rows' changes from events and calls
+    /// meanwhile, to apply again over what it read: the listing can be
+    /// older than they are.
+    private var changedDuringRefresh: [(host: String, ref: String, change: (inout Agent) -> Void)]?
 
     public init(
         daemon: any DaemonConnection, terminal: TerminalScripting, notifier: Notifier? = nil,
@@ -140,6 +144,8 @@ public final class MenuModel: ObservableObject {
     }
 
     private func refreshOnce() async {
+        changedDuringRefresh = []
+        defer { changedDuringRefresh = nil }
         memory = HostMemory.current()
         now = Date()
         let hosts: [HostInfo]
@@ -169,6 +175,10 @@ public final class MenuModel: ObservableObject {
         }
         self.hosts = hosts
         self.agents = agents
+        for changed in changedDuringRefresh ?? [] {
+            apply(host: changed.host, ref: changed.ref, changed.change)
+        }
+        changedDuringRefresh = []
         unavailableHosts = unavailable
         connection = .connected
         gh = (try? await call(GhStatusGet.self, GhStatusParams())) ?? gh
@@ -234,11 +244,10 @@ public final class MenuModel: ObservableObject {
     /// Shell does: raises its tab if one is attached, or opens one running
     /// `vibe toolbox`, which boots it and attaches. Twice gives one tab.
     public func openToolbox() async {
-        var attached: [String] = []
-        // Open already, it gives the same shell at once, with its ttys.
-        if (try? await call(ToolboxStatusGet.self, NoParams()))?.state == .open {
-            attached = (try? await call(ToolboxOpen.self, NoParams()))?.ttys ?? []
-        }
+        // The terminals attached to its shell, if it runs, from the
+        // session list, which changes nothing: toolbox.open could boot it.
+        let sessions = (try? await call(SessionsList.self, HostParams()))?.sessions ?? []
+        let attached = sessions.first { $0.ref == Attacher.toolboxRef && $0.state == .running }?.ttys ?? []
         do {
             _ = try attacher.openToolbox(attached: attached)
             message = nil
@@ -340,7 +349,12 @@ public final class MenuModel: ObservableObject {
         }
     }
 
-    private func update(host: String, ref: String, _ change: (inout Agent) -> Void) {
+    private func update(host: String, ref: String, _ change: @escaping (inout Agent) -> Void) {
+        apply(host: host, ref: ref, change)
+        changedDuringRefresh?.append((host: host, ref: ref, change: change))
+    }
+
+    private func apply(host: String, ref: String, _ change: (inout Agent) -> Void) {
         guard let i = agents.firstIndex(where: { $0.host == host && $0.ref == ref }) else { return }
         change(&agents[i])
     }

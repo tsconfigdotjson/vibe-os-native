@@ -390,7 +390,7 @@ public enum EventKind: String, Codable, CaseIterable, Hashable, Sendable {
     /// failed to; `message` says which.
     case toolboxChanged = "toolbox.changed"
     /// Where MCP is served changed: `mcp.set` turned the Tailscale address
-    /// on or off.
+    /// on or off, or MCP started or stopped being served (`HostInfo.mcp`).
     case mcpChanged = "mcp.changed"
 }
 
@@ -698,7 +698,7 @@ public struct HostInfo: Codable, Hashable, Sendable {
     public var link: HostLink
     /// Whether it's the external address for outside MCP callers.
     public var external: Bool
-    /// Whether it serves MCP.
+    /// Whether it serves MCP now: on loopback, at least.
     public var mcp: Bool
 
     public enum CodingKeys: String, CodingKey, CaseIterable {

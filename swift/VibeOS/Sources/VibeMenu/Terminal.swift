@@ -51,6 +51,8 @@ public enum AttachOutcome: Equatable, Sendable {
 public final class Attacher {
     /// The toolbox shell's key; an agent's has a host in it.
     public static let toolboxKey = "toolbox"
+    /// The toolbox shell's session, as vibed lists it.
+    public static let toolboxRef = "toolbox"
 
     public let terminal: TerminalScripting
     /// The `vibe` that local agents attach with.

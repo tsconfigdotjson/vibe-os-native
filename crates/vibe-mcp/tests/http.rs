@@ -459,6 +459,10 @@ async fn a_start_goes_to_the_host_its_project_is_on() {
     );
     assert!(text(&r).contains("call vibe_wait"));
     assert_eq!(r["structuredContent"]["ref"], "brave-copper-lynx");
+    // Memory in the names vibe_list_agents gives it: in use, and the limit.
+    assert_eq!(r["structuredContent"]["memory"], 340u64 << 20);
+    assert_eq!(r["structuredContent"]["memory_limit"], 4u64 << 30);
+    assert!(r["structuredContent"].get("memory_used").is_none());
     assert_eq!(
         fake.starts.lock().unwrap()[0].host.as_deref(),
         Some("local")

@@ -1097,6 +1097,11 @@ impl Core {
         }
         crate::log!("vibed: interrupted {}", p.agent);
         let status = self.agent_status(&mut record, self.idle_debounce()).await;
+        // As agents.list does: one being started, woken or deleted isn't
+        // measured.
+        if lock(&self.agents_busy).contains(&p.agent) {
+            return Ok(self.agent_info(&record, &status));
+        }
         Ok(self.live_info(&record, &status).await)
     }
 
