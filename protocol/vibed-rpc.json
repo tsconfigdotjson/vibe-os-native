@@ -33,10 +33,12 @@
     { "name": "agents.start", "params": "AgentStartParams", "result": "Agent" },
     { "name": "agents.list", "params": "HostParams", "result": "AgentList" },
     { "name": "agents.delete", "params": "AgentDeleteParams", "result": "Agent" },
+    { "name": "agents.interrupt", "params": "AgentParams", "result": "Agent" },
     { "name": "toolbox.status", "params": "NoParams", "result": "ToolboxStatus" },
     { "name": "toolbox.open", "params": "NoParams", "result": "SessionAttach" },
     { "name": "toolbox.update", "params": "NoParams", "result": "ToolboxRun" },
-    { "name": "toolbox.rebuild", "params": "NoParams", "result": "ToolboxRun" }
+    { "name": "toolbox.rebuild", "params": "NoParams", "result": "ToolboxRun" },
+    { "name": "toolbox.logins", "params": "NoParams", "result": "ToolboxLogins" }
   ],
   "notifications": [
     { "name": "events.event", "params": "Event" }
@@ -61,6 +63,7 @@
     "ProjectSource": ["github", "path"],
     "GhState": ["unknown", "logged_in", "logged_out", "not_installed", "error"],
     "EventKind": ["project.added", "project.removed", "profiles.changed", "limits.changed", "keys.changed", "gh.status", "agent.added", "agent.deleted", "agent.state", "agent.status", "agent.limit", "lagged", "toolbox.changed", "mcp.changed"],
+    "HostLink": ["local", "connected", "down"],
     "SessionState": ["running", "exited"],
     "AgentState": ["busy", "idle", "question", "asleep", "paused", "exited"],
     "Activity": ["awaiting_answer", "awaiting_approval", "running_tool", "thinking", "background_work", "done", "interrupted", "errored", "unknown"],
@@ -68,7 +71,8 @@
     "WakeupKind": ["loop", "cron"],
     "StopReason": ["usage_limit"],
     "ToolboxState": ["unavailable", "closed", "open", "saving", "updating", "rebuilding"],
-    "ToolboxAction": ["shell", "update", "rebuild"]
+    "ToolboxAction": ["shell", "update", "rebuild"],
+    "LoginTool": ["gh", "gcloud", "git", "ssh"]
   },
   "types": {
     "Request": ["jsonrpc", "id", "method", "params"],
@@ -79,7 +83,7 @@
     "ProtocolMismatchData": ["protocol"],
     "NoParams": [],
     "HostParams": ["host"],
-    "HostInfo": ["name", "os", "label"],
+    "HostInfo": ["name", "os", "label", "link", "external", "mcp"],
     "HostList": ["hosts"],
     "Project": ["host", "name", "source", "repo", "path", "added_at", "profiles"],
     "ProjectList": ["projects"],
@@ -111,12 +115,15 @@
     "SessionAttach": ["host", "ref", "title", "socket", "ttys"],
     "AgentStartParams": ["host", "project", "profile", "prompt", "from", "name"],
     "AgentDeleteParams": ["host", "ref", "force"],
-    "Agent": ["host", "ref", "project", "profile", "environment", "state", "worktree", "branch", "session_id", "created_at", "attach", "status"],
+    "AgentParams": ["host", "ref"],
+    "Agent": ["host", "ref", "project", "profile", "environment", "state", "worktree", "branch", "session_id", "created_at", "attach", "memory", "memory_used", "status"],
     "AgentStatus": ["activity", "certainty", "since", "title", "line", "pending_wakeups", "stop_reason", "resets_at", "error"],
     "Wakeup": ["kind", "due_at", "certainty", "recurring", "reason"],
     "AgentList": ["agents"],
     "ToolboxStatus": ["state", "template", "home", "base", "newest_base", "last"],
-    "ToolboxRun": ["action", "at", "template", "uncovered", "error"]
+    "ToolboxRun": ["action", "at", "template", "uncovered", "error"],
+    "ToolboxLogins": ["home", "logins", "claude", "claude_problem"],
+    "Login": ["tool", "account"]
   },
   "optional": {
     "Request": ["id", "params"],
@@ -158,12 +165,15 @@
     "SessionAttach": [],
     "AgentStartParams": ["host", "from", "name"],
     "AgentDeleteParams": ["host", "force"],
-    "Agent": [],
+    "AgentParams": ["host"],
+    "Agent": ["memory_used"],
     "AgentStatus": ["since", "title", "line", "stop_reason", "resets_at", "error"],
     "Wakeup": ["due_at", "reason"],
     "AgentList": [],
     "ToolboxStatus": ["template", "home", "base", "newest_base", "last"],
-    "ToolboxRun": ["template", "error"]
+    "ToolboxRun": ["template", "error"],
+    "ToolboxLogins": ["home", "logins", "claude_problem"],
+    "Login": []
   },
   "nested": {
     "HostList": { "hosts": "HostInfo" },
@@ -178,6 +188,7 @@
     "Agent": { "status": "AgentStatus" },
     "AgentStatus": { "pending_wakeups": "Wakeup" },
     "AgentList": { "agents": "Agent" },
-    "ToolboxStatus": { "last": "ToolboxRun" }
+    "ToolboxStatus": { "last": "ToolboxRun" },
+    "ToolboxLogins": { "logins": "Login" }
   }
 }

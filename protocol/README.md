@@ -53,8 +53,10 @@ to `.env.local`. Agents run under `vibe-env`'s test backend, with its
 stand-in for Claude Code, on a host with 64G of memory; randomness is fixed,
 so refs and session ids are too. Its toolbox is `vibe-env`'s test toolbox
 (a shell of `sleep 600`, empty images for versions), with base release 1
-installed, a Linux home (version 1) and a `toolbox.toml` whose `[update]`
-runs `true` and whose one `[[install]]` fails the first time it's run. The
+installed, a Linux home (version 1, holding a `gh` login and a git
+identity; linux agents have no Claude login yet) and a `toolbox.toml` whose
+`[update]` runs `true` and whose one `[[install]]` fails the first time it's
+run. The
 Rust replays build that world in a temp directory and put its path in place
 of `/Users/me`.
 
@@ -69,7 +71,10 @@ which only `vibe attach` and `vibed` speak. Clients find a session with
 
 **Hosts.** Every method that acts on one host takes an optional `host`;
 absent means this one, which every `vibed` calls `local`. Other hosts come
-with Linux hosts (#16).
+with Linux hosts (#16). `hosts.list` gives each host's `link` (`local` for
+itself; `connected` or `down` for another), whether it's the external address
+(#18) and whether it serves MCP now, on loopback at least, for the menu's
+header. `mcp.changed` says when that changes.
 
 **Units.** Sizes are bytes and durations are seconds, as integers. Only
 `host.toml` writes them as `"4G"` and `"60s"`. Times are RFC 3339 in UTC.

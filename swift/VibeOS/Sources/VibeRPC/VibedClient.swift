@@ -86,7 +86,7 @@ public struct VibedClient: Sendable {
         }
     }
 
-    private func connectSocket() throws -> Int32 {
+    func connectSocket() throws -> Int32 {
         var addr = sockaddr_un()
         let path = Array(socketPath.utf8)
         guard path.count < MemoryLayout.size(ofValue: addr.sun_path) else {
@@ -121,7 +121,7 @@ public struct VibedClient: Sendable {
         return fd
     }
 
-    private func writeAll(_ fd: Int32, _ data: Data) throws {
+    func writeAll(_ fd: Int32, _ data: Data) throws {
         try data.withUnsafeBytes { (buf: UnsafeRawBufferPointer) in
             var offset = 0
             while offset < buf.count {

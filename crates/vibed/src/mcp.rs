@@ -7,12 +7,13 @@
 
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::task::JoinHandle;
 use vibe_core::limits::{self, HostLimits};
-use vibe_core::model::{AgentState, EventKind};
+use vibe_core::model::EventKind;
 use vibe_core::rpc::{
     Agent, AgentDeleteParams, AgentStartParams, ErrorObject, HostParams, McpSetParams, McpSettings,
     Project,
@@ -20,7 +21,6 @@ use vibe_core::rpc::{
 use vibe_mcp::http::Settings;
 use vibe_mcp::{AgentView, Check, Daemon, Input, Message, Screen, Sent, Target};
 
-use crate::agents::blocking;
 use crate::core::{Core, invalid, limits_error, lock};
 
 /// How often the MCP listeners are checked against `host.toml`.
@@ -139,7 +139,8 @@ impl Core {
     }
 
     /// What `vibe_list_agents` shows of a host's agents: what `agents.list`
-    /// does, with each one's memory now and its limit.
+    /// does (its memory now and its limit included), with the line that
+    /// attaches from another machine.
     pub async fn agent_views(&self, host: &str) -> Result<Vec<AgentView>, ErrorObject> {
         let list = self
             .agents(HostParams {
@@ -148,37 +149,34 @@ impl Core {
             .await?;
         let machine = machine_name();
         let vibe = vibe_path();
-        let mut views = Vec::new();
-        for agent in list.agents {
-            let record = self.store().agent(&agent.host, &agent.agent).ok();
-            let memory_limit = record.as_ref().map_or(0, |r| r.memory);
-            let awake = !matches!(agent.state, AgentState::Asleep | AgentState::Exited);
-            let memory = match (&record, awake) {
-                (Some(r), true) => self.memory_of(r).await,
-                _ => None,
-            };
-            views.push(AgentView {
+        Ok(list
+            .agents
+            .into_iter()
+            .map(|agent| AgentView {
                 attach_remote: format!("ssh -t {machine} {vibe} attach {}", agent.agent),
                 agent,
-                memory,
-                memory_limit,
-            });
-        }
-        Ok(views)
-    }
-
-    /// What `r`'s compartment uses now, if its backend can say.
-    async fn memory_of(&self, r: &vibe_core::store::AgentRecord) -> Option<u64> {
-        let backend = self.backend(r.environment).ok()?;
-        let handle = Core::handle_of(r).ok()?;
-        blocking(move || backend.usage(&handle))
-            .await
-            .ok()
-            .map(|u| u.memory)
+            })
+            .collect())
     }
 }
 
 impl Daemon for Core {
+    fn serving(&self, on: bool) {
+        if self.mcp_serving.swap(on, Ordering::SeqCst) != on {
+            crate::log!("vibed: MCP is {}", if on { "served" } else { "not served" });
+            let mut e = self.event(EventKind::McpChanged);
+            e.message = Some(
+                if on {
+                    "MCP is served"
+                } else {
+                    "MCP isn't served"
+                }
+                .into(),
+            );
+            self.publish(e);
+        }
+    }
+
     fn log(&self, line: &str) {
         crate::log!("vibed: {line}");
     }

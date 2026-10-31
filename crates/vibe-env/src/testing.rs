@@ -56,6 +56,9 @@ pub struct TestBackend {
     /// Held to pause, to replace a supervisor and to wake, so a supervisor
     /// that was just replaced can't pause the agent a wake has continued.
     gate: Arc<Mutex<()>>,
+    /// What [`Limiter::usage`] says each running agent's memory is, in
+    /// place of what its processes use.
+    memory: Option<u64>,
 }
 
 /// One agent's limits, held by a thread of its own.
@@ -82,7 +85,16 @@ impl TestBackend {
             claude: claude.into(),
             supervisors: Mutex::new(HashMap::new()),
             gate: Arc::new(Mutex::new(())),
+            memory: None,
         }
+    }
+
+    /// Reports `bytes` as each running agent's memory, so listings that
+    /// show it are the same every time. Limits still see what its
+    /// processes really use.
+    pub fn reporting_memory(mut self, bytes: u64) -> TestBackend {
+        self.memory = Some(bytes);
+        self
     }
 
     /// The agent's session, unless its pid now names someone else's.
@@ -202,8 +214,9 @@ impl Limiter for TestBackend {
         let paused = lock(&self.supervisors)
             .get(&h.agent_ref)
             .and_then(|s| *lock(&s.paused));
+        let memory = procs.iter().map(|p| p.memory).sum();
         Ok(Usage {
-            memory: procs.iter().map(|p| p.memory).sum(),
+            memory: self.memory.filter(|_| !procs.is_empty()).unwrap_or(memory),
             cpu_ms: procs.iter().map(|p| p.cpu_ms).sum(),
             processes: procs.len() as u32,
             paused,
@@ -293,6 +306,7 @@ impl Backend for TestBackend {
 /// version in `~/VibeOS/linux/`, as the real one keeps the disks it wrote.
 /// Update and recipe commands run natively with `sh -c` in its directory,
 /// so `true` succeeds and `exit 3` fails; a rebuild reports `uncovered`.
+/// Each home it keeps holds the logins it was given ([`TestToolbox::with_logins`]).
 #[derive(Debug)]
 pub struct TestToolbox {
     layout: vibe_core::paths::Layout,
@@ -301,6 +315,8 @@ pub struct TestToolbox {
     uncovered: Vec<String>,
     outlives_shim: bool,
     discard_takes: Duration,
+    logins: Vec<vibe_core::rpc::Login>,
+    claude: bool,
 }
 
 impl TestToolbox {
@@ -312,7 +328,17 @@ impl TestToolbox {
             uncovered: Vec::new(),
             outlives_shim: false,
             discard_takes: Duration::ZERO,
+            logins: Vec::new(),
+            claude: false,
         }
+    }
+
+    /// The logins each home its shell saves holds, as the real toolbox's
+    /// look finds them, and whether linux agents have a Claude login.
+    pub fn with_logins(mut self, logins: Vec<vibe_core::rpc::Login>, claude: bool) -> TestToolbox {
+        self.logins = logins;
+        self.claude = claude;
+        self
     }
 
     /// Its discard takes `how_long`, as stopping a VM an interrupted
@@ -420,9 +446,13 @@ impl crate::toolbox::ToolboxHost for TestToolbox {
         let base = self
             .base()
             .ok_or_else(|| EnvError::new("no Linux base image yet"))?;
+        let template = self.keep(Kind::Template, Some(base))?;
+        let working = self.dir().join("Home.img");
+        fs::write(&working, "").map_err(|e| EnvError::new(e.to_string()))?;
+        let (home, _) = self.images.keep_home(&working, Some(&self.logins))?;
         Ok(crate::toolbox::Saved {
-            template: Some(self.keep(Kind::Template, Some(base))?),
-            home: Some(self.keep(Kind::Home, None)?),
+            template: Some(template),
+            home: Some(home),
             uncovered: Vec::new(),
         })
     }
@@ -463,5 +493,14 @@ impl crate::toolbox::ToolboxHost for TestToolbox {
             home: None,
             uncovered: self.uncovered.clone(),
         })
+    }
+
+    fn logins(&self) -> vibe_core::rpc::ToolboxLogins {
+        let claude = if self.claude {
+            Ok(())
+        } else {
+            Err("linux agents have no Claude login yet: run `vibe setup-token`".into())
+        };
+        crate::toolbox::home_logins(&self.images, claude)
     }
 }

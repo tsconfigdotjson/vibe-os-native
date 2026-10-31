@@ -127,8 +127,21 @@ names! {
         /// or failed to; `message` says which.
         ToolboxChanged = "toolbox.changed",
         /// Where MCP is served changed: `mcp.set` turned the Tailscale
-        /// address on or off.
+        /// address on or off, or MCP started or stopped being served on
+        /// loopback (`HostInfo.mcp`).
         McpChanged = "mcp.changed",
+    }
+}
+
+names! {
+    /// How a host's `vibed` is reached from this one.
+    HostLink {
+        /// It's this host.
+        Local = "local",
+        /// Another host, whose link is up.
+        Connected = "connected",
+        /// Another host, whose link is down: its agents are unavailable.
+        Down = "down",
     }
 }
 
@@ -219,6 +232,12 @@ names! {
     /// What a toolbox run was: a shell session, the weekly `[update]`, or
     /// **Rebuild template**.
     ToolboxAction { Shell = "shell", Update = "update", Rebuild = "rebuild" }
+}
+
+names! {
+    /// What a login kept in the Linux home is for (PRD: Core concepts,
+    /// Linux home): `gh`, `gcloud`, git's identity, or an SSH key.
+    LoginTool { Gh = "gh", Gcloud = "gcloud", Git = "git", Ssh = "ssh" }
 }
 
 /// The default memory of a profile.

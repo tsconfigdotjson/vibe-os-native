@@ -40,10 +40,12 @@ public enum VibeRPC {
         AgentsStart.name,
         AgentsList.name,
         AgentsDelete.name,
+        AgentsInterrupt.name,
         ToolboxStatusGet.name,
         ToolboxOpen.name,
         ToolboxUpdate.name,
         ToolboxRebuild.name,
+        ToolboxLoginsGet.name,
     ]
     /// Every notification vibed sends.
     public static let notifications = [EventNotice.name]
@@ -389,8 +391,13 @@ public enum EventKind: String, Codable, CaseIterable, Hashable, Sendable {
     /// failed to; `message` says which.
     case toolboxChanged = "toolbox.changed"
     /// Where MCP is served changed: `mcp.set` turned the Tailscale address
-    /// on or off.
+    /// on or off, or MCP started or stopped being served (`HostInfo.mcp`).
     case mcpChanged = "mcp.changed"
+}
+
+/// How vibed reaches a host: `local` for itself, else whether its link is up.
+public enum HostLink: String, Codable, CaseIterable, Hashable, Sendable {
+    case local, connected, down
 }
 
 /// Whether a session's shim still holds its terminal.
@@ -438,6 +445,12 @@ public enum ToolboxState: String, Codable, CaseIterable, Hashable, Sendable {
 /// What a toolbox run was: a shell session, the `[update]`, or Rebuild template.
 public enum ToolboxAction: String, Codable, CaseIterable, Hashable, Sendable {
     case shell, update, rebuild
+}
+
+/// What a login kept in the Linux home is for: `gh`, `gcloud`, git's
+/// identity, or an SSH key.
+public enum LoginTool: String, Codable, CaseIterable, Hashable, Sendable {
+    case gh, gcloud, git, ssh
 }
 
 // MARK: - Methods
@@ -599,6 +612,14 @@ public enum AgentsDelete: RPCMethod {
     public static let name = "agents.delete"
 }
 
+/// `agents.interrupt`: presses Escape in the agent's terminal, which stops
+/// Claude's turn. Refused unless its session runs; it never wakes one.
+public enum AgentsInterrupt: RPCMethod {
+    public typealias Params = AgentParams
+    public typealias Result = Agent
+    public static let name = "agents.interrupt"
+}
+
 /// `toolbox.status`: the versions new agents boot, and the last toolbox run.
 public enum ToolboxStatusGet: RPCMethod {
     public typealias Params = NoParams
@@ -627,6 +648,15 @@ public enum ToolboxRebuild: RPCMethod {
     public typealias Params = NoParams
     public typealias Result = ToolboxRun
     public static let name = "toolbox.rebuild"
+}
+
+/// `toolbox.logins`: See logins. What the Linux home new agents boot holds,
+/// as the toolbox found when it saved it, and whether linux agents have a
+/// Claude login. Boots nothing.
+public enum ToolboxLoginsGet: RPCMethod {
+    public typealias Params = NoParams
+    public typealias Result = ToolboxLogins
+    public static let name = "toolbox.logins"
 }
 
 /// `events.event`: one event, sent to subscribed connections.
@@ -680,9 +710,15 @@ public struct HostInfo: Codable, Hashable, Sendable {
     public var os: String
     /// The hostname, for people.
     public var label: String
+    /// `local` for vibed's own host; another's link is `connected` or `down`.
+    public var link: HostLink
+    /// Whether it's the external address for outside MCP callers.
+    public var external: Bool
+    /// Whether it serves MCP now: on loopback, at least.
+    public var mcp: Bool
 
     public enum CodingKeys: String, CodingKey, CaseIterable {
-        case name, os, label
+        case name, os, label, link, external, mcp
     }
 }
 
@@ -1189,6 +1225,21 @@ public struct AgentDeleteParams: Codable, Hashable, Sendable {
     }
 }
 
+/// Names one agent.
+public struct AgentParams: Codable, Hashable, Sendable {
+    public var host: String?
+    public var ref: String
+
+    public init(host: String? = nil, ref: String) {
+        self.host = host
+        self.ref = ref
+    }
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case host, ref
+    }
+}
+
 /// One Claude Code in its own worktree and compartment.
 public struct Agent: Codable, Hashable, Sendable {
     public var host: String
@@ -1204,6 +1255,11 @@ public struct Agent: Codable, Hashable, Sendable {
     public var createdAt: String
     /// The command that attaches a terminal, such as `vibe attach <ref>`.
     public var attach: String
+    /// Its memory limit in bytes: its profile's when it started.
+    public var memory: Int
+    /// What it uses now, in bytes, while its session runs; only
+    /// `agents.list` and `agents.interrupt` measure it.
+    public var memoryUsed: Int?
     /// What its transcript says it's doing.
     public var status: AgentStatus
 
@@ -1211,7 +1267,9 @@ public struct Agent: Codable, Hashable, Sendable {
         case host, ref, project, profile, environment, state, worktree, branch
         case sessionId = "session_id"
         case createdAt = "created_at"
-        case attach, status
+        case attach, memory
+        case memoryUsed = "memory_used"
+        case status
     }
 }
 
@@ -1299,5 +1357,37 @@ public struct ToolboxRun: Codable, Hashable, Sendable {
 
     public enum CodingKeys: String, CodingKey, CaseIterable {
         case action, at, template, uncovered, error
+    }
+}
+
+/// The logins linux agents start with, for `toolbox.logins`.
+public struct ToolboxLogins: Codable, Hashable, Sendable {
+    /// The Linux home version new agents boot; none before the toolbox has
+    /// saved one.
+    public var home: Int?
+    /// The gh, gcloud, git and SSH logins that home holds, found as the
+    /// toolbox saved it; nil if it couldn't tell. Without a home, empty.
+    public var logins: [Login]?
+    /// Whether linux agents have a Claude login (`vibe setup-token`'s token,
+    /// kept on the Mac).
+    public var claude: Bool
+    /// Without one, why, as a sentence: none kept yet, or it can't be read.
+    public var claudeProblem: String?
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case home, logins, claude
+        case claudeProblem = "claude_problem"
+    }
+}
+
+/// One login the Linux home holds. Never its secret.
+public struct Login: Codable, Hashable, Sendable {
+    public var tool: LoginTool
+    /// Whose it is: `octocat on github.com`, an account, `Name <email>`, or
+    /// an SSH key's file and comment.
+    public var account: String
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case tool, account
     }
 }

@@ -15,8 +15,11 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::oneshot;
+use vibe_core::model::LoginTool;
 use vibe_core::paths::Layout;
+use vibe_core::rpc::Login;
 use vibe_core::units::GIB;
+use vibe_env::images::Images;
 use vibe_env::testing::{STAND_IN, TestBackend, TestToolbox};
 use vibed::agents::{Backends, HostAdmission};
 use vibed::core::{Config, Core, DaemonInfo};
@@ -35,6 +38,10 @@ pub fn golden_info() -> DaemonInfo {
 /// The home directory the examples are written with; replaced by the real
 /// one when they're replayed.
 pub const GOLDEN_HOME: &str = "/Users/me";
+
+/// What the test backend says every running agent uses: about what a real
+/// Claude Code does (PRD: Spike results).
+pub const AGENT_MEMORY_USED: u64 = 340 * 1024 * 1024;
 
 /// 2026-10-30T12:00:00Z: the time in every example.
 pub const GOLDEN_NOW: i64 = 1_793_361_600;
@@ -270,6 +277,10 @@ impl Golden {
             fs::write(base.join(f), f).unwrap();
         }
         fs::write(layout.linux_dir().join("home-1.img"), "").unwrap();
+        // What the toolbox found in that home when it saved it.
+        Images::new(layout.linux_dir())
+            .note_logins(1, &golden_logins())
+            .unwrap();
         fs::create_dir_all(layout.config_dir()).unwrap();
         fs::write(
             layout.toolbox_config(),
@@ -285,13 +296,16 @@ impl Golden {
         config.label = "mac-mini".into();
         config.gh = self.gh.clone().into();
         config.shim = workspace_bin("vibe-shim").into_os_string();
-        config.backends = Backends::all(Arc::new(TestBackend::new(&self.claude)));
+        config.backends = Backends::all(Arc::new(
+            TestBackend::new(&self.claude).reporting_memory(AGENT_MEMORY_USED),
+        ));
         config.toolbox = Some(Arc::new(
             TestToolbox::new(
                 Layout::new(&self.home, "macos"),
                 vec!["sleep".into(), "600".into()],
             )
-            .with_uncovered(vec!["apt: htop".into()]),
+            .with_uncovered(vec!["apt: htop".into()])
+            .with_logins(golden_logins(), false),
         ));
         config.admission = Arc::new(HostAdmission {
             total_memory: 64 * GIB,
@@ -546,3 +560,17 @@ impl Conn {
 }
 
 pub const HELLO: &str = r#"{"jsonrpc":"2.0","id":"probe","method":"daemon.hello","params":{"client":"test","protocol":1}}"#;
+
+/// The logins the examples' Linux home holds.
+pub fn golden_logins() -> Vec<Login> {
+    vec![
+        Login {
+            tool: LoginTool::Gh,
+            account: "me on github.com".into(),
+        },
+        Login {
+            tool: LoginTool::Git,
+            account: "Me <me@example.com>".into(),
+        },
+    ]
+}

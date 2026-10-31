@@ -9,8 +9,9 @@ use serde::de::{self, DeserializeOwned, Deserializer, Visitor};
 use serde::{Serialize, forward_to_deserialize_any};
 use serde_json::Value;
 use vibe_core::model::{
-    Activity, AgentState, Certainty, Environment, EventKind, GhState, Mode, Model, ProjectSource,
-    Reasoning, SessionState, StopReason, ToolboxAction, ToolboxState, WakeupKind,
+    Activity, AgentState, Certainty, Environment, EventKind, GhState, HostLink, LoginTool, Mode,
+    Model, ProjectSource, Reasoning, SessionState, StopReason, ToolboxAction, ToolboxState,
+    WakeupKind,
 };
 use vibe_core::paths;
 use vibe_core::rpc::*;
@@ -188,12 +189,15 @@ fn rust_types() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
         entry::<SessionAttach>(),
         entry::<AgentStartParams>(),
         entry::<AgentDeleteParams>(),
+        entry::<AgentParams>(),
         entry::<Agent>(),
         entry::<AgentStatus>(),
         entry::<Wakeup>(),
         entry::<AgentList>(),
         entry::<ToolboxStatus>(),
         entry::<ToolboxRun>(),
+        entry::<ToolboxLogins>(),
+        entry::<Login>(),
     ])
 }
 
@@ -255,10 +259,12 @@ fn rust_methods() -> BTreeMap<&'static str, MethodTypes> {
         method::<AgentsStart>(),
         method::<AgentsList>(),
         method::<AgentsDelete>(),
+        method::<AgentsInterrupt>(),
         method::<ToolboxStatusGet>(),
         method::<ToolboxOpen>(),
         method::<ToolboxUpdate>(),
         method::<ToolboxRebuild>(),
+        method::<ToolboxLoginsGet>(),
     ])
 }
 
@@ -287,6 +293,7 @@ fn rust_enums() -> BTreeMap<&'static str, Vec<&'static str>> {
         ),
         ("GhState", names(GhState::ALL, GhState::as_str)),
         ("EventKind", names(EventKind::ALL, EventKind::as_str)),
+        ("HostLink", names(HostLink::ALL, HostLink::as_str)),
         (
             "SessionState",
             names(SessionState::ALL, SessionState::as_str),
@@ -304,6 +311,7 @@ fn rust_enums() -> BTreeMap<&'static str, Vec<&'static str>> {
             "ToolboxAction",
             names(ToolboxAction::ALL, ToolboxAction::as_str),
         ),
+        ("LoginTool", names(LoginTool::ALL, LoginTool::as_str)),
     ])
 }
 

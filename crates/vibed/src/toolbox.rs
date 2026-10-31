@@ -22,7 +22,9 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use vibe_core::model::{EventKind, LOCAL_HOST, ToolboxAction, ToolboxState};
 use vibe_core::paths::private_dir;
-use vibe_core::rpc::{ErrorCode, ErrorObject, NoParams, SessionAttach, ToolboxRun, ToolboxStatus};
+use vibe_core::rpc::{
+    ErrorCode, ErrorObject, NoParams, SessionAttach, ToolboxLogins, ToolboxRun, ToolboxStatus,
+};
 use vibe_core::shim;
 use vibe_core::time::rfc3339;
 use vibe_core::toolbox as recipe;
@@ -237,6 +239,16 @@ impl Core {
         };
         let versions = blocking(move || Ok(host.versions())).await?.ok();
         Ok(self.toolbox_status_of(versions))
+    }
+
+    /// `toolbox.logins`: what the newest Linux home holds, from the note
+    /// kept beside it, and whether linux agents have a Claude login. Boots
+    /// nothing, and works while the toolbox is busy.
+    pub async fn toolbox_logins(&self, _: NoParams) -> Result<ToolboxLogins, ErrorObject> {
+        let host = self.toolbox_host()?;
+        blocking(move || Ok(host.logins()))
+            .await?
+            .map_err(|e| error(ErrorCode::InternalError, e.to_string()))
     }
 
     /// The status as it is now, without leaving the current thread.

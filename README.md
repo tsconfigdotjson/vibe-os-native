@@ -60,7 +60,8 @@ VIBE_BASE_RELEASES=file://$PWD/build/base-image target/debug/vibed
 ```
 
 `VIBE_SOCKET` (or `--socket`) points `vibed`, `vibe` and the app at another
-socket.
+socket. The app's rows attach Terminal with `/usr/local/bin/vibe`, or
+`$VIBE_CLI` when it's set, such as `VIBE_CLI=$PWD/target/debug/vibe`.
 
 ## Check
 
@@ -71,7 +72,8 @@ scripts/check-full.sh
 One command for everything: Rust fmt, clippy, build and test; the
 `vibe-guest` cross-build; a `vibed` smoke test; on a Mac, both Swift packages,
 the Swift contract tests, signing with the virtualization entitlement,
-smoke tests of `vibe-vm` and `VibeOS.app` against a live `vibed`, real
+smoke tests of `vibe-vm` and `VibeOS.app` against a live `vibed`, the menu
+following a live agent and two clicks giving one Terminal tab, real
 VMs booted, saved and restored through `vibe-vm`, the Linux base image, and
 `linux` agents on it: the backend's conformance suite, and real Claude across
 a sleep. It prints a

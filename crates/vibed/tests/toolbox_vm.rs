@@ -1,7 +1,9 @@
 //! The Done-when of #10, on a Mac with real VMs: after installing `gcloud`
 //! in the toolbox, new agents have it, and an agent asleep on the old
 //! template still restores. Also the Linux home (a login made in the
-//! toolbox reaches agents), `sudo` in the toolbox and nowhere else,
+//! toolbox reaches agents, and See logins says which logins it holds,
+//! found as the save looked in the real guest), `sudo` in the toolbox and
+//! nowhere else,
 //! `[update]`, and **Rebuild template** with what it doesn't cover. It
 //! boots the base image `scripts/base-image.sh` built, with Claude Code's
 //! managed layer downloaded the way `vibed` does it; the agents here run a
@@ -26,9 +28,9 @@ use std::time::{Duration, Instant};
 
 use common::{Golden, workspace_bin};
 use vibe_core::limits::HostLimits;
-use vibe_core::model::{Environment, ToolboxState};
+use vibe_core::model::{Environment, LoginTool, ToolboxState};
 use vibe_core::paths::Layout;
-use vibe_core::rpc::NoParams;
+use vibe_core::rpc::{Login, NoParams};
 use vibe_core::shim::{self, Frame, FrameKind, control_hello};
 use vibe_env::guest::{self, proto};
 use vibe_env::images::Images;
@@ -266,9 +268,37 @@ async fn new_agents_get_what_the_toolbox_installed_and_sleeping_ones_keep_theirs
             w.in_toolbox("stat -c 'sudo is %a %U:%G' /usr/bin/sudo; sudo -n true");
             w.in_toolbox(&format!("sudo -n -H bash -c '{GCLOUD}'"));
             w.in_toolbox("git config --global user.name 'Toolbox Test'");
+            // Logins as gh and ssh-keygen leave them, for See logins.
+            w.in_toolbox(concat!(
+                "mkdir -p ~/.config/gh ~/.ssh && ",
+                "printf 'github.com:\\n    oauth_token: gho_not_a_real_token\\n",
+                "    user: toolbox-test\\n' > ~/.config/gh/hosts.yml && ",
+                "echo not-a-real-key > ~/.ssh/id_ed25519 && ",
+                "echo 'ssh-ed25519 AAAAC3Nz toolbox-test@vibeos' > ~/.ssh/id_ed25519.pub",
+            ));
         })
         .await;
     assert_eq!((t1, h1), (1, 1));
+    // See logins: what the save found in the real guest, with nothing booted.
+    let logins = w.core.toolbox_logins(NoParams {}).await.unwrap();
+    let login = |tool, account: &str| Login {
+        tool,
+        account: account.into(),
+    };
+    assert_eq!(
+        (logins.home, logins.logins, logins.claude),
+        (
+            Some(1),
+            Some(vec![
+                login(LoginTool::Gh, "toolbox-test on github.com"),
+                login(LoginTool::Git, "Toolbox Test"),
+                login(LoginTool::Ssh, "id_ed25519 (toolbox-test@vibeos)"),
+            ]),
+            true
+        ),
+        "{}",
+        w.logs(TOOLBOX_REF)
+    );
     let template_1 = layout.linux_dir().join("template-1.img");
 
     // 2. A new agent has them; it may not sudo.

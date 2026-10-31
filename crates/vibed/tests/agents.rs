@@ -15,7 +15,7 @@ use serde_json::Value;
 use vibe_core::model::{Activity, AgentState, Certainty, EventKind, Mode};
 use vibe_core::paths::Layout;
 use vibe_core::rpc::{
-    Agent, AgentDeleteParams, AgentStartParams, ErrorCode, ErrorObject, HostParams,
+    Agent, AgentDeleteParams, AgentParams, AgentStartParams, ErrorCode, ErrorObject, HostParams,
     ProfileUpdateParams, ProjectAddParams,
 };
 use vibe_core::shim::{self, Frame, FrameKind, control_hello};
@@ -268,9 +268,14 @@ async fn a_start_makes_the_worktree_branch_and_session_and_claude_writes_its_tra
             .contains("autoSetupRemote")
     );
 
-    // Listed, with its session titled for it, and announced.
+    // Listed, with what it uses measured, its session titled for it, and
+    // announced.
     let list = w.list().await;
-    assert_eq!(list, std::slice::from_ref(&a));
+    let measured = Agent {
+        memory_used: Some(common::AGENT_MEMORY_USED),
+        ..a.clone()
+    };
+    assert_eq!(list, [measured]);
     let sessions = w.core.sessions(HostParams::default()).await.unwrap();
     let s = sessions
         .sessions
@@ -667,6 +672,63 @@ async fn an_exited_agent_resumes_its_session() {
 }
 
 #[tokio::test]
+async fn interrupt_presses_escape_while_the_session_runs() {
+    let w = world().await;
+    // A "Claude" that writes down the first key it's sent, raw.
+    common::write_script(
+        &w.golden.claude,
+        "#!/bin/sh\nstty raw -echo\n: >.vibe-ready\nhead -c 1 | od -An -c >.vibe-key\nexec sleep 600\n",
+    );
+    let a = w.core.start_agent(start("anything")).await.unwrap();
+    let worktree = Path::new(&a.worktree);
+    wait_until("the stand-in to be ready", || {
+        worktree.join(".vibe-ready").exists()
+    });
+    let interrupt = |r: &str| AgentParams {
+        host: None,
+        agent: r.into(),
+    };
+    let got = w.core.interrupt_agent(interrupt(&a.agent)).await.unwrap();
+    assert_eq!(got.agent, a.agent);
+    assert_eq!(got.state, AgentState::Busy);
+    assert_eq!(got.memory, GIB);
+    assert_eq!(got.memory_used, Some(common::AGENT_MEMORY_USED));
+    let key = worktree.join(".vibe-key");
+    wait_until("the key", || {
+        fs::read_to_string(&key).is_ok_and(|k| !k.trim().is_empty())
+    });
+    assert_eq!(fs::read_to_string(&key).unwrap().trim(), "033");
+    // Interrupting presses a key; it doesn't attach.
+    let sessions = w.core.sessions(HostParams::default()).await.unwrap();
+    assert_eq!(sessions.sessions[0].clients, 0);
+
+    // Once its session has gone there's nothing to interrupt, and a
+    // listing no longer measures it.
+    w.session(&a.agent).end(Duration::from_secs(5));
+    let list = w.list().await;
+    assert_eq!(
+        (list[0].state, list[0].memory, list[0].memory_used),
+        (AgentState::Exited, GIB, None)
+    );
+    let e = w
+        .core
+        .interrupt_agent(interrupt(&a.agent))
+        .await
+        .unwrap_err();
+    assert_eq!(code(&e), ErrorCode::Conflict, "{e:?}");
+    assert!(e.message.contains("isn't running"), "{}", e.message);
+    let e = w
+        .core
+        .interrupt_agent(interrupt("lone-grey-wolf"))
+        .await
+        .unwrap_err();
+    assert_eq!(code(&e), ErrorCode::NotFound, "{e:?}");
+    let e = w.core.interrupt_agent(interrupt("../x")).await.unwrap_err();
+    assert_eq!(code(&e), ErrorCode::InvalidParams, "{e:?}");
+    w.core.delete_agent(delete(&a.agent, true)).await.unwrap();
+}
+
+#[tokio::test]
 async fn agents_outlive_vibed() {
     let w = world().await;
     let a = w.core.start_agent(start("question")).await.unwrap();
@@ -683,10 +745,13 @@ async fn agents_outlive_vibed() {
     let list = core.agents(HostParams::default()).await.unwrap().agents;
     assert_eq!(list, before);
     assert_eq!(list[0].status.activity, Activity::AwaitingAnswer);
+    // A start doesn't measure memory; a listing does.
+    assert_eq!(list[0].memory_used, Some(common::AGENT_MEMORY_USED));
     assert_eq!(
         Agent {
             state: a.state,
             status: a.status.clone(),
+            memory_used: None,
             ..list[0].clone()
         },
         a

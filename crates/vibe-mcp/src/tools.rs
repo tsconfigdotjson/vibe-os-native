@@ -19,7 +19,7 @@ use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler};
 use serde_json::{Value, json};
 use vibe_core::model::{AgentState, LOCAL_HOST};
-use vibe_core::rpc::{AgentDeleteParams, AgentStartParams, ErrorCode};
+use vibe_core::rpc::{Agent, AgentDeleteParams, AgentStartParams, ErrorCode};
 
 use crate::{
     AgentView, Check, Daemon, Error, Input, Message, Role, Target, display_ref, keys, split_ref,
@@ -345,15 +345,23 @@ pub(crate) fn tools() -> Vec<Tool> {
 // Results.
 
 fn agent_json(v: &AgentView) -> Value {
-    let mut j = serde_json::to_value(&v.agent).expect("agents serialize");
+    let mut j = agent_value(&v.agent);
     if let Value::Object(m) = &mut j {
-        m.insert(
-            "ref".into(),
-            display_ref(&v.agent.host, &v.agent.agent).into(),
-        );
-        m.insert("memory".into(), json!(v.memory));
-        m.insert("memory_limit".into(), json!(v.memory_limit));
         m.insert("attach_remote".into(), json!(v.attach_remote));
+    }
+    j
+}
+
+/// An agent as every tool gives one: its ref as MCP writes it, and its
+/// memory in MCP's own names, `memory` for what it uses now and
+/// `memory_limit` for its profile's.
+fn agent_value(a: &Agent) -> Value {
+    let mut j = serde_json::to_value(a).expect("agents serialize");
+    if let Value::Object(m) = &mut j {
+        m.insert("ref".into(), display_ref(&a.host, &a.agent).into());
+        m.remove("memory_used");
+        m.insert("memory".into(), json!(a.memory_used));
+        m.insert("memory_limit".into(), json!(a.memory));
     }
     j
 }
@@ -368,8 +376,8 @@ fn agent_line(v: &AgentView) -> String {
         a.profile.clone(),
         format!("{} · branch {}", a.project, a.branch),
     ];
-    if let Some(m) = v.memory {
-        parts.push(format!("{} of {}", human(m), human(v.memory_limit)));
+    if let Some(m) = a.memory_used {
+        parts.push(format!("{} of {}", human(m), human(a.memory)));
     }
     if let Some(until) = limited_until(a) {
         parts.push(until);
@@ -518,9 +526,7 @@ impl<D: Daemon> Server<D> {
             "started {r} as {} in {} on {}, on branch {}. The prompt is submitted; call vibe_wait to know when it has answered",
             a.profile, a.project, a.host, a.branch
         );
-        let mut j = serde_json::to_value(&a).expect("agents serialize");
-        j["ref"] = r.into();
-        ok(&text, j)
+        ok(&text, agent_value(&a))
     }
 
     /// The one host `project` is on.

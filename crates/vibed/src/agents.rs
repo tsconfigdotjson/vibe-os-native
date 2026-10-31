@@ -27,7 +27,8 @@ use vibe_core::model::{
     AgentState, Environment, EventKind, LOCAL_HOST, Mode, ref_from_bytes, validate_ref,
 };
 use vibe_core::rpc::{
-    Agent, AgentDeleteParams, AgentList, AgentStartParams, ErrorCode, ErrorObject, HostParams,
+    Agent, AgentDeleteParams, AgentList, AgentParams, AgentStartParams, ErrorCode, ErrorObject,
+    HostParams,
 };
 use vibe_core::socket;
 use vibe_core::store::{AgentRecord, StoreError};
@@ -47,6 +48,9 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 /// Draws of randomness for a free ref before giving up.
 const REF_TRIES: usize = 8;
+
+/// What Interrupt presses: Escape, which stops Claude's turn.
+const ESCAPE: &[u8] = b"\x1b";
 
 /// The script a repo can have run in every new agent's compartment.
 pub const SETUP_SCRIPT: &str = ".vibe/setup.sh";
@@ -526,8 +530,27 @@ impl Core {
             session_id: a.session_id.clone(),
             created_at: rfc3339(a.created_at),
             attach: format!("vibe attach {}", a.agent_ref),
+            memory: a.memory,
+            memory_used: None,
             status: status.to_rpc(),
         }
+    }
+
+    /// [`Core::agent_info`] with the memory it uses now, for an agent in
+    /// `state` whose session may run. Its backend measures it; one that
+    /// can't is left without.
+    async fn live_info(&self, a: &AgentRecord, status: &vibe_status::Status) -> Agent {
+        let mut info = self.agent_info(a, status);
+        if matches!(a.state, AgentState::Exited | AgentState::Asleep) {
+            return info;
+        }
+        if let (Ok(backend), Ok(handle)) = (self.backend(a.environment), Core::handle_of(a)) {
+            info.memory_used = blocking(move || backend.usage(&handle))
+                .await
+                .ok()
+                .map(|u| u.memory);
+        }
+        info
     }
 
     pub(crate) fn handle_of(a: &AgentRecord) -> Result<Handle, ErrorObject> {
@@ -1044,9 +1067,42 @@ impl Core {
             if state != a.state {
                 self.set_state(&mut a, state);
             }
-            agents.push(self.agent_info(&a, &status));
+            agents.push(self.live_info(&a, &status).await);
         }
         Ok(AgentList { agents })
+    }
+
+    /// Presses Escape in an agent's terminal, which stops Claude's turn
+    /// (PRD: Menu bar, Right-click). Like a read, it never wakes one.
+    pub async fn interrupt_agent(&self, p: AgentParams) -> Result<Agent, ErrorObject> {
+        let host = self.host(p.host.as_deref())?;
+        validate_ref(&p.agent).map_err(invalid)?;
+        let mut record = self.store().agent(host, &p.agent).map_err(store_error)?;
+        let not_running = || {
+            error(
+                ErrorCode::Conflict,
+                format!("{} isn't running, so there's nothing to interrupt", p.agent),
+            )
+        };
+        if record.state == AgentState::Asleep {
+            return Err(not_running());
+        }
+        let socket = self.layout.session_socket(&p.agent);
+        match sessions::send_input(&socket, ESCAPE).await {
+            Ok(()) => {}
+            Err(_) if !self.session_runs(&p.agent).await => return Err(not_running()),
+            Err(e) => {
+                return Err(internal(format!("can't reach {}'s session: {e}", p.agent)));
+            }
+        }
+        crate::log!("vibed: interrupted {}", p.agent);
+        let status = self.agent_status(&mut record, self.idle_debounce()).await;
+        // As agents.list does: one being started, woken or deleted isn't
+        // measured.
+        if lock(&self.agents_busy).contains(&p.agent) {
+            return Ok(self.agent_info(&record, &status));
+        }
+        Ok(self.live_info(&record, &status).await)
     }
 
     pub(crate) fn set_state(&self, a: &mut AgentRecord, state: AgentState) {

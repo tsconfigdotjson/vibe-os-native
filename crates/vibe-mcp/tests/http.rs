@@ -75,6 +75,8 @@ fn agent(host: &str, r: &str, project: &str, state: AgentState) -> Agent {
         session_id: "5e55".into(),
         created_at: "2026-10-30T12:00:00Z".into(),
         attach: format!("vibe attach {r}"),
+        memory: 4 << 30,
+        memory_used: Some(340 << 20),
         status: AgentStatus {
             activity: Activity::Done,
             certainty: Certainty::Firm,
@@ -147,8 +149,6 @@ impl Daemon for Fake {
             .filter(|a| a.host == host)
             .map(|a| AgentView {
                 attach_remote: format!("ssh -t mac {}", a.attach),
-                memory: Some(340 << 20),
-                memory_limit: 4 << 30,
                 agent: a,
             })
             .collect())
@@ -459,6 +459,10 @@ async fn a_start_goes_to_the_host_its_project_is_on() {
     );
     assert!(text(&r).contains("call vibe_wait"));
     assert_eq!(r["structuredContent"]["ref"], "brave-copper-lynx");
+    // Memory in the names vibe_list_agents gives it: in use, and the limit.
+    assert_eq!(r["structuredContent"]["memory"], 340u64 << 20);
+    assert_eq!(r["structuredContent"]["memory_limit"], 4u64 << 30);
+    assert!(r["structuredContent"].get("memory_used").is_none());
     assert_eq!(
         fake.starts.lock().unwrap()[0].host.as_deref(),
         Some("local")

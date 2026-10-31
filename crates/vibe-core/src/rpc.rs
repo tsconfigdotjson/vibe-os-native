@@ -17,8 +17,9 @@ use serde_json::Value;
 
 pub use crate::limits::HostLimits;
 pub use crate::model::{
-    Activity, AgentState, Certainty, Environment, EventKind, GhState, Mode, Model, Profile,
-    ProjectSource, Reasoning, SessionState, StopReason, ToolboxAction, ToolboxState, WakeupKind,
+    Activity, AgentState, Certainty, Environment, EventKind, GhState, HostLink, LoginTool, Mode,
+    Model, Profile, ProjectSource, Reasoning, SessionState, StopReason, ToolboxAction,
+    ToolboxState, WakeupKind,
 };
 
 /// Bumped on any incompatible change to the contract. Clients send theirs in
@@ -347,10 +348,12 @@ pub const METHODS: &[&str] = &[
     AgentsStart::NAME,
     AgentsList::NAME,
     AgentsDelete::NAME,
+    AgentsInterrupt::NAME,
     ToolboxStatusGet::NAME,
     ToolboxOpen::NAME,
     ToolboxUpdate::NAME,
     ToolboxRebuild::NAME,
+    ToolboxLoginsGet::NAME,
 ];
 
 /// Every notification the daemon sends.
@@ -544,6 +547,13 @@ method! {
 }
 
 method! {
+    /// `agents.interrupt`: presses Escape in the agent's terminal, which
+    /// stops Claude's turn, as the menu's Interrupt does. Refused unless its
+    /// session runs; it never wakes an agent.
+    AgentsInterrupt = "agents.interrupt", AgentParams => Agent
+}
+
+method! {
     /// `toolbox.status`: the toolbox's state, the template and Linux home
     /// versions new agents boot, the base images, and how the last toolbox
     /// run went.
@@ -574,6 +584,14 @@ method! {
     ToolboxRebuild = "toolbox.rebuild", NoParams => ToolboxRun
 }
 
+method! {
+    /// `toolbox.logins`: **See logins**. What the Linux home new agents
+    /// boot holds, as the toolbox found when it saved that home, and
+    /// whether linux agents have a Claude login. Reads only what's kept on
+    /// the Mac: it never boots a VM.
+    ToolboxLoginsGet = "toolbox.logins", NoParams => ToolboxLogins
+}
+
 /// `events.event`: one event, sent to subscribed connections.
 #[derive(Debug)]
 pub enum EventNotice {}
@@ -598,6 +616,13 @@ pub struct HostInfo {
     pub os: String,
     /// For people: the machine's hostname.
     pub label: String,
+    /// How this daemon reaches it: `local` for itself; for another host,
+    /// whether its SSH link is up (#16).
+    pub link: HostLink,
+    /// Whether it's the external address for outside MCP callers (#18).
+    pub external: bool,
+    /// Whether it serves MCP now: on loopback, at least.
+    pub mcp: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -945,6 +970,16 @@ pub struct AgentDeleteParams {
     pub force: Option<bool>,
 }
 
+/// Names one agent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(rename = "ref")]
+    pub agent: String,
+}
+
 /// An agent: one Claude Code in its own worktree and compartment.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Agent {
@@ -965,6 +1000,12 @@ pub struct Agent {
     pub created_at: String,
     /// The command that attaches a terminal to it.
     pub attach: String,
+    /// Its memory limit, in bytes: its profile's memory when it started.
+    pub memory: u64,
+    /// What it uses now, in bytes, while its session runs and its backend
+    /// can tell. Only `agents.list` and `agents.interrupt` measure it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_used: Option<u64>,
     /// What its transcript says it's doing.
     pub status: AgentStatus,
 }
@@ -1091,6 +1132,36 @@ pub struct ToolboxRun {
     /// Why it failed, in which case nothing was kept.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// The logins linux agents start with, for `toolbox.logins`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolboxLogins {
+    /// The Linux home version new agents boot; absent before the toolbox
+    /// has saved one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home: Option<u32>,
+    /// The gh, gcloud, git and SSH logins that home holds, found as the
+    /// toolbox saved it; absent if it couldn't tell (the look failed, or a
+    /// VibeOS before `toolbox.logins` saved it). Without a home, none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logins: Option<Vec<Login>>,
+    /// Whether linux agents have a Claude login: the token `vibe
+    /// setup-token` keeps, which lives on the Mac, not in the home.
+    pub claude: bool,
+    /// Without one, why, as a sentence: none kept yet, or it can't be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_problem: Option<String>,
+}
+
+/// One login the Linux home holds. Never its secret.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Login {
+    pub tool: LoginTool,
+    /// Whose it is, for people: `octocat on github.com` for `gh`, an
+    /// account for `gcloud`, `Name <email>` for git, the key's file and
+    /// comment for SSH.
+    pub account: String,
 }
 
 #[cfg(test)]

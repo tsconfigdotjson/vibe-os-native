@@ -431,6 +431,7 @@ async fn a_host_without_a_toolbox_says_so() {
         core.open_toolbox(NoParams {}).await.unwrap_err(),
         core.update_toolbox(NoParams {}).await.unwrap_err(),
         core.rebuild_toolbox(NoParams {}).await.unwrap_err(),
+        core.toolbox_logins(NoParams {}).await.unwrap_err(),
     ] {
         assert_eq!(e.code, ErrorCode::Conflict.code());
         assert!(e.message.contains("no Linux toolbox"), "{}", e.message);
@@ -488,4 +489,51 @@ async fn an_open_toolbox_counts_against_admission() {
         .unwrap_err();
     assert_eq!(e.code, ErrorCode::Conflict.code());
     assert!(e.message.contains("can't start an agent"), "{}", e.message);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn see_logins_says_what_the_home_holds_and_whether_claude_is_logged_in() {
+    use vibe_core::model::LoginTool;
+    use vibe_core::rpc::Login;
+    let w = world();
+    let gh = Login {
+        tool: LoginTool::Gh,
+        account: "octocat on github.com".into(),
+    };
+    let core = w.core_with(Some(
+        w.toolbox(&["sh", "-c", "sleep 0.5"])
+            .with_logins(vec![gh.clone()], true),
+    ));
+    // No home yet: nothing to log in with, and the toolbox stays closed.
+    let l = core.toolbox_logins(NoParams {}).await.unwrap();
+    assert_eq!((l.home, l.logins, l.claude), (None, Some(vec![]), true));
+    assert_eq!(
+        core.toolbox_status(NoParams {}).await.unwrap().state,
+        ToolboxState::Closed
+    );
+
+    // A shell's save notes them.
+    core.open_toolbox(NoParams {}).await.unwrap();
+    wait_gone(&w.socket()).await;
+    core.check_toolbox().await;
+    let l = core.toolbox_logins(NoParams {}).await.unwrap();
+    assert_eq!((l.home, l.logins), (Some(1), Some(vec![gh.clone()])));
+
+    // A home saved without a look: unknown, not empty.
+    fs::write(w.layout.linux_dir().join("home-2.img"), "").unwrap();
+    let l = core.toolbox_logins(NoParams {}).await.unwrap();
+    assert_eq!((l.home, l.logins), (Some(2), None));
+    assert_eq!(l.claude_problem, None);
+
+    // No Claude login for linux agents: it says so, and why.
+    let other = world();
+    let core = other.core(&["true"]);
+    let l = core.toolbox_logins(NoParams {}).await.unwrap();
+    assert!(!l.claude);
+    assert!(
+        l.claude_problem
+            .as_deref()
+            .is_some_and(|p| p.contains("vibe setup-token")),
+        "{l:?}"
+    );
 }

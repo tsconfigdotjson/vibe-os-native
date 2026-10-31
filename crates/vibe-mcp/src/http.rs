@@ -228,7 +228,9 @@ pub type Settings = dyn Fn() -> Vec<SocketAddr> + Send + Sync;
 /// loopback always, and on the Tailscale address while that's on and the
 /// machine has one. A listener whose address is no longer wanted stops; one
 /// that can't bind is tried again on the next check. `kick` has it check
-/// at once, as after a change from Settings.
+/// at once, as after a change from Settings. After each check it tells the
+/// daemon whether MCP is served on loopback ([`Daemon::serving`]), and that
+/// it isn't once the supervisor ends.
 pub fn spawn_listeners<D: Daemon>(
     daemon: Arc<D>,
     settings: Arc<Settings>,
@@ -238,7 +240,7 @@ pub fn spawn_listeners<D: Daemon>(
     tokio::spawn(async move {
         let mut running: HashMap<SocketAddr, JoinHandle<()>> = HashMap::new();
         let mut failing: HashMap<SocketAddr, String> = HashMap::new();
-        let stopper = Stopper(&mut running);
+        let stopper = Stopper(&mut running, &*daemon);
         loop {
             let wanted = settings();
             stopper.0.retain(|addr, task| {
@@ -274,6 +276,7 @@ pub fn spawn_listeners<D: Daemon>(
                     }
                 }
             }
+            daemon.serving(stopper.0.keys().any(|a| a.ip().is_loopback()));
             tokio::select! {
                 _ = tokio::time::sleep(every) => {}
                 _ = kick.notified() => {}
@@ -282,13 +285,15 @@ pub fn spawn_listeners<D: Daemon>(
     })
 }
 
-/// Stops every listener when the supervisor ends, aborted or not.
-struct Stopper<'a>(&'a mut HashMap<SocketAddr, JoinHandle<()>>);
+/// Stops every listener when the supervisor ends, aborted or not, and
+/// tells the daemon MCP is no longer served.
+struct Stopper<'a, D: Daemon>(&'a mut HashMap<SocketAddr, JoinHandle<()>>, &'a D);
 
-impl Drop for Stopper<'_> {
+impl<D: Daemon> Drop for Stopper<'_, D> {
     fn drop(&mut self) {
         for task in self.0.values() {
             task.abort();
         }
+        self.1.serving(false);
     }
 }

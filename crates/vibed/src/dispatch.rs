@@ -5,12 +5,13 @@
 use serde_json::Value;
 use tokio::sync::broadcast;
 use vibe_core::rpc::{
-    AgentsDelete, AgentsList, AgentsStart, ErrorCode, ErrorObject, Event, EventsSubscribe,
-    GhStatusGet, Hello, HelloParams, HelloResult, HostsList, Id, KeysCreate, KeysList, KeysRevoke,
-    KeysVerify, LimitsGet, LimitsSet, McpGet, McpSet, Method, PROTOCOL_VERSION, ProfilesCreate,
-    ProfilesDelete, ProfilesList, ProfilesUpdate, ProjectsAdd, ProjectsList, ProjectsRemove,
-    ProtocolMismatchData, Request, Response, SessionsAttach, SessionsList, Subscribed, ToolboxOpen,
-    ToolboxRebuild, ToolboxStatusGet, ToolboxUpdate,
+    AgentsDelete, AgentsInterrupt, AgentsList, AgentsStart, ErrorCode, ErrorObject, Event,
+    EventsSubscribe, GhStatusGet, Hello, HelloParams, HelloResult, HostsList, Id, KeysCreate,
+    KeysList, KeysRevoke, KeysVerify, LimitsGet, LimitsSet, McpGet, McpSet, Method,
+    PROTOCOL_VERSION, ProfilesCreate, ProfilesDelete, ProfilesList, ProfilesUpdate, ProjectsAdd,
+    ProjectsList, ProjectsRemove, ProtocolMismatchData, Request, Response, SessionsAttach,
+    SessionsList, Subscribed, ToolboxLoginsGet, ToolboxOpen, ToolboxRebuild, ToolboxStatusGet,
+    ToolboxUpdate,
 };
 
 use crate::core::Core;
@@ -175,6 +176,10 @@ async fn call(
         AgentsDelete::NAME => {
             encode_result(core.delete_agent(decode::<AgentsDelete>(params)?).await)
         }
+        AgentsInterrupt::NAME => encode_result(
+            core.interrupt_agent(decode::<AgentsInterrupt>(params)?)
+                .await,
+        ),
         ToolboxStatusGet::NAME => encode_result(
             core.toolbox_status(decode::<ToolboxStatusGet>(params)?)
                 .await,
@@ -185,6 +190,10 @@ async fn call(
         }
         ToolboxRebuild::NAME => encode_result(
             core.rebuild_toolbox(decode::<ToolboxRebuild>(params)?)
+                .await,
+        ),
+        ToolboxLoginsGet::NAME => encode_result(
+            core.toolbox_logins(decode::<ToolboxLoginsGet>(params)?)
                 .await,
         ),
         _ => Err(ErrorObject::new(

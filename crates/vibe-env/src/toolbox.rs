@@ -50,7 +50,9 @@ use serde::{Deserialize, Serialize};
 use vibe_core::claude_token::TOKEN_ENV;
 use vibe_core::limits::{self, HostLimits};
 use vibe_core::model::DEFAULT_PROFILE_MEMORY;
+use vibe_core::model::LoginTool;
 use vibe_core::paths::{Layout, private_dir};
+use vibe_core::rpc::{Login, ToolboxLogins};
 use vibe_core::toolbox::Recipe;
 
 use crate::claude::{CONFIG_DIR_ENV, ClaudeHome};
@@ -106,6 +108,105 @@ done
 npm ls -g --depth=0 --parseable 2>/dev/null | sed -n 's|.*/node_modules/||p' | sed 's/^/npm: /'
 exit 0"#;
 
+/// How long the look at the Linux home's logins may take: it reads a few
+/// small files.
+const LOGINS_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Lists the logins in the Linux home `$1`, one `<tool>\t<whose>` per line,
+/// from the files the tools keep, so nothing goes over the network and no
+/// secret is printed: every account `gh` holds on each host (its `user` and
+/// the `users` of gh 2.40 on), `gcloud`'s accounts and application-default
+/// credentials, git's identity (includes followed), and SSH keys (`id_*`,
+/// or any private key with its `.pub` beside it) with their comments. Run
+/// as `vibe` just before the toolbox seals the home it saves (PRD: Core
+/// concepts, Linux home). Other logins (`~/.aws`, `~/.npmrc`, …) aren't
+/// looked for.
+pub const LOGINS: &str = r#"h=$1
+unset GIT_CONFIG_GLOBAL
+if [ -f "$h/.config/gh/hosts.yml" ]; then
+  awk 'function unq(s) { gsub(/^"|"$/, "", s); return s }
+       function ind(s) { match(s, /^[ \t]*/); return RLENGTH }
+       /^[ \t]*(#.*)?$/ { next }
+       { n = ind($0); line = $0; sub(/^[ \t]+/, "", line) }
+       n == 0 { host = ""; users = 0
+                if (line ~ /:[ \t]*$/) { host = line; sub(/:[ \t]*$/, "", host); host = unq(host) }
+                next }
+       host == "" { next }
+       users && n <= uind { users = 0 }
+       users { if (cind == 0) cind = n
+               if (n == cind && line ~ /^[^:]+:[ \t]*({[ \t]*})?[ \t]*$/) {
+                 u = line; sub(/:.*$/, "", u); print "gh\t" unq(u) " on " host }
+               next }
+       line ~ /^users:[ \t]*$/ { users = 1; uind = n; cind = 0; next }
+       line ~ /^user:[ \t]*[^ \t]/ { u = line; sub(/^user:[ \t]*/, "", u); print "gh\t" unq(u) " on " host }' \
+    "$h/.config/gh/hosts.yml"
+fi
+for a in "$h"/.config/gcloud/legacy_credentials/*/; do
+  [ -d "$a" ] && printf 'gcloud\t%s\n' "$(basename "$a")"
+done
+[ -f "$h/.config/gcloud/application_default_credentials.json" ] &&
+  printf 'gcloud\tapplication default credentials\n'
+git() { HOME=$h XDG_CONFIG_HOME= command git config --global --includes --get "$1" 2>/dev/null; }
+n=$(git user.name)
+e=$(git user.email)
+if [ -n "$n" ] && [ -n "$e" ]; then printf 'git\t%s <%s>\n' "$n" "$e"
+elif [ -n "$n$e" ]; then printf 'git\t%s\n' "$n$e"; fi
+for k in "$h"/.ssh/*; do
+  [ -f "$k" ] || continue
+  case $k in *.pub) continue ;; esac
+  case ${k##*/} in id_*) ;; *) [ -f "$k.pub" ] || continue ;; esac
+  c=
+  [ -f "$k.pub" ] && c=$(awk '{ $1 = ""; $2 = ""; sub(/^ +/, ""); print; exit }' "$k.pub")
+  printf 'ssh\t%s%s\n' "${k##*/}" "${c:+ ($c)}"
+done
+exit 0"#;
+
+/// What [`LOGINS`] printed, as logins: known tools only, each once, in
+/// the order found.
+pub fn parse_logins(output: &str) -> Vec<Login> {
+    let mut found: Vec<Login> = Vec::new();
+    for line in output.lines() {
+        let Some((tool, account)) = line.split_once('\t') else {
+            continue;
+        };
+        let tool = match tool.trim() {
+            "gh" => LoginTool::Gh,
+            "gcloud" => LoginTool::Gcloud,
+            "git" => LoginTool::Git,
+            "ssh" => LoginTool::Ssh,
+            _ => continue,
+        };
+        let account: String = account
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(200)
+            .collect::<String>()
+            .trim()
+            .to_owned();
+        let login = Login { tool, account };
+        if !login.account.is_empty() && !found.contains(&login) {
+            found.push(login);
+        }
+    }
+    found
+}
+
+/// What `toolbox.logins` says of the toolbox in `images`: the newest Linux
+/// home, the logins noted for it (none without a home), and whether linux
+/// agents have a Claude login, or why not.
+pub fn home_logins(images: &Images, claude: std::result::Result<(), String>) -> ToolboxLogins {
+    let home = images.newest_of(Kind::Home).map(|(n, _)| n);
+    ToolboxLogins {
+        logins: match home {
+            Some(n) => images.logins_of(n),
+            None => Some(Vec::new()),
+        },
+        home,
+        claude: claude.is_ok(),
+        claude_problem: claude.err(),
+    }
+}
+
 /// What one toolbox run kept: the new versions, and for a rebuild, what
 /// the old template had that the recipe doesn't cover.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -153,6 +254,9 @@ pub trait ToolboxHost: Send + Sync + fmt::Debug {
     /// and lists what the old template has that the recipe doesn't cover.
     /// The Linux home carries over as it is.
     fn rebuild(&self, recipe: &Recipe) -> Result<Saved>;
+    /// The logins the newest Linux home holds, as noted when it was saved,
+    /// and whether linux agents have a Claude login. Boots nothing.
+    fn logins(&self) -> ToolboxLogins;
 }
 
 /// The toolbox in a VM, on `vibe-vm` and `vibe-guest`.
@@ -868,6 +972,27 @@ impl ToolboxHost for Toolbox {
             .opened()
             .ok_or_else(|| err("no toolbox shell is open"))?;
         let mut saved = Saved::default();
+        // What the home holds, while the guest still runs. A look that
+        // fails leaves it unknown, and says why in the log; it never stops
+        // or slows the save.
+        let logins = if self.machine.running(&self.socket()) {
+            self.run(
+                "the look at the Linux home's logins",
+                vec![
+                    "/bin/bash".into(),
+                    "-c".into(),
+                    LOGINS.into(),
+                    "logins".into(),
+                    GUEST_HOME.into(),
+                ],
+                LOGINS_TIMEOUT,
+            )
+            .map(|out| parse_logins(&out))
+            .map_err(|e| eprintln!("vibe-env: the toolbox's logins are unknown: {e}"))
+            .ok()
+        } else {
+            None
+        };
         let kept = (|| -> Result<()> {
             self.seal_and_power_off(&["template", "home"])?;
             // Each as it's kept: one that fails stays unsaved alone.
@@ -879,7 +1004,7 @@ impl ToolboxHost for Toolbox {
             saved.template = Some(template);
             let (home, _) = self
                 .images
-                .keep(Kind::Home, &self.working(Kind::Home), None)?;
+                .keep_home(&self.working(Kind::Home), logins.as_deref())?;
             saved.home = Some(home);
             Ok(())
         })();
@@ -1008,6 +1133,13 @@ impl ToolboxHost for Toolbox {
             home: None,
             uncovered: uncovered(&by_hand, &BTreeSet::new(), &after),
         })
+    }
+
+    fn logins(&self) -> ToolboxLogins {
+        home_logins(
+            &self.images,
+            (self.token)().map(drop).map_err(|e| e.message().to_owned()),
+        )
     }
 }
 

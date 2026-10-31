@@ -92,15 +92,12 @@ pub struct Check {
     pub answered: bool,
 }
 
-/// An agent as `vibe_list_agents` shows it.
+/// An agent as `vibe_list_agents` shows it. Its memory is the agent's
+/// own: `memory` (the profile's limit) and `memory_used` (what it uses now,
+/// while its compartment runs and its backend can say).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentView {
     pub agent: Agent,
-    /// What it uses now, in bytes, while its compartment runs and its
-    /// backend can say.
-    pub memory: Option<u64>,
-    /// The profile's memory: its limit.
-    pub memory_limit: u64,
     /// The line that attaches a terminal from another machine.
     pub attach_remote: String,
 }
@@ -119,6 +116,10 @@ pub trait Daemon: Send + Sync + 'static {
     fn log(&self, line: &str) {
         eprintln!("{}", vibe_core::keys::redact(line));
     }
+
+    /// Whether MCP is served on loopback now, after each check of the
+    /// listeners, so the daemon can say so (`HostInfo.mcp`).
+    fn serving(&self, _on: bool) {}
 
     /// The name of the API key `secret` is, if it's a key; checking it
     /// records that it was used.

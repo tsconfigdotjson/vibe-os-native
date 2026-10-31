@@ -37,7 +37,8 @@
 #     max_processes edited in host.toml pauses it at once, and a delete
 #     leaves nothing of it there or in VibeOS's folders but the branch
 #   - both Swift packages (swift/VibeOS, swift/vibe-vm): build and test,
-#     including the Swift half of the Rust<->Swift contract test
+#     including the Swift half of the Rust<->Swift contract test, and the
+#     menu's model, Terminal attach and notifications against stand-ins
 #   - ad hoc signing, with the virtualization entitlement on vibe-vm
 #   - vibe-vm check, signed and unsigned
 #   - the test guests (scripts/test-guest.sh): Alpine's netboot kernel, and
@@ -63,12 +64,21 @@
 #     (crates/vibed/tests/linux_vm.rs). It needs the Claude token: from
 #     CLAUDE_CODE_OAUTH_TOKEN, or what `vibe setup-token` kept in the
 #     Keychain. Then the toolbox: gcloud and a login made in it reach a new
-#     agent, an agent asleep on the old template restores, and [update] and
+#     agent, See logins names the logins its save found in the real guest
+#     (gh, git, an SSH key), an agent asleep on the old template restores,
+#     and [update] and
 #     Rebuild template make new templates (crates/vibed/tests/toolbox_vm.rs,
 #     which needs the network). N/A on a Mac that is itself a VM, like
 #     vm-cycle.
-#   - the Swift client against a live vibed
+#   - the Swift client against a live vibed, its event stream included
+#   - the menu against a live vibed on the test backend: an agent started
+#     over the socket appears in it and turns `question`, from vibed's events
+#     alone, and Interrupt, attach and Delete reach it
 #   - VibeOS.app launching and saying hello to a live vibed
+#   - Terminal attach with the real Terminal: two clicks on an agent's row,
+#     through `VibeOS --attach`, give one tab attached to it, and a third
+#     from a new process raises that tab. It needs Automation permission to
+#     control Terminal for the app this script runs in; macOS asks once.
 #
 # Made for a Mac on macOS 26 with Xcode 26 (or its command line tools) and
 # rustup. On Linux it runs the Rust steps and the vibed smoke test and skips
@@ -748,6 +758,120 @@ s_live_contract() {
   stop_vibed
 }
 
+s_menu_live() {
+  # Short: an agent's session socket is under its home's Library.
+  local socket="$WORK/ml/run/vibed.sock" repo="$WORK/ml/src/app" marker="$WORK/ml-marker"
+  git init -q "$repo"
+  git -C "$repo" -c user.name=t -c user.email=t@example.com commit -q --allow-empty -m first
+  export VIBE_TEST_BACKEND="$ROOT/crates/vibe-env/src/stand-in.sh"
+  start_vibed "$socket" "$WORK/ml-vibed.log"
+  rm -f "$marker"
+  VIBE_TEST_SOCKET="$VIBED_SOCKET" VIBE_TEST_REPO="$repo" VIBE_TEST_MARKER="$marker" \
+    swift test --package-path swift/VibeOS --filter LiveMenuTests
+  [ -f "$marker" ] || { echo "the live menu test was skipped, not run"; return 1; }
+  stop_vibed
+}
+
+# terminal_tabs: how many tabs Terminal has. Bounded, as a Terminal that
+# isn't answering would otherwise hold osascript for two minutes.
+terminal_tabs() {
+  osascript \
+    -e 'with timeout of 10 seconds' -e 'tell application "Terminal"' -e 'set n to 0' \
+    -e 'repeat with w in windows' -e 'set n to n + (count of tabs of w)' -e 'end repeat' \
+    -e 'return n' -e 'end tell' -e 'end timeout'
+}
+
+# terminal_up: starts Terminal if it isn't running, through Launch Services
+# as Finder would, and waits up to 30 s for it to answer Apple events.
+terminal_up() {
+  local i
+  # Outside the logged-in GUI session (over SSH, say) Terminal can start
+  # without ever answering.
+  if [ "$(launchctl managername 2>/dev/null)" != Aqua ]; then
+    echo "not in the logged-in GUI session (launchctl managername: $(launchctl managername 2>/dev/null)); run this from Terminal on the Mac"
+    return 1
+  fi
+  open -b com.apple.Terminal
+  for i in $(seq 1 60); do
+    osascript -e 'with timeout of 2 seconds' -e 'tell application "Terminal" to count windows' \
+      -e 'end timeout' >/dev/null 2>&1 && return 0
+    sleep 0.5
+  done
+  echo "Terminal is running but doesn't answer Apple events after 30 s"
+  return 1
+}
+
+# attached <home> <ref>: the line `vibe ls` gives <ref> once one client is
+# attached, waiting up to 20 s for it.
+attached() {
+  local i line
+  for i in $(seq 1 200); do
+    line=$(ls_sessions "$1" | grep "^$2 " || true)
+    case $line in *" 1 attached ("*) echo "$line"; return 0 ;; esac
+    sleep 0.1
+  done
+  echo "$2 never had one client attached: $line"
+  return 1
+}
+
+s_terminal_attach() {
+  local socket="$WORK/ta/run/vibed.sock" home="$WORK/ta/home" repo="$WORK/ta/src/app"
+  local app="$ROOT/build/VibeOS.app/Contents/MacOS/VibeOS" ref before after line tty
+  git init -q "$repo"
+  git -C "$repo" -c user.name=t -c user.email=t@example.com commit -q --allow-empty -m first
+  export VIBE_TEST_BACKEND="$ROOT/crates/vibe-env/src/stand-in.sh"
+  start_vibed "$socket" "$WORK/ta-vibed.log"
+  out=$(rpc \
+    "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"projects.add\",\"params\":{\"path\":\"$repo\"}}" \
+    '{"jsonrpc":"2.0","id":2,"method":"profiles.update","params":{"project":"app","profile":"software-eng-mac","memory":1073741824}}' \
+    '{"jsonrpc":"2.0","id":3,"method":"limits.set","params":{"reserve_memory":0}}' \
+    '{"jsonrpc":"2.0","id":4,"method":"agents.start","params":{"project":"app","profile":"software-eng-mac","prompt":"question"}}')
+  echo "start: $out"
+  case $out in *'"error"'*) echo "a call failed"; return 1 ;; esac
+  ref=$(json_field "$out" 4 ref)
+  [ -n "$ref" ] || { echo "no agent"; return 1; }
+  export VIBE_SOCKET="$VIBED_SOCKET" VIBE_CLI="$ROOT/target/debug/vibe"
+  terminal_up
+  before=$(terminal_tabs)
+  # Two clicks in a row, as fast as one process makes them.
+  "$app" --attach "$ref" --attach "$ref"
+  line=$(attached "$home" "$ref")
+  echo "after two clicks: $line"
+  tty=$(printf '%s\n' "$line" | sed -n 's/.*1 attached (\(.*\)).*/\1/p')
+  after=$(terminal_tabs)
+  echo "Terminal tabs: $before before, $after after"
+  [ "$after" -eq $((before + 1)) ] || { echo "two clicks should open exactly one tab"; return 1; }
+  # A third, from a process that didn't open the tab, raises it by its tty.
+  out=$("$app" --attach "$ref")
+  echo "$out"
+  expect "raised its tab" "the raise"
+  line=$(attached "$home" "$ref")
+  [ "$(terminal_tabs)" -eq "$after" ] || { echo "the third click opened another tab"; return 1; }
+  # Detach by ending the attach, then close its window, which then asks
+  # nothing.
+  pkill -f "$VIBE_CLI --socket $VIBED_SOCKET attach $ref" || true
+  sleep 1
+  osascript - "$tty" <<'EOF' || true
+on run argv
+  with timeout of 10 seconds
+  tell application "Terminal"
+    repeat with w in (every window)
+      repeat with t in tabs of w
+        if tty of t is item 1 of argv then
+          close w
+          exit repeat
+        end if
+      end repeat
+    end repeat
+  end tell
+  end timeout
+end run
+EOF
+  out=$(rpc "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"agents.delete\",\"params\":{\"ref\":\"$ref\",\"force\":true}}")
+  case $out in *'"error"'*) echo "the delete failed: $out"; return 1 ;; esac
+  stop_vibed
+}
+
 s_app_launch() {
   local log="$WORK/app-vibed.log" app
   start_vibed "$WORK/app/run/vibed.sock" "$log"
@@ -789,7 +913,9 @@ mac_step vm-cycle "VMs boot, save and restore; vibe-guest's question survives" s
 mac_step base-image "the Linux base image: kernel, initrd, Debian image" s_base_image
 mac_step linux-vm "linux agents in VMs: conformance, Claude on Opus across a sleep, the toolbox" s_linux_vm build sign base-image
 mac_step live-contract "Swift client against a live vibed" s_live_contract build swift-app-test
+mac_step menu-live "the menu follows a live agent through vibed's events" s_menu_live build swift-app-test
 mac_step app-launch "VibeOS.app launches and says hello to vibed" s_app_launch build sign
+mac_step terminal-attach "two clicks give one Terminal tab attached to the agent" s_terminal_attach build sign
 
 echo
 echo "================================ summary ================================"
