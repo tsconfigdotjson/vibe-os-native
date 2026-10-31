@@ -74,7 +74,9 @@ pub fn listen_addresses(port: u16, tailscale: bool) -> Vec<SocketAddr> {
     )
 }
 
-fn listen_on(port: u16, tailscale: Vec<IpAddr>) -> Vec<SocketAddr> {
+/// Loopback on `port`, and each of the `tailscale` addresses that is one,
+/// on the same port.
+pub fn listen_on(port: u16, tailscale: Vec<IpAddr>) -> Vec<SocketAddr> {
     let mut out = vec![SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port)];
     out.extend(
         tailscale

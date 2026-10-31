@@ -53,7 +53,8 @@ pub struct HostLimits {
     #[serde(skip, default = "mcp_port")]
     pub mcp_port: u16,
     /// Whether MCP is also served on this host's Tailscale address, on the
-    /// same port. Set in `host.toml` only, not over the socket.
+    /// same port. In `host.toml`, and set over the socket with `mcp.set`
+    /// (Settings), not with `limits.set`.
     #[serde(skip)]
     pub mcp_tailscale: bool,
 }
@@ -76,7 +77,7 @@ pub const PACKAGE_CACHES: &str = "package_caches";
 pub const MCP_PORT_KEY: &str = "mcp_port";
 pub const MCP_TAILSCALE: &str = "mcp_tailscale";
 
-/// The settings that are in `host.toml` only.
+/// The settings that aren't host limits on the socket.
 const FILE_ONLY: [&str; 3] = [PACKAGE_CACHES, MCP_PORT_KEY, MCP_TAILSCALE];
 
 impl Default for HostLimits {
@@ -255,28 +256,60 @@ pub fn load(path: &Path) -> Result<HostLimits, LimitsError> {
     Ok(limits)
 }
 
+/// Sets the numeric setting `key` in `doc`.
+fn set_number(doc: &mut DocumentMut, key: &str, value: u64) -> Result<(), LimitsError> {
+    let kind = SETTINGS
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, kind)| *kind)
+        .ok_or_else(|| LimitsError::Rejected(format!("unknown setting `{key}`")))?;
+    set_value(doc, key, encode(kind, value));
+    Ok(())
+}
+
 /// Writes `changes` (setting, value) into `path`, keeping everything else in
 /// the file, comments included, and returns the limits that result. Nothing
 /// is written if they'd be invalid.
 pub fn update(path: &Path, changes: &[(&str, u64)]) -> Result<HostLimits, LimitsError> {
+    edit(path, |doc| {
+        for &(key, value) in changes {
+            set_number(doc, key, value)?;
+        }
+        Ok(())
+    })
+}
+
+/// Turns MCP on this host's Tailscale address on or off in `path`
+/// (PRD: MCP interface, Transport), keeping everything else in the file, and
+/// returns the settings that result.
+pub fn set_mcp_tailscale(path: &Path, on: bool) -> Result<HostLimits, LimitsError> {
+    edit(path, |doc| {
+        set_value(doc, MCP_TAILSCALE, Value::from(on));
+        Ok(())
+    })
+}
+
+/// Sets `key` to `new` in `doc`, keeping the comment after the old value,
+/// e.g. `# per agent`.
+fn set_value(doc: &mut DocumentMut, key: &str, mut new: Value) {
+    match doc.get_mut(key).and_then(Item::as_value_mut) {
+        Some(old) => {
+            *new.decor_mut() = old.decor().clone();
+            *old = new;
+        }
+        None => doc[key] = Item::Value(new),
+    }
+}
+
+/// Reads `path`, changes it with `change`, and writes it back if what
+/// results is valid; nothing is written if it isn't.
+fn edit(
+    path: &Path,
+    change: impl FnOnce(&mut DocumentMut) -> Result<(), LimitsError>,
+) -> Result<HostLimits, LimitsError> {
     let existed = path.exists();
     let mut doc = read(path)?;
-    for &(key, value) in changes {
-        let kind = SETTINGS
-            .iter()
-            .find(|(k, _)| *k == key)
-            .map(|(_, kind)| *kind)
-            .ok_or_else(|| LimitsError::Rejected(format!("unknown setting `{key}`")))?;
-        let mut new = encode(kind, value);
-        match doc.get_mut(key).and_then(Item::as_value_mut) {
-            Some(old) => {
-                // Keep the comment after the value, e.g. `# per agent`.
-                *new.decor_mut() = old.decor().clone();
-                *old = new;
-            }
-            None => doc[key] = Item::Value(new),
-        }
-    }
+    change(&mut doc)?;
     let limits = interpret(&doc).map_err(|message| invalid(path, message))?;
     limits.validate().map_err(LimitsError::Rejected)?;
     let mut text = doc.to_string();
@@ -516,7 +549,7 @@ package_caches   = true    # linux agents share npm, pnpm, cargo and pip caches
         let (_d, path) = file("mcp_port = 9000\nmcp_tailscale = true\ncpu_cores = 2\n");
         let l = load(&path).unwrap();
         assert_eq!((l.mcp_port, l.mcp_tailscale), (9000, true));
-        // An edit over the socket keeps them, and they aren't on the socket.
+        // A limits edit keeps them, and they aren't among the limits.
         let l = update(&path, &[("cpu_cores", 3)]).unwrap();
         assert_eq!((l.mcp_port, l.mcp_tailscale), (9000, true));
         let json = serde_json::to_value(l).unwrap();
@@ -536,6 +569,33 @@ package_caches   = true    # linux agents share npm, pnpm, cargo and pip caches
         let (_d, path) = file("mcp_ports = 1");
         let e = load(&path).unwrap_err().to_string();
         assert!(e.contains("mcp_port, mcp_tailscale"), "{e}");
+    }
+
+    #[test]
+    fn tailscale_is_set_in_the_file_keeping_the_rest() {
+        let (_d, path) = file("cpu_cores = 2   # per agent\nmcp_tailscale = false # Settings\n");
+        let l = set_mcp_tailscale(&path, true).unwrap();
+        assert!(l.mcp_tailscale);
+        assert_eq!(l.cpu_cores, 2);
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("cpu_cores = 2   # per agent"), "{text}");
+        assert!(text.contains("mcp_tailscale = true # Settings"), "{text}");
+        assert!(load(&path).unwrap().mcp_tailscale);
+        assert!(!set_mcp_tailscale(&path, false).unwrap().mcp_tailscale);
+        // A new file gets the header, and only what was set.
+        let dir = tempfile::tempdir().unwrap();
+        let new = dir.path().join("host.toml");
+        set_mcp_tailscale(&new, true).unwrap();
+        let text = fs::read_to_string(&new).unwrap();
+        assert!(text.starts_with("# VibeOS host limits."), "{text}");
+        assert!(text.ends_with("mcp_tailscale = true\n"), "{text}");
+        // A file that's broken already is left alone.
+        let (_d, bad) = file("cpu_core = 4\n");
+        assert!(matches!(
+            set_mcp_tailscale(&bad, true),
+            Err(LimitsError::Invalid { .. })
+        ));
+        assert_eq!(fs::read_to_string(&bad).unwrap(), "cpu_core = 4\n");
     }
 
     #[test]

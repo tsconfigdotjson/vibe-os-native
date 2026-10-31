@@ -455,3 +455,134 @@ async fn a_name_used_again_is_waited_on_afresh() {
     )
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn settings_turn_tailscale_on_and_off_and_it_applies_at_once() {
+    use vibe_core::model::EventKind;
+    use vibe_core::rpc::{HostParams, McpSetParams};
+    let golden = Golden::new();
+    let core = Arc::new(Core::open(golden.config()).unwrap());
+    let host_toml = golden.home.join(".config/vibeos/host.toml");
+    let s = core.mcp(HostParams::default()).unwrap();
+    assert_eq!(
+        (s.port, s.tailscale, s.url.as_str()),
+        (7878, false, "http://127.0.0.1:7878/mcp")
+    );
+    assert!(s.tailscale_urls.is_empty());
+
+    // A port of its own, and the listeners on it, checked only hourly.
+    let free = || {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    };
+    let first = free();
+    std::fs::create_dir_all(host_toml.parent().unwrap()).unwrap();
+    std::fs::write(
+        &host_toml,
+        format!("# mine\nmcp_port = {first}  # the port\n"),
+    )
+    .unwrap();
+    let task = core.spawn_mcp(Duration::from_secs(3600));
+    let serves = |port: u16| async move {
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_ok()
+            {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    };
+    assert!(serves(first).await);
+
+    // On: written into host.toml, keeping the rest; announced; and the
+    // Tailscale URL is there for the setup command.
+    let (_, mut events) = core.subscribe();
+    let s = core
+        .set_mcp(McpSetParams {
+            host: None,
+            tailscale: Some(true),
+        })
+        .unwrap();
+    assert!(s.tailscale);
+    assert_eq!(s.url, format!("http://127.0.0.1:{first}/mcp"));
+    assert_eq!(
+        s.tailscale_urls,
+        [format!("http://{}:{first}/mcp", common::GOLDEN_TAILSCALE)]
+    );
+    assert_eq!(events.try_recv().unwrap().kind, EventKind::McpChanged);
+    let text = std::fs::read_to_string(&host_toml).unwrap();
+    assert!(text.starts_with("# mine\n"), "{text}");
+    assert!(
+        text.contains(&format!("mcp_port = {first}  # the port")),
+        "{text}"
+    );
+    assert!(text.contains("mcp_tailscale = true"), "{text}");
+    assert_eq!(core.mcp(HostParams::default()).unwrap(), s);
+
+    // A set applies at once, not at the next hourly check: with the port
+    // edited by hand meanwhile, a set moves the listener there now.
+    let second = free();
+    let edited = text.replace(
+        &format!("mcp_port = {first}"),
+        &format!("mcp_port = {second}"),
+    );
+    std::fs::write(&host_toml, edited).unwrap();
+    let s = core
+        .set_mcp(McpSetParams {
+            host: Some("local".into()),
+            tailscale: Some(false),
+        })
+        .unwrap();
+    assert!(!s.tailscale && s.tailscale_urls.is_empty());
+    assert!(serves(second).await, "the set was applied at once");
+    let mut gone = false;
+    for _ in 0..200 {
+        if tokio::net::TcpStream::connect(("127.0.0.1", first))
+            .await
+            .is_err()
+        {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(gone, "the old port stopped");
+
+    // Nothing to change, another host, or a broken host.toml: refused, and
+    // the file is left alone.
+    let e = core.set_mcp(McpSetParams::default()).unwrap_err();
+    assert_eq!(
+        e.message,
+        "Invalid params: give at least one setting to change"
+    );
+    let e = core
+        .set_mcp(McpSetParams {
+            host: Some("vps".into()),
+            tailscale: Some(true),
+        })
+        .unwrap_err();
+    assert_eq!(e.message, "no host named vps");
+    std::fs::write(&host_toml, "cpu_core = 4\n").unwrap();
+    let e = core.mcp(HostParams::default()).unwrap_err();
+    assert_eq!(e.code, vibe_core::rpc::ErrorCode::HostConfigInvalid.code());
+    assert!(
+        core.set_mcp(McpSetParams {
+            host: None,
+            tailscale: Some(true),
+        })
+        .is_err()
+    );
+    assert_eq!(
+        std::fs::read_to_string(&host_toml).unwrap(),
+        "cpu_core = 4\n"
+    );
+    // While it's broken, MCP stays where it was.
+    assert!(serves(second).await);
+    task.abort();
+}

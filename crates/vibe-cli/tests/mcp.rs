@@ -378,5 +378,23 @@ fn keys_from_the_command_line() {
     )
     .unwrap();
     let out = vibe(&["key", "create", "other"]);
-    assert!(String::from_utf8_lossy(&out.stderr).contains("http://127.0.0.1:9123/mcp"));
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(stderr.contains("http://127.0.0.1:9123/mcp"), "{stderr}");
+    assert!(!stderr.contains("tailnet"), "{stderr}");
+    // With Tailscale on, the line for another machine on the tailnet too.
+    w.core
+        .set_mcp(vibe_core::rpc::McpSetParams {
+            host: None,
+            tailscale: Some(true),
+        })
+        .unwrap();
+    let out = vibe(&["key", "create", "third"]);
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        stderr.contains(&format!(
+            "from another machine on your tailnet:\n\n  claude mcp add --transport http vibeos http://{}:9123/mcp",
+            common::GOLDEN_TAILSCALE
+        )),
+        "{stderr}"
+    );
 }

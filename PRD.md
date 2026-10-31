@@ -254,7 +254,7 @@ mcp_port         = 7878    # MCP on http://127.0.0.1:<port>/mcp
 mcp_tailscale    = false   # MCP on this host's Tailscale address too
 ```
 
-`package_caches` is the opt-out from the shared caches (Mounts, below). It, `mcp_port` and `mcp_tailscale` are set in this file only, not over the socket.
+`package_caches` is the opt-out from the shared caches (Mounts, below). It and `mcp_port` are set in this file only, not over the socket. `mcp_tailscale` is also set over the socket, by Settings.
 
 Admission reserves the profile's memory for each awake agent. If host headroom minus the reserve can't cover a new agent, agents still inside their idle debounce go to sleep early, oldest first. If there's still no room, the start is refused with a clear reason. Starts never queue.
 

@@ -42,7 +42,7 @@
       "jsonrpc": "2.0",
       "method": "events.event",
       "params": {
-        "seq": 12,
+        "seq": 13,
         "at": "2026-10-30T12:00:00Z",
         "host": "local",
         "kind": "project.added",

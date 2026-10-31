@@ -20,7 +20,8 @@
 #     delete is refused while a commit is unpushed, and once it's pushed,
 #     leaves nothing behind but the branch
 #   - MCP, as a client drives it, on the test backend: vibed serves it on
-#     the port host.toml names and refuses a call without an API key; then,
+#     the port host.toml names and refuses a call without an API key;
+#     mcp.get gives its URL and mcp.set turns Tailscale on and off; then,
 #     with a key from `vibe key create`, `vibe mcp` carries VibeOS's round
 #     over stdio: start an agent on a question, wait for it, read it, answer
 #     it with keys, wait for that answer, read it, and delete the agent
@@ -494,6 +495,16 @@ s_mcp() {
     -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' "http://127.0.0.1:$port/mcp")
   echo "without a key: HTTP $code"
   [ "$code" = 401 ] || { echo "a call without a key wasn't refused"; return 1; }
+  # Where it's served, as Settings asks; and the Tailscale switch, written
+  # to host.toml.
+  out=$(rpc '{"jsonrpc":"2.0","id":3,"method":"mcp.get","params":{}}' \
+    '{"jsonrpc":"2.0","id":4,"method":"mcp.set","params":{"tailscale":true}}')
+  echo "mcp: $out"
+  expect "\"url\":\"http://127.0.0.1:$port/mcp\"" "the loopback URL"
+  expect '"tailscale":true' "Tailscale turned on"
+  grep -q '^mcp_tailscale = true' "$home/.config/vibeos/host.toml" || { echo "not in host.toml"; return 1; }
+  out=$(rpc '{"jsonrpc":"2.0","id":5,"method":"mcp.set","params":{"tailscale":false}}')
+  expect '"tailscale_urls":[]' "Tailscale turned off"
   key=$(HOME="$home" target/debug/vibe --socket "$socket" key create check)
   case $key in vk_*) ;; *) echo "no key made: $key"; return 1 ;; esac
 

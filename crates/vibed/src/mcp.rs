@@ -5,21 +5,23 @@
 //! Only this host's agents are reachable until Linux hosts (#16) connect
 //! others: a call for another host gets the core's "no host named …".
 
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::task::JoinHandle;
 use vibe_core::limits::{self, HostLimits};
-use vibe_core::model::AgentState;
+use vibe_core::model::{AgentState, EventKind};
 use vibe_core::rpc::{
-    Agent, AgentDeleteParams, AgentStartParams, ErrorObject, HostParams, Project,
+    Agent, AgentDeleteParams, AgentStartParams, ErrorObject, HostParams, McpSetParams, McpSettings,
+    Project,
 };
 use vibe_mcp::http::Settings;
 use vibe_mcp::{AgentView, Check, Daemon, Input, Message, Screen, Sent, Target};
 
 use crate::agents::blocking;
-use crate::core::Core;
+use crate::core::{Core, invalid, limits_error, lock};
 
 /// How often the MCP listeners are checked against `host.toml`.
 pub const LISTEN_CHECK_EVERY: Duration = Duration::from_secs(5);
@@ -60,21 +62,80 @@ impl Core {
             .map(|l| (l.mcp_port, l.mcp_tailscale))
     }
 
-    /// Serves MCP where `host.toml` says, until the task is aborted. While
-    /// the file can't be read, such as halfway through an edit, MCP stays
-    /// where it was; before it ever could, it's on the default port.
+    /// The addresses MCP is served on with these settings: loopback, and
+    /// with `tailscale` this machine's Tailscale addresses as they are now.
+    fn mcp_addresses(&self, port: u16, tailscale: bool) -> Vec<SocketAddr> {
+        let ts = if tailscale {
+            (self.tailscale)()
+        } else {
+            Vec::new()
+        };
+        vibe_mcp::net::listen_on(port, ts)
+    }
+
+    fn mcp_info(&self, port: u16, tailscale: bool) -> McpSettings {
+        let urls: Vec<String> = self
+            .mcp_addresses(port, tailscale)
+            .iter()
+            .map(|a| format!("http://{a}{}", vibe_mcp::PATH))
+            .collect();
+        McpSettings {
+            port,
+            tailscale,
+            url: urls[0].clone(),
+            tailscale_urls: urls[1..].to_vec(),
+        }
+    }
+
+    /// `mcp.get`: where MCP is served, as `host.toml` says now.
+    pub fn mcp(&self, p: HostParams) -> Result<McpSettings, ErrorObject> {
+        self.host(p.host.as_deref())?;
+        let l = limits::load(&self.layout.host_config()).map_err(limits_error)?;
+        Ok(self.mcp_info(l.mcp_port, l.mcp_tailscale))
+    }
+
+    /// `mcp.set`: writes the change into `host.toml`, keeping the rest of
+    /// the file, and has the listeners follow it at once.
+    pub fn set_mcp(&self, p: McpSetParams) -> Result<McpSettings, ErrorObject> {
+        self.host(p.host.as_deref())?;
+        let Some(on) = p.tailscale else {
+            return Err(invalid("give at least one setting to change"));
+        };
+        let l = {
+            let _one_at_a_time = lock(&self.limits_lock);
+            limits::set_mcp_tailscale(&self.layout.host_config(), on).map_err(limits_error)?
+        };
+        crate::log!(
+            "vibed: MCP on the Tailscale address turned {}",
+            if on { "on" } else { "off" }
+        );
+        self.publish(self.event(EventKind::McpChanged));
+        self.mcp_kick.notify_one();
+        Ok(self.mcp_info(l.mcp_port, l.mcp_tailscale))
+    }
+
+    /// Serves MCP where `host.toml` says, until the task is aborted, and
+    /// follows each change: at once after `mcp.set`, and within `every` of
+    /// a hand edit. While the file can't be read, such as halfway through
+    /// an edit, MCP stays where it was; before it ever could, it's on the
+    /// default port.
     pub fn spawn_mcp(self: &Arc<Self>, every: Duration) -> JoinHandle<()> {
         let core = Arc::clone(self);
         let defaults = HostLimits::default();
         let last = Mutex::new((defaults.mcp_port, defaults.mcp_tailscale));
         let settings: Arc<Settings> = Arc::new(move || {
-            let mut last = crate::core::lock(&last);
+            let mut last = lock(&last);
             if let Some(now) = core.mcp_settings() {
                 *last = now;
             }
-            *last
+            core.mcp_addresses(last.0, last.1)
         });
-        vibe_mcp::http::spawn_listeners(Arc::clone(self), settings, every)
+        vibe_mcp::http::spawn_listeners(
+            Arc::clone(self),
+            settings,
+            every,
+            Arc::clone(&self.mcp_kick),
+        )
     }
 
     /// What `vibe_list_agents` shows of a host's agents: what `agents.list`

@@ -21,7 +21,7 @@
       "jsonrpc": "2.0",
       "method": "events.event",
       "params": {
-        "seq": 17,
+        "seq": 18,
         "at": "2026-10-30T12:00:00Z",
         "host": "local",
         "kind": "toolbox.changed",

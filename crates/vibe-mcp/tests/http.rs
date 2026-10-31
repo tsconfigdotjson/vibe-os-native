@@ -916,9 +916,15 @@ async fn listeners_follow_the_settings() {
     };
     let port = Arc::new(Mutex::new(free()));
     let p = Arc::clone(&port);
-    let settings: Arc<vibe_mcp::http::Settings> = Arc::new(move || (*p.lock().unwrap(), false));
-    let task =
-        vibe_mcp::http::spawn_listeners(Arc::clone(&fake), settings, Duration::from_millis(50));
+    let settings: Arc<vibe_mcp::http::Settings> =
+        Arc::new(move || vibe_mcp::net::listen_on(*p.lock().unwrap(), vec![]));
+    let kick = Arc::new(tokio::sync::Notify::new());
+    let task = vibe_mcp::http::spawn_listeners(
+        Arc::clone(&fake),
+        settings,
+        Duration::from_secs(3600),
+        Arc::clone(&kick),
+    );
     let reach = |port: u16| async move {
         let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
         for _ in 0..100 {
@@ -939,9 +945,12 @@ async fn listeners_follow_the_settings() {
     )
     .await;
     assert_eq!(r.status, 200);
-    // A new port in host.toml: served there, and no longer on the old one.
+    // New settings, and a kick: served there at once, and no longer on the
+    // old port.
     let second = free();
     *port.lock().unwrap() = second;
+    // Checked hourly, so only the kick makes it look again now.
+    kick.notify_one();
     assert!(reach(second).await);
     let gone = async {
         for _ in 0..100 {

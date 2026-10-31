@@ -40,7 +40,7 @@
       "jsonrpc": "2.0",
       "method": "events.event",
       "params": {
-        "seq": 14,
+        "seq": 15,
         "at": "2026-10-30T12:00:00Z",
         "host": "local",
         "kind": "agent.added",

@@ -8,7 +8,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use vibe_core::rpc::{
-    ApiKey, KeyCreateParams, KeyParams, KeysCreate, KeysList, KeysRevoke, NoParams,
+    ApiKey, HostParams, KeyCreateParams, KeyParams, KeysCreate, KeysList, KeysRevoke, McpGet,
+    NoParams,
 };
 
 use crate::client;
@@ -73,10 +74,20 @@ pub(crate) fn run(socket: &Path, command: Command, url: &str) -> Result<(), Stri
             let made = client::call::<KeysCreate>(socket, &KeyCreateParams { name }, TIMEOUT)
                 .map_err(|e| e.to_string())?;
             println!("{}", made.secret);
+            // Where vibed serves MCP, as Settings asks; host.toml's port
+            // if this vibed can't say.
+            let served = client::call::<McpGet>(socket, &HostParams::default(), TIMEOUT).ok();
+            let local = served.as_ref().map_or(url, |m| m.url.as_str());
+            let mut how = format!("  {}", setup_line(local, &made.secret));
+            for ts in served.iter().flat_map(|m| &m.tailscale_urls) {
+                how.push_str(&format!(
+                    "\n\nfrom another machine on your tailnet:\n\n  {}",
+                    setup_line(ts, &made.secret)
+                ));
+            }
             eprintln!(
-                "\nThat's API key {:?}. It's shown only now, and it's equivalent to a shell on this host: keep it like a password. To use it from Claude Code:\n\n  {}\n\nor over stdio: VIBE_API_KEY=… vibe mcp",
+                "\nThat's API key {:?}. It's shown only now, and it's equivalent to a shell on this host: keep it like a password. To use it from Claude Code:\n\n{how}\n\nor over stdio: VIBE_API_KEY=… vibe mcp",
                 made.key.name,
-                setup_line(url, &made.secret)
             );
         }
         Command::Revoke(name) => {

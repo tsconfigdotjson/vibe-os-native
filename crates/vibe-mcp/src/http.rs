@@ -30,7 +30,7 @@ use tokio::task::JoinHandle;
 use tower_service::Service as _;
 
 use crate::tools::Caller;
-use crate::{Daemon, PATH, Server, net};
+use crate::{Daemon, PATH, Server};
 
 type Body = BoxBody<Bytes, Infallible>;
 
@@ -166,26 +166,27 @@ pub async fn serve<D: Daemon>(listener: TcpListener, daemon: Arc<D>, check_host:
     }
 }
 
-/// What to listen on: the port, and whether the Tailscale address too.
-/// Asked again on every check, as `host.toml` can change at any time.
-pub type Settings = dyn Fn() -> (u16, bool) + Send + Sync;
+/// The addresses to listen on, such as [`crate::net::listen_on`] gives. Asked
+/// again on every check, as `host.toml` can change at any time.
+pub type Settings = dyn Fn() -> Vec<SocketAddr> + Send + Sync;
 
 /// Keeps MCP served where the settings say, checking every `every`: on
 /// loopback always, and on the Tailscale address while that's on and the
 /// machine has one. A listener whose address is no longer wanted stops; one
-/// that can't bind is tried again on the next check.
+/// that can't bind is tried again on the next check. `kick` has it check
+/// at once, as after a change from Settings.
 pub fn spawn_listeners<D: Daemon>(
     daemon: Arc<D>,
     settings: Arc<Settings>,
     every: Duration,
+    kick: Arc<tokio::sync::Notify>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut running: HashMap<SocketAddr, JoinHandle<()>> = HashMap::new();
         let mut failing: HashMap<SocketAddr, String> = HashMap::new();
         let stopper = Stopper(&mut running);
         loop {
-            let (port, tailscale) = settings();
-            let wanted = net::listen_addresses(port, tailscale);
+            let wanted = settings();
             stopper.0.retain(|addr, task| {
                 let keep = wanted.contains(addr) && !task.is_finished();
                 if !keep {
@@ -219,7 +220,10 @@ pub fn spawn_listeners<D: Daemon>(
                     }
                 }
             }
-            tokio::time::sleep(every).await;
+            tokio::select! {
+                _ = tokio::time::sleep(every) => {}
+                _ = kick.notified() => {}
+            }
         }
     })
 }

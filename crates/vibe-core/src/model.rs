@@ -126,6 +126,9 @@ names! {
         /// The toolbox opened, or saved, updated or rebuilt the template,
         /// or failed to; `message` says which.
         ToolboxChanged = "toolbox.changed",
+        /// Where MCP is served changed: `mcp.set` turned the Tailscale
+        /// address on or off.
+        McpChanged = "mcp.changed",
     }
 }
 

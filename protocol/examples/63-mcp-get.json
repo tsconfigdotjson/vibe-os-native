@@ -1,0 +1,9 @@
+{
+  "description": "Where MCP is served: loopback on mcp_port (host.toml, 7878 by default), and with tailscale on, each Tailscale address too. Settings builds its Copy setup command from these URLs.",
+  "request": {"jsonrpc": "2.0", "id": 63, "method": "mcp.get", "params": {"host": "local"}},
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 63,
+    "result": {"port": 7878, "tailscale": false, "url": "http://127.0.0.1:7878/mcp", "tailscale_urls": []}
+  }
+}
