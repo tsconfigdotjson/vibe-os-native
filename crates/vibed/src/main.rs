@@ -27,7 +27,9 @@ usage: vibed [--socket PATH]
 
 Serves the VibeOS JSON-RPC API on a Unix socket, and MCP on
 http://127.0.0.1:7878/mcp (mcp_port and mcp_tailscale in host.toml), until
-SIGTERM or SIGINT.
+SIGTERM or SIGINT. A Linux host that's the external address also serves MCP
+publicly on https://<its name>/mcp, port 443, with a certificate from Let's
+Encrypt; a Mac keeps an SSH tunnel to it, reaching run/tunnel.sock here.
 State lives under $HOME: on macOS in ~/Library/Application Support/VibeOS
 (logs in ~/Library/Logs/VibeOS), elsewhere in ~/.local/share/vibeos. Host
 limits are in ~/.config/vibeos/host.toml.
@@ -57,6 +59,14 @@ environment:
                   the Linux builds of vibed, vibe and vibe-shim that Add Linux
                   host installs, as <dir>/<x86_64|aarch64>/<binary> (default:
                   linux/ beside vibed, or in the app's Resources)
+  VIBE_EXTERNAL_PORT, VIBE_EXTERNAL_LISTEN, VIBE_ACME_DIRECTORY
+                  for tests only: the port the external address is served
+                  on (default 443), the one address it listens on (default
+                  all), and the ACME server its certificate comes from
+                  (default Let's Encrypt's)
+  VIBE_EXTERNAL_CERT, VIBE_EXTERNAL_KEY
+                  for tests only: a PEM certificate chain and key the
+                  external address serves, instead of one from ACME
   VIBE_TEST_BACKEND
                   for tests only: run every environment's agents natively,
                   unlimited but for a supervisor, with this program as
@@ -202,6 +212,27 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
             bundle: vibed::remote::default_bundle(),
         });
     }
+    if let Some(port) = env_text("VIBE_EXTERNAL_PORT") {
+        match port.parse() {
+            Ok(port) => config.external.port = port,
+            Err(_) => vibed::log!("vibed: VIBE_EXTERNAL_PORT isn't a port: {port}"),
+        }
+    }
+    if let Some(ip) = env_text("VIBE_EXTERNAL_LISTEN") {
+        match ip.parse() {
+            Ok(ip) => config.external.listen = Some(ip),
+            Err(_) => vibed::log!("vibed: VIBE_EXTERNAL_LISTEN isn't an IP address: {ip}"),
+        }
+    }
+    if let Some(directory) = env_text("VIBE_ACME_DIRECTORY") {
+        config.external.acme_directory = directory;
+    }
+    if let (Some(cert), Some(key)) = (
+        std::env::var_os("VIBE_EXTERNAL_CERT").filter(|v| !v.is_empty()),
+        std::env::var_os("VIBE_EXTERNAL_KEY").filter(|v| !v.is_empty()),
+    ) {
+        config.external.fixed_cert = Some((PathBuf::from(cert), PathBuf::from(key)));
+    }
     if let Some(claude) = std::env::var_os("VIBE_TEST_BACKEND").filter(|v| !v.is_empty()) {
         vibed::log!(
             "vibed: VIBE_TEST_BACKEND is set: agents run under the test backend, with {} as \
@@ -321,6 +352,21 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
     let sleep = core.spawn_sleep_watch();
     // The links to Linux hosts, each kept up on its own.
     core.spawn_links();
+    // On a Mac, the socket the external address's tunnel reaches, which
+    // checks every call's API key itself.
+    let tunnel_socket = if cfg!(target_os = "macos") {
+        match core.spawn_tunnel_socket() {
+            Ok(served) => Some(served),
+            Err(e) => {
+                vibed::log!("vibed: the external address can't reach this Mac: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    // External access: a Linux host's public endpoint, a Mac's tunnel.
+    core.spawn_external();
     vibed::log!(
         "vibed {} listening on {}",
         env!("CARGO_PKG_VERSION"),
@@ -334,6 +380,11 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
     };
     server::serve(listener, Arc::clone(&core), MAX_MESSAGE_BYTES, shutdown).await;
     core.stop_links();
+    core.stop_external();
+    if let Some((task, guard)) = tunnel_socket {
+        task.abort();
+        drop(guard);
+    }
     mcp.abort();
     gh_checks.abort();
     status.abort();
@@ -360,6 +411,11 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
     drop(guard);
     vibed::log!("vibed: stopped");
     Ok(())
+}
+
+/// An environment variable's value, if it's set to text.
+fn env_text(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.is_empty())
 }
 
 /// The `vibe-vm` to run VMs with: `VIBE_VM`, or the one beside `vibed`.

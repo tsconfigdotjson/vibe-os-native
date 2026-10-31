@@ -19,7 +19,7 @@ pub use crate::limits::HostLimits;
 pub use crate::model::{
     Activity, AgentState, Certainty, Environment, EventKind, GhState, HostLink, LoginTool,
     MessageRole, Mode, Model, Profile, ProjectSource, Reasoning, SessionState, StopReason,
-    ToolboxAction, ToolboxState, WakeupKind,
+    ToolboxAction, ToolboxState, TunnelState, WakeupKind,
 };
 
 /// Bumped on any incompatible change to the contract. Clients send theirs in
@@ -214,10 +214,14 @@ pub enum ErrorCode {
     /// The call is for a Linux host whose link is down: its agents are
     /// unavailable until the link is back.
     HostUnavailable,
+    /// A call that came through the external address's tunnel carried no
+    /// API key this Mac knows: unknown, revoked, or a host's own. Only the
+    /// tunnel's socket answers with it.
+    Unauthorized,
 }
 
 impl ErrorCode {
-    pub const ALL: [ErrorCode; 11] = [
+    pub const ALL: [ErrorCode; 12] = [
         ErrorCode::ParseError,
         ErrorCode::InvalidRequest,
         ErrorCode::MethodNotFound,
@@ -229,6 +233,7 @@ impl ErrorCode {
         ErrorCode::HostConfigInvalid,
         ErrorCode::CommandFailed,
         ErrorCode::HostUnavailable,
+        ErrorCode::Unauthorized,
     ];
 
     pub fn code(self) -> i64 {
@@ -244,6 +249,7 @@ impl ErrorCode {
             ErrorCode::HostConfigInvalid => -32003,
             ErrorCode::CommandFailed => -32004,
             ErrorCode::HostUnavailable => -32005,
+            ErrorCode::Unauthorized => -32006,
         }
     }
 
@@ -261,6 +267,7 @@ impl ErrorCode {
             ErrorCode::HostConfigInvalid => "host_config_invalid",
             ErrorCode::CommandFailed => "command_failed",
             ErrorCode::HostUnavailable => "host_unavailable",
+            ErrorCode::Unauthorized => "unauthorized",
         }
     }
 
@@ -335,6 +342,8 @@ pub const METHODS: &[&str] = &[
     HostsAdd::NAME,
     HostsUpgrade::NAME,
     HostsRemove::NAME,
+    HostsExternal::NAME,
+    TunnelPrepare::NAME,
     ProjectsList::NAME,
     ProjectsAdd::NAME,
     ProjectsRemove::NAME,
@@ -448,6 +457,24 @@ method! {
     /// `hosts.remove`: forgets a Linux host and ends its link. Nothing on
     /// the server changes: its `vibed` and agents run on, on their own.
     HostsRemove = "hosts.remove", HostNameParams => HostInfo
+}
+
+method! {
+    /// `hosts.external`: Settings → Hosts → *Use as external address*. On
+    /// the Mac, for a Linux host added to it: records the choice, tells the
+    /// host (now, or once its link is back), and keeps an SSH tunnel to it
+    /// while it's on. On a Linux host, for `local`: serves MCP publicly at
+    /// `https://<domain>/mcp`, with a certificate from Let's Encrypt. A Mac
+    /// never serves it itself.
+    HostsExternal = "hosts.external", HostExternalParams => HostInfo
+}
+
+method! {
+    /// `tunnel.prepare`: on a Linux host, where the Mac's reverse tunnel
+    /// is to end, a Unix socket in its private `run/`, with any left by an
+    /// earlier tunnel cleared. The Mac calls it over the link before each
+    /// `ssh -R`.
+    TunnelPrepare = "tunnel.prepare", NoParams => TunnelPrepared
 }
 
 method! {
@@ -706,6 +733,83 @@ pub struct HostInfo {
     /// For a host whose link is down, why.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// While it's the external address, where outside MCP callers reach
+    /// it: `https://<domain>/mcp`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// While it's the external address, the Mac's tunnel to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tunnel: Option<TunnelState>,
+    /// While it's the external address and something keeps it from
+    /// working, or holds it up, what and how to fix it: such as port 443,
+    /// or Let's Encrypt not reaching the domain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostExternalParams {
+    /// A Linux host this Mac added; or, absent or `local`, the Linux host
+    /// this is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    pub on: bool,
+    /// The public DNS name it's reached at, such as `vps.example.com`,
+    /// pointing at the host. Needed to turn it on; ignored to turn it off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TunnelPrepared {
+    /// The absolute path, on the host, of the socket the tunnel ends at.
+    pub socket: String,
+}
+
+/// `tunnel.call`, which only the Mac's tunnel socket takes (PRD: External
+/// access, keys are checked where the agent lives): one of the agent calls
+/// MCP makes, on this Mac, with the API key the outside caller sent, which
+/// the Mac checks itself. Its result is the call's.
+#[derive(Debug)]
+pub enum TunnelCall {}
+
+impl Method for TunnelCall {
+    const NAME: &'static str = "tunnel.call";
+    type Params = TunnelCallParams;
+    type Result = Value;
+}
+
+/// The calls the tunnel takes, each for this Mac's own agents only.
+pub const TUNNEL_METHODS: &[&str] = &[
+    "projects.list",
+    "agents.list",
+    "agents.start",
+    "agents.delete",
+    "agents.send",
+    "agents.check",
+    "agents.output",
+    "agents.messages",
+];
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TunnelCallParams {
+    /// The outside caller's API key, as it sent it.
+    pub key: String,
+    /// One of [`TUNNEL_METHODS`].
+    pub method: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<Value>,
+}
+
+impl fmt::Debug for TunnelCallParams {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TunnelCallParams")
+            .field("key", &crate::keys::shown_prefix(&self.key))
+            .field("method", &self.method)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

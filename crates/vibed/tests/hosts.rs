@@ -152,6 +152,12 @@ impl Remote for Wires {
     }
 }
 
+/// An outside caller, as MCP passes one: these calls never reach a tunnel,
+/// so its key isn't checked again.
+fn caller() -> vibe_mcp::Caller {
+    vibe_mcp::Caller::new("laptop", "vk_test")
+}
+
 fn quick() -> Timing {
     Timing {
         ping_every: Duration::from_millis(200),
@@ -324,6 +330,7 @@ async fn a_linux_hosts_agents_join_the_macs_view_over_the_link() {
     // An agent started through the Mac's MCP lives on the host.
     let agent = Daemon::start_agent(
         &*w.mac,
+        &caller(),
         AgentStartParams {
             host: Some("vps".into()),
             project: "app".into(),
@@ -365,7 +372,7 @@ async fn a_linux_hosts_agents_join_the_macs_view_over_the_link() {
         listed["attach"],
         "ssh -t me@vps.example.com .local/lib/vibeos/vibe attach remote-one"
     );
-    let views = Daemon::agents(&*w.mac, "vps").await.unwrap();
+    let views = Daemon::agents(&*w.mac, &caller(), "vps").await.unwrap();
     assert!(views[0].available);
     assert_eq!(views[0].attach_remote, views[0].agent.attach);
     assert_eq!(Daemon::hosts(&*w.mac).await.unwrap(), ["local", "vps"]);
@@ -383,7 +390,9 @@ async fn a_linux_hosts_agents_join_the_macs_view_over_the_link() {
         agent: "remote-one".into(),
     };
     for _ in 0..200 {
-        let screen = Daemon::read_output(&*w.mac, &t, None).await.unwrap();
+        let screen = Daemon::read_output(&*w.mac, &caller(), &t, None)
+            .await
+            .unwrap();
         if screen.screen.contains("Ready.") {
             break;
         }
@@ -391,6 +400,7 @@ async fn a_linux_hosts_agents_join_the_macs_view_over_the_link() {
     }
     let sent = Daemon::send(
         &*w.mac,
+        &caller(),
         &t,
         Input::Text {
             text: "ping".into(),
@@ -403,7 +413,9 @@ async fn a_linux_hosts_agents_join_the_macs_view_over_the_link() {
     assert!(!sent.woke);
     let mut echoed = false;
     for _ in 0..200 {
-        let screen = Daemon::read_output(&*w.mac, &t, None).await.unwrap();
+        let screen = Daemon::read_output(&*w.mac, &caller(), &t, None)
+            .await
+            .unwrap();
         if screen.screen.contains("> ping") {
             echoed = true;
             break;
@@ -411,13 +423,18 @@ async fn a_linux_hosts_agents_join_the_macs_view_over_the_link() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     assert!(echoed, "the send reached the agent on the host");
-    Daemon::send(&*w.mac, &t, Input::Keys(vec!["y".into(), "Enter".into()]))
-        .await
-        .unwrap();
-    let check = Daemon::check(&*w.mac, &t, false).await.unwrap();
+    Daemon::send(
+        &*w.mac,
+        &caller(),
+        &t,
+        Input::Keys(vec!["y".into(), "Enter".into()]),
+    )
+    .await
+    .unwrap();
+    let check = Daemon::check(&*w.mac, &caller(), &t, false).await.unwrap();
     assert_ne!(check.state, AgentState::Exited);
     assert!(
-        Daemon::read_messages(&*w.mac, &t, 5)
+        Daemon::read_messages(&*w.mac, &caller(), &t, 5)
             .await
             .unwrap()
             .is_empty(),
@@ -511,7 +528,7 @@ async fn a_pulled_network_shows_the_host_down_and_it_reconnects() {
     // Its agents show as they were last seen, unavailable; calls fail.
     let list = w.rpc("agents.list", json!({"host": "vps"})).await;
     assert_eq!(list["result"]["agents"][0]["ref"], "keeps-going");
-    let views = Daemon::agents(&*w.mac, "vps").await.unwrap();
+    let views = Daemon::agents(&*w.mac, &caller(), "vps").await.unwrap();
     assert!(!views[0].available);
     let refused = w.rpc("projects.list", json!({"host": "vps"})).await;
     assert_eq!(refused["error"]["code"], ErrorCode::HostUnavailable.code());
@@ -690,7 +707,7 @@ async fn a_mac_restarted_keeps_its_hosts_and_links_again() {
     wires.pull();
     let mac = open().await;
     // While the host is out of reach, its agents are as last listed.
-    let kept = Daemon::agents(&*mac, "vps").await.unwrap();
+    let kept = Daemon::agents(&*mac, &caller(), "vps").await.unwrap();
     assert_eq!(kept.len(), 1, "{kept:?}");
     assert!(!kept[0].available);
     wires.plug_in();

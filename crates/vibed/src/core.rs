@@ -108,6 +108,8 @@ pub struct Config {
     pub free_disk: FreeDisk,
     /// How the sleep watch is timed.
     pub sleep_timing: crate::sleep::Timing,
+    /// How a Linux host serves the external address.
+    pub external: crate::external::ExternalConfig,
 }
 
 impl std::fmt::Debug for Config {
@@ -154,6 +156,7 @@ impl Config {
             power: Arc::new(crate::power::HostPower::default()),
             free_disk: Arc::new(crate::sleep::free_space),
             sleep_timing: crate::sleep::Timing::default(),
+            external: crate::external::ExternalConfig::default(),
         }
     }
 }
@@ -324,6 +327,16 @@ pub struct Core {
     /// The runtime those tasks run on, as a call may come from a thread
     /// outside it.
     pub(crate) runtime: OnceLock<tokio::runtime::Handle>,
+    /// How a Linux host serves the external address.
+    pub(crate) external: crate::external::ExternalConfig,
+    /// On a Linux host, its public endpoint while it's the external address.
+    pub(crate) public: Mutex<Option<crate::external::Public>>,
+    /// On a Linux host, the Mac behind it, at the tunnel's end.
+    pub(crate) peer: crate::external::MacPeer,
+    /// On a Mac, the tunnel to the Linux host that's its external address.
+    pub(crate) tunnel: Mutex<Option<crate::tunnel::Tunnel>>,
+    /// On a Mac, when a host last came through the tunnel.
+    pub(crate) tunnel_seen: Mutex<Option<std::time::Instant>>,
     _state_lock: File,
 }
 
@@ -423,6 +436,7 @@ impl Core {
             .ensure_host(LOCAL_HOST, &config.info.os, &config.label, (config.clock)())
             .map_err(OpenError::Store)?;
         let (tx, _) = broadcast::channel(EVENT_BACKLOG);
+        let tunnel_end = config.layout.run_dir().join(crate::external::TUNNEL_END);
         let core = Core {
             info: config.info,
             label: config.label,
@@ -474,6 +488,11 @@ impl Core {
             adding_hosts: Mutex::new(HashSet::new()),
             me: OnceLock::new(),
             runtime: OnceLock::new(),
+            peer: crate::external::MacPeer::new(tunnel_end),
+            external: config.external,
+            public: Mutex::new(None),
+            tunnel: Mutex::new(None),
+            tunnel_seen: Mutex::new(None),
             _state_lock: state_lock,
         };
         core.load_pressure_pauses();

@@ -21,6 +21,8 @@ public enum VibeRPC {
         HostsAdd.name,
         HostsUpgrade.name,
         HostsRemove.name,
+        HostsExternal.name,
+        TunnelPrepare.name,
         ProjectsList.name,
         ProjectsAdd.name,
         ProjectsRemove.name,
@@ -262,6 +264,9 @@ public enum RPCErrorCode: Int, CaseIterable, Sendable {
     /// The call is for a Linux host whose link is down: its agents are
     /// unavailable until it's back.
     case hostUnavailable = -32005
+    /// A call that came through the external address's tunnel carried no
+    /// API key this Mac knows. Only the tunnel's socket says it.
+    case unauthorized = -32006
 
     /// The name protocol/vibed-rpc.json uses.
     public var name: String {
@@ -277,6 +282,7 @@ public enum RPCErrorCode: Int, CaseIterable, Sendable {
         case .hostConfigInvalid: "host_config_invalid"
         case .commandFailed: "command_failed"
         case .hostUnavailable: "host_unavailable"
+        case .unauthorized: "unauthorized"
         }
     }
 }
@@ -419,6 +425,18 @@ public enum HostLink: String, Codable, CaseIterable, Hashable, Sendable {
     case local, connected, down
 }
 
+/// The Mac's tunnel to the Linux host that's its external address: on the
+/// Mac, the tunnel it keeps; in that host's own row, whether a Mac answers
+/// through it.
+public enum TunnelState: String, Codable, CaseIterable, Hashable, Sendable {
+    /// ssh is starting, or the host hasn't come through it yet.
+    case connecting
+    /// The host reaches the Mac through it.
+    case up
+    /// It isn't up; `externalDetail` says why. It's tried again.
+    case down
+}
+
 /// Whether a session's shim still holds its terminal.
 public enum SessionState: String, Codable, CaseIterable, Hashable, Sendable {
     case running, exited
@@ -512,6 +530,23 @@ public enum HostsRemove: RPCMethod {
     public typealias Params = HostNameParams
     public typealias Result = HostInfo
     public static let name = "hosts.remove"
+}
+
+/// `hosts.external`: Settings → Hosts → Use as External Address. The Linux
+/// host serves `https://<domain>/mcp` with a certificate from Let's
+/// Encrypt, and this Mac keeps an SSH tunnel to it. One host at most.
+public enum HostsExternal: RPCMethod {
+    public typealias Params = HostExternalParams
+    public typealias Result = HostInfo
+    public static let name = "hosts.external"
+}
+
+/// `tunnel.prepare`: on a Linux host, where the Mac's tunnel ends. Only
+/// vibed calls it, over the link.
+public enum TunnelPrepare: RPCMethod {
+    public typealias Params = NoParams
+    public typealias Result = TunnelPrepared
+    public static let name = "tunnel.prepare"
 }
 
 /// `projects.list`: a host's projects, with their profiles.
@@ -815,9 +850,47 @@ public struct HostInfo: Codable, Hashable, Sendable {
     public var missing: [String]
     /// For a host whose link is down, why.
     public var detail: String?
+    /// While it's the external address, where outside MCP callers reach it.
+    public var url: String?
+    /// While it's the external address, the Mac's tunnel to it.
+    public var tunnel: TunnelState?
+    /// While it's the external address and something keeps it from
+    /// working, or holds it up, what, and how to fix it.
+    public var externalDetail: String?
 
     public enum CodingKeys: String, CodingKey, CaseIterable {
-        case name, os, label, link, external, mcp, address, version, missing, detail
+        case name, os, label, link, external, mcp, address, version, missing, detail, url, tunnel
+        case externalDetail = "external_detail"
+    }
+}
+
+/// What Use as External Address takes.
+public struct HostExternalParams: Codable, Hashable, Sendable {
+    /// A Linux host this Mac added.
+    public var host: String?
+    public var on: Bool
+    /// The public DNS name it's reached at, pointing at the host. Needed to
+    /// turn it on.
+    public var domain: String?
+
+    public init(host: String?, on: Bool, domain: String? = nil) {
+        self.host = host
+        self.on = on
+        self.domain = domain
+    }
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case host, on, domain
+    }
+}
+
+/// Where the Mac's tunnel ends on a Linux host.
+public struct TunnelPrepared: Codable, Hashable, Sendable {
+    /// The socket's absolute path on the host.
+    public var socket: String
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case socket
     }
 }
 

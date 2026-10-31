@@ -17,6 +17,7 @@ libc.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+rcgen.workspace = true
 vibe-env.workspace = true
 vibe-mcp.workspace = true
 vibed.workspace = true

@@ -29,29 +29,28 @@ use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tower_service::Service as _;
 
-use crate::tools::Caller;
-use crate::{Daemon, PATH, Server};
+use crate::{Caller, Daemon, PATH, Server};
 
-type Body = BoxBody<Bytes, Infallible>;
+pub(crate) type Body = BoxBody<Bytes, Infallible>;
 
 /// How long an idle event stream goes between keep-alives.
 const KEEP_ALIVE: Duration = Duration::from_secs(15);
 
 /// How long a request's body may take to arrive, once its headers have.
-const READ_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The most connections open at once on one listener.
-const MAX_CONNECTIONS: usize = 256;
+pub(crate) const MAX_CONNECTIONS: usize = 256;
 
 /// How long a client has to send a request's headers.
-const HEADER_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const HEADER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The largest request body: a prompt can be long, but not this long.
-const MAX_BODY: usize = 4 << 20;
+pub(crate) const MAX_BODY: usize = 4 << 20;
 
 /// The `rmcp` service behind the gate. `check_host` holds the `Host`
 /// header to loopback names.
-fn service<D: Daemon>(
+pub(crate) fn service<D: Daemon>(
     daemon: Arc<D>,
     check_host: bool,
 ) -> StreamableHttpService<Server<D>, NeverSessionManager> {
@@ -71,7 +70,7 @@ fn service<D: Daemon>(
     )
 }
 
-fn plain(status: StatusCode, text: &str) -> Response<Body> {
+pub(crate) fn plain(status: StatusCode, text: &str) -> Response<Body> {
     let mut r = Response::new(Full::new(Bytes::from(format!("{text}\n"))).boxed());
     *r.status_mut() = status;
     r.headers_mut().insert(
@@ -82,14 +81,14 @@ fn plain(status: StatusCode, text: &str) -> Response<Body> {
 }
 
 /// The key a request carries, as `Authorization: Bearer <key>`.
-fn bearer<B>(req: &Request<B>) -> Option<&str> {
+pub(crate) fn bearer<B>(req: &Request<B>) -> Option<&str> {
     let value = req.headers().get(header::AUTHORIZATION)?.to_str().ok()?;
     let (scheme, key) = value.trim().split_once(' ')?;
     scheme.eq_ignore_ascii_case("bearer").then(|| key.trim())
 }
 
 /// A request as `rmcp` gets it: read whole first.
-type FullRequest = Request<Full<Bytes>>;
+pub(crate) type FullRequest = Request<Full<Bytes>>;
 
 /// Reads a request's body whole, up to [`MAX_BODY`] and within
 /// [`READ_TIMEOUT`], before anything answers it. A socket closed with a
@@ -97,7 +96,7 @@ type FullRequest = Request<Full<Bytes>>;
 /// the answer before the client reads it; macOS does so even for a small
 /// body that came in a write of its own. Every refusal, the key gate's
 /// and `rmcp`'s own Host and Origin checks, comes after this.
-async fn read_whole(req: Request<Incoming>) -> Result<FullRequest, Box<Response<Body>>> {
+pub(crate) async fn read_whole(req: Request<Incoming>) -> Result<FullRequest, Box<Response<Body>>> {
     let (parts, mut body) = req.into_parts();
     let read = async {
         let mut kept = bytes::BytesMut::new();
@@ -135,6 +134,31 @@ async fn read_whole(req: Request<Incoming>) -> Result<FullRequest, Box<Response<
         })
 }
 
+/// The caller a request's key says it is, if the key is one.
+pub(crate) async fn verify<D: Daemon, B>(req: &Request<B>, daemon: &Arc<D>) -> Option<Caller> {
+    let key = bearer(req)?.to_owned();
+    let d = Arc::clone(daemon);
+    let checked = key.clone();
+    let name = tokio::task::spawn_blocking(move || d.verify_key(&checked))
+        .await
+        .ok()
+        .flatten()?;
+    Some(Caller::new(name, key))
+}
+
+/// What a request without a key it may use gets.
+pub(crate) fn unauthorized() -> Response<Body> {
+    let mut r = plain(
+        StatusCode::UNAUTHORIZED,
+        "an API key is needed: send it as Authorization: Bearer vk_… (Settings → API keys, or vibe key create)",
+    );
+    r.headers_mut().insert(
+        header::WWW_AUTHENTICATE,
+        header::HeaderValue::from_static("Bearer realm=\"vibeos\""),
+    );
+    r
+}
+
 async fn handle<D: Daemon>(
     req: Request<Incoming>,
     svc: StreamableHttpService<Server<D>, NeverSessionManager>,
@@ -147,29 +171,10 @@ async fn handle<D: Daemon>(
     if req.uri().path() != PATH {
         return plain(StatusCode::NOT_FOUND, "VibeOS serves MCP at /mcp");
     }
-    let caller = match bearer(&req) {
-        Some(key) => {
-            let key = key.to_owned();
-            let d = Arc::clone(&daemon);
-            tokio::task::spawn_blocking(move || d.verify_key(&key))
-                .await
-                .ok()
-                .flatten()
-        }
-        None => None,
+    let Some(caller) = verify(&req, &daemon).await else {
+        return unauthorized();
     };
-    let Some(caller) = caller else {
-        let mut r = plain(
-            StatusCode::UNAUTHORIZED,
-            "an API key is needed: send it as Authorization: Bearer vk_… (Settings → API keys, or vibe key create)",
-        );
-        r.headers_mut().insert(
-            header::WWW_AUTHENTICATE,
-            header::HeaderValue::from_static("Bearer realm=\"vibeos\""),
-        );
-        return r;
-    };
-    req.extensions_mut().insert(Caller(caller));
+    req.extensions_mut().insert(caller);
     let mut svc = svc;
     match svc.call(req).await {
         Ok(r) => r,

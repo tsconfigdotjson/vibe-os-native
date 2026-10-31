@@ -1,0 +1,48 @@
+{
+  "description": "Settings → Hosts → *Use as external address*: the Linux host serves `https://<domain>/mcp` with a certificate from Let's Encrypt, and this Mac keeps an SSH tunnel to it, so nothing opens on the Mac. One host at most is the external address. The name is taken in lowercase. While the host's link is down it's recorded here and the host is told once the link is back; `external_detail` says what's holding it up, and `tunnel` how the Mac's tunnel is.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 9973,
+    "method": "hosts.external",
+    "params": {
+      "host": "vps",
+      "on": true,
+      "domain": "VPS.example.com"
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 9973,
+    "result": {
+      "address": "me@vps.example.com",
+      "detail": "not connected yet",
+      "external": true,
+      "external_detail": "vps's link is down: it serves it once it's back",
+      "label": "vps-1",
+      "link": "down",
+      "mcp": false,
+      "missing": [
+        "claude"
+      ],
+      "name": "vps",
+      "os": "linux",
+      "tunnel": "down",
+      "url": "https://vps.example.com/mcp",
+      "version": "0.1.0"
+    }
+  },
+  "events": [
+    {
+      "jsonrpc": "2.0",
+      "method": "events.event",
+      "params": {
+        "at": "2026-10-30T12:00:00Z",
+        "host": "vps",
+        "kind": "host.link",
+        "message": "not connected yet",
+        "seq": 25,
+        "state": "down"
+      }
+    }
+  ]
+}

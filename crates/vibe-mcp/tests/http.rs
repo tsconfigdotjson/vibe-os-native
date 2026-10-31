@@ -16,7 +16,7 @@ use vibe_core::rpc::{
     Agent, AgentDeleteParams, AgentStartParams, AgentStatus, ErrorCode, ErrorObject, Project,
 };
 use vibe_mcp::{
-    AgentView, Check, Daemon, Input, MAX_RESULT_CHARS, Message, Role, Screen, Sent, Target,
+    AgentView, Caller, Check, Daemon, Input, MAX_RESULT_CHARS, Message, Role, Screen, Sent, Target,
 };
 
 const KEY: &str = "vk_aaaqeayeaudaocajbifqydiob4ibceqtcqkrmfyydenbwha5dypq";
@@ -127,7 +127,7 @@ impl Daemon for Fake {
         Ok(vec!["local".into(), "vps".into(), "down".into()])
     }
 
-    async fn projects(&self, host: &str) -> Result<Vec<Project>, ErrorObject> {
+    async fn projects(&self, _c: &Caller, host: &str) -> Result<Vec<Project>, ErrorObject> {
         match host {
             "local" => Ok(vec![project("local", "app"), project("local", "web")]),
             "vps" => Ok(vec![project("vps", "web")]),
@@ -139,7 +139,7 @@ impl Daemon for Fake {
         }
     }
 
-    async fn agents(&self, host: &str) -> Result<Vec<AgentView>, ErrorObject> {
+    async fn agents(&self, _c: &Caller, host: &str) -> Result<Vec<AgentView>, ErrorObject> {
         if host == "down" {
             return Err(ErrorObject::new(
                 ErrorCode::InternalError,
@@ -157,14 +157,14 @@ impl Daemon for Fake {
             .collect())
     }
 
-    async fn start_agent(&self, p: AgentStartParams) -> Result<Agent, ErrorObject> {
+    async fn start_agent(&self, _c: &Caller, p: AgentStartParams) -> Result<Agent, ErrorObject> {
         self.starts.lock().unwrap().push(p.clone());
         let host = p.host.clone().unwrap();
         let name = p.name.clone().unwrap_or("brave-copper-lynx".into());
         Ok(agent(&host, &name, &p.project, AgentState::Busy))
     }
 
-    async fn delete_agent(&self, p: AgentDeleteParams) -> Result<Agent, ErrorObject> {
+    async fn delete_agent(&self, _c: &Caller, p: AgentDeleteParams) -> Result<Agent, ErrorObject> {
         self.deletes.lock().unwrap().push(p.clone());
         let t = Target {
             host: p.host.clone().unwrap(),
@@ -180,7 +180,7 @@ impl Daemon for Fake {
         Ok(a)
     }
 
-    async fn send(&self, t: &Target, input: Input) -> Result<Sent, ErrorObject> {
+    async fn send(&self, _c: &Caller, t: &Target, input: Input) -> Result<Sent, ErrorObject> {
         let a = self.find(t)?;
         self.sends.lock().unwrap().push((t.clone(), input));
         Ok(Sent {
@@ -189,7 +189,7 @@ impl Daemon for Fake {
         })
     }
 
-    async fn check(&self, t: &Target, background: bool) -> Result<Check, ErrorObject> {
+    async fn check(&self, _c: &Caller, t: &Target, background: bool) -> Result<Check, ErrorObject> {
         self.backgrounds.lock().unwrap().push(background);
         let a = self.find(t)?;
         let n = {
@@ -238,7 +238,12 @@ impl Daemon for Fake {
         })
     }
 
-    async fn read_output(&self, t: &Target, after: Option<u64>) -> Result<Screen, ErrorObject> {
+    async fn read_output(
+        &self,
+        _c: &Caller,
+        t: &Target,
+        after: Option<u64>,
+    ) -> Result<Screen, ErrorObject> {
         self.find(t)?;
         self.reads.lock().unwrap().push((t.clone(), after));
         let history = match (after, self.history.lock().unwrap().clone()) {
@@ -261,7 +266,12 @@ impl Daemon for Fake {
         })
     }
 
-    async fn read_messages(&self, t: &Target, last: usize) -> Result<Vec<Message>, ErrorObject> {
+    async fn read_messages(
+        &self,
+        _c: &Caller,
+        t: &Target,
+        last: usize,
+    ) -> Result<Vec<Message>, ErrorObject> {
         self.find(t)?;
         self.message_reads.lock().unwrap().push(last);
         Ok(vec![

@@ -23,6 +23,27 @@ pub fn rfc3339(secs: i64) -> String {
     )
 }
 
+/// Seconds since the epoch of a UTC time, by its parts (month and day from
+/// 1); `None` if a part is out of range.
+pub fn unix_seconds(y: i64, m: u32, d: u32, h: u32, min: u32, s: u32) -> Option<i64> {
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || h > 23 || min > 59 || s > 60 {
+        return None;
+    }
+    Some(days_from_civil(y, m, d) * 86_400 + i64::from(h * 3600 + min * 60 + s))
+}
+
+/// The day count from 1970-01-01 of a proleptic Gregorian date (Howard
+/// Hinnant's `days_from_civil`).
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let m = i64::from(m);
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + i64::from(d) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
 /// The proleptic Gregorian date of a day count from 1970-01-01 (Howard
 /// Hinnant's `civil_from_days`).
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
@@ -49,6 +70,27 @@ mod tests {
         assert_eq!(rfc3339(951_782_400), "2000-02-29T00:00:00Z");
         assert_eq!(rfc3339(4_107_542_399), "2100-02-28T23:59:59Z");
         assert_eq!(rfc3339(-1), "1969-12-31T23:59:59Z");
+    }
+
+    #[test]
+    fn parts_to_seconds_and_back() {
+        assert_eq!(unix_seconds(1970, 1, 1, 0, 0, 0), Some(0));
+        assert_eq!(unix_seconds(2026, 10, 30, 12, 0, 0), Some(1_793_361_600));
+        assert_eq!(unix_seconds(2000, 2, 29, 0, 0, 0), Some(951_782_400));
+        assert_eq!(unix_seconds(2100, 2, 28, 23, 59, 59), Some(4_107_542_399));
+        assert_eq!(unix_seconds(1969, 12, 31, 23, 59, 59), Some(-1));
+        assert_eq!(unix_seconds(2026, 13, 1, 0, 0, 0), None);
+        assert_eq!(unix_seconds(2026, 1, 1, 24, 0, 0), None);
+        for t in [0, 86_399, 1_793_361_600, 4_107_542_399, -86_401] {
+            let s = rfc3339(t);
+            let p = |a: usize, b: usize| s[a..b].parse::<u32>().unwrap();
+            let y = s[0..4].parse::<i64>().unwrap();
+            assert_eq!(
+                unix_seconds(y, p(5, 7), p(8, 10), p(11, 13), p(14, 16), p(17, 19)),
+                Some(t),
+                "{s}"
+            );
+        }
     }
 
     #[test]
