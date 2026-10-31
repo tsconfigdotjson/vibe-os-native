@@ -475,7 +475,7 @@ fn updates_run_as_root_and_keep_only_a_template() {
         .unwrap()
         .runs
         .iter()
-        .filter(|r| r.command.last().map(String::as_str) != Some(LOGINS))
+        .filter(|r| !r.command.iter().any(|a| a == LOGINS))
         .cloned()
         .collect();
     assert_eq!(
@@ -588,7 +588,9 @@ run = "curl -sSL https://sdk.cloud.google.com | bash -s -- --disable-prompts --i
         .runs
         .iter()
         .map(|r| r.command.clone())
-        .filter(|c| !matches!(c.last().map(String::as_str), Some(INVENTORY | LOGINS)))
+        .filter(|c| {
+            c.last().map(String::as_str) != Some(INVENTORY) && !c.iter().any(|a| a == LOGINS)
+        })
         .collect();
     assert_eq!(
         runs,
@@ -785,13 +787,14 @@ fn saving_the_home_notes_its_logins() {
             home: None,
             logins: Some(vec![]),
             claude: true,
+            claude_problem: None,
         }
     );
     s.fake.state.lock().unwrap().run_handler = Some(Arc::new(|run, _| proto::Ran {
         code: Some(0),
         signal: None,
         timed_out: false,
-        output: if run.command.last().map(String::as_str) == Some(LOGINS) {
+        output: if run.command.iter().any(|a| a == LOGINS) {
             "gh\toctocat on github.com\ngit\tOcto Cat <octo@example.com>\n".into()
         } else {
             String::new()
@@ -807,75 +810,145 @@ fn saving_the_home_notes_its_logins() {
                 login(LoginTool::Git, "Octo Cat <octo@example.com>"),
             ]),
             claude: true,
+            claude_problem: None,
         }
     );
-    // It looked while the guest ran, before the seal.
+    // It looked in vibe's home while the guest ran, before the seal.
+    let runs = s.fake.state.lock().unwrap().runs.clone();
+    let look = runs
+        .iter()
+        .find(|r| r.command.iter().any(|a| a == LOGINS))
+        .unwrap();
+    assert_eq!(look.command.last().map(String::as_str), Some(GUEST_HOME));
     let calls = s.calls();
-    let look = calls.iter().rposition(|c| c == "run").unwrap();
+    let looked = calls.iter().rposition(|c| c == "run").unwrap();
     let seal = calls.iter().rposition(|c| c == "seal").unwrap();
-    assert!(look < seal, "{calls:?}");
+    assert!(looked < seal, "{calls:?}");
 
-    // A look that fails still saves; that home's logins are unknown.
+    // A look that fails still saves; that home's logins are unknown, even
+    // if a note was left under its name (a home deleted by hand).
+    s.images_note(2, &[login(LoginTool::Gh, "someone else")]);
     s.fake.state.lock().unwrap().run_handler = None;
     assert_eq!(s.session(|| {}).home, Some(2));
     let l = s.toolbox.logins();
     assert_eq!((l.home, l.logins), (Some(2), None));
 
-    // Without the Claude token, linux agents have no Claude login.
+    // Without the Claude token, linux agents have no Claude login, and why.
     let none: TokenSource = Arc::new(|| Err(EnvError::new("no Claude login yet")));
     let t = Toolbox::new(s.layout.clone(), s.fake.clone(), none);
-    assert!(!t.logins().claude);
+    let l = t.logins();
+    assert!(!l.claude);
+    assert_eq!(l.claude_problem.as_deref(), Some("no Claude login yet"));
+}
+
+impl Setup {
+    fn images_note(&self, home: u32, logins: &[Login]) {
+        Images::new(self.layout.linux_dir())
+            .note_logins(home, logins)
+            .unwrap();
+    }
+}
+
+/// The awks on this machine, as `awk` in a directory of its own each: the
+/// guest's Debian has mawk, a Mac its BSD awk.
+fn awks(tmp: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    for (i, awk) in ["mawk", "gawk", "awk", "original-awk"].iter().enumerate() {
+        let Some(found) = ["/usr/bin", "/bin", "/usr/local/bin", "/opt/homebrew/bin"]
+            .iter()
+            .map(|d| Path::new(d).join(awk))
+            .find(|p| p.exists())
+        else {
+            continue;
+        };
+        let dir = tmp.join(format!("awk-{i}"));
+        fs::create_dir_all(&dir).unwrap();
+        std::os::unix::fs::symlink(found, dir.join("awk")).unwrap();
+        dirs.push(dir);
+    }
+    assert!(!dirs.is_empty(), "no awk");
+    dirs
 }
 
 #[test]
 fn the_look_at_the_logins_reads_what_the_tools_keep() {
     let tmp = tempfile::tempdir().unwrap();
-    let h = tmp.path();
+    let h = tmp.path().join("home");
+    fs::create_dir_all(&h).unwrap();
     let write = |path: &str, text: &str| {
         let p = h.join(path);
         fs::create_dir_all(p.parent().unwrap()).unwrap();
         fs::write(p, text).unwrap();
     };
+    let awks = awks(tmp.path());
+    // The same with every awk there is.
     let look = || {
-        let out = std::process::Command::new("/bin/bash")
-            .args(["-c", LOGINS, "logins"])
-            .arg(h)
-            .env_remove("GIT_CONFIG_GLOBAL")
-            .output()
-            .unwrap();
-        assert!(out.status.success(), "{out:?}");
-        String::from_utf8(out.stdout).unwrap()
+        let mut outs = Vec::new();
+        for dir in &awks {
+            let path = format!(
+                "{}:{}",
+                dir.display(),
+                std::env::var("PATH").unwrap_or_default()
+            );
+            let out = std::process::Command::new("/bin/bash")
+                .args(["-c", LOGINS, "logins"])
+                .arg(&h)
+                .env("PATH", path)
+                .env_remove("GIT_CONFIG_GLOBAL")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{dir:?}: {out:?}");
+            outs.push(String::from_utf8(out.stdout).unwrap());
+        }
+        assert!(
+            outs.windows(2).all(|w| w[0] == w[1]),
+            "awks differ: {outs:#?}"
+        );
+        outs.remove(0)
     };
     // An empty home holds nothing.
     assert_eq!(parse_logins(&look()), vec![]);
 
+    // gh 2.40 on, with two accounts on github.com, one kept in a keyring
+    // (`{}`); an older host entry; a GitHub Enterprise host with a port;
+    // and a quoted name.
     write(
         ".config/gh/hosts.yml",
-        "github.com:\n    users:\n        octocat:\n            oauth_token: gho_secret\n    \
-         git_protocol: https\n    oauth_token: gho_secret\n    user: octocat\n\
-         ghe.example.com:\n    oauth_token: other_secret\n    user: ada\n",
+        "# gh's hosts\n\
+         github.com:\n    users:\n        octocat:\n            oauth_token: gho_secret\n        \
+         hubot: {}\n    git_protocol: https\n    oauth_token: gho_secret\n    user: octocat\n\
+         ghe.example.com:\n    oauth_token: other_secret\n    user: \"ada\"\n\
+         git.corp.example:8443:\n    user: grace\n",
     );
     fs::create_dir_all(h.join(".config/gcloud/legacy_credentials/me@example.com")).unwrap();
     write(".config/gcloud/application_default_credentials.json", "{}");
+    // The identity in a file the .gitconfig includes, as dotfiles often do.
+    write(".gitconfig", "[include]\n\tpath = ~/.gitconfig.local\n");
     write(
-        ".gitconfig",
+        ".gitconfig.local",
         "[user]\n\tname = Ada Lovelace\n\temail = ada@example.com\n",
     );
     write(".ssh/id_ed25519", "PRIVATE");
     write(".ssh/id_ed25519.pub", "ssh-ed25519 AAAAC3Nz me@laptop\n");
     write(".ssh/id_rsa", "PRIVATE");
+    write(".ssh/github_key", "PRIVATE");
+    write(".ssh/github_key.pub", "ssh-ed25519 AAAAC3Nz work key\n");
     write(".ssh/id_old.pub", "ssh-rsa AAAAB3 public only\n");
     write(".ssh/known_hosts", "github.com ssh-ed25519 AAAA\n");
+    write(".ssh/config", "Host github.com\n");
     let out = look();
     assert!(!out.contains("secret") && !out.contains("PRIVATE"), "{out}");
     assert_eq!(
         parse_logins(&out),
         vec![
             login(LoginTool::Gh, "octocat on github.com"),
+            login(LoginTool::Gh, "hubot on github.com"),
             login(LoginTool::Gh, "ada on ghe.example.com"),
+            login(LoginTool::Gh, "grace on git.corp.example:8443"),
             login(LoginTool::Gcloud, "me@example.com"),
             login(LoginTool::Gcloud, "application default credentials"),
             login(LoginTool::Git, "Ada Lovelace <ada@example.com>"),
+            login(LoginTool::Ssh, "github_key (work key)"),
             login(LoginTool::Ssh, "id_ed25519 (me@laptop)"),
             login(LoginTool::Ssh, "id_rsa"),
         ]

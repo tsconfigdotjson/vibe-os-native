@@ -54,7 +54,7 @@ stand-in for Claude Code, on a host with 64G of memory; randomness is fixed,
 so refs and session ids are too. Its toolbox is `vibe-env`'s test toolbox
 (a shell of `sleep 600`, empty images for versions), with base release 1
 installed, a Linux home (version 1, holding a `gh` login and a git
-identity; linux agents have a Claude login) and a `toolbox.toml` whose
+identity; linux agents have no Claude login yet) and a `toolbox.toml` whose
 `[update]` runs `true` and whose one `[[install]]` fails the first time it's
 run. The
 Rust replays build that world in a temp directory and put its path in place

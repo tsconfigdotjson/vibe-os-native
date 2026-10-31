@@ -492,7 +492,7 @@ async fn an_open_toolbox_counts_against_admission() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn see_logins_says_what_the_home_holds_without_booting_anything() {
+async fn see_logins_says_what_the_home_holds_and_whether_claude_is_logged_in() {
     use vibe_core::model::LoginTool;
     use vibe_core::rpc::Login;
     let w = world();
@@ -504,7 +504,7 @@ async fn see_logins_says_what_the_home_holds_without_booting_anything() {
         w.toolbox(&["sh", "-c", "sleep 0.5"])
             .with_logins(vec![gh.clone()], true),
     ));
-    // No home yet: nothing to log in with, and nothing opened to say so.
+    // No home yet: nothing to log in with, and the toolbox stays closed.
     let l = core.toolbox_logins(NoParams {}).await.unwrap();
     assert_eq!((l.home, l.logins, l.claude), (None, Some(vec![]), true));
     assert_eq!(
@@ -523,4 +523,17 @@ async fn see_logins_says_what_the_home_holds_without_booting_anything() {
     fs::write(w.layout.linux_dir().join("home-2.img"), "").unwrap();
     let l = core.toolbox_logins(NoParams {}).await.unwrap();
     assert_eq!((l.home, l.logins), (Some(2), None));
+    assert_eq!(l.claude_problem, None);
+
+    // No Claude login for linux agents: it says so, and why.
+    let other = world();
+    let core = other.core(&["true"]);
+    let l = core.toolbox_logins(NoParams {}).await.unwrap();
+    assert!(!l.claude);
+    assert!(
+        l.claude_problem
+            .as_deref()
+            .is_some_and(|p| p.contains("vibe setup-token")),
+        "{l:?}"
+    );
 }

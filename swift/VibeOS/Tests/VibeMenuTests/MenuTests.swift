@@ -131,19 +131,26 @@ import VibeRPC
                         ["tool": "git", "account": "Octo Cat <octo@example.com>"],
                     ],
                 ] as [String: Any]))
-        #expect(known.headline == "Every new linux agent starts with what Linux home 2 holds:")
+        #expect(
+            known.headline == "Every new linux agent starts with what Linux home 2 holds. Its gh, gcloud, git and SSH logins:")
         #expect(known.rows.map(\.tool) == ["GitHub (gh)", "Git identity"])
         #expect(known.rows.map(\.account) == ["octocat on github.com", "Octo Cat <octo@example.com>"])
         #expect(known.claude == "Claude: linux agents are logged in.")
         #expect(!known.needsClaude)
 
         let empty = LoginsSummary(try decode(ToolboxLogins.self, ["home": 2, "logins": [Any](), "claude": false] as [String: Any]))
-        #expect(empty.headline.hasPrefix("Linux home 2 has no logins yet."))
+        #expect(empty.headline.hasPrefix("VibeOS found no gh, gcloud, git or SSH logins in Linux home 2."))
         #expect(empty.rows.isEmpty)
         #expect(empty.needsClaude)
         #expect(empty.claude == "Claude: linux agents aren't logged in yet.")
-        let unknown = LoginsSummary(try decode(ToolboxLogins.self, ["home": 3, "claude": true] as [String: Any]))
-        #expect(unknown.headline.contains("can't say what's in it"))
+        let unknown = LoginsSummary(
+            try decode(
+                ToolboxLogins.self,
+                ["home": 3, "claude": false, "claude_problem": "can't read the Claude login for linux agents: locked"]
+                    as [String: Any]))
+        #expect(unknown.headline.contains("couldn't tell which logins Linux home 3 holds"))
+        #expect(unknown.claude == "Claude: can't read the Claude login for linux agents: locked")
+        #expect(unknown.needsClaude)
         let none = LoginsSummary(try decode(ToolboxLogins.self, ["logins": [Any](), "claude": true] as [String: Any]))
         #expect(none.headline.hasPrefix("There's no Linux home yet."))
         #expect(LoginTool.allCases.map(toolName) == ["GitHub (gh)", "Google Cloud", "Git identity", "SSH key"])

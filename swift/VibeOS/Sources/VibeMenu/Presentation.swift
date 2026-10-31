@@ -302,18 +302,24 @@ public struct LoginsSummary: Equatable, Sendable {
             headline = "There's no Linux home yet. Open the toolbox shell and log in to what your linux "
                 + "agents need, such as gh auth login. Exiting the shell saves it."
         case (let home?, nil):
-            headline = "Linux home \(home) was saved before VibeOS kept track of its logins, so it can't "
-                + "say what's in it. Open the toolbox shell and exit it, and they'll show here."
+            headline = "VibeOS couldn't tell which logins Linux home \(home) holds when it was saved "
+                + "(the look failed, or an older VibeOS saved it). Open the toolbox shell and exit it, "
+                + "and they'll show here."
         case (let home?, let found?) where found.isEmpty:
-            headline = "Linux home \(home) has no logins yet. Open the toolbox shell and log in there "
-                + "(gh auth login, gcloud auth login, git config --global user.name …). "
-                + "Exiting the shell saves them."
+            headline = "VibeOS found no gh, gcloud, git or SSH logins in Linux home \(home). Open the "
+                + "toolbox shell and log in there (gh auth login, gcloud auth login, "
+                + "git config --global user.name …). Exiting the shell saves them."
         case (let home?, _):
-            headline = "Every new linux agent starts with what Linux home \(home) holds:"
+            headline = "Every new linux agent starts with what Linux home \(home) holds. "
+                + "Its gh, gcloud, git and SSH logins:"
         }
         needsClaude = !logins.claude
-        claude = logins.claude
-            ? "Claude: linux agents are logged in."
-            : "Claude: linux agents aren't logged in yet."
+        if logins.claude {
+            claude = "Claude: linux agents are logged in."
+        } else if let why = logins.claudeProblem {
+            claude = "Claude: \(why)"
+        } else {
+            claude = "Claude: linux agents aren't logged in yet."
+        }
     }
 }

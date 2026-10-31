@@ -447,8 +447,9 @@ impl crate::toolbox::ToolboxHost for TestToolbox {
             .base()
             .ok_or_else(|| EnvError::new("no Linux base image yet"))?;
         let template = self.keep(Kind::Template, Some(base))?;
-        let home = self.keep(Kind::Home, None)?;
-        self.images.note_logins(home, &self.logins)?;
+        let working = self.dir().join("Home.img");
+        fs::write(&working, "").map_err(|e| EnvError::new(e.to_string()))?;
+        let (home, _) = self.images.keep_home(&working, Some(&self.logins))?;
         Ok(crate::toolbox::Saved {
             template: Some(template),
             home: Some(home),
@@ -495,6 +496,11 @@ impl crate::toolbox::ToolboxHost for TestToolbox {
     }
 
     fn logins(&self) -> vibe_core::rpc::ToolboxLogins {
-        crate::toolbox::home_logins(&self.images, self.claude)
+        let claude = if self.claude {
+            Ok(())
+        } else {
+            Err("linux agents have no Claude login yet: run `vibe setup-token`".into())
+        };
+        crate::toolbox::home_logins(&self.images, claude)
     }
 }

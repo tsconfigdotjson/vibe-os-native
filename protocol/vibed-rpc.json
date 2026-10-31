@@ -122,7 +122,7 @@
     "AgentList": ["agents"],
     "ToolboxStatus": ["state", "template", "home", "base", "newest_base", "last"],
     "ToolboxRun": ["action", "at", "template", "uncovered", "error"],
-    "ToolboxLogins": ["home", "logins", "claude"],
+    "ToolboxLogins": ["home", "logins", "claude", "claude_problem"],
     "Login": ["tool", "account"]
   },
   "optional": {
@@ -172,7 +172,7 @@
     "AgentList": [],
     "ToolboxStatus": ["template", "home", "base", "newest_base", "last"],
     "ToolboxRun": ["template", "error"],
-    "ToolboxLogins": ["home", "logins"],
+    "ToolboxLogins": ["home", "logins", "claude_problem"],
     "Login": []
   },
   "nested": {

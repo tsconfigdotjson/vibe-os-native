@@ -1141,14 +1141,17 @@ pub struct ToolboxLogins {
     /// has saved one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub home: Option<u32>,
-    /// What that home holds, found as the toolbox saved it; absent if that
-    /// home was saved without a look (by a VibeOS before `toolbox.logins`).
-    /// Without a home, none.
+    /// The gh, gcloud, git and SSH logins that home holds, found as the
+    /// toolbox saved it; absent if it couldn't tell (the look failed, or a
+    /// VibeOS before `toolbox.logins` saved it). Without a home, none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logins: Option<Vec<Login>>,
     /// Whether linux agents have a Claude login: the token `vibe
     /// setup-token` keeps, which lives on the Mac, not in the home.
     pub claude: bool,
+    /// Without one, why, as a sentence: none kept yet, or it can't be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_problem: Option<String>,
 }
 
 /// One login the Linux home holds. Never its secret.

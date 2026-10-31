@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 import VibeMenu
 import VibeRPC
@@ -14,7 +15,8 @@ struct LoginsView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Linux agents use the logins and dotfiles you set up once in the Linux toolbox. "
-                + "Secrets stay in the Linux home: this shows only what's there and whose.")
+                + "Secrets stay in the Linux home: this shows only which logins are there, and whose. "
+                + "Anything else you set up there, such as ~/.aws or ~/.npmrc, reaches agents too.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -60,8 +62,12 @@ struct LoginsView: View {
         }
         .padding()
         .frame(width: 460)
-        // Again after each toolbox change, as a save notes a new home's.
+        // Again after each toolbox change, as a save notes a new home's,
+        // and on coming back to the app, as from `vibe setup-token`.
         .task(id: model.toolbox) { await load() }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            Task { await load() }
+        }
     }
 
     private func load() async {

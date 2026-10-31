@@ -1,5 +1,5 @@
 {
-  "description": "See logins: what the Linux home new agents boot holds, as the toolbox found when it saved that home, and whether linux agents have a Claude login (vibe setup-token's token, kept on the Mac). It boots nothing, so it answers while the shell is open too. A home saved without a look has no logins field; with no home yet, logins is empty.",
+  "description": "See logins: what the Linux home new agents boot holds, as the toolbox found when it saved that home, and whether linux agents have a Claude login (vibe setup-token's token, kept on the Mac). Without a Claude login, claude_problem says why. It boots nothing, so it answers while the shell is open too. If VibeOS couldn't tell what a home holds, there's no logins field; with no home yet, logins is empty.",
   "request": {
     "jsonrpc": "2.0",
     "id": 100,
@@ -21,7 +21,8 @@
           "account": "Me <me@example.com>"
         }
       ],
-      "claude": true
+      "claude": false,
+      "claude_problem": "linux agents have no Claude login yet: run `vibe setup-token`"
     }
   }
 }

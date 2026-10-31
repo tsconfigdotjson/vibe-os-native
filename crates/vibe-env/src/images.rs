@@ -237,14 +237,14 @@ impl Images {
     /// The logins Linux home `home` holds, as noted when it was kept; `None`
     /// if nothing was noted, or the note can't be read.
     pub fn logins_of(&self, home: u32) -> Option<Vec<vibe_core::rpc::Login>> {
-        let text = fs::read_to_string(self.dir.join(format!("home-{home}.logins"))).ok()?;
+        let text = fs::read_to_string(self.logins_note(home)).ok()?;
         serde_json::from_str(&text).ok()
     }
 
     /// Notes the logins Linux home `home` holds, beside its image. Never
     /// any secret: only which tools, and whose.
     pub fn note_logins(&self, home: u32, logins: &[vibe_core::rpc::Login]) -> Result<()> {
-        let note = self.dir.join(format!("home-{home}.logins"));
+        let note = self.logins_note(home);
         let tmp = note.with_extension("logins.partial");
         let text = serde_json::to_string_pretty(logins).expect("logins serialize");
         fs::write(&tmp, text + "\n")
@@ -258,6 +258,39 @@ impl Images {
     /// first, in `template-<n>.base`, so it's never booted on another.
     /// Returns the version and the image.
     pub fn keep(&self, kind: Kind, working: &Path, base: Option<u32>) -> Result<(u32, PathBuf)> {
+        self.keep_then(kind, working, base, |_| {})
+    }
+
+    /// [`Images::keep`] for a Linux home, with the logins the toolbox found
+    /// in it noted first, so an agent or `toolbox.logins` never sees the
+    /// home without its note. `None` (the look failed) clears any note
+    /// left under its name, so a home is never credited with another's.
+    pub fn keep_home(
+        &self,
+        working: &Path,
+        logins: Option<&[vibe_core::rpc::Login]>,
+    ) -> Result<(u32, PathBuf)> {
+        self.keep_then(Kind::Home, working, None, |next| {
+            let _ = fs::remove_file(self.logins_note(next));
+            if let Some(logins) = logins
+                && let Err(e) = self.note_logins(next, logins)
+            {
+                eprintln!("vibe-env: home {next}'s logins are unknown: {e}");
+            }
+        })
+    }
+
+    fn logins_note(&self, home: u32) -> PathBuf {
+        self.dir.join(format!("home-{home}.logins"))
+    }
+
+    fn keep_then(
+        &self,
+        kind: Kind,
+        working: &Path,
+        base: Option<u32>,
+        before_link: impl FnOnce(u32),
+    ) -> Result<(u32, PathBuf)> {
         self.make_dir()?;
         let next = self.newest_of(kind).map_or(1, |(n, _)| n + 1);
         let dest = self.dir.join(format!("{}-{next}.img", kind.prefix()));
@@ -275,6 +308,7 @@ impl Images {
                 .and_then(|()| fs::rename(&tmp, &note))
                 .map_err(io_err(format!("write {}", note.display())))?;
         }
+        before_link(next);
         // A link fails if the name is taken, which a rename wouldn't.
         fs::hard_link(working, &dest)
             .and_then(|()| fs::remove_file(working))
@@ -579,6 +613,16 @@ impl Images {
             }
         }
         for name in self.names() {
+            // A note whose write was cut short, not one being written.
+            if name.starts_with("home-") && name.ends_with(".logins.partial") {
+                let path = self.dir.join(&name);
+                let old = fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .is_ok_and(|t| t.elapsed().unwrap_or_default() >= grace);
+                if old && fs::remove_file(&path).is_ok() {
+                    gone.push(path);
+                }
+            }
             if name.starts_with(".managed-") && name.ends_with(".partial") {
                 let path = self.dir.join(&name);
                 // Only one left by a vibed that's gone: its pid is in the name.

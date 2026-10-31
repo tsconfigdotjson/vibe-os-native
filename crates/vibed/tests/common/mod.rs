@@ -305,7 +305,7 @@ impl Golden {
                 vec!["sleep".into(), "600".into()],
             )
             .with_uncovered(vec!["apt: htop".into()])
-            .with_logins(golden_logins(), true),
+            .with_logins(golden_logins(), false),
         ));
         config.admission = Arc::new(HostAdmission {
             total_memory: 64 * GIB,

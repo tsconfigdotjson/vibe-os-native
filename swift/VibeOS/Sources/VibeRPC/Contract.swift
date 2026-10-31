@@ -1365,15 +1365,18 @@ public struct ToolboxLogins: Codable, Hashable, Sendable {
     /// The Linux home version new agents boot; none before the toolbox has
     /// saved one.
     public var home: Int?
-    /// What that home holds, found as the toolbox saved it; nil if that home
-    /// was saved without a look. Without a home, empty.
+    /// The gh, gcloud, git and SSH logins that home holds, found as the
+    /// toolbox saved it; nil if it couldn't tell. Without a home, empty.
     public var logins: [Login]?
     /// Whether linux agents have a Claude login (`vibe setup-token`'s token,
     /// kept on the Mac).
     public var claude: Bool
+    /// Without one, why, as a sentence: none kept yet, or it can't be read.
+    public var claudeProblem: String?
 
     public enum CodingKeys: String, CodingKey, CaseIterable {
         case home, logins, claude
+        case claudeProblem = "claude_problem"
     }
 }
 
