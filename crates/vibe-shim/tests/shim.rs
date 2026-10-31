@@ -287,6 +287,22 @@ fn the_shim_leads_the_session_and_its_death_hangs_up_the_command() {
 }
 
 #[test]
+fn the_command_keeps_its_temp_files_in_the_state_directory() {
+    let shim = Shim::start(&[
+        "sh",
+        "-c",
+        "echo \"tmp=$TMPDIR\"; touch \"$TMPDIR/x\"; read y",
+    ]);
+    let tmp = shim.state.join("tmp");
+    let mut a = shim.attach(None);
+    a.expect(&format!("tmp={}", tmp.display()));
+    wait_until("a temp file", || tmp.join("x").exists());
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(&tmp).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700);
+}
+
+#[test]
 fn an_exit_is_sent_to_clients_and_recorded() {
     let shim = Shim::start(&["sh", "-c", "read x; echo got-$x; exit 3"]);
     let mut a = shim.attach(None);

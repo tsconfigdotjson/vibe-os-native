@@ -16,6 +16,9 @@ use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::oneshot;
 use vibe_core::paths::Layout;
+use vibe_core::units::GIB;
+use vibe_env::testing::{STAND_IN, TestBackend};
+use vibed::agents::{Backends, HostAdmission};
 use vibed::core::{Config, Core, DaemonInfo};
 use vibed::server::{self, SocketGuard};
 
@@ -104,6 +107,39 @@ pub fn repo(dir: &Path) {
     git(&["-C", d, "commit", "-q", "-m", "first"]);
 }
 
+/// A clone at `dir` of a new repo at `origin`, as a project with an
+/// `origin` to fetch is.
+pub fn clone_of_new_repo(origin: &Path, dir: &Path) {
+    repo(origin);
+    fs::create_dir_all(dir.parent().unwrap()).unwrap();
+    git(&[
+        "clone",
+        "-q",
+        origin.to_str().unwrap(),
+        dir.to_str().unwrap(),
+    ]);
+}
+
+/// `git -C dir args`'s output, trimmed.
+pub fn git_out(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git {args:?}: {out:?}");
+    String::from_utf8(out.stdout).unwrap().trim().to_owned()
+}
+
+/// Installs the stand-in for Claude Code at `bin/claude`.
+pub fn stand_in(bin: &Path) -> PathBuf {
+    fs::create_dir_all(bin).unwrap();
+    let claude = bin.join("claude");
+    write_script(&claude, STAND_IN);
+    claude
+}
+
 /// Writes an executable script beside `path` and renames it into place, so
 /// no test thread can fork while it's open for writing, which makes running
 /// it fail with "text file busy" on Linux.
@@ -152,15 +188,17 @@ esac
     gh
 }
 
-/// The world the examples were recorded in: a Mac whose home has
-/// `src/app` checked out, a GitHub with `me/web` on it, a fixed clock and
-/// fixed key randomness.
+/// The world the examples were recorded in: a Mac whose home has `src/app`
+/// checked out from an `origin` beside it, a GitHub with `me/web` on it, a
+/// fixed clock and fixed key randomness, 64G of memory, and the test
+/// backend for every environment, with the stand-in for Claude Code.
 pub struct Golden {
     pub dir: tempfile::TempDir,
     /// Canonical, so paths vibed canonicalizes match it (macOS's temp dir
     /// is behind a symlink).
     pub home: PathBuf,
     pub gh: PathBuf,
+    pub claude: PathBuf,
     sessions: Vec<RunningShim>,
 }
 
@@ -169,21 +207,41 @@ impl Golden {
         let dir = short_tempdir();
         let root = dir.path().canonicalize().unwrap();
         let home = root.join("home");
-        repo(&home.join("src/app"));
+        clone_of_new_repo(&root.join("remotes/app"), &home.join("src/app"));
         repo(&root.join("remotes/web"));
         let gh = fake_gh(&root.join("bin"), &root.join("remotes"));
+        let claude = stand_in(&root.join("bin"));
         Golden {
             dir,
             home,
             gh,
+            claude,
             sessions: Vec::new(),
         }
     }
 
-    /// The sessions the examples list: `quiet-amber-otter` running, and two
-    /// that exited, `brave-copper-lynx` with code 0 and `calm-silver-heron`
-    /// killed.
-    pub fn with_sessions(mut self) -> Golden {
+    /// Everything else the examples need: the sessions they list,
+    /// `quiet-amber-otter` running and two that exited, `brave-copper-lynx`
+    /// with code 0 and `calm-silver-heron` killed; and a `.vibe/setup.sh`
+    /// in `app` that copies `.env.example` to `.env.local`, so a new
+    /// agent's worktree has a change it hasn't committed.
+    pub fn for_examples(mut self) -> Golden {
+        let origin = self.dir.path().canonicalize().unwrap().join("remotes/app");
+        fs::create_dir_all(origin.join(".vibe")).unwrap();
+        fs::write(
+            origin.join(".vibe/setup.sh"),
+            "cp .env.example .env.local\n",
+        )
+        .unwrap();
+        fs::write(
+            origin.join(".env.example"),
+            "API_URL=http://localhost:8080\n",
+        )
+        .unwrap();
+        let (o, app) = (origin.to_str().unwrap(), self.home.join("src/app"));
+        git(&["-C", o, "add", "."]);
+        git(&["-C", o, "commit", "-q", "-m", "setup"]);
+        git(&["-C", app.to_str().unwrap(), "pull", "-q"]);
         let layout = Layout::new(&self.home, "macos");
         write_record(
             &layout,
@@ -208,6 +266,11 @@ impl Golden {
         let mut config = Config::new(golden_info(), Layout::new(&self.home, "macos"));
         config.label = "mac-mini".into();
         config.gh = self.gh.clone().into();
+        config.shim = workspace_bin("vibe-shim").into_os_string();
+        config.backends = Backends::all(Arc::new(TestBackend::new(&self.claude)));
+        config.admission = Arc::new(HostAdmission {
+            total_memory: 64 * GIB,
+        });
         config.clock = Arc::new(|| GOLDEN_NOW);
         // Bytes 0, 1, 2, … for the first key, 32, 33, … for the next.
         let calls = AtomicU8::new(0);
@@ -222,6 +285,36 @@ impl Golden {
 
     pub fn core(&self) -> Arc<Core> {
         Arc::new(Core::open(self.config()).unwrap())
+    }
+}
+
+impl Drop for Golden {
+    /// Agents a test started and didn't delete, because it failed, end with
+    /// it: every shim serving in its `run/` is killed, which hangs up its
+    /// command.
+    fn drop(&mut self) {
+        let run = Layout::new(&self.home, "macos").run_dir();
+        let Ok(entries) = fs::read_dir(&run) else {
+            return;
+        };
+        for e in entries.filter_map(Result::ok) {
+            let path = e.path();
+            if path.extension().is_none_or(|x| x != "sock") {
+                continue;
+            }
+            let status = vibe_core::shim::connect(
+                &path,
+                &vibe_core::shim::control_hello("test cleanup"),
+                Duration::from_secs(2),
+            )
+            .and_then(|mut c| Ok(c.status()?));
+            if let Ok(status) = status
+                && let Ok(pid) = i32::try_from(status.pid)
+            {
+                // SAFETY: a signal to a shim this test's daemon started.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+        }
     }
 }
 

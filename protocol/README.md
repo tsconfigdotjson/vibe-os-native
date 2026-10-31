@@ -46,9 +46,12 @@ against one daemon: a Mac (`os` `macos`, so new projects get two starter
 profiles) whose home is `/Users/me`, at 2026-10-30T12:00:00Z, with `src/app`
 checked out and `me/web` on GitHub. Its sessions are `quiet-amber-otter`,
 a real `vibe-shim` running `sleep`, and the records of two that exited:
-`brave-copper-lynx` with code 0 and `calm-silver-heron` killed. The Rust
-replays build that world in a temp directory and put its path in place of
-`/Users/me`.
+`brave-copper-lynx` with code 0 and `calm-silver-heron` killed. `src/app`
+has an `origin` to fetch, and a `.vibe/setup.sh` that copies `.env.example`
+to `.env.local`. Agents run under `vibe-env`'s test backend, with its
+stand-in for Claude Code, on a host with 64G of memory; randomness is fixed,
+so refs and session ids are too. The Rust replays build that world in a temp
+directory and put its path in place of `/Users/me`.
 
 **`vibe-vm` has a contract of its own**, in `vibe-vm/`: the configuration
 `vibed` gives it, the line it prints as it starts, and its control socket.

@@ -27,7 +27,10 @@
     { "name": "gh.status", "params": "GhStatusParams", "result": "GhStatus" },
     { "name": "events.subscribe", "params": "NoParams", "result": "Subscribed" },
     { "name": "sessions.list", "params": "HostParams", "result": "SessionList" },
-    { "name": "sessions.attach", "params": "SessionParams", "result": "SessionAttach" }
+    { "name": "sessions.attach", "params": "SessionParams", "result": "SessionAttach" },
+    { "name": "agents.start", "params": "AgentStartParams", "result": "Agent" },
+    { "name": "agents.list", "params": "HostParams", "result": "AgentList" },
+    { "name": "agents.delete", "params": "AgentDeleteParams", "result": "Agent" }
   ],
   "notifications": [
     { "name": "events.event", "params": "Event" }
@@ -51,8 +54,9 @@
     "Mode": ["auto", "bypass"],
     "ProjectSource": ["github", "path"],
     "GhState": ["unknown", "logged_in", "logged_out", "not_installed", "error"],
-    "EventKind": ["project.added", "project.removed", "profiles.changed", "limits.changed", "keys.changed", "gh.status", "agent.state", "agent.limit", "lagged"],
-    "SessionState": ["running", "exited"]
+    "EventKind": ["project.added", "project.removed", "profiles.changed", "limits.changed", "keys.changed", "gh.status", "agent.added", "agent.deleted", "agent.state", "agent.limit", "lagged"],
+    "SessionState": ["running", "exited"],
+    "AgentState": ["busy", "idle", "question", "asleep", "paused", "exited"]
   },
   "types": {
     "Request": ["jsonrpc", "id", "method", "params"],
@@ -90,7 +94,11 @@
     "SessionList": ["sessions"],
     "SessionInfo": ["host", "ref", "state", "title", "clients", "ttys", "exit"],
     "SessionExit": ["code", "signal", "at"],
-    "SessionAttach": ["host", "ref", "title", "socket", "ttys"]
+    "SessionAttach": ["host", "ref", "title", "socket", "ttys"],
+    "AgentStartParams": ["host", "project", "profile", "prompt", "from", "name"],
+    "AgentDeleteParams": ["host", "ref", "force"],
+    "Agent": ["host", "ref", "project", "profile", "environment", "state", "worktree", "branch", "session_id", "created_at", "attach"],
+    "AgentList": ["agents"]
   },
   "optional": {
     "Request": ["id", "params"],
@@ -127,7 +135,11 @@
     "SessionList": [],
     "SessionInfo": ["exit"],
     "SessionExit": ["code", "signal"],
-    "SessionAttach": []
+    "SessionAttach": [],
+    "AgentStartParams": ["host", "from", "name"],
+    "AgentDeleteParams": ["host", "force"],
+    "Agent": [],
+    "AgentList": []
   },
   "nested": {
     "HostList": { "hosts": "HostInfo" },
@@ -137,6 +149,7 @@
     "KeyList": { "keys": "ApiKey" },
     "KeyCreated": { "key": "ApiKey" },
     "SessionList": { "sessions": "SessionInfo" },
-    "SessionInfo": { "exit": "SessionExit" }
+    "SessionInfo": { "exit": "SessionExit" },
+    "AgentList": { "agents": "Agent" }
   }
 }

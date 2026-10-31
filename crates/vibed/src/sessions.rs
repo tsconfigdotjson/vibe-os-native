@@ -250,6 +250,10 @@ pub struct SessionSpec {
     pub env: Vec<(OsString, OsString)>,
     /// The terminal's size until a client attaches.
     pub size: Option<Size>,
+    /// For a `linux` agent on the Mac: the `vibe-vm` socket of its VM,
+    /// whose `vibe-guest` already runs the command on a terminal of its
+    /// own. Then `command`, `cwd` and `env` aren't used.
+    pub vm: Option<PathBuf>,
 }
 
 /// Runs `vibe-shim` for `spec` and waits until its command is running.
@@ -266,17 +270,23 @@ pub async fn spawn_shim(
         .arg("--socket")
         .arg(layout.session_socket(&spec.agent))
         .arg("--state")
-        .arg(layout.agent_dir(&spec.agent))
-        .arg("--cwd")
-        .arg(&spec.cwd);
+        .arg(layout.agent_dir(&spec.agent));
     if let Some(size) = spec.size {
         cmd.arg("--size").arg(size.to_string());
     }
-    cmd.arg("--")
-        .args(&spec.command)
-        .envs(spec.env.iter().map(|(k, v)| (k, v)))
-        .stdin(std::process::Stdio::null())
-        .kill_on_drop(true);
+    match &spec.vm {
+        Some(vm) => {
+            cmd.arg("--vm").arg(vm);
+        }
+        None => {
+            cmd.arg("--cwd")
+                .arg(&spec.cwd)
+                .arg("--")
+                .args(&spec.command)
+                .envs(spec.env.iter().map(|(k, v)| (k, v)));
+        }
+    }
+    cmd.stdin(std::process::Stdio::null()).kill_on_drop(true);
     let out = match tokio::time::timeout(START_TIMEOUT, cmd.output()).await {
         Ok(Ok(out)) => out,
         Ok(Err(e)) => {

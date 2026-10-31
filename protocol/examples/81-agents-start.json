@@ -1,0 +1,45 @@
+{
+  "description": "Starts an agent: a worktree on a new branch named by its ref (three random words), cut from origin's default branch after a fetch; its compartment; `.vibe/setup.sh` run inside it; Claude's state pre-filled; and Claude on the prompt, given as an argument, in a session of its own. `attach` is the command that attaches a terminal.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 81,
+    "method": "agents.start",
+    "params": {
+      "project": "app",
+      "profile": "software-eng-mac",
+      "prompt": "Add a dark mode toggle to the settings page"
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 81,
+    "result": {
+      "host": "local",
+      "ref": "honest-lilac-marten",
+      "project": "app",
+      "profile": "software-eng-mac",
+      "environment": "macos",
+      "state": "busy",
+      "worktree": "/Users/me/VibeOS/worktrees/app/honest-lilac-marten",
+      "branch": "honest-lilac-marten",
+      "session_id": "40414243-4445-4647-8849-4a4b4c4d4e4f",
+      "created_at": "2026-10-30T12:00:00Z",
+      "attach": "vibe attach honest-lilac-marten"
+    }
+  },
+  "events": [
+    {
+      "jsonrpc": "2.0",
+      "method": "events.event",
+      "params": {
+        "seq": 13,
+        "at": "2026-10-30T12:00:00Z",
+        "host": "local",
+        "kind": "agent.added",
+        "project": "app",
+        "ref": "honest-lilac-marten",
+        "state": "busy"
+      }
+    }
+  ]
+}

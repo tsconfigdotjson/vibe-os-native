@@ -109,7 +109,11 @@ names! {
         KeysChanged = "keys.changed",
         /// `gh auth status` changed; `state` is the new [`GhState`].
         GhStatus = "gh.status",
-        /// An agent changed state; `state` is the new one (#4, #5).
+        /// An agent was started; `state` is its first [`AgentState`].
+        AgentAdded = "agent.added",
+        /// An agent was deleted, with everything VibeOS made for it.
+        AgentDeleted = "agent.deleted",
+        /// An agent changed state; `state` is the new [`AgentState`].
         AgentState = "agent.state",
         /// An agent hit a limit; `limit` says which (#6, #11, #17).
         AgentLimit = "agent.limit",
@@ -124,6 +128,24 @@ names! {
         /// Its shim is up, and clients can attach.
         Running = "running",
         /// Its command ended; the shim left a record of how.
+        Exited = "exited",
+    }
+}
+
+names! {
+    /// What an agent is doing, as clients see it (PRD: MCP interface,
+    /// States). The status engine (#5) tells `busy`, `idle` and `question`
+    /// apart; until it does, an agent whose session runs is `busy`.
+    AgentState {
+        Busy = "busy",
+        Idle = "idle",
+        /// Waiting on an answer: a menu, a yes/no, a permission prompt.
+        Question = "question",
+        /// Frozen, or saved to disk; a send wakes it.
+        Asleep = "asleep",
+        /// Stopped by a limit.
+        Paused = "paused",
+        /// Its processes are gone; a send resumes it with `claude --resume`.
         Exited = "exited",
     }
 }
@@ -250,6 +272,45 @@ pub fn validate_ref(r: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The words of a new agent's ref: one of each list, such as
+/// `quiet-amber-otter`. 64 × 64 × 64 is 262,144 refs per host, and none is
+/// longer than [`MAX_REF_LEN`].
+const REF_WORDS: [[&str; 64]; 3] = [
+    [
+        "able", "agile", "alert", "ample", "avid", "bold", "brave", "brisk", "calm", "candid",
+        "civil", "clear", "clever", "cosy", "crisp", "curious", "daring", "deft", "eager", "early",
+        "easy", "fair", "fancy", "fond", "frank", "free", "fresh", "gentle", "glad", "grand",
+        "happy", "hardy", "honest", "jolly", "keen", "kind", "lively", "loyal", "lucky", "merry",
+        "mild", "modest", "neat", "nimble", "noble", "patient", "plucky", "polite", "proud",
+        "quick", "quiet", "rapid", "ready", "sharp", "shy", "sleek", "smart", "steady", "sunny",
+        "swift", "tidy", "warm", "wise", "witty",
+    ],
+    [
+        "amber", "aqua", "ashen", "azure", "beige", "black", "bronze", "brown", "cedar", "cerise",
+        "chalk", "cobalt", "copper", "coral", "cream", "crimson", "cyan", "denim", "dusky",
+        "ebony", "fawn", "flint", "golden", "granite", "green", "grey", "hazel", "honey", "indigo",
+        "ivory", "jade", "khaki", "lemon", "lilac", "lime", "linen", "maple", "maroon", "mauve",
+        "mint", "navy", "ochre", "olive", "onyx", "opal", "orange", "pearl", "pewter", "pink",
+        "plum", "red", "rose", "ruby", "russet", "rust", "sable", "sage", "sandy", "scarlet",
+        "silver", "slate", "teal", "violet", "white",
+    ],
+    [
+        "badger", "beaver", "bison", "bobcat", "crane", "cougar", "coyote", "deer", "dingo",
+        "dove", "eagle", "egret", "falcon", "ferret", "finch", "fox", "gecko", "gibbon", "goose",
+        "hare", "hawk", "heron", "ibex", "ibis", "impala", "jackal", "jaguar", "koala", "lemur",
+        "lion", "llama", "lynx", "magpie", "marmot", "marten", "mink", "moose", "newt", "ocelot",
+        "orca", "osprey", "otter", "owl", "panda", "panther", "parrot", "pelican", "puffin",
+        "quail", "raven", "robin", "salmon", "seal", "shrike", "sparrow", "stoat", "swan", "tapir",
+        "tiger", "toucan", "trout", "walrus", "weasel", "wren",
+    ],
+];
+
+/// A ref of three words, chosen by `bytes`: each word by one of them.
+pub fn ref_from_bytes(bytes: [u8; 3]) -> String {
+    let pick = |list: usize| REF_WORDS[list][usize::from(bytes[list]) % REF_WORDS[list].len()];
+    format!("{}-{}-{}", pick(0), pick(1), pick(2))
+}
+
 /// API key names are only shown, never used as paths: anything printable up
 /// to 100 characters, such as "laptop Claude Code".
 pub fn validate_key_name(name: &str) -> Result<(), String> {
@@ -337,6 +398,37 @@ mod tests {
         let long = validate_ref(&"a".repeat(MAX_REF_LEN + 1)).unwrap_err();
         assert!(long.contains("up to 32"), "{long}");
         assert_eq!(SessionState::Exited.as_str(), "exited");
+    }
+
+    #[test]
+    fn three_word_refs() {
+        assert_eq!(ref_from_bytes([0, 0, 0]), "able-amber-badger");
+        // Every byte picks a word, so every ref is one of 64³.
+        let mut seen = std::collections::HashSet::new();
+        for list in &REF_WORDS {
+            let unique: std::collections::HashSet<_> = list.iter().collect();
+            assert_eq!(unique.len(), list.len(), "a word appears twice");
+            for w in list {
+                assert!(w.chars().all(|c| c.is_ascii_lowercase()), "{w}");
+            }
+        }
+        // Each byte picks its word on its own.
+        for position in 0..3 {
+            for b in 0..=255u8 {
+                let mut bytes = [9, 9, 9];
+                bytes[position] = b;
+                let r = ref_from_bytes(bytes);
+                assert_eq!(validate_ref(&r), Ok(()), "{r}");
+                seen.insert(r);
+            }
+        }
+        assert_eq!(seen.len(), 3 * 64 - 2);
+        let longest = REF_WORDS
+            .iter()
+            .map(|l| l.iter().map(|w| w.len()).max().unwrap())
+            .sum::<usize>()
+            + 2;
+        assert!(longest <= MAX_REF_LEN, "{longest}");
     }
 
     #[test]

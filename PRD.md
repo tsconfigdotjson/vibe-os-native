@@ -107,17 +107,19 @@ An agent's life runs setup → start (worktree and compartment included) → wor
    - **Settings → API keys → New key**, with a ready `claude mcp add …` line to copy.
 2. **Add a project.** Settings → Projects → Add takes a GitHub `owner/name`, cloned with the Mac's `gh` login into `~/VibeOS/projects/`, or a local path. The project starts with two profiles, one per environment (see Profiles), which you can edit or add to. Removing a project forgets it and its profiles but leaves its files on disk; adding the same repo again picks up its existing clone. A project with agents can't be removed.
 3. **Start an agent.** `vibe_start_agent {project, profile, prompt}`, or New agent… in the menu. One call does it all:
-   - fetch `origin` and cut a worktree on a new branch from the default branch (or from `from`), with `push.autoSetupRemote` set
+   - fetch `origin` and cut a worktree on a new branch from the default branch (or from `from`), with `push.autoSetupRemote` set. Agents get their git settings through their environment (`GIT_CONFIG_*`), so the shared `.git/config` is unchanged
    - check admission against host headroom, using the profile's memory
    - create the compartment: boot the VM for `linux`, or set up the governed tree for `macos`
    - run the optional `.vibe/setup.sh` inside it
    - pre-fill Claude's state so it opens straight to its prompt: first-run onboarding done (otherwise Claude stops at its theme picker) and the worktree trusted. Then start the shim, and launch `claude --session-id <uuid>` with the profile's model, reasoning level and mode. The prompt is an argument, never pasted, so a startup dialog can't swallow it.
    - agent-tail starts tailing the transcript
+
+   If a step fails, the steps before it are undone, the new branch included, and the call says why (for `.vibe/setup.sh`, its last line of output). The agent's record is written first, so a start cut short by a crash of `vibed` is undone the same way when `vibed` starts again.
 4. **Monitor.** The menu bar row shows state, title and the latest activity line. A notification fires when an agent has a question, errors or hits a limit. MCP clients use `vibe_wait`.
 5. **Attach.** Click the row and Terminal.app opens running `vibe attach <ref>`. If a tab is already attached, that tab is raised instead. Closing the window detaches; the agent keeps running.
 6. **Go idle.** About a minute after the agent comes to rest with nothing attached, it goes to sleep: a `linux` VM is saved to disk and its RAM freed, and a `macos` agent is frozen. A send or an attach wakes it exactly where it was, including mid-question.
 7. **Finish.** The agent commits, pushes and opens a PR itself, in either environment. It uses the Mac's `gh` login in `macos`, and the Linux home's in `linux`.
-8. **Delete.** `vibe_delete_agent` ends the agent and removes everything VibeOS made for it: the worktree, its temp directory (the shim points `TMPDIR` at `~/VibeOS/agents/<ref>/tmp`), Claude's transcripts for that worktree, its scrollback, socket and record, and in `linux` its VM disk, Claude home and snapshot. The branch is kept. Deletion is refused if there are uncommitted changes or unpushed commits, unless `force` is set. Nothing is deleted automatically.
+8. **Delete.** `vibe_delete_agent` ends the agent and removes everything VibeOS made for it: the worktree, its temp directory (the shim points `TMPDIR` at `~/VibeOS/agents/<ref>/tmp`), Claude's transcripts for that worktree, its scrollback, socket and record, and in `linux` its VM disk, Claude home and snapshot. The branch is kept. Deletion is refused if there are uncommitted changes or unpushed commits, unless `force` is set. Unpushed means on the agent's branch, or its worktree's `HEAD`, but on no remote-tracking branch; `vibed` fetches without pruning, so a branch merged and deleted on GitHub still counts as pushed. In a repo with no remote, it means on no other branch. Nothing is deleted automatically.
 9. **Reboot.** `vibed` starts at login and marks every agent `asleep`. A `linux` agent wakes from its snapshot exactly where it was; a spike confirmed snapshots survive a reboot. A `macos` agent's processes are gone, so it wakes by continuing its conversation with `claude --resume`.
 
 ## Architecture
@@ -135,7 +137,7 @@ A Rust daemon owns all state and logic. Every other part is a thin client of it.
 
 **Restarts.** Shims and `vibe-vm` processes are detached from `vibed`. A daemon crash or upgrade leaves every agent running, and on start `vibed` re-adopts them by scanning `run/`: a shim serves `<ref>.sock` there and a `vibe-vm` `<ref>.vm`. Each shim leads its own session and process group, so launchd ending `vibed`'s job leaves them alone; on a Linux host the systemd unit (#16) must use `KillMode=process`, or restarting `vibed` would kill the shims in its cgroup.
 
-**Sessions.** `vibed` starts a shim as `vibe-shim --ref <ref> --socket run/<ref>.sock --state ~/VibeOS/agents/<ref> -- <command>`. Like `dtach -n`, it binds the socket (with a lock beside it, so there's one shim per ref), forks a process that leads a new session and owns a new terminal, starts the command in its own process group as that terminal's foreground, prints its pid once the command runs, and exits. The shim's pid is therefore the session ID of everything the agent starts (the governor freezes those processes, never the shim itself, which must keep answering), and if the shim dies the kernel hangs up the command. The shims are the record of what's running: `vibed` keeps no session state of its own, and finds every session, after a restart too, by asking the shim behind each socket in `run/`; a socket nobody serves is removed. When the command exits, the shim tells attached clients how, leaves `session.json` (the exit, the last screen and the history) and `shim.log` in the agent's directory, removes its socket and exits. A size from a client is capped at 1000 rows and columns, input waiting for a command that doesn't read is capped too, and a client that stops reading for 30 s is dropped. A shim's socket speaks a small framed protocol of its own (`vibe_core::shim`), spoken only by `vibe attach` and `vibed`, never by the Swift app: terminal bytes as they are, JSON for the rest. For a `linux` agent on the Mac, Claude runs in the VM: `vibed` launches it through `vibe-guest`, and starts the shim with `--vm run/<ref>.vm` instead of a command, to attach to `vibe-guest`'s terminal through `vibe-vm`. If that stream drops, the shim exits without a record and Claude goes on in the VM. The socket API has `sessions.list` and `sessions.attach`; the latter gives the shim's socket, the window title and the ttys of clients already attached. A ref is at most 32 characters, because `run/<ref>.sock` must fit in a socket path's 104 bytes on macOS.
+**Sessions.** `vibed` starts a shim as `vibe-shim --ref <ref> --socket run/<ref>.sock --state ~/VibeOS/agents/<ref> -- <command>`. Like `dtach -n`, it binds the socket (with a lock beside it, so there's one shim per ref), forks a process that leads a new session and owns a new terminal, starts the command in its own process group as that terminal's foreground, prints its pid once the command runs, and exits. The shim's pid is therefore the session ID of everything the agent starts (the governor freezes those processes, never the shim itself, which must keep answering), and if the shim dies the kernel hangs up the command. The shims are the record of what's running: `vibed` keeps no session state of its own, and finds every session, after a restart too, by asking the shim behind each socket in `run/`; a socket nobody serves is removed. When the command exits, the shim tells attached clients how, leaves `session.json` (the exit, the last screen and the history) and `shim.log` in the agent's directory, removes its socket and exits. A size from a client is capped at 1000 rows and columns, input waiting for a command that doesn't read is capped too, and a client that stops reading for 30 s is dropped. A shim's socket speaks a small framed protocol of its own (`vibe_core::shim`), spoken only by `vibe attach` and `vibed`, never by the Swift app: terminal bytes as they are, JSON for the rest. For a `linux` agent on the Mac, Claude runs in the VM: `vibed` launches it through `vibe-guest`, and starts the shim with `--vm run/<ref>.vm` instead of a command, to attach to `vibe-guest`'s terminal through `vibe-vm`. If that stream drops, the shim exits without a record and Claude goes on in the VM. The socket API has `sessions.list` and `sessions.attach` (and `agents.start`, `agents.list` and `agents.delete` for agents themselves); the latter gives the shim's socket, the window title and the ttys of clients already attached. A ref is at most 32 characters, because `run/<ref>.sock` must fit in a socket path's 104 bytes on macOS.
 
 **One core, three doors.** The menu bar, the CLI and MCP all call the same core handlers inside `vibed` over JSON-RPC 2.0, so they can't drift apart. MCP is a façade on that core, built with `rmcp` (the official Rust MCP SDK).
 
@@ -152,6 +154,7 @@ Every way of running an agent sits behind one small interface, so the policy cod
 ```rust
 trait Compartment {               // lifecycle: every backend
     fn create(&self, spec: &AgentSpec) -> Result<Handle>;
+    fn run(&self, h: &Handle, cmd: &Run) -> Result<RunOutput>;         // to completion: .vibe/setup.sh
     fn launch(&self, h: &Handle, cmd: &Launch) -> Result<TerminalEnd>; // PTY or vsock, for the shim
     fn processes(&self, h: &Handle) -> Result<Vec<Proc>>;              // for the idle rule
     fn stop(&self, h: &Handle) -> Result<()>;
@@ -163,7 +166,7 @@ trait Limiter {                   // governor, cgroups, or fixed at VM boot
 }
 trait Sleeper {                   // SIGSTOP, cgroup freezer, or snapshot
     fn sleep(&self, h: &Handle) -> Result<()>;
-    fn wake(&self, h: &Handle) -> Result<()>;
+    fn wake(&self, h: &Handle) -> Result<Woke>;  // exact, exact on a new terminal, or --resume
 }
 struct Capabilities { sleep_frees_memory: bool, exact_after_reboot: bool,
                       kernel_limits: bool, file_containment: bool, wake_cost: Duration }
@@ -309,7 +312,7 @@ Repos don't customize the VM themselves. Project dependencies go in `.vibe/setup
 Mounts are the same for every agent:
 
 - **The worktree**, read-write, at the same absolute path as on the host.
-- **The project's `.git` directory**, read-write, at its host path. A worktree's `.git` file points into it. Git's lock files handle concurrent ref updates from several VMs: they use O_EXCL, which the spike showed holds across VMs, unlike `flock` and `mkdir` locks. Agents run with `gc.auto=0`, and the daemon runs `git maintenance` on the host during quiet periods.
+- **The project's `.git` directory**, read-write, at its host path. A worktree's `.git` file points into it. Git's lock files handle concurrent ref updates from several VMs: they use O_EXCL, which the spike showed holds across VMs, unlike `flock` and `mkdir` locks. Agents run with `gc.auto=0`, and the daemon runs `git maintenance` on the host during quiet periods: hourly, on each project none of whose agents is awake.
 - **The agent's Claude home**, a per-agent host directory mounted as `~/.claude`. When the agent starts, it's seeded with a copy of the Linux Claude config (CLAUDE.md, settings, skills, MCP servers) made in the toolbox shell. agent-tail reads the transcripts from it on the host, and `claude --resume` finds them after a crash or reboot. It isn't shared between agents: VibeOS shares one `~/.claude` on a single disk, but across VMs the spike lost appended lines and served stale files under a lock.
 - **Shared package caches** (npm, pnpm, cargo, pip), read-write.
 
@@ -550,7 +553,7 @@ Never put to sleep: `thinking`, `running_tool` or `background_work`.
 
 **Where state lives:**
 
-- SQLite at `~/Library/Application Support/VibeOS/vibe.db`: hosts, projects, profiles, agents (ref, profile, shim socket, Claude session id, worktree, last state; one agent has one worktree, so it's a column), API key hashes. The state directory is private (`0700`), and a lock in it allows one `vibed` at a time
+- SQLite at `~/Library/Application Support/VibeOS/vibe.db`: hosts, projects, profiles, agents (ref, profile and the settings it was started with, shim socket, Claude session id, worktree, last state, the compartment's handle; one agent has one worktree, so it's a column), API key hashes. The state directory is private (`0700`), and a lock in it allows one `vibed` at a time
 - snapshots in `~/VibeOS/snapshots/`; each `linux` agent's `vm.json`, console log and `vibe-vm.log` in its directory under `~/VibeOS/agents/`
 - logs in `~/Library/Logs/VibeOS/vibed.log`, with anything shaped like an API key redacted
 - sockets in `…/VibeOS/run/`

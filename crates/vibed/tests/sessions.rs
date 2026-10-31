@@ -143,12 +143,18 @@ async fn an_agents_session_is_titled_with_its_profile() {
             project: "app".into(),
             profile: "reviewer".into(),
             environment: Environment::Linux,
+            model: vibe_core::model::Model::Opus,
+            reasoning: vibe_core::model::Reasoning::High,
+            mode: vibe_core::model::Mode::Auto,
+            memory: 1 << 30,
             worktree: "/w".into(),
             branch: "quiet-amber-otter".into(),
             session_id: "s".into(),
             shim_socket: None,
-            state: "busy".into(),
+            state: vibe_core::model::AgentState::Busy,
             created_at: 0,
+            compartment: "{}".into(),
+            starting: false,
         })
         .unwrap();
     let _shim = start_shim(&w.layout, "quiet-amber-otter", &["sleep", "600"]);
@@ -242,6 +248,7 @@ async fn a_started_session_is_detached_and_outlives_vibed() {
         cwd: w.layout.home().to_owned(),
         env: vec![("GREETING".into(), "world".into())],
         size: Some(Size { rows: 10, cols: 50 }),
+        vm: None,
     };
     std::fs::create_dir_all(w.layout.home()).unwrap();
     let info = core.start_session(spec.clone()).await.unwrap();
@@ -327,6 +334,7 @@ async fn starting_reports_what_went_wrong() {
         cwd: "/".into(),
         env: Vec::new(),
         size: None,
+        vm: None,
     };
     let err = core
         .start_session(spec("quiet-amber-otter", "/nonexistent/claude"))

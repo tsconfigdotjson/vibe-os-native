@@ -17,7 +17,8 @@ use serde_json::Value;
 
 pub use crate::limits::HostLimits;
 pub use crate::model::{
-    Environment, EventKind, GhState, Mode, Model, Profile, ProjectSource, Reasoning, SessionState,
+    AgentState, Environment, EventKind, GhState, Mode, Model, Profile, ProjectSource, Reasoning,
+    SessionState,
 };
 
 /// Bumped on any incompatible change to the contract. Clients send theirs in
@@ -341,6 +342,9 @@ pub const METHODS: &[&str] = &[
     EventsSubscribe::NAME,
     SessionsList::NAME,
     SessionsAttach::NAME,
+    AgentsStart::NAME,
+    AgentsList::NAME,
+    AgentsDelete::NAME,
 ];
 
 /// Every notification the daemon sends.
@@ -496,6 +500,28 @@ method! {
     /// session. The client then talks to the session's shim directly, so
     /// restarting `vibed` doesn't interrupt it.
     SessionsAttach = "sessions.attach", SessionParams => SessionAttach
+}
+
+method! {
+    /// `agents.start`: one call does it all (PRD: Key user flows, Start an
+    /// agent). It cuts a worktree on a new branch, named by the agent's
+    /// ref, from `origin`'s default branch or `from`; checks admission;
+    /// creates the compartment; runs `.vibe/setup.sh` there if the
+    /// worktree has one; pre-fills Claude's state; and starts Claude on the
+    /// prompt in a session of its own.
+    AgentsStart = "agents.start", AgentStartParams => Agent
+}
+
+method! {
+    /// `agents.list`: a host's agents, oldest first.
+    AgentsList = "agents.list", HostParams => AgentList
+}
+
+method! {
+    /// `agents.delete`: ends the agent and removes everything VibeOS made
+    /// for it; its branch is kept. Refused while its worktree has
+    /// uncommitted changes or unpushed commits, unless `force`.
+    AgentsDelete = "agents.delete", AgentDeleteParams => Agent
 }
 
 /// `events.event`: one event, sent to subscribed connections.
@@ -809,6 +835,66 @@ pub struct SessionAttach {
     /// The terminals of clients already attached, so the menu bar can raise
     /// one of those instead of opening another.
     pub ttys: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentStartParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    pub project: String,
+    /// The project's profile to start it from.
+    pub profile: String,
+    /// What Claude starts on, given as an argument.
+    pub prompt: String,
+    /// The branch (or any commit) to cut the agent's branch from; by
+    /// default `origin`'s default branch, or the project's `HEAD` when it
+    /// has no `origin`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    /// The ref, which names the worktree and the branch too; by default
+    /// three random words.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentDeleteParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(rename = "ref")]
+    pub agent: String,
+    /// Delete even with uncommitted changes or unpushed commits.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub force: Option<bool>,
+}
+
+/// An agent: one Claude Code in its own worktree and compartment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Agent {
+    pub host: String,
+    #[serde(rename = "ref")]
+    pub agent: String,
+    pub project: String,
+    /// The profile it was started from. Its settings were copied at the
+    /// start, so editing the profile changes only later agents.
+    pub profile: String,
+    pub environment: Environment,
+    pub state: AgentState,
+    /// The worktree's absolute path, the same in every environment.
+    pub worktree: String,
+    pub branch: String,
+    /// Claude Code's `--session-id`, which names its transcript.
+    pub session_id: String,
+    pub created_at: String,
+    /// The command that attaches a terminal to it.
+    pub attach: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentList {
+    pub agents: Vec<Agent>,
 }
 
 /// Something that happened on a host. Fields other than these four are set

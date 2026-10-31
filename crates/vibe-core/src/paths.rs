@@ -9,6 +9,10 @@ use std::path::{Path, PathBuf};
 /// Overrides the socket path for the daemon and every client.
 pub const SOCKET_ENV: &str = "VIBE_SOCKET";
 
+/// The temp directory's name in a shim's state directory, which is
+/// `~/VibeOS/agents/<ref>` for an agent's session.
+pub const TMP_DIR: &str = "tmp";
+
 /// The socket path relative to `$HOME` on macOS.
 pub const MACOS_SOCKET: &str = "Library/Application Support/VibeOS/run/vibed.sock";
 
@@ -149,6 +153,17 @@ impl Layout {
         self.home.join("VibeOS/projects")
     }
 
+    /// Agents' worktrees, one directory per project.
+    pub fn worktrees_dir(&self) -> PathBuf {
+        self.home.join("VibeOS/worktrees")
+    }
+
+    /// The worktree of the agent `agent_ref` of `project`, which is also
+    /// where its branch is checked out.
+    pub fn worktree(&self, project: &str, agent_ref: &str) -> PathBuf {
+        self.worktrees_dir().join(project).join(agent_ref)
+    }
+
     /// One directory per agent, for what VibeOS keeps of it outside its
     /// worktree: its temp dir and its session's log and record.
     pub fn agents_dir(&self) -> PathBuf {
@@ -157,6 +172,11 @@ impl Layout {
 
     pub fn agent_dir(&self, agent_ref: &str) -> PathBuf {
         self.agents_dir().join(agent_ref)
+    }
+
+    /// The agent's `TMPDIR`, which its shim points it at.
+    pub fn agent_tmp(&self, agent_ref: &str) -> PathBuf {
+        self.agent_dir(agent_ref).join(TMP_DIR)
     }
 
     /// A `linux` agent's VM configuration, fixed for its life.
@@ -264,6 +284,8 @@ mod tests {
         assert_eq!(l.host_config(), p("/Users/u/.config/vibeos/host.toml"));
         assert_eq!(l.projects_dir(), p("/Users/u/VibeOS/projects"));
         assert_eq!(l.agent_dir("x"), p("/Users/u/VibeOS/agents/x"));
+        assert_eq!(l.agent_tmp("x"), p("/Users/u/VibeOS/agents/x/tmp"));
+        assert_eq!(l.worktree("web", "x"), p("/Users/u/VibeOS/worktrees/web/x"));
         assert_eq!(
             l.session_socket("x"),
             p("/Users/u/Library/Application Support/VibeOS/run/x.sock")

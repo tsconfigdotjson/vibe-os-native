@@ -1,0 +1,53 @@
+{
+  "description": "A project removed earlier is added again where it is. `app` has an `origin`, and a `.vibe/setup.sh` that copies `.env.example` to `.env.local`.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 80,
+    "method": "projects.add",
+    "params": {
+      "path": "/Users/me/src/app"
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 80,
+    "result": {
+      "host": "local",
+      "name": "app",
+      "source": "path",
+      "path": "/Users/me/src/app",
+      "added_at": "2026-10-30T12:00:00Z",
+      "profiles": [
+        {
+          "name": "software-eng-linux",
+          "environment": "linux",
+          "model": "opus",
+          "reasoning": "high",
+          "mode": "auto",
+          "memory": 4294967296
+        },
+        {
+          "name": "software-eng-mac",
+          "environment": "macos",
+          "model": "opus",
+          "reasoning": "high",
+          "mode": "auto",
+          "memory": 4294967296
+        }
+      ]
+    }
+  },
+  "events": [
+    {
+      "jsonrpc": "2.0",
+      "method": "events.event",
+      "params": {
+        "seq": 12,
+        "at": "2026-10-30T12:00:00Z",
+        "host": "local",
+        "kind": "project.added",
+        "project": "app"
+      }
+    }
+  ]
+}

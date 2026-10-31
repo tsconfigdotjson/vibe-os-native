@@ -35,6 +35,9 @@ public enum VibeRPC {
         EventsSubscribe.name,
         SessionsList.name,
         SessionsAttach.name,
+        AgentsStart.name,
+        AgentsList.name,
+        AgentsDelete.name,
     ]
     /// Every notification vibed sends.
     public static let notifications = [EventNotice.name]
@@ -368,6 +371,8 @@ public enum EventKind: String, Codable, CaseIterable, Hashable, Sendable {
     case limitsChanged = "limits.changed"
     case keysChanged = "keys.changed"
     case ghStatus = "gh.status"
+    case agentAdded = "agent.added"
+    case agentDeleted = "agent.deleted"
     case agentState = "agent.state"
     case agentLimit = "agent.limit"
     /// The subscriber fell behind and missed events: read everything again.
@@ -377,6 +382,12 @@ public enum EventKind: String, Codable, CaseIterable, Hashable, Sendable {
 /// Whether a session's shim still holds its terminal.
 public enum SessionState: String, Codable, CaseIterable, Hashable, Sendable {
     case running, exited
+}
+
+/// What an agent is doing: `question` is waiting on an answer, `asleep`
+/// wakes on a send, `paused` hit a limit, `exited` resumes on a send.
+public enum AgentState: String, Codable, CaseIterable, Hashable, Sendable {
+    case busy, idle, question, asleep, paused, exited
 }
 
 // MARK: - Methods
@@ -498,6 +509,29 @@ public enum SessionsAttach: RPCMethod {
     public typealias Params = SessionParams
     public typealias Result = SessionAttach
     public static let name = "sessions.attach"
+}
+
+/// `agents.start`: a worktree on a new branch, a compartment, the repo's
+/// `.vibe/setup.sh`, and Claude on the prompt, in one call.
+public enum AgentsStart: RPCMethod {
+    public typealias Params = AgentStartParams
+    public typealias Result = Agent
+    public static let name = "agents.start"
+}
+
+/// `agents.list`: a host's agents, oldest first.
+public enum AgentsList: RPCMethod {
+    public typealias Params = HostParams
+    public typealias Result = AgentList
+    public static let name = "agents.list"
+}
+
+/// `agents.delete`: removes everything VibeOS made for the agent but its
+/// branch. Refused on uncommitted or unpushed work unless `force`.
+public enum AgentsDelete: RPCMethod {
+    public typealias Params = AgentDeleteParams
+    public typealias Result = Agent
+    public static let name = "agents.delete"
 }
 
 /// `events.event`: one event, sent to subscribed connections.
@@ -972,5 +1006,83 @@ public struct SessionAttach: Codable, Hashable, Sendable {
 
     public enum CodingKeys: String, CodingKey, CaseIterable {
         case host, ref, title, socket, ttys
+    }
+}
+
+public struct AgentStartParams: Codable, Hashable, Sendable {
+    public var host: String?
+    public var project: String
+    public var profile: String
+    /// What Claude starts on, given as an argument.
+    public var prompt: String
+    /// The branch or commit to cut from; by default origin's default branch.
+    public var from: String?
+    /// The ref, which names the worktree and branch; by default three
+    /// random words.
+    public var name: String?
+
+    public init(
+        host: String? = nil, project: String, profile: String, prompt: String,
+        from: String? = nil, name: String? = nil
+    ) {
+        self.host = host
+        self.project = project
+        self.profile = profile
+        self.prompt = prompt
+        self.from = from
+        self.name = name
+    }
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case host, project, profile, prompt, from, name
+    }
+}
+
+public struct AgentDeleteParams: Codable, Hashable, Sendable {
+    public var host: String?
+    public var ref: String
+    /// Delete even with uncommitted changes or unpushed commits.
+    public var force: Bool?
+
+    public init(host: String? = nil, ref: String, force: Bool? = nil) {
+        self.host = host
+        self.ref = ref
+        self.force = force
+    }
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case host, ref, force
+    }
+}
+
+/// One Claude Code in its own worktree and compartment.
+public struct Agent: Codable, Hashable, Sendable {
+    public var host: String
+    public var ref: String
+    public var project: String
+    public var profile: String
+    public var environment: AgentEnvironment
+    public var state: AgentState
+    public var worktree: String
+    public var branch: String
+    /// Claude Code's `--session-id`.
+    public var sessionId: String
+    public var createdAt: String
+    /// The command that attaches a terminal, such as `vibe attach <ref>`.
+    public var attach: String
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case host, ref, project, profile, environment, state, worktree, branch
+        case sessionId = "session_id"
+        case createdAt = "created_at"
+        case attach
+    }
+}
+
+public struct AgentList: Codable, Hashable, Sendable {
+    public var agents: [Agent]
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case agents
     }
 }

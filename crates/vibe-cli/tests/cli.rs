@@ -120,7 +120,7 @@ fn hello_without_a_daemon_fails_clearly() {
 #[test]
 fn rpc_bridges_the_whole_contract() {
     // The golden daemon of protocol/examples, so every reply is exact.
-    let golden = common::Golden::new().with_sessions();
+    let golden = common::Golden::new().for_examples();
     let core = Core::open(golden.config()).unwrap();
     let s = start_core(core, tempfile::tempdir().unwrap());
     let mut input = Vec::new();

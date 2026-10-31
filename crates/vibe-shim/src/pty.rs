@@ -81,11 +81,12 @@ pub(crate) struct Pty {
 }
 
 /// Makes this process, which must lead its session, own a new terminal of
-/// `size`, and starts `command` on it in `cwd` as the terminal's foreground
-/// process group. The caller ignores `SIGHUP`, as it owns the terminal and
-/// closing the master end, as a failed start does, hangs it up; and
-/// `SIGTTOU`, as it isn't the terminal's foreground.
-pub(crate) fn spawn(command: &[OsString], cwd: &Path, size: Size) -> io::Result<Pty> {
+/// `size`, and starts `command` on it in `cwd`, with `tmp` as its `TMPDIR`,
+/// as the terminal's foreground process group. The caller ignores
+/// `SIGHUP`, as it owns the terminal and closing the master end, as a failed
+/// start does, hangs it up; and `SIGTTOU`, as it isn't the terminal's
+/// foreground.
+pub(crate) fn spawn(command: &[OsString], cwd: &Path, tmp: &Path, size: Size) -> io::Result<Pty> {
     let (master, slave) = open_pty(size)?;
     // SAFETY: we lead our session and have no controlling terminal yet; this
     // makes the slave ours.
@@ -95,6 +96,7 @@ pub(crate) fn spawn(command: &[OsString], cwd: &Path, size: Size) -> io::Result<
         .current_dir(cwd)
         // What the screen model and the terminals that attach understand.
         .env("TERM", "xterm-256color")
+        .env("TMPDIR", tmp)
         .stdin(Stdio::from(slave.try_clone()?))
         .stdout(Stdio::from(slave.try_clone()?))
         .stderr(Stdio::from(slave.try_clone()?));

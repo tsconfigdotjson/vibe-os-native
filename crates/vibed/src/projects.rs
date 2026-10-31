@@ -83,10 +83,19 @@ fn last_words(out: &Output) -> String {
 
 /// `git -C <dir> <args>`, its trimmed stdout if it succeeds, its last words
 /// if not.
-async fn git(dir: &Path, args: &[&str]) -> Result<Result<String, String>, ErrorObject> {
+pub(crate) async fn git(dir: &Path, args: &[&str]) -> Result<Result<String, String>, ErrorObject> {
+    git_within(dir, args, GIT_TIMEOUT).await
+}
+
+/// [`git`], given `timeout` to finish.
+pub(crate) async fn git_within(
+    dir: &Path,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<Result<String, String>, ErrorObject> {
     let mut all: Vec<&OsStr> = vec![OsStr::new("-C"), dir.as_os_str()];
     all.extend(args.iter().map(OsStr::new));
-    let out = run(OsStr::new("git"), &all, GIT_TIMEOUT)
+    let out = run(OsStr::new("git"), &all, timeout)
         .await
         .map_err(|e| failed(format!("can't run git: {e}")))?;
     Ok(if out.status.success() {
