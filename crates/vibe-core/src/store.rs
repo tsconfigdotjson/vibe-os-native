@@ -636,6 +636,24 @@ impl Store {
         Ok(())
     }
 
+    /// Records the Claude session an agent is now in: a `/clear` starts a
+    /// new one, which a resume must continue.
+    pub fn set_agent_session(
+        &mut self,
+        host: &str,
+        agent_ref: &str,
+        session_id: &str,
+    ) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE agents SET session_id = ?3 WHERE host = ?1 AND ref = ?2",
+            params![host, agent_ref, session_id],
+        )?;
+        if n == 0 {
+            return Err(no_agent(host, agent_ref));
+        }
+        Ok(())
+    }
+
     /// Records where an agent's session now is, after a new shim started.
     pub fn set_agent_socket(&mut self, host: &str, agent_ref: &str, socket: &str) -> Result<()> {
         let n = self.conn.execute(
@@ -1045,7 +1063,14 @@ mod tests {
             .unwrap();
         s.finish_agent_start(LOCAL_HOST, "quiet-amber-otter")
             .unwrap();
+        s.set_agent_session(
+            LOCAL_HOST,
+            "quiet-amber-otter",
+            "c1ea4ed0-0000-4000-8000-000000000000",
+        )
+        .unwrap();
         let q = s.agent(LOCAL_HOST, "quiet-amber-otter").unwrap();
+        assert_eq!(q.session_id, "c1ea4ed0-0000-4000-8000-000000000000");
         assert_eq!(q.compartment, r#"{"y":2}"#);
         assert!(!q.starting);
         assert!(matches!(
@@ -1064,6 +1089,10 @@ mod tests {
         ));
         assert!(matches!(
             s.set_agent_compartment(LOCAL_HOST, "nope", "{}"),
+            Err(StoreError::NotFound(_))
+        ));
+        assert!(matches!(
+            s.set_agent_session(LOCAL_HOST, "nope", "x"),
             Err(StoreError::NotFound(_))
         ));
 

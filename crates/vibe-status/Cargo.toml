@@ -8,6 +8,16 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# Pinned to a commit with agent-tail#120, #121, #122, #127 and #130 until it
+# has tags (PRD: Going to sleep). Only `fs`, for reading a file into a
+# reducer; not `sqlite`, which is for Cursor and OpenCode.
+agent-tail = { git = "https://github.com/tsconfigdotjson/agent-tail", rev = "0b5c3f6d9b624e3e22493bfdfbb442067367459f", default-features = false, features = ["fs"] }
+vibe-core.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

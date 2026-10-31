@@ -1,5 +1,5 @@
 {
-  "description": "A host's agents, oldest first. An agent whose session runs is `busy` until the status engine knows better; one whose session has gone is `exited`.",
+  "description": "A host's agents, oldest first, each with its status from its transcript. Here the stand-in for Claude has written only a line agent-tail can't place, so each is `unknown`, and an agent whose session runs and whose transcript says nothing yet is `busy`; one whose session has gone is `exited`.",
   "request": {
     "jsonrpc": "2.0",
     "id": 83,
@@ -22,7 +22,12 @@
           "branch": "honest-lilac-marten",
           "session_id": "40414243-4445-4647-8849-4a4b4c4d4e4f",
           "created_at": "2026-10-30T12:00:00Z",
-          "attach": "vibe attach honest-lilac-marten"
+          "attach": "vibe attach honest-lilac-marten",
+          "status": {
+            "activity": "unknown",
+            "certainty": "firm",
+            "pending_wakeups": []
+          }
         },
         {
           "host": "local",
@@ -35,7 +40,12 @@
           "branch": "dark-mode-review",
           "session_id": "60616263-6465-4667-a869-6a6b6c6d6e6f",
           "created_at": "2026-10-30T12:00:00Z",
-          "attach": "vibe attach dark-mode-review"
+          "attach": "vibe attach dark-mode-review",
+          "status": {
+            "activity": "unknown",
+            "certainty": "firm",
+            "pending_wakeups": []
+          }
         }
       ]
     }

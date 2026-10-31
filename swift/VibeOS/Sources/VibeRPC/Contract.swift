@@ -374,6 +374,8 @@ public enum EventKind: String, Codable, CaseIterable, Hashable, Sendable {
     case agentAdded = "agent.added"
     case agentDeleted = "agent.deleted"
     case agentState = "agent.state"
+    /// What an agent's transcript says changed; `status` has it.
+    case agentStatus = "agent.status"
     case agentLimit = "agent.limit"
     /// The subscriber fell behind and missed events: read everything again.
     case lagged
@@ -388,6 +390,32 @@ public enum SessionState: String, Codable, CaseIterable, Hashable, Sendable {
 /// wakes on a send, `paused` hit a limit, `exited` resumes on a send.
 public enum AgentState: String, Codable, CaseIterable, Hashable, Sendable {
     case busy, idle, question, asleep, paused, exited
+}
+
+/// What an agent's transcript says it's doing: agent-tail's finer activity,
+/// which `AgentState` folds (index: Activity).
+public enum AgentActivity: String, Codable, CaseIterable, Hashable, Sendable {
+    case awaitingAnswer = "awaiting_answer"
+    case awaitingApproval = "awaiting_approval"
+    case runningTool = "running_tool"
+    case thinking
+    case backgroundWork = "background_work"
+    case done, interrupted, errored, unknown
+}
+
+/// Whether the transcript says so, or it's a guess from timing.
+public enum Certainty: String, Codable, CaseIterable, Hashable, Sendable {
+    case firm, inferred
+}
+
+/// What armed a scheduled wakeup: a `/loop`, or a cron job.
+public enum WakeupKind: String, Codable, CaseIterable, Hashable, Sendable {
+    case loop, cron
+}
+
+/// Why a turn stopped beyond an error: `usageLimit` shows as "limited until …".
+public enum StopReason: String, Codable, CaseIterable, Hashable, Sendable {
+    case usageLimit = "usage_limit"
 }
 
 // MARK: - Methods
@@ -936,9 +964,11 @@ public struct DaemonEvent: Codable, Hashable, Sendable {
     /// Which limit an `agent.limit` is about.
     public var limit: String?
     public var message: String?
+    /// An agent's new status, for `agent.status`.
+    public var status: AgentStatus?
 
     public enum CodingKeys: String, CodingKey, CaseIterable {
-        case seq, at, host, kind, project, ref, state, limit, message
+        case seq, at, host, kind, project, ref, state, limit, message, status
     }
 }
 
@@ -1070,12 +1100,55 @@ public struct Agent: Codable, Hashable, Sendable {
     public var createdAt: String
     /// The command that attaches a terminal, such as `vibe attach <ref>`.
     public var attach: String
+    /// What its transcript says it's doing.
+    public var status: AgentStatus
 
     public enum CodingKeys: String, CodingKey, CaseIterable {
         case host, ref, project, profile, environment, state, worktree, branch
         case sessionId = "session_id"
         case createdAt = "created_at"
-        case attach
+        case attach, status
+    }
+}
+
+/// What an agent's transcript says it's doing, from agent-tail.
+public struct AgentStatus: Codable, Hashable, Sendable {
+    public var activity: AgentActivity
+    public var certainty: Certainty
+    /// When the activity began.
+    public var since: String?
+    /// The session's title, for the menu row.
+    public var title: String?
+    /// The latest activity line, for the menu row.
+    public var line: String?
+    public var pendingWakeups: [Wakeup]
+    public var stopReason: StopReason?
+    /// When a usage limit resets, if Claude recorded it.
+    public var resetsAt: String?
+    public var error: String?
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case activity, certainty, since, title, line
+        case pendingWakeups = "pending_wakeups"
+        case stopReason = "stop_reason"
+        case resetsAt = "resets_at"
+        case error
+    }
+}
+
+/// A wakeup an agent has armed: a `/loop` or a cron job.
+public struct Wakeup: Codable, Hashable, Sendable {
+    public var kind: WakeupKind
+    public var dueAt: String?
+    public var certainty: Certainty
+    /// A recurring cron job stays pending until it's deleted.
+    public var recurring: Bool
+    public var reason: String?
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case kind
+        case dueAt = "due_at"
+        case certainty, recurring, reason
     }
 }
 

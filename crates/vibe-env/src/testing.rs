@@ -26,7 +26,10 @@ use crate::{
 /// arguments, writes a line to the transcript where Claude would, and then
 /// does what the prompt's words say:
 ///
-/// - `question`: asks "Red or blue?" and waits for the answer;
+/// - `question`: asks "Red or blue?" and waits for the answer, writing
+///   its prompt, an `AskUserQuestion`, the answer and its reply to the
+///   transcript as Claude Code does, and then each line it's sent as a
+///   turn of its own;
 /// - `tick`: counts in `.vibe-ticks` in its directory, ten times a second;
 /// - `fork N`: leaves `N` sleeping processes running;
 /// - `dirty`: leaves `notes.txt` uncommitted in its directory;

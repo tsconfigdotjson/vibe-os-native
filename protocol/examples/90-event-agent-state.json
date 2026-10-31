@@ -1,5 +1,5 @@
 {
-  "description": "A notification, not a reply: an agent changed state. `agents.list` sends one when it finds an agent's session has gone (`exited`); the status engine (#5) sends the rest.",
+  "description": "A notification, not a reply: an agent changed state. `agents.list` sends one when it finds an agent's session has gone (`exited`); the status engine sends the rest, from the agent's transcript and its session.",
   "notification": {
     "jsonrpc": "2.0",
     "method": "events.event",

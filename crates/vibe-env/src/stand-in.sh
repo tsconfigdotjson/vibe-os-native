@@ -13,7 +13,21 @@ done
 cwd=$(pwd -P)
 dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/$(printf '%s' "$cwd" | tr -c 'A-Za-z0-9' '-')"
 mkdir -p "$dir"
-printf '{"type":"user","sessionId":"%s","cwd":"%s","resumed":%s}\n' "$id" "$cwd" "$resumed" >>"$dir/$id.jsonl"
+transcript="$dir/$id.jsonl"
+printf '{"type":"user","sessionId":"%s","cwd":"%s","resumed":%s}\n' "$id" "$cwd" "$resumed" >>"$transcript"
+# record <type> <message>: an entry as Claude Code writes one, now. Its
+# milliseconds count entries, so no two have the same time, as Claude's don't.
+seq=0
+record() {
+  seq=$((seq+1))
+  printf '{"type":"%s","sessionId":"%s","cwd":"%s","timestamp":"%s.%03dZ","uuid":"%s-%s","message":%s}\n' \
+    "$1" "$id" "$cwd" "$(date -u +%Y-%m-%dT%H:%M:%S)" $((seq % 1000)) "$$" "$seq" "$2" >>"$transcript"
+}
+json() { printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')"; }
+prompt() { record user "{\"role\":\"user\",\"content\":$(json "$1")}"; }
+reply() {
+  record assistant "{\"id\":\"msg-$$-$seq\",\"role\":\"assistant\",\"stop_reason\":\"end_turn\",\"content\":[{\"type\":\"text\",\"text\":$(json "$1")}]}"
+}
 if [ "$resumed" = true ]; then echo "Resumed $id."; fi
 case " $prompt " in *" tick "*)
   ( i=0; while :; do i=$((i+1)); echo "$i" >.vibe-ticks; sleep 0.1; done ) &
@@ -34,11 +48,24 @@ case " $prompt " in *" env "*)
   echo "TMPDIR=$TMPDIR"
   echo "autoSetupRemote=$(git config push.autoSetupRemote) gc.auto=$(git config gc.auto)"
 esac
+# A question is written to the transcript as Claude writes one, and so is
+# every turn after it: an AskUserQuestion, its answer, and a reply to each
+# line sent.
+talk=false
 case " $prompt " in *" question "*)
-  echo "Red or blue?"; read -r answer; echo "You chose $answer."
+  talk=true
+  prompt "$prompt"
+  record assistant "{\"id\":\"msg-$$-ask\",\"role\":\"assistant\",\"stop_reason\":\"tool_use\",\"content\":[{\"type\":\"tool_use\",\"id\":\"toolu-$$\",\"name\":\"AskUserQuestion\",\"input\":{\"questions\":[{\"question\":\"Red or blue?\",\"header\":\"Colour\",\"multiSelect\":false,\"options\":[{\"label\":\"Red\"},{\"label\":\"Blue\"}]}]}}]}"
+  echo "Red or blue?"; read -r answer
+  record user "{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu-$$\",\"content\":$(json "User answered: $answer")}]}"
+  echo "You chose $answer."
+  reply "You chose $answer."
   ;;
 *)
   if [ -n "$prompt" ]; then echo "Working on: $prompt"; fi
 esac
 echo "Ready."
-while read -r line; do echo "> $line"; done
+while read -r line; do
+  echo "> $line"
+  if [ "$talk" = true ]; then prompt "$line"; reply "> $line"; fi
+done

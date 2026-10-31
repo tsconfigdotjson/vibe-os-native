@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use common::{Golden, git, git_out, wait_until};
 use serde_json::Value;
-use vibe_core::model::{AgentState, EventKind, Mode};
+use vibe_core::model::{Activity, AgentState, Certainty, EventKind, Mode};
 use vibe_core::paths::Layout;
 use vibe_core::rpc::{
     Agent, AgentDeleteParams, AgentStartParams, ErrorCode, ErrorObject, HostParams,
@@ -672,15 +672,204 @@ async fn agents_outlive_vibed() {
     let a = w.core.start_agent(start("question")).await.unwrap();
     w.wait_screen(&a.agent, "Red or blue?");
     let tree = w.session(&a.agent);
+    let before = w.list().await;
+    assert_eq!(before[0].state, AgentState::Question);
     let golden = &w.golden;
     drop(w.core);
-    // A new vibed finds it running and can delete it.
+    // A new vibed finds it running, rebuilds its state from its transcript,
+    // and can delete it.
     let core = Arc::new(Core::open(golden.config()).unwrap());
     assert_eq!(core.adopt_sessions().await, 1);
     let list = core.agents(HostParams::default()).await.unwrap().agents;
-    assert_eq!(list, std::slice::from_ref(&a));
+    assert_eq!(list, before);
+    assert_eq!(list[0].status.activity, Activity::AwaitingAnswer);
+    assert_eq!(
+        Agent {
+            state: a.state,
+            status: a.status.clone(),
+            ..list[0].clone()
+        },
+        a
+    );
     core.delete_agent(delete(&a.agent, false)).await.unwrap();
     assert!(tree.is_empty());
+}
+
+/// Waits up to 20 s for `answered`.
+async fn wait_answered(core: &Core, r: &str, mark: &vibe_status::Mark) {
+    for _ in 0..1000 {
+        if core.answered(None, r, mark).await.unwrap() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("{r} never answered");
+}
+
+#[tokio::test]
+async fn the_status_follows_the_transcript_through_a_question_and_its_answer() {
+    let w = world().await;
+    let a = w.core.start_agent(start("pick a question")).await.unwrap();
+    w.wait_screen(&a.agent, "Red or blue?");
+    let list = w.list().await;
+    let s = &list[0].status;
+    assert_eq!(list[0].state, AgentState::Question);
+    assert_eq!(
+        (s.activity, s.certainty),
+        (Activity::AwaitingAnswer, Certainty::Firm)
+    );
+    assert!(s.since.is_some());
+    assert_eq!(s.line.as_deref(), Some("AskUserQuestion"));
+
+    // Waiting on the answer to a send: quiet isn't an answer, and the old
+    // question isn't one either.
+    let mark = w.core.mark_send(None, &a.agent).await.unwrap();
+    assert!(!w.core.answered(None, &a.agent, &mark).await.unwrap());
+    w.type_line(&a.agent, "red");
+    wait_answered(&w.core, &a.agent, &mark).await;
+    let list = w.list().await;
+    assert_eq!(list[0].state, AgentState::Idle);
+    assert_eq!(list[0].status.activity, Activity::Done);
+
+    // A turn after it is waited for the same way.
+    let mark = w.core.mark_send(None, &a.agent).await.unwrap();
+    assert!(
+        !w.core.answered(None, &a.agent, &mark).await.unwrap(),
+        "done with the last turn isn't an answer to this one"
+    );
+    w.type_line(&a.agent, "and now green");
+    wait_answered(&w.core, &a.agent, &mark).await;
+    assert_eq!(
+        w.list().await[0].status.line.as_deref(),
+        Some("› and now green")
+    );
+
+    // vibed's own asleep stands while it holds; the transcript doesn't
+    // undo it.
+    {
+        let mut store = vibe_core::store::Store::open(&w.layout.db()).unwrap();
+        store
+            .set_agent_state("local", &a.agent, AgentState::Asleep)
+            .unwrap();
+    }
+    assert_eq!(w.list().await[0].state, AgentState::Asleep);
+    w.core.delete_agent(delete(&a.agent, false)).await.unwrap();
+    assert!(w.core.mark_send(None, &a.agent).await.is_err());
+}
+
+#[tokio::test]
+async fn the_status_loop_announces_states_and_statuses() {
+    let w = world().await;
+    let (_, mut events) = w.core.subscribe();
+    let looping = w.core.spawn_status();
+    let a = w.core.start_agent(start("question")).await.unwrap();
+    // Waits for the event `ok` takes, and returns it.
+    async fn next(
+        events: &mut tokio::sync::broadcast::Receiver<vibe_core::rpc::Event>,
+        what: &str,
+        ok: impl Fn(&vibe_core::rpc::Event) -> bool,
+    ) -> vibe_core::rpc::Event {
+        let found = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let e = events.recv().await.unwrap();
+                if ok(&e) {
+                    return e;
+                }
+            }
+        })
+        .await;
+        found.unwrap_or_else(|_| panic!("no {what} event"))
+    }
+    let r = a.agent.clone();
+    let e = next(&mut events, "question", |e| {
+        e.kind == EventKind::AgentState && e.state.as_deref() == Some("question")
+    })
+    .await;
+    assert_eq!(e.agent.as_deref(), Some(r.as_str()));
+    assert_eq!(e.project.as_deref(), Some("app"));
+    let e = next(&mut events, "awaiting_answer status", |e| {
+        e.kind == EventKind::AgentStatus
+            && e.status.as_ref().map(|s| s.activity) == Some(Activity::AwaitingAnswer)
+    })
+    .await;
+    assert_eq!(e.agent.as_deref(), Some(r.as_str()));
+    w.type_line(&r, "blue");
+    next(&mut events, "idle", |e| {
+        e.kind == EventKind::AgentState && e.state.as_deref() == Some("idle")
+    })
+    .await;
+    let e = next(&mut events, "done status", |e| {
+        e.kind == EventKind::AgentStatus
+            && e.status.as_ref().map(|s| s.activity) == Some(Activity::Done)
+    })
+    .await;
+    assert_eq!(e.agent.as_deref(), Some(r.as_str()));
+    looping.abort();
+    w.core.delete_agent(delete(&r, false)).await.unwrap();
+}
+
+#[tokio::test]
+async fn sessions_are_asked_on_a_full_refresh_or_a_change() {
+    let w = world().await;
+    let a = w.core.start_agent(start("hello")).await.unwrap();
+    w.wait_screen(&a.agent, "Working on: hello");
+    let mut published = std::collections::HashMap::new();
+    let (_, mut events) = w.core.subscribe();
+    let paths = w.core.refresh_status(&mut published, true).await;
+    let transcript = w
+        .claude(&a.agent)
+        .transcript(Path::new(&a.worktree), &a.session_id);
+    assert!(paths.contains(&transcript), "{paths:?}");
+    let e = events.try_recv().unwrap();
+    assert_eq!(e.kind, EventKind::AgentStatus);
+    assert_eq!(
+        e.status.map(|s| s.activity),
+        Some(Activity::Unknown),
+        "the stand-in's line says nothing yet"
+    );
+    assert!(events.try_recv().is_err(), "nothing else changed");
+    // Its session ends. A refresh for a file-system event, with nothing new
+    // in the transcript, doesn't ask; the next full one does.
+    w.session(&a.agent).end(Duration::from_secs(5));
+    w.core.refresh_status(&mut published, false).await;
+    assert!(events.try_recv().is_err());
+    w.core.refresh_status(&mut published, true).await;
+    let e = events.try_recv().unwrap();
+    assert_eq!(
+        (e.kind, e.state.as_deref()),
+        (EventKind::AgentState, Some("exited"))
+    );
+    w.core.delete_agent(delete(&a.agent, false)).await.unwrap();
+    // A deleted agent's tail and status go with it.
+    assert!(w.core.refresh_status(&mut published, true).await.is_empty());
+    assert!(published.is_empty());
+}
+
+#[tokio::test]
+async fn after_a_clear_the_agent_follows_its_new_session() {
+    let w = world().await;
+    let a = w.core.start_agent(start("question")).await.unwrap();
+    w.wait_screen(&a.agent, "Red or blue?");
+    // `/clear`: Claude starts a new session in the same worktree, in a
+    // new transcript beside the first.
+    let claude = w.claude(&a.agent);
+    let worktree = Path::new(&a.worktree);
+    let new_id = "c1ea4ed0-0000-4000-8000-00000000c1ea";
+    // It began after the first, whose entries the stand-in dates now.
+    let later = vibe_core::time::rfc3339(vibe_core::time::now() + 60);
+    let line = serde_json::json!({"type": "user", "sessionId": new_id, "cwd": a.worktree,
+        "timestamp": later,
+        "message": {"role": "user", "content": "after the clear"}});
+    std::thread::sleep(Duration::from_millis(20));
+    fs::write(claude.transcript(worktree, new_id), format!("{line}\n")).unwrap();
+    let list = w.list().await;
+    assert_eq!(list[0].session_id, new_id);
+    assert_eq!(list[0].status.activity, Activity::Thinking);
+    assert_eq!(list[0].status.line.as_deref(), Some("› after the clear"));
+    // Recorded, so a resume continues the new session.
+    let store = vibe_core::store::Store::open(&w.layout.db()).unwrap();
+    assert_eq!(store.agent("local", &a.agent).unwrap().session_id, new_id);
+    w.core.delete_agent(delete(&a.agent, true)).await.unwrap();
 }
 
 #[tokio::test]

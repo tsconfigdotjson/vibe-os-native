@@ -1,0 +1,34 @@
+{
+  "description": "A notification, not a reply: what an agent's transcript says changed. The status engine sends one whenever its activity, title, latest activity line, pending wakeups or stop change. This agent stopped at a Claude usage limit, which the menu and `vibe_list_agents` show as \"limited until 15:00\", with a `/loop` wakeup still armed for later; it's `idle`, and the next send wakes it.",
+  "notification": {
+    "jsonrpc": "2.0",
+    "method": "events.event",
+    "params": {
+      "seq": 14,
+      "at": "2026-10-30T12:00:00Z",
+      "host": "local",
+      "kind": "agent.status",
+      "project": "web",
+      "ref": "quiet-amber-otter",
+      "status": {
+        "activity": "errored",
+        "certainty": "firm",
+        "since": "2026-10-30T11:58:12Z",
+        "title": "Watch the deploy and fix what breaks",
+        "line": "$ gh run watch",
+        "pending_wakeups": [
+          {
+            "kind": "loop",
+            "due_at": "2026-10-30T13:30:00Z",
+            "certainty": "firm",
+            "recurring": false,
+            "reason": "Check the deploy again"
+          }
+        ],
+        "stop_reason": "usage_limit",
+        "resets_at": "2026-10-30T15:00:00Z",
+        "error": "rate_limit"
+      }
+    }
+  }
+}

@@ -3,6 +3,17 @@
 version = 4
 
 [[package]]
+name = "agent-tail"
+version = "0.0.0"
+source = "git+https://github.com/tsconfigdotjson/agent-tail?rev=0b5c3f6d9b624e3e22493bfdfbb442067367459f#0b5c3f6d9b624e3e22493bfdfbb442067367459f"
+dependencies = [
+ "memchr",
+ "serde",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
 name = "arrayvec"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -370,6 +381,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_spanned"
+version = "1.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e7523beb55eece201a2356bee0bbca0d1ab466c14c07703b2e0ee6d42cb0c2c"
+dependencies = [
+ "serde_core",
+]
+
+[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -496,6 +516,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "toml"
+version = "1.1.8+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "20489e00e4d8741d6be680764cc12e270655e375a20d1011e844a9c3379e678d"
+dependencies = [
+ "indexmap",
+ "serde_core",
+ "serde_spanned",
+ "toml_datetime",
+ "toml_parser",
+ "toml_writer",
+ "winnow",
+]
+
+[[package]]
 name = "toml_datetime"
 version = "1.1.2+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -598,6 +633,7 @@ dependencies = [
  "tempfile",
  "vibe-core",
  "vibe-guest",
+ "vibe-status",
  "vt100",
 ]
 
@@ -633,6 +669,13 @@ dependencies = [
 [[package]]
 name = "vibe-status"
 version = "0.1.0"
+dependencies = [
+ "agent-tail",
+ "libc",
+ "serde_json",
+ "tempfile",
+ "vibe-core",
+]
 
 [[package]]
 name = "vibe-testguest"
@@ -653,6 +696,7 @@ dependencies = [
  "tokio",
  "vibe-core",
  "vibe-env",
+ "vibe-status",
 ]
 
 [[package]]

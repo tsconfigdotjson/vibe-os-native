@@ -17,8 +17,8 @@ use serde_json::Value;
 
 pub use crate::limits::HostLimits;
 pub use crate::model::{
-    AgentState, Environment, EventKind, GhState, Mode, Model, Profile, ProjectSource, Reasoning,
-    SessionState,
+    Activity, AgentState, Certainty, Environment, EventKind, GhState, Mode, Model, Profile,
+    ProjectSource, Reasoning, SessionState, StopReason, WakeupKind,
 };
 
 /// Bumped on any incompatible change to the contract. Clients send theirs in
@@ -890,6 +890,57 @@ pub struct Agent {
     pub created_at: String,
     /// The command that attaches a terminal to it.
     pub attach: String,
+    /// What its transcript says it's doing.
+    pub status: AgentStatus,
+}
+
+/// What an agent's transcript says it's doing, from agent-tail (PRD:
+/// Matching an agent to its transcript). Until a transcript is read, its
+/// activity is `unknown`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentStatus {
+    pub activity: Activity,
+    pub certainty: Certainty,
+    /// When the activity began.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<String>,
+    /// The session's title, once Claude has written one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// The latest thing it did, as a line: `› fix the build`, `$ cargo
+    /// test`, `Edit routing.ts`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<String>,
+    /// Wakeups it has armed and that haven't fired.
+    pub pending_wakeups: Vec<Wakeup>,
+    /// Why its turn stopped, beyond an error: `usage_limit` is shown as
+    /// "limited until …".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<StopReason>,
+    /// When a usage limit resets, if Claude recorded it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<String>,
+    /// The error its turn ended with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// A wakeup an agent has armed: a `/loop` or a cron job.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Wakeup {
+    pub kind: WakeupKind,
+    /// When it's due, if the transcript recorded it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub due_at: Option<String>,
+    /// `firm` when a tool result recorded it, `inferred` from the call
+    /// alone.
+    pub certainty: Certainty,
+    /// Whether it fires again after this time: a recurring cron job stays
+    /// pending until it's deleted.
+    pub recurring: bool,
+    /// What it's for, if the model said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -921,6 +972,9 @@ pub struct Event {
     pub limit: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// An agent's new status, for `agent.status`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<AgentStatus>,
 }
 
 #[cfg(test)]
@@ -1081,6 +1135,7 @@ mod tests {
             state: None,
             limit: None,
             message: None,
+            status: None,
         };
         assert_eq!(
             serde_json::to_value(Request::notification::<EventNotice>(&e)).unwrap(),

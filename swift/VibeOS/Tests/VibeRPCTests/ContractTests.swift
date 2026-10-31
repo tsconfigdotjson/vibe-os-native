@@ -145,6 +145,8 @@ let swiftTypes: [String: Set<String>] = [
     "AgentStartParams": keys(AgentStartParams.CodingKeys.self),
     "AgentDeleteParams": keys(AgentDeleteParams.CodingKeys.self),
     "Agent": keys(Agent.CodingKeys.self),
+    "AgentStatus": keys(AgentStatus.CodingKeys.self),
+    "Wakeup": keys(Wakeup.CodingKeys.self),
     "AgentList": keys(AgentList.CodingKeys.self),
 ]
 
@@ -159,6 +161,10 @@ let swiftEnums: [String: [String]] = [
     "EventKind": EventKind.allCases.map(\.rawValue),
     "SessionState": SessionState.allCases.map(\.rawValue),
     "AgentState": AgentState.allCases.map(\.rawValue),
+    "Activity": AgentActivity.allCases.map(\.rawValue),
+    "Certainty": Certainty.allCases.map(\.rawValue),
+    "WakeupKind": WakeupKind.allCases.map(\.rawValue),
+    "StopReason": StopReason.allCases.map(\.rawValue),
 ]
 
 /// A method's Swift types, and a typed round trip of an example of it.
