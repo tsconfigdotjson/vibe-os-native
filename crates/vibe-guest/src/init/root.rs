@@ -326,7 +326,8 @@ fn stack(boot: &Boot) -> io::Result<Vec<Writable>> {
         None => {
             let dir = Path::new(LAYERS).join(".scratch");
             mkdir_p(&dir, 0o755)?;
-            mount("tmpfs", &dir, "tmpfs", NOSUID_NODEV, "mode=0755")?;
+            // Like a disk's, not `nosuid`: setuid is the root overlay's call.
+            mount("tmpfs", &dir, "tmpfs", libc::MS_NODEV, "mode=0755")?;
             dir
         }
     };
@@ -545,10 +546,7 @@ fn mount_disk(device: &Path, dir: &Path, read_only: bool) -> io::Result<()> {
             format!("{source} has no filesystem vibe-guest knows"),
         )
     })?;
-    let mut flags = NOSUID_NODEV;
-    if read_only || fstype != "ext4" {
-        flags |= libc::MS_RDONLY;
-    }
+    let flags = disk_flags(read_only, fstype);
     // The writable disk is sparse on the host, so the kernel mustn't zero
     // its inode tables in the background; mke2fs marked them unused.
     let data = if fstype == "ext4" && !read_only {
@@ -568,6 +566,18 @@ fn mount_disk(device: &Path, dir: &Path, read_only: bool) -> io::Result<()> {
             format!("mount {source} ({fstype}) at {}: {e}", dir.display()),
         )
     })
+}
+
+/// How a disk is mounted under `/layers`: never `nosuid`. Nothing runs
+/// from those mounts, which the switch hides; programs run through the
+/// root overlay, which decides setuid, and a layer's own `nosuid` would
+/// only risk taking it away from the template's `sudo`.
+fn disk_flags(read_only: bool, fstype: &str) -> libc::c_ulong {
+    let mut flags = libc::MS_NODEV;
+    if read_only || fstype != "ext4" {
+        flags |= libc::MS_RDONLY;
+    }
+    flags
 }
 
 /// Formats a blank writable disk.
@@ -723,6 +733,17 @@ mod tests {
         let empty = dir.path().join("empty.img");
         fs::File::create(&empty).unwrap();
         assert!(blank(&empty).unwrap());
+    }
+
+    #[test]
+    fn layers_keep_setuid() {
+        for (read_only, fstype) in [(true, "ext4"), (false, "ext4"), (true, "squashfs")] {
+            assert_eq!(disk_flags(read_only, fstype) & libc::MS_NOSUID, 0);
+            assert_ne!(disk_flags(read_only, fstype) & libc::MS_NODEV, 0);
+        }
+        assert_ne!(disk_flags(true, "ext4") & libc::MS_RDONLY, 0);
+        assert_eq!(disk_flags(false, "ext4") & libc::MS_RDONLY, 0);
+        assert_ne!(disk_flags(false, "erofs") & libc::MS_RDONLY, 0);
     }
 
     #[test]

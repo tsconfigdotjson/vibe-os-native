@@ -333,8 +333,12 @@ async fn a_restarted_vibed_saves_a_shell_that_exited_while_it_was_down() {
         .unwrap();
     let watched = core.clone();
     tokio::task::spawn_blocking(move || {
+        // Saved and recorded: the image is kept a moment before the run's
+        // record is written, and stopping the supervisor in between would
+        // cancel the record.
         wait_until("the toolbox to be saved", || {
-            watched.toolbox_status_now().template == Some(1)
+            let s = watched.toolbox_status_now();
+            s.template == Some(1) && s.state == ToolboxState::Closed && s.last.is_some()
         })
     })
     .await

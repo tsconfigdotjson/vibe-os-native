@@ -261,7 +261,9 @@ async fn new_agents_get_what_the_toolbox_installed_and_sleeping_ones_keep_theirs
     // 1. gcloud and a login, in the toolbox. The toolbox may sudo.
     let (t1, h1) = w
         .toolbox_session(|| {
-            w.in_toolbox("sudo -n true");
+            // Its mode and owner first, so a failure says whether the image or
+            // the mounts lost setuid.
+            w.in_toolbox("stat -c 'sudo is %a %U:%G' /usr/bin/sudo; sudo -n true");
             w.in_toolbox(&format!("sudo -n -H bash -c '{GCLOUD}'"));
             w.in_toolbox("git config --global user.name 'Toolbox Test'");
         })

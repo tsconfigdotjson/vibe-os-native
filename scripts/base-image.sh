@@ -170,23 +170,40 @@ say "making the images"
 "$DOCKER" run --rm -v "$WORK:/work" vibeos-base-builder bash -euo pipefail -c '
   cd /work
   ./gen_init_cpio initrd.list | gzip -9 >initrd
-  mkdir rootfs
-  tar -xpf rootfs.tar -C rootfs --numeric-owner
+  # Unpacked inside the container, never in /work: on a Mac, /work is the
+  # host directory through Docker Desktop'"'"'s file sharing, which keeps
+  # neither root ownership nor setuid bits, and mke2fs copies what it sees
+  # (sudo then refuses to run).
+  rootfs=/rootfs
+  mkdir "$rootfs"
+  tar -xpf rootfs.tar -C "$rootfs" --numeric-owner --same-owner
   rm rootfs.tar
   # What docker leaves to the runtime, and vibe-guest fills in at boot.
-  echo vibe >rootfs/etc/hostname
-  printf "127.0.0.1\tlocalhost\n::1\tlocalhost\n127.0.1.1\tvibe\n" >rootfs/etc/hosts
-  : >rootfs/etc/resolv.conf
-  rm -f rootfs/.dockerenv
-  used=$(du -sk --apparent-size rootfs | cut -f1)
-  inodes=$(find rootfs | wc -l)
+  echo vibe >"$rootfs/etc/hostname"
+  printf "127.0.0.1\tlocalhost\n::1\tlocalhost\n127.0.1.1\tvibe\n" >"$rootfs/etc/hosts"
+  : >"$rootfs/etc/resolv.conf"
+  rm -f "$rootfs/.dockerenv"
+  used=$(du -sk --apparent-size "$rootfs" | cut -f1)
+  inodes=$(find "$rootfs" | wc -l)
   # A quarter more than it holds, for ext4'"'"'s own, and nothing reserved:
   # nobody writes to it.
   size=$(( (used + used / 4 + 65536) / 1024 ))M
   mke2fs -q -t ext4 -b 4096 -m 0 -O ^has_journal -N $(( inodes + inodes / 4 + 1024 )) \
-    -L base -d rootfs base.img "$size"
+    -L base -d "$rootfs" base.img "$size"
   e2fsck -fn base.img
-  rm -rf rootfs
+  rm -rf "$rootfs"
+  # The image keeps owners and modes: sudo is root'"'"'s and setuid.
+  check() {
+    debugfs -R "stat $1" base.img 2>/dev/null >stat.txt
+    grep -Eq "Mode: +0*$2 " stat.txt && grep -Eq "^User: +0 +Group: +0 " stat.txt || {
+      echo "base.img: $1 isn'"'"'t mode $2, owned by root:" >&2
+      head -3 stat.txt >&2
+      exit 1
+    }
+  }
+  check /usr/bin/sudo 4755
+  check /etc 755
+  rm -f stat.txt
   gzip -6 base.img
 '
 
