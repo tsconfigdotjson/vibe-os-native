@@ -15,18 +15,19 @@ dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/$(printf '%s' "$cwd" | tr -c '
 mkdir -p "$dir"
 transcript="$dir/$id.jsonl"
 printf '{"type":"user","sessionId":"%s","cwd":"%s","resumed":%s}\n' "$id" "$cwd" "$resumed" >>"$transcript"
-# record <type> <message>: an entry as Claude Code writes one, now. Its
-# milliseconds count entries, so no two have the same time, as Claude's don't.
-seq=0
+# record <type> <message> [<more fields>]: an entry as Claude Code writes
+# one, now. Its milliseconds count entries, so no two have the same time, as
+# Claude's don't.
+seq=0 who=$$
 record() {
   seq=$((seq+1))
-  printf '{"type":"%s","sessionId":"%s","cwd":"%s","timestamp":"%s.%03dZ","uuid":"%s-%s","message":%s}\n' \
-    "$1" "$id" "$cwd" "$(date -u +%Y-%m-%dT%H:%M:%S)" $((seq % 1000)) "$$" "$seq" "$2" >>"$transcript"
+  printf '{"type":"%s","sessionId":"%s","cwd":"%s","timestamp":"%s.%03dZ","uuid":"%s-%s","message":%s%s}\n' \
+    "$1" "$id" "$cwd" "$(date -u +%Y-%m-%dT%H:%M:%S)" $((seq % 1000)) "$who" "$seq" "$2" "${3:-}" >>"$transcript"
 }
 json() { printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')"; }
 prompt() { record user "{\"role\":\"user\",\"content\":$(json "$1")}"; }
 reply() {
-  record assistant "{\"id\":\"msg-$$-$seq\",\"role\":\"assistant\",\"stop_reason\":\"end_turn\",\"content\":[{\"type\":\"text\",\"text\":$(json "$1")}]}"
+  record assistant "{\"id\":\"msg-$who-$seq\",\"role\":\"assistant\",\"stop_reason\":\"end_turn\",\"content\":[{\"type\":\"text\",\"text\":$(json "$1")}]}"
 }
 if [ "$resumed" = true ]; then echo "Resumed $id."; fi
 case " $prompt " in *" tick "*)
@@ -64,6 +65,31 @@ case " $prompt " in *" question "*)
   record user "{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu-$$\",\"content\":$(json "User answered: $answer")}]}"
   echo "You chose $answer."
   reply "You chose $answer."
+  ;;
+*" talk "*|*" loop "*)
+  talk=true
+  echo "Working on: $prompt"
+  prompt "$prompt"
+  case " $prompt " in *" loop "*)
+    # A /loop wakeup, as Claude Code arms one with ScheduleWakeup: firm
+    # once its result gives the time it's due. It fires by the wall clock,
+    # as a frozen or restored clock would make a plain sleep late.
+    n=${prompt#*loop }; n=${n%% *}; due=$(($(date +%s) + n))
+    record assistant "{\"id\":\"msg-$$-loop\",\"role\":\"assistant\",\"stop_reason\":\"tool_use\",\"content\":[{\"type\":\"tool_use\",\"id\":\"toolu-$$-loop\",\"name\":\"ScheduleWakeup\",\"input\":{\"delaySeconds\":$n,\"prompt\":\"loop check\",\"reason\":\"Checking again in ${n}s.\"}}]}"
+    record user "{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu-$$-loop\",\"content\":\"Next wakeup scheduled (in ${n}s).\"}]}" \
+      ",\"toolUseResult\":{\"scheduledFor\":${due}000,\"clampedDelaySeconds\":$n,\"wasClamped\":false}"
+    echo "Loop due at $due."
+    (
+      who="$$-loop"
+      while [ "$(date +%s)" -lt "$due" ]; do sleep 1; done
+      printf '{"type":"system","subtype":"scheduled_task_fire","sessionId":"%s","cwd":"%s","timestamp":"%s.999Z","uuid":"%s-fire","taskKind":"loop","cronKind":"loop","prompt":"loop check"}\n' \
+        "$id" "$cwd" "$(date -u +%Y-%m-%dT%H:%M:%S)" "$who" >>"$transcript"
+      prompt "loop check"
+      reply "Loop fired."
+      echo "Loop fired at $(date +%s)."
+    ) &
+  esac
+  reply "Done."
   ;;
 *)
   if [ -n "$prompt" ]; then echo "Working on: $prompt"; fi

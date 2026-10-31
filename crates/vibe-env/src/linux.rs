@@ -937,6 +937,39 @@ impl Sleeper for LinuxVm {
         self.machine.thaw(&socket, SystemTime::now())?;
         Ok(Woke::Reattach(end))
     }
+
+    /// What the guest really uses now, plus its headroom: the balloon
+    /// hands the rest back before the save, so that's about the snapshot.
+    fn sleep_size(&self, h: &Handle) -> Result<Option<u64>> {
+        let socket = self.socket(h);
+        if !self.machine.running(&socket) {
+            return Err(EnvError::new(format!("{} isn't running", h.agent_ref)));
+        }
+        let status = self.machine.status(&socket)?;
+        Ok(Some(guest::balloon_floor(status.memory)))
+    }
+
+    fn saved(&self, h: &Handle) -> Option<crate::Saved> {
+        let meta = fs::metadata(self.snapshot(h))
+            .ok()
+            .filter(fs::Metadata::is_file)?;
+        Some(crate::Saved {
+            bytes: meta.len(),
+            at: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+        })
+    }
+
+    /// Its VM is in the snapshot alone, so it goes with it; a wake then
+    /// boots fresh, for `claude --resume`.
+    fn drop_saved(&self, h: &Handle) -> Result<()> {
+        if self.machine.running(&self.socket(h)) {
+            return Err(EnvError::new(format!(
+                "{}'s VM is running, so its snapshot isn't its own to drop",
+                h.agent_ref
+            )));
+        }
+        remove_file(&self.snapshot(h))
+    }
 }
 
 impl Backend for LinuxVm {

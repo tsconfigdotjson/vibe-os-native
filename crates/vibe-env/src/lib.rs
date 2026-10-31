@@ -324,12 +324,39 @@ pub trait Limiter {
     fn usage(&self, h: &Handle) -> Result<Usage>;
 }
 
+/// What a sleeping agent keeps on disk: a snapshot, on a backend whose
+/// sleep saves the agent there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Saved {
+    pub bytes: u64,
+    /// When it was saved.
+    pub at: std::time::SystemTime,
+}
+
 /// Sleep: `SIGSTOP`, the cgroup freezer, or a snapshot.
 pub trait Sleeper {
     fn sleep(&self, h: &Handle) -> Result<()>;
 
     /// Wakes a sleeping or paused agent.
     fn wake(&self, h: &Handle) -> Result<Woke>;
+
+    /// About how much disk a sleep now would write, on a backend whose
+    /// sleep saves the agent to disk; none on one whose sleep writes
+    /// nothing. All snapshots share the `snapshot_disk` budget.
+    fn sleep_size(&self, _h: &Handle) -> Result<Option<u64>> {
+        Ok(None)
+    }
+
+    /// What the agent's sleep saved, while it's asleep that way.
+    fn saved(&self, _h: &Handle) -> Option<Saved> {
+        None
+    }
+
+    /// Drops what the agent's sleep saved, to make room for another's.
+    /// Its processes go with it: its next wake is [`Woke::Resume`].
+    fn drop_saved(&self, _h: &Handle) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// A way of running agents: the three traits and what it can do.
