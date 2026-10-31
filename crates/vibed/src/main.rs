@@ -14,6 +14,7 @@ use vibe_core::model::Environment;
 use vibe_core::paths::{self, Layout};
 use vibe_core::rpc::MAX_MESSAGE_BYTES;
 use vibe_env::linux::{self, LinuxVm};
+use vibe_env::macos::Macos;
 use vibe_env::testing::{TestBackend, TestToolbox};
 use vibe_env::toolbox::Toolbox;
 use vibed::agents::Backends;
@@ -44,6 +45,8 @@ environment:
                   where the Linux base image and Claude Code for linux agents
                   come from (default: their published releases; a file://
                   directory works too)
+  VIBE_CLAUDE     on a Mac, the claude macos agents run (default: the one on
+                  the login shell's PATH)
   VIBE_TEST_BACKEND
                   for tests only: run every environment's agents natively,
                   unlimited but for a supervisor, with this program as
@@ -224,6 +227,18 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
             ),
         }
     }
+    // macos agents run natively, under the governor.
+    let mut macos = None;
+    if config.backends.get(Environment::Macos).is_none() && cfg!(target_os = "macos") {
+        let mut backend = Macos::new(config.layout.home());
+        if let Some(claude) = std::env::var_os("VIBE_CLAUDE").filter(|v| !v.is_empty()) {
+            backend = backend.with_claude(PathBuf::from(claude));
+        }
+        vibed::log!("vibed: macos agents run natively, under the governor");
+        let backend = Arc::new(backend);
+        macos = Some(Arc::clone(&backend));
+        config.backends = config.backends.with(Environment::Macos, backend);
+    }
     let gh: OsString = config.gh.clone();
     let core = Arc::new(Core::open(config)?);
     vibed::log!(
@@ -249,6 +264,8 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
     // restart, rebuilt.
     let status = core.spawn_status();
     let maintenance = core.spawn_maintenance(MAINTENANCE_EVERY);
+    // Pauses and warnings from agents' limits, as events and states.
+    let limit_watch = core.spawn_limit_watch(vibed::limit_watch::LIMITS_EVERY);
     // Saves the toolbox when its shell exits, and runs the weekly update.
     let toolbox = core.spawn_toolbox(TOOLBOX_POLL, vibed::toolbox::UPDATE_CHECK_EVERY);
     vibed::log!(
@@ -266,12 +283,18 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
     gh_checks.abort();
     status.abort();
     maintenance.abort();
+    limit_watch.abort();
     adopting.abort();
     if let Some(toolbox) = toolbox {
         toolbox.abort();
     }
     if let Some(images) = images {
         images.abort();
+    }
+    // Governors' threads end with the process, mid duty cycle or not:
+    // their agents run on as themselves.
+    if let Some(macos) = macos {
+        macos.release();
     }
     drop(guard);
     vibed::log!("vibed: stopped");

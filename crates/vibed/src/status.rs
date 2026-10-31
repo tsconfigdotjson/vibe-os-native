@@ -233,7 +233,7 @@ impl Core {
         paths
     }
 
-    fn is_busy(&self, agent_ref: &str) -> bool {
+    pub(crate) fn is_busy(&self, agent_ref: &str) -> bool {
         lock(&self.agents_busy).contains(agent_ref)
     }
 
