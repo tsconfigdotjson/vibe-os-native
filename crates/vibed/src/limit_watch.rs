@@ -84,18 +84,24 @@ impl Core {
                     Seen::default()
                 }
             });
+            // A stop, delete or resume that began meanwhile goes first.
+            if self.is_busy(&a.agent_ref) {
+                continue;
+            }
             if usage.paused.is_none() && before.applied != Some(limits) {
+                // Tried once per change, so a failure is said once.
+                before.applied = Some(limits);
                 match blocking(move || backend.apply(&handle, &limits)).await {
-                    Ok(()) => {
-                        crate::log!("vibed: {} is held to new limits", a.agent_ref);
-                        before.applied = Some(limits);
-                    }
+                    Ok(()) => crate::log!("vibed: {} is held to new limits", a.agent_ref),
                     Err(e) => crate::log!(
                         "vibed: can't hold {} to new limits: {}",
                         a.agent_ref,
                         e.message
                     ),
                 }
+            }
+            if self.is_busy(&a.agent_ref) {
+                continue;
             }
             if let Some(limit) = usage.paused
                 && before.paused != Some(limit)

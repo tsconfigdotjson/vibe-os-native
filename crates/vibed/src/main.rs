@@ -228,13 +228,16 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
         }
     }
     // macos agents run natively, under the governor.
+    let mut macos = None;
     if config.backends.get(Environment::Macos).is_none() && cfg!(target_os = "macos") {
         let mut backend = Macos::new(config.layout.home());
         if let Some(claude) = std::env::var_os("VIBE_CLAUDE").filter(|v| !v.is_empty()) {
             backend = backend.with_claude(PathBuf::from(claude));
         }
         vibed::log!("vibed: macos agents run natively, under the governor");
-        config.backends = config.backends.with(Environment::Macos, Arc::new(backend));
+        let backend = Arc::new(backend);
+        macos = Some(Arc::clone(&backend));
+        config.backends = config.backends.with(Environment::Macos, backend);
     }
     let gh: OsString = config.gh.clone();
     let core = Arc::new(Core::open(config)?);
@@ -287,6 +290,11 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
     }
     if let Some(images) = images {
         images.abort();
+    }
+    // Governors' threads end with the process, mid duty cycle or not:
+    // their agents run on as themselves.
+    if let Some(macos) = macos {
+        macos.release();
     }
     drop(guard);
     vibed::log!("vibed: stopped");

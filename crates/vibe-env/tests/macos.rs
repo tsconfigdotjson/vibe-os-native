@@ -26,6 +26,14 @@ use vibe_env::{
 
 const MIB: u64 = 1 << 20;
 
+/// One test at a time, whatever the test threads: they time what the
+/// governor does, and one spins two cores.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// A "Claude" that runs its prompt as a shell script, then echoes what it's
 /// sent, for the governor's own tests.
 const SCRIPT: &str = r#"#!/bin/sh
@@ -132,36 +140,43 @@ impl Harness for MacHarness {
 
 #[test]
 fn start_shows_processes() {
+    let _one = serial();
     conformance::start_shows_processes(&MacHarness::new());
 }
 
 #[test]
 fn run_in_compartment() {
+    let _one = serial();
     conformance::run_in_compartment(&MacHarness::new());
 }
 
 #[test]
 fn limit_hit_pauses() {
+    let _one = serial();
     conformance::limit_hit_pauses(&MacHarness::new());
 }
 
 #[test]
 fn sleep_then_wake_is_exact() {
+    let _one = serial();
     conformance::sleep_then_wake_is_exact(&MacHarness::new());
 }
 
 #[test]
 fn reboot_then_wake() {
+    let _one = serial();
     conformance::reboot_then_wake(&MacHarness::new());
 }
 
 #[test]
 fn delete_leaves_nothing() {
+    let _one = serial();
     conformance::delete_leaves_nothing(&MacHarness::new());
 }
 
 #[test]
 fn a_memory_limit_pauses_too() {
+    let _one = serial();
     struct Memory(MacHarness);
     impl Harness for Memory {
         type B = Macos;
@@ -194,6 +209,7 @@ fn a_memory_limit_pauses_too() {
 
 #[test]
 fn the_backend_says_what_it_can_do() {
+    let _one = serial();
     let caps = vibe_env::Backend::capabilities(MacHarness::new().backend());
     assert!(!caps.sleep_frees_memory, "macOS may swap, but keeps it");
     assert!(!caps.exact_after_reboot, "after a reboot it's --resume");
@@ -333,6 +349,7 @@ fn quick() -> Intervals {
 
 #[test]
 fn a_fork_bomb_is_paused() {
+    let _one = serial();
     // Bounded, so a governor that failed wouldn't take the machine down:
     // each level forks two more, 2^(depth+1) shells and their sleeps.
     let depth: u32 = std::env::var("VIBE_FORK_BOMB_DEPTH")
@@ -374,6 +391,7 @@ fn a_fork_bomb_is_paused() {
 
 #[test]
 fn a_200_mb_allocation_shows_up_in_the_agents_memory() {
+    let _one = serial();
     let h = MacHarness::with(SCRIPT, Intervals::default());
     let a = Agent::start(
         &h,
@@ -456,6 +474,7 @@ fn priority(pid: u32) -> i32 {
 
 #[test]
 fn a_nohup_child_is_still_counted_once_its_reparented() {
+    let _one = serial();
     let h = MacHarness::with(SCRIPT, quick());
     // Five sleeps whose parent shell exits, so launchd (or init, or a
     // subreaper) adopts them; then the agent goes on. They start once the
@@ -501,6 +520,7 @@ fn a_nohup_child_is_still_counted_once_its_reparented() {
 
 #[test]
 fn a_child_in_a_session_of_its_own_is_found_by_the_walk() {
+    let _one = serial();
     let h = MacHarness::with(SCRIPT, quick());
     let a = Agent::start(
         &h,
@@ -535,7 +555,51 @@ fn a_child_in_a_session_of_its_own_is_found_by_the_walk() {
 }
 
 #[test]
+fn a_member_that_leaves_tree_and_session_is_still_counted() {
+    let _one = serial();
+    let h = MacHarness::with(SCRIPT, quick());
+    // A child that, a second in, starts a session of its own; a second
+    // after that, its parent exits, so it's reparented too: by then
+    // neither a walk nor a scan would find it, only having found it.
+    let a = Agent::start(
+        &h,
+        "daemon",
+        "perl -MPOSIX -e 'if (fork) { sleep 2; exit } sleep 1; POSIX::setsid(); sleep 300' &",
+    );
+    a.apply(roomy());
+    wait("two perls", Duration::from_secs(10), || {
+        a.named("perl").len() == 2
+    });
+    let child = a.named("perl").iter().map(|p| p.pid).max().unwrap();
+    wait("its parent to go", Duration::from_secs(10), || {
+        a.named("perl").len() == 1
+    });
+    let (p, sid) = vibe_env::tree::process(child).unwrap();
+    assert_ne!(sid, a.handle.session.unwrap(), "it left the session");
+    assert!(
+        a.procs().iter().all(|q| q.pid != p.ppid),
+        "it left the tree: {p:?}"
+    );
+    assert!(
+        a.named("perl").iter().any(|q| q.pid == child),
+        "still counted"
+    );
+    // The governor counts it, and a pause stops it.
+    a.apply(Limits {
+        max_processes: 1,
+        ..roomy()
+    });
+    wait("a processes pause", Duration::from_secs(10), || {
+        a.usage().paused == Some(Limit::Processes)
+    });
+    assert!(vibe_env::tree::process(child).unwrap().0.stopped);
+    h.backend.delete(&a.handle).unwrap();
+    assert!(vibe_env::tree::process(child).is_none(), "delete ends it");
+}
+
+#[test]
 fn cpu_is_held_to_its_cap() {
+    let _one = serial();
     let h = MacHarness::with(SCRIPT, Intervals::default());
     let a = Agent::start(
         &h,
@@ -545,18 +609,38 @@ fn cpu_is_held_to_its_cap() {
     wait("two spinners", Duration::from_secs(10), || {
         a.procs().len() >= 3
     });
+    let cpu = |a: &Agent| a.usage().cpu_ms;
+    // What it uses unlimited, which a busy machine may hold under the cap.
+    let cores_over = |a: &Agent, d: Duration| {
+        let (before, t) = (cpu(a), Instant::now());
+        std::thread::sleep(d);
+        (cpu(a) - before) as f64 / t.elapsed().as_millis() as f64
+    };
+    let free = cores_over(&a, Duration::from_secs(1));
     a.apply(Limits {
         cpu_cores: 1,
         ..roomy()
     });
     // The background, then duty cycling, take a few seconds to settle.
     std::thread::sleep(Duration::from_secs(7));
-    let cpu = |a: &Agent| a.usage().cpu_ms;
-    let (before, t) = (cpu(&a), Instant::now());
-    std::thread::sleep(Duration::from_secs(4));
+    // Meanwhile, a duty cycle is seen stopping the spinners now and then.
+    let t = Instant::now();
+    let mut seen_stopped = false;
+    let before = cpu(&a);
+    while t.elapsed() < Duration::from_secs(4) {
+        let procs = a.procs();
+        seen_stopped |= procs.iter().any(|p| p.stopped);
+        std::thread::sleep(Duration::from_millis(20));
+    }
     let cores = (cpu(&a) - before) as f64 / t.elapsed().as_millis() as f64;
+    eprintln!("{free:.2} cores unlimited, {cores:.2} held to 1");
     assert!(cores < 1.35, "{cores:.2} cores against a cap of 1");
     assert!(cores > 0.2, "{cores:.2} cores: throttled, not stopped");
+    if free > 1.4 {
+        assert!(seen_stopped, "over the cap, but never duty cycled");
+    } else {
+        eprintln!("the machine gave it only {free:.2} cores: duty cycling not required");
+    }
     assert_eq!(a.usage().paused, None, "CPU never pauses");
     // Asleep, a duty cycle doesn't continue it; woken, it runs on.
     h.backend.sleep(&a.handle).unwrap();
@@ -574,6 +658,7 @@ fn cpu_is_held_to_its_cap() {
 
 #[test]
 fn disk_past_soft_warns_and_past_hard_pauses() {
+    let _one = serial();
     let h = MacHarness::with(SCRIPT, quick());
     // Three MiB in the worktree, and one in the temp dir.
     let a = Agent::start(
@@ -599,10 +684,21 @@ fn disk_past_soft_warns_and_past_hard_pauses() {
     wait("a disk pause", Duration::from_secs(10), || {
         a.usage().paused == Some(Limit::Disk)
     });
+    assert!(a.procs().iter().all(|p| p.stopped), "paused means stopped");
+    // Room made and woken, the measurement from before doesn't pause it
+    // again: a fresh one does, or doesn't.
+    fs::remove_file(a.handle.worktree.join("fill")).unwrap();
+    assert_eq!(h.backend.wake(&a.handle).unwrap(), Woke::Exact);
+    std::thread::sleep(Duration::from_secs(2));
+    let u = a.usage();
+    assert_eq!(u.paused, None, "{u:?}");
+    assert!(u.disk.is_some_and(|d| d < 3 * MIB), "{u:?}");
+    assert!(a.procs().iter().all(|p| !p.stopped));
 }
 
 #[test]
 fn a_pause_holds_across_a_restart_of_vibed() {
+    let _one = serial();
     let h = MacHarness::with(SCRIPT, quick());
     let backend = |h: &MacHarness| {
         Macos::new(h.root().join("home"))
@@ -612,6 +708,14 @@ fn a_pause_holds_across_a_restart_of_vibed() {
     };
     let first = backend(&h);
     let handle = start_on(&first, &h, "restart", "sleep 300 & sleep 300 & sleep 300 &");
+    // Whatever happens, nothing of it is left running.
+    struct Ends(u32);
+    impl Drop for Ends {
+        fn drop(&mut self) {
+            SessionTree::with_descendants(self.0).end(Duration::from_secs(2));
+        }
+    }
+    let _ends = Ends(handle.session.unwrap());
     let procs = || first.processes(&handle).unwrap();
     wait("three sleeps", Duration::from_secs(10), || {
         procs().iter().filter(|p| p.name == "sleep").count() == 3
@@ -663,6 +767,7 @@ fn a_pause_holds_across_a_restart_of_vibed() {
 
 #[test]
 fn a_governor_from_a_killed_vibed_leaves_nothing_stopped() {
+    let _one = serial();
     // As if a vibed was killed mid duty cycle: its agent's processes stay
     // stopped, though the agent is meant to run.
     let h = MacHarness::with(SCRIPT, quick());
@@ -684,6 +789,7 @@ fn a_governor_from_a_killed_vibed_leaves_nothing_stopped() {
 
 #[test]
 fn agents_use_the_owners_home_and_path() {
+    let _one = serial();
     let h = MacHarness::with(SCRIPT, quick());
     let spec = h.spec("env");
     let handle = h.backend.create(&spec).unwrap();

@@ -1062,8 +1062,9 @@ impl Core {
     }
 
     /// Brings an agent whose processes are gone back: `claude --resume`,
-    /// in its compartment, on a new shim (PRD: Failures). One that runs is
-    /// left as it is. `vibe_send` (#12) and wakes (#6) come through here.
+    /// in its compartment, on a new shim (PRD: Failures). One a limit
+    /// paused is held to the limits there are now and woken; any other
+    /// that runs is left as it is. `vibe_send` (#12) and wakes (#6) come through here.
     pub async fn resume_agent(
         &self,
         host: Option<&str>,
@@ -1073,6 +1074,23 @@ impl Core {
         let _held = self.hold(agent_ref)?;
         let mut record = self.store().agent(host, agent_ref).map_err(store_error)?;
         if self.session_runs(agent_ref).await {
+            // Paused by a limit, it runs again under the limits there are
+            // now, raised or not: one it's still over pauses it again.
+            if record.state == AgentState::Paused {
+                let backend = self.backend(record.environment)?;
+                let handle = Core::handle_of(&record)?;
+                let host_limits =
+                    limits::load(&self.layout.host_config()).map_err(|e| failed(e.to_string()))?;
+                let limits = Limits::new(record.memory, &host_limits);
+                let (b, h) = (Arc::clone(&backend), handle.clone());
+                blocking(move || b.apply(&h, &limits)).await?;
+                let (b, h) = (Arc::clone(&backend), handle);
+                blocking(move || b.wake(&h)).await?;
+                crate::log!("vibed: {agent_ref} resumed from its pause");
+                let status = self.agent_status(&mut record, self.idle_debounce()).await;
+                self.set_state(&mut record, status.state());
+                return Ok(self.agent_info(&record, &status));
+            }
             let status = self.agent_status(&mut record, self.idle_debounce()).await;
             return Ok(self.agent_info(&record, &status));
         }

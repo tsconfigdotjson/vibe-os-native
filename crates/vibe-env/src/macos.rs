@@ -5,14 +5,17 @@
 //!   session, with `TMPDIR` at `~/VibeOS/agents/<ref>/tmp` (the shim sets
 //!   it). It uses the Mac's own `claude`, `gh` and logins, and the Mac's own
 //!   `~/.claude`: nothing is redirected. As `vibed` runs as a LaunchAgent
-//!   with launchd's short `PATH`, the agent gets the owner's login shell's
-//!   `PATH` instead, so it finds what Terminal would.
+//!   with launchd's short `PATH`, the agent gets the `PATH` of the owner's
+//!   login shell, started interactive as Terminal starts it, so it finds
+//!   what Terminal would.
 //! - **Membership.** A governor thread per agent walks its tree every
 //!   [`Intervals::walk`] (`proc_listchildpids`, from the shim and from what
 //!   it found before), and every [`Intervals::scan`] also matches every
 //!   process by session ID (`getsid`), which catches jobs reparented to
-//!   launchd (`nohup … &`). A process that starts a session of its own and
-//!   leaves the tree escapes, and that's accepted.
+//!   launchd (`nohup … &`). A member found once stays the agent's even
+//!   after it leaves both tree and session. One that does both before it's
+//!   found (a true daemon) escapes, and that's accepted. Every count and
+//!   every signal goes by the same membership.
 //! - **Limits**, decided by [`crate::governor`]: CPU in cores
 //!   (`PRIO_DARWIN_BG`, then `SIGSTOP`/`SIGCONT` duty cycling), memory by
 //!   `phys_footprint` (the background and a warning at 80%, a pause at
@@ -34,7 +37,7 @@ use std::io;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -97,8 +100,9 @@ pub struct Macos {
     home: PathBuf,
     /// The `claude` to run; by default the one on the agent's `PATH`.
     claude: Option<PathBuf>,
-    /// The agent's `PATH`: the owner's login shell's, found once.
-    path: OnceLock<String>,
+    /// The agent's `PATH`, once the owner's login shell has said it. One it
+    /// couldn't say isn't kept, so the next launch asks again.
+    path: Mutex<Option<String>>,
     intervals: Intervals,
     agents: Mutex<HashMap<String, Arc<Agent>>>,
 }
@@ -119,13 +123,21 @@ struct State {
     limits: Option<Limits>,
     /// The thread holding it to its limits, while one does.
     governor: Option<Running>,
+    /// Stopped by [`Compartment::stop`]: nothing holds it to limits again
+    /// until it's launched again.
+    stopped: bool,
+    /// Its members as last followed, by pid with when each started: what
+    /// left both the tree and the session after it was found is still the
+    /// agent's.
+    known: HashMap<u32, u64>,
     warnings: Vec<Limit>,
     disk: Option<u64>,
     /// What a duty cycle stopped, which it continues.
     duty_stopped: Vec<u32>,
-    /// What's in the background.
-    background: HashSet<u32>,
-    /// Set by a wake, so the governor starts measuring afresh.
+    /// Whether it's in the background. Children inherit that, so letting
+    /// go brings back every member, not just those put there.
+    background: bool,
+    /// Set by a wake, so the governor measures afresh.
     woke: bool,
 }
 
@@ -163,10 +175,12 @@ impl Agent {
                 mode,
                 limits: None,
                 governor: None,
+                stopped: false,
+                known: HashMap::new(),
                 warnings: Vec::new(),
                 disk: None,
                 duty_stopped: Vec::new(),
-                background: HashSet::new(),
+                background: false,
                 woke: false,
             }),
         }
@@ -196,7 +210,7 @@ impl Macos {
         Macos {
             home: home.into(),
             claude: None,
-            path: OnceLock::new(),
+            path: Mutex::new(None),
             intervals: Intervals::default(),
             agents: Mutex::new(HashMap::new()),
         }
@@ -210,7 +224,7 @@ impl Macos {
 
     /// Gives agents this `PATH`, rather than the login shell's.
     pub fn with_path(mut self, path: impl Into<String>) -> Macos {
-        self.path = OnceLock::from(path.into());
+        self.path = Mutex::new(Some(path.into()));
         self
     }
 
@@ -222,8 +236,18 @@ impl Macos {
     }
 
     /// The `PATH` agents get.
-    pub fn path(&self) -> &str {
-        self.path.get_or_init(|| login_path(&self.home))
+    pub fn path(&self) -> String {
+        let mut path = lock(&self.path);
+        if let Some(p) = &*path {
+            return p.clone();
+        }
+        match login_path(&self.home) {
+            Ok(p) => {
+                *path = Some(p.clone());
+                p
+            }
+            Err(fallback) => fallback,
+        }
     }
 
     /// The `claude` agents run.
@@ -233,7 +257,7 @@ impl Macos {
         }
         let path = self.path();
         let legacy = self.home.join(".claude/local");
-        std::env::split_paths(path)
+        std::env::split_paths(&path)
             .chain([legacy])
             .map(|d| d.join("claude"))
             .find(|c| is_executable(c))
@@ -245,13 +269,6 @@ impl Macos {
             })
     }
 
-    /// The agent's session, unless its pid now names someone else's.
-    fn tree(h: &Handle) -> Option<SessionTree> {
-        h.session
-            .map(SessionTree::with_descendants)
-            .filter(SessionTree::is_shims)
-    }
-
     fn agent(&self, h: &Handle) -> Arc<Agent> {
         Arc::clone(
             lock(&self.agents)
@@ -260,43 +277,53 @@ impl Macos {
         )
     }
 
+    /// The agent's tree as its governor last followed it, unless its
+    /// session's pid now names someone else's.
+    fn members(h: &Handle, st: &State) -> Option<Members> {
+        let sid = h.session?;
+        SessionTree::new(sid)
+            .is_shims()
+            .then(|| Members::new(sid).knowing(st.known.clone()))
+    }
+
     /// What every command in the compartment runs with: the owner's own
     /// `HOME` and their login shell's `PATH`.
     fn env(&self) -> Vec<(String, String)> {
         vec![
             ("HOME".into(), self.home.to_string_lossy().into_owned()),
-            ("PATH".into(), self.path().to_owned()),
+            ("PATH".into(), self.path()),
         ]
     }
 
-    /// Stops its governor, and brings back what it put in the background
-    /// or stopped for a duty cycle.
-    fn unsupervise(&self, h: &Handle) {
-        let agent = self.agent(h);
-        let mut st = lock(&agent.state);
-        if let Some(g) = st.governor.take() {
-            g.stop.store(true, Ordering::SeqCst);
-        }
-        let_go(&mut st);
-    }
-}
-
-impl Drop for Macos {
-    /// Its governors stop with it, letting go of their levers.
-    fn drop(&mut self) {
-        for agent in lock(&self.agents).values() {
-            if let Some(g) = &lock(&agent.state).governor {
+    /// Stops every governor at once, bringing back what each put in the
+    /// background or stopped for a duty cycle, as `vibed` must before it
+    /// exits: its threads die with it, mid cycle or not.
+    pub fn release(&self) {
+        let agents: Vec<Arc<Agent>> = lock(&self.agents).values().cloned().collect();
+        for agent in agents {
+            let mut st = lock(&agent.state);
+            if let Some(g) = st.governor.take() {
                 g.stop.store(true, Ordering::SeqCst);
+                let procs = Members::new(g.shim).knowing(st.known.clone()).refresh(true);
+                let_go(&mut st, &procs);
             }
         }
     }
 }
 
+impl Drop for Macos {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 /// Lets go of the levers: the background, and a duty cycle's stop, unless
 /// the agent is meant to be stopped.
-fn let_go(st: &mut State) {
-    for pid in st.background.drain() {
-        let _ = tree::set_background(pid, false);
+fn let_go(st: &mut State, procs: &[Proc]) {
+    if std::mem::take(&mut st.background) {
+        for p in procs {
+            let _ = tree::set_background(p.pid, false);
+        }
     }
     let stopped = std::mem::take(&mut st.duty_stopped);
     if st.mode == Mode::Running {
@@ -310,21 +337,49 @@ fn is_executable(path: &Path) -> bool {
     fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
-/// The owner's login shell's `PATH`, with the [`USUAL_BINS`] it lacks after
-/// it. Without a shell that answers, `vibed`'s own `PATH` stands in.
-pub fn login_path(home: &Path) -> String {
-    const MARK: &str = "__VIBE_PATH__=";
-    let shell = std::env::var("SHELL")
-        .ok()
+/// The owner's login shell: their account's, as launchd's environment may
+/// not say.
+fn login_shell() -> PathBuf {
+    // SAFETY: getpwuid returns null or a record that stays valid until the
+    // next call; it's copied out at once.
+    let from_account = unsafe {
+        let pw = libc::getpwuid(libc::getuid());
+        if pw.is_null() || (*pw).pw_shell.is_null() {
+            None
+        } else {
+            Some(
+                std::ffi::CStr::from_ptr((*pw).pw_shell)
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        }
+    };
+    from_account
+        .or_else(|| std::env::var("SHELL").ok())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "/bin/zsh".into());
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/bin/zsh"))
+}
+
+/// The owner's login shell's `PATH`, as an interactive login shell has it,
+/// the way Terminal starts one, with the [`USUAL_BINS`] it lacks after it.
+/// If the shell doesn't say, it's `Err` with `vibed`'s own `PATH` and the
+/// usual places instead.
+pub fn login_path(home: &Path) -> std::result::Result<String, String> {
+    login_path_with(&login_shell(), home)
+}
+
+fn login_path_with(shell: &Path, home: &Path) -> std::result::Result<String, String> {
+    const MARK: &str = "__VIBE_PATH__";
+    // `printenv`, not `$PATH`: fish keeps PATH as a list.
     let asked = native::run(
         &Run {
             argv: vec![
-                shell,
+                shell.to_string_lossy().into_owned(),
                 "-l".into(),
+                "-i".into(),
                 "-c".into(),
-                format!("printf '\\n{MARK}%s\\n' \"$PATH\""),
+                format!("printf '\\n{MARK}\\n'; /usr/bin/printenv PATH"),
             ],
             env: vec![("HOME".into(), home.to_string_lossy().into_owned())],
             cwd: home.to_owned(),
@@ -333,14 +388,21 @@ pub fn login_path(home: &Path) -> String {
         &[],
     );
     let found = asked.ok().filter(RunOutput::success).and_then(|out| {
-        String::from_utf8_lossy(&out.output)
-            .lines()
-            .rev()
-            .find_map(|l| l.strip_prefix(MARK).map(str::to_owned))
-            .filter(|p| !p.is_empty())
+        let text = String::from_utf8_lossy(&out.output).into_owned();
+        let mut lines = text.lines();
+        lines.find(|l| l.ends_with(MARK))?;
+        lines
+            .map(str::trim)
+            .find(|l| l.starts_with('/'))
+            .map(str::to_owned)
     });
-    let base = found.unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
-    with_usual_bins(&base, home)
+    match found {
+        Some(p) => Ok(with_usual_bins(&p, home)),
+        None => Err(with_usual_bins(
+            &std::env::var("PATH").unwrap_or_default(),
+            home,
+        )),
+    }
 }
 
 fn with_usual_bins(path: &str, home: &Path) -> String {
@@ -390,10 +452,12 @@ impl Compartment for Macos {
         command.extend(launch.args.iter().cloned());
         let mut env = self.env();
         env.extend(launch.env.iter().cloned());
-        // A new launch runs: nothing of an old pause or sleep holds.
+        // A new launch runs: nothing of an old pause, sleep or stop holds.
         let agent = self.agent(h);
         let mut st = lock(&agent.state);
         agent.set_mode(&mut st, Mode::Running);
+        st.stopped = false;
+        st.known.clear();
         Ok(TerminalEnd::Pty {
             command,
             cwd: launch.cwd.clone(),
@@ -402,22 +466,38 @@ impl Compartment for Macos {
     }
 
     fn processes(&self, h: &Handle) -> Result<Vec<Proc>> {
-        Ok(Macos::tree(h).map(|t| t.members()).unwrap_or_default())
+        let agent = self.agent(h);
+        let members = Macos::members(h, &lock(&agent.state));
+        Ok(members.map(|mut m| m.refresh(true)).unwrap_or_default())
     }
 
     fn stop(&self, h: &Handle) -> Result<()> {
-        self.unsupervise(h);
-        if let Some(tree) = Macos::tree(h)
-            && !tree.end(STOP_GRACE)
+        let agent = self.agent(h);
+        let members = {
+            let mut st = lock(&agent.state);
+            st.stopped = true;
+            if let Some(g) = st.governor.take() {
+                g.stop.store(true, Ordering::SeqCst);
+            }
+            let members = Macos::members(h, &st);
+            let procs = members
+                .clone()
+                .map(|mut m| m.refresh(true))
+                .unwrap_or_default();
+            let_go(&mut st, &procs);
+            members
+        };
+        if let Some(mut m) = members
+            && !m.end(STOP_GRACE)
         {
             return Err(EnvError::new(format!(
                 "{}'s processes didn't end",
                 h.agent_ref
             )));
         }
-        let agent = self.agent(h);
         let mut st = lock(&agent.state);
         agent.set_mode(&mut st, Mode::Running);
+        st.known.clear();
         Ok(())
     }
 
@@ -468,17 +548,19 @@ fn make_writable_and_remove(dir: &Path) -> io::Result<()> {
 impl Limiter for Macos {
     /// Starts its governor, or gives the one it has new limits.
     fn apply(&self, h: &Handle, limits: &Limits) -> Result<()> {
-        // Its shim must be there: without it the tree is hung up.
-        let tree = Macos::tree(h)
-            .filter(|t| tree::process(t.sid).is_some())
-            .ok_or_else(|| EnvError::new(format!("{} isn't running", h.agent_ref)))?;
+        let not_running = || EnvError::new(format!("{} isn't running", h.agent_ref));
+        let sid = h.session.ok_or_else(not_running)?;
         let agent = self.agent(h);
         let mut st = lock(&agent.state);
+        // Its shim must be there: without it the tree is hung up.
+        if st.stopped || !Macos::members(h, &st).is_some_and(|m| m.shim_alive()) {
+            return Err(not_running());
+        }
         st.limits = Some(*limits);
         if st
             .governor
             .as_ref()
-            .is_some_and(|g| g.shim == tree.sid && !g.stop.load(Ordering::SeqCst))
+            .is_some_and(|g| g.shim == sid && !g.stop.load(Ordering::SeqCst))
         {
             return Ok(());
         }
@@ -488,15 +570,12 @@ impl Limiter for Macos {
         let stop = Arc::new(AtomicBool::new(false));
         {
             let (agent, stop, intervals) = (Arc::clone(&agent), Arc::clone(&stop), self.intervals);
-            let shim = tree.sid;
+            let members = Members::new(sid).knowing(st.known.clone());
             std::thread::Builder::new()
                 .name(format!("governor {}", h.agent_ref))
-                .spawn(move || govern(&agent, shim, &stop, intervals))?;
+                .spawn(move || govern(&agent, members, &stop, intervals))?;
         }
-        st.governor = Some(Running {
-            shim: tree.sid,
-            stop,
-        });
+        st.governor = Some(Running { shim: sid, stop });
         Ok(())
     }
 
@@ -522,22 +601,24 @@ impl Sleeper for Macos {
     /// `SIGSTOP` on the tree. A paused agent is stopped already, and stays
     /// paused.
     fn sleep(&self, h: &Handle) -> Result<()> {
-        let tree = Macos::tree(h)
-            .filter(|t| !t.is_empty())
-            .ok_or_else(|| EnvError::new(format!("{} isn't running", h.agent_ref)))?;
         let agent = self.agent(h);
         let mut st = lock(&agent.state);
+        let not_running = || EnvError::new(format!("{} isn't running", h.agent_ref));
+        let mut members = Macos::members(h, &st).ok_or_else(not_running)?;
+        if members.is_empty() {
+            return Err(not_running());
+        }
         let was = st.mode;
         if was == Mode::Running {
             // What a duty cycle stopped stays stopped.
             st.duty_stopped.clear();
             agent.set_mode(&mut st, Mode::Asleep);
         }
-        if let Err(e) = tree.freeze() {
+        if let Err(e) = members.freeze() {
             // Half asleep isn't asleep: it runs on, and says why.
             if was == Mode::Running {
                 agent.set_mode(&mut st, Mode::Running);
-                tree.thaw();
+                members.thaw();
             }
             return Err(e.into());
         }
@@ -548,23 +629,21 @@ impl Sleeper for Macos {
     /// are gone, as after a reboot.
     fn wake(&self, h: &Handle) -> Result<Woke> {
         let agent = self.agent(h);
-        let Some(tree) = Macos::tree(h) else {
-            let mut st = lock(&agent.state);
+        let mut st = lock(&agent.state);
+        let members = Macos::members(h, &st);
+        // Without its shim the agent has no terminal: what's left of its
+        // tree is hung up.
+        let Some(mut members) = members.filter(Members::shim_alive) else {
+            if let Some(mut m) = Macos::members(h, &st) {
+                m.end(STOP_GRACE);
+            }
             agent.set_mode(&mut st, Mode::Running);
             return Ok(Woke::Resume);
         };
-        // Without its shim the agent has no terminal: its tree is hung up.
-        if !tree.all().iter().any(|p| p.pid == tree.sid) {
-            tree.end(STOP_GRACE);
-            let mut st = lock(&agent.state);
-            agent.set_mode(&mut st, Mode::Running);
-            return Ok(Woke::Resume);
-        }
-        let mut st = lock(&agent.state);
         agent.set_mode(&mut st, Mode::Running);
         st.duty_stopped.clear();
         st.woke = true;
-        tree.thaw();
+        members.thaw();
         Ok(Woke::Exact)
     }
 }
@@ -581,40 +660,70 @@ impl Backend for Macos {
     }
 }
 
-/// An agent's tree as the governor follows it: walked from its shim and
-/// what it found before, and now and then matched by session too.
-#[derive(Debug)]
+/// An agent's tree: walked from its shim and from every member found
+/// before, and, with a scan, matched by session too. It's the one account
+/// of the agent's processes: the governor counts them, and sleep, wake,
+/// pauses, stops and `processes` act on them.
+#[derive(Debug, Clone)]
 struct Members {
     shim: u32,
-    /// Each member found, by pid, with when it started, so a pid reused by
-    /// someone else isn't taken for it.
+    /// When the shim started, once seen: a pid reused by someone else
+    /// isn't taken for it.
+    shim_started: Option<u64>,
+    /// Each member found, by pid, with when it started.
     known: HashMap<u32, u64>,
 }
 
 impl Members {
     fn new(shim: u32) -> Members {
+        let shim_started = tree::process(shim)
+            .filter(|(p, _)| p.name == tree::SHIM_NAME)
+            .map(|(p, _)| p.started_ms);
         Members {
             shim,
+            shim_started,
             known: HashMap::new(),
         }
+    }
+
+    fn knowing(mut self, known: HashMap<u32, u64>) -> Members {
+        self.known = known;
+        self
+    }
+
+    /// Whether the shim is still there, the one that started.
+    fn shim_alive(&self) -> bool {
+        self.shim_started.is_some_and(|started| {
+            tree::process(self.shim).is_some_and(|(p, _)| p.started_ms == started)
+        })
     }
 
     /// Walks the tree from the shim and every member still there; with
     /// `scan`, from every process of the session too. The shim isn't a
     /// member.
     fn refresh(&mut self, scan: bool) -> Vec<Proc> {
-        let mut roots: Vec<u32> = vec![self.shim];
+        let alive = self.shim_alive();
+        // A pid that's some process's session ID isn't reused, so a shim
+        // gone with no one in its place leaves its session to be scanned.
+        let shim_free = alive || tree::process(self.shim).is_none();
+        let mut roots: Vec<u32> = Vec::new();
+        if alive {
+            roots.push(self.shim);
+        }
         for (&pid, &started) in &self.known {
             if tree::process(pid).is_some_and(|(p, _)| p.started_ms == started) {
                 roots.push(pid);
             }
         }
-        if scan {
+        if scan && shim_free {
             roots.extend(SessionTree::new(self.shim).all().iter().map(|p| p.pid));
         }
         let mut seen: HashSet<u32> = HashSet::new();
         let mut found = Vec::new();
         while let Some(pid) = roots.pop() {
+            if pid == self.shim && !alive {
+                continue;
+            }
             if !seen.insert(pid) {
                 continue;
             }
@@ -629,6 +738,54 @@ impl Members {
         self.known = found.iter().map(|p| (p.pid, p.started_ms)).collect();
         found
     }
+
+    fn is_empty(&mut self) -> bool {
+        !self.shim_alive() && self.refresh(true).is_empty()
+    }
+
+    /// Stops every member; see [`tree::freeze`].
+    fn freeze(&mut self) -> io::Result<usize> {
+        tree::freeze(|| self.refresh(true))
+    }
+
+    fn thaw(&mut self) {
+        for p in self.refresh(true) {
+            tree::signal(p.pid, libc::SIGCONT);
+        }
+    }
+
+    /// Ends the whole tree: `SIGTERM` to the members (continued, so a
+    /// frozen one gets it), up to `grace` for them to go, then `SIGKILL`
+    /// to everything left, the shim included. Whether it emptied.
+    fn end(&mut self, grace: Duration) -> bool {
+        for p in self.refresh(true) {
+            tree::signal(p.pid, libc::SIGTERM);
+            tree::signal(p.pid, libc::SIGCONT);
+        }
+        if self.wait_empty(grace) {
+            return true;
+        }
+        for p in self.refresh(true) {
+            tree::signal(p.pid, libc::SIGKILL);
+        }
+        if self.shim_alive() {
+            tree::signal(self.shim, libc::SIGKILL);
+        }
+        self.wait_empty(Duration::from_secs(5))
+    }
+
+    fn wait_empty(&mut self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.is_empty() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
 }
 
 fn wall_ms() -> u64 {
@@ -638,15 +795,21 @@ fn wall_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// The latest disk measurement, and which one: a measurement begun before a
+/// wake doesn't count after it.
+#[derive(Debug, Default)]
+struct Disk {
+    generation: u64,
+    bytes: Option<u64>,
+}
+
 /// The governor's thread: holds the agent to its limits until told to stop
 /// or until its tree has gone.
-fn govern(agent: &Agent, shim: u32, stop: &AtomicBool, intervals: Intervals) {
-    let tree = SessionTree::with_descendants(shim);
-    let mut members = Members::new(shim);
+fn govern(agent: &Agent, mut members: Members, stop: &AtomicBool, intervals: Intervals) {
     let mut governor: Option<Governor> = None;
     let started = Instant::now();
     let (mut next_walk, mut next_scan, mut next_disk) = (started, started, started);
-    let disk = Arc::new(Mutex::new(None::<u64>));
+    let disk = Arc::new(Mutex::new(Disk::default()));
     let measuring = Arc::new(AtomicBool::new(false));
     let mut procs: Vec<Proc> = Vec::new();
     let mut duty = 1.0;
@@ -656,7 +819,7 @@ fn govern(agent: &Agent, shim: u32, stop: &AtomicBool, intervals: Intervals) {
     {
         let st = lock(&agent.state);
         if st.mode == Mode::Running && !stop.load(Ordering::SeqCst) {
-            for p in tree.members() {
+            for p in members.refresh(true) {
                 let _ = tree::set_background(p.pid, false);
                 if p.stopped {
                     tree::signal(p.pid, libc::SIGCONT);
@@ -673,28 +836,14 @@ fn govern(agent: &Agent, shim: u32, stop: &AtomicBool, intervals: Intervals) {
                 next_scan = now + intervals.scan;
             }
             procs = members.refresh(scan);
-            if procs.is_empty() && tree::process(shim).is_none() {
+            if procs.is_empty() && !members.shim_alive() {
                 break;
             }
-            if now >= next_disk && !measuring.swap(true, Ordering::SeqCst) {
-                next_disk = now + intervals.disk;
-                let (into, done) = (Arc::clone(&disk), Arc::clone(&measuring));
-                let paths = [agent.worktree.clone(), agent.tmp.clone()];
-                let spawned = std::thread::Builder::new()
-                    .name("governor disk".into())
-                    .spawn(move || {
-                        *lock(&into) = Some(disk_usage(&paths));
-                        done.store(false, Ordering::SeqCst);
-                    });
-                if spawned.is_err() {
-                    measuring.store(false, Ordering::SeqCst);
-                }
-            }
-            let disk = *lock(&disk);
             let mut st = lock(&agent.state);
             if stop.load(Ordering::SeqCst) {
                 break;
             }
+            st.known = members.known.clone();
             let Some(limits) = st.limits else {
                 break;
             };
@@ -704,7 +853,32 @@ fn govern(agent: &Agent, shim: u32, stop: &AtomicBool, intervals: Intervals) {
             }
             if std::mem::take(&mut st.woke) {
                 g.reset();
+                // What it took before the wake may be gone now.
+                let mut d = lock(&disk);
+                d.generation += 1;
+                d.bytes = None;
+                next_disk = now;
             }
+            if next_disk <= now && !measuring.swap(true, Ordering::SeqCst) {
+                next_disk = now + intervals.disk;
+                let (into, done) = (Arc::clone(&disk), Arc::clone(&measuring));
+                let generation = lock(&disk).generation;
+                let paths = [agent.worktree.clone(), agent.tmp.clone()];
+                let spawned = std::thread::Builder::new()
+                    .name("governor disk".into())
+                    .spawn(move || {
+                        let bytes = disk_usage(&paths);
+                        let mut d = lock(&into);
+                        if d.generation == generation {
+                            d.bytes = Some(bytes);
+                        }
+                        done.store(false, Ordering::SeqCst);
+                    });
+                if spawned.is_err() {
+                    measuring.store(false, Ordering::SeqCst);
+                }
+            }
+            let disk = lock(&disk).bytes;
             st.disk = disk;
             duty = 1.0;
             match st.mode {
@@ -715,31 +889,27 @@ fn govern(agent: &Agent, shim: u32, stop: &AtomicBool, intervals: Intervals) {
                         // Stopped whole, and held so until a wake.
                         st.duty_stopped.clear();
                         agent.set_mode(&mut st, Mode::Paused { limit });
-                        let _ = tree.freeze();
+                        let _ = members.freeze();
                         continue;
                     }
                     if d.background {
+                        // New members too: each walk puts them there.
                         for p in &procs {
-                            if !st.background.contains(&p.pid)
-                                && tree::set_background(p.pid, true).is_ok()
-                            {
-                                st.background.insert(p.pid);
-                            }
+                            let _ = tree::set_background(p.pid, true);
                         }
-                    } else {
-                        for pid in st.background.drain() {
-                            let _ = tree::set_background(pid, false);
+                        st.background = true;
+                    } else if std::mem::take(&mut st.background) {
+                        for p in &procs {
+                            let _ = tree::set_background(p.pid, false);
                         }
                     }
-                    let alive: HashSet<u32> = procs.iter().map(|p| p.pid).collect();
-                    st.background.retain(|pid| alive.contains(pid));
                     duty = d.duty;
                 }
                 Mode::Asleep | Mode::Paused { .. } => {
                     // Still stopped: whatever runs again, or was started
                     // meanwhile, is stopped again.
                     if procs.iter().any(|p| !p.stopped) {
-                        let _ = tree.freeze();
+                        let _ = members.freeze();
                     }
                     g.reset();
                 }
@@ -783,7 +953,7 @@ fn govern(agent: &Agent, shim: u32, stop: &AtomicBool, intervals: Intervals) {
         .is_some_and(|g| std::ptr::eq(Arc::as_ptr(&g.stop), stop));
     if current {
         st.governor = None;
-        let_go(&mut st);
+        let_go(&mut st, &procs);
     }
 }
 
@@ -850,16 +1020,45 @@ mod tests {
         );
     }
 
+    /// A login shell that runs its command with `PATH` set to `path`,
+    /// after some noise of the kind a profile makes.
+    fn fake_shell(dir: &Path, path: &str, exit: i32) -> PathBuf {
+        let shell = dir.join("shell");
+        fs::write(
+            &shell,
+            format!(
+                "#!/bin/sh\n\
+                 printf 'welcome, no newline'\n\
+                 echo 'zsh: no job control' >&2\n\
+                 [ \"$1 $2 $3\" = '-l -i -c' ] || exit 9\n\
+                 PATH='{path}' /bin/sh -c \"$4\" || exit 8\n\
+                 exit {exit}\n"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&shell, fs::Permissions::from_mode(0o755)).unwrap();
+        shell
+    }
+
     #[test]
     fn the_login_shell_says_its_path() {
         let home = tempfile::tempdir().unwrap();
-        let path = login_path(home.path());
-        // Whatever the shell's profile does, the usual places are there.
-        assert!(
-            path.contains(&format!("{}/.local/bin", home.path().display())),
-            "{path}"
+        let h = home.path();
+        let shell = fake_shell(h, "/opt/homebrew/bin:/usr/bin:/bin", 0);
+        assert_eq!(
+            login_path_with(&shell, h).unwrap(),
+            format!(
+                "/opt/homebrew/bin:/usr/bin:/bin:{}/.local/bin:/usr/local/bin",
+                h.display()
+            )
         );
-        assert!(path.contains("/usr/local/bin"), "{path}");
+        // One that fails says so, with vibed's own PATH instead.
+        let shell = fake_shell(h, "/opt/x/bin:/usr/bin:/bin", 1);
+        let fallback = login_path_with(&shell, h).unwrap_err();
+        assert!(!fallback.contains("/opt/x/bin"), "{fallback}");
+        assert!(fallback.contains(&format!("{}/.local/bin", h.display())));
+        // And the account's own shell answers on this machine.
+        assert!(login_path(h).is_ok(), "{:?}", login_path(h));
     }
 
     #[test]

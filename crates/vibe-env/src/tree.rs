@@ -145,15 +145,20 @@ impl SessionTree {
 /// there were once every one says it's stopped. A process can fork between
 /// being listed and being stopped, so `list` is asked again until a pass
 /// finds nothing running; and a process a stop hasn't reached yet (or that
-/// was continued meanwhile) is sent it again. A tree that won't all stop
-/// within [`FREEZE_SETTLE`] is an error naming those left: a freeze that's
-/// only been asked for isn't one.
+/// was continued meanwhile) is sent it again. One this user may not signal,
+/// such as a `sudo` the agent ran, is left running: it isn't the user's to
+/// stop. A tree that won't all stop within [`FREEZE_SETTLE`] is an error
+/// naming those left: a freeze that's only been asked for isn't one.
 pub fn freeze(mut list: impl FnMut() -> Vec<Proc>) -> io::Result<usize> {
     let deadline = Instant::now() + FREEZE_SETTLE;
     let mut sent: HashMap<u32, Instant> = HashMap::new();
+    let mut denied: HashSet<u32> = HashSet::new();
     loop {
         let members = list();
-        let running: Vec<&Proc> = members.iter().filter(|p| !p.stopped).collect();
+        let running: Vec<&Proc> = members
+            .iter()
+            .filter(|p| !p.stopped && !denied.contains(&p.pid))
+            .collect();
         if running.is_empty() {
             return Ok(members.len());
         }
@@ -172,7 +177,11 @@ pub fn freeze(mut list: impl FnMut() -> Vec<Proc>) -> io::Result<usize> {
                 .get(&p.pid)
                 .is_none_or(|at| at.elapsed() >= FREEZE_RESEND);
             if due {
-                signal(p.pid, libc::SIGSTOP);
+                if let Err(e) = try_signal(p.pid, libc::SIGSTOP)
+                    && e.raw_os_error() == Some(libc::EPERM)
+                {
+                    denied.insert(p.pid);
+                }
                 sent.insert(p.pid, Instant::now());
             }
         }
@@ -221,14 +230,22 @@ pub fn set_background(pid: u32, on: bool) -> io::Result<()> {
 /// Sends `sig` to `pid`, unless it's init or no pid at all; whether it was
 /// sent.
 pub fn signal(pid: u32, sig: i32) -> bool {
-    if let Ok(pid) = i32::try_from(pid)
-        && pid > 1
-    {
-        // SAFETY: kill has no memory-safety preconditions; a process that
-        // has gone just makes it fail with ESRCH.
-        return unsafe { libc::kill(pid, sig) } == 0;
+    try_signal(pid, sig).is_ok()
+}
+
+/// Sends `sig` to `pid`, and says why it couldn't.
+pub fn try_signal(pid: u32, sig: i32) -> io::Result<()> {
+    let pid = i32::try_from(pid)
+        .ok()
+        .filter(|p| *p > 1)
+        .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+    // SAFETY: kill has no memory-safety preconditions; a process that has
+    // gone just makes it fail with ESRCH.
+    if unsafe { libc::kill(pid, sig) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
     }
-    false
 }
 
 #[cfg(target_os = "linux")]
@@ -654,6 +671,34 @@ mod tests {
         let _ = leader.wait();
         // With no leader at all, what's left would be its stragglers.
         assert!(SessionTree::new(u32::MAX - 1).is_shims());
+    }
+
+    #[test]
+    fn a_freeze_leaves_alone_what_it_may_not_stop() {
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("running as root, which may stop anything: skipped");
+            return;
+        }
+        // Someone else's process, as a `sudo` in an agent's tree is.
+        let out = Command::new("ps")
+            .args(["-U", "root", "-o", "pid="])
+            .output()
+            .unwrap();
+        let theirs = String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .filter_map(|p| p.parse::<u32>().ok())
+            .find(|&p| p > 1 && process(p).is_some())
+            .expect("a root process");
+        let (p, _) = process(theirs).unwrap();
+        let started = Instant::now();
+        assert_eq!(freeze(|| vec![p.clone()]).unwrap(), 1);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(!process(theirs).unwrap().0.stopped);
     }
 
     #[test]

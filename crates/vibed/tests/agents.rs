@@ -1528,6 +1528,27 @@ async fn a_macos_agent_runs_on_the_governor_in_the_owners_own_claude_home() {
             .join(vibe_env::macos::STATE_FILE)
             .is_file()
     );
+    // Resumed while still over its limit, it's paused again.
+    w.core.resume_agent(None, &a.agent).await.unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while w.list().await[0].state != AgentState::Paused {
+        assert!(std::time::Instant::now() < deadline, "never paused again");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // Given room, a resume brings it back where it was, under the new
+    // limits, and it stays back.
+    w.core
+        .set_limits(vibe_core::rpc::LimitsSetParams {
+            max_processes: Some(100),
+            ..Default::default()
+        })
+        .unwrap();
+    let resumed = w.core.resume_agent(None, &a.agent).await.unwrap();
+    assert_eq!(resumed.state, AgentState::Question, "{resumed:?}");
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(w.list().await[0].state, AgentState::Question);
+    w.type_line(&a.agent, "red");
+    w.wait_screen(&a.agent, "You chose red.");
     watching.abort();
 
     // A delete takes its transcripts and its trust from the owner's

@@ -24,7 +24,9 @@
 #     processes, and PRIO_DARWIN_BG seen in `ps` as the memory warning
 #     puts an agent in the background and lets it go
 #   - a macos agent through `vibe rpc`, on the real macos backend with the
-#     stand-in for Claude Code (VIBE_CLAUDE): its transcript lands in the
+#     stand-in for Claude Code (VIBE_CLAUDE), with vibed in a LaunchAgent's
+#     bare environment: the agent has the PATH of the owner's interactive
+#     login shell, not launchd's; its transcript lands in the
 #     Mac's own ~/.claude, the status engine reads its question, a
 #     max_processes edited in host.toml pauses it at once, and a delete
 #     leaves nothing of it there or in VibeOS's folders but the branch
@@ -458,13 +460,29 @@ s_macos_agents() {
   local repo="$WORK/ma/src/app" ref worktree session transcript i left run
   run="$home/Library/Application Support/VibeOS/run"
   git init -q "$origin"
-  git -C "$origin" -c user.name=t -c user.email=t@example.com commit -q --allow-empty -m first
+  # Its setup says the PATH the agent has.
+  mkdir -p "$origin/.vibe"
+  echo 'echo "PATH=$PATH"' >"$origin/.vibe/setup.sh"
+  git -C "$origin" add .vibe
+  git -C "$origin" -c user.name=t -c user.email=t@example.com commit -q -m first
   git clone -q "$origin" "$repo"
-  # The Mac's own Claude state, as the owner has it before any agent.
-  mkdir -p "$home/.claude/projects"
+  # The Mac's own Claude state, as the owner has it before any agent; and
+  # a directory their interactive shell puts on PATH, as nvm or pyenv do.
+  mkdir -p "$home/.claude/projects" "$home/.config/fish"
   echo '{}' >"$home/.claude.json"
-  export VIBE_CLAUDE="$ROOT/crates/vibe-env/src/stand-in.sh"
-  start_vibed "$socket" "$WORK/ma-vibed.log"
+  echo 'export PATH="$HOME/shell-bin:$PATH"' >"$home/.zshrc"
+  echo 'export PATH="$HOME/shell-bin:$PATH"' >"$home/.bash_profile"
+  echo 'set -gx PATH $HOME/shell-bin $PATH' >"$home/.config/fish/config.fish"
+  # vibed as launchd starts a LaunchAgent: launchd's short PATH, and little
+  # else in its environment.
+  mkdir -p "$(dirname "$socket")"
+  chmod 700 "$(dirname "$socket")"
+  env -i HOME="$home" USER="$USER" LOGNAME="$USER" PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+    VIBE_CLAUDE="$ROOT/crates/vibe-env/src/stand-in.sh" \
+    target/debug/vibed --socket "$socket" 2>"$WORK/ma-vibed.log" &
+  VIBED_PID=$! VIBED_SOCKET=$socket
+  echo "$VIBED_PID" >>"$WORK/pids"
+  wait_file "$socket"
   out=$(rpc \
     "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"projects.add\",\"params\":{\"path\":\"$repo\"}}" \
     '{"jsonrpc":"2.0","id":2,"method":"profiles.update","params":{"project":"app","profile":"software-eng-mac","memory":1073741824}}' \
@@ -478,6 +496,10 @@ s_macos_agents() {
   session=$(json_field "$out" 4 session_id)
   echo "agent $ref in $worktree, session $session"
   grep -q "macos agents run natively" "$WORK/ma-vibed.log"
+  # Its PATH is the login shell's, not launchd's.
+  grep "^PATH=" "$home/VibeOS/agents/$ref/setup.log"
+  grep -q "^PATH=$home/shell-bin:" "$home/VibeOS/agents/$ref/setup.log" ||
+    { echo "the agent doesn't have the login shell's PATH"; return 1; }
   # In the Mac's own ~/.claude, not one of its own.
   transcript="$home/.claude/projects/$(printf '%s' "$worktree" | tr -c 'A-Za-z0-9' '-')/$session.jsonl"
   wait_file "$transcript"
