@@ -7,10 +7,10 @@ use tokio::sync::broadcast;
 use vibe_core::rpc::{
     AgentsDelete, AgentsList, AgentsStart, ErrorCode, ErrorObject, Event, EventsSubscribe,
     GhStatusGet, Hello, HelloParams, HelloResult, HostsList, Id, KeysCreate, KeysList, KeysRevoke,
-    KeysVerify, LimitsGet, LimitsSet, Method, PROTOCOL_VERSION, ProfilesCreate, ProfilesDelete,
-    ProfilesList, ProfilesUpdate, ProjectsAdd, ProjectsList, ProjectsRemove, ProtocolMismatchData,
-    Request, Response, SessionsAttach, SessionsList, Subscribed, ToolboxOpen, ToolboxRebuild,
-    ToolboxStatusGet, ToolboxUpdate,
+    KeysVerify, LimitsGet, LimitsSet, McpGet, McpSet, Method, PROTOCOL_VERSION, ProfilesCreate,
+    ProfilesDelete, ProfilesList, ProfilesUpdate, ProjectsAdd, ProjectsList, ProjectsRemove,
+    ProtocolMismatchData, Request, Response, SessionsAttach, SessionsList, Subscribed, ToolboxOpen,
+    ToolboxRebuild, ToolboxStatusGet, ToolboxUpdate,
 };
 
 use crate::core::Core;
@@ -140,6 +140,8 @@ async fn call(
         }
         LimitsGet::NAME => encode_result(core.limits(decode::<LimitsGet>(params)?)),
         LimitsSet::NAME => encode_result(core.set_limits(decode::<LimitsSet>(params)?)),
+        McpGet::NAME => encode_result(core.mcp(decode::<McpGet>(params)?)),
+        McpSet::NAME => encode_result(core.set_mcp(decode::<McpSet>(params)?)),
         KeysList::NAME => {
             decode::<KeysList>(params)?;
             encode_result(core.keys())

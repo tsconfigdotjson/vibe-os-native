@@ -334,6 +334,8 @@ pub const METHODS: &[&str] = &[
     ProfilesDelete::NAME,
     LimitsGet::NAME,
     LimitsSet::NAME,
+    McpGet::NAME,
+    McpSet::NAME,
     KeysList::NAME,
     KeysCreate::NAME,
     KeysRevoke::NAME,
@@ -458,6 +460,19 @@ method! {
     /// `limits.set`: writes the settings given into `host.toml` and returns
     /// the limits that result.
     LimitsSet = "limits.set", LimitsSetParams => HostLimits
+}
+
+method! {
+    /// `mcp.get`: where this host serves MCP, for Settings and its Copy
+    /// setup command (PRD: MCP interface, Transport).
+    McpGet = "mcp.get", HostParams => McpSettings
+}
+
+method! {
+    /// `mcp.set`: turns MCP on the Tailscale address on or off. It's
+    /// written to `host.toml` and applied at once, and the settings that
+    /// result are returned.
+    McpSet = "mcp.set", McpSetParams => McpSettings
 }
 
 method! {
@@ -719,6 +734,31 @@ pub struct LimitsSetParams {
     pub idle_debounce: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snapshot_disk: Option<u64>,
+}
+
+/// Where a host serves MCP.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpSettings {
+    /// The port, on loopback and Tailscale alike: `mcp_port` in
+    /// `host.toml`, which is set there only.
+    pub port: u16,
+    /// Whether it's served on this host's Tailscale address too.
+    pub tailscale: bool,
+    /// Its loopback URL, `http://127.0.0.1:<port>/mcp`.
+    pub url: String,
+    /// Its URL on each of this host's Tailscale addresses while `tailscale`
+    /// is on; none while it's off, or the host has no Tailscale address.
+    pub tailscale_urls: Vec<String>,
+}
+
+/// The MCP settings to change; the others keep their values.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpSetParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tailscale: Option<bool>,
 }
 
 impl LimitsSetParams {

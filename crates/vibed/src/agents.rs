@@ -700,6 +700,9 @@ impl Core {
         let (agent_ref, _held) = self
             .pick_ref(host, &project.name, &project_path, p.name.as_deref())
             .await?;
+        // Its prompt is what a wait waits on first, not a send to an agent
+        // that had its name before.
+        lock(&self.sends).remove(&agent_ref);
         let mut undo = Undo {
             project: project_path.clone(),
             ..Undo::default()
@@ -1075,8 +1078,10 @@ impl Core {
         let mut record = self.store().agent(host, agent_ref).map_err(store_error)?;
         if self.session_runs(agent_ref).await {
             // Paused by a limit, it runs again under the limits there are
-            // now, raised or not: one it's still over pauses it again.
-            if record.state == AgentState::Paused {
+            // now, raised or not: one it's still over pauses it again. One
+            // asleep with its session still there (frozen) is thawed the
+            // same way.
+            if matches!(record.state, AgentState::Paused | AgentState::Asleep) {
                 let backend = self.backend(record.environment)?;
                 let handle = Core::handle_of(&record)?;
                 let host_limits =
@@ -1086,7 +1091,7 @@ impl Core {
                 blocking(move || b.apply(&h, &limits)).await?;
                 let (b, h) = (Arc::clone(&backend), handle);
                 blocking(move || b.wake(&h)).await?;
-                crate::log!("vibed: {agent_ref} resumed from its pause");
+                crate::log!("vibed: {agent_ref} resumed from being {}", record.state);
                 let status = self.agent_status(&mut record, self.idle_debounce()).await;
                 self.set_state(&mut record, status.state());
                 return Ok(self.agent_info(&record, &status));

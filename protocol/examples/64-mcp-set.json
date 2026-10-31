@@ -1,0 +1,21 @@
+{
+  "description": "Turning MCP on the Tailscale address on: written to host.toml and applied at once, announced as mcp.changed. This host's Tailscale address is 100.101.102.103.",
+  "request": {"jsonrpc": "2.0", "id": 64, "method": "mcp.set", "params": {"host": "local", "tailscale": true}},
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 64,
+    "result": {
+      "port": 7878,
+      "tailscale": true,
+      "url": "http://127.0.0.1:7878/mcp",
+      "tailscale_urls": ["http://100.101.102.103:7878/mcp"]
+    }
+  },
+  "events": [
+    {
+      "jsonrpc": "2.0",
+      "method": "events.event",
+      "params": {"seq": 12, "at": "2026-10-30T12:00:00Z", "host": "local", "kind": "mcp.changed"}
+    }
+  ]
+}

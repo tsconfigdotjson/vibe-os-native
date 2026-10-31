@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 vibe-core.workspace = true
 vibe-env.workspace = true
+vibe-mcp.workspace = true
 vibe-status.workspace = true
 libc.workspace = true
 serde.workspace = true

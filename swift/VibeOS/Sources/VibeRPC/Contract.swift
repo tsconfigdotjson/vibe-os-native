@@ -27,6 +27,8 @@ public enum VibeRPC {
         ProfilesDelete.name,
         LimitsGet.name,
         LimitsSet.name,
+        McpGet.name,
+        McpSet.name,
         KeysList.name,
         KeysCreate.name,
         KeysRevoke.name,
@@ -386,6 +388,9 @@ public enum EventKind: String, Codable, CaseIterable, Hashable, Sendable {
     /// The toolbox opened, or saved, updated or rebuilt the template, or
     /// failed to; `message` says which.
     case toolboxChanged = "toolbox.changed"
+    /// Where MCP is served changed: `mcp.set` turned the Tailscale address
+    /// on or off.
+    case mcpChanged = "mcp.changed"
 }
 
 /// Whether a session's shim still holds its terminal.
@@ -499,6 +504,21 @@ public enum LimitsSet: RPCMethod {
     public typealias Params = LimitsSetParams
     public typealias Result = HostLimits
     public static let name = "limits.set"
+}
+
+/// Where this host serves MCP, for Settings and its Copy setup command.
+public enum McpGet: RPCMethod {
+    public typealias Params = HostParams
+    public typealias Result = McpSettings
+    public static let name = "mcp.get"
+}
+
+/// Turns MCP on the Tailscale address on or off: written to `host.toml`
+/// and applied at once.
+public enum McpSet: RPCMethod {
+    public typealias Params = McpSetParams
+    public typealias Result = McpSettings
+    public static let name = "mcp.set"
 }
 
 public enum KeysList: RPCMethod {
@@ -891,6 +911,43 @@ public struct LimitsSetParams: Codable, Hashable, Sendable {
         case vmDisk = "vm_disk"
         case idleDebounce = "idle_debounce"
         case snapshotDisk = "snapshot_disk"
+    }
+}
+
+/// Where a host serves MCP.
+public struct McpSettings: Codable, Hashable, Sendable {
+    /// The port, on loopback and Tailscale alike (`mcp_port` in
+    /// `host.toml`, which is set there only).
+    public var port: Int
+    /// Whether it's served on this host's Tailscale address too.
+    public var tailscale: Bool
+    /// Its loopback URL, `http://127.0.0.1:<port>/mcp`.
+    public var url: String
+    /// Its URL on each of this host's Tailscale addresses while `tailscale`
+    /// is on; none while it's off, or the host has no Tailscale address.
+    public var tailscaleUrls: [String]
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case port
+        case tailscale
+        case url
+        case tailscaleUrls = "tailscale_urls"
+    }
+}
+
+/// The MCP settings to change; nil ones keep their values.
+public struct McpSetParams: Codable, Hashable, Sendable {
+    public var host: String?
+    public var tailscale: Bool?
+
+    public init(host: String? = nil, tailscale: Bool? = nil) {
+        self.host = host
+        self.tailscale = tailscale
+    }
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case host
+        case tailscale
     }
 }
 

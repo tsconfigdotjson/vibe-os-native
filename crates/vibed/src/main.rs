@@ -24,7 +24,9 @@ use vibed::{logging, server};
 const USAGE: &str = "\
 usage: vibed [--socket PATH]
 
-Serves the VibeOS JSON-RPC API on a Unix socket until SIGTERM or SIGINT.
+Serves the VibeOS JSON-RPC API on a Unix socket, and MCP on
+http://127.0.0.1:7878/mcp (mcp_port and mcp_tailscale in host.toml), until
+SIGTERM or SIGINT.
 State lives under $HOME: on macOS in ~/Library/Application Support/VibeOS
 (logs in ~/Library/Logs/VibeOS), elsewhere in ~/.local/share/vibeos. Host
 limits are in ~/.config/vibeos/host.toml.
@@ -268,6 +270,8 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
     let limit_watch = core.spawn_limit_watch(vibed::limit_watch::LIMITS_EVERY);
     // Saves the toolbox when its shell exits, and runs the weekly update.
     let toolbox = core.spawn_toolbox(TOOLBOX_POLL, vibed::toolbox::UPDATE_CHECK_EVERY);
+    // MCP on loopback, and on the Tailscale address when host.toml says.
+    let mcp = core.spawn_mcp(vibed::mcp::LISTEN_CHECK_EVERY);
     vibed::log!(
         "vibed {} listening on {}",
         env!("CARGO_PKG_VERSION"),
@@ -280,6 +284,7 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
         }
     };
     server::serve(listener, core, MAX_MESSAGE_BYTES, shutdown).await;
+    mcp.abort();
     gh_checks.abort();
     status.abort();
     maintenance.abort();

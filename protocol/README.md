@@ -43,7 +43,8 @@ name; a method that takes none accepts `{}` or no params at all.
 
 **The examples are one session.** From `20-` on they run in file order
 against one daemon: a Mac (`os` `macos`, so new projects get two starter
-profiles) whose home is `/Users/me`, at 2026-10-30T12:00:00Z, with `src/app`
+profiles) whose home is `/Users/me` and Tailscale address `100.101.102.103`, at
+2026-10-30T12:00:00Z, with `src/app`
 checked out and `me/web` on GitHub. Its sessions are `quiet-amber-otter`,
 a real `vibe-shim` running `sleep`, and the records of two that exited:
 `brave-copper-lynx` with code 0 and `calm-silver-heron` killed. `src/app`

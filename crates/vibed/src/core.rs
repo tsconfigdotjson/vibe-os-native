@@ -61,6 +61,9 @@ pub type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
 /// The 256 random bits behind a new API key.
 pub type Entropy = Arc<dyn Fn() -> io::Result<[u8; keys::KEY_BYTES]> + Send + Sync>;
 
+/// This machine's Tailscale addresses now.
+pub type TailscaleAddresses = Arc<dyn Fn() -> Vec<std::net::IpAddr> + Send + Sync>;
+
 /// Everything [`Core::open`] needs. Tests swap the clock, the randomness and
 /// `gh` for fixed ones.
 pub struct Config {
@@ -81,6 +84,9 @@ pub struct Config {
     /// The Linux toolbox: on a Mac that runs `linux` agents in VMs, none
     /// on a Linux host.
     pub toolbox: Option<Arc<dyn vibe_env::toolbox::ToolboxHost>>,
+    /// Where MCP can be served on Tailscale: this machine's addresses in
+    /// its ranges, by default.
+    pub tailscale: TailscaleAddresses,
 }
 
 impl std::fmt::Debug for Config {
@@ -116,6 +122,7 @@ impl Config {
             backends: Backends::new(),
             admission: Arc::new(HostAdmission::current()),
             toolbox: None,
+            tailscale: Arc::new(vibe_mcp::net::tailscale_addresses),
         }
     }
 }
@@ -229,12 +236,18 @@ pub struct Core {
     pub(crate) starting: Mutex<HashMap<u64, u64>>,
     /// Each agent's transcript, as the status engine follows it.
     pub(crate) tails: Mutex<HashMap<String, Arc<Mutex<vibe_status::Tail>>>>,
+    /// Where each agent's transcript was at its last send over MCP: what
+    /// `vibe_wait` waits for an answer after. None yet means its start's
+    /// prompt was the last.
+    pub(crate) sends: Mutex<HashMap<String, vibe_status::Mark>>,
+    /// Held while a send types into an agent, so two can't interleave.
+    pub(crate) typing: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// One fetch at a time per project, as concurrent fetches of the same
     /// refs fail on each other's locks.
     pub(crate) fetching: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     store: Mutex<Store>,
     /// One `host.toml` edit at a time.
-    limits_lock: Mutex<()>,
+    pub(crate) limits_lock: Mutex<()>,
     /// Names of projects being added. A clone can take minutes; meanwhile
     /// no other add may take its name or its directory, but other adds go
     /// ahead.
@@ -246,6 +259,10 @@ pub struct Core {
     pub(crate) toolbox_state: Mutex<vibe_core::model::ToolboxState>,
     /// Held for one toolbox operation at a time.
     pub(crate) toolbox_op: tokio::sync::Mutex<()>,
+    /// This machine's Tailscale addresses, for MCP.
+    pub(crate) tailscale: TailscaleAddresses,
+    /// Tells the MCP listeners to look at their settings again now.
+    pub(crate) mcp_kick: Arc<tokio::sync::Notify>,
     _state_lock: File,
 }
 
@@ -276,7 +293,7 @@ pub(crate) fn store_error(e: StoreError) -> ErrorObject {
     }
 }
 
-fn limits_error(e: LimitsError) -> ErrorObject {
+pub(crate) fn limits_error(e: LimitsError) -> ErrorObject {
     match e {
         LimitsError::Invalid { .. } => error(ErrorCode::HostConfigInvalid, e.to_string()),
         LimitsError::Rejected(m) => error(ErrorCode::InvalidParams, format!("Invalid params: {m}")),
@@ -361,6 +378,8 @@ impl Core {
             starting: Mutex::new(HashMap::new()),
             fetching: Mutex::new(HashMap::new()),
             tails: Mutex::new(HashMap::new()),
+            sends: Mutex::new(HashMap::new()),
+            typing: Mutex::new(HashMap::new()),
             store: Mutex::new(store),
             limits_lock: Mutex::new(()),
             adding: Mutex::new(HashSet::new()),
@@ -377,6 +396,8 @@ impl Core {
             toolbox: config.toolbox,
             toolbox_state: Mutex::new(vibe_core::model::ToolboxState::Closed),
             toolbox_op: tokio::sync::Mutex::new(()),
+            tailscale: config.tailscale,
+            mcp_kick: Arc::new(tokio::sync::Notify::new()),
             _state_lock: state_lock,
         })
     }

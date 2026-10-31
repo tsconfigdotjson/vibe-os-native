@@ -259,17 +259,42 @@ impl Tail {
     /// on what may be a permission prompt for [`INFERRED_QUIET`], as a long
     /// silent tool run looks the same until then.
     pub fn answered(&self, mark: &Mark, now: Timestamp) -> bool {
+        self.moved_since(mark) && self.status(now).settled(now)
+    }
+
+    /// What `vibe_wait` takes for an answer to what was sent after `mark`:
+    /// the transcript moved on since, as for [`Tail::answered`], and the
+    /// agent has stopped. A permission prompt counts as soon as agent-tail
+    /// infers one, not after [`INFERRED_QUIET`]: that longer wait is for
+    /// sleeping, and a wait can't outlast it. The caller says it may be a
+    /// long silent tool run instead. Unless `background` is set, a turn
+    /// that ended with work still running in the background counts too, as
+    /// a server left running never finishes.
+    pub fn answered_after(&self, mark: &Mark, now: Timestamp, background: bool) -> bool {
+        if !self.moved_since(mark) {
+            return false;
+        }
+        let status = self.status(now);
+        status.settled(now)
+            || status.activity == Activity::AwaitingApproval
+            || !background && status.activity == Activity::BackgroundWork
+    }
+
+    /// Whether the transcript has moved on since `mark`; if the agent was
+    /// at work when the mark was taken, by a prompt or interrupt of the
+    /// user's, as the end of the turn it was in is no answer to a send it
+    /// hasn't read yet.
+    fn moved_since(&self, mark: &Mark) -> bool {
         let Some(f) = &self.followed else {
             return false;
         };
-        let moved = self.generation != mark.generation
+        self.generation != mark.generation
             || if mark.busy {
                 f.inputs > mark.inputs
             } else {
                 f.reducer.received() > mark.received
                     && f.reducer.state(Timestamp::EPOCH).last_at != mark.last_at
-            };
-        moved && self.status(now).settled(now)
+            }
     }
 
     /// Picks the transcript to follow, and says whether it changed.
@@ -1135,6 +1160,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn background_work_answers_unless_waited_for() {
+        let w = world();
+        let path = w.project.join(format!("{ID}.jsonl"));
+        let mut tail = Tail::new(w.project.clone(), &w.worktree, ID, Duration::from_secs(60));
+        let mark = tail.mark(t("2026-10-30T12:00:00Z"));
+        append(&path, &user("/w/app", "2026-10-30T12:00:00Z", "go"));
+        append(
+            &path,
+            &reply("/w/app", "2026-10-30T12:00:01Z", "started a helper"),
+        );
+        let helpers = w.project.join(ID).join("subagents");
+        fs::create_dir_all(&helpers).unwrap();
+        let helper = helpers.join("agent-a1.jsonl");
+        let call = serde_json::json!({"type": "assistant", "isSidechain": true, "sessionId": ID,
+            "cwd": "/w/app", "timestamp": "2026-10-30T12:00:02Z", "message": {"id": "h1",
+            "role": "assistant", "stop_reason": "tool_use", "content": [{"type": "tool_use",
+            "id": "toolu_h", "name": "Bash", "input": {"command": "sleep 100"}}]}});
+        append(&helper, &format!("{call}\n"));
+        tail.poll();
+        let now = t("2026-10-30T12:00:05Z");
+        assert_eq!(tail.status(now).activity, Activity::BackgroundWork);
+        assert!(tail.answered_after(&mark, now, false));
+        assert!(!tail.answered_after(&mark, now, true));
+        assert!(!tail.answered(&mark, now));
+        fs::write(helper.with_extension("meta.json"), r#"{"finished":true}"#).unwrap();
+        tail.poll();
+        let now = t("2026-10-30T12:00:06Z");
+        assert!(tail.answered_after(&mark, now, true));
+        assert!(tail.answered(&mark, now));
+    }
+
     fn bash(at: &str, id: &str) -> String {
         format!(
             "{}\n",
@@ -1176,6 +1233,11 @@ mod tests {
         assert!(!tail.answered(&mark, t("2026-10-30T12:00:34Z")));
         assert!(!tail.answered(&mark, t("2026-10-30T12:04:00Z")));
         assert!(tail.answered(&mark, t("2026-10-30T12:05:05Z")));
+        // A wait, which can't outlast five minutes, takes the prompt once
+        // agent-tail infers it, and not before.
+        assert!(!tail.answered_after(&mark, t("2026-10-30T12:00:10Z"), false));
+        assert!(tail.answered_after(&mark, t("2026-10-30T12:00:34Z"), false));
+        assert!(tail.answered_after(&mark, t("2026-10-30T12:00:34Z"), true));
     }
 
     #[test]

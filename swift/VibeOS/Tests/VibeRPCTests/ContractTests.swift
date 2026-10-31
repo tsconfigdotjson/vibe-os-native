@@ -127,6 +127,8 @@ let swiftTypes: [String: Set<String>] = [
     "ProfileParams": keys(ProfileParams.CodingKeys.self),
     "HostLimits": keys(HostLimits.CodingKeys.self),
     "LimitsSetParams": keys(LimitsSetParams.CodingKeys.self),
+    "McpSettings": keys(McpSettings.CodingKeys.self),
+    "McpSetParams": keys(McpSetParams.CodingKeys.self),
     "ApiKey": keys(ApiKey.CodingKeys.self),
     "KeyList": keys(KeyList.CodingKeys.self),
     "KeyCreateParams": keys(KeyCreateParams.CodingKeys.self),
@@ -203,6 +205,8 @@ func methodChecks() -> [String: MethodCheck] {
         check(ProfilesDelete.self),
         check(LimitsGet.self),
         check(LimitsSet.self),
+        check(McpGet.self),
+        check(McpSet.self),
         check(KeysList.self),
         check(KeysCreate.self),
         check(KeysRevoke.self),
@@ -429,6 +433,10 @@ struct LiveDaemonTests {
         let limits = try client.call(LimitsGet.self, HostParams())
         #expect(limits.maxAwakeAgents == 16)
         #expect(limits.reserveMemory == 4 << 30)
+        let mcp = try client.call(McpGet.self, HostParams())
+        #expect(mcp.url == "http://127.0.0.1:\(mcp.port)/mcp")
+        #expect(!mcp.tailscale)
+        #expect(mcp.tailscaleUrls.isEmpty)
         let projects = try client.call(ProjectsList.self, HostParams(host: VibeRPC.localHost))
         #expect(projects.projects.isEmpty)
         do {

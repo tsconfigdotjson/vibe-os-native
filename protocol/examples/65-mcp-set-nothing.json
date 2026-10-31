@@ -1,0 +1,9 @@
+{
+  "description": "An mcp.set with nothing to change is refused.",
+  "request": {"jsonrpc": "2.0", "id": 65, "method": "mcp.set", "params": {}},
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 65,
+    "error": {"code": -32602, "message": "Invalid params: give at least one setting to change"}
+  }
+}

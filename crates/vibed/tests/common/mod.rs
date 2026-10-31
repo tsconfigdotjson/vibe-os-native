@@ -192,6 +192,9 @@ esac
 /// checked out from an `origin` beside it, a GitHub with `me/web` on it, a
 /// fixed clock and fixed key randomness, 64G of memory, and the test
 /// backend for every environment, with the stand-in for Claude Code.
+/// The golden host's Tailscale address (protocol/README.md).
+pub const GOLDEN_TAILSCALE: &str = "100.101.102.103";
+
 pub struct Golden {
     pub dir: tempfile::TempDir,
     /// Canonical, so paths vibed canonicalizes match it (macOS's temp dir
@@ -294,6 +297,8 @@ impl Golden {
             total_memory: 64 * GIB,
         });
         config.clock = Arc::new(|| GOLDEN_NOW);
+        // One Tailscale address, whatever this machine has.
+        config.tailscale = Arc::new(|| vec![GOLDEN_TAILSCALE.parse().unwrap()]);
         // Bytes 0, 1, 2, … for the first key, 32, 33, … for the next.
         let calls = AtomicU8::new(0);
         config.entropy = Arc::new(move || {

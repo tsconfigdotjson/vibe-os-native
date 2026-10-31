@@ -2,6 +2,8 @@
 
 mod attach;
 mod client;
+mod key;
+mod mcp;
 mod setup_token;
 mod toolbox;
 
@@ -35,6 +37,13 @@ commands:
   toolbox status   the template and Linux home versions, and the last run
   toolbox update   run toolbox.toml's [update] commands on the template now
   toolbox rebuild  rebuild the template on the newest base image from toolbox.toml
+  mcp         MCP over stdin and stdout, for clients that can only start a
+              command: a bridge to vibed's http://127.0.0.1:7878/mcp, with the
+              API key in VIBE_API_KEY (--key KEY works too, but shows it to
+              anyone who can run ps); --url URL for another endpoint
+  key         list this host's API keys for MCP
+  key create NAME  make an API key, and print it once
+  key revoke NAME  revoke an API key
 
 options:
   --socket PATH   vibed's socket (default: $VIBE_SOCKET, or the platform default)
@@ -42,7 +51,8 @@ options:
   -h, --help      print this help
 
 environment:
-  VIBE_CLAUDE     the claude that setup-token runs (default: claude on PATH)";
+  VIBE_CLAUDE     the claude that setup-token runs (default: claude on PATH)
+  VIBE_API_KEY    the API key vibe mcp sends";
 
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
@@ -52,6 +62,11 @@ enum Command {
     Rpc,
     SetupToken,
     Toolbox(toolbox::Command),
+    Mcp {
+        url: Option<String>,
+        key: Option<String>,
+    },
+    Key(key::Command),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -90,6 +105,32 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
                     iter.next();
                 }
                 Command::Toolbox(sub.unwrap_or(toolbox::Command::Open))
+            }
+            "mcp" => {
+                let (mut url, mut key) = (None, None);
+                while let Some(flag) = iter.as_slice().first() {
+                    let slot = match flag.as_str() {
+                        "--url" => &mut url,
+                        "--key" => &mut key,
+                        _ => break,
+                    };
+                    iter.next();
+                    let value = iter.next().ok_or(format!("{flag} needs a value"))?;
+                    *slot = Some(value.clone());
+                }
+                Command::Mcp { url, key }
+            }
+            "key" => {
+                let words: Vec<String> = iter
+                    .as_slice()
+                    .iter()
+                    .take_while(|w| !w.starts_with('-'))
+                    .cloned()
+                    .collect();
+                for _ in 0..words.len() {
+                    iter.next();
+                }
+                Command::Key(key::Command::parse(&words)?)
             }
             other => match other.strip_prefix("--socket=") {
                 Some(path) => {
@@ -136,6 +177,27 @@ fn main() -> ExitCode {
             }
         };
     }
+    if let Command::Mcp { url, key } = &command {
+        let key = key
+            .clone()
+            .or_else(|| std::env::var("VIBE_API_KEY").ok().filter(|k| !k.is_empty()));
+        let Some(key) = key else {
+            eprintln!(
+                "vibe: vibe mcp needs an API key: set VIBE_API_KEY, or pass --key. Make one in \
+                 Settings → API keys, or with vibe key create NAME"
+            );
+            return ExitCode::from(2);
+        };
+        let url = url.clone().unwrap_or_else(default_mcp_url);
+        let run = mcp::Url::parse(&url).and_then(|u| mcp::run(u, key));
+        return match run {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("vibe: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let socket = match paths::socket_path(socket) {
         Ok(s) => s,
         Err(e) => {
@@ -157,7 +219,16 @@ fn main() -> ExitCode {
         Command::Ls => ls(&socket),
         Command::Hello => hello(&socket),
         Command::Rpc => rpc(&socket),
-        Command::SetupToken => unreachable!("handled above"),
+        Command::SetupToken | Command::Mcp { .. } => unreachable!("handled above"),
+        Command::Key(command) => {
+            return match key::run(&socket, command, &default_mcp_url()) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("vibe: {e}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
         Command::Toolbox(command) => {
             return match toolbox::run(&socket, command) {
                 Ok(()) => ExitCode::SUCCESS,
@@ -175,6 +246,15 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// This host's MCP endpoint on loopback, at the port in `host.toml`.
+fn default_mcp_url() -> String {
+    let port = paths::Layout::current()
+        .ok()
+        .and_then(|l| vibe_core::limits::load(&l.host_config()).ok())
+        .map_or(vibe_core::limits::MCP_PORT, |l| l.mcp_port);
+    format!("http://127.0.0.1:{port}/mcp")
 }
 
 fn ls(socket: &Path) -> Result<(), ClientError> {
@@ -340,6 +420,42 @@ mod tests {
                 command: Command::Toolbox(toolbox::Command::Open),
             })
         );
+        assert_eq!(
+            parse(&["mcp"]),
+            Ok(Args::Run {
+                socket: None,
+                command: Command::Mcp {
+                    url: None,
+                    key: None
+                },
+            })
+        );
+        assert_eq!(
+            parse(&["mcp", "--url", "http://h:1/mcp", "--key", "vk_k"]),
+            Ok(Args::Run {
+                socket: None,
+                command: Command::Mcp {
+                    url: Some("http://h:1/mcp".into()),
+                    key: Some("vk_k".into())
+                },
+            })
+        );
+        assert!(parse(&["mcp", "--url"]).is_err());
+        assert_eq!(
+            parse(&["key", "create", "laptop", "--socket", "/s"]),
+            Ok(Args::Run {
+                socket: Some("/s".into()),
+                command: Command::Key(key::Command::Create("laptop".into())),
+            })
+        );
+        assert_eq!(
+            parse(&["key"]),
+            Ok(Args::Run {
+                socket: None,
+                command: Command::Key(key::Command::List),
+            })
+        );
+        assert!(parse(&["key", "create"]).is_err());
         assert!(parse(&["toolbox", "rebiuld"]).is_err());
         assert!(parse(&["toolbox", "status", "update"]).is_err());
     }

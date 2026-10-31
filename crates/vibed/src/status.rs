@@ -56,7 +56,7 @@ impl Core {
     /// pool: the first read after a restart is the whole transcript. None
     /// until its compartment's handle, which says where its Claude home is,
     /// is written.
-    async fn with_tail<T: Send + 'static>(
+    pub(crate) async fn with_tail<T: Send + 'static>(
         &self,
         a: &mut AgentRecord,
         debounce: Duration,
@@ -111,6 +111,8 @@ impl Core {
     /// Forgets an agent's tail, once the agent is gone.
     pub(crate) fn forget_status(&self, agent_ref: &str) {
         lock(&self.tails).remove(agent_ref);
+        lock(&self.sends).remove(agent_ref);
+        lock(&self.typing).remove(agent_ref);
     }
 
     /// The state clients see: `vibed`'s own `asleep` and `paused` while
@@ -181,6 +183,7 @@ impl Core {
         };
         let refs: HashSet<&str> = records.iter().map(|a| a.agent_ref.as_str()).collect();
         lock(&self.tails).retain(|r, _| refs.contains(r.as_str()));
+        lock(&self.sends).retain(|r, _| refs.contains(r.as_str()));
         published.retain(|r, _| refs.contains(r.as_str()));
         let debounce = self.idle_debounce();
         let mut paths = Vec::new();
