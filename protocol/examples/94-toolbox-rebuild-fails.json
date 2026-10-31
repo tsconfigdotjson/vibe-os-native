@@ -1,0 +1,30 @@
+{
+  "description": "Rebuild template, with an [[install]] that fails: nothing is kept, and the error says which step and how.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 94,
+    "method": "toolbox.rebuild",
+    "params": {}
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 94,
+    "error": {
+      "code": -32004,
+      "message": "installing gcloud exited with code 3"
+    }
+  },
+  "events": [
+    {
+      "jsonrpc": "2.0",
+      "method": "events.event",
+      "params": {
+        "seq": 18,
+        "at": "2026-10-30T12:00:00Z",
+        "host": "local",
+        "kind": "toolbox.changed",
+        "message": "Rebuilding the template failed: installing gcloud exited with code 3"
+      }
+    }
+  ]
+}

@@ -592,6 +592,33 @@ fn poweroff_ends_the_command_and_the_guest() {
     wait_until("the command to end", || !alive(pid));
 }
 
+#[test]
+fn a_seal_ends_the_command_and_leaves_only_a_poweroff() {
+    let mut g = Guest::start("seal", true, &[]);
+    let pid = g.launch(&["sleep", "300"]);
+    let sealed = g.ok(json!({"op": "seal"}));
+    // A test guest has no disks of its own to freeze.
+    assert_eq!(sealed["disks"], json!([]));
+    wait_until("the command to end", || !alive(pid));
+    // Sealing again says the same; nothing more runs.
+    assert_eq!(g.ok(json!({"op": "seal"}))["disks"], json!([]));
+    for request in [
+        json!({"op": "launch", "command": ["true"], "cwd": g.dir.path()}),
+        json!({"op": "run", "command": ["true"], "timeout_ms": 1000}),
+    ] {
+        let reply = g.ask(request);
+        assert_eq!(reply["code"], "busy", "{reply}");
+        assert!(reply["error"].as_str().unwrap().contains("sealed"));
+    }
+    g.ok(json!({"op": "status"}));
+    g.ok(json!({"op": "poweroff"}));
+    let deadline = Instant::now() + WAIT;
+    while g.child.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "the guest didn't exit");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 impl Term {
     /// Waits for the screen to differ from `before`.
     fn expect_change(&mut self, before: &str) {

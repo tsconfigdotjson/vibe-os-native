@@ -148,6 +148,11 @@ impl Layout {
         self.config_dir().join("host.toml")
     }
 
+    /// The toolbox's optional recipe, which the owner writes by hand.
+    pub fn toolbox_config(&self) -> PathBuf {
+        self.config_dir().join("toolbox.toml")
+    }
+
     /// Where GitHub projects are cloned.
     pub fn projects_dir(&self) -> PathBuf {
         self.home.join("VibeOS/projects")

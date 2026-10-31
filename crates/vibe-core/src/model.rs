@@ -123,6 +123,9 @@ names! {
         AgentLimit = "agent.limit",
         /// The subscriber fell behind and missed events: re-read everything.
         Lagged = "lagged",
+        /// The toolbox opened, or saved, updated or rebuilt the template,
+        /// or failed to; `message` says which.
+        ToolboxChanged = "toolbox.changed",
     }
 }
 
@@ -193,6 +196,26 @@ names! {
         /// A Claude usage limit; the next send starts a new turn.
         UsageLimit = "usage_limit",
     }
+}
+
+names! {
+    /// What the toolbox is doing (PRD: The toolbox shell). `unavailable` on
+    /// a host with none: a Linux host, or a Mac without `vibe-vm`.
+    ToolboxState {
+        Unavailable = "unavailable",
+        Closed = "closed",
+        Open = "open",
+        /// The shell exited, and the new versions are being kept.
+        Saving = "saving",
+        Updating = "updating",
+        Rebuilding = "rebuilding",
+    }
+}
+
+names! {
+    /// What a toolbox run was: a shell session, the weekly `[update]`, or
+    /// **Rebuild template**.
+    ToolboxAction { Shell = "shell", Update = "update", Rebuild = "rebuild" }
 }
 
 /// The default memory of a profile.

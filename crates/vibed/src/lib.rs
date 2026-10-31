@@ -11,3 +11,4 @@ pub mod projects;
 pub mod server;
 pub mod sessions;
 pub mod status;
+pub mod toolbox;

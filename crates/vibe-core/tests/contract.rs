@@ -10,7 +10,7 @@ use serde::{Serialize, forward_to_deserialize_any};
 use serde_json::Value;
 use vibe_core::model::{
     Activity, AgentState, Certainty, Environment, EventKind, GhState, Mode, Model, ProjectSource,
-    Reasoning, SessionState, StopReason, WakeupKind,
+    Reasoning, SessionState, StopReason, ToolboxAction, ToolboxState, WakeupKind,
 };
 use vibe_core::paths;
 use vibe_core::rpc::*;
@@ -190,6 +190,8 @@ fn rust_types() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
         entry::<AgentStatus>(),
         entry::<Wakeup>(),
         entry::<AgentList>(),
+        entry::<ToolboxStatus>(),
+        entry::<ToolboxRun>(),
     ])
 }
 
@@ -249,6 +251,10 @@ fn rust_methods() -> BTreeMap<&'static str, MethodTypes> {
         method::<AgentsStart>(),
         method::<AgentsList>(),
         method::<AgentsDelete>(),
+        method::<ToolboxStatusGet>(),
+        method::<ToolboxOpen>(),
+        method::<ToolboxUpdate>(),
+        method::<ToolboxRebuild>(),
     ])
 }
 
@@ -286,6 +292,14 @@ fn rust_enums() -> BTreeMap<&'static str, Vec<&'static str>> {
         ("Certainty", names(Certainty::ALL, Certainty::as_str)),
         ("WakeupKind", names(WakeupKind::ALL, WakeupKind::as_str)),
         ("StopReason", names(StopReason::ALL, StopReason::as_str)),
+        (
+            "ToolboxState",
+            names(ToolboxState::ALL, ToolboxState::as_str),
+        ),
+        (
+            "ToolboxAction",
+            names(ToolboxAction::ALL, ToolboxAction::as_str),
+        ),
     ])
 }
 

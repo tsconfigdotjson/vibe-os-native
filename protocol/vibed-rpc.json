@@ -30,7 +30,11 @@
     { "name": "sessions.attach", "params": "SessionParams", "result": "SessionAttach" },
     { "name": "agents.start", "params": "AgentStartParams", "result": "Agent" },
     { "name": "agents.list", "params": "HostParams", "result": "AgentList" },
-    { "name": "agents.delete", "params": "AgentDeleteParams", "result": "Agent" }
+    { "name": "agents.delete", "params": "AgentDeleteParams", "result": "Agent" },
+    { "name": "toolbox.status", "params": "NoParams", "result": "ToolboxStatus" },
+    { "name": "toolbox.open", "params": "NoParams", "result": "SessionAttach" },
+    { "name": "toolbox.update", "params": "NoParams", "result": "ToolboxRun" },
+    { "name": "toolbox.rebuild", "params": "NoParams", "result": "ToolboxRun" }
   ],
   "notifications": [
     { "name": "events.event", "params": "Event" }
@@ -54,13 +58,15 @@
     "Mode": ["auto", "bypass"],
     "ProjectSource": ["github", "path"],
     "GhState": ["unknown", "logged_in", "logged_out", "not_installed", "error"],
-    "EventKind": ["project.added", "project.removed", "profiles.changed", "limits.changed", "keys.changed", "gh.status", "agent.added", "agent.deleted", "agent.state", "agent.status", "agent.limit", "lagged"],
+    "EventKind": ["project.added", "project.removed", "profiles.changed", "limits.changed", "keys.changed", "gh.status", "agent.added", "agent.deleted", "agent.state", "agent.status", "agent.limit", "lagged", "toolbox.changed"],
     "SessionState": ["running", "exited"],
     "AgentState": ["busy", "idle", "question", "asleep", "paused", "exited"],
     "Activity": ["awaiting_answer", "awaiting_approval", "running_tool", "thinking", "background_work", "done", "interrupted", "errored", "unknown"],
     "Certainty": ["firm", "inferred"],
     "WakeupKind": ["loop", "cron"],
-    "StopReason": ["usage_limit"]
+    "StopReason": ["usage_limit"],
+    "ToolboxState": ["unavailable", "closed", "open", "saving", "updating", "rebuilding"],
+    "ToolboxAction": ["shell", "update", "rebuild"]
   },
   "types": {
     "Request": ["jsonrpc", "id", "method", "params"],
@@ -104,7 +110,9 @@
     "Agent": ["host", "ref", "project", "profile", "environment", "state", "worktree", "branch", "session_id", "created_at", "attach", "status"],
     "AgentStatus": ["activity", "certainty", "since", "title", "line", "pending_wakeups", "stop_reason", "resets_at", "error"],
     "Wakeup": ["kind", "due_at", "certainty", "recurring", "reason"],
-    "AgentList": ["agents"]
+    "AgentList": ["agents"],
+    "ToolboxStatus": ["state", "template", "home", "base", "newest_base", "last"],
+    "ToolboxRun": ["action", "at", "template", "uncovered", "error"]
   },
   "optional": {
     "Request": ["id", "params"],
@@ -147,7 +155,9 @@
     "Agent": [],
     "AgentStatus": ["since", "title", "line", "stop_reason", "resets_at", "error"],
     "Wakeup": ["due_at", "reason"],
-    "AgentList": []
+    "AgentList": [],
+    "ToolboxStatus": ["template", "home", "base", "newest_base", "last"],
+    "ToolboxRun": ["template", "error"]
   },
   "nested": {
     "HostList": { "hosts": "HostInfo" },
@@ -161,6 +171,7 @@
     "Event": { "status": "AgentStatus" },
     "Agent": { "status": "AgentStatus" },
     "AgentStatus": { "pending_wakeups": "Wakeup" },
-    "AgentList": { "agents": "Agent" }
+    "AgentList": { "agents": "Agent" },
+    "ToolboxStatus": { "last": "ToolboxRun" }
   }
 }

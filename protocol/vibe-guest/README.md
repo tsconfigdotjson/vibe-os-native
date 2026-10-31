@@ -10,6 +10,7 @@ to it:
 | File | What it pins |
 | --- | --- |
 | `cmdline.txt` | The kernel command line: what to stack and mount, and who `vibe` is |
+| `cmdline-toolbox.txt` | The toolbox's: the template and the Linux home on writable disks of their own, and `sudo` |
 | `examples/*.json` | Requests on the control port with their exact replies (`request`, or a malformed `request_raw`, and `reply`) |
 | `terminal/*.json` | The JSON frames on the terminal port (`kind` and `payload`) |
 
@@ -30,13 +31,16 @@ arguments and environment.
 | --- | --- |
 | `vibe.layers=managed,home,template,base` | The read-only disks, by `vm.json` id (their virtio serial), top first, stacked with overlayfs into the root. Absent: run from the initrd |
 | `vibe.upper=agent` | The agent's writable disk, which takes every write to the root. Blank, it's formatted ext4 on the first boot. Absent with layers: writes go to memory |
+| `vibe.home=home` | A second writable disk, for `/home/vibe` alone: its own overlay puts the home's writes in the disk's `upper/home/vibe`, so the disk can later be stacked as a layer of its own. The toolbox's Linux home; needs `vibe.upper` |
+| `vibe.sudo=1` | `vibe` may run anything as root with `sudo`, through `/etc/sudoers.d/vibe-toolbox`: the toolbox only. Without it, a boot removes that file if a layer has one |
 | `vibe.share=TAG:PATH` | Mount the virtio-fs share `TAG` at `PATH`, percent-encoded. The worktree and `.git` go at their host paths; the agent's Claude home at `/home/vibe/.claude`; the package caches where the tools look (`/home/vibe/.npm`, …) |
 | `vibe.uid=501 vibe.gid=20` | Who `vibe` is: the host user, since virtio-fs shows the shares' files with their host owner. Absent: 1000 |
 
 A layer disk is ext4 (or squashfs or erofs): either a whole root filesystem,
 as the base image is, or a writable disk from an earlier VM, whose changes
 are in its `upper/` directory, which is then the layer. That's how the
-toolbox saves the template and the Linux home. A word the guest can't read
+toolbox saves the template (its `vibe.upper`) and the Linux home (its
+`vibe.home`). A word the guest can't read
 doesn't stop the boot: it's a problem in the status, and a stack that makes
 no sense isn't stacked at all.
 
@@ -80,6 +84,7 @@ line, both JSON: `{"ok":true, …}` or `{"ok":false,"code":…,"error":…}`.
 | `{"op":"clock","time_ms":…}` | Sets the clock. A VM has no clock of its own to boot with | `step_ms` |
 | `{"op":"run","command":[…],"env":{…},"cwd":…,"timeout_ms":…}` | Runs the command to completion as `vibe`, beside the agent's (Claude running or not): for `.vibe/setup.sh`. In a process group of its own, not the agent's cgroup, so a freeze doesn't stop it nor a launch clear it out. Past `timeout_ms` the group is killed, and what the command leaves in it is killed when it ends. The connection waits for it | `code` or `signal`, `timed_out`, and its stdout and stderr together as `output`: the last 32 KiB, as UTF-8 |
 | `{"op":"poweroff"}` | Replies, ends the agent (`SIGTERM`, then after 3 s `SIGKILL`), syncs and powers off; `vibe-vm` then exits 0 | `{"ok":true}` |
+| `{"op":"seal"}` | Before a poweroff whose writable disks are kept (the toolbox's): ends the command, takes `sudo` away, empties `/tmp`, syncs, then freezes every writable disk's filesystem (`FIFREEZE`), which empties its journal and marks it clean, so it can be stacked read-only later. After it, `launch` and `run` are refused with `busy`; sealing again gives the same reply | `disks` frozen, by id, and `seal_ms`; `seal_failed` if one couldn't be, and then nothing may be kept |
 
 A share answers when its root lists and every name in it can be looked up;
 before probing, the guest drops the dentries nobody holds, so lookups go to

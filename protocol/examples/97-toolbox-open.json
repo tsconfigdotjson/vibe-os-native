@@ -1,0 +1,33 @@
+{
+  "description": "Opens the toolbox shell and says how to attach to it, as sessions.attach does. While it's open, opening again gives the same shell. Exiting it saves a new template and Linux home version.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 97,
+    "method": "toolbox.open",
+    "params": {}
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 97,
+    "result": {
+      "host": "local",
+      "ref": "toolbox",
+      "title": "Linux toolbox",
+      "socket": "/Users/me/Library/Application Support/VibeOS/run/toolbox.sock",
+      "ttys": []
+    }
+  },
+  "events": [
+    {
+      "jsonrpc": "2.0",
+      "method": "events.event",
+      "params": {
+        "seq": 20,
+        "at": "2026-10-30T12:00:00Z",
+        "host": "local",
+        "kind": "toolbox.changed",
+        "message": "The Linux toolbox is open: exit its shell to save the template and Linux home"
+      }
+    }
+  ]
+}

@@ -38,6 +38,10 @@ public enum VibeRPC {
         AgentsStart.name,
         AgentsList.name,
         AgentsDelete.name,
+        ToolboxStatusGet.name,
+        ToolboxOpen.name,
+        ToolboxUpdate.name,
+        ToolboxRebuild.name,
     ]
     /// Every notification vibed sends.
     public static let notifications = [EventNotice.name]
@@ -379,6 +383,9 @@ public enum EventKind: String, Codable, CaseIterable, Hashable, Sendable {
     case agentLimit = "agent.limit"
     /// The subscriber fell behind and missed events: read everything again.
     case lagged
+    /// The toolbox opened, or saved, updated or rebuilt the template, or
+    /// failed to; `message` says which.
+    case toolboxChanged = "toolbox.changed"
 }
 
 /// Whether a session's shim still holds its terminal.
@@ -416,6 +423,16 @@ public enum WakeupKind: String, Codable, CaseIterable, Hashable, Sendable {
 /// Why a turn stopped beyond an error: `usageLimit` shows as "limited until …".
 public enum StopReason: String, Codable, CaseIterable, Hashable, Sendable {
     case usageLimit = "usage_limit"
+}
+
+/// What the Linux toolbox is doing; `unavailable` on a host with none.
+public enum ToolboxState: String, Codable, CaseIterable, Hashable, Sendable {
+    case unavailable, closed, open, saving, updating, rebuilding
+}
+
+/// What a toolbox run was: a shell session, the `[update]`, or Rebuild template.
+public enum ToolboxAction: String, Codable, CaseIterable, Hashable, Sendable {
+    case shell, update, rebuild
 }
 
 // MARK: - Methods
@@ -560,6 +577,36 @@ public enum AgentsDelete: RPCMethod {
     public typealias Params = AgentDeleteParams
     public typealias Result = Agent
     public static let name = "agents.delete"
+}
+
+/// `toolbox.status`: the versions new agents boot, and the last toolbox run.
+public enum ToolboxStatusGet: RPCMethod {
+    public typealias Params = NoParams
+    public typealias Result = ToolboxStatus
+    public static let name = "toolbox.status"
+}
+
+/// `toolbox.open`: opens the Linux toolbox shell, and where to attach to it,
+/// as `sessions.attach` says. Exiting the shell saves a new template and
+/// Linux home version.
+public enum ToolboxOpen: RPCMethod {
+    public typealias Params = NoParams
+    public typealias Result = SessionAttach
+    public static let name = "toolbox.open"
+}
+
+/// `toolbox.update`: runs toolbox.toml's `[update]` on the template now.
+public enum ToolboxUpdate: RPCMethod {
+    public typealias Params = NoParams
+    public typealias Result = ToolboxRun
+    public static let name = "toolbox.update"
+}
+
+/// `toolbox.rebuild`: Rebuild template, on the newest base image.
+public enum ToolboxRebuild: RPCMethod {
+    public typealias Params = NoParams
+    public typealias Result = ToolboxRun
+    public static let name = "toolbox.rebuild"
 }
 
 /// `events.event`: one event, sent to subscribed connections.
@@ -1157,5 +1204,43 @@ public struct AgentList: Codable, Hashable, Sendable {
 
     public enum CodingKeys: String, CodingKey, CaseIterable {
         case agents
+    }
+}
+
+/// The Linux toolbox, for `toolbox.status`.
+public struct ToolboxStatus: Codable, Hashable, Sendable {
+    public var state: ToolboxState
+    /// The newest template version, which new agents boot.
+    public var template: Int?
+    /// The newest Linux home version.
+    public var home: Int?
+    /// The base release new agents boot: the template's.
+    public var base: Int?
+    /// The newest base release installed; newer than `base`, offer Rebuild template.
+    public var newestBase: Int?
+    /// The last shell, update or rebuild to finish.
+    public var last: ToolboxRun?
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case state, template, home, base
+        case newestBase = "newest_base"
+        case last
+    }
+}
+
+/// How a toolbox run went.
+public struct ToolboxRun: Codable, Hashable, Sendable {
+    public var action: ToolboxAction
+    /// When it finished.
+    public var at: String
+    /// The template version it saved.
+    public var template: Int?
+    /// After a rebuild: what the old template has that the recipe doesn't cover.
+    public var uncovered: [String]
+    /// Why it failed; then nothing was kept.
+    public var error: String?
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case action, at, template, uncovered, error
     }
 }

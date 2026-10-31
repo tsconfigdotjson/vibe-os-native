@@ -1,0 +1,13 @@
+{
+  "request": {
+    "op": "seal"
+  },
+  "reply": {
+    "ok": true,
+    "disks": [
+      "template",
+      "home"
+    ],
+    "seal_ms": 412
+  }
+}

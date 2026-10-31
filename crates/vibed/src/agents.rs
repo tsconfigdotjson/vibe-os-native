@@ -459,7 +459,7 @@ fn remove(path: &Path) -> io::Result<()> {
 }
 
 /// Removes a session's socket and its lock, unless a shim holds the lock.
-fn remove_session_files(socket_path: &Path) -> io::Result<()> {
+pub(crate) fn remove_session_files(socket_path: &Path) -> io::Result<()> {
     let lock_path = socket::lock_path(socket_path);
     let lock = match OpenOptions::new().write(true).open(&lock_path) {
         Ok(f) => Some(f),
@@ -547,10 +547,21 @@ impl Core {
         })
     }
 
-    /// The agents whose sessions run, with what they reserve.
+    /// The agents whose sessions run, with what they reserve, and the
+    /// toolbox's VM while it runs, which takes a profile's default memory.
     async fn awake(&self, host: &str) -> Result<Vec<Awake>, ErrorObject> {
         let agents = self.store().agents(host).map_err(store_error)?;
         let mut awake = Vec::new();
+        let toolbox = *lock(&self.toolbox_state);
+        if !matches!(
+            toolbox,
+            vibe_core::model::ToolboxState::Closed | vibe_core::model::ToolboxState::Unavailable
+        ) {
+            awake.push(Awake {
+                agent_ref: vibe_env::toolbox::TOOLBOX_REF.into(),
+                memory: vibe_core::model::DEFAULT_PROFILE_MEMORY,
+            });
+        }
         for a in agents {
             if self.session_runs(&a.agent_ref).await {
                 awake.push(Awake {
@@ -592,6 +603,11 @@ impl Core {
         };
         if let Some(name) = name {
             validate_ref(name).map_err(invalid)?;
+            if name == vibe_env::toolbox::TOOLBOX_REF {
+                return Err(invalid(format!(
+                    "`{name}` is the Linux toolbox's; pick another name"
+                )));
+            }
             let ok = git(project, &["check-ref-format", "--branch", name])
                 .await?
                 .is_ok();

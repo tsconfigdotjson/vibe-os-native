@@ -5,17 +5,20 @@
 //! base-<n>/                 Image, initrd and base.img: base release <n>,
 //!                           downloaded once per app release
 //! managed-<version>.img     the managed layer: Claude Code <version>
-//! template-<n>.img          the Linux template, from the toolbox (#10)
-//! home-<n>.img              the Linux home, from the toolbox (#10)
+//! template-<n>.img          the Linux template, from the toolbox
+//! template-<n>.base         the base release template <n> was built on
+//! home-<n>.img              the Linux home, from the toolbox
 //! downloads/                downloads under way
 //! ```
 //!
 //! An image is never changed in place, because a sleeping agent's snapshot
 //! depends on the exact disks it was saved with: each new version is a new
-//! file, written beside its final name and renamed into place. New agents
-//! boot the newest of each; an agent keeps the ones in its `vm.json` until
-//! its next fresh boot. Old managed layers go once no agent's `vm.json`
-//! names them.
+//! file, written beside its final name and renamed into place. The toolbox
+//! (`vibe_env::toolbox`) makes a new template or home version from a clone
+//! of the last one, which it writes and then keeps here ([`Images::keep`]).
+//! New agents boot the newest of each; an agent keeps the ones in its
+//! `vm.json` until its next fresh boot. Old managed layers, templates and
+//! homes go once no agent's `vm.json` names them ([`Images::prune_unused`]).
 //!
 //! Downloads go through `curl`, over HTTPS (or `file://`, for a base image
 //! built locally and for tests), and are checked against the checksums
@@ -28,7 +31,7 @@ use std::io::{self, Read};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -49,8 +52,9 @@ pub const CLAUDE_PLATFORM: &str = "linux-arm64";
 pub const MANAGED_BIN: &str = "opt/vibeos/bin";
 
 /// The base release this build of VibeOS boots: a new app release may ship
-/// a new one (PRD: Base image updates).
-pub const BASE_RELEASE: u32 = 1;
+/// a new one (PRD: Base image updates). 2 has the `vibe-guest` the toolbox
+/// needs (`vibe.home`, `vibe.sudo`, `seal`) and `sudo`.
+pub const BASE_RELEASE: u32 = 2;
 
 /// Where base releases are published, each in `base-<n>/`, as
 /// `scripts/base-image.sh` makes them.
@@ -117,6 +121,31 @@ pub struct Layers {
     pub home: Option<PathBuf>,
 }
 
+/// The two layers the toolbox makes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Template,
+    Home,
+}
+
+impl Kind {
+    fn prefix(self) -> &'static str {
+        match self {
+            Kind::Template => "template",
+            Kind::Home => "home",
+        }
+    }
+}
+
+impl fmt::Display for Kind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Kind::Template => "template",
+            Kind::Home => "Linux home",
+        })
+    }
+}
+
 /// The images in one directory, `~/VibeOS/linux/`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Images {
@@ -138,6 +167,11 @@ impl Images {
             .into_iter()
             .filter_map(|(n, _)| self.installed_base(n))
             .next_back()
+    }
+
+    /// Base release `version`, if it's installed.
+    pub fn installed(&self, version: u32) -> Option<Base> {
+        self.installed_base(version)
     }
 
     fn installed_base(&self, version: u32) -> Option<Base> {
@@ -178,6 +212,57 @@ impl Images {
             .map(|(_, p)| p)
     }
 
+    /// The newest version of the template or the home, and its image.
+    pub fn newest_of(&self, kind: Kind) -> Option<(u32, PathBuf)> {
+        self.versions(&format!("{}-", kind.prefix()), ".img").pop()
+    }
+
+    /// The base release `template` was built on: the one its `.base` names,
+    /// or failing that the oldest installed, which a template from before
+    /// `.base` files was built on.
+    pub fn base_of(&self, template: &Path) -> Option<Base> {
+        fs::read_to_string(template.with_extension("base"))
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .and_then(|v| self.installed_base(v))
+            .or_else(|| {
+                self.versions("base-", "")
+                    .into_iter()
+                    .find_map(|(n, _)| self.installed_base(n))
+            })
+    }
+
+    /// Keeps `working`, an image the toolbox wrote, as the next version of
+    /// `kind`: read-only from now on, renamed into place, never over
+    /// another file. A template notes the base release it was built on
+    /// first, in `template-<n>.base`, so it's never booted on another.
+    /// Returns the version and the image.
+    pub fn keep(&self, kind: Kind, working: &Path, base: Option<u32>) -> Result<(u32, PathBuf)> {
+        self.make_dir()?;
+        let next = self.newest_of(kind).map_or(1, |(n, _)| n + 1);
+        let dest = self.dir.join(format!("{}-{next}.img", kind.prefix()));
+        readonly(working)?;
+        // On disk before it has a name: a crash mustn't leave a torn image
+        // under one that agents boot.
+        File::open(working)
+            .and_then(|f| f.sync_all())
+            .map_err(io_err(format!("flush {}", working.display())))?;
+        if kind == Kind::Template {
+            let base = base.ok_or_else(|| err("a template needs the base it was built on"))?;
+            let note = dest.with_extension("base");
+            let tmp = dest.with_extension("base.partial");
+            fs::write(&tmp, format!("{base}\n"))
+                .and_then(|()| fs::rename(&tmp, &note))
+                .map_err(io_err(format!("write {}", note.display())))?;
+        }
+        // A link fails if the name is taken, which a rename wouldn't.
+        fs::hard_link(working, &dest)
+            .and_then(|()| fs::remove_file(working))
+            .and_then(|()| File::open(&self.dir)?.sync_all())
+            .map_err(io_err(format!("keep {}", dest.display())))?;
+        Ok((next, dest))
+    }
+
     /// The newest of each layer, or why there's no base to boot. A new base
     /// is never put under a template built on an older one (PRD: Base image
     /// updates): with a template, the base is the one it names in
@@ -193,20 +278,7 @@ impl Images {
         let template = self.newest("template");
         let base = match &template {
             None => self.base().ok_or_else(none)?,
-            Some(t) => {
-                let named = fs::read_to_string(t.with_extension("base"))
-                    .ok()
-                    .and_then(|v| v.trim().parse::<u32>().ok())
-                    .and_then(|v| self.installed_base(v));
-                match named {
-                    Some(base) => base,
-                    None => self
-                        .versions("base-", "")
-                        .into_iter()
-                        .find_map(|(n, _)| self.installed_base(n))
-                        .ok_or_else(none)?,
-                }
-            }
+            Some(t) => self.base_of(t).ok_or_else(none)?,
         };
         Ok(Layers {
             base,
@@ -447,15 +519,42 @@ impl Images {
         built.map(|()| dest)
     }
 
-    /// Removes every managed layer but the newest that no path in `in_use`
-    /// names, and anything a stopped build left. Returns what went.
+    /// Removes every managed layer, template and home but the newest of
+    /// each that no path in `in_use` names, and anything a stopped build
+    /// left. Returns what went. A template or home is kept while its newest
+    /// version is younger than [`PRUNE_GRACE`]: an agent being made, or
+    /// booting afresh, may have picked the one before it a moment ago and
+    /// not yet named it in its `vm.json`.
     pub fn prune_managed(&self, in_use: &HashSet<PathBuf>) -> Vec<PathBuf> {
+        self.prune_managed_after(in_use, PRUNE_GRACE)
+    }
+
+    /// [`Images::prune_managed`] with `grace` in place of [`PRUNE_GRACE`].
+    pub fn prune_managed_after(&self, in_use: &HashSet<PathBuf>, grace: Duration) -> Vec<PathBuf> {
         let mut all = self.managed_all();
         all.pop();
         let mut gone = Vec::new();
         for (_, path) in all {
             if !in_use.contains(&path) && fs::remove_file(&path).is_ok() {
                 gone.push(path);
+            }
+        }
+        for kind in [Kind::Template, Kind::Home] {
+            let mut all = self.versions(&format!("{}-", kind.prefix()), ".img");
+            let settled = all.last().is_some_and(|(_, newest)| {
+                fs::metadata(newest)
+                    .and_then(|m| m.modified())
+                    .is_ok_and(|t| t.elapsed().unwrap_or_default() >= grace)
+            });
+            if !settled {
+                continue;
+            }
+            all.pop();
+            for (_, path) in all {
+                if !in_use.contains(&path) && fs::remove_file(&path).is_ok() {
+                    let _ = fs::remove_file(path.with_extension("base"));
+                    gone.push(path);
+                }
             }
         }
         for name in self.names() {
@@ -503,13 +602,22 @@ impl Images {
     /// [`Images::prune_managed`] for the agents in `agents_dir`; nothing goes
     /// if any of their `vm.json` can't be read.
     pub fn prune_unused(&self, agents_dir: &Path) -> Vec<PathBuf> {
+        self.prune_unused_after(agents_dir, PRUNE_GRACE)
+    }
+
+    /// [`Images::prune_unused`] with `grace` in place of [`PRUNE_GRACE`].
+    pub fn prune_unused_after(&self, agents_dir: &Path, grace: Duration) -> Vec<PathBuf> {
         let used = disks_in_use(agents_dir);
         if used.contains(Path::new("*")) {
             return Vec::new();
         }
-        self.prune_managed(&used)
+        self.prune_managed_after(&used, grace)
     }
 }
+
+/// How long a superseded template or home version is kept even if no agent
+/// names it: see [`Images::prune_managed`].
+pub const PRUNE_GRACE: Duration = Duration::from_secs(10 * 60);
 
 /// A file's size and SHA-256, as a manifest gives them.
 #[derive(Debug, Clone, Deserialize)]
@@ -998,6 +1106,57 @@ mod tests {
         fs::write(agent.join("vm.json"), "{").unwrap();
         assert!(images.prune_unused(&agents).is_empty());
         assert!(used.exists());
+    }
+
+    #[test]
+    fn toolbox_versions_are_kept_as_new_files_and_pruned_once_unused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let images = Images::new(tmp.path().join("linux"));
+        let working = |name: &str| {
+            let p = tmp.path().join(name);
+            fs::write(&p, name).unwrap();
+            p
+        };
+        assert_eq!(images.newest_of(Kind::Template), None);
+        // A template needs its base.
+        assert!(images.keep(Kind::Template, &working("t0"), None).is_err());
+        let (n, t1) = images
+            .keep(Kind::Template, &working("t1"), Some(1))
+            .unwrap();
+        assert_eq!((n, t1.clone()), (1, images.dir().join("template-1.img")));
+        assert_eq!(
+            fs::read_to_string(images.dir().join("template-1.base")).unwrap(),
+            "1\n"
+        );
+        assert!(!tmp.path().join("t1").exists(), "renamed, not copied");
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&t1).unwrap().permissions().mode() & 0o777,
+            0o444
+        );
+        let (_, t2) = images
+            .keep(Kind::Template, &working("t2"), Some(2))
+            .unwrap();
+        let (n, h1) = images.keep(Kind::Home, &working("h1"), None).unwrap();
+        assert_eq!(n, 1);
+        assert!(!images.dir().join("home-1.base").exists());
+        let (_, h2) = images.keep(Kind::Home, &working("h2"), None).unwrap();
+        assert_eq!(images.newest_of(Kind::Template), Some((2, t2.clone())));
+        assert_eq!(images.newest_of(Kind::Home), Some((2, h2.clone())));
+
+        // An agent asleep on template 1 and home 1 keeps them; the newest
+        // of each always stays.
+        let used: HashSet<PathBuf> = [t1.clone(), h1.clone()].into();
+        assert!(images.prune_managed_after(&used, Duration::ZERO).is_empty());
+        // Just superseded, they wait out the grace, used or not.
+        assert!(images.prune_managed(&HashSet::new()).is_empty());
+        assert!(t1.exists() && h1.exists());
+        let gone = images.prune_managed_after(&HashSet::new(), Duration::ZERO);
+        assert_eq!(gone.len(), 2, "{gone:?}");
+        assert!(!t1.exists() && !h1.exists());
+        assert!(!images.dir().join("template-1.base").exists());
+        assert!(t2.exists() && h2.exists());
+        assert!(images.dir().join("template-2.base").exists());
     }
 
     /// Publishes base release `version` in `dir`, with a real ext4 image.

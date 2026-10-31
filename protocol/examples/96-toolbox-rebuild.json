@@ -1,0 +1,34 @@
+{
+  "description": "Rebuild template: the newest base, with toolbox.toml's recipe replayed into a fresh template, and what the old template has that the recipe doesn't cover. The Linux home carries over.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 96,
+    "method": "toolbox.rebuild",
+    "params": {}
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 96,
+    "result": {
+      "action": "rebuild",
+      "at": "2026-10-30T12:00:00Z",
+      "template": 2,
+      "uncovered": [
+        "apt: htop"
+      ]
+    }
+  },
+  "events": [
+    {
+      "jsonrpc": "2.0",
+      "method": "events.event",
+      "params": {
+        "seq": 19,
+        "at": "2026-10-30T12:00:00Z",
+        "host": "local",
+        "kind": "toolbox.changed",
+        "message": "The rebuild saved template 2; toolbox.toml doesn't cover apt: htop"
+      }
+    }
+  ]
+}

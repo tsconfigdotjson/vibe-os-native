@@ -7,9 +7,16 @@
 //! (`vibe.upper`). A layer disk is either a whole root filesystem (the base
 //! image) or the writable disk of an earlier VM, whose changes are in its
 //! `upper/` directory; that's how the toolbox saves the template and the
-//! Linux home. A blank writable disk is formatted ext4 on the first boot,
-//! with the `mke2fs` the initrd carries. With no `vibe.layers` the guest
-//! runs from its initrd, as the test guest does.
+//! Linux home. In the toolbox, `vibe.home` names a second writable disk,
+//! which takes the writes to `vibe`'s home in its own `upper/home/vibe`
+//! through an overlay of its own, so the Linux home and the template come
+//! out as two layers. A blank writable disk is formatted ext4 on the first
+//! boot, with the `mke2fs` the initrd carries. With no `vibe.layers` the
+//! guest runs from its initrd, as the test guest does.
+//!
+//! `vibe.sudo` lets `vibe` use `sudo` in the toolbox, through a file in
+//! `/etc/sudoers.d` that the seal takes away again; any other boot removes
+//! it, should one ever be left in a layer.
 //!
 //! Nothing here stops the boot. What fails is reported as a problem in the
 //! guest's status, so the host can say why.
@@ -49,10 +56,24 @@ const DISK_TIMEOUT: Duration = Duration::from_secs(10);
 
 const NOSUID_NODEV: libc::c_ulong = libc::MS_NOSUID | libc::MS_NODEV;
 
+/// The rule `vibe.sudo` puts in place, so the toolbox shell can install
+/// with `sudo apt install …`. Its name has no `.`, which `sudo` would skip.
+pub(crate) const SUDOERS: &str = "/etc/sudoers.d/vibe-toolbox";
+
+/// A writable disk's filesystem, held open by its mount directory so it can
+/// be sealed after the switch hides that directory.
+#[derive(Debug)]
+pub(crate) struct Writable {
+    pub(crate) id: String,
+    pub(crate) dir: fs::File,
+}
+
 /// What the boot set up.
 #[derive(Debug)]
 pub(crate) struct Setup {
     pub(crate) layers: Vec<String>,
+    pub(crate) writable: Vec<Writable>,
+    pub(crate) sudo: bool,
     pub(crate) shares: Vec<ShareMount>,
     pub(crate) uid: u32,
     pub(crate) gid: u32,
@@ -72,15 +93,21 @@ pub(crate) fn setup() -> Setup {
     let (boot, unreadable) = Boot::parse(&cmdline);
     unreadable.into_iter().for_each(&mut problem);
     let mut layers = Vec::new();
+    let mut writable = Vec::new();
     if !boot.layers.is_empty() {
         match stack(&boot) {
-            Ok(()) => {
+            Ok(disks) => {
                 log!(
-                    "the root is {} under {}",
+                    "the root is {} under {}{}",
                     boot.layers.join(", "),
-                    boot.upper.as_deref().unwrap_or("a scratch disk")
+                    boot.upper.as_deref().unwrap_or("a scratch disk"),
+                    boot.home
+                        .as_deref()
+                        .map(|h| format!(", with {HOME} on {h}"))
+                        .unwrap_or_default()
                 );
                 layers = boot.layers.clone();
+                writable = disks;
             }
             Err(e) => problem(format!(
                 "can't stack the disks, so running from the initrd: {e}"
@@ -106,6 +133,10 @@ pub(crate) fn setup() -> Setup {
         .unwrap_or("/bin/sh");
     if let Err(e) = add_user(uid, gid, shell) {
         problem(format!("can't set up the user vibe: {e}"));
+    }
+    let sudo = boot.sudo && !layers.is_empty();
+    if let Err(e) = set_sudo(sudo) {
+        problem(format!("can't set up sudo for vibe: {e}"));
     }
     let runtime = format!("/run/user/{uid}");
     if let Err(e) = mkdir_p(Path::new(&runtime), 0o755)
@@ -153,6 +184,8 @@ pub(crate) fn setup() -> Setup {
     .collect();
     Setup {
         layers,
+        writable,
+        sudo,
         shares,
         uid,
         gid,
@@ -267,9 +300,9 @@ fn runtime_filesystems(problem: &mut impl FnMut(String)) {
     }
 }
 
-/// Mounts the layers and the writable disk, stacks them with overlayfs, and
-/// makes that the root.
-fn stack(boot: &Boot) -> io::Result<()> {
+/// Mounts the layers and the writable disks, stacks them with overlayfs,
+/// and makes that the root. Returns the writable disks' filesystems.
+fn stack(boot: &Boot) -> io::Result<Vec<Writable>> {
     let mut lowers = Vec::new();
     for id in &boot.layers {
         let device = find_disk(id)?;
@@ -279,26 +312,14 @@ fn stack(boot: &Boot) -> io::Result<()> {
         let upper = dir.join("upper");
         lowers.push(if upper.is_dir() { upper } else { dir });
     }
+    let mut writable = Vec::new();
     let top = match &boot.upper {
         Some(id) => {
-            let device = find_disk(id)?;
-            if detect(&device)?.is_none() {
-                // Only a disk that has never been written: anything else
-                // may be the agent's work, and isn't the guest's to wipe.
-                if !blank(&device)? {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "{} ({id}) has data but no filesystem vibe-guest knows; not formatting it",
-                            device.display()
-                        ),
-                    ));
-                }
-                format(&device, id)?;
-            }
-            let dir = Path::new(LAYERS).join(id);
-            mkdir_p(&dir, 0o755)?;
-            mount_disk(&device, &dir, false)?;
+            let dir = writable_disk(id)?;
+            writable.push(Writable {
+                id: id.clone(),
+                dir: fs::File::open(&dir)?,
+            });
             dir
         }
         // Without a disk, writes go to memory and are lost on a reboot.
@@ -325,7 +346,92 @@ fn stack(boot: &Boot) -> io::Result<()> {
     mkdir_p(Path::new(NEW_ROOT), 0o755)?;
     mount("overlay", Path::new(NEW_ROOT), "overlay", 0, &options)
         .map_err(|e| io::Error::new(e.kind(), format!("overlay {options}: {e}")))?;
-    switch_root(Path::new(NEW_ROOT))
+    if let Some(id) = &boot.home {
+        let dir = writable_disk(id)?;
+        stack_home(&dir, boot.uid(), boot.gid())?;
+        writable.push(Writable {
+            id: id.clone(),
+            dir: fs::File::open(&dir)?,
+        });
+    }
+    switch_root(Path::new(NEW_ROOT))?;
+    Ok(writable)
+}
+
+/// Finds writable disk `id`, formats it if it's blank, and mounts it at
+/// `/layers/<id>`.
+fn writable_disk(id: &str) -> io::Result<PathBuf> {
+    let device = find_disk(id)?;
+    if detect(&device)?.is_none() {
+        // Only a disk that has never been written: anything else may be
+        // the agent's work, and isn't the guest's to wipe.
+        if !blank(&device)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{} ({id}) has data but no filesystem vibe-guest knows; not formatting it",
+                    device.display()
+                ),
+            ));
+        }
+        format(&device, id)?;
+    }
+    let dir = Path::new(LAYERS).join(id);
+    mkdir_p(&dir, 0o755)?;
+    mount_disk(&device, &dir, false)?;
+    Ok(dir)
+}
+
+/// Lays `vibe`'s home in the new root over with the writable home disk
+/// mounted at `disk`: its writes land in the disk's `upper/home/vibe`,
+/// where they're the Linux home layer's when it's stacked under an agent.
+fn stack_home(disk: &Path, uid: u32, gid: u32) -> io::Result<()> {
+    let (upper, work) = home_dirs(disk);
+    mkdir_p(&disk.join("upper/home"), 0o755)?;
+    mkdir_p_owned(&upper, 0o755, uid, gid)?;
+    mkdir_p(&work, 0o755)?;
+    let at = Path::new(NEW_ROOT).join(&HOME[1..]);
+    mkdir_p(&at, 0o755)?;
+    let options = format!(
+        "lowerdir={},upperdir={},workdir={}",
+        at.display(),
+        upper.display(),
+        work.display()
+    );
+    mount("overlay", &at, "overlay", 0, &options)
+        .map_err(|e| io::Error::new(e.kind(), format!("overlay {options}: {e}")))
+}
+
+/// Where a writable home disk keeps `vibe`'s home, and overlayfs's work
+/// directory beside it.
+fn home_dirs(disk: &Path) -> (PathBuf, PathBuf) {
+    (disk.join("upper").join(&HOME[1..]), disk.join("work"))
+}
+
+/// Puts the toolbox's `sudo` rule in place, or takes it away.
+pub(crate) fn set_sudo(on: bool) -> io::Result<()> {
+    let path = Path::new(SUDOERS);
+    if !on {
+        return match fs::remove_file(path) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        };
+    }
+    mkdir_p(path.parent().expect("a parent"), 0o755)?;
+    // A name with a `.`, which sudo skips, until it's whole.
+    let tmp = path.with_extension("vibe-guest");
+    fs::write(&tmp, "vibe ALL=(ALL:ALL) NOPASSWD: ALL\n")?;
+    sys::chmod(&tmp, 0o440)?;
+    fs::rename(&tmp, path)
+}
+
+/// Freezes the filesystem open at `dir`: the kernel flushes it, empties its
+/// journal and marks it clean, so the disk under it can be kept as it is.
+pub(crate) fn freeze_filesystem(dir: &fs::File) -> io::Result<()> {
+    /// `_IOWR('X', 119, int)`.
+    const FIFREEZE: u32 = 0xC004_5877;
+    // SAFETY: an ioctl on a descriptor we hold, with an integer argument.
+    check(unsafe { libc::ioctl(dir.as_raw_fd(), FIFREEZE as _, 0) }).map(drop)
 }
 
 /// Moves the kernel's filesystems into `new` and makes it `/`, as
@@ -617,6 +723,20 @@ mod tests {
         let empty = dir.path().join("empty.img");
         fs::File::create(&empty).unwrap();
         assert!(blank(&empty).unwrap());
+    }
+
+    #[test]
+    fn the_home_disk_holds_the_home_where_a_layer_has_it() {
+        let (upper, work) = home_dirs(Path::new("/layers/home"));
+        assert_eq!(upper, Path::new("/layers/home/upper/home/vibe"));
+        assert_eq!(work, Path::new("/layers/home/work"));
+        // Stacked as a layer, the disk's `upper/` is a root, and its
+        // `home/vibe` lands on vibe's home.
+        assert_eq!(
+            Path::new("/").join(upper.strip_prefix("/layers/home/upper").unwrap()),
+            Path::new(HOME)
+        );
+        assert!(!SUDOERS.rsplit('/').next().unwrap().contains('.'));
     }
 
     #[test]

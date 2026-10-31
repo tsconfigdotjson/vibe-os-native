@@ -113,6 +113,9 @@ pub trait Machine: Send + Sync + fmt::Debug {
     fn thaw(&self, socket: &Path, now: SystemTime) -> Result<guest::Thawed>;
     /// Ends the agent, syncs and powers off; `vibe-vm` then exits.
     fn poweroff(&self, socket: &Path) -> Result<()>;
+    /// Ends the command and leaves the writable disks clean, to be kept:
+    /// the ids of those it sealed.
+    fn seal(&self, socket: &Path) -> Result<Vec<String>>;
     /// Runs a command to completion in the guest, beside the agent's.
     fn run(&self, socket: &Path, run: &proto::Run) -> Result<proto::Ran>;
 }
@@ -227,6 +230,12 @@ impl Machine for Real {
 
     fn run(&self, socket: &Path, run: &proto::Run) -> Result<proto::Ran> {
         guest::run(socket, run).map_err(env_err("vibe-guest couldn't run it"))
+    }
+
+    fn seal(&self, socket: &Path) -> Result<Vec<String>> {
+        guest::seal(socket)
+            .map(|s| s.disks)
+            .map_err(env_err("vibe-guest couldn't seal the disks"))
     }
 }
 
@@ -399,6 +408,8 @@ impl LinuxVm {
         let boot = boot::Boot {
             layers: Vec::new(),
             upper: Some("agent".into()),
+            home: None,
+            sudo: false,
             shares: shares
                 .iter()
                 .map(|(tag, _, at)| boot::Share {
@@ -925,5 +936,7 @@ impl Backend for LinuxVm {
     }
 }
 
+#[cfg(test)]
+pub(crate) mod fake;
 #[cfg(test)]
 mod tests;

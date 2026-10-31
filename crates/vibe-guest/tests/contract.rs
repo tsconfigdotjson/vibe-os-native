@@ -12,8 +12,8 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use vibe_guest::boot::Boot;
 use vibe_guest::proto::{
-    ClockSet, Done, ErrorCode, Exit, Frozen, Launched, Processes, Ran, Refused, Request, Status,
-    TermHello, TermSize, TermWelcome, Thawed, decode_reply, decode_request, encode_reply,
+    ClockSet, Done, ErrorCode, Exit, Frozen, Launched, Processes, Ran, Refused, Request, Sealed,
+    Status, TermHello, TermSize, TermWelcome, Thawed, decode_reply, decode_request, encode_reply,
 };
 
 fn contract_dir() -> PathBuf {
@@ -89,6 +89,7 @@ fn every_example_round_trips() {
             Request::Clock { .. } => round_trip::<ClockSet>(&name, reply),
             Request::Poweroff => round_trip::<Done>(&name, reply),
             Request::Run(_) => round_trip::<Ran>(&name, reply),
+            Request::Seal => round_trip::<Sealed>(&name, reply),
         };
         if let Some(code) = code {
             codes.insert(format!("{code:?}"));
@@ -103,6 +104,7 @@ fn every_example_round_trips() {
         "clock",
         "poweroff",
         "run",
+        "seal",
     ]
     .map(String::from)
     .into();
@@ -148,6 +150,20 @@ fn the_command_line_reads_and_writes_back() {
     assert_eq!(boot.layers, ["managed", "home", "template", "base"]);
     assert_eq!(boot.upper.as_deref(), Some("agent"));
     assert_eq!((boot.uid(), boot.gid()), (501, 20));
+    assert!(boot.shares.iter().any(|s| s.path == "/home/vibe/.claude"));
+    assert_eq!(boot.append_to("console=hvc0 quiet").unwrap(), line);
+}
+
+#[test]
+fn the_toolbox_command_line_reads_and_writes_back() {
+    let text = fs::read_to_string(contract_dir().join("cmdline-toolbox.txt")).unwrap();
+    let line = text.trim_end();
+    let (boot, problems) = Boot::parse(line);
+    assert!(problems.is_empty(), "{problems:?}");
+    assert_eq!(boot.layers, ["managed", "base"]);
+    assert_eq!(boot.upper.as_deref(), Some("template"));
+    assert_eq!(boot.home.as_deref(), Some("home"));
+    assert!(boot.sudo);
     assert!(boot.shares.iter().any(|s| s.path == "/home/vibe/.claude"));
     assert_eq!(boot.append_to("console=hvc0 quiet").unwrap(), line);
 }

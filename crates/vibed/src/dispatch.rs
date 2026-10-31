@@ -9,7 +9,8 @@ use vibe_core::rpc::{
     GhStatusGet, Hello, HelloParams, HelloResult, HostsList, Id, KeysCreate, KeysList, KeysRevoke,
     KeysVerify, LimitsGet, LimitsSet, Method, PROTOCOL_VERSION, ProfilesCreate, ProfilesDelete,
     ProfilesList, ProfilesUpdate, ProjectsAdd, ProjectsList, ProjectsRemove, ProtocolMismatchData,
-    Request, Response, SessionsAttach, SessionsList, Subscribed,
+    Request, Response, SessionsAttach, SessionsList, Subscribed, ToolboxOpen, ToolboxRebuild,
+    ToolboxStatusGet, ToolboxUpdate,
 };
 
 use crate::core::Core;
@@ -172,6 +173,18 @@ async fn call(
         AgentsDelete::NAME => {
             encode_result(core.delete_agent(decode::<AgentsDelete>(params)?).await)
         }
+        ToolboxStatusGet::NAME => encode_result(
+            core.toolbox_status(decode::<ToolboxStatusGet>(params)?)
+                .await,
+        ),
+        ToolboxOpen::NAME => encode_result(core.open_toolbox(decode::<ToolboxOpen>(params)?).await),
+        ToolboxUpdate::NAME => {
+            encode_result(core.update_toolbox(decode::<ToolboxUpdate>(params)?).await)
+        }
+        ToolboxRebuild::NAME => encode_result(
+            core.rebuild_toolbox(decode::<ToolboxRebuild>(params)?)
+                .await,
+        ),
         _ => Err(ErrorObject::new(
             ErrorCode::MethodNotFound,
             format!("Method not found: {method}"),

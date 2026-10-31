@@ -50,8 +50,12 @@ a real `vibe-shim` running `sleep`, and the records of two that exited:
 has an `origin` to fetch, and a `.vibe/setup.sh` that copies `.env.example`
 to `.env.local`. Agents run under `vibe-env`'s test backend, with its
 stand-in for Claude Code, on a host with 64G of memory; randomness is fixed,
-so refs and session ids are too. The Rust replays build that world in a temp
-directory and put its path in place of `/Users/me`.
+so refs and session ids are too. Its toolbox is `vibe-env`'s test toolbox
+(a shell of `sleep 600`, empty images for versions), with base release 1
+installed, a Linux home (version 1) and a `toolbox.toml` whose `[update]`
+runs `true` and whose one `[[install]]` fails the first time it's run. The
+Rust replays build that world in a temp directory and put its path in place
+of `/Users/me`.
 
 **`vibe-vm` has a contract of its own**, in `vibe-vm/`: the configuration
 `vibed` gives it, the line it prints as it starts, and its control socket.

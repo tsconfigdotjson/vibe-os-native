@@ -1,0 +1,17 @@
+{
+  "description": "One toolbox at a time: nothing else runs in it while its shell is open.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 99,
+    "method": "toolbox.update",
+    "params": {}
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 99,
+    "error": {
+      "code": -32002,
+      "message": "the toolbox shell is open: exit it first, and the update can run"
+    }
+  }
+}

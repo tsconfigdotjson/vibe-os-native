@@ -9,11 +9,16 @@
 //! zeros: `F_PUNCHHOLE` on macOS, `fallocate` on Linux. It flushes the
 //! file first, as APFS writes those zeros out only then. Reads of a hole
 //! return zeros, so the file's contents don't change.
+//!
+//! [`clone_file`] makes a new image from an old one without copying it: an
+//! APFS clone on a Mac (`clonefile`), a reflink where Linux has one, and
+//! otherwise a copy of only the parts on disk.
 
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
+use std::path::Path;
 
 /// What's read at a time while looking for zeros.
 const CHUNK: u64 = 1 << 20;
@@ -160,6 +165,78 @@ pub fn punch_zeros(file: &File) -> io::Result<u64> {
     Ok(punched)
 }
 
+/// Makes `dest`, which mustn't exist, a copy of `src` that shares its
+/// blocks where the filesystem can: an APFS clone on macOS, a reflink
+/// (`FICLONE`) on Linux, and failing those a sparse copy, of only the parts
+/// of `src` on disk. `dest` is `0600`, whatever `src` is: it's to be
+/// written.
+pub fn clone_file(src: &Path, dest: &Path) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let c = |p: &Path| {
+            std::ffi::CString::new(p.as_os_str().as_bytes())
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a NUL in a path"))
+        };
+        let (from, to) = (c(src)?, c(dest)?);
+        // SAFETY: two NUL-terminated paths that outlive the call.
+        if unsafe { libc::clonefile(from.as_ptr(), to.as_ptr(), 0) } == 0 {
+            return std::fs::set_permissions(
+                dest,
+                std::os::unix::fs::PermissionsExt::from_mode(0o600),
+            );
+        }
+        let e = io::Error::last_os_error();
+        // Only where cloning isn't possible: another volume, or not APFS.
+        if ![libc::EXDEV, libc::ENOTSUP, libc::EOPNOTSUPP].contains(&e.raw_os_error().unwrap_or(0))
+        {
+            return Err(e);
+        }
+    }
+    let from = File::open(src)?;
+    let to = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(dest)?;
+    let copied = copy_into(&from, &to);
+    if copied.is_err() {
+        drop(to);
+        let _ = std::fs::remove_file(dest);
+    }
+    copied
+}
+
+fn copy_into(from: &File, to: &File) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: an ioctl between two descriptors we hold.
+        if unsafe { libc::ioctl(to.as_raw_fd(), libc::FICLONE as _, from.as_raw_fd()) } == 0 {
+            return Ok(());
+        }
+    }
+    let len = from.metadata()?.len();
+    to.set_len(len)?;
+    let mut buf = vec![0u8; CHUNK as usize];
+    let mut at = 0;
+    while let Some((start, end)) = next_data(from, at, len) {
+        let mut pos = start;
+        while pos < end {
+            let n = ((end - pos) as usize).min(buf.len());
+            from.read_exact_at(&mut buf[..n], pos)?;
+            // A block of zeros stays a hole.
+            if buf[..n].iter().any(|&b| b != 0) {
+                to.write_all_at(&buf[..n], pos)?;
+            }
+            pos += n as u64;
+        }
+        at = end;
+    }
+    punch_zeros(to)?;
+    to.sync_all()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,5 +334,45 @@ mod tests {
         odd.write_all_at(&[0u8; 100], 4096).unwrap();
         assert_eq!(punch_zeros(&odd).unwrap(), 0);
         assert_eq!(odd.metadata().unwrap().len(), 4196);
+    }
+
+    #[test]
+    fn a_clone_is_the_same_bytes_and_stays_sparse() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src.img");
+        let f = File::create(&src).unwrap();
+        f.set_len(64 << 20).unwrap();
+        f.write_all_at(b"superblock", 1024).unwrap();
+        f.write_all_at(b"tail", (64 << 20) - 4).unwrap();
+        drop(f);
+        std::fs::set_permissions(&src, std::os::unix::fs::PermissionsExt::from_mode(0o444))
+            .unwrap();
+        let dest = tmp.path().join("dest.img");
+        clone_file(&src, &dest).unwrap();
+        let (a, b) = (std::fs::read(&src).unwrap(), std::fs::read(&dest).unwrap());
+        assert!(a == b, "the clone differs");
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let meta = std::fs::metadata(&dest).unwrap();
+        assert_eq!(
+            meta.permissions().mode() & 0o777,
+            0o600,
+            "the clone is to be written"
+        );
+        assert!(
+            meta.blocks() * 512 < 4 << 20,
+            "{} bytes on disk",
+            meta.blocks() * 512
+        );
+        // Writing the clone leaves the original as it was.
+        OpenOptions::new()
+            .write(true)
+            .open(&dest)
+            .unwrap()
+            .write_all_at(b"changed", 1024)
+            .unwrap();
+        assert_eq!(std::fs::read(&src).unwrap(), a);
+        // It never replaces a file.
+        assert!(clone_file(&src, &dest).is_err());
+        assert_eq!(&std::fs::read(&dest).unwrap()[1024..1031], b"changed");
     }
 }

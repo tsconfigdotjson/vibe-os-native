@@ -285,3 +285,172 @@ impl Backend for TestBackend {
         }
     }
 }
+
+/// A toolbox for tests and for `VIBE_TEST_BACKEND`, so `vibed`'s handling
+/// of it is tested without a VM. Its shell is any command, run natively
+/// under the shim's PTY; closing it keeps a new, empty template and home
+/// version in `~/VibeOS/linux/`, as the real one keeps the disks it wrote.
+/// Update and recipe commands run natively with `sh -c` in its directory,
+/// so `true` succeeds and `exit 3` fails; a rebuild reports `uncovered`.
+#[derive(Debug)]
+pub struct TestToolbox {
+    layout: vibe_core::paths::Layout,
+    images: crate::images::Images,
+    shell: Vec<String>,
+    uncovered: Vec<String>,
+    outlives_shim: bool,
+}
+
+impl TestToolbox {
+    pub fn new(layout: vibe_core::paths::Layout, shell: Vec<String>) -> TestToolbox {
+        TestToolbox {
+            images: crate::images::Images::new(layout.linux_dir()),
+            layout,
+            shell,
+            uncovered: Vec::new(),
+            outlives_shim: false,
+        }
+    }
+
+    /// Its shell counts as running while it's open, as a VM's shell runs
+    /// on when its shim dies; opening it again then starts the shell anew,
+    /// standing in for a new shim on the same one.
+    pub fn outliving_its_shim(mut self) -> TestToolbox {
+        self.outlives_shim = true;
+        self
+    }
+
+    /// What a rebuild says the recipe doesn't cover.
+    pub fn with_uncovered(mut self, uncovered: Vec<String>) -> TestToolbox {
+        self.uncovered = uncovered;
+        self
+    }
+
+    fn dir(&self) -> PathBuf {
+        self.layout.agent_dir(crate::toolbox::TOOLBOX_REF)
+    }
+
+    fn marker(&self) -> PathBuf {
+        self.dir().join("open.json")
+    }
+
+    fn keep(&self, kind: crate::images::Kind, base: Option<u32>) -> Result<u32> {
+        let working = self.dir().join(format!("{kind:?}.img"));
+        fs::write(&working, "").map_err(|e| EnvError::new(e.to_string()))?;
+        let (n, _) = self.images.keep(kind, &working, base)?;
+        Ok(n)
+    }
+
+    fn base(&self) -> Option<u32> {
+        crate::toolbox::ToolboxHost::versions(self).base
+    }
+
+    fn sh(&self, what: &str, command: &str) -> Result<()> {
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(command)
+            .current_dir(self.dir())
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|e| EnvError::new(format!("{what}: {e}")))?;
+        match out.status.code() {
+            Some(0) => Ok(()),
+            Some(code) => Err(EnvError::new(format!("{what} exited with code {code}"))),
+            None => Err(EnvError::new(format!("{what} was ended by a signal"))),
+        }
+    }
+}
+
+impl crate::toolbox::ToolboxHost for TestToolbox {
+    fn versions(&self) -> crate::toolbox::Versions {
+        use crate::images::Kind;
+        let template = self.images.newest_of(Kind::Template);
+        crate::toolbox::Versions {
+            base: match &template {
+                Some((_, t)) => self.images.base_of(t).map(|b| b.version),
+                None => self.images.base().map(|b| b.version),
+            },
+            template: template.map(|(n, _)| n),
+            home: self.images.newest_of(Kind::Home).map(|(n, _)| n),
+            newest_base: self.images.base().map(|b| b.version),
+        }
+    }
+
+    fn open(&self) -> Result<TerminalEnd> {
+        let dir = self.dir();
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir)
+            .and_then(|()| fs::write(self.marker(), "{}"))
+            .map_err(|e| EnvError::new(format!("can't open the test toolbox: {e}")))?;
+        Ok(TerminalEnd::Pty {
+            command: self.shell.clone(),
+            cwd: dir,
+            env: Vec::new(),
+        })
+    }
+
+    fn is_open(&self) -> bool {
+        self.marker().exists()
+    }
+
+    /// Its shell runs under the shim, so it's gone with the shim, unless
+    /// it stands in for a VM's ([`TestToolbox::outliving_its_shim`]).
+    fn shell_running(&self) -> bool {
+        self.outlives_shim && self.is_open()
+    }
+
+    fn close(&self) -> Result<crate::toolbox::Saved> {
+        use crate::images::Kind;
+        if !self.is_open() {
+            return Err(EnvError::new("no toolbox shell is open"));
+        }
+        let _ = fs::remove_file(self.marker());
+        let base = self
+            .base()
+            .ok_or_else(|| EnvError::new("no Linux base image yet"))?;
+        Ok(crate::toolbox::Saved {
+            template: Some(self.keep(Kind::Template, Some(base))?),
+            home: Some(self.keep(Kind::Home, None)?),
+            uncovered: Vec::new(),
+        })
+    }
+
+    fn discard(&self) -> Result<()> {
+        match fs::remove_file(self.marker()) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(EnvError::new(e.to_string())),
+            _ => Ok(()),
+        }
+    }
+
+    fn update(&self, commands: &[String]) -> Result<crate::toolbox::Saved> {
+        fs::create_dir_all(self.dir()).map_err(|e| EnvError::new(e.to_string()))?;
+        for command in commands {
+            self.sh(&format!("`{command}`"), command)?;
+        }
+        let base = self
+            .base()
+            .ok_or_else(|| EnvError::new("no Linux base image yet"))?;
+        Ok(crate::toolbox::Saved {
+            template: Some(self.keep(crate::images::Kind::Template, Some(base))?),
+            ..crate::toolbox::Saved::default()
+        })
+    }
+
+    fn rebuild(&self, recipe: &vibe_core::toolbox::Recipe) -> Result<crate::toolbox::Saved> {
+        fs::create_dir_all(self.dir()).map_err(|e| EnvError::new(e.to_string()))?;
+        for install in &recipe.install {
+            self.sh(&format!("installing {}", install.name), &install.run)?;
+        }
+        let newest = self
+            .images
+            .base()
+            .ok_or_else(|| EnvError::new("no Linux base image yet"))?;
+        Ok(crate::toolbox::Saved {
+            template: Some(self.keep(crate::images::Kind::Template, Some(newest.version))?),
+            home: None,
+            uncovered: self.uncovered.clone(),
+        })
+    }
+}

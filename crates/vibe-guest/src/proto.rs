@@ -83,6 +83,13 @@ pub enum Request {
     /// Ends the command and everything it started, flushes the disks and
     /// powers the VM off, after replying [`Done`]. `vibe-vm` then exits 0.
     Poweroff,
+    /// Before a poweroff whose writable disks are kept, as the toolbox's
+    /// are: ends the command and everything it started, empties `/tmp`,
+    /// takes away `sudo`, flushes, then freezes every writable disk's
+    /// filesystem, which leaves it clean, its journal empty, for it to be
+    /// stacked read-only later: a [`Sealed`]. From then on the guest runs
+    /// nothing more, and only a poweroff is left.
+    Seal,
 }
 
 /// What a [`Request::Run`] runs. Its environment may carry secrets, so
@@ -409,6 +416,15 @@ pub struct ClockSet {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Done {}
 
+/// The reply to a seal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Sealed {
+    /// The writable disks, by id, whose filesystems are now clean and
+    /// frozen.
+    pub disks: Vec<String>,
+    pub seal_ms: u64,
+}
+
 /// Why the guest refused or failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -421,15 +437,18 @@ pub enum ErrorCode {
     /// The command couldn't be frozen or thawed.
     FreezeFailed,
     ClockFailed,
+    /// A writable disk couldn't be left clean, so it mustn't be kept.
+    SealFailed,
 }
 
 impl ErrorCode {
-    pub const ALL: [ErrorCode; 5] = [
+    pub const ALL: [ErrorCode; 6] = [
         ErrorCode::BadRequest,
         ErrorCode::Busy,
         ErrorCode::LaunchFailed,
         ErrorCode::FreezeFailed,
         ErrorCode::ClockFailed,
+        ErrorCode::SealFailed,
     ];
 }
 
@@ -514,7 +533,7 @@ pub fn decode_request(line: &str) -> Result<Request, Failure> {
     Ok(request)
 }
 
-const KNOWN_OPS: [&str; 8] = [
+const KNOWN_OPS: [&str; 9] = [
     "status",
     "launch",
     "processes",
@@ -523,6 +542,7 @@ const KNOWN_OPS: [&str; 8] = [
     "clock",
     "poweroff",
     "run",
+    "seal",
 ];
 
 // ---------------------------------------------------------------------------

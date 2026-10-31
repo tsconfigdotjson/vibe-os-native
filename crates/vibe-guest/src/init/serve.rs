@@ -11,10 +11,11 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use vibe_guest::proto::{
-    self, ClockSet, Done, ErrorCode, Failure, FrameKind, Network, PROTOCOL, Request, ShareMount,
-    Status, TermHello, Thawed, read_frame,
+    self, ClockSet, Done, ErrorCode, Failure, FrameKind, Network, PROTOCOL, Request, Sealed,
+    ShareMount, Status, TermHello, Thawed, read_frame,
 };
 
+use crate::init::root::{self, Writable};
 use crate::init::session::{Agent, Conn, lock, refusal, set_timeouts};
 use crate::init::{log, net, sys};
 
@@ -38,6 +39,12 @@ pub(crate) struct Guest {
     /// PID 1 of a VM, rather than a test's process.
     pub(crate) pid1: bool,
     pub(crate) layers: Vec<String>,
+    /// The writable disks' filesystems, which a seal freezes.
+    pub(crate) writable: Vec<Writable>,
+    /// Whether `vibe` may use `sudo`, until the seal.
+    pub(crate) sudo: bool,
+    /// Set once sealed: what the seal said. Nothing runs after it.
+    pub(crate) sealed: Mutex<Option<Sealed>>,
     pub(crate) shares: Vec<ShareMount>,
     pub(crate) problems: Mutex<Vec<String>>,
     pub(crate) network: Arc<Mutex<Option<Network>>>,
@@ -219,9 +226,20 @@ fn answer(guest: &Guest, request: Request) -> (Result<Value, Failure>, Option<Th
         Request::Clock { .. } => "clock",
         Request::Poweroff => "poweroff",
         Request::Run(_) => "run",
+        Request::Seal => "seal",
     };
     if op != "status" && op != "processes" {
         log!("control: {op}");
+    }
+    // A sealed guest's disks are frozen: anything that ran would hang on
+    // its first write.
+    if matches!(request, Request::Launch(_) | Request::Run(_)) && lock(&guest.sealed).is_some() {
+        let f = Failure::new(
+            ErrorCode::Busy,
+            "the guest is sealed: only a poweroff is left",
+        );
+        log!("control: {op} failed: {f}");
+        return (Err(f), None);
     }
     let reply = match request {
         Request::Status => json(status(guest)),
@@ -238,6 +256,7 @@ fn answer(guest: &Guest, request: Request) -> (Result<Value, Failure>, Option<Th
             .and_then(json),
         Request::Poweroff => return (json(Done {}), Some(poweroff)),
         Request::Run(run) => guest.agent.run(&run).and_then(json),
+        Request::Seal => seal(guest).and_then(json),
     };
     if let Err(f) = &reply {
         log!("control: {op} failed: {f}");
@@ -369,11 +388,65 @@ fn answers(dir: &Path) -> bool {
         .all(|e| e.is_ok_and(|e| fs::symlink_metadata(e.path()).is_ok()))
 }
 
+/// Ends the command, cleans up what the toolbox shouldn't keep, flushes,
+/// and freezes every writable disk's filesystem, so each is left clean for
+/// the host to keep. Sealing twice says the same again.
+fn seal(guest: &Guest) -> Result<Sealed, Failure> {
+    let mut sealed = lock(&guest.sealed);
+    if let Some(s) = &*sealed {
+        return Ok(s.clone());
+    }
+    let t = Instant::now();
+    guest.agent.end_all(POWEROFF_GRACE);
+    if guest.pid1 {
+        if guest.sudo
+            && let Err(e) = root::set_sudo(false)
+        {
+            return Err(Failure::new(
+                ErrorCode::SealFailed,
+                format!("can't take sudo away again: {e}"),
+            ));
+        }
+        // What installers leave in /tmp isn't for every agent to boot with.
+        if let Ok(entries) = fs::read_dir("/tmp") {
+            for e in entries.flatten() {
+                let path = e.path();
+                let gone = match e.file_type() {
+                    Ok(t) if t.is_dir() => fs::remove_dir_all(&path),
+                    _ => fs::remove_file(&path),
+                };
+                if let Err(err) = gone {
+                    log!("seal: can't remove {}: {err}", path.display());
+                }
+            }
+        }
+    }
+    // SAFETY: sync takes no arguments and can't fail.
+    unsafe { libc::sync() };
+    let mut disks = Vec::new();
+    for w in &guest.writable {
+        root::freeze_filesystem(&w.dir).map_err(|e| {
+            Failure::new(ErrorCode::SealFailed, format!("can't freeze {}: {e}", w.id))
+        })?;
+        disks.push(w.id.clone());
+    }
+    let done = Sealed {
+        disks,
+        seal_ms: t.elapsed().as_millis() as u64,
+    };
+    log!("sealed {:?} in {} ms", done.disks, done.seal_ms);
+    *sealed = Some(done.clone());
+    Ok(done)
+}
+
 fn poweroff(guest: &Guest) {
     log!("powering off");
     guest.agent.end_all(POWEROFF_GRACE);
-    // SAFETY: sync takes no arguments and can't fail.
-    unsafe { libc::sync() };
+    // A sealed guest's disks are flushed and frozen already.
+    if lock(&guest.sealed).is_none() {
+        // SAFETY: sync takes no arguments and can't fail.
+        unsafe { libc::sync() };
+    }
     if guest.pid1 {
         // SAFETY: as PID 1, this powers the VM off; nothing returns.
         unsafe { libc::reboot(libc::RB_POWER_OFF) };

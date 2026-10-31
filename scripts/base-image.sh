@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Builds base release N of the Linux image every linux agent boots (PRD:
-# What's inside linux), into OUT/base-N/ (default build/base-image/base-1/):
+# What's inside linux), into OUT/base-N/ (default build/base-image/base-2/):
 #
 #   Image        an arm64 kernel (Linux 6.18 LTS) with everything vibe-guest
 #                needs built in: scripts/base-image/kernel.config
@@ -30,7 +30,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 export PATH="$HOME/.cargo/bin:$PATH"
 
-N=${BASE_RELEASE:-1}
+N=${BASE_RELEASE:-2}
 OUT=${1:-build/base-image}
 DOCKER=${DOCKER:-docker}
 TARGET=aarch64-unknown-linux-musl
