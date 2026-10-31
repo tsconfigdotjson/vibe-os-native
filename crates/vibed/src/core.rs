@@ -218,6 +218,8 @@ pub struct Core {
     pub(crate) admitting: tokio::sync::Mutex<()>,
     /// The memory of starts admitted but not yet running, by a token each.
     pub(crate) starting: Mutex<HashMap<u64, u64>>,
+    /// Each agent's transcript, as the status engine follows it.
+    pub(crate) tails: Mutex<HashMap<String, vibe_status::Tail>>,
     /// One fetch at a time per project, as concurrent fetches of the same
     /// refs fail on each other's locks.
     pub(crate) fetching: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
@@ -334,6 +336,7 @@ impl Core {
             admitting: tokio::sync::Mutex::new(()),
             starting: Mutex::new(HashMap::new()),
             fetching: Mutex::new(HashMap::new()),
+            tails: Mutex::new(HashMap::new()),
             store: Mutex::new(store),
             limits_lock: Mutex::new(()),
             adding: Mutex::new(HashSet::new()),
@@ -405,6 +408,7 @@ impl Core {
             state: None,
             limit: None,
             message: None,
+            status: None,
         }
     }
 

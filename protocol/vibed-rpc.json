@@ -54,9 +54,13 @@
     "Mode": ["auto", "bypass"],
     "ProjectSource": ["github", "path"],
     "GhState": ["unknown", "logged_in", "logged_out", "not_installed", "error"],
-    "EventKind": ["project.added", "project.removed", "profiles.changed", "limits.changed", "keys.changed", "gh.status", "agent.added", "agent.deleted", "agent.state", "agent.limit", "lagged"],
+    "EventKind": ["project.added", "project.removed", "profiles.changed", "limits.changed", "keys.changed", "gh.status", "agent.added", "agent.deleted", "agent.state", "agent.status", "agent.limit", "lagged"],
     "SessionState": ["running", "exited"],
-    "AgentState": ["busy", "idle", "question", "asleep", "paused", "exited"]
+    "AgentState": ["busy", "idle", "question", "asleep", "paused", "exited"],
+    "Activity": ["awaiting_answer", "awaiting_approval", "running_tool", "thinking", "background_work", "done", "interrupted", "errored", "unknown"],
+    "Certainty": ["firm", "inferred"],
+    "WakeupKind": ["loop", "cron"],
+    "StopReason": ["usage_limit"]
   },
   "types": {
     "Request": ["jsonrpc", "id", "method", "params"],
@@ -89,7 +93,7 @@
     "GhStatusParams": ["refresh"],
     "GhStatus": ["state", "account", "detail", "checked_at"],
     "Subscribed": ["seq"],
-    "Event": ["seq", "at", "host", "kind", "project", "ref", "state", "limit", "message"],
+    "Event": ["seq", "at", "host", "kind", "project", "ref", "state", "limit", "message", "status"],
     "SessionParams": ["host", "ref"],
     "SessionList": ["sessions"],
     "SessionInfo": ["host", "ref", "state", "title", "clients", "ttys", "exit"],
@@ -97,7 +101,9 @@
     "SessionAttach": ["host", "ref", "title", "socket", "ttys"],
     "AgentStartParams": ["host", "project", "profile", "prompt", "from", "name"],
     "AgentDeleteParams": ["host", "ref", "force"],
-    "Agent": ["host", "ref", "project", "profile", "environment", "state", "worktree", "branch", "session_id", "created_at", "attach"],
+    "Agent": ["host", "ref", "project", "profile", "environment", "state", "worktree", "branch", "session_id", "created_at", "attach", "status"],
+    "AgentStatus": ["activity", "certainty", "since", "title", "line", "pending_wakeups", "stop_reason", "resets_at", "error"],
+    "Wakeup": ["kind", "due_at", "certainty", "recurring", "reason"],
     "AgentList": ["agents"]
   },
   "optional": {
@@ -130,7 +136,7 @@
     "GhStatusParams": ["refresh"],
     "GhStatus": ["account", "detail", "checked_at"],
     "Subscribed": [],
-    "Event": ["project", "ref", "state", "limit", "message"],
+    "Event": ["project", "ref", "state", "limit", "message", "status"],
     "SessionParams": ["host"],
     "SessionList": [],
     "SessionInfo": ["exit"],
@@ -139,6 +145,8 @@
     "AgentStartParams": ["host", "from", "name"],
     "AgentDeleteParams": ["host", "force"],
     "Agent": [],
+    "AgentStatus": ["since", "title", "line", "stop_reason", "resets_at", "error"],
+    "Wakeup": ["due_at", "reason"],
     "AgentList": []
   },
   "nested": {
@@ -150,6 +158,9 @@
     "KeyCreated": { "key": "ApiKey" },
     "SessionList": { "sessions": "SessionInfo" },
     "SessionInfo": { "exit": "SessionExit" },
+    "Event": { "status": "AgentStatus" },
+    "Agent": { "status": "AgentStatus" },
+    "AgentStatus": { "pending_wakeups": "Wakeup" },
     "AgentList": { "agents": "Agent" }
   }
 }

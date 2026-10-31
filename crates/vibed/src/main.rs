@@ -172,6 +172,9 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
         })
     };
     let gh_checks = core.spawn_gh_checks(GH_CHECK_EVERY);
+    // Every agent's transcript, read whole first: the states from before a
+    // restart, rebuilt.
+    let status = core.spawn_status();
     let maintenance = core.spawn_maintenance(MAINTENANCE_EVERY);
     vibed::log!(
         "vibed {} listening on {}",
@@ -186,6 +189,7 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
     };
     server::serve(listener, core, MAX_MESSAGE_BYTES, shutdown).await;
     gh_checks.abort();
+    status.abort();
     maintenance.abort();
     adopting.abort();
     drop(guard);

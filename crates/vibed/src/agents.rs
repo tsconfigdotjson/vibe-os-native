@@ -510,7 +510,7 @@ impl Core {
         })
     }
 
-    fn agent_info(&self, a: &AgentRecord) -> Agent {
+    fn agent_info(&self, a: &AgentRecord, status: &vibe_status::Status) -> Agent {
         Agent {
             host: a.host.clone(),
             agent: a.agent_ref.clone(),
@@ -523,10 +523,11 @@ impl Core {
             session_id: a.session_id.clone(),
             created_at: rfc3339(a.created_at),
             attach: format!("vibe attach {}", a.agent_ref),
+            status: status.to_rpc(),
         }
     }
 
-    fn handle_of(a: &AgentRecord) -> Result<Handle, ErrorObject> {
+    pub(crate) fn handle_of(a: &AgentRecord) -> Result<Handle, ErrorObject> {
         serde_json::from_str(&a.compartment)
             .map_err(|e| internal(format!("{}'s compartment can't be read: {e}", a.agent_ref)))
     }
@@ -561,7 +562,7 @@ impl Core {
         Ok(awake)
     }
 
-    async fn session_runs(&self, agent_ref: &str) -> bool {
+    pub(crate) async fn session_runs(&self, agent_ref: &str) -> bool {
         !matches!(
             sessions::probe(&self.layout.session_socket(agent_ref)).await,
             Probe::Gone
@@ -846,7 +847,8 @@ impl Core {
             profile.name,
             worktree.display()
         );
-        let agent = self.agent_info(&record);
+        let status = self.agent_status(&mut record);
+        let agent = self.agent_info(&record, &status);
         let mut e = self.event(EventKind::AgentAdded);
         e.project = Some(p.project.clone());
         e.agent = Some(agent_ref.to_owned());
@@ -981,6 +983,7 @@ impl Core {
             }
         }
         if let Some(r) = &undo.record {
+            self.forget_status(r);
             let _ = self.store().remove_agent(host, r);
             let _ = remove_session_files(&self.layout.session_socket(r));
         }
@@ -999,40 +1002,31 @@ impl Core {
         }
     }
 
-    /// A host's agents, oldest first, each in the state its session says:
-    /// one whose session has gone is `exited`.
+    /// A host's agents, oldest first, each with what its transcript says
+    /// and in the state that and its session give: one whose session has
+    /// gone is `exited`.
     pub async fn agents(&self, p: HostParams) -> Result<AgentList, ErrorObject> {
         let host = self.host(p.host.as_deref())?;
         let records = self.store().agents(host).map_err(store_error)?;
         let mut agents = Vec::new();
         for mut a in records {
+            let status = self.agent_status(&mut a);
             // One being started, deleted or resumed is left as it's
             // recorded until that's done.
             if lock(&self.agents_busy).contains(&a.agent_ref) {
-                agents.push(self.agent_info(&a));
+                agents.push(self.agent_info(&a, &status));
                 continue;
             }
-            let state = self.observed_state(&a).await;
+            let state = self.observed_state(&a, &status).await;
             if state != a.state {
                 self.set_state(&mut a, state);
             }
-            agents.push(self.agent_info(&a));
+            agents.push(self.agent_info(&a, &status));
         }
         Ok(AgentList { agents })
     }
 
-    /// What an agent is doing, as far as `vibed` can tell without the
-    /// status engine (#5): running, or exited.
-    async fn observed_state(&self, a: &AgentRecord) -> AgentState {
-        let runs = self.session_runs(&a.agent_ref).await;
-        match (runs, a.state) {
-            (false, _) => AgentState::Exited,
-            (true, AgentState::Exited) => AgentState::Busy,
-            (true, state) => state,
-        }
-    }
-
-    fn set_state(&self, a: &mut AgentRecord, state: AgentState) {
+    pub(crate) fn set_state(&self, a: &mut AgentRecord, state: AgentState) {
         match self.store().set_agent_state(&a.host, &a.agent_ref, state) {
             Ok(true) => {
                 a.state = state;
@@ -1059,8 +1053,11 @@ impl Core {
         let _held = self.hold(agent_ref)?;
         let mut record = self.store().agent(host, agent_ref).map_err(store_error)?;
         if self.session_runs(agent_ref).await {
-            return Ok(self.agent_info(&record));
+            let status = self.agent_status(&mut record);
+            return Ok(self.agent_info(&record, &status));
         }
+        // The session it's in now, after a `/clear`, is the one to resume.
+        self.agent_status(&mut record);
         let backend = self.backend(record.environment)?;
         let mut handle = Core::handle_of(&record)?;
         // What's left of its tree, if anything, ends: it has no terminal.
@@ -1092,8 +1089,9 @@ impl Core {
                 "had no transcript, so it started again"
             }
         );
-        self.set_state(&mut record, AgentState::Busy);
-        Ok(self.agent_info(&record))
+        let status = self.agent_status(&mut record);
+        self.set_state(&mut record, status.state());
+        Ok(self.agent_info(&record, &status))
     }
 
     /// Deletes an agent and everything VibeOS made for it but its branch
@@ -1102,7 +1100,9 @@ impl Core {
         let host = self.host(p.host.as_deref())?;
         validate_ref(&p.agent).map_err(invalid)?;
         let _held = self.hold(&p.agent)?;
-        let record = self.store().agent(host, &p.agent).map_err(store_error)?;
+        let mut record = self.store().agent(host, &p.agent).map_err(store_error)?;
+        // What it was doing, as its transcript is about to go.
+        let status = self.agent_status(&mut record);
         let project = self
             .store()
             .project(host, &record.project)
@@ -1172,6 +1172,7 @@ impl Core {
         self.store()
             .remove_agent(host, &p.agent)
             .map_err(store_error)?;
+        self.forget_status(&p.agent);
         crate::log!(
             "vibed: deleted agent {}{}; its branch {} is kept",
             p.agent,
@@ -1184,7 +1185,7 @@ impl Core {
         self.publish(e);
         let mut gone = record;
         gone.state = AgentState::Exited;
-        Ok(self.agent_info(&gone))
+        Ok(self.agent_info(&gone, &status))
     }
 
     /// Undoes every start that a crash or a kill of `vibed` cut short, as

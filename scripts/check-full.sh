@@ -14,8 +14,10 @@
 #     a new vibed adopts it again, and `vibe ls` shows it, then its exit
 #   - agents through `vibe rpc`, on vibe-env's test backend with its stand-in
 #     for Claude Code: a start makes the worktree, the branch and the
-#     transcript where Claude writes it; the agent outlives a killed vibed;
-#     a delete is refused while a commit is unpushed, and once it's pushed,
+#     transcript where Claude writes it; the status engine reads the
+#     question in that transcript as `question`; the agent outlives a killed
+#     vibed, and the new one rebuilds that state from the transcript; a
+#     delete is refused while a commit is unpushed, and once it's pushed,
 #     leaves nothing behind but the branch
 #   - both Swift packages (swift/VibeOS, swift/vibe-vm): build and test,
 #     including the Swift half of the Rust<->Swift contract test
@@ -30,8 +32,9 @@
 #     and thaw (crates/vibe-env/tests/vm_cycle.rs). With VIBE_CLAUDE_BIN
 #     (Claude Code's linux-arm64-musl build) and CLAUDE_CODE_OAUTH_TOKEN set,
 #     the same with the real Claude and its AskUserQuestion, which is then
-#     required too. The check across a reboot is
-#     scripts/vm-reboot-test.sh, which can't run here. On a Mac that is
+#     required too, and which the status engine must read from the real
+#     transcript as a firm question, before the sleep and after. The check
+#     across a reboot is scripts/vm-reboot-test.sh, which can't run here. On a Mac that is
 #     itself a VM, such as a CI runner, this step is N/A: it can't nest VMs.
 #   - the Swift client against a live vibed
 #   - VibeOS.app launching and saying hello to a live vibed
@@ -355,8 +358,9 @@ s_agents() {
   git init -q "$origin"
   git -C "$origin" -c user.name=t -c user.email=t@example.com commit -q --allow-empty -m first
   git clone -q "$origin" "$repo"
-  # The stand-in for Claude Code: on the prompt "commit" it commits on its
-  # branch, and stays until it's hung up.
+  # The stand-in for Claude Code: on the prompt "commit question" it commits
+  # on its branch, then asks a question, in its transcript as Claude does,
+  # and waits for the answer until it's hung up.
   export VIBE_TEST_BACKEND="$ROOT/crates/vibe-env/src/stand-in.sh"
   start_vibed "$socket" "$WORK/ag-vibed-1.log"
   # 1G agents and nothing kept back, so one fits on any machine.
@@ -364,7 +368,7 @@ s_agents() {
     "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"projects.add\",\"params\":{\"path\":\"$repo\"}}" \
     '{"jsonrpc":"2.0","id":2,"method":"profiles.update","params":{"project":"app","profile":"software-eng-linux","memory":1073741824}}' \
     '{"jsonrpc":"2.0","id":3,"method":"limits.set","params":{"reserve_memory":0}}' \
-    '{"jsonrpc":"2.0","id":4,"method":"agents.start","params":{"project":"app","profile":"software-eng-linux","prompt":"commit"}}')
+    '{"jsonrpc":"2.0","id":4,"method":"agents.start","params":{"project":"app","profile":"software-eng-linux","prompt":"commit question"}}')
   echo "start: $out"
   case $out in *'"error"'*) echo "a call failed"; return 1 ;; esac
   ref=$(json_field "$out" 4 ref)
@@ -383,6 +387,11 @@ s_agents() {
     sleep 0.1
   done
   [ "$(git -C "$repo" log -1 --format=%s "$ref")" = work ] || { echo "the agent never committed"; return 1; }
+  wait_for "$transcript" AskUserQuestion
+  out=$(rpc '{"jsonrpc":"2.0","id":8,"method":"agents.list","params":{}}')
+  echo "asking: $out"
+  expect '"state":"question"' "the question, from the transcript"
+  expect '"activity":"awaiting_answer"' "its activity"
 
   # Killed mid-work, vibed takes nothing with it.
   kill -KILL "$VIBED_PID"
@@ -393,7 +402,8 @@ s_agents() {
   out=$(rpc '{"jsonrpc":"2.0","id":5,"method":"agents.list","params":{}}')
   echo "after a restart: $out"
   expect "\"ref\":\"$ref\"" "the agent"
-  expect '"state":"busy"' "its running session"
+  expect '"state":"question"' "its state, rebuilt from its transcript"
+  expect '"activity":"awaiting_answer"' "its activity, rebuilt"
 
   out=$(rpc "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"agents.delete\",\"params\":{\"ref\":\"$ref\"}}")
   echo "delete with an unpushed commit: $out"

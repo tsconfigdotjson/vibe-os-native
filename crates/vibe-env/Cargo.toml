@@ -16,6 +16,8 @@ serde_json.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# The real Claude's transcript, read as vibed reads it (tests/vm_cycle.rs).
+vibe-status.workspace = true
 vt100.workspace = true
 
 [lints]

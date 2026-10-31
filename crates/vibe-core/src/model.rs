@@ -115,6 +115,10 @@ names! {
         AgentDeleted = "agent.deleted",
         /// An agent changed state; `state` is the new [`AgentState`].
         AgentState = "agent.state",
+        /// What an agent's transcript says changed: its activity, title,
+        /// latest activity line, wakeups or stop; `status` is the new
+        /// [`AgentStatus`](crate::rpc::AgentStatus).
+        AgentStatus = "agent.status",
         /// An agent hit a limit; `limit` says which (#6, #11, #17).
         AgentLimit = "agent.limit",
         /// The subscriber fell behind and missed events: re-read everything.
@@ -134,8 +138,9 @@ names! {
 
 names! {
     /// What an agent is doing, as clients see it (PRD: MCP interface,
-    /// States). The status engine (#5) tells `busy`, `idle` and `question`
-    /// apart; until it does, an agent whose session runs is `busy`.
+    /// States). The status engine tells `busy`, `idle` and `question` apart
+    /// from the agent's transcript; `asleep`, `paused` and `exited` are
+    /// `vibed`'s own.
     AgentState {
         Busy = "busy",
         Idle = "idle",
@@ -147,6 +152,46 @@ names! {
         Paused = "paused",
         /// Its processes are gone; a send resumes it with `claude --resume`.
         Exited = "exited",
+    }
+}
+
+names! {
+    /// What an agent's transcript says it's doing: agent-tail's finer
+    /// `activity`, which [`AgentState`] folds (PRD: MCP interface, States).
+    Activity {
+        /// It asked a question, or for its plan to be approved.
+        AwaitingAnswer = "awaiting_answer",
+        /// A tool call may be waiting on a permission prompt.
+        AwaitingApproval = "awaiting_approval",
+        RunningTool = "running_tool",
+        Thinking = "thinking",
+        /// Its turn ended, but a subagent or background task still runs.
+        BackgroundWork = "background_work",
+        Done = "done",
+        Interrupted = "interrupted",
+        /// Its turn ended with an error, such as a usage limit.
+        Errored = "errored",
+        /// No entry that moves the state has been read yet.
+        Unknown = "unknown",
+    }
+}
+
+names! {
+    /// Whether the transcript says so, or it's a guess from timing.
+    Certainty { Firm = "firm", Inferred = "inferred" }
+}
+
+names! {
+    /// What armed a scheduled wakeup: a dynamic `/loop` wakeup, or a cron
+    /// job (`/loop 5m` makes one).
+    WakeupKind { Loop = "loop", Cron = "cron" }
+}
+
+names! {
+    /// Why a turn stopped, when an error alone doesn't say.
+    StopReason {
+        /// A Claude usage limit; the next send starts a new turn.
+        UsageLimit = "usage_limit",
     }
 }
 

@@ -29,8 +29,8 @@ The checks:
   Codable types, and each field can be dropped exactly when it's optional.
   With `VIBE_TEST_SOCKET` set, it also calls a live `vibed`. A few Swift names
   differ from the index's, to stay clear of SwiftUI and Foundation
-  (`AgentEnvironment` for `Environment`, `DaemonEvent` for `Event`, …); the
-  tests map them.
+  (`AgentEnvironment` for `Environment`, `AgentActivity` for `Activity`,
+  `DaemonEvent` for `Event`, …); the tests map them.
 
 To change the contract, edit this directory first, then both sides, and bump
 `protocol_version` for anything a running peer would misread.

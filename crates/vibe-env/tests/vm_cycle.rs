@@ -1241,6 +1241,39 @@ fn guest_question_survives_sleep() {
     mark("guest_question_survives_sleep");
 }
 
+/// What a new status engine tail on the real Claude's `transcript` says,
+/// once it says Claude is asking: up to 10 s, as Claude may still be
+/// writing the question's entry.
+fn claude_status(transcript: &Path, worktree: &str, session: &str) -> vibe_status::Status {
+    use vibe_core::model::{Activity, AgentState, Certainty};
+    let mut tail = vibe_status::Tail::new(
+        transcript.parent().unwrap().to_owned(),
+        Path::new(worktree),
+        session,
+        Duration::from_secs(60),
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        tail.poll();
+        let s = tail.status(vibe_status::Timestamp::from(std::time::SystemTime::now()));
+        if s.activity == Activity::AwaitingAnswer || Instant::now() > deadline {
+            assert_eq!(
+                (s.state(), s.activity, s.certainty),
+                (
+                    AgentState::Question,
+                    Activity::AwaitingAnswer,
+                    Certainty::Firm
+                ),
+                "{s:?}"
+            );
+            assert_eq!(s.transcript.as_deref(), Some(transcript));
+            assert!(s.at_rest(), "safe to sleep on");
+            return s;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
 /// Whether the screen shows a question with Red and Blue as its options.
 fn shows_question(screen: &str) -> bool {
     let s = screen.to_lowercase();
@@ -1368,6 +1401,8 @@ fn guest_claude_question_survives_sleep() {
             .unwrap()
             .contains("AskUserQuestion")
     );
+    // The status engine reads it there as vibed does: a firm question.
+    let asking = claude_status(&transcript, &share, &session);
     drop(screen);
 
     let frozen = vibe_guest::freeze(&vm.socket).unwrap();
@@ -1393,6 +1428,10 @@ fn guest_claude_question_survives_sleep() {
         );
         screen.pump(Duration::from_millis(200));
     }
+    // Read afresh, as a restarted vibed would, still the same question. (Its
+    // title may have come in since: Claude writes one when it's ready.)
+    let after = claude_status(&transcript, &share, &session);
+    assert_eq!((after.line, after.since), (asking.line, asking.since));
     let procs = vibe_guest::processes(&vm.socket).unwrap();
     assert!(
         procs
