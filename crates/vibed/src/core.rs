@@ -11,7 +11,7 @@ use std::io;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::Duration;
 
 use tokio::sync::broadcast;
@@ -23,8 +23,8 @@ use vibe_core::model::{
 };
 use vibe_core::paths::Layout;
 use vibe_core::rpc::{
-    ApiKey, ErrorCode, ErrorObject, Event, GhStatus, GhStatusParams, HostLimits, HostList,
-    HostParams, KeyCreateParams, KeyCreated, KeyList, KeyParams, KeyVerifyParams, LimitsSetParams,
+    ApiKey, ErrorCode, ErrorObject, Event, GhStatus, GhStatusParams, HostLimits, HostParams,
+    KeyCreateParams, KeyCreated, KeyList, KeyParams, KeyVerifyParams, LimitsSetParams,
     ProfileCreateParams, ProfileList, ProfileParams, ProfileUpdateParams, Project,
     ProjectAddParams, ProjectList, ProjectParams, SessionAttach, SessionInfo, SessionList,
     SessionParams,
@@ -33,6 +33,8 @@ use vibe_core::store::{NewProject, Store, StoreError};
 use vibe_core::time::rfc3339;
 
 use crate::agents::{Admission, Backends, HostAdmission};
+use crate::link::{Link, Timing};
+use crate::remote::{Remote, Ssh};
 use crate::sessions::{self, Probe, SessionSpec};
 use crate::{gh, projects};
 
@@ -88,6 +90,10 @@ pub struct Config {
     /// Where MCP can be served on Tailscale: this machine's addresses in
     /// its ranges, by default.
     pub tailscale: TailscaleAddresses,
+    /// How Linux hosts are reached: over SSH, by default.
+    pub remote: Arc<dyn Remote>,
+    /// How their links are timed.
+    pub link_timing: Timing,
 }
 
 impl std::fmt::Debug for Config {
@@ -101,6 +107,7 @@ impl std::fmt::Debug for Config {
             .field("backends", &self.backends)
             .field("admission", &self.admission)
             .field("toolbox", &self.toolbox)
+            .field("remote", &self.remote)
             .finish_non_exhaustive()
     }
 }
@@ -124,6 +131,8 @@ impl Config {
             admission: Arc::new(HostAdmission::current()),
             toolbox: None,
             tailscale: Arc::new(vibe_mcp::net::tailscale_addresses),
+            remote: Arc::new(Ssh::new()),
+            link_timing: Timing::default(),
         }
     }
 }
@@ -266,6 +275,19 @@ pub struct Core {
     pub(crate) mcp_kick: Arc<tokio::sync::Notify>,
     /// Whether MCP is served on loopback now, for `hosts.list`.
     pub(crate) mcp_serving: AtomicBool,
+    /// How Linux hosts are reached.
+    pub(crate) remote: Arc<dyn Remote>,
+    /// Each Linux host's link, by its name.
+    pub(crate) links: Mutex<HashMap<String, Arc<Link>>>,
+    pub(crate) link_timing: Timing,
+    /// Names of hosts being added: an install takes a while.
+    pub(crate) adding_hosts: Mutex<HashSet<String>>,
+    /// This core, for the tasks it starts, once [`Core::spawn_links`] has
+    /// run: links run only then.
+    pub(crate) me: OnceLock<Weak<Core>>,
+    /// The runtime those tasks run on, as a call may come from a thread
+    /// outside it.
+    pub(crate) runtime: OnceLock<tokio::runtime::Handle>,
     _state_lock: File,
 }
 
@@ -365,7 +387,7 @@ impl Core {
             .ensure_host(LOCAL_HOST, &config.info.os, &config.label, (config.clock)())
             .map_err(OpenError::Store)?;
         let (tx, _) = broadcast::channel(EVENT_BACKLOG);
-        Ok(Core {
+        let core = Core {
             info: config.info,
             label: config.label,
             layout: config.layout,
@@ -402,8 +424,21 @@ impl Core {
             tailscale: config.tailscale,
             mcp_kick: Arc::new(tokio::sync::Notify::new()),
             mcp_serving: AtomicBool::new(false),
+            remote: config.remote,
+            links: Mutex::new(HashMap::new()),
+            link_timing: config.link_timing,
+            adding_hosts: Mutex::new(HashSet::new()),
+            me: OnceLock::new(),
+            runtime: OnceLock::new(),
             _state_lock: state_lock,
-        })
+        };
+        core.load_links().map_err(|e| {
+            OpenError::Store(StoreError::Conflict(format!(
+                "can't read the Linux hosts: {}",
+                e.message
+            )))
+        })?;
+        Ok(core)
     }
 
     pub fn info(&self) -> &DaemonInfo {
@@ -437,8 +472,9 @@ impl Core {
         Ok(std::array::from_fn(|i| bytes[i]))
     }
 
-    /// The host a call is for. Absent means this one. Calls for other hosts
-    /// are forwarded once #16 links them; until then there are none.
+    /// The host a call is for, when it's this one: absent means this one.
+    /// A call for a Linux host goes over its link before it gets here
+    /// ([`Core::forward`]).
     pub(crate) fn host(&self, host: Option<&str>) -> Result<&'static str, ErrorObject> {
         match host {
             None | Some(LOCAL_HOST) => Ok(LOCAL_HOST),
@@ -492,17 +528,6 @@ impl Core {
         e.seq = last_missed;
         e.message = Some(format!("missed {missed} events; read everything again"));
         e
-    }
-
-    // Hosts.
-
-    pub fn hosts(&self) -> Result<HostList, ErrorObject> {
-        let mut hosts = self.store().hosts().map_err(store_error)?;
-        let serving = self.mcp_serving.load(std::sync::atomic::Ordering::SeqCst);
-        for h in hosts.iter_mut().filter(|h| h.name == LOCAL_HOST) {
-            h.mcp = serving;
-        }
-        Ok(HostList { hosts })
     }
 
     // Projects.
@@ -718,6 +743,7 @@ impl Core {
             .map_err(store_error)?;
         crate::log!("vibed: created API key {} ({}…)", key.name, key.prefix);
         self.publish(self.event(EventKind::KeysChanged));
+        self.push_keys();
         Ok(KeyCreated { key, secret })
     }
 
@@ -725,6 +751,7 @@ impl Core {
         let key = self.store().revoke_key(&p.name).map_err(store_error)?;
         crate::log!("vibed: revoked API key {} ({}…)", key.name, key.prefix);
         self.publish(self.event(EventKind::KeysChanged));
+        self.push_keys();
         Ok(key)
     }
 

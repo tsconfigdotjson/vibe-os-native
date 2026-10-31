@@ -1,0 +1,49 @@
+{
+  "description": "Installs this build's `vibed` on a host added already, if it runs another, and checks its tools again; `changed` says whether anything on the server changed. Agents there keep running across the restart.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 995,
+    "method": "hosts.upgrade",
+    "params": {
+      "host": "vps"
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 995,
+    "result": {
+      "changed": true,
+      "host": {
+        "address": "me@vps.example.com",
+        "detail": "not connected yet",
+        "external": false,
+        "label": "vps-1",
+        "link": "down",
+        "mcp": false,
+        "missing": [
+          "claude"
+        ],
+        "name": "vps",
+        "os": "linux",
+        "version": "0.1.0"
+      },
+      "notes": [
+        "Lingering is on for you on me@vps.example.com, so vibed runs when you're logged out and starts again after a reboot."
+      ]
+    }
+  },
+  "events": [
+    {
+      "jsonrpc": "2.0",
+      "method": "events.event",
+      "params": {
+        "at": "2026-10-30T12:00:00Z",
+        "host": "vps",
+        "kind": "host.link",
+        "message": "not connected yet",
+        "seq": 24,
+        "state": "down"
+      }
+    }
+  ]
+}

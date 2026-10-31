@@ -4,6 +4,7 @@ mod attach;
 mod client;
 mod key;
 mod mcp;
+mod setup;
 mod setup_token;
 mod toolbox;
 
@@ -46,6 +47,25 @@ commands:
   key         list this host's API keys for MCP
   key create NAME  make an API key, and print it once
   key revoke NAME  revoke an API key
+  project     list this host's projects and their profiles
+  project add OWNER/NAME|PATH [--name NAME]
+              clone a GitHub repo with this host's gh login, or register a
+              local checkout; it starts with this host's starter profiles
+  project remove NAME   forget a project; its files stay on disk
+  profile list PROJECT  a project's profiles
+  profile create PROJECT NAME [--environment linux|macos] [--model opus|sonnet]
+              [--reasoning low|medium|high|xhigh|max] [--mode auto|bypass]
+              [--memory 4G]
+  profile set PROJECT PROFILE [--name NEW] [the same settings]
+  profile delete PROJECT PROFILE
+              project and profile take --host NAME for a Linux host this one
+              is linked to
+  host        the hosts this one knows, and their links
+  host add NAME SSH-DESTINATION
+              install vibed on a Linux host over SSH (as Add Linux Host…
+              does) and link it, as NAME
+  host upgrade NAME    install this build's vibed there, if it runs another
+  host remove NAME     forget a Linux host; it runs on there, on its own
 
 options:
   --socket PATH   vibed's socket (default: $VIBE_SOCKET, or the platform default)
@@ -69,6 +89,7 @@ enum Command {
         key: Option<String>,
     },
     Key(key::Command),
+    Setup(setup::Command),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -121,6 +142,26 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
                     *slot = Some(value.clone());
                 }
                 Command::Mcp { url, key }
+            }
+            word @ ("project" | "profile" | "host") => {
+                // Everything after it is its, but --socket.
+                let mut words = Vec::new();
+                while let Some(w) = iter.next() {
+                    if w == "--socket" {
+                        socket = Some(PathBuf::from(iter.next().ok_or("--socket needs a path")?));
+                    } else if let Some(path) = w.strip_prefix("--socket=") {
+                        socket = Some(PathBuf::from(path));
+                    } else if w == "-h" || w == "--help" {
+                        return Ok(Args::Help);
+                    } else {
+                        words.push(w.clone());
+                    }
+                }
+                Command::Setup(match word {
+                    "project" => setup::Command::parse_project(&words)?,
+                    "profile" => setup::Command::parse_profile(&words)?,
+                    _ => setup::Command::parse_host(&words)?,
+                })
             }
             "key" => {
                 let words: Vec<String> = iter
@@ -231,6 +272,15 @@ fn main() -> ExitCode {
                 }
             };
         }
+        Command::Setup(command) => {
+            return match setup::run(&socket, command) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("vibe: {e}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
         Command::Toolbox(command) => {
             return match toolbox::run(&socket, command) {
                 Ok(()) => ExitCode::SUCCESS,
@@ -328,13 +378,29 @@ fn rpc(socket: &Path) -> Result<(), ClientError> {
     let stream = client::connect(socket)?;
     let mut to_daemon = stream.try_clone()?;
     std::thread::spawn(move || {
-        let _ = io::copy(&mut io::stdin().lock(), &mut to_daemon);
+        let _ = pump(&mut io::stdin().lock(), &mut to_daemon);
         let _ = to_daemon.shutdown(Shutdown::Write);
     });
-    let mut stdout = io::stdout().lock();
-    io::copy(&mut &stream, &mut stdout)?;
-    stdout.flush()?;
+    pump(&mut &stream, &mut io::stdout().lock())?;
     Ok(())
+}
+
+/// Copies `from` to `to` as it comes, each read written and flushed at
+/// once. Not `io::copy`: on Linux, between a socket and a pipe it splices,
+/// and a splice from a Unix socket into a pipe can hold what it read until
+/// the socket ends, which would hold every reply until stdin closes.
+fn pump(from: &mut impl io::Read, to: &mut impl Write) -> io::Result<()> {
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = match from.read(&mut buf) {
+            Ok(0) => return Ok(()),
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        to.write_all(&buf[..n])?;
+        to.flush()?;
+    }
 }
 
 #[cfg(test)]
@@ -462,6 +528,41 @@ mod tests {
             })
         );
         assert!(parse(&["key", "create"]).is_err());
+        assert_eq!(
+            parse(&[
+                "profile", "create", "web", "x", "--socket", "/s", "--model", "sonnet"
+            ]),
+            Ok(Args::Run {
+                socket: Some("/s".into()),
+                command: Command::Setup(setup::Command::CreateProfile {
+                    host: None,
+                    project: "web".into(),
+                    name: "x".into(),
+                    settings: setup::Settings {
+                        model: Some(vibe_core::model::Model::Sonnet),
+                        ..Default::default()
+                    },
+                }),
+            })
+        );
+        assert_eq!(
+            parse(&["--socket=/s", "host", "add", "vps", "me@vps"]),
+            Ok(Args::Run {
+                socket: Some("/s".into()),
+                command: Command::Setup(setup::Command::AddHost {
+                    name: "vps".into(),
+                    address: "me@vps".into(),
+                }),
+            })
+        );
+        assert_eq!(
+            parse(&["project", "--socket=/s"]),
+            Ok(Args::Run {
+                socket: Some("/s".into()),
+                command: Command::Setup(setup::Command::Projects { host: None }),
+            })
+        );
+        assert!(parse(&["project", "add"]).is_err());
         assert!(parse(&["toolbox", "rebiuld"]).is_err());
         assert!(parse(&["toolbox", "status", "update"]).is_err());
     }

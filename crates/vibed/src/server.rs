@@ -135,10 +135,21 @@ async fn read_messages(
         let limit = u64::try_from(max_bytes)
             .unwrap_or(u64::MAX)
             .saturating_add(1);
-        let n = (&mut reader)
-            .take(limit)
-            .read_until(b'\n', &mut line)
-            .await?;
+        let mut limited = (&mut reader).take(limit);
+        let read = limited.read_until(b'\n', &mut line);
+        let n = match session.quiet_limit() {
+            None => read.await?,
+            Some(quiet) => match tokio::time::timeout(quiet, read).await {
+                Ok(n) => n?,
+                Err(_) => {
+                    crate::log!(
+                        "vibed: a link went quiet for {} s; closing it",
+                        quiet.as_secs()
+                    );
+                    return Ok(());
+                }
+            },
+        };
         if n == 0 {
             return Ok(());
         }

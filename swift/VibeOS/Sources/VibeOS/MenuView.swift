@@ -80,6 +80,8 @@ struct HeaderView: View {
                     }
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    .help(host.link == .down ? (host.detail ?? "Its link is down; it reconnects on its own") : host.label)
+                    .accessibilityElement(children: .combine)
                 }
             }
         }
@@ -318,9 +320,10 @@ struct FooterView: View {
             .buttonStyle(.plain)
             .padding(.horizontal, 16)
             .padding(.vertical, 5)
-            FooterItem(title: "Add Linux Host…", symbol: "server.rack") {}
-                .disabled(true)
-                .help("Adding Linux hosts comes with Linux host support")
+            FooterItem(title: "Add Linux Host…", symbol: "server.rack") {
+                show(WindowID.addHost, with: openWindow)
+            }
+            .disabled(model.connection != .connected)
             FooterItem(title: "Settings…", symbol: "gearshape") {
                 show(WindowID.settings, with: openWindow)
             }

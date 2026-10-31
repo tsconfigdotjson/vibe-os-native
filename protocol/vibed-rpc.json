@@ -11,6 +11,9 @@
   "methods": [
     { "name": "daemon.hello", "params": "HelloParams", "result": "HelloResult" },
     { "name": "hosts.list", "params": "NoParams", "result": "HostList" },
+    { "name": "hosts.add", "params": "HostAddParams", "result": "HostInstall" },
+    { "name": "hosts.upgrade", "params": "HostNameParams", "result": "HostInstall" },
+    { "name": "hosts.remove", "params": "HostNameParams", "result": "HostInfo" },
     { "name": "projects.list", "params": "HostParams", "result": "ProjectList" },
     { "name": "projects.add", "params": "ProjectAddParams", "result": "Project" },
     { "name": "projects.remove", "params": "ProjectParams", "result": "Project" },
@@ -26,6 +29,7 @@
     { "name": "keys.create", "params": "KeyCreateParams", "result": "KeyCreated" },
     { "name": "keys.revoke", "params": "KeyParams", "result": "ApiKey" },
     { "name": "keys.verify", "params": "KeyVerifyParams", "result": "ApiKey" },
+    { "name": "keys.sync", "params": "KeySyncParams", "result": "KeyList" },
     { "name": "gh.status", "params": "GhStatusParams", "result": "GhStatus" },
     { "name": "events.subscribe", "params": "NoParams", "result": "Subscribed" },
     { "name": "sessions.list", "params": "HostParams", "result": "SessionList" },
@@ -34,6 +38,10 @@
     { "name": "agents.list", "params": "HostParams", "result": "AgentList" },
     { "name": "agents.delete", "params": "AgentDeleteParams", "result": "Agent" },
     { "name": "agents.interrupt", "params": "AgentParams", "result": "Agent" },
+    { "name": "agents.send", "params": "AgentSendParams", "result": "AgentSent" },
+    { "name": "agents.check", "params": "AgentCheckParams", "result": "AgentCheck" },
+    { "name": "agents.output", "params": "AgentOutputParams", "result": "AgentOutput" },
+    { "name": "agents.messages", "params": "AgentMessagesParams", "result": "MessageList" },
     { "name": "toolbox.status", "params": "NoParams", "result": "ToolboxStatus" },
     { "name": "toolbox.open", "params": "NoParams", "result": "SessionAttach" },
     { "name": "toolbox.update", "params": "NoParams", "result": "ToolboxRun" },
@@ -53,7 +61,8 @@
     { "name": "not_found", "code": -32001 },
     { "name": "conflict", "code": -32002 },
     { "name": "host_config_invalid", "code": -32003 },
-    { "name": "command_failed", "code": -32004 }
+    { "name": "command_failed", "code": -32004 },
+    { "name": "host_unavailable", "code": -32005 }
   ],
   "enums": {
     "Environment": ["linux", "macos"],
@@ -62,7 +71,7 @@
     "Mode": ["auto", "bypass"],
     "ProjectSource": ["github", "path"],
     "GhState": ["unknown", "logged_in", "logged_out", "not_installed", "error"],
-    "EventKind": ["project.added", "project.removed", "profiles.changed", "limits.changed", "keys.changed", "gh.status", "agent.added", "agent.deleted", "agent.state", "agent.status", "agent.limit", "lagged", "toolbox.changed", "mcp.changed"],
+    "EventKind": ["project.added", "project.removed", "profiles.changed", "limits.changed", "keys.changed", "gh.status", "agent.added", "agent.deleted", "agent.state", "agent.status", "agent.limit", "lagged", "toolbox.changed", "mcp.changed", "host.added", "host.removed", "host.link"],
     "HostLink": ["local", "connected", "down"],
     "SessionState": ["running", "exited"],
     "AgentState": ["busy", "idle", "question", "asleep", "paused", "exited"],
@@ -72,7 +81,8 @@
     "StopReason": ["usage_limit"],
     "ToolboxState": ["unavailable", "closed", "open", "saving", "updating", "rebuilding"],
     "ToolboxAction": ["shell", "update", "rebuild"],
-    "LoginTool": ["gh", "gcloud", "git", "ssh"]
+    "LoginTool": ["gh", "gcloud", "git", "ssh"],
+    "MessageRole": ["user", "assistant", "tool"]
   },
   "types": {
     "Request": ["jsonrpc", "id", "method", "params"],
@@ -83,7 +93,7 @@
     "ProtocolMismatchData": ["protocol"],
     "NoParams": [],
     "HostParams": ["host"],
-    "HostInfo": ["name", "os", "label", "link", "external", "mcp"],
+    "HostInfo": ["name", "os", "label", "link", "external", "mcp", "address", "version", "missing", "detail"],
     "HostList": ["hosts"],
     "Project": ["host", "name", "source", "repo", "path", "added_at", "profiles"],
     "ProjectList": ["projects"],
@@ -98,7 +108,7 @@
     "LimitsSetParams": ["host", "reserve_memory", "reserve_cores", "max_awake_agents", "cpu_cores", "max_processes", "disk_soft", "disk_hard", "vm_disk", "idle_debounce", "snapshot_disk"],
     "McpSettings": ["port", "tailscale", "url", "tailscale_urls"],
     "McpSetParams": ["host", "tailscale"],
-    "ApiKey": ["name", "prefix", "created_at", "last_used_at"],
+    "ApiKey": ["name", "prefix", "created_at", "last_used_at", "pushed"],
     "KeyList": ["keys"],
     "KeyCreateParams": ["name"],
     "KeyCreated": ["key", "secret"],
@@ -123,7 +133,21 @@
     "ToolboxStatus": ["state", "template", "home", "base", "newest_base", "last"],
     "ToolboxRun": ["action", "at", "template", "uncovered", "error"],
     "ToolboxLogins": ["home", "logins", "claude", "claude_problem"],
-    "Login": ["tool", "account"]
+    "Login": ["tool", "account"],
+    "HostAddParams": ["name", "address"],
+    "HostNameParams": ["host"],
+    "HostInstall": ["host", "changed", "notes"],
+    "KeyHash": ["name", "prefix", "hash", "created_at"],
+    "KeySyncParams": ["keys"],
+    "AgentSendParams": ["host", "ref", "text", "submit", "force", "keys"],
+    "AgentSent": ["woke", "state"],
+    "AgentCheckParams": ["host", "ref", "background"],
+    "AgentCheck": ["state", "activity", "line", "answered"],
+    "AgentOutputParams": ["host", "ref", "after"],
+    "AgentOutput": ["screen", "history", "cursor", "dropped", "more", "live"],
+    "AgentMessagesParams": ["host", "ref", "last"],
+    "Message": ["role", "text", "at"],
+    "MessageList": ["messages"]
   },
   "optional": {
     "Request": ["id", "params"],
@@ -133,7 +157,7 @@
     "ProtocolMismatchData": [],
     "NoParams": [],
     "HostParams": ["host"],
-    "HostInfo": [],
+    "HostInfo": ["address", "version", "detail"],
     "HostList": [],
     "Project": ["repo"],
     "ProjectList": [],
@@ -148,7 +172,7 @@
     "LimitsSetParams": ["host", "reserve_memory", "reserve_cores", "max_awake_agents", "cpu_cores", "max_processes", "disk_soft", "disk_hard", "vm_disk", "idle_debounce", "snapshot_disk"],
     "McpSettings": [],
     "McpSetParams": ["host", "tailscale"],
-    "ApiKey": ["last_used_at"],
+    "ApiKey": ["last_used_at", "pushed"],
     "KeyList": [],
     "KeyCreateParams": [],
     "KeyCreated": [],
@@ -173,7 +197,21 @@
     "ToolboxStatus": ["template", "home", "base", "newest_base", "last"],
     "ToolboxRun": ["template", "error"],
     "ToolboxLogins": ["home", "logins", "claude_problem"],
-    "Login": []
+    "Login": [],
+    "HostAddParams": [],
+    "HostNameParams": [],
+    "HostInstall": [],
+    "KeyHash": [],
+    "KeySyncParams": [],
+    "AgentSendParams": ["host", "text", "submit", "force", "keys"],
+    "AgentSent": [],
+    "AgentCheckParams": ["host", "background"],
+    "AgentCheck": ["line"],
+    "AgentOutputParams": ["host", "after"],
+    "AgentOutput": [],
+    "AgentMessagesParams": ["host", "last"],
+    "Message": ["at"],
+    "MessageList": []
   },
   "nested": {
     "HostList": { "hosts": "HostInfo" },
@@ -189,6 +227,9 @@
     "AgentStatus": { "pending_wakeups": "Wakeup" },
     "AgentList": { "agents": "Agent" },
     "ToolboxStatus": { "last": "ToolboxRun" },
-    "ToolboxLogins": { "logins": "Login" }
+    "ToolboxLogins": { "logins": "Login" },
+    "HostInstall": { "host": "HostInfo" },
+    "KeySyncParams": { "keys": "KeyHash" },
+    "MessageList": { "messages": "Message" }
   }
 }

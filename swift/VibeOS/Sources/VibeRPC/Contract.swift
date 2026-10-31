@@ -18,6 +18,9 @@ public enum VibeRPC {
     public static let methods = [
         Hello.name,
         HostsList.name,
+        HostsAdd.name,
+        HostsUpgrade.name,
+        HostsRemove.name,
         ProjectsList.name,
         ProjectsAdd.name,
         ProjectsRemove.name,
@@ -33,6 +36,7 @@ public enum VibeRPC {
         KeysCreate.name,
         KeysRevoke.name,
         KeysVerify.name,
+        KeysSync.name,
         GhStatusGet.name,
         EventsSubscribe.name,
         SessionsList.name,
@@ -41,6 +45,10 @@ public enum VibeRPC {
         AgentsList.name,
         AgentsDelete.name,
         AgentsInterrupt.name,
+        AgentsSend.name,
+        AgentsCheck.name,
+        AgentsOutput.name,
+        AgentsMessages.name,
         ToolboxStatusGet.name,
         ToolboxOpen.name,
         ToolboxUpdate.name,
@@ -251,6 +259,9 @@ public enum RPCErrorCode: Int, CaseIterable, Sendable {
     case hostConfigInvalid = -32003
     /// A command vibed ran, such as `gh repo clone`, failed.
     case commandFailed = -32004
+    /// The call is for a Linux host whose link is down: its agents are
+    /// unavailable until it's back.
+    case hostUnavailable = -32005
 
     /// The name protocol/vibed-rpc.json uses.
     public var name: String {
@@ -265,6 +276,7 @@ public enum RPCErrorCode: Int, CaseIterable, Sendable {
         case .conflict: "conflict"
         case .hostConfigInvalid: "host_config_invalid"
         case .commandFailed: "command_failed"
+        case .hostUnavailable: "host_unavailable"
         }
     }
 }
@@ -393,6 +405,13 @@ public enum EventKind: String, Codable, CaseIterable, Hashable, Sendable {
     /// Where MCP is served changed: `mcp.set` turned the Tailscale address
     /// on or off, or MCP started or stopped being served (`HostInfo.mcp`).
     case mcpChanged = "mcp.changed"
+    /// A Linux host was added, under `host`'s name.
+    case hostAdded = "host.added"
+    /// A Linux host was forgotten; it runs on there, on its own.
+    case hostRemoved = "host.removed"
+    /// A Linux host's link came up or went down, or what it reports
+    /// changed; `state` is its `HostLink`, `message` why it's down.
+    case hostLink = "host.link"
 }
 
 /// How vibed reaches a host: `local` for itself, else whether its link is up.
@@ -453,13 +472,46 @@ public enum LoginTool: String, Codable, CaseIterable, Hashable, Sendable {
     case gh, gcloud, git, ssh
 }
 
+/// Who said a message of an agent's conversation.
+public enum MessageRole: String, Codable, CaseIterable, Hashable, Sendable {
+    case user, assistant
+    /// A tool call, as one short line.
+    case tool
+}
+
 // MARK: - Methods
 
-/// `hosts.list`: every host this vibed knows; for now, itself.
+/// `hosts.list`: every host this vibed knows: itself first, then the Linux
+/// hosts added to it, each with its link.
 public enum HostsList: RPCMethod {
     public typealias Params = NoParams
     public typealias Result = HostList
     public static let name = "hosts.list"
+}
+
+/// `hosts.add`: Add Linux Host. Over SSH, installs or upgrades vibed on the
+/// server, checks git, gh and claude there, and starts the link. It can take
+/// minutes: call it with a long timeout.
+public enum HostsAdd: RPCMethod {
+    public typealias Params = HostAddParams
+    public typealias Result = HostInstall
+    public static let name = "hosts.add"
+}
+
+/// `hosts.upgrade`: installs this build's vibed on a host added already, if
+/// it runs another, and checks its tools again.
+public enum HostsUpgrade: RPCMethod {
+    public typealias Params = HostNameParams
+    public typealias Result = HostInstall
+    public static let name = "hosts.upgrade"
+}
+
+/// `hosts.remove`: forgets a Linux host and ends its link; nothing on the
+/// server changes.
+public enum HostsRemove: RPCMethod {
+    public typealias Params = HostNameParams
+    public typealias Result = HostInfo
+    public static let name = "hosts.remove"
 }
 
 /// `projects.list`: a host's projects, with their profiles.
@@ -559,6 +611,15 @@ public enum KeysVerify: RPCMethod {
     public static let name = "keys.verify"
 }
 
+/// `keys.sync`: what a Mac's vibed sends its Linux hosts: every key it
+/// has, by its hash. The app never calls it.
+public enum KeysSync: RPCMethod {
+    public typealias Params = KeySyncParams
+    public typealias Result = KeyList
+    public static let name = "keys.sync"
+}
+
+/// `gh.status`.
 public enum GhStatusGet: RPCMethod {
     public typealias Params = GhStatusParams
     public typealias Result = GhStatus
@@ -618,6 +679,36 @@ public enum AgentsInterrupt: RPCMethod {
     public typealias Params = AgentParams
     public typealias Result = Agent
     public static let name = "agents.interrupt"
+}
+
+/// `agents.send`: types text, or presses keys, in the agent's terminal, as
+/// `vibe_send` does. The Mac reaches a Linux host's agents with it.
+public enum AgentsSend: RPCMethod {
+    public typealias Params = AgentSendParams
+    public typealias Result = AgentSent
+    public static let name = "agents.send"
+}
+
+/// `agents.check`: where the agent is, and whether it has answered its last
+/// send. Never wakes it.
+public enum AgentsCheck: RPCMethod {
+    public typealias Params = AgentCheckParams
+    public typealias Result = AgentCheck
+    public static let name = "agents.check"
+}
+
+/// `agents.output`: its screen, and what scrolled off since `after`.
+public enum AgentsOutput: RPCMethod {
+    public typealias Params = AgentOutputParams
+    public typealias Result = AgentOutput
+    public static let name = "agents.output"
+}
+
+/// `agents.messages`: the last messages of its conversation.
+public enum AgentsMessages: RPCMethod {
+    public typealias Params = AgentMessagesParams
+    public typealias Result = MessageList
+    public static let name = "agents.messages"
 }
 
 /// `toolbox.status`: the versions new agents boot, and the last toolbox run.
@@ -716,9 +807,60 @@ public struct HostInfo: Codable, Hashable, Sendable {
     public var external: Bool
     /// Whether it serves MCP now: on loopback, at least.
     public var mcp: Bool
+    /// A Linux host's SSH destination, such as `me@vps.example.com`.
+    public var address: String?
+    /// The vibed it runs, when that's known.
+    public var version: String?
+    /// What a Linux host lacks of git, gh and claude, which its agents need.
+    public var missing: [String]
+    /// For a host whose link is down, why.
+    public var detail: String?
 
     public enum CodingKeys: String, CodingKey, CaseIterable {
-        case name, os, label, link, external, mcp
+        case name, os, label, link, external, mcp, address, version, missing, detail
+    }
+}
+
+/// What Add Linux Host takes.
+public struct HostAddParams: Codable, Hashable, Sendable {
+    /// What the host goes by, such as `vps`; its agents read `vps:<ref>`.
+    public var name: String
+    /// Its SSH destination, as after `ssh`.
+    public var address: String
+
+    public init(name: String, address: String) {
+        self.name = name
+        self.address = address
+    }
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case name, address
+    }
+}
+
+/// Names a Linux host.
+public struct HostNameParams: Codable, Hashable, Sendable {
+    public var host: String
+
+    public init(host: String) {
+        self.host = host
+    }
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case host
+    }
+}
+
+/// How an install over SSH went.
+public struct HostInstall: Codable, Hashable, Sendable {
+    public var host: HostInfo
+    /// Whether it changed what the server runs.
+    public var changed: Bool
+    /// What the owner should know, in sentences.
+    public var notes: [String]
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case host, changed, notes
     }
 }
 
@@ -994,11 +1136,36 @@ public struct ApiKey: Codable, Hashable, Sendable {
     public var prefix: String
     public var createdAt: String
     public var lastUsedAt: String?
+    /// On a Linux host: made on the Mac it's linked to, and pushed there.
+    public var pushed: Bool?
 
     public enum CodingKeys: String, CodingKey, CaseIterable {
         case name, prefix
         case createdAt = "created_at"
         case lastUsedAt = "last_used_at"
+        case pushed
+    }
+}
+
+/// A key as a Mac pushes it to its hosts: its hash, never the key.
+public struct KeyHash: Codable, Hashable, Sendable {
+    public var name: String
+    public var prefix: String
+    /// SHA-256 of the key, in lowercase hex.
+    public var hash: String
+    public var createdAt: String
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case name, prefix, hash
+        case createdAt = "created_at"
+    }
+}
+
+public struct KeySyncParams: Codable, Hashable, Sendable {
+    public var keys: [KeyHash]
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case keys
     }
 }
 
@@ -1237,6 +1404,141 @@ public struct AgentParams: Codable, Hashable, Sendable {
 
     public enum CodingKeys: String, CodingKey, CaseIterable {
         case host, ref
+    }
+}
+
+/// `agents.send`: text, or keys by name, for one agent.
+public struct AgentSendParams: Codable, Hashable, Sendable {
+    public var host: String?
+    public var ref: String
+    public var text: String?
+    /// Whether Enter follows the text; true unless false.
+    public var submit: Bool?
+    /// Paste even while the agent is on a question.
+    public var force: Bool?
+    /// Keys by name: "2", "Enter", "Down", "Ctrl+C".
+    public var keys: [String]?
+
+    public init(
+        host: String? = nil, ref: String, text: String? = nil, submit: Bool? = nil,
+        force: Bool? = nil, keys: [String]? = nil
+    ) {
+        self.host = host
+        self.ref = ref
+        self.text = text
+        self.submit = submit
+        self.force = force
+        self.keys = keys
+    }
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case host, ref, text, submit, force, keys
+    }
+}
+
+public struct AgentSent: Codable, Hashable, Sendable {
+    /// It was asleep, paused or exited, and was woken or resumed first.
+    public var woke: Bool
+    public var state: AgentState
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case woke, state
+    }
+}
+
+public struct AgentCheckParams: Codable, Hashable, Sendable {
+    public var host: String?
+    public var ref: String
+    public var background: Bool?
+
+    public init(host: String? = nil, ref: String, background: Bool? = nil) {
+        self.host = host
+        self.ref = ref
+        self.background = background
+    }
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case host, ref, background
+    }
+}
+
+public struct AgentCheck: Codable, Hashable, Sendable {
+    public var state: AgentState
+    public var activity: AgentActivity
+    public var line: String?
+    /// It has answered the last send to it, or its start's prompt.
+    public var answered: Bool
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case state, activity, line, answered
+    }
+}
+
+public struct AgentOutputParams: Codable, Hashable, Sendable {
+    public var host: String?
+    public var ref: String
+    /// A cursor from an earlier read.
+    public var after: Int?
+
+    public init(host: String? = nil, ref: String, after: Int? = nil) {
+        self.host = host
+        self.ref = ref
+        self.after = after
+    }
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case host, ref, after
+    }
+}
+
+/// What an agent's terminal shows.
+public struct AgentOutput: Codable, Hashable, Sendable {
+    public var screen: String
+    public var history: [String]
+    public var cursor: Int
+    public var dropped: Int
+    public var more: Bool
+    /// The live terminal, or the last one saved.
+    public var live: Bool
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case screen, history, cursor, dropped, more, live
+    }
+}
+
+public struct AgentMessagesParams: Codable, Hashable, Sendable {
+    public var host: String?
+    public var ref: String
+    /// How many of the last messages; 10 if nil.
+    public var last: Int?
+
+    public init(host: String? = nil, ref: String, last: Int? = nil) {
+        self.host = host
+        self.ref = ref
+        self.last = last
+    }
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case host, ref, last
+    }
+}
+
+/// One message of an agent's conversation, from its transcript.
+public struct Message: Codable, Hashable, Sendable {
+    public var role: MessageRole
+    public var text: String
+    public var at: String?
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case role, text, at
+    }
+}
+
+public struct MessageList: Codable, Hashable, Sendable {
+    public var messages: [Message]
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case messages
     }
 }
 

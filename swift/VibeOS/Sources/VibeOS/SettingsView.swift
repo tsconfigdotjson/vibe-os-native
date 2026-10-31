@@ -144,7 +144,11 @@ func day(_ time: String) -> String {
 
 struct HostsTab: View {
     @ObservedObject var model: MenuModel
+    @Environment(\.openWindow) private var openWindow
     @State private var error: String?
+    @State private var hostError: String?
+    @State private var selected: HostInfo.ID?
+    @State private var working = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -170,11 +174,22 @@ struct HostsTab: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
-            Table(model.hosts) {
-                TableColumn("Name", value: \.name)
-                TableColumn("Machine", value: \.label)
-                TableColumn("OS", value: \.os)
-                TableColumn("Link") { host in Text(host.link.rawValue) }
+            Table(model.hosts, selection: $selected) {
+                TableColumn("Name") { host in
+                    Text(host.link == .local ? "\(host.label) (this Mac)" : host.name)
+                }
+                TableColumn("Link") { host in HostLinkText(host: host) }
+                TableColumn("SSH") { host in Text(host.address ?? "—").foregroundStyle(.secondary) }
+                TableColumn("vibed") { host in Text(host.version ?? "—").monospacedDigit() }
+                TableColumn("Still needs") { host in
+                    if host.missing.isEmpty {
+                        Text("—").foregroundStyle(.secondary)
+                    } else {
+                        Label(host.missing.joined(separator: ", "), systemImage: "wrench.and.screwdriver")
+                            .foregroundStyle(.orange)
+                            .help("Install these on \(host.name), then log in there: gh auth login, and claude with /login")
+                    }
+                }
                 TableColumn("MCP") { host in Text(host.mcp ? "on" : "off") }
                 TableColumn("External address") { host in
                     Toggle("", isOn: .constant(host.external))
@@ -182,16 +197,66 @@ struct HostsTab: View {
                         .disabled(true)
                 }
             }
-            Text("A Linux host with a public address can be the external address for outside MCP callers. "
-                + "Adding Linux hosts and choosing the external address come with those features.")
+            .contextMenu(forSelectionType: HostInfo.ID.self) { names in
+                if let name = names.first, name != VibeRPC.localHost {
+                    Button("Update vibed on \(name)") { Task { await upgrade(name) } }
+                    Button("Remove \(name)…", role: .destructive) { Task { await remove(name) } }
+                }
+            }
+            Text("A Linux host runs its agents itself, under its own logins; this Mac's menu and MCP show them too. "
+                + "Removing a host only forgets it here: its vibed and agents run on, on their own.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+            if working {
+                HStack {
+                    ProgressView().controlSize(.small)
+                    Text("Updating vibed over SSH…").font(.callout).foregroundStyle(.secondary)
+                }
+            }
+            ErrorText(error: hostError)
             HStack {
-                Button("Add Linux Host…") {}.disabled(true)
+                Button("Add Linux Host…") { show(WindowID.addHost, with: openWindow) }
+                Button("Update vibed") { if let s = selectedHost { Task { await upgrade(s) } } }
+                    .disabled(selectedHost == nil || working)
+                Button("Remove…") { if let s = selectedHost { Task { await remove(s) } } }
+                    .disabled(selectedHost == nil || working)
                 Spacer()
                 Button("Refresh") { Task { await model.refresh() } }
             }
+        }
+    }
+
+    /// The selected Linux host; this Mac can't be updated or removed here.
+    private var selectedHost: String? {
+        guard let selected, selected != VibeRPC.localHost else { return nil }
+        return selected
+    }
+
+    private func upgrade(_ name: String) async {
+        working = true
+        defer { working = false }
+        do {
+            _ = try await model.upgradeHost(name)
+            hostError = nil
+        } catch {
+            hostError = describe(error)
+        }
+    }
+
+    private func remove(_ name: String) async {
+        guard confirm(
+            "Remove \(name)?",
+            detail: "This Mac forgets it and its agents. Nothing changes on the server: vibed and its agents run on "
+                + "there, with their own MCP, and you can add it again later.",
+            action: "Remove")
+        else { return }
+        do {
+            try await model.removeHost(name)
+            selected = nil
+            hostError = nil
+        } catch {
+            hostError = describe(error)
         }
     }
 
@@ -207,6 +272,29 @@ struct HostsTab: View {
 
 extension HostInfo: @retroactive Identifiable {
     public var id: String { name }
+}
+
+/// A host's link, with why it's down when it is.
+struct HostLinkText: View {
+    let host: HostInfo
+
+    var body: some View {
+        switch host.link {
+        case .local:
+            Text("this Mac").foregroundStyle(.secondary)
+        case .connected:
+            Label("Connected", systemImage: "circle.fill")
+                .labelStyle(.titleAndIcon)
+                .imageScale(.small)
+                .foregroundStyle(.green)
+        case .down:
+            Label("Down", systemImage: "circle.fill")
+                .labelStyle(.titleAndIcon)
+                .imageScale(.small)
+                .foregroundStyle(.red)
+                .help(host.detail ?? "Its link is down; it reconnects on its own")
+        }
+    }
 }
 
 // MARK: Projects and profiles
@@ -291,15 +379,17 @@ struct ProjectsTab: View {
     private func add() async {
         let text = source.trimmingCharacters(in: .whitespaces)
         guard !text.isEmpty else { return }
-        // A path starts with / or ~; anything else is owner/name.
+        // A path starts with / or ~; anything else is owner/name. A path on
+        // a Linux host is that host's, so ~ there isn't this Mac's home.
         let isPath = text.hasPrefix("/") || text.hasPrefix("~")
-        let path = (text as NSString).expandingTildeInPath
+        let path = host == VibeRPC.localHost ? (text as NSString).expandingTildeInPath : text
         adding = true
         defer { adding = false }
         do {
             let added = try await model.call(
                 ProjectsAdd.self,
-                ProjectAddParams(host: host, repo: isPath ? nil : text, path: isPath ? path : nil))
+                ProjectAddParams(host: host, repo: isPath ? nil : text, path: isPath ? path : nil),
+                timeout: MenuModel.patience(for: host))
             source = ""
             await load()
             selected = added.name

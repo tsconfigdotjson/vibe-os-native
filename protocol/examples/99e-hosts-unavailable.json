@@ -1,0 +1,19 @@
+{
+  "description": "A call for a Linux host whose link is down fails with `host_unavailable`. Calls for a Linux host whose link is up go to its own `vibed` over the link, and their answers come back under its name.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 993,
+    "method": "projects.list",
+    "params": {
+      "host": "vps"
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 993,
+    "error": {
+      "code": -32005,
+      "message": "vps is unavailable: not connected yet"
+    }
+  }
+}

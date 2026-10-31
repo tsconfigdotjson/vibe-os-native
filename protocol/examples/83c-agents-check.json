@@ -1,0 +1,23 @@
+{
+  "description": "Where an agent is, and whether it has answered the last send to it, or its start's prompt: what `vibe_wait` polls. With `background`, a turn that left commands running in the background doesn't count until they're done. It never wakes an agent. This one's transcript has a turn that ended.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 831,
+    "method": "agents.check",
+    "params": {
+      "host": "local",
+      "ref": "dark-mode-review",
+      "background": true
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 831,
+    "result": {
+      "activity": "done",
+      "answered": true,
+      "line": "› Review the dark mode change",
+      "state": "idle"
+    }
+  }
+}

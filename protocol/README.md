@@ -18,7 +18,9 @@ The checks:
   exactly when it's optional, and the examples cover every method,
   notification, error and field, nested types included. The one error left
   out is `host_config_invalid`, which needs a broken `host.toml`;
-  `crates/vibed/tests/core.rs` covers it.
+  `crates/vibed/tests/core.rs` covers it. When the contract changes, the
+  ignored test `record_examples` in `crates/vibed/tests/contract.rs`
+  writes what the daemon answers each example with, to review and copy in.
 - **Rust, `vibed`** (`crates/vibed/tests/contract.rs`): the examples replay in
   file order, as one session, through the daemon's dispatcher and over a real
   socket, giving exactly the recorded responses and events. `vibe rpc`
@@ -56,7 +58,9 @@ so refs and session ids are too. Its toolbox is `vibe-env`'s test toolbox
 installed, a Linux home (version 1, holding a `gh` login and a git
 identity; linux agents have no Claude login yet) and a `toolbox.toml` whose
 `[update]` runs `true` and whose one `[[install]]` fails the first time it's
-run. The
+run. `dark-mode-review`'s transcript has a turn in it already, so its
+conversation reads the same every time. Every Linux host it adds is an
+x86_64 server called `vps-1` without `claude`, and no link comes up. The
 Rust replays build that world in a temp directory and put its path in place
 of `/Users/me`.
 
@@ -70,11 +74,28 @@ which only `vibe attach` and `vibed` speak. Clients find a session with
 `sessions.attach` here.
 
 **Hosts.** Every method that acts on one host takes an optional `host`;
-absent means this one, which every `vibed` calls `local`. Other hosts come
-with Linux hosts (#16). `hosts.list` gives each host's `link` (`local` for
-itself; `connected` or `down` for another), whether it's the external address
-(#18) and whether it serves MCP now, on loopback at least, for the menu's
-header. `mcp.changed` says when that changes.
+absent means this one, which every `vibed` calls `local`. A Linux host is
+added with `hosts.add` (an install over SSH) and goes by the name it was
+added under, such as `vps`. A call that names it goes to that host's own
+`vibed` over its link, `ssh <host> vibe rpc`, which carries this same
+contract, and its answer comes back with the host's name in place of its
+`local` (an agent's `attach` becomes the `ssh -t …` line that reaches it).
+While the link is down such a call fails with `host_unavailable`, except
+`agents.list`, which gives the host's agents as they were last listed.
+`hosts.list` gives each host's `link` (`local` for itself; `connected` or
+`down` for a Linux host, with `detail` saying why it's down), the `vibed`
+it runs, what it's `missing` of `git`, `gh` and `claude`, whether it's the
+external address (#18) and whether it serves MCP now, on loopback at least,
+for the menu's header. `mcp.changed` says when that changes, and
+`host.added`, `host.removed` and `host.link` when the hosts or their links
+do. A Linux host's events come onto the Mac's stream under its name. The Mac
+pushes its API keys to each linked host by their hashes (`keys.sync`), so
+one key works on every host.
+
+The methods MCP's `vibe_send`, `vibe_wait`, `vibe_read_output` and
+`vibe_read_messages` stand on are here too, as `agents.send`,
+`agents.check`, `agents.output` and `agents.messages`, so the Mac can reach
+a Linux host's agents over its link.
 
 **Units.** Sizes are bytes and durations are seconds, as integers. Only
 `host.toml` writes them as `"4G"` and `"60s"`. Times are RFC 3339 in UTC.

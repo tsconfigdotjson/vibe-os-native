@@ -113,7 +113,7 @@ async fn running_and_exited_sessions_are_listed() {
     assert_eq!(found.ttys, ["/dev/ttys009"]);
     assert_eq!(found.socket, shim.socket.to_str().unwrap());
 
-    // Another host's sessions come with #16.
+    // A host this one has never added is unknown.
     let other = core
         .sessions(HostParams {
             host: Some("vps".into()),

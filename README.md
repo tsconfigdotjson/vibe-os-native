@@ -21,7 +21,7 @@ truth.
 | `swift/VibeOS` | `VibeOS.app`, the SwiftUI menu bar app, and `VibeRPC`, its socket client |
 | `swift/vibe-vm` | `vibe-vm`, the Virtualization.framework helper |
 | `protocol/` | The socket contract both sides are tested against, `vibe-vm`'s in `protocol/vibe-vm/` and `vibe-guest`'s in `protocol/vibe-guest/`; see the READMEs |
-| `scripts/` | `check-full.sh` runs every check; `sign-macos.sh` signs for local use; `test-guest.sh` builds the test guest; `base-image.sh` builds the Linux base image (with Docker); `vm-reboot-test.sh` checks a saved VM survives a reboot |
+| `scripts/` | `check-full.sh` runs every check; `sign-macos.sh` signs for local use; `test-guest.sh` builds the test guest; `base-image.sh` builds the Linux base image (with Docker); `vm-reboot-test.sh` checks a saved VM survives a reboot; `host-bundle.sh` builds the Linux `vibed` that Add Linux Host installs |
 
 Every crate builds on macOS and Linux (x86_64 and arm64); `vibe-guest` and
 `vibe-testguest` do their work only as static `aarch64-unknown-linux-musl`
@@ -59,6 +59,19 @@ target/debug/vibe setup-token   # the Claude login for linux agents
 VIBE_BASE_RELEASES=file://$PWD/build/base-image target/debug/vibed
 ```
 
+Add Linux Host installs the Linux builds of `vibed`, `vibe` and `vibe-shim`
+over SSH. A release carries them in the app; for a build of your own, make
+them and point `vibed` at them:
+
+```sh
+scripts/host-bundle.sh          # build/host-bundle/{x86_64,aarch64}: static musl builds (needs zig, cargo-zigbuild)
+VIBE_HOST_BUNDLE=$PWD/build/host-bundle target/debug/vibed
+target/debug/vibe host add vps me@vps.example.com   # or Add Linux Host… in the menu
+```
+
+On the server, `vibe project`, `vibe profile` and `vibe key` set it up
+without the menu bar, and it serves its own MCP when the Mac is off.
+
 `VIBE_SOCKET` (or `--socket`) points `vibed`, `vibe` and the app at another
 socket. The app's rows attach Terminal with `/usr/local/bin/vibe`, or
 `$VIBE_CLI` when it's set, such as `VIBE_CLI=$PWD/target/debug/vibe`.
@@ -73,7 +86,9 @@ One command for everything: Rust fmt, clippy, build and test; the
 `vibe-guest` cross-build; a `vibed` smoke test; on a Mac, both Swift packages,
 the Swift contract tests, signing with the virtualization entitlement,
 smoke tests of `vibe-vm` and `VibeOS.app` against a live `vibed`, the menu
-following a live agent and two clicks giving one Terminal tab, real
+following a live agent and two clicks giving one Terminal tab; a Linux host
+added over SSH and linked, on stand-ins for `ssh` and `systemctl` (and on a
+real server with `VIBE_TEST_LINUX_HOST` set); real
 VMs booted, saved and restored through `vibe-vm`, the Linux base image, and
 `linux` agents on it: the backend's conformance suite, and real Claude across
 a sleep. It prints a

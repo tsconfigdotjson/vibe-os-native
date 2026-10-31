@@ -24,7 +24,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use vibe_core::model::{AgentState, validate_ref};
-use vibe_core::rpc::{ErrorCode, ErrorObject};
+use vibe_core::rpc::{
+    AgentCheck, AgentCheckParams, AgentMessagesParams, AgentOutput, AgentOutputParams,
+    AgentSendParams, AgentSent, ErrorCode, ErrorObject, MessageList,
+};
 use vibe_core::shim::{self, FrameKind, Output};
 use vibe_core::store::AgentRecord;
 use vibe_mcp::{Check, Input, Screen, Sent};
@@ -125,9 +128,15 @@ fn chunks_of(input: &Input, bracketed: bool) -> Vec<(Vec<u8>, Duration)> {
         }
         Input::Keys(keys) => {
             let last = keys.len().saturating_sub(1);
+            // Each name was checked before the send began.
             keys.iter()
                 .enumerate()
-                .map(|(i, k)| (k.clone(), if i < last { KEY_GAP } else { Duration::ZERO }))
+                .map(|(i, k)| {
+                    (
+                        vibe_mcp::keys::bytes(k).unwrap_or_default(),
+                        if i < last { KEY_GAP } else { Duration::ZERO },
+                    )
+                })
                 .collect()
         }
     }
@@ -200,10 +209,13 @@ impl Core {
                 format!("{agent_ref} is being started, resumed or deleted; try again in a moment"),
             ));
         }
-        if let Input::Keys(keys) = &input
-            && keys.is_empty()
-        {
-            return Err(invalid("give keys to press"));
+        if let Input::Keys(keys) = &input {
+            if keys.is_empty() {
+                return Err(invalid("give keys to press"));
+            }
+            for k in keys {
+                vibe_mcp::keys::bytes(k).map_err(invalid)?;
+            }
         }
         let typing = self.typing(agent_ref);
         let _one_at_a_time = typing.lock().await;
@@ -380,6 +392,104 @@ impl Core {
     }
 }
 
+/// How many messages `agents.messages` gives when it isn't told, and the
+/// most it gives, as `vibe_read_messages` does.
+const DEFAULT_MESSAGES: u32 = 10;
+const MAX_MESSAGES: u32 = 500;
+
+/// What `agents.send` types: text or keys, as `vibe_send` takes them.
+pub fn input_of(p: &AgentSendParams) -> Result<Input, ErrorObject> {
+    match (&p.text, &p.keys) {
+        (Some(_), Some(_)) => Err(invalid("give text or keys, not both")),
+        (None, None) => Err(invalid("give text to send, or keys to press")),
+        (Some(text), None) => Ok(Input::Text {
+            text: text.clone(),
+            submit: p.submit.unwrap_or(true),
+            force: p.force.unwrap_or(false),
+        }),
+        (None, Some(keys)) => {
+            if p.submit.is_some() {
+                return Err(invalid(
+                    "submit goes with text; press [\"Enter\"] with keys",
+                ));
+            }
+            Ok(Input::Keys(keys.clone()))
+        }
+    }
+}
+
+/// `input` as `agents.send` carries it to another host.
+pub fn send_params(host: &str, agent: &str, input: &Input) -> AgentSendParams {
+    let mut p = AgentSendParams {
+        host: Some(host.to_owned()),
+        agent: agent.to_owned(),
+        ..Default::default()
+    };
+    match input {
+        Input::Text {
+            text,
+            submit,
+            force,
+        } => {
+            p.text = Some(text.clone());
+            p.submit = Some(*submit);
+            p.force = force.then_some(true);
+        }
+        Input::Keys(keys) => p.keys = Some(keys.clone()),
+    }
+    p
+}
+
+// The socket's doors to the same handlers MCP calls, which a Mac uses to
+// reach a Linux host's agents over its link.
+impl Core {
+    pub async fn send_call(&self, p: AgentSendParams) -> Result<AgentSent, ErrorObject> {
+        let input = input_of(&p)?;
+        let sent = self.send_input(p.host.as_deref(), &p.agent, input).await?;
+        Ok(AgentSent {
+            woke: sent.woke,
+            state: sent.state,
+        })
+    }
+
+    pub async fn check_call(&self, p: AgentCheckParams) -> Result<AgentCheck, ErrorObject> {
+        let c = self
+            .check_agent(p.host.as_deref(), &p.agent, p.background.unwrap_or(false))
+            .await?;
+        Ok(AgentCheck {
+            state: c.state,
+            activity: c.activity,
+            line: c.line,
+            answered: c.answered,
+        })
+    }
+
+    pub async fn output_call(&self, p: AgentOutputParams) -> Result<AgentOutput, ErrorObject> {
+        let s = self
+            .agent_output(p.host.as_deref(), &p.agent, p.after)
+            .await?;
+        Ok(AgentOutput {
+            screen: s.screen,
+            history: s.history,
+            cursor: s.cursor,
+            dropped: s.dropped,
+            more: s.more,
+            live: s.live,
+        })
+    }
+
+    pub async fn messages_call(&self, p: AgentMessagesParams) -> Result<MessageList, ErrorObject> {
+        let last = p.last.unwrap_or(DEFAULT_MESSAGES);
+        if !(1..=MAX_MESSAGES).contains(&last) {
+            return Err(invalid(format!("last must be from 1 to {MAX_MESSAGES}")));
+        }
+        let messages = self
+            .agent_messages(p.host.as_deref(), &p.agent, last as usize)
+            .await?;
+        Ok(MessageList { messages })
+    }
+}
+
 /// Waits for a Claude just started to be ready for input: it has turned
 /// on bracketed paste, or its screen has drawn something and stayed still
 /// for [`SETTLE`]. Gives up after [`READY_WITHIN`], and at once if its
@@ -445,7 +555,7 @@ mod tests {
             chunks_of(&pasted, true),
             [(b"\x1b[200~go\x1b[201~".to_vec(), Duration::ZERO)]
         );
-        let keys = Input::Keys(vec![b"\x1b[B".to_vec(), b"\r".to_vec()]);
+        let keys = Input::Keys(vec!["Down".into(), "Enter".into()]);
         assert_eq!(
             chunks_of(&keys, true),
             [
@@ -453,6 +563,53 @@ mod tests {
                 (b"\r".to_vec(), Duration::ZERO)
             ]
         );
+    }
+
+    #[test]
+    fn sends_over_the_socket_are_text_or_keys() {
+        let p = |text: Option<&str>, keys: Option<&[&str]>, submit: Option<bool>| AgentSendParams {
+            host: None,
+            agent: "a".into(),
+            text: text.map(str::to_owned),
+            submit,
+            force: None,
+            keys: keys.map(|k| k.iter().map(|s| s.to_string()).collect()),
+        };
+        assert_eq!(
+            input_of(&p(Some("hi"), None, None)).unwrap(),
+            Input::Text {
+                text: "hi".into(),
+                submit: true,
+                force: false
+            }
+        );
+        assert_eq!(
+            input_of(&p(None, Some(&["Down"]), None)).unwrap(),
+            Input::Keys(vec!["Down".into()])
+        );
+        for bad in [
+            p(Some("a"), Some(&["b"]), None),
+            p(None, None, None),
+            p(None, Some(&["Enter"]), Some(true)),
+        ] {
+            assert_eq!(
+                input_of(&bad).unwrap_err().code,
+                ErrorCode::InvalidParams.code()
+            );
+        }
+        // And back, as a Mac forwards a send to a Linux host.
+        for input in [
+            Input::Text {
+                text: "go".into(),
+                submit: false,
+                force: true,
+            },
+            Input::Keys(vec!["2".into(), "Enter".into()]),
+        ] {
+            let params = send_params("vps", "a", &input);
+            assert_eq!(params.host.as_deref(), Some("vps"));
+            assert_eq!(input_of(&params).unwrap(), input);
+        }
     }
 
     #[test]

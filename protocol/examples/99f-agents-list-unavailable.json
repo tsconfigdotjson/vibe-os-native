@@ -1,0 +1,18 @@
+{
+  "description": "A Linux host's agents while its link is down: as it last listed them, so they show as unavailable rather than vanishing. This host has none yet.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 994,
+    "method": "agents.list",
+    "params": {
+      "host": "vps"
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 994,
+    "result": {
+      "agents": []
+    }
+  }
+}

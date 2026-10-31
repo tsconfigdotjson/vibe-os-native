@@ -1,0 +1,41 @@
+{
+  "description": "Forgets a Linux host and ends its link. Nothing on the server changes: its `vibed` and its agents run on, on their own, with their own MCP.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 996,
+    "method": "hosts.remove",
+    "params": {
+      "host": "vps"
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 996,
+    "result": {
+      "address": "me@vps.example.com",
+      "detail": "not connected yet",
+      "external": false,
+      "label": "vps-1",
+      "link": "down",
+      "mcp": false,
+      "missing": [
+        "claude"
+      ],
+      "name": "vps",
+      "os": "linux",
+      "version": "0.1.0"
+    }
+  },
+  "events": [
+    {
+      "jsonrpc": "2.0",
+      "method": "events.event",
+      "params": {
+        "at": "2026-10-30T12:00:00Z",
+        "host": "vps",
+        "kind": "host.removed",
+        "seq": 25
+      }
+    }
+  ]
+}

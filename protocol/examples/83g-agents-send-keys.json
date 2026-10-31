@@ -1,0 +1,24 @@
+{
+  "description": "Presses keys in an agent's terminal, one at a time, by name: a character, or Enter, Escape, Tab, Up, Down, Ctrl+C and the like, as `vibe_send` takes them. This is how a question is answered.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 835,
+    "method": "agents.send",
+    "params": {
+      "host": "local",
+      "ref": "dark-mode-review",
+      "keys": [
+        "y",
+        "Enter"
+      ]
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 835,
+    "result": {
+      "state": "idle",
+      "woke": false
+    }
+  }
+}

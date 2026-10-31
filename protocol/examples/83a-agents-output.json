@@ -1,0 +1,25 @@
+{
+  "description": "What an agent's terminal shows, as `vibe_read_output` gives it: the screen, and the lines that scrolled off it since `after`, a cursor from an earlier read. `live` is false for an agent asleep or exited, whose last saved screen it gives; it never wakes one.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 832,
+    "method": "agents.output",
+    "params": {
+      "host": "local",
+      "ref": "dark-mode-review",
+      "after": 0
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 832,
+    "result": {
+      "cursor": 0,
+      "dropped": 0,
+      "history": [],
+      "live": true,
+      "more": false,
+      "screen": "Working on: Review the dark mode change\nReady."
+    }
+  }
+}

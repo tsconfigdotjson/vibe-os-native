@@ -40,9 +40,17 @@ func agent(
         agentJSON(ref, host: host, project: project, state: state, activity: activity, title: title, memoryUsed: memoryUsed))
 }
 
-func hostJSON(_ name: String, link: HostLink = .local, external: Bool = false, mcp: Bool = false) -> [String: Any] {
-    ["name": name, "os": name == "local" ? "macos" : "linux", "label": name == "local" ? "mac-mini" : name,
-     "link": link.rawValue, "external": external, "mcp": mcp]
+func hostJSON(
+    _ name: String, link: HostLink = .local, external: Bool = false, mcp: Bool = false, missing: [String] = [],
+    detail: String? = nil
+) -> [String: Any] {
+    var host: [String: Any] = [
+        "name": name, "os": name == "local" ? "macos" : "linux", "label": name == "local" ? "mac-mini" : name,
+        "link": link.rawValue, "external": external, "mcp": mcp, "version": "0.1.0", "missing": missing,
+    ]
+    if name != "local" { host["address"] = "me@\(name).example.com" }
+    if let detail { host["detail"] = detail }
+    return host
 }
 
 func event(_ kind: EventKind, ref: String? = nil, host: String = "local", seq: Int = 1, extra: [String: Any] = [:])
@@ -81,6 +89,7 @@ final class FakeDaemon: DaemonConnection, @unchecked Sendable {
     private var handlers: [String: Handler] = [:]
     private var log: [(method: String, params: [String: Any])] = []
     private var streams: [AsyncThrowingStream<EventMessage, any Error>.Continuation] = []
+    private var timeouts: [String: TimeInterval] = [:]
 
     func on(_ method: String, _ handler: @escaping Handler) {
         lock.withLock { handlers[method] = handler }
@@ -103,6 +112,16 @@ final class FakeDaemon: DaemonConnection, @unchecked Sendable {
             throw VibedClientError.rpc(RPCError(code: RPCErrorCode.methodNotFound.rawValue, message: "no \(M.name)"))
         }
         return try decode(M.Result.self, try handler(json))
+    }
+
+    func call<M: RPCMethod>(_ method: M.Type, _ params: M.Params, timeout: TimeInterval) throws -> M.Result {
+        lock.withLock { timeouts[M.name] = timeout }
+        return try call(method, params)
+    }
+
+    /// The timeout the last long call of `method` asked for.
+    func timeout(of method: String) -> TimeInterval? {
+        lock.withLock { timeouts[method] }
     }
 
     func events(client: String) -> AsyncThrowingStream<EventMessage, any Error> {

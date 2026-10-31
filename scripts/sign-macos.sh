@@ -28,6 +28,12 @@ mkdir -p "$APP/Contents/MacOS"
 cp swift/VibeOS/Support/Info.plist "$APP/Contents/Info.plist"
 plutil -lint "$APP/Contents/Info.plist"
 cp "$app_bin" "$APP/Contents/MacOS/VibeOS"
+# The Linux builds Add Linux Host installs, when scripts/host-bundle.sh has
+# made them.
+if [ -d "$OUT/host-bundle" ]; then
+  mkdir -p "$APP/Contents/Resources"
+  cp -R "$OUT/host-bundle" "$APP/Contents/Resources/linux"
+fi
 codesign --force --sign - --timestamp=none "$APP"
 codesign --verify --strict --verbose=2 "$APP"
 

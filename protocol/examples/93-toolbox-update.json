@@ -21,11 +21,11 @@
       "jsonrpc": "2.0",
       "method": "events.event",
       "params": {
-        "seq": 18,
         "at": "2026-10-30T12:00:00Z",
         "host": "local",
         "kind": "toolbox.changed",
-        "message": "The update saved template 1"
+        "message": "The update saved template 1",
+        "seq": 19
       }
     }
   ]

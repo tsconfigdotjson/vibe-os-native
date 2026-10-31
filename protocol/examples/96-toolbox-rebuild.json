@@ -23,11 +23,11 @@
       "jsonrpc": "2.0",
       "method": "events.event",
       "params": {
-        "seq": 20,
         "at": "2026-10-30T12:00:00Z",
         "host": "local",
         "kind": "toolbox.changed",
-        "message": "The rebuild saved template 2; toolbox.toml doesn't cover apt: htop"
+        "message": "The rebuild saved template 2; toolbox.toml doesn't cover apt: htop",
+        "seq": 21
       }
     }
   ]
