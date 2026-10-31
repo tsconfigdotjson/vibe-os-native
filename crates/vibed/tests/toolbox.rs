@@ -85,6 +85,21 @@ impl World {
         self.layout.linux_dir().join(name).exists()
     }
 
+    /// A file the test makes to let a shell it holds open exit: see
+    /// [`held_shell`].
+    fn release(&self) -> std::path::PathBuf {
+        self._dir.path().join("release")
+    }
+
+    /// A shell that runs until the test makes [`World::release`], however
+    /// slow the machine is, and then exits at once (every time after).
+    fn held_shell(&self) -> String {
+        format!(
+            "while [ ! -e '{}' ]; do sleep 0.05; done",
+            self.release().display()
+        )
+    }
+
     fn advance(&self, by: i64) {
         self.clock.fetch_add(by, Ordering::SeqCst);
     }
@@ -115,7 +130,8 @@ fn kill_shim(pid: u32) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exiting_the_shell_saves_and_the_next_one_starts_afresh() {
     let w = world();
-    let core = w.core(&["sh", "-c", "sleep 0.5"]);
+    let shell = w.held_shell();
+    let core = w.core(&["sh", "-c", &shell]);
     let (_, mut events) = core.subscribe();
     let status = core.toolbox_status(NoParams {}).await.unwrap();
     assert_eq!(status.state, ToolboxState::Closed);
@@ -139,9 +155,13 @@ async fn exiting_the_shell_saves_and_the_next_one_starts_afresh() {
     let listed = core.sessions(Default::default()).await.unwrap();
     assert!(listed.sessions.iter().any(|s| s.agent == "toolbox"));
 
-    // While the shell runs, nothing is saved.
+    // While the shell runs, nothing is saved: it's held open until the
+    // test lets it go.
+    assert!(running(&w.socket()).await.is_some());
     core.check_toolbox().await;
     assert!(!w.version("template-1.img"));
+    assert!(running(&w.socket()).await.is_some(), "the shell still runs");
+    fs::write(w.release(), "").unwrap();
     wait_gone(&w.socket()).await;
     core.check_toolbox().await;
     let status = core.toolbox_status(NoParams {}).await.unwrap();
