@@ -166,6 +166,24 @@ container=$("$DOCKER" create --platform linux/arm64 "vibeos-base-rootfs:$N" /bin
 versions=$("$DOCKER" run --rm --platform linux/arm64 "vibeos-base-rootfs:$N" sh -c \
   'echo "debian $(cat /etc/debian_version); $(git --version); gh $(gh --version | head -n1 | cut -d" " -f3); node $(node --version); mise $(mise --version | cut -d" " -f1); $(python3 --version)"')
 
+# The toolbox's sudo works in this root: vibe set up as vibe-guest sets it
+# up (its passwd, group and shadow entries, and the toolbox's sudo rule,
+# read from crates/vibe-guest/src/init/root.rs), sudo runs as root for it
+# with no password.
+rule=$(sed -n 's/^pub(crate) const SUDO_RULE: &str = "\(.*\)";$/\1/p' crates/vibe-guest/src/init/root.rs)
+shadow=$(sed -n 's/^pub(crate) const SHADOW_ENTRY: &str = "\(.*\)";$/\1/p' crates/vibe-guest/src/init/root.rs)
+[ -n "$rule" ] && [ -n "$shadow" ] || { say "can't find SUDO_RULE and SHADOW_ENTRY in vibe-guest"; exit 1; }
+say "checking sudo for vibe in the toolbox"
+"$DOCKER" run --rm --platform linux/arm64 -e RULE="$rule" -e SHADOW="$shadow" \
+  "vibeos-base-rootfs:$N" bash -euo pipefail -c '
+  echo "vibe:x:501:20:vibe:/home/vibe:/bin/bash" >>/etc/passwd
+  grep -q "^vibe:" /etc/group || echo "vibe:x:20:" >>/etc/group
+  echo "$SHADOW" >>/etc/shadow
+  echo "$RULE" >/etc/sudoers.d/vibe-toolbox
+  chmod 440 /etc/sudoers.d/vibe-toolbox
+  [ "$(setpriv --reuid=501 --regid=20 --clear-groups sudo -n id -u)" = 0 ]
+' || { say "sudo doesn't work for vibe as vibe-guest sets it up"; exit 1; }
+
 say "making the images"
 "$DOCKER" run --rm -v "$WORK:/work" vibeos-base-builder bash -euo pipefail -c '
   cd /work

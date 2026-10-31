@@ -60,6 +60,10 @@ const NOSUID_NODEV: libc::c_ulong = libc::MS_NOSUID | libc::MS_NODEV;
 /// with `sudo apt install …`. Its name has no `.`, which `sudo` would skip.
 pub(crate) const SUDOERS: &str = "/etc/sudoers.d/vibe-toolbox";
 
+/// The rule in [`SUDOERS`]. `scripts/base-image.sh` reads it, and
+/// [`SHADOW_ENTRY`], from here, to check that sudo works with them.
+pub(crate) const SUDO_RULE: &str = "vibe ALL=(ALL:ALL) NOPASSWD: ALL";
+
 /// A writable disk's filesystem, held open by its mount directory so it can
 /// be sealed after the switch hides that directory.
 #[derive(Debug)]
@@ -421,7 +425,7 @@ pub(crate) fn set_sudo(on: bool) -> io::Result<()> {
     mkdir_p(path.parent().expect("a parent"), 0o755)?;
     // A name with a `.`, which sudo skips, until it's whole.
     let tmp = path.with_extension("vibe-guest");
-    fs::write(&tmp, "vibe ALL=(ALL:ALL) NOPASSWD: ALL\n")?;
+    fs::write(&tmp, format!("{SUDO_RULE}\n"))?;
     sys::chmod(&tmp, 0o440)?;
     fs::rename(&tmp, path)
 }
@@ -626,13 +630,61 @@ fn add_user(uid: u32, gid: u32, shell: &str) -> io::Result<()> {
     mkdir_p(Path::new("/etc"), 0o755)?;
     let entry = format!("vibe:x:{uid}:{gid}:vibe:{HOME}:{shell}");
     replace_atomically(passwd, &upsert(&read_or_empty(passwd)?, "vibe", &entry))?;
-    let entry = format!("vibe:x:{gid}:");
-    replace_atomically(group, &upsert(&read_or_empty(group)?, "vibe", &entry))?;
+    let groups = upsert(&read_or_empty(group)?, "vibe", &format!("vibe:x:{gid}:"));
+    replace_atomically(group, &groups)?;
+    // The `x` above says the password is in /etc/shadow, and PAM's account
+    // check, which sudo runs even for a NOPASSWD rule, fails without an
+    // entry there. Shadow stays root's and the `shadow` group's, unreadable
+    // to `vibe`.
+    let shadow = Path::new("/etc/shadow");
+    let (mode, owner_gid) = match fs::metadata(shadow) {
+        Ok(m) => {
+            use std::os::unix::fs::MetadataExt;
+            (m.mode() & 0o7777, m.gid())
+        }
+        Err(_) => (0o640, group_id(&groups, "shadow").unwrap_or(0)),
+    };
+    let text = upsert(&read_or_empty(shadow)?, "vibe", SHADOW_ENTRY);
+    write_private(shadow, &text, mode, owner_gid)?;
     mkdir_p(Path::new("/home"), 0o755)?;
     mkdir_p(Path::new(HOME), 0o755)?;
     // Only the top: the Linux home layer's files are already the user's,
     // and a recursive chown would copy every one of them up.
     sys::chown(Path::new(HOME), uid, gid)
+}
+
+/// `vibe`'s line in `/etc/shadow`: a password nobody can type (`*`, so no
+/// login by password) and no password ageing. The last-change day is left
+/// empty: 0 would make PAM demand a new password before anything else.
+pub(crate) const SHADOW_ENTRY: &str = "vibe:*::0:99999:7:::";
+
+/// The id of group `name` in `/etc/group`'s `text`.
+fn group_id(text: &str, name: &str) -> Option<u32> {
+    text.lines().find_map(|l| {
+        let mut f = l.split(':');
+        (f.next()? == name).then_some(())?;
+        f.nth(1)?.parse().ok()
+    })
+}
+
+/// Replaces `path` with `text`, `mode`, root's and group `gid`'s, never
+/// readable by anyone else on the way.
+fn write_private(path: &Path, text: &str, mode: u32, gid: u32) -> io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let tmp = path.with_extension("vibe-guest");
+    let _ = fs::remove_file(&tmp);
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    f.write_all(text.as_bytes())?;
+    f.sync_all()?;
+    drop(f);
+    sys::chown(&tmp, 0, gid)?;
+    sys::chmod(&tmp, mode)?;
+    fs::rename(&tmp, path)
 }
 
 fn read_or_empty(path: &Path) -> io::Result<String> {
@@ -701,6 +753,60 @@ mod tests {
             upsert("vibe:a\nvibe:b\n", "vibe", line),
             format!("{line}\n")
         );
+    }
+
+    #[test]
+    fn vibe_gets_a_shadow_entry_pam_accepts() {
+        // What Debian's /etc/shadow has, and the entry vibe gets in it.
+        let debian = "root:*:20000:0:99999:7:::\nnobody:*:20000:0:99999:7:::\n";
+        let text = upsert(debian, "vibe", SHADOW_ENTRY);
+        assert!(text.starts_with(debian), "{text}");
+        let line = text.lines().find(|l| l.starts_with("vibe:")).unwrap();
+        let fields: Vec<&str> = line.split(':').collect();
+        // name, password, last change, min, max, warn, inactive, expire,
+        // reserved: nine fields, as shadow(5) has them.
+        assert_eq!(fields.len(), 9, "{line}");
+        assert_eq!(fields[1], "*", "no password anyone can type");
+        assert_eq!(fields[2], "", "0 would force a password change");
+        assert!(
+            fields[6].is_empty() && fields[7].is_empty(),
+            "never expires"
+        );
+        // Booted again, it stays one entry.
+        assert_eq!(upsert(&text, "vibe", SHADOW_ENTRY), text);
+
+        let groups = "root:x:0:\nshadow:x:42:\nvibe:x:20:\n";
+        assert_eq!(group_id(groups, "shadow"), Some(42));
+        assert_eq!(group_id(groups, "shad"), None);
+        assert_eq!(group_id("", "shadow"), None);
+    }
+
+    #[test]
+    fn a_private_file_is_never_world_readable() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shadow");
+        fs::write(&path, "old\n").unwrap();
+        // As a test this can only give the file to its own group.
+        // SAFETY: getgid has no memory effects.
+        let gid = unsafe { libc::getgid() };
+        // chown to root fails unprivileged; only check the rest as root.
+        let r = write_private(&path, "new\n", 0o640, gid);
+        if unsafe { libc::geteuid() } == 0 {
+            r.unwrap();
+            let m = fs::metadata(&path).unwrap();
+            assert_eq!((m.mode() & 0o7777, m.uid(), m.gid()), (0o640, 0, gid));
+            assert_eq!(fs::read_to_string(&path).unwrap(), "new\n");
+        } else {
+            assert!(r.is_err());
+            assert_eq!(
+                fs::read_to_string(&path).unwrap(),
+                "old\n",
+                "left as it was"
+            );
+            let tmp = path.with_extension("vibe-guest");
+            assert_eq!(fs::metadata(&tmp).unwrap().mode() & 0o777, 0o600);
+        }
     }
 
     #[test]

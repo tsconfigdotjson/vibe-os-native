@@ -34,7 +34,7 @@ arguments and environment.
 | `vibe.home=home` | A second writable disk, for `/home/vibe` alone: its own overlay puts the home's writes in the disk's `upper/home/vibe`, so the disk can later be stacked as a layer of its own. The toolbox's Linux home; needs `vibe.upper` |
 | `vibe.sudo=1` | `vibe` may run anything as root with `sudo`, through `/etc/sudoers.d/vibe-toolbox`: the toolbox only. Without it, a boot removes that file if a layer has one |
 | `vibe.share=TAG:PATH` | Mount the virtio-fs share `TAG` at `PATH`, percent-encoded. The worktree and `.git` go at their host paths; the agent's Claude home at `/home/vibe/.claude`; the package caches where the tools look (`/home/vibe/.npm`, …) |
-| `vibe.uid=501 vibe.gid=20` | Who `vibe` is: the host user, since virtio-fs shows the shares' files with their host owner. Absent: 1000 |
+| `vibe.uid=501 vibe.gid=20` | Who `vibe` is: the host user, since virtio-fs shows the shares' files with their host owner. Absent: 1000. `vibe` gets entries in `/etc/passwd`, `/etc/group` and `/etc/shadow` (a password nobody can type, no ageing), which PAM's account check needs for `sudo` |
 
 A layer disk is ext4 (or squashfs or erofs): either a whole root filesystem,
 as the base image is, or a writable disk from an earlier VM, whose changes
