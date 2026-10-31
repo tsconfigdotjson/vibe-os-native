@@ -13,7 +13,7 @@ truth.
 | `crates/vibe-core` | Domain types, the store, and the socket contract (`vibe_core::rpc`) |
 | `crates/vibe-cli` | The `vibe` command |
 | `crates/vibe-status` | The status engine (agent-tail) |
-| `crates/vibe-env` | Environment backends behind `Compartment`, `Limiter`, `Sleeper`, and `vibe_env::vm`, which drives `vibe-vm` |
+| `crates/vibe-env` | Environment backends behind `Compartment`, `Limiter`, `Sleeper`: the `linux` VMs on a Mac (`vibe_env::linux`, driving `vibe-vm` and `vibe-guest`), with the images they boot (`vibe_env::images`) |
 | `crates/vibe-shim` | Holds one agent's terminal |
 | `crates/vibe-guest` | PID 1 in each `linux` VM; a static `aarch64-unknown-linux-musl` binary. Its library is the protocol `vibed` and `vibe-shim` speak to it |
 | `crates/vibe-testguest` | PID 1 of the small test guest `vibe-vm` is tested with, and a stand-in for Claude in the one `vibe-guest` is; not shipped |
@@ -21,7 +21,7 @@ truth.
 | `swift/VibeOS` | `VibeOS.app`, the SwiftUI menu bar app, and `VibeRPC`, its socket client |
 | `swift/vibe-vm` | `vibe-vm`, the Virtualization.framework helper |
 | `protocol/` | The socket contract both sides are tested against, `vibe-vm`'s in `protocol/vibe-vm/` and `vibe-guest`'s in `protocol/vibe-guest/`; see the READMEs |
-| `scripts/` | `check-full.sh` runs every check; `sign-macos.sh` signs for local use; `test-guest.sh` builds the test guest; `vm-reboot-test.sh` checks a saved VM survives a reboot |
+| `scripts/` | `check-full.sh` runs every check; `sign-macos.sh` signs for local use; `test-guest.sh` builds the test guest; `base-image.sh` builds the Linux base image (with Docker); `vm-reboot-test.sh` checks a saved VM survives a reboot |
 
 Every crate builds on macOS and Linux (x86_64 and arm64); `vibe-guest` and
 `vibe-testguest` do their work only as static `aarch64-unknown-linux-musl`
@@ -48,6 +48,17 @@ VIBE_VM_BIN=build/vibe-vm VIBE_VM_GUEST=build/test-guest \
   cargo test -p vibe-env --test vm_cycle -- --test-threads=1 --nocapture
 ```
 
+linux agents on a Mac boot the base image and Claude Code's managed layer,
+which `vibed` downloads into `~/VibeOS/linux/` when it starts, and sign in to
+Claude with the token `vibe setup-token` keeps in the Keychain. Until a base
+release is published, build one and point `vibed` at it:
+
+```sh
+scripts/base-image.sh           # build/base-image/base-1: kernel, initrd, Debian image
+target/debug/vibe setup-token   # the Claude login for linux agents
+VIBE_BASE_RELEASES=file://$PWD/build/base-image target/debug/vibed
+```
+
 `VIBE_SOCKET` (or `--socket`) points `vibed`, `vibe` and the app at another
 socket.
 
@@ -60,8 +71,10 @@ scripts/check-full.sh
 One command for everything: Rust fmt, clippy, build and test; the
 `vibe-guest` cross-build; a `vibed` smoke test; on a Mac, both Swift packages,
 the Swift contract tests, signing with the virtualization entitlement,
-smoke tests of `vibe-vm` and `VibeOS.app` against a live `vibed`, and real
-VMs booted, saved and restored through `vibe-vm`. It prints a
+smoke tests of `vibe-vm` and `VibeOS.app` against a live `vibed`, real
+VMs booted, saved and restored through `vibe-vm`, the Linux base image, and
+`linux` agents on it: the backend's conformance suite, and real Claude across
+a sleep. It prints a
 PASS/FAIL table and leaves logs in `build/check/`. On Linux the macOS steps
 are skipped. CI runs the same script.
 

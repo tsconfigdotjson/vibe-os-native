@@ -1,6 +1,7 @@
 # The base image's root filesystem (PRD: What's inside linux): Debian slim
 # with git, gh, curl, ripgrep, jq, build-essential, Python 3, Node LTS and
-# mise. scripts/base-image.sh builds it for linux/arm64 and exports it into
+# mise; and bubblewrap and socat, for Claude Code's own sandbox.
+# scripts/base-image.sh builds it for linux/arm64 and exports it into
 # a read-only ext4 image. Downloads are pinned by checksum.
 FROM debian:trixie-slim
 
@@ -15,6 +16,7 @@ RUN apt-get update \
       git gh curl ca-certificates ripgrep jq build-essential \
       python3 python3-pip python3-venv \
       openssh-client less procps psmisc unzip xz-utils zstd file \
+      bubblewrap socat \
  && rm -rf /var/lib/apt/lists/*
 
 # Node LTS, from nodejs.org.

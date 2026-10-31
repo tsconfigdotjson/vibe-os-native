@@ -194,8 +194,6 @@ impl Layout {
         self.agent_dir(agent_ref).join("vibe-vm.log")
     }
 
-    /// Sleeping `linux` agents' snapshots, which share the `snapshot_disk`
-    /// budget.
     /// The disk images `linux` agents boot: the base, the managed layer,
     /// the template and the Linux home (`vibe_env::images`).
     pub fn linux_dir(&self) -> PathBuf {
@@ -213,6 +211,8 @@ impl Layout {
         self.home.join("VibeOS/cache")
     }
 
+    /// Sleeping `linux` agents' snapshots, which share the `snapshot_disk`
+    /// budget.
     pub fn snapshots_dir(&self) -> PathBuf {
         self.home.join("VibeOS/snapshots")
     }

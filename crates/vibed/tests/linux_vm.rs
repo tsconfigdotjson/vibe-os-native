@@ -213,6 +213,21 @@ async fn a_linux_agent_answers_on_opus_and_carries_on_after_sleep() {
     );
     let text = fs::read_to_string(&transcript).unwrap();
     assert!(text.contains("\"model\":\"claude-opus"), "answered on Opus");
+    // Nothing about where it's installed or how it updates: the managed
+    // layer does that (PRD: Spike results).
+    let shown = screen().to_lowercase();
+    for warning in [
+        "claude install",
+        "installmethod",
+        "auto-update",
+        "not in your path",
+    ] {
+        assert!(
+            !shown.contains(warning),
+            "Claude warned ({warning}):\n{shown}"
+        );
+    }
+    let boot_id = vibe_env::guest::status(&socket).unwrap().boot_id;
 
     // Asleep: the VM saved to disk, its RAM given back.
     let h = handle.clone();
@@ -223,13 +238,19 @@ async fn a_linux_agent_answers_on_opus_and_carries_on_after_sleep() {
         .unwrap_or_else(|e| panic!("sleep: {e}\n{}", logs()));
     assert!(layout.snapshot(&r).is_file());
     assert!(!vm::lock_held(&socket), "vibe-vm exited");
-    std::thread::sleep(Duration::from_secs(3));
 
     // A wake restores it on a new shim, and the conversation carries on.
     core.resume_agent(None, &r)
         .await
         .unwrap_or_else(|e| panic!("wake: {e}\n{}", logs()));
     assert!(!layout.snapshot(&r).exists(), "the snapshot is used up");
+    // The same boot, restored, not a fresh VM resuming the conversation.
+    assert_eq!(
+        vibe_env::guest::status(&socket).unwrap().boot_id,
+        boot_id,
+        "the wake was a fresh boot\n{}",
+        logs()
+    );
     let mut c = shim::connect(
         &layout.session_socket(&r),
         &control_hello("linux_vm"),

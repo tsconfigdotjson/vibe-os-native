@@ -3,7 +3,8 @@
 //!
 //! It runs `claude setup-token`, the same browser sign-in as `/login`, on a
 //! terminal of its own that this one is joined to, and picks the long-lived
-//! token out of what it prints. The token goes to the Keychain, where
+//! token out of what it prints, joined up again if the terminal wrapped
+//! it. The token goes to the Keychain, where
 //! `vibed` reads it for every `linux` agent's launch; it's never written to
 //! a file. If none can be found in the output, it asks for the token to be
 //! pasted.
@@ -14,6 +15,8 @@ use std::io::{self, BufRead, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use vibe_core::claude_token::{self, TokenStore};
 
@@ -21,9 +24,6 @@ use crate::attach::{RawMode, is_tty, window_size};
 
 /// The most of its output kept to look for the token in: the end of it.
 const KEEP: usize = 1 << 20;
-
-/// Wide enough that the token is never wrapped onto two lines.
-const MIN_COLS: u16 = 300;
 
 fn check(rc: libc::c_int) -> io::Result<libc::c_int> {
     if rc == -1 {
@@ -33,14 +33,24 @@ fn check(rc: libc::c_int) -> io::Result<libc::c_int> {
     }
 }
 
+fn cloexec(fd: libc::c_int) -> io::Result<()> {
+    // SAFETY: plain fcntl calls on a descriptor we own.
+    unsafe {
+        let flags = check(libc::fcntl(fd, libc::F_GETFD))?;
+        check(libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC))?;
+    }
+    Ok(())
+}
+
 /// A new terminal pair, `rows` by `cols`.
 fn open_pty(rows: u16, cols: u16) -> io::Result<(File, OwnedFd)> {
     // SAFETY: each call is checked; the descriptors are owned at once. This
     // runs before any other thread, as ptsname isn't thread-safe.
     unsafe {
-        let master = OwnedFd::from_raw_fd(check(libc::posix_openpt(
-            libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
-        ))?);
+        // posix_openpt takes no O_CLOEXEC on macOS: that's set after.
+        let master =
+            OwnedFd::from_raw_fd(check(libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY))?);
+        cloexec(master.as_raw_fd())?;
         check(libc::grantpt(master.as_raw_fd()))?;
         check(libc::unlockpt(master.as_raw_fd()))?;
         let name = libc::ptsname(master.as_raw_fd());
@@ -50,8 +60,9 @@ fn open_pty(rows: u16, cols: u16) -> io::Result<(File, OwnedFd)> {
         let name = CStr::from_ptr(name).to_owned();
         let slave = OwnedFd::from_raw_fd(check(libc::open(
             name.as_ptr(),
-            libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
+            libc::O_RDWR | libc::O_NOCTTY,
         ))?);
+        cloexec(slave.as_raw_fd())?;
         let ws = libc::winsize {
             ws_row: rows,
             ws_col: cols,
@@ -67,7 +78,8 @@ fn open_pty(rows: u16, cols: u16) -> io::Result<(File, OwnedFd)> {
 /// how it exited and all it printed.
 fn run_claude(claude: &OsString) -> io::Result<(std::process::ExitStatus, Vec<u8>)> {
     let (rows, cols) = window_size().map_or((24, 80), |s| (s.rows, s.cols));
-    let (mut master, slave) = open_pty(rows, cols.max(MIN_COLS))?;
+    // This terminal's size, so its sign-in screen draws as it should.
+    let (mut master, slave) = open_pty(rows, cols)?;
     let mut cmd = Command::new(claude);
     cmd.arg("setup-token")
         .stdin(Stdio::from(slave.try_clone()?))
@@ -96,16 +108,34 @@ fn run_claude(claude: &OsString) -> io::Result<(std::process::ExitStatus, Vec<u8
     } else {
         None
     };
+    // What's typed is forwarded until Claude exits. Read from the descriptor
+    // with a poll, not through `io::stdin()`, whose lock a blocked read
+    // would hold: a paste asked for after must find stdin free.
     let mut to_child = master.try_clone()?;
-    std::thread::spawn(move || {
-        let mut stdin = io::stdin().lock();
-        let mut buf = [0u8; 1024];
-        while let Ok(n) = stdin.read(&mut buf) {
-            if n == 0 || to_child.write_all(&buf[..n]).is_err() {
-                break;
+    let done = Arc::new(AtomicBool::new(false));
+    let typing = {
+        let done = Arc::clone(&done);
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 1024];
+            while !done.load(Ordering::SeqCst) {
+                let mut fds = libc::pollfd {
+                    fd: libc::STDIN_FILENO,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: one pollfd, owned here.
+                if unsafe { libc::poll(&mut fds, 1, 100) } <= 0 {
+                    continue;
+                }
+                // SAFETY: reads into a buffer of its length.
+                let n =
+                    unsafe { libc::read(libc::STDIN_FILENO, buf.as_mut_ptr().cast(), buf.len()) };
+                if n <= 0 || to_child.write_all(&buf[..n as usize]).is_err() {
+                    break;
+                }
             }
-        }
-    });
+        })
+    };
     let mut seen = Vec::new();
     let mut stdout = io::stdout();
     let mut buf = [0u8; 8192];
@@ -126,6 +156,8 @@ fn run_claude(claude: &OsString) -> io::Result<(std::process::ExitStatus, Vec<u8
         }
     }
     let status = child.wait()?;
+    done.store(true, Ordering::SeqCst);
+    let _ = typing.join();
     drop(raw);
     Ok((status, seen))
 }
@@ -176,6 +208,10 @@ pub(crate) fn setup_token(claude: &OsString, store: &TokenStore) -> Result<(), S
         TokenStore::Keychain { .. } => "the Keychain",
         TokenStore::File(_) => "the test token file",
     };
-    println!("\r\nvibe: linux agents will sign in to Claude with this token, kept in {place}.");
+    // Its end, to check against what Claude showed, never the whole.
+    let end = &token[token.len() - 6..];
+    println!(
+        "\r\nvibe: linux agents will sign in to Claude with the token ending …{end}, kept in {place}."
+    );
     Ok(())
 }

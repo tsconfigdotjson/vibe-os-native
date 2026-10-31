@@ -18,7 +18,8 @@ use std::process::{Command, Stdio};
 /// What Claude Code reads its token from.
 pub const TOKEN_ENV: &str = "CLAUDE_CODE_OAUTH_TOKEN";
 
-/// For tests only: keep the token in this file instead of the Keychain.
+/// For tests only, and only in debug builds: keep the token in this file
+/// instead of the Keychain.
 pub const TEST_FILE_ENV: &str = "VIBE_TEST_TOKEN_FILE";
 
 /// The Keychain item: a generic password with this service and account.
@@ -45,7 +46,13 @@ pub enum TokenStore {
 impl TokenStore {
     /// The Keychain item, unless [`TEST_FILE_ENV`] names a file.
     pub fn current() -> TokenStore {
-        match std::env::var_os(TEST_FILE_ENV).filter(|v| !v.is_empty()) {
+        // Release builds keep it in the Keychain, whatever the environment.
+        let test_file = if cfg!(debug_assertions) {
+            std::env::var_os(TEST_FILE_ENV).filter(|v| !v.is_empty())
+        } else {
+            None
+        };
+        match test_file {
             Some(path) => TokenStore::File(PathBuf::from(path)),
             None => TokenStore::Keychain {
                 service: SERVICE.into(),
@@ -208,21 +215,47 @@ pub fn validate(token: &str) -> Result<(), String> {
 }
 
 /// The last token in what `claude setup-token` printed, terminal escapes
-/// and all.
+/// and all. One its terminal wrapped onto the next lines is joined up again:
+/// a run of token characters that ends a line goes on with the next line
+/// when that line, past its indent, is token characters to its end.
 pub fn find(output: &[u8]) -> Option<String> {
     let text = strip_escapes(output);
+    let is_token = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
+    let run = |s: &str| s.find(|c: char| !is_token(c)).unwrap_or(s.len());
+    let line_break = |s: &str| {
+        let crs = s.len() - s.trim_start_matches('\r').len();
+        s[crs..].starts_with('\n').then_some(crs + 1)
+    };
     let mut found = None;
     let mut rest = text.as_str();
     while let Some(at) = rest.find(PREFIX) {
         let tail = &rest[at..];
-        let end = tail
-            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
-            .unwrap_or(tail.len());
-        let token = &tail[..end];
-        if validate(token).is_ok() {
-            found = Some(token.to_owned());
+        let mut token = String::new();
+        let mut i = 0;
+        loop {
+            let end = i + run(&tail[i..]);
+            token.push_str(&tail[i..end]);
+            i = end;
+            let Some(nl) = line_break(&tail[end..]) else {
+                break;
+            };
+            let next = &tail[end + nl..];
+            let indent = next.len() - next.trim_start_matches(' ').len();
+            let body = &next[indent..];
+            let more = run(body);
+            // A line that starts a token anew is a redraw, not the rest.
+            if more == 0
+                || body.starts_with(PREFIX)
+                || !(body[more..].is_empty() || line_break(&body[more..]).is_some())
+            {
+                break;
+            }
+            i = end + nl + indent;
         }
-        rest = &tail[end.max(1)..];
+        if validate(&token).is_ok() {
+            found = Some(token);
+        }
+        rest = &tail[i.max(1)..];
     }
     found
 }
@@ -288,6 +321,21 @@ mod tests {
         );
         assert_eq!(find(screen.as_bytes()).as_deref(), Some(TOKEN));
         assert_eq!(find(b"no token here, nor sk-ant-oat01-tiny"), None);
+        // Wrapped by a narrow terminal, indented, it's joined up again; the
+        // prose after it isn't taken for more of it.
+        let wrapped = format!(
+            "Your OAuth token:\r\n\r\n  {}\r\n  {}\r\n  {}\r\n\r\nStore this token securely.\r\n",
+            &TOKEN[..25],
+            &TOKEN[25..50],
+            &TOKEN[50..]
+        );
+        assert_eq!(find(wrapped.as_bytes()).as_deref(), Some(TOKEN));
+        let then_word = format!("{TOKEN}\nDone\n");
+        assert_eq!(
+            find(then_word.as_bytes()).map(|t| t.len()),
+            Some(TOKEN.len() + 4),
+            "a lone word on the next line can't be told from a wrap"
+        );
         // A redraw printed it twice; the last whole one wins.
         let twice = format!("{TOKEN}\r\n\x1b[1A\x1b[2K{TOKEN}\r\n");
         assert_eq!(find(twice.as_bytes()).as_deref(), Some(TOKEN));

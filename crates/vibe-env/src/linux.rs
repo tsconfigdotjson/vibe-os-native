@@ -168,8 +168,16 @@ impl Machine for Real {
 
     fn sleep(&self, socket: &Path, balloon_floor: u64) -> Result<()> {
         vm::sleep(socket, None, Some(balloon_floor))
-            .map(drop)
-            .map_err(|e| EnvError::new(format!("the VM couldn't be saved: {e}")))
+            .map_err(|e| EnvError::new(format!("the VM couldn't be saved: {e}")))?;
+        // It replies once the VM is saved and stopped, and exits just after:
+        // a wake must find it gone.
+        if vm::wait_gone(socket, POWEROFF_PATIENCE) {
+            Ok(())
+        } else {
+            Err(EnvError::new(
+                "the VM was saved, but its vibe-vm didn't exit",
+            ))
+        }
     }
 
     fn stop(&self, socket: &Path) -> Result<()> {
@@ -456,6 +464,26 @@ impl LinuxVm {
                 status.problems.join("; ")
             )));
         }
+        // A share that didn't mount leaves an empty directory where it
+        // should be: Claude would work there unseen, and write its
+        // transcript to the agent's own disk.
+        let config = VmConfig::load(&LinuxVm::config_path(h))
+            .map_err(|e| EnvError::new(format!("{}'s VM: {e}", h.agent_ref)))?;
+        let missing: Vec<&str> = config
+            .shares
+            .iter()
+            .map(|s| s.tag.as_str())
+            .filter(|tag| !status.shares.iter().any(|m| m.tag == *tag))
+            .collect();
+        if !missing.is_empty() {
+            let _ = self.machine.stop(&socket);
+            return Err(EnvError::new(format!(
+                "{}'s VM couldn't mount {}: {}",
+                h.agent_ref,
+                missing.join(", "),
+                status.problems.join("; ")
+            )));
+        }
         Ok(())
     }
 
@@ -718,6 +746,9 @@ impl Compartment for LinuxVm {
         env.insert(CONFIG_DIR_ENV.into(), GUEST_CLAUDE_HOME.into());
         // The managed layer keeps Claude current (PRD: Exceptions).
         env.insert("DISABLE_AUTOUPDATER".into(), "1".into());
+        // Nor is it where Claude's own installer would put it, which Claude
+        // otherwise warns about (PRD: Spike results).
+        env.insert("DISABLE_INSTALLATION_CHECKS".into(), "1".into());
         env.insert(TOKEN_ENV.into(), token);
         self.machine.launch(
             &socket,
@@ -850,7 +881,6 @@ impl Sleeper for LinuxVm {
         if !self.machine.running(&socket) {
             return Err(EnvError::new(format!("{} isn't running", h.agent_ref)));
         }
-        self.unsupervise(h);
         // Frozen already if a limit paused it; a second freeze is harmless.
         let frozen = self.machine.freeze(&socket)?;
         if let Err(e) = self
@@ -863,6 +893,8 @@ impl Sleeper for LinuxVm {
             }
             return Err(e);
         }
+        // Its limits are held again when it wakes on a new shim.
+        self.unsupervise(h);
         Ok(())
     }
 

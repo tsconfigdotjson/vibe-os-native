@@ -178,17 +178,39 @@ impl Images {
             .map(|(_, p)| p)
     }
 
-    /// The newest of each layer, or why there's no base to boot.
+    /// The newest of each layer, or why there's no base to boot. A new base
+    /// is never put under a template built on an older one (PRD: Base image
+    /// updates): with a template, the base is the one it names in
+    /// `template-<n>.base` (its version, which the toolbox writes, #10), or
+    /// failing that the oldest installed, which it was built on.
     pub fn layers(&self) -> Result<Layers> {
-        let base = self.base().ok_or_else(|| {
+        let none = || {
             err(format!(
                 "no Linux base image in {} yet: vibed downloads it when it starts",
                 self.dir.display()
             ))
-        })?;
+        };
+        let template = self.newest("template");
+        let base = match &template {
+            None => self.base().ok_or_else(none)?,
+            Some(t) => {
+                let named = fs::read_to_string(t.with_extension("base"))
+                    .ok()
+                    .and_then(|v| v.trim().parse::<u32>().ok())
+                    .and_then(|v| self.installed_base(v));
+                match named {
+                    Some(base) => base,
+                    None => self
+                        .versions("base-", "")
+                        .into_iter()
+                        .find_map(|(n, _)| self.installed_base(n))
+                        .ok_or_else(none)?,
+                }
+            }
+        };
         Ok(Layers {
             base,
-            template: self.newest("template"),
+            template,
             managed: self.managed(),
             home: self.newest("home"),
         })
@@ -549,7 +571,14 @@ struct Version {
     numbers: [u64; 3],
     /// A release without a tag sorts after its pre-releases.
     release: bool,
-    tag: String,
+    /// The tag's dot-separated parts: numbers by value, before words.
+    tag: Vec<TagPart>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum TagPart {
+    Number(u64),
+    Word(String),
 }
 
 impl Version {
@@ -580,7 +609,15 @@ impl Version {
         Some(Version {
             numbers,
             release: tag.is_none(),
-            tag: tag.unwrap_or_default().to_owned(),
+            tag: tag
+                .unwrap_or_default()
+                .split('.')
+                .filter(|p| !p.is_empty())
+                .map(|p| match p.parse() {
+                    Ok(n) if p.len() <= 18 => TagPart::Number(n),
+                    _ => TagPart::Word(p.to_owned()),
+                })
+                .collect(),
         })
     }
 }
@@ -588,7 +625,17 @@ impl Version {
 /// Downloads `url` to `dest` with `curl`, over HTTPS or from a local file.
 fn fetch(url: &str, dest: &Path) -> Result<()> {
     let out = Command::new("curl")
-        .args(["-fsSL", "--retry", "3", "--proto", "=https,file", "-o"])
+        .args(["-fsSL", "--retry", "3", "--proto", "=https,file"])
+        // A download that stalls gives up, so the next check can run.
+        .args([
+            "--connect-timeout",
+            "30",
+            "--speed-limit",
+            "1024",
+            "--speed-time",
+            "120",
+            "-o",
+        ])
         .arg(dest)
         .arg(url)
         .stdin(Stdio::null())
@@ -627,19 +674,25 @@ fn readonly(path: &Path) -> Result<()> {
 /// Unpacks a gzip file with `gzip -dc`, writing only blocks that aren't all
 /// zeros, so an ext4 image stays as sparse as it was made.
 fn gunzip_sparse(src: &Path, dest: &Path) -> Result<()> {
-    let mut child = Command::new("gzip")
+    let out = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dest)
+        .map_err(io_err(format!("create {}", dest.display())))?;
+    let mut child = match Command::new("gzip")
         .arg("-dc")
         .arg(src)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(io_err("run gzip"))?;
-    let out = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(dest)
-        .map_err(io_err(format!("create {}", dest.display())))?;
+    {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = fs::remove_file(dest);
+            return Err(err(format!("run gzip: {e}")));
+        }
+    };
     let mut stdout = child.stdout.take().expect("piped");
     let mut buf = vec![0u8; ext4::BLOCK as usize];
     let mut at = 0u64;
@@ -666,6 +719,11 @@ fn gunzip_sparse(src: &Path, dest: &Path) -> Result<()> {
         out.set_len(at)?;
         out.sync_all()
     })();
+    // Stopped early (a full disk, say), gzip may be blocked on the pipe.
+    drop(stdout);
+    if copied.is_err() {
+        let _ = child.kill();
+    }
     let status = child.wait().map_err(io_err("wait for gzip"))?;
     let mut stderr = String::new();
     if let Some(mut e) = child.stderr.take() {
@@ -755,6 +813,7 @@ mod tests {
         assert!(v("2.10.0") > v("2.9.99"));
         assert!(v("2.1.0") > v("2.1.0-beta.1"));
         assert!(v("2.1.0-beta.2") > v("2.1.0-beta.1"));
+        assert!(v("2.1.0-beta.10") > v("2.1.0-beta.9"));
         for bad in [
             "",
             "2.1",
@@ -1013,13 +1072,28 @@ mod tests {
         assert_eq!(layers.template, Some(images.dir().join("template-10.img")));
         assert_eq!(layers.home, Some(images.dir().join("home-1.img")));
 
-        // A newer release, uncompressed, is the base new agents get.
+        // A newer release, uncompressed, is installed beside it...
         let release2 = tmp.path().join("release-2");
         publish_base(&release2, 2, false);
         images
             .install_base(&format!("file://{}", release2.display()), 2)
             .unwrap();
         assert_eq!(images.base().unwrap().version, 2);
+        // ...but never goes under the template built on the old one, until
+        // a rebuilt template says it's on the new one.
+        assert_eq!(images.layers().unwrap().base.version, 1);
+        fs::write(images.dir().join("template-10.base"), "2\n").unwrap();
+        assert_eq!(images.layers().unwrap().base.version, 2);
+        // Without a template, new agents get the newest.
+        for name in [
+            "template-2.img",
+            "template-10.img",
+            "template-01.img",
+            "template-10.base",
+        ] {
+            fs::remove_file(images.dir().join(name)).unwrap();
+        }
+        assert_eq!(images.layers().unwrap().base.version, 2);
     }
 
     #[test]

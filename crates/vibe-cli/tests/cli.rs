@@ -237,3 +237,64 @@ fn setup_token_without_a_token_fails_and_keeps_nothing() {
         text(&out.stderr)
     );
 }
+
+#[test]
+fn setup_token_asks_for_a_paste_on_a_terminal_when_it_saw_none() {
+    use std::io::Read;
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let tmp = tempfile::tempdir().unwrap();
+    let claude = tmp.path().join("claude");
+    fs::write(&claude, "#!/bin/sh\necho 'Opened your browser.'\n").unwrap();
+    fs::set_permissions(&claude, fs::Permissions::from_mode(0o755)).unwrap();
+    let token = tmp.path().join("token");
+    // A terminal for vibe's stdin, stdout and stderr, as a person's is.
+    // SAFETY: each call is checked; the descriptors are owned at once.
+    let (master, slave) = unsafe {
+        let m = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+        assert!(m >= 0);
+        assert_eq!(libc::grantpt(m), 0);
+        assert_eq!(libc::unlockpt(m), 0);
+        let name = std::ffi::CStr::from_ptr(libc::ptsname(m)).to_owned();
+        let s = libc::open(name.as_ptr(), libc::O_RDWR | libc::O_NOCTTY);
+        assert!(s >= 0);
+        (OwnedFd::from_raw_fd(m), OwnedFd::from_raw_fd(s))
+    };
+    let mut child = Command::new(VIBE)
+        .arg("setup-token")
+        .env("VIBE_CLAUDE", &claude)
+        .env("VIBE_TEST_TOKEN_FILE", &token)
+        .stdin(Stdio::from(slave.try_clone().unwrap()))
+        .stdout(Stdio::from(slave.try_clone().unwrap()))
+        .stderr(Stdio::from(slave.try_clone().unwrap()))
+        .spawn()
+        .unwrap();
+    drop(slave);
+    let mut master = fs::File::from(master);
+    let mut reader = master.try_clone().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        let mut buf = [0u8; 1024];
+        while let Ok(n) = reader.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            seen.extend_from_slice(&buf[..n]);
+            let _ = tx.send(String::from_utf8_lossy(&seen).into_owned());
+        }
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let seen = rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("vibe asked for nothing");
+        if seen.contains("paste the token") {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "{seen}");
+    }
+    master.write_all(format!("{TOKEN}\n").as_bytes()).unwrap();
+    let status = child.wait().unwrap();
+    assert!(status.success());
+    assert_eq!(fs::read_to_string(&token).unwrap().trim(), TOKEN);
+}

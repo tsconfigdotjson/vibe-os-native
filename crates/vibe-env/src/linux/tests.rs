@@ -28,6 +28,8 @@ struct State {
     restore_fails: bool,
     /// What a `run` writes before it exits, or `None` to hang.
     run_output: Option<(String, i32)>,
+    /// A share the guest fails to mount.
+    unmounted: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -54,7 +56,14 @@ impl Fake {
         f(s.vms.entry(socket.to_owned()).or_default())
     }
 
-    fn status_of(vm: &Vm) -> guest::Status {
+    fn status_of(vm: &Vm, unmounted: Option<&str>) -> guest::Status {
+        let shares: Vec<_> = VmConfig::load(&vm.config)
+            .map(|c| c.shares)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|s| Some(s.tag.as_str()) != unmounted)
+            .map(|s| json!({"tag": s.tag, "path": s.path}))
+            .collect();
         serde_json::from_value(json!({
             "protocol": proto::PROTOCOL,
             "version": "0.1.0",
@@ -68,7 +77,7 @@ impl Fake {
             "frozen": vm.frozen,
             "memory": {"total": 4u64 << 30, "available": 3u64 << 30},
             "layers": ["managed", "base"],
-            "shares": [],
+            "shares": shares,
         }))
         .unwrap()
     }
@@ -160,7 +169,8 @@ impl Machine for Fake {
         if !vm.running {
             return Err(refused("not running"));
         }
-        Ok(Fake::status_of(&vm))
+        let unmounted = lock(&self.state).unmounted.clone();
+        Ok(Fake::status_of(&vm, unmounted.as_deref()))
     }
 
     fn launch(&self, socket: &Path, launch: &guest::Launch) -> Result<()> {
@@ -453,6 +463,7 @@ fn launch_boots_and_starts_claude_with_the_token() {
     assert_eq!(launch.env["CLAUDE_CODE_OAUTH_TOKEN"], TOKEN);
     assert_eq!(launch.env["CLAUDE_CONFIG_DIR"], "/home/vibe/.claude");
     assert_eq!(launch.env["DISABLE_AUTOUPDATER"], "1");
+    assert_eq!(launch.env["DISABLE_INSTALLATION_CHECKS"], "1");
     assert_eq!(launch.env["GIT_CONFIG_COUNT"], "1");
     assert!(launch.time_ms.is_some(), "the clock is set first");
     // The token is in no file VibeOS keeps.
@@ -730,4 +741,23 @@ fn capabilities_are_a_vms() {
     assert_eq!(linux_signal("SIGKILL"), Some(9));
     assert_eq!(linux_signal("SIGTERM"), Some(15));
     assert_eq!(linux_signal("SIGWHAT"), None);
+}
+
+#[test]
+fn a_share_that_didnt_mount_fails_the_boot() {
+    let s = Setup::new();
+    let h = s.backend.create(&s.spec("quiet-amber-otter")).unwrap();
+    lock(&s.fake.state).unmounted = Some("claude".into());
+    let e = s.launch(&h).unwrap_err();
+    assert!(e.message().contains("couldn't mount claude"), "{e}");
+    assert!(
+        !s.fake.vm(&s.socket("quiet-amber-otter")).running,
+        "it's stopped"
+    );
+    assert!(
+        !s.fake.calls().contains(&"launch".to_owned()),
+        "Claude never starts"
+    );
+    lock(&s.fake.state).unmounted = None;
+    s.launch(&h).unwrap();
 }
