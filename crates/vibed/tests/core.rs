@@ -122,7 +122,9 @@ fn a_lock_let_go_of_a_moment_later_is_taken() {
         .write(true)
         .open(layout.data_dir().join("vibed.lock"))
         .unwrap();
-    held.try_lock().unwrap();
+    // Waited for, not tried: the core just dropped may not have let go in
+    // every process yet, for the same reason.
+    held.lock().unwrap();
     let let_go = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(500));
         drop(held);

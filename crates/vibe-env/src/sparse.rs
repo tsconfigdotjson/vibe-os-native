@@ -6,7 +6,8 @@
 //! writes zeros on disk for a gap a later write leaves behind it. So once
 //! an image is written, [`punch_zeros`] goes through the parts of it that
 //! are on disk and gives back every run of whole blocks that holds only
-//! zeros: `F_PUNCHHOLE` on macOS, `fallocate` on Linux. Reads of a hole
+//! zeros: `F_PUNCHHOLE` on macOS, `fallocate` on Linux. It flushes the
+//! file first, as APFS writes those zeros out only then. Reads of a hole
 //! return zeros, so the file's contents don't change.
 
 use std::fs::File;
@@ -110,6 +111,11 @@ fn next_data(file: &File, from: u64, len: u64) -> Option<(u64, u64)> {
 /// hole. Returns how many bytes were given back. A filesystem that can't
 /// punch holes is left as it is, and that's no error.
 pub fn punch_zeros(file: &File) -> io::Result<u64> {
+    // APFS fills a gap with zeros only when the file is flushed, and until
+    // then reports the gap as a hole, which the walk below would skip. So
+    // the file is flushed first, and every block it will keep is on disk
+    // and found.
+    file.sync_all()?;
     let len = file.metadata()?.len();
     let block = block_size(file);
     let mut buf = vec![0u8; CHUNK as usize];
@@ -196,6 +202,35 @@ mod tests {
         assert!(back == bytes, "the contents changed");
         // Again, there's nothing more to give back.
         assert_eq!(punch_zeros(&file).unwrap(), 0);
+    }
+
+    #[test]
+    fn gaps_left_by_writes_not_yet_flushed_become_holes() {
+        // As an image is written: data here and there, in order, with
+        // nothing flushed until the punching. APFS writes the gaps out as
+        // zeros at the flush.
+        let tmp = tempfile::tempdir().unwrap();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(tmp.path().join("img"))
+            .unwrap();
+        let mut at = 0u64;
+        for i in 0..8u8 {
+            file.write_all_at(&[i + 1; 4096], at).unwrap();
+            at += 1 << 20;
+        }
+        file.set_len(8 << 20).unwrap();
+        punch_zeros(&file).unwrap();
+        file.sync_all().unwrap();
+        let after = on_disk(&file);
+        assert!(after < 1 << 20, "still {after} bytes on disk");
+        for i in 0..8u8 {
+            let mut b = [0u8; 4097];
+            file.read_exact_at(&mut b, u64::from(i) << 20).unwrap();
+            assert!(b[..4096].iter().all(|&x| x == i + 1) && b[4096] == 0);
+        }
     }
 
     #[test]
