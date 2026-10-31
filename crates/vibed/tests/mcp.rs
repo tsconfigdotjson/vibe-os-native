@@ -485,6 +485,10 @@ async fn settings_turn_tailscale_on_and_off_and_it_applies_at_once() {
         format!("# mine\nmcp_port = {first}  # the port\n"),
     )
     .unwrap();
+    // Not served yet, so hosts.list says MCP is off.
+    let mcp_on = |core: &Core| core.hosts().unwrap().hosts[0].mcp;
+    assert!(!mcp_on(&core));
+    let (_, mut served) = core.subscribe();
     let task = core.spawn_mcp(Duration::from_secs(3600));
     let serves = |port: u16| async move {
         for _ in 0..200 {
@@ -499,6 +503,14 @@ async fn settings_turn_tailscale_on_and_off_and_it_applies_at_once() {
         false
     };
     assert!(serves(first).await);
+    // Served on loopback: hosts.list says so, and it's announced.
+    let e = tokio::time::timeout(Duration::from_secs(5), served.recv())
+        .await
+        .expect("an mcp.changed")
+        .unwrap();
+    assert_eq!(e.kind, EventKind::McpChanged);
+    assert_eq!(e.message.as_deref(), Some("MCP is served"));
+    assert!(mcp_on(&core));
 
     // On: written into host.toml, keeping the rest; announced; and the
     // Tailscale URL is there for the setup command.
@@ -584,5 +596,14 @@ async fn settings_turn_tailscale_on_and_off_and_it_applies_at_once() {
     );
     // While it's broken, MCP stays where it was.
     assert!(serves(second).await);
+    assert!(mcp_on(&core));
+    // Once the listeners stop, hosts.list says MCP is off again.
     task.abort();
+    for _ in 0..200 {
+        if !mcp_on(&core) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(!mcp_on(&core), "MCP is off once it isn't served");
 }

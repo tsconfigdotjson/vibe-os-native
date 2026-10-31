@@ -127,7 +127,8 @@ names! {
         /// or failed to; `message` says which.
         ToolboxChanged = "toolbox.changed",
         /// Where MCP is served changed: `mcp.set` turned the Tailscale
-        /// address on or off.
+        /// address on or off, or MCP started or stopped being served on
+        /// loopback (`HostInfo.mcp`).
         McpChanged = "mcp.changed",
     }
 }

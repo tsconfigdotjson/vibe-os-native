@@ -295,11 +295,19 @@ struct FooterView: View {
             }
             .disabled(model.connection != .connected)
             Menu {
-                Button("Open Shell") {}.disabled(true)
-                Button("Rebuild Template") {}.disabled(true)
+                Button("Open Shell") { Task { await model.openToolbox() } }
+                    .disabled(!canOpenToolbox)
+                // In Terminal, as it can take many minutes and says how it goes.
+                Button("Rebuild Template") { model.runInTerminal(["toolbox", "rebuild"], exec: false) }
+                    .disabled(model.toolbox?.state != .closed)
                 Button("See Logins") {}.disabled(true)
+                let lines = toolboxLines(model.toolbox)
+                if !lines.isEmpty {
+                    Divider()
+                    ForEach(lines, id: \.self) { Text($0) }
+                }
                 Divider()
-                Button("Log In to Claude for Linux Agents…") { setupToken() }
+                Button("Log In to Claude for Linux Agents…") { model.runInTerminal(["setup-token"], exec: true) }
             } label: {
                 Label("Linux Toolbox", systemImage: "shippingbox")
             }
@@ -307,7 +315,6 @@ struct FooterView: View {
             .buttonStyle(.plain)
             .padding(.horizontal, 16)
             .padding(.vertical, 5)
-            .help("The toolbox shell and template versions come with the Linux toolbox")
             FooterItem(title: "Add Linux Host…", symbol: "server.rack") {}
                 .disabled(true)
                 .help("Adding Linux hosts comes with Linux host support")
@@ -322,16 +329,11 @@ struct FooterView: View {
         }
     }
 
-    /// `vibe setup-token` in Terminal: the Claude sign-in for linux agents.
-    private func setupToken() {
-        let command = "exec " + shellQuote(model.attacher.vibePath) + " setup-token"
-        do {
-            _ = try model.attacher.terminal.run(command)
-        } catch TerminalError.notPermitted {
-            try? model.attacher.terminal.runWithoutScripting(command)
-        } catch {
-            model.message = "Can't open Terminal: \(describe(error))"
-        }
+    /// The shell opens while the toolbox is closed or already open; an
+    /// update, a rebuild or a save holds it.
+    private var canOpenToolbox: Bool {
+        guard let state = model.toolbox?.state else { return false }
+        return state == .closed || state == .open
     }
 }
 

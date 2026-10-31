@@ -29,6 +29,10 @@ public final class MenuModel: ObservableObject {
     /// known, shown as unavailable.
     @Published public private(set) var unavailableHosts: Set<String> = []
     @Published public private(set) var gh: GhStatus?
+    /// This host's Linux toolbox: its versions and what it's doing.
+    @Published public private(set) var toolbox: ToolboxStatus?
+    /// Where this host serves MCP, for the setup command and Settings.
+    @Published public private(set) var mcp: McpSettings?
     @Published public private(set) var memory: HostMemory?
     /// Whether events are coming in; without them only the poll updates
     /// the menu.
@@ -168,6 +172,8 @@ public final class MenuModel: ObservableObject {
         unavailableHosts = unavailable
         connection = .connected
         gh = (try? await call(GhStatusGet.self, GhStatusParams())) ?? gh
+        toolbox = (try? await call(ToolboxStatusGet.self, NoParams())) ?? toolbox
+        mcp = (try? await call(McpGet.self, HostParams())) ?? mcp
     }
 
     /// Opens Terminal on `agent`: raises its tab if it has one, or opens
@@ -222,6 +228,47 @@ public final class MenuModel: ObservableObject {
         } catch {
             return .failed(describe(error))
         }
+    }
+
+    /// Opens the Linux toolbox shell in Terminal, as Linux Toolbox → Open
+    /// Shell does: raises its tab if one is attached, or opens one running
+    /// `vibe toolbox`, which boots it and attaches. Twice gives one tab.
+    public func openToolbox() async {
+        var attached: [String] = []
+        // Open already, it gives the same shell at once, with its ttys.
+        if (try? await call(ToolboxStatusGet.self, NoParams()))?.state == .open {
+            attached = (try? await call(ToolboxOpen.self, NoParams()))?.ttys ?? []
+        }
+        do {
+            _ = try attacher.openToolbox(attached: attached)
+            message = nil
+        } catch {
+            message = "Can't open the toolbox: \(describe(error))"
+        }
+    }
+
+    /// Runs `vibe <words>` in a new Terminal window, where it can take as
+    /// long as it needs and show how it goes, as Rebuild Template and Log
+    /// In to Claude do. With `exec`, the window's shell becomes it. `words`
+    /// are shell words, as `Attacher.vibeCommand` takes them.
+    public func runInTerminal(_ words: [String], exec: Bool) {
+        let command = (exec ? "exec " : "") + attacher.vibeCommand(words)
+        do {
+            do {
+                _ = try attacher.terminal.run(command)
+            } catch TerminalError.notPermitted {
+                try attacher.terminal.runWithoutScripting(command)
+            }
+            message = nil
+        } catch {
+            message = "Can't open Terminal: \(describe(error))"
+        }
+    }
+
+    /// Turns MCP on this Mac's Tailscale address on or off, as Settings
+    /// does.
+    public func setMCPTailscale(_ on: Bool) async throws {
+        mcp = try await call(McpSet.self, McpSetParams(tailscale: on))
     }
 
     /// Starts an agent, as New agent… does.
@@ -284,6 +331,12 @@ public final class MenuModel: ObservableObject {
             await refresh()
         case .projectAdded, .projectRemoved, .profilesChanged, .limitsChanged, .keysChanged:
             settingsRevision += 1
+        case .toolboxChanged:
+            toolbox = (try? await call(ToolboxStatusGet.self, NoParams())) ?? toolbox
+        case .mcpChanged:
+            // Where it's served, and whether it is, for the header.
+            settingsRevision += 1
+            await refresh()
         }
     }
 

@@ -40,8 +40,10 @@ public func notice(for event: DaemonEvent, agent: Agent?, endOfTurn: Bool) -> No
         guard event.state == AgentState.question.rawValue, agent?.state != .question else { return nil }
         return make(.question, "\(ref) has a question", title ?? agent?.status.line)
     case .agentLimit:
-        let limit = event.limit ?? "a"
-        return make(.limit, "\(ref) hit its \(limit) limit", event.message)
+        // A pause, or a warning on the way to one (memory at 80%, past
+        // disk_soft); vibed's message says which.
+        let headline = event.limit.map { "\(ref): \($0) limit" } ?? "\(ref) hit a limit"
+        return make(.limit, headline, event.message)
     case .agentStatus:
         guard let status = event.status else { return nil }
         let before = agent?.status.activity

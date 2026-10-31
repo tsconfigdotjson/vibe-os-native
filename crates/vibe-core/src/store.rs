@@ -300,8 +300,8 @@ impl Store {
         let hosts = stmt
             .query_map([], |r| {
                 // Another host's link is down until a link to it is up
-                // (#16); MCP (#12) and the external address (#18) are off
-                // until they come.
+                // (#16), and the external address (#18) is off until it
+                // comes. Whether MCP is served is the daemon's to say.
                 let local: bool = r.get(3)?;
                 Ok(HostInfo {
                     name: r.get(0)?,

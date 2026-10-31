@@ -45,9 +45,13 @@ public enum AttachOutcome: Equatable, Sendable {
     case openedWithoutScripting
 }
 
-/// Attaches Terminal to agents, one tab per agent.
+/// Attaches Terminal to agents, one tab per agent, and to the Linux
+/// toolbox's shell, one tab for it.
 @MainActor
 public final class Attacher {
+    /// The toolbox shell's key; an agent's has a host in it.
+    public static let toolboxKey = "toolbox"
+
     public let terminal: TerminalScripting
     /// The `vibe` that local agents attach with.
     public let vibePath: String
@@ -75,35 +79,55 @@ public final class Attacher {
         self.clock = clock
     }
 
+    /// This app's `vibe`, with the socket when it isn't the default, then
+    /// `words`: shell words, quoted already where they need it.
+    public func vibeCommand(_ words: [String]) -> String {
+        var all = [shellQuote(vibePath)]
+        if let socket { all += ["--socket", shellQuote(socket)] }
+        return (all + words).joined(separator: " ")
+    }
+
     /// The shell command a new window runs for `agent`. A local one goes
     /// through this app's `vibe`; another host's is the `ssh -t <host> vibe
     /// attach <ref>` line vibed gives it.
     public func command(for agent: Agent) -> String {
         guard agent.isLocal else { return "exec \(agent.attach)" }
-        var words = [shellQuote(vibePath)]
-        if let socket { words += ["--socket", shellQuote(socket)] }
-        words += ["attach", shellQuote(agent.ref)]
-        return "exec " + words.joined(separator: " ")
+        return "exec " + vibeCommand(["attach", shellQuote(agent.ref)])
     }
+
+    /// The shell command a new window runs for the toolbox shell: `vibe
+    /// toolbox` opens it, and attaches.
+    public var toolboxCommand: String { "exec " + vibeCommand(["toolbox"]) }
 
     /// Raises `agent`'s tab if one is attached, by the ttys vibed reports
     /// (`attached`) or the one this app opened a moment ago, which vibed may
     /// not have seen yet; otherwise opens a new one.
     public func attach(_ agent: Agent, attached: [String]) throws -> AttachOutcome {
-        var ttys = agent.isLocal ? attached : []
+        try open(key: agent.key, command: command(for: agent), attached: agent.isLocal ? attached : [])
+    }
+
+    /// Raises the toolbox shell's tab if one is attached, or opens one.
+    public func openToolbox(attached: [String]) throws -> AttachOutcome {
+        try open(key: Attacher.toolboxKey, command: toolboxCommand, attached: attached)
+    }
+
+    /// The rule both follow: raise the tab for `key`, if vibed says one is
+    /// attached (`attached`) or this app opened it a moment ago; otherwise
+    /// run `command` in a new one.
+    public func open(key: String, command: String, attached: [String]) throws -> AttachOutcome {
+        var ttys = attached
         var busyOnly: [String] = []
-        if let mine = opened[agent.key], !ttys.contains(mine.tty) {
+        if let mine = opened[key], !ttys.contains(mine.tty) {
             let age = clock().timeIntervalSince(mine.at)
             if age < startup {
                 ttys.append(mine.tty)
             } else if age < grace {
                 busyOnly.append(mine.tty)
             } else {
-                opened[agent.key] = nil
+                opened[key] = nil
             }
         }
-        let command = self.command(for: agent)
-        if ttys.isEmpty, let at = openedUnscripted[agent.key], clock().timeIntervalSince(at) < startup {
+        if ttys.isEmpty, let at = openedUnscripted[key], clock().timeIntervalSince(at) < startup {
             return .openedWithoutScripting
         }
         do {
@@ -111,11 +135,11 @@ public final class Attacher {
                 return .raised
             }
             let tty = try terminal.run(command)
-            if let tty, !tty.isEmpty { opened[agent.key] = (tty, clock()) }
+            if let tty, !tty.isEmpty { opened[key] = (tty, clock()) }
             return .opened(tty: tty)
         } catch TerminalError.notPermitted {
             try terminal.runWithoutScripting(command)
-            openedUnscripted[agent.key] = clock()
+            openedUnscripted[key] = clock()
             return .openedWithoutScripting
         }
     }

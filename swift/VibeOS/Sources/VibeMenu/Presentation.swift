@@ -216,13 +216,52 @@ public func rowLines(_ agent: Agent, timeZone: TimeZone = .current) -> (title: S
 }
 
 /// The MCP setup line a new key's Copy setup command gives (PRD: MCP
-/// interface, Auth). The port is the PRD's placeholder until #12 settles it.
+/// interface, Auth), as `vibe key create` prints it. `url` is where vibed
+/// says MCP is served (`mcp.get`); before it has said, the default port's.
 public enum MCPSetup {
     public static let url = "http://127.0.0.1:7878/mcp"
 
-    public static func command(secret: String) -> String {
+    public static func command(secret: String, url: String = MCPSetup.url) -> String {
         "claude mcp add --transport http vibeos \(url) --header \"Authorization: Bearer \(secret)\""
     }
+}
+
+/// What the Linux toolbox menu says about the toolbox (PRD: The toolbox
+/// shell): the versions new agents boot, what it's doing, a newer base
+/// image that Rebuild template would move to, and how the last run went.
+public func toolboxLines(_ status: ToolboxStatus?) -> [String] {
+    guard let status else { return [] }
+    guard status.state != .unavailable else { return ["This host has no Linux toolbox"] }
+    var lines: [String] = []
+    var versions: [String] = []
+    if let template = status.template { versions.append("template v\(template)") }
+    if let home = status.home { versions.append("Linux home v\(home)") }
+    if let base = status.base { versions.append("base \(base)") }
+    if !versions.isEmpty { lines.append("New agents boot " + versions.joined(separator: ", ")) }
+    switch status.state {
+    case .open: lines.append("The shell is open: exit it to save")
+    case .saving: lines.append("Saving the template and Linux home…")
+    case .updating: lines.append("Running toolbox.toml's [update]…")
+    case .rebuilding: lines.append("Rebuilding the template…")
+    case .closed, .unavailable: break
+    }
+    if let newest = status.newestBase, newest > (status.base ?? 0) {
+        lines.append("Base \(newest) is installed: Rebuild Template moves to it")
+    }
+    if let last = status.last {
+        let what: String
+        switch last.action {
+        case .shell: what = "shell"
+        case .update: what = "update"
+        case .rebuild: what = "rebuild"
+        }
+        if let error = last.error {
+            lines.append("The last \(what) failed: \(error)")
+        } else if !last.uncovered.isEmpty {
+            lines.append("Not in toolbox.toml: " + last.uncovered.joined(separator: ", "))
+        }
+    }
+    return lines
 }
 
 /// Quotes `word` for a POSIX shell.

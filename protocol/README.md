@@ -71,7 +71,8 @@ which only `vibe attach` and `vibed` speak. Clients find a session with
 absent means this one, which every `vibed` calls `local`. Other hosts come
 with Linux hosts (#16). `hosts.list` gives each host's `link` (`local` for
 itself; `connected` or `down` for another), whether it's the external address
-(#18) and whether it serves MCP (#12), for the menu's header.
+(#18) and whether it serves MCP now, on loopback at least, for the menu's
+header. `mcp.changed` says when that changes.
 
 **Units.** Sizes are bytes and durations are seconds, as integers. Only
 `host.toml` writes them as `"4G"` and `"60s"`. Times are RFC 3339 in UTC.

@@ -351,8 +351,10 @@ fn agent_json(v: &AgentView) -> Value {
             "ref".into(),
             display_ref(&v.agent.host, &v.agent.agent).into(),
         );
-        m.insert("memory".into(), json!(v.memory));
-        m.insert("memory_limit".into(), json!(v.memory_limit));
+        // MCP names them its own way: `memory` is what it uses now.
+        m.remove("memory_used");
+        m.insert("memory".into(), json!(v.agent.memory_used));
+        m.insert("memory_limit".into(), json!(v.agent.memory));
         m.insert("attach_remote".into(), json!(v.attach_remote));
     }
     j
@@ -368,8 +370,8 @@ fn agent_line(v: &AgentView) -> String {
         a.profile.clone(),
         format!("{} · branch {}", a.project, a.branch),
     ];
-    if let Some(m) = v.memory {
-        parts.push(format!("{} of {}", human(m), human(v.memory_limit)));
+    if let Some(m) = a.memory_used {
+        parts.push(format!("{} of {}", human(m), human(a.memory)));
     }
     if let Some(until) = limited_until(a) {
         parts.push(until);

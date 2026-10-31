@@ -10,6 +10,7 @@ use std::fs::{DirBuilder, File, OpenOptions, TryLockError};
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -263,6 +264,8 @@ pub struct Core {
     pub(crate) tailscale: TailscaleAddresses,
     /// Tells the MCP listeners to look at their settings again now.
     pub(crate) mcp_kick: Arc<tokio::sync::Notify>,
+    /// Whether MCP is served on loopback now, for `hosts.list`.
+    pub(crate) mcp_serving: AtomicBool,
     _state_lock: File,
 }
 
@@ -398,6 +401,7 @@ impl Core {
             toolbox_op: tokio::sync::Mutex::new(()),
             tailscale: config.tailscale,
             mcp_kick: Arc::new(tokio::sync::Notify::new()),
+            mcp_serving: AtomicBool::new(false),
             _state_lock: state_lock,
         })
     }
@@ -493,7 +497,11 @@ impl Core {
     // Hosts.
 
     pub fn hosts(&self) -> Result<HostList, ErrorObject> {
-        let hosts = self.store().hosts().map_err(store_error)?;
+        let mut hosts = self.store().hosts().map_err(store_error)?;
+        let serving = self.mcp_serving.load(std::sync::atomic::Ordering::SeqCst);
+        for h in hosts.iter_mut().filter(|h| h.name == LOCAL_HOST) {
+            h.mcp = serving;
+        }
         Ok(HostList { hosts })
     }
 

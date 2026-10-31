@@ -612,7 +612,7 @@ pub struct HostInfo {
     pub link: HostLink,
     /// Whether it's the external address for outside MCP callers (#18).
     pub external: bool,
-    /// Whether it serves MCP (#12).
+    /// Whether it serves MCP now: on loopback, at least.
     pub mcp: bool,
 }
 

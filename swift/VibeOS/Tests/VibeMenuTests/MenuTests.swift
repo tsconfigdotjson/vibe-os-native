@@ -114,6 +114,36 @@ import VibeRPC
         #expect(
             MCPSetup.command(secret: "vk_abc")
                 == "claude mcp add --transport http vibeos http://127.0.0.1:7878/mcp --header \"Authorization: Bearer vk_abc\"")
+        // And where vibed says MCP is served.
+        #expect(
+            MCPSetup.command(secret: "vk_abc", url: "http://100.101.102.103:9123/mcp")
+                == "claude mcp add --transport http vibeos http://100.101.102.103:9123/mcp --header \"Authorization: Bearer vk_abc\"")
+    }
+
+    @Test func theToolboxMenuSaysWhatTheToolboxIsDoing() throws {
+        #expect(toolboxLines(nil).isEmpty)
+        #expect(toolboxLines(try decode(ToolboxStatus.self, ["state": "unavailable"])) == ["This host has no Linux toolbox"])
+        var status = try decode(
+            ToolboxStatus.self,
+            [
+                "state": "closed", "template": 3, "home": 2, "base": 1, "newest_base": 2,
+                "last": ["action": "rebuild", "at": "2026-10-30T12:00:00Z", "uncovered": ["apt: htop"]],
+            ])
+        #expect(
+            toolboxLines(status) == [
+                "New agents boot template v3, Linux home v2, base 1",
+                "Base 2 is installed: Rebuild Template moves to it",
+                "Not in toolbox.toml: apt: htop",
+            ])
+        status.state = .open
+        status.newestBase = 1
+        status.last?.error = "installing gcloud exited with code 3"
+        #expect(
+            toolboxLines(status) == [
+                "New agents boot template v3, Linux home v2, base 1",
+                "The shell is open: exit it to save",
+                "The last rebuild failed: installing gcloud exited with code 3",
+            ])
     }
 
     @Test func quoting() {
@@ -157,7 +187,7 @@ import VibeRPC
                 for: try event(.agentLimit, ref: "a", extra: ["limit": "memory", "message": "paused at 100% of its 4G"]),
                 agent: before, endOfTurn: false))
         #expect(limit.kind == .limit)
-        #expect(limit.title == "a hit its memory limit")
+        #expect(limit.title == "a: memory limit")
         #expect(limit.body == "paused at 100% of its 4G")
 
         let status: [String: Any] = [
@@ -290,6 +320,20 @@ import VibeRPC
         #expect(terminal.withoutScripting.count == 1)
     }
 
+    @Test func theToolboxShellHasOneTabToo() throws {
+        let terminal = FakeTerminal()
+        let attacher = makeAttacher(terminal)
+        #expect(try attacher.openToolbox(attached: []) == .opened(tty: "/dev/ttys001"))
+        #expect(terminal.ran == ["exec '/usr/local/bin/vibe' toolbox"])
+        #expect(try attacher.openToolbox(attached: []) == .raised)
+        // It's no agent's tab, even one named toolbox.
+        #expect(try attacher.attach(try agent("toolbox"), attached: []) == .opened(tty: "/dev/ttys002"))
+        // One attached elsewhere is raised.
+        terminal.tabs["/dev/ttys009"] = "vibe toolbox"
+        #expect(try makeAttacher(terminal).openToolbox(attached: ["/dev/ttys009"]) == .raised)
+        #expect(terminal.raised.last == "/dev/ttys009")
+    }
+
     @Test func commandsForLocalAndRemoteAgents() throws {
         let terminal = FakeTerminal()
         let withSocket = Attacher(
@@ -372,6 +416,72 @@ import VibeRPC
         await model.handle(try event(.lagged))
         #expect(model.settingsRevision == before + 6)
         #expect(daemon.calls.contains(AgentsList.name))
+    }
+
+    @Test func theToolboxAndMCPFollowTheirEvents() async throws {
+        let state = Box("closed")
+        let serving = Box(false)
+        let daemon = fakeDaemon()
+        daemon.on(HostsList.name) { _ in ["hosts": [hostJSON("local", mcp: serving.value)]] }
+        daemon.on(ToolboxStatusGet.name) { _ in
+            ["state": state.value, "template": 1, "home": 1, "base": 1, "newest_base": 1]
+        }
+        daemon.on(McpGet.name) { _ in
+            ["port": 7878, "tailscale": false, "url": "http://127.0.0.1:7878/mcp", "tailscale_urls": []]
+        }
+        let model = makeModel(daemon)
+        await model.refresh()
+        #expect(model.toolbox?.state == .closed)
+        #expect(model.mcp?.url == "http://127.0.0.1:7878/mcp")
+        #expect(model.localHost?.mcp == false)
+
+        state.value = "open"
+        await model.handle(try event(.toolboxChanged, extra: ["message": "The Linux toolbox is open"]))
+        #expect(model.toolbox?.state == .open)
+
+        // MCP served now: the header says so, and open settings re-read.
+        serving.value = true
+        let before = model.settingsRevision
+        await model.handle(try event(.mcpChanged, extra: ["message": "MCP is served"]))
+        #expect(model.localHost?.mcp == true)
+        #expect(model.settingsRevision == before + 1)
+    }
+
+    @Test func openShellGivesOneTabAndRaisesAnOpenOne() async throws {
+        let state = Box("closed")
+        let daemon = fakeDaemon()
+        daemon.on(ToolboxStatusGet.name) { _ in ["state": state.value] }
+        daemon.on(ToolboxOpen.name) { _ in
+            ["host": "local", "ref": "toolbox", "title": "Linux toolbox", "socket": "/s", "ttys": ["/dev/ttys007"]]
+        }
+        let terminal = FakeTerminal()
+        let model = makeModel(daemon, terminal: terminal)
+        // Closed: `vibe toolbox` opens it, in Terminal, once for two clicks.
+        await model.openToolbox()
+        await model.openToolbox()
+        #expect(terminal.ran == ["exec '/usr/local/bin/vibe' toolbox"])
+        #expect(terminal.raised == ["/dev/ttys001"])
+        #expect(daemon.params(of: ToolboxOpen.name).isEmpty)
+        // Open, in a tab vibed knows of: that one is raised.
+        state.value = "open"
+        terminal.tabs["/dev/ttys007"] = "vibe toolbox"
+        await model.openToolbox()
+        #expect(terminal.raised.last == "/dev/ttys007")
+        #expect(terminal.ran.count == 1)
+        #expect(model.message == nil)
+    }
+
+    @Test func rebuildAndTheClaudeLoginRunInTerminal() async throws {
+        let terminal = FakeTerminal()
+        let model = makeModel(fakeDaemon(), terminal: terminal)
+        model.runInTerminal(["toolbox", "rebuild"], exec: false)
+        model.runInTerminal(["setup-token"], exec: true)
+        #expect(terminal.ran == ["'/usr/local/bin/vibe' toolbox rebuild", "exec '/usr/local/bin/vibe' setup-token"])
+        // Without Automation, through a .command file.
+        terminal.permitted = false
+        model.runInTerminal(["setup-token"], exec: true)
+        #expect(terminal.withoutScripting == ["exec '/usr/local/bin/vibe' setup-token"])
+        #expect(model.message == nil)
     }
 
     @Test func whenVibedGoesAwayTheMenuSaysSoAndReconnects() async throws {

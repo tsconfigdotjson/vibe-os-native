@@ -394,12 +394,12 @@ public enum EventKind: String, Codable, CaseIterable, Hashable, Sendable {
     case mcpChanged = "mcp.changed"
 }
 
-/// Whether a session's shim still holds its terminal.
 /// How vibed reaches a host: `local` for itself, else whether its link is up.
 public enum HostLink: String, Codable, CaseIterable, Hashable, Sendable {
     case local, connected, down
 }
 
+/// Whether a session's shim still holds its terminal.
 public enum SessionState: String, Codable, CaseIterable, Hashable, Sendable {
     case running, exited
 }

@@ -75,7 +75,14 @@ struct KeysTab: View {
                         HStack {
                             Button("Copy") { WorktreeActions.copy(created.secret) }
                             Button("Copy Setup Command") {
-                                WorktreeActions.copy(MCPSetup.command(secret: created.secret))
+                                WorktreeActions.copy(
+                                    MCPSetup.command(secret: created.secret, url: model.mcp?.url ?? MCPSetup.url))
+                            }
+                            // For another machine on the tailnet, while MCP is served there.
+                            if let tailscale = model.mcp?.tailscaleUrls.first {
+                                Button("Copy Tailscale Setup Command") {
+                                    WorktreeActions.copy(MCPSetup.command(secret: created.secret, url: tailscale))
+                                }
                             }
                             Spacer()
                             Button("Done") { self.created = nil }
@@ -137,9 +144,32 @@ func day(_ time: String) -> String {
 
 struct HostsTab: View {
     @ObservedObject var model: MenuModel
+    @State private var error: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
+            GroupBox("MCP on this Mac") {
+                VStack(alignment: .leading, spacing: 6) {
+                    if let mcp = model.mcp {
+                        ForEach([mcp.url] + mcp.tailscaleUrls, id: \.self) { url in
+                            Text(url).font(.system(.body, design: .monospaced)).textSelection(.enabled)
+                        }
+                        Toggle(
+                            "Also serve MCP on this Mac's Tailscale address",
+                            isOn: Binding(get: { mcp.tailscale }, set: { on in Task { await setTailscale(on) } }))
+                        if mcp.tailscale && mcp.tailscaleUrls.isEmpty {
+                            Text("This Mac has no Tailscale address now; MCP is served there once it has one.")
+                                .font(.callout).foregroundStyle(.secondary)
+                        }
+                        Text("Its port is mcp_port in ~/.config/vibeos/host.toml.")
+                            .font(.callout).foregroundStyle(.secondary)
+                    } else {
+                        Text("Where MCP is served isn't known yet.").foregroundStyle(.secondary)
+                    }
+                    ErrorText(error: error)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
             Table(model.hosts) {
                 TableColumn("Name", value: \.name)
                 TableColumn("Machine", value: \.label)
@@ -162,6 +192,15 @@ struct HostsTab: View {
                 Spacer()
                 Button("Refresh") { Task { await model.refresh() } }
             }
+        }
+    }
+
+    private func setTailscale(_ on: Bool) async {
+        do {
+            try await model.setMCPTailscale(on)
+            error = nil
+        } catch {
+            self.error = describe(error)
         }
     }
 }
