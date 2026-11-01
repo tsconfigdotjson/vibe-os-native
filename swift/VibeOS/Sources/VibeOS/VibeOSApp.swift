@@ -3,14 +3,20 @@ import SwiftUI
 import VibeMenu
 import VibeRPC
 
-/// `VibeOS --attach <ref>` attaches Terminal and exits, for scripts; with
-/// no arguments it's the menu bar app.
+/// `VibeOS --attach <ref>` attaches Terminal and exits, for scripts;
+/// `VibeOS --gallery` and `--render-surfaces <dir>` draw every surface on
+/// canned data, in light and dark (Gallery.swift); with no arguments it's
+/// the menu bar app.
 @main
 enum Main {
     static func main() {
-        if let refs = AttachCommandLine.refs(in: Array(CommandLine.arguments.dropFirst())) {
+        let arguments = Array(CommandLine.arguments.dropFirst())
+        if let refs = AttachCommandLine.refs(in: arguments) {
             let code = MainActor.assumeIsolated { AttachCommandLine.run(refs: refs) }
             exit(code)
+        }
+        if let request = GalleryRequest(arguments: arguments) {
+            MainActor.assumeIsolated { Gallery.run(request) }
         }
         MainActor.assumeIsolated { VibeOSApp.main() }
     }
@@ -61,53 +67,33 @@ struct VibeOSApp: App {
         .windowResizability(.contentSize)
         .defaultLaunchBehavior(.suppressed)
 
-        Window("VibeOS Settings", id: WindowID.settings) {
+        Window("Settings", id: WindowID.settings) {
             SettingsView(model: model)
         }
+        .defaultSize(width: 780, height: 560)
+        .windowResizability(.contentMinSize)
         .defaultLaunchBehavior(.suppressed)
     }
 }
 
-/// The glyph, the count of awake agents, and an amber dot for a question or
-/// a red one for an agent paused by a limit.
+/// The menu bar icon (PRD: Menu bar icon): the glyph, whose windows light
+/// as agents wake and which carries the question and pause badges, and the
+/// count of awake agents. A menu bar label takes one image and one text, so
+/// the badges are drawn into the image (MenuBarGlyph).
 struct MenuBarLabel: View {
     let icon: IconSummary
     let connected: Bool
 
     var body: some View {
+        let state = GlyphState(icon: icon, connected: connected)
         HStack(spacing: 3) {
-            Image(systemName: connected ? "square.stack.3d.up.fill" : "square.stack.3d.up.slash")
+            Image(nsImage: MenuBarGlyph.image(state, awake: icon.awake))
             if connected {
                 Text("\(icon.awake)").monospacedDigit()
             }
-            if icon.question {
-                Image(nsImage: dot(.systemOrange))
-            }
-            if icon.paused {
-                Image(nsImage: dot(.systemRed))
-            }
         }
-        .accessibilityLabel(accessibility)
-    }
-
-    private var accessibility: String {
-        guard connected else { return "VibeOS: vibed is unavailable" }
-        var text = "VibeOS: \(icon.awake) awake"
-        if icon.question { text += ", a question waiting" }
-        if icon.paused { text += ", an agent paused" }
-        return text
-    }
-
-    /// A coloured dot. The menu bar draws template images in its own
-    /// colour, so this one isn't one.
-    private func dot(_ color: NSColor) -> NSImage {
-        let image = NSImage(size: NSSize(width: 7, height: 7), flipped: false) { rect in
-            color.setFill()
-            NSBezierPath(ovalIn: rect).fill()
-            return true
-        }
-        image.isTemplate = false
-        return image
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(state.accessibilityLabel(awake: icon.awake))
     }
 }
 
@@ -117,6 +103,13 @@ struct MenuBarLabel: View {
 func show(_ id: String, with openWindow: OpenWindowAction) {
     openWindow(id: id)
     NSApp.activate()
+}
+
+/// Opens Settings on `pane`.
+@MainActor
+func showSettings(_ pane: SettingsPane, with openWindow: OpenWindowAction) {
+    UserDefaults.standard.set(pane.rawValue, forKey: SettingsPane.storageKey)
+    show(WindowID.settings, with: openWindow)
 }
 
 /// Asks a question in an alert, in front of everything. True for the first

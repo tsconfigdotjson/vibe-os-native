@@ -4,160 +4,262 @@ import VibeMenu
 import VibeRPC
 
 /// The menu (PRD: Menu bar and Terminal attach): a header, the agents
-/// grouped by host and project, and a footer.
+/// grouped by host and project, and a footer. With no agents it welcomes a
+/// new owner through setup, or says all is quiet; without vibed, it says so
+/// and that the agents keep running.
 struct MenuView: View {
     @ObservedObject var model: MenuModel
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HeaderView(model: model)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 10)
+                .padding(.horizontal, Metrics.gutter)
+                .padding(.top, 12)
+                .padding(.bottom, 10)
             Divider()
             if let message = model.message {
-                HStack(alignment: .top) {
-                    Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
-                    Text(message).font(.callout).fixedSize(horizontal: false, vertical: true)
-                    Spacer()
-                    Button {
-                        model.message = nil
-                    } label: {
-                        Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
-                    }
-                    .buttonStyle(.plain)
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-                Divider()
+                InlineMessage(text: message) { model.message = nil }
+                    .padding(.horizontal, 10)
+                    .padding(.top, 8)
+                    .transition(.move(edge: .top).combined(with: .opacity))
             }
-            AgentList(model: model)
+            content
             Divider()
             FooterView(model: model)
-                .padding(.vertical, 4)
+                .padding(.vertical, 5)
         }
-        .frame(width: 380)
+        .frame(width: Metrics.menuWidth)
+        .animation(motion(.smooth(duration: 0.25), reduce: reduceMotion), value: model.message)
+        .animation(motion(.smooth(duration: 0.25), reduce: reduceMotion), value: model.connection)
         .onAppear { model.menuIsOpen = true }
         .onDisappear { model.menuIsOpen = false }
     }
+
+    @ViewBuilder
+    private var content: some View {
+        switch model.connection {
+        case .connecting:
+            Working(text: "Connecting to vibed…")
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 28)
+        case .unavailable(let why):
+            OfflineView(model: model, why: why)
+        case .connected:
+            if model.agents.isEmpty {
+                EmptyMenuView(model: model)
+            } else {
+                AgentList(model: model)
+            }
+        }
+    }
 }
 
+// MARK: Header
+
+/// The agent count, and how the host is doing: the Mac's memory, `gh`,
+/// MCP, and each Linux host's link and external address.
 struct HeaderView: View {
     @ObservedObject var model: MenuModel
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline) {
                 Text("VibeOS").font(.headline)
                 Spacer()
-                Text(agentCount).font(.callout).foregroundStyle(.secondary)
-            }
-            switch model.connection {
-            case .connecting:
-                Text("Connecting to vibed…").font(.caption).foregroundStyle(.secondary)
-            case .unavailable(let why):
-                Text("vibed is unavailable: \(why)")
-                    .font(.caption).foregroundStyle(.red)
-                    .fixedSize(horizontal: false, vertical: true)
-            case .connected:
-                HStack(spacing: 10) {
-                    if let memory = model.memory {
-                        Label("\(formatBytes(memory.used)) / \(formatBytes(memory.total))", systemImage: "memorychip")
-                    }
-                    Label(ghText, systemImage: "person.crop.circle")
-                        .foregroundStyle(model.gh?.state == .loggedIn ? Color.secondary : Color.orange)
-                    Label(model.localHost?.mcp == true ? "MCP on" : "MCP off", systemImage: "point.3.connected.trianglepath.dotted")
+                if model.connection == .connected {
+                    Text(agentSummary(model.agents))
+                        .font(.callout)
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                        .contentTransition(.numericText())
+                        .animation(motion(.snappy, reduce: reduceMotion), value: agentSummary(model.agents))
                 }
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .labelStyle(.titleAndIcon)
-                ForEach(model.otherHosts, id: \.name) { host in
-                    HStack(spacing: 4) {
-                        Circle()
-                            .fill(host.link == .connected ? Color.green : Color.red)
-                            .frame(width: 6, height: 6)
-                            .accessibilityHidden(true)
-                        Text("\(host.name): \(host.link == .connected ? "connected" : "down")")
-                        if let external = externalStatus(host) {
-                            Text("·").accessibilityHidden(true)
-                            Label(external.short, systemImage: external.symbol)
-                                .labelStyle(.titleAndIcon)
-                                .foregroundStyle(external.tone == .trouble ? Color.orange : Color.secondary)
-                                .accessibilityLabel("external address, \(external.short)")
-                        }
+            }
+            if model.connection == .connected {
+                Flow {
+                    if let memory = model.memory {
+                        Chip(text: "\(formatBytes(memory.used)) of \(formatBytes(memory.total))", symbol: "memorychip")
+                            .help("This Mac's memory in use")
+                            .accessibilityElement(children: .ignore)
+                            .accessibilityLabel("Mac memory, \(formatBytes(memory.used)) of \(formatBytes(memory.total)) in use")
                     }
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .help(hostHelp(host))
-                    .accessibilityElement(children: .combine)
+                    gh
+                    let mcp = model.localHost?.mcp == true
+                    Chip(text: mcp ? "MCP on" : "MCP off", dot: mcp ? Palette.signal : Palette.rest)
+                        .help(mcp ? "MCP clients reach this Mac at \(model.mcp?.url ?? MCPSetup.url)" : "MCP is off")
+                        .accessibilityElement(children: .ignore)
+                        .accessibilityLabel(mcp ? "MCP on" : "MCP off")
+                    ForEach(model.otherHosts, id: \.name) { host in
+                        hostChip(host)
+                    }
                 }
             }
         }
+    }
+
+    @ViewBuilder
+    private var gh: some View {
+        let status = ghText
+        Chip(
+            text: status.text, symbol: status.ok ? "checkmark.circle.fill" : "exclamationmark.circle.fill",
+            tint: status.ok ? Palette.signal : Palette.attention
+        )
+        .help(model.gh?.detail ?? "GitHub CLI login")
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("GitHub, \(status.text)")
+    }
+
+    /// What the `gh` chip says, and whether all is well.
+    private var ghText: (text: String, ok: Bool) {
+        guard let gh = model.gh else { return ("gh checking…", true) }
+        switch gh.state {
+        case .loggedIn: return ("gh · \(gh.account ?? "logged in")", true)
+        case .loggedOut: return ("gh logged out", false)
+        case .notInstalled: return ("gh not installed", false)
+        case .error: return ("gh can't check", false)
+        case .unknown: return ("gh checking…", true)
+        }
+    }
+
+    private func hostChip(_ host: HostInfo) -> some View {
+        let up = host.link == .connected
+        let external = externalStatus(host)
+        return HStack(spacing: 4) {
+            Chip(text: up ? host.name : "\(host.name) · down", dot: up ? Palette.signal : Palette.trouble)
+            if let external {
+                Chip(text: external.short, symbol: external.symbol, tint: external.tone.color)
+            }
+        }
+        .help(hostHelp(host))
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(
+            "\(host.name), \(up ? "connected" : "link down")"
+                + (external.map { ", external address \($0.short)" } ?? ""))
     }
 
     /// A host's tooltip: why its link is down, or its hostname; and while
     /// it's the external address, where and how that is.
     private func hostHelp(_ host: HostInfo) -> String {
-        var lines = [host.link == .down ? (host.detail ?? "Its link is down; it reconnects on its own") : host.label]
+        var lines = [host.link == .down ? sentence(host.detail ?? "its link is down; it reconnects on its own") : host.label]
         if let external = externalStatus(host) {
             lines.append(host.url.map { "External address: \($0)" } ?? "External address")
             lines.append(external.summary)
-            if let detail = external.detail { lines.append(detail) }
+            if let detail = external.detail { lines.append(sentence(detail)) }
         }
         return lines.joined(separator: "\n")
     }
-
-    private var agentCount: String {
-        let all = model.agents.count
-        let awake = model.icon.awake
-        return all == 1 ? "1 agent · \(awake) awake" : "\(all) agents · \(awake) awake"
-    }
-
-    private var ghText: String {
-        guard let gh = model.gh else { return "gh: …" }
-        switch gh.state {
-        case .loggedIn: return gh.account.map { "gh: \($0)" } ?? "gh: logged in"
-        case .loggedOut: return "gh: logged out"
-        case .notInstalled: return "gh: not installed"
-        case .error: return "gh: error"
-        case .unknown: return "gh: …"
-        }
-    }
 }
 
+// MARK: Agents
+
+/// The agents, grouped by host and project. ↑ and ↓ pick a row, and ↩
+/// opens it, as in a menu.
 struct AgentList: View {
     @ObservedObject var model: MenuModel
+    @State private var selection: String?
+    @FocusState private var focused: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        if model.agents.isEmpty {
-            Text(model.connection == .connected ? "No agents yet. Start one with New Agent…, or over MCP." : "")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .padding(12)
-        } else {
+        ScrollViewReader { proxy in
             ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
                     ForEach(model.groups) { host in
                         ForEach(host.projects) { project in
-                            Text(model.groups.count > 1 || host.host != VibeRPC.localHost
-                                ? "\(host.host) · \(project.project)" : project.project)
-                                .font(.caption.weight(.semibold))
-                                .foregroundStyle(.secondary)
-                                .padding(.horizontal, 12)
-                                .padding(.top, 8)
-                                .padding(.bottom, 2)
+                            GroupHeader(
+                                model: model, group: project,
+                                showHost: model.groups.count > 1 || host.host != VibeRPC.localHost)
                             ForEach(project.agents, id: \.key) { agent in
                                 AgentRow(
                                     model: model, agent: agent,
-                                    unavailable: model.unavailableHosts.contains(agent.host))
+                                    unavailable: model.unavailableHosts.contains(agent.host),
+                                    selected: selection == agent.key
+                                )
+                                .id(agent.key)
+                                .transition(.opacity.combined(with: .move(edge: .top)))
                             }
                         }
                     }
                 }
+                .padding(.top, 2)
                 .padding(.bottom, 6)
             }
-            .frame(maxHeight: 460)
+            .frame(maxHeight: 440)
             .fixedSize(horizontal: false, vertical: true)
+            .focusable()
+            .focused($focused)
+            .focusEffectDisabled()
+            .onKeyPress(.downArrow) {
+                move(by: 1, proxy)
+                return .handled
+            }
+            .onKeyPress(.upArrow) {
+                move(by: -1, proxy)
+                return .handled
+            }
+            .onKeyPress(.return) {
+                guard let key = selection, let agent = openable.first(where: { $0.key == key }) else { return .ignored }
+                Task { await model.attach(agent) }
+                return .handled
+            }
+            .onAppear { focused = true }
+            .onDisappear { selection = nil }
+            .animation(motion(.smooth(duration: 0.3), reduce: reduceMotion), value: model.agents.map(\.key))
         }
+    }
+
+    /// The rows a click can open, top to bottom.
+    private var openable: [Agent] {
+        model.groups.flatMap { $0.projects.flatMap(\.agents) }.filter { !model.unavailableHosts.contains($0.host) }
+    }
+
+    private func move(by step: Int, _ proxy: ScrollViewProxy) {
+        let rows = openable.map(\.key)
+        guard !rows.isEmpty else { return }
+        let next: Int
+        if let current = selection, let index = rows.firstIndex(of: current) {
+            next = min(max(index + step, 0), rows.count - 1)
+        } else {
+            next = step > 0 ? 0 : rows.count - 1
+        }
+        selection = rows[next]
+        withAnimation(motion(.snappy(duration: 0.2), reduce: reduceMotion)) { proxy.scrollTo(rows[next]) }
+    }
+}
+
+/// A project's heading, with its host when there's more than this Mac.
+struct GroupHeader: View {
+    @ObservedObject var model: MenuModel
+    let group: ProjectGroup
+    let showHost: Bool
+
+    var body: some View {
+        let unavailable = model.unavailableHosts.contains(group.host)
+        HStack(spacing: 5) {
+            if showHost {
+                Image(systemName: group.host == VibeRPC.localHost ? "laptopcomputer" : "server.rack")
+                    .imageScale(.small)
+                Text(hostName)
+                Text("·").foregroundStyle(.tertiary)
+            }
+            Text(group.project)
+            if unavailable {
+                Text("· unavailable").foregroundStyle(Palette.trouble)
+            }
+        }
+        .font(.subheadline.weight(.semibold))
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, Metrics.gutter)
+        .padding(.top, 10)
+        .padding(.bottom, 3)
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(.isHeader)
+    }
+
+    private var hostName: String {
+        group.host == VibeRPC.localHost ? (model.localHost?.label ?? "This Mac") : group.host
     }
 }
 
@@ -165,7 +267,7 @@ struct AgentRow: View {
     @ObservedObject var model: MenuModel
     let agent: Agent
     let unavailable: Bool
-    @State private var hovering = false
+    var selected = false
     @AppStorage(Preferences.editor) private var editor = ""
 
     var body: some View {
@@ -173,76 +275,83 @@ struct AgentRow: View {
         Button {
             Task { await model.attach(agent) }
         } label: {
-            HStack(alignment: .top, spacing: 8) {
-                StateDotView(dot: StateDot(agent.state))
-                    .padding(.top, 5)
-                VStack(alignment: .leading, spacing: 2) {
+            HStack(alignment: .top, spacing: 10) {
+                StatusDot(dot: StateDot(agent.state))
+                    .padding(.top, 4)
+                VStack(alignment: .leading, spacing: 3) {
                     HStack(spacing: 6) {
                         Text(agent.ref)
-                            .font(.system(.body, design: .monospaced))
+                            .font(.system(.callout, design: .monospaced).weight(.medium))
                             .lineLimit(1)
-                        Text(agent.profile)
-                            .font(.caption2)
-                            .padding(.horizontal, 5)
-                            .padding(.vertical, 1)
-                            .background(Capsule().fill(Color.secondary.opacity(0.15)))
-                            .lineLimit(1)
-                        Spacer(minLength: 4)
+                            .truncationMode(.middle)
+                        Chip(text: agent.profile, symbol: environmentSymbol(agent.environment))
+                            .layoutPriority(-1)
+                        Spacer(minLength: 6)
                         if model.attaching.contains(agent.key) {
                             ProgressView().controlSize(.mini)
-                        }
-                        if let age = elapsed(agent, now: model.now) {
+                        } else if let age = elapsed(agent, now: model.now) {
                             Text(age)
-                                .font(.caption)
+                                .font(.subheadline)
                                 .monospacedDigit()
                                 .foregroundStyle(.secondary)
                         }
                     }
                     if let title = lines.title {
-                        Text(title).font(.callout).lineLimit(1)
+                        Text(title).lineLimit(1)
                     }
-                    if let line = lines.line {
-                        Text(line).font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                    }
-                    if let gauge = MemoryGauge(agent) {
+                    if lines.line != nil || MemoryGauge(agent) != nil {
                         HStack(spacing: 6) {
-                            ProgressView(value: gauge.fraction)
-                                .progressViewStyle(.linear)
-                                .tint(gauge.fraction > 0.8 ? Color.orange : Color.accentColor)
-                            Text(gauge.label)
-                                .font(.caption2)
-                                .monospacedDigit()
-                                .foregroundStyle(.secondary)
+                            if let line = lines.line {
+                                HStack(spacing: 4) {
+                                    if let symbol = activitySymbol(agent) {
+                                        Image(systemName: symbol)
+                                            .imageScale(.small)
+                                            .foregroundStyle(agent.state == .question ? Palette.attention : .secondary)
+                                    }
+                                    Text(line).lineLimit(1)
+                                }
+                            }
+                            Spacer(minLength: 6)
+                            if let gauge = MemoryGauge(agent) {
+                                MemoryBar(gauge: gauge)
+                            }
                         }
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
                     }
                 }
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
+            .padding(.horizontal, Metrics.gutter)
+            .padding(.vertical, 7)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(RoundedRectangle(cornerRadius: 6).fill(hovering ? Color.primary.opacity(0.08) : .clear))
-            .padding(.horizontal, 4)
-            .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
-        .opacity(unavailable ? 0.5 : 1)
+        .buttonStyle(MenuRowStyle(selected: selected))
+        .opacity(unavailable ? 0.45 : 1)
         .disabled(unavailable)
-        .onHover { hovering = $0 }
-        .help(unavailable ? "\(agent.host) is unavailable" : "Open in Terminal")
+        .help(unavailable ? "\(agent.host) can't be reached. Its agents keep running there." : "Open in Terminal")
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(rowAccessibilityLabel(agent, now: model.now, unavailable: unavailable))
+        .accessibilityHint(unavailable ? "" : "Opens it in Terminal")
+        .accessibilityAddTraits(.isButton)
+        .accessibilityAction { Task { await model.attach(agent) } }
+        .accessibilityAction(named: "Interrupt") { Task { await model.interrupt(agent) } }
+        .accessibilityAction(named: "Copy Attach Command") { WorktreeActions.copy(agent.attach) }
+        .accessibilityAction(named: "Delete Agent") { delete() }
         .contextMenu {
             // Not while paused: its tree is stopped, so the Escape would
             // wait, and cancel the turn it resumes into.
-            Button("Interrupt") { Task { await model.interrupt(agent) } }
+            Button("Interrupt", systemImage: "stop.circle") { Task { await model.interrupt(agent) } }
                 .disabled(!agent.state.isAwake || agent.state == .paused || unavailable)
-            Button("Reveal Worktree in Finder") { WorktreeActions.reveal(agent.worktree) }
+            Divider()
+            Button("Reveal Worktree in Finder", systemImage: "folder") { WorktreeActions.reveal(agent.worktree) }
                 .disabled(!agent.isLocal)
-            Button("Open in Editor") {
+            Button("Open in Editor", systemImage: "chevron.left.forwardslash.chevron.right") {
                 WorktreeActions.openInEditor(agent.worktree, preferred: editor.isEmpty ? nil : editor)
             }
             .disabled(!agent.isLocal)
-            Button("Copy Attach Command") { WorktreeActions.copy(agent.attach) }
+            Button("Copy Attach Command", systemImage: "doc.on.doc") { WorktreeActions.copy(agent.attach) }
             Divider()
-            Button("Delete Agent…", role: .destructive) { delete() }
+            Button("Delete Agent…", systemImage: "trash", role: .destructive) { delete() }
                 .disabled(unavailable)
         }
     }
@@ -252,7 +361,7 @@ struct AgentRow: View {
             confirm(
                 "Delete \(agent.ref)?",
                 detail: "This ends the agent and removes its worktree, transcripts and compartment. "
-                    + "Its branch \(agent.branch) is kept.",
+                    + "Its branch, \(agent.branch), is kept.",
                 action: "Delete")
         else { return }
         Task {
@@ -260,63 +369,223 @@ struct AgentRow: View {
             case .deleted:
                 break
             case .refused(let why):
-                if confirm("Delete \(agent.ref) anyway?", detail: why, action: "Delete Anyway") {
+                if confirm(
+                    "\(agent.ref) has work that isn't pushed", detail: sentence(why) + "\n\nDelete it anyway?",
+                    action: "Delete Anyway")
+                {
                     if case .failed(let why) = await model.delete(agent, force: true) {
-                        model.message = "Can't delete \(agent.ref): \(why)"
+                        model.message = "Couldn't delete \(agent.ref): \(why)"
                     }
                 }
             case .failed(let why):
-                model.message = "Can't delete \(agent.ref): \(why)"
+                model.message = "Couldn't delete \(agent.ref): \(why)"
             }
         }
     }
 }
 
-/// busy (pulsing), question (amber), idle (grey), asleep (hollow), paused
-/// or exited (red).
-struct StateDotView: View {
-    let dot: StateDot
-    @State private var dim = false
+// MARK: Empty, first run and offline
+
+/// No agents: a welcome through setup until it's done, then a quiet night.
+struct EmptyMenuView: View {
+    @ObservedObject var model: MenuModel
+    @Environment(\.openWindow) private var openWindow
+    @State private var setup: SetupProgress?
+    @State private var loaded = false
 
     var body: some View {
         Group {
-            switch dot {
-            case .busy:
-                Circle().fill(Color.green)
-                    .opacity(dim ? 0.3 : 1)
-                    .animation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true), value: dim)
-                    .onAppear { dim = true }
-            case .question: Circle().fill(Color.orange)
-            case .idle: Circle().fill(Color.gray)
-            case .asleep: Circle().strokeBorder(Color.secondary, lineWidth: 1.5)
-            case .stopped: Circle().fill(Color.red)
+            if !loaded {
+                ProgressView().controlSize(.small).frame(maxWidth: .infinity).padding(.vertical, 40)
+            } else if let setup, !setup.complete {
+                WelcomeView(setup: setup) { act(on: $0) }
+            } else {
+                QuietView { show(WindowID.newAgent, with: openWindow) }
             }
         }
-        .frame(width: 9, height: 9)
-        .accessibilityLabel(label)
+        // Again on each open and each settings change, so a step just done
+        // in Settings or Terminal shows as done.
+        .task(id: model.settingsRevision) {
+            setup = await loadSetup()
+            loaded = true
+        }
     }
 
-    private var label: String {
-        switch dot {
-        case .busy: "busy"
-        case .question: "has a question"
-        case .idle: "idle"
-        case .asleep: "asleep"
-        case .stopped: "paused or exited"
+    private func loadSetup() async -> SetupProgress? {
+        do {
+            let projects = try await model.call(ProjectsList.self, HostParams()).projects
+            let keys = try await model.call(KeysList.self, NoParams()).keys
+            var claude: Bool?
+            if let toolbox = model.toolbox, toolbox.state != .unavailable {
+                claude = (try? await model.toolboxLogins())?.claude
+            }
+            return SetupProgress(hasProject: !projects.isEmpty, hasKey: !keys.isEmpty, linuxClaude: claude)
+        } catch {
+            return nil
+        }
+    }
+
+    private func act(on step: SetupProgress.Step.ID) {
+        switch step {
+        case .project: showSettings(.projects, with: openWindow)
+        case .claude: model.runInTerminal(["setup-token"], exec: true)
+        case .key: showSettings(.keys, with: openWindow)
         }
     }
 }
+
+/// The first run: the mark lights a window for each step done.
+struct WelcomeView: View {
+    let setup: SetupProgress
+    let act: (SetupProgress.Step.ID) -> Void
+
+    var body: some View {
+        VStack(spacing: 14) {
+            BrandMark(lit: setup.done, size: 64)
+            VStack(spacing: 4) {
+                Text("Welcome to VibeOS").font(.title3.weight(.semibold))
+                Text("A few steps and this Mac is ready to host agents.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+            }
+            VStack(spacing: 0) {
+                ForEach(Array(setup.steps.enumerated()), id: \.element.id) { index, step in
+                    Button { act(step.id) } label: {
+                        SetupStepRow(step: step, number: index + 1)
+                    }
+                    .buttonStyle(MenuRowStyle())
+                    .disabled(step.done)
+                }
+            }
+        }
+        .padding(.top, 20)
+        .padding(.bottom, 10)
+        .frame(maxWidth: .infinity)
+    }
+}
+
+struct SetupStepRow: View {
+    let step: SetupProgress.Step
+    let number: Int
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            ZStack {
+                if step.done {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.title3)
+                        .foregroundStyle(Palette.signal)
+                        .transition(.scale.combined(with: .opacity))
+                } else {
+                    Circle().strokeBorder(Color.secondary.opacity(0.5), lineWidth: 1.25)
+                    Text("\(number)").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                }
+            }
+            .frame(width: 20, height: 20)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(step.title)
+                    .foregroundStyle(step.done ? Color.secondary : Color.primary)
+                Text(step.detail)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 4)
+            if !step.done {
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.tertiary)
+                    .padding(.top, 3)
+            }
+        }
+        .padding(.horizontal, Metrics.gutter)
+        .padding(.vertical, 7)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Step \(number), \(step.title)\(step.done ? ", done" : ""). \(step.detail)")
+    }
+}
+
+/// Set up, and nothing running.
+struct QuietView: View {
+    let newAgent: () -> Void
+
+    var body: some View {
+        VStack(spacing: 12) {
+            BrandMark(lit: 0, size: 56)
+            VStack(spacing: 4) {
+                Text("All quiet").font(.title3.weight(.semibold))
+                Text("No agents running. Start one here, or from any MCP client.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Button("New Agent…", action: newAgent)
+                .buttonStyle(.borderedProminent)
+        }
+        .padding(.vertical, 22)
+        .padding(.horizontal, 28)
+        .frame(maxWidth: .infinity)
+    }
+}
+
+/// vibed can't be reached. The agents don't depend on the menu, so it says
+/// that first.
+struct OfflineView: View {
+    @ObservedObject var model: MenuModel
+    let why: String
+    @State private var trying = false
+
+    var body: some View {
+        VStack(spacing: 10) {
+            BrandMark(lit: 0, size: 44)
+                .saturation(0)
+                .opacity(0.6)
+            Text("Can't reach vibed").font(.headline)
+            Text("Your agents keep running. The menu reconnects on its own.")
+                .font(.callout)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+            Text(sentence(why))
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+            Button {
+                Task {
+                    trying = true
+                    await model.refresh()
+                    trying = false
+                }
+            } label: {
+                if trying { ProgressView().controlSize(.small) } else { Text("Try Again") }
+            }
+            .disabled(trying)
+        }
+        .padding(.vertical, 22)
+        .padding(.horizontal, 28)
+        .frame(maxWidth: .infinity)
+    }
+}
+
+// MARK: Footer
 
 struct FooterView: View {
     @ObservedObject var model: MenuModel
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
+        let connected = model.connection == .connected
         VStack(alignment: .leading, spacing: 0) {
-            FooterItem(title: "New Agent…", symbol: "plus") {
-                show(WindowID.newAgent, with: openWindow)
+            Button { show(WindowID.newAgent, with: openWindow) } label: {
+                MenuItemLabel(title: "New Agent…", symbol: "plus", trailing: "⌘N")
             }
-            .disabled(model.connection != .connected)
+            .buttonStyle(MenuRowStyle())
+            .keyboardShortcut("n")
+            .disabled(!connected)
             Menu {
                 Button("Open Shell") { Task { await model.openToolbox() } }
                     .disabled(!model.toolboxCanOpen)
@@ -333,51 +602,32 @@ struct FooterView: View {
                 Divider()
                 Button("Log In to Claude for Linux Agents…") { model.runInTerminal(["setup-token"], exec: true) }
             } label: {
-                Label("Linux Toolbox", systemImage: "shippingbox")
+                MenuItemLabel(title: "Linux Toolbox", symbol: "shippingbox", trailingSymbol: "chevron.right")
             }
             .menuStyle(.button)
             .buttonStyle(.plain)
-            .padding(.horizontal, 16)
-            .padding(.vertical, 5)
-            FooterItem(title: "Add Linux Host…", symbol: "server.rack") {
-                show(WindowID.addHost, with: openWindow)
+            .menuIndicator(.hidden)
+            .modifier(HoverRow())
+            Button { show(WindowID.addHost, with: openWindow) } label: {
+                MenuItemLabel(title: "Add Linux Host…", symbol: "server.rack")
             }
-            .disabled(model.connection != .connected)
-            FooterItem(title: "Settings…", symbol: "gearshape") {
-                show(WindowID.settings, with: openWindow)
+            .buttonStyle(MenuRowStyle())
+            .disabled(!connected)
+            Button { show(WindowID.settings, with: openWindow) } label: {
+                MenuItemLabel(title: "Settings…", symbol: "gearshape", trailing: "⌘,")
             }
-            Divider().padding(.vertical, 4)
+            .buttonStyle(MenuRowStyle())
+            .keyboardShortcut(",")
+            Divider()
+                .padding(.horizontal, Metrics.gutter)
+                .padding(.vertical, 4)
             // Quitting the menu leaves vibed and every agent running.
-            FooterItem(title: "Quit Menu", symbol: "power") {
-                NSApplication.shared.terminate(nil)
+            Button { NSApplication.shared.terminate(nil) } label: {
+                MenuItemLabel(title: "Quit Menu", symbol: "power", trailing: "⌘Q")
             }
+            .buttonStyle(MenuRowStyle())
+            .keyboardShortcut("q")
+            .help("vibed and your agents keep running")
         }
-    }
-}
-
-/// A footer row that looks like a menu item.
-struct FooterItem: View {
-    let title: String
-    let symbol: String
-    let action: () -> Void
-    @State private var hovering = false
-    @Environment(\.isEnabled) private var isEnabled
-
-    var body: some View {
-        Button(action: action) {
-            Label(title, systemImage: symbol)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 5)
-                .background(
-                    RoundedRectangle(cornerRadius: 5)
-                        .fill(hovering && isEnabled ? Color.primary.opacity(0.08) : .clear)
-                )
-                .padding(.horizontal, 4)
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .foregroundStyle(isEnabled ? Color.primary : Color.secondary)
-        .onHover { hovering = $0 }
     }
 }

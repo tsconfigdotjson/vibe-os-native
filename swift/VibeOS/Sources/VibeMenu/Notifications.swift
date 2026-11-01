@@ -14,7 +14,13 @@ public struct Notice: Equatable, Sendable {
     public var host: String
     public var ref: String
     public var title: String
+    /// Where the agent works: its project, and its host when that isn't
+    /// this Mac (`web on vps`).
+    public var subtitle: String = ""
     public var body: String
+
+    /// Notification Center groups each agent's notices together.
+    public var thread: String { "\(host):\(ref)" }
 }
 
 extension AgentActivity {
@@ -32,8 +38,10 @@ extension AgentActivity {
 public func notice(for event: DaemonEvent, agent: Agent?, endOfTurn: Bool) -> Notice? {
     guard let ref = event.ref else { return nil }
     let title = agent?.status.title
+    var place = event.project ?? agent?.project ?? ""
+    if event.host != VibeRPC.localHost { place = place.isEmpty ? event.host : "\(place) on \(event.host)" }
     func make(_ kind: Notice.Kind, _ headline: String, _ body: String?) -> Notice {
-        Notice(kind: kind, host: event.host, ref: ref, title: headline, body: body ?? "")
+        Notice(kind: kind, host: event.host, ref: ref, title: headline, subtitle: place, body: body ?? "")
     }
     switch event.kind {
     case .agentState:
@@ -42,20 +50,21 @@ public func notice(for event: DaemonEvent, agent: Agent?, endOfTurn: Bool) -> No
     case .agentLimit:
         // A pause, or a warning on the way to one (memory at 80%, past
         // disk_soft); vibed's message says which.
-        let headline = event.limit.map { "\(ref): \($0) limit" } ?? "\(ref) hit a limit"
-        return make(.limit, headline, event.message)
+        let headline = event.limit.map { "\(ref) · \($0) limit" } ?? "\(ref) hit a limit"
+        return make(.limit, headline, event.message.map(sentence))
     case .agentStatus:
         guard let status = event.status else { return nil }
         let before = agent?.status.activity
         if status.activity == .errored, before != .errored {
             if status.stopReason == .usageLimit {
-                var why = "limited by a Claude usage limit"
+                var why = "It picks up when you send it something after the limit lifts."
                 if let resets = status.resetsAt.flatMap(parseTime) {
-                    why = "limited until \(resets.formatted(date: .omitted, time: .shortened))"
+                    why = "Limited until \(resets.formatted(date: .omitted, time: .shortened)). "
+                        + "It sleeps till then; a send picks it up."
                 }
                 return make(.error, "\(ref) hit a usage limit", why)
             }
-            return make(.error, "\(ref) stopped with an error", status.error ?? status.title ?? title)
+            return make(.error, "\(ref) stopped with an error", (status.error ?? status.title ?? title).map(sentence))
         }
         if endOfTurn, status.activity == .done, before?.isWorking == true {
             return make(.endOfTurn, "\(ref) finished its turn", status.title ?? title)
@@ -92,7 +101,11 @@ public final class UserNotifier: NSObject, Notifier, UNUserNotificationCenterDel
     public func post(_ notice: Notice) {
         let content = UNMutableNotificationContent()
         content.title = notice.title
+        content.subtitle = notice.subtitle
         content.body = notice.body
+        content.threadIdentifier = notice.thread
+        // The end of a turn is news, not a call: it arrives quietly.
+        content.interruptionLevel = notice.kind == .endOfTurn ? .passive : .active
         content.userInfo = ["host": notice.host, "ref": notice.ref]
         if notice.kind != .endOfTurn { content.sound = .default }
         let request = UNNotificationRequest(

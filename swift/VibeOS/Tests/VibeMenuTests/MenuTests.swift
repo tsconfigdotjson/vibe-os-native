@@ -131,25 +131,26 @@ import VibeRPC
                         ["tool": "git", "account": "Octo Cat <octo@example.com>"],
                     ],
                 ] as [String: Any]))
-        #expect(
-            known.headline == "Every new linux agent starts with what Linux home 2 holds. Its gh, gcloud, git and SSH logins:")
+        #expect(known.headline == "Every new linux agent starts with these logins, from Linux home 2.")
         #expect(known.rows.map(\.tool) == ["GitHub (gh)", "Git identity"])
         #expect(known.rows.map(\.account) == ["octocat on github.com", "Octo Cat <octo@example.com>"])
-        #expect(known.claude == "Claude: linux agents are logged in.")
+        #expect(known.claude == "Linux agents are logged in.")
+        #expect(known.rows.map(\.symbol) == ["chevron.left.forwardslash.chevron.right", "person.text.rectangle"])
         #expect(!known.needsClaude)
 
         let empty = LoginsSummary(try decode(ToolboxLogins.self, ["home": 2, "logins": [Any](), "claude": false] as [String: Any]))
-        #expect(empty.headline.hasPrefix("VibeOS found no gh, gcloud, git or SSH logins in Linux home 2."))
+        #expect(empty.headline.hasPrefix("No gh, gcloud, git or SSH logins in Linux home 2 yet."))
         #expect(empty.rows.isEmpty)
         #expect(empty.needsClaude)
-        #expect(empty.claude == "Claude: linux agents aren't logged in yet.")
+        #expect(empty.claude == "Linux agents aren't logged in yet.")
         let unknown = LoginsSummary(
             try decode(
                 ToolboxLogins.self,
                 ["home": 3, "claude": false, "claude_problem": "can't read the Claude login for linux agents: locked"]
                     as [String: Any]))
         #expect(unknown.headline.contains("couldn't tell which logins Linux home 3 holds"))
-        #expect(unknown.claude == "Claude: can't read the Claude login for linux agents: locked")
+        // vibed's clause, as a sentence.
+        #expect(unknown.claude == "Can't read the Claude login for linux agents: locked")
         #expect(unknown.needsClaude)
         let none = LoginsSummary(try decode(ToolboxLogins.self, ["logins": [Any](), "claude": true] as [String: Any]))
         #expect(none.headline.hasPrefix("There's no Linux home yet."))
@@ -258,6 +259,15 @@ import VibeRPC
         #expect(question.title == "a has a question")
         #expect(question.body == "Dark mode")
         #expect((question.host, question.ref) == ("local", "a"))
+        // Where it works, and grouped with its other notices.
+        #expect(question.subtitle == "app")
+        #expect(question.thread == "local:a")
+        let remote = try #require(
+            notice(
+                for: try event(.agentState, ref: "b", host: "vps", extra: ["state": "question"]), agent: nil,
+                endOfTurn: false))
+        #expect(remote.subtitle == "app on vps")
+        #expect(remote.thread == "vps:b")
 
         #expect(notice(for: try event(.agentState, ref: "a", extra: ["state": "idle"]), agent: before, endOfTurn: true) == nil)
         // Once per question.
@@ -269,8 +279,8 @@ import VibeRPC
                 for: try event(.agentLimit, ref: "a", extra: ["limit": "memory", "message": "paused at 100% of its 4G"]),
                 agent: before, endOfTurn: false))
         #expect(limit.kind == .limit)
-        #expect(limit.title == "a: memory limit")
-        #expect(limit.body == "paused at 100% of its 4G")
+        #expect(limit.title == "a · memory limit")
+        #expect(limit.body == "Paused at 100% of its 4G")
 
         let status: [String: Any] = [
             "activity": "errored", "certainty": "firm", "pending_wakeups": [], "error": "overloaded",
@@ -278,7 +288,7 @@ import VibeRPC
         let error = try #require(
             notice(for: try event(.agentStatus, ref: "a", extra: ["status": status]), agent: before, endOfTurn: false))
         #expect(error.kind == .error)
-        #expect(error.body == "overloaded")
+        #expect(error.body == "Overloaded")
         // Only as it starts: a status that stays errored doesn't again.
         let errored = try agent("a", activity: .errored)
         #expect(notice(for: try event(.agentStatus, ref: "a", extra: ["status": status]), agent: errored, endOfTurn: false) == nil)
@@ -289,7 +299,7 @@ import VibeRPC
         let limited = try #require(
             notice(for: try event(.agentStatus, ref: "a", extra: ["status": usage]), agent: before, endOfTurn: false))
         #expect(limited.title == "a hit a usage limit")
-        #expect(limited.body.hasPrefix("limited until"))
+        #expect(limited.body.hasPrefix("Limited until"))
     }
 
     @Test func theEndOfATurnNotifiesOnlyWhenAskedTo() throws {
