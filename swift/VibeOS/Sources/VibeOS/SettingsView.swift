@@ -153,7 +153,7 @@ struct ProjectsPane: View {
                         ? "A GitHub repo is cloned with this Mac's gh login into ~/VibeOS/projects; a folder stays "
                             + "where it is. It starts with two profiles, one per environment."
                         : "A GitHub repo is cloned with \(host)'s own gh login; a path is a folder on \(host). "
-                            + "It starts with one linux profile."
+                            + "It starts with one Linux profile."
                 )
                 .foregroundStyle(.secondary)
             }
@@ -232,6 +232,34 @@ struct ProjectLabel: View {
     }
 }
 
+/// A project's page header: its name, where it comes from, and where it is.
+struct ProjectHeader: View {
+    let project: Project
+
+    var body: some View {
+        HStack(spacing: 12) {
+            IconTile(
+                symbol: project.source == .github ? "chevron.left.forwardslash.chevron.right" : "folder.fill",
+                color: .blue, size: 40)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(project.name).font(.title2.weight(.semibold))
+                Text(project.repo.map { "github.com/\($0)" } ?? "A folder")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                Text(project.path)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .textSelection(.enabled)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.vertical, 6)
+        .accessibilityElement(children: .combine)
+    }
+}
+
 /// One project: its profiles, each edited in place, and its removal.
 struct ProjectDetail: View {
     @ObservedObject var model: MenuModel
@@ -246,10 +274,7 @@ struct ProjectDetail: View {
         Form {
             if let project {
                 Section {
-                    LabeledContent("Source", value: project.repo.map { "github.com/\($0)" } ?? "A folder")
-                    LabeledContent("Path") {
-                        Text(project.path).textSelection(.enabled).lineLimit(1).truncationMode(.middle)
-                    }
+                    ProjectHeader(project: project)
                 }
                 ForEach(project.profiles, id: \.name) { profile in
                     ProfileSection(model: model, host: host, project: name, profile: profile) { await load() }
@@ -266,7 +291,7 @@ struct ProjectDetail: View {
                 } header: {
                     Text("Add a Profile")
                 } footer: {
-                    Text("It starts as linux, Opus, high reasoning, auto and 4G. Change any of it above.")
+                    Text("It starts as Linux, Opus, High, Auto and 4G. Change any of it above.")
                         .foregroundStyle(.secondary)
                 }
                 Section {
@@ -357,18 +382,18 @@ struct ProfileSection: View {
                 }
             }
             Picker("Environment", selection: binding(\.environment, \.environment)) {
-                ForEach(environments, id: \.self) { Text($0.rawValue).tag($0) }
+                ForEach(environments, id: \.self) { Text($0.title).tag($0) }
             }
             .pickerStyle(.segmented)
             Picker("Model", selection: binding(\.model, \.model)) {
-                ForEach(ClaudeModel.allCases, id: \.self) { Text($0.rawValue.capitalized).tag($0) }
+                ForEach(ClaudeModel.allCases, id: \.self) { Text($0.title).tag($0) }
             }
             .pickerStyle(.segmented)
             Picker("Reasoning", selection: binding(\.reasoning, \.reasoning)) {
-                ForEach(ReasoningLevel.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+                ForEach(ReasoningLevel.allCases, id: \.self) { Text($0.title).tag($0) }
             }
             Picker("Mode", selection: binding(\.mode, \.mode)) {
-                ForEach(PermissionMode.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+                ForEach(PermissionMode.allCases, id: \.self) { Text($0.title).tag($0) }
             }
             .pickerStyle(.segmented)
             LabeledContent {
@@ -380,27 +405,20 @@ struct ProfileSection: View {
                 }
             } label: {
                 Text("Memory")
-                Text("A linux VM's RAM, or a macos agent's hard limit")
+                Text("A Linux VM's RAM, or a macOS agent's hard limit")
             }
-        } header: {
             HStack {
-                Text(profile.name)
                 Spacer()
-                Button(role: .destructive) {
-                    Task { await delete() }
-                } label: {
-                    Image(systemName: "trash")
-                }
-                .buttonStyle(.borderless)
-                .help("Delete \(profile.name)")
-                .accessibilityLabel("Delete profile \(profile.name)")
+                Button("Delete Profile…", role: .destructive) { Task { await delete() } }
+                    .buttonStyle(.borderless)
+                    .accessibilityLabel("Delete profile \(profile.name)")
             }
         } footer: {
             VStack(alignment: .leading, spacing: 4) {
                 if shown.mode == .bypass {
                     Label(
                         shown.environment == .macos
-                            ? "Bypass skips every permission prompt, and a macos agent acts as you."
+                            ? "Bypass skips every permission prompt, and a macOS agent acts as you."
                             : "Bypass skips every permission prompt; the VM is its sandbox.",
                         systemImage: "exclamationmark.shield"
                     )
@@ -1082,7 +1100,7 @@ struct LimitsPane: View {
                       value: \.cpuCores, set: \.cpuCores),
                 Field(key: "max_awake_agents", label: "Most agents awake at once", kind: .count,
                       value: \.maxAwakeAgents, set: \.maxAwakeAgents),
-                Field(key: "max_processes", label: "Processes per macos agent", kind: .count,
+                Field(key: "max_processes", label: "Processes per macOS agent", kind: .count,
                       value: \.maxProcesses, set: \.maxProcesses),
             ]),
         FieldGroup(
@@ -1092,9 +1110,9 @@ struct LimitsPane: View {
                       value: \.diskSoft, set: \.diskSoft),
                 Field(key: "disk_hard", label: "Worktree disk: pause past", kind: .bytes,
                       value: \.diskHard, set: \.diskHard),
-                Field(key: "vm_disk", label: "A linux agent's own disk", kind: .bytes,
+                Field(key: "vm_disk", label: "A Linux agent's own disk", kind: .bytes,
                       value: \.vmDisk, set: \.vmDisk),
-                Field(key: "snapshot_disk", label: "Disk for all sleeping linux agents", kind: .bytes,
+                Field(key: "snapshot_disk", label: "Disk for all sleeping Linux agents", kind: .bytes,
                       value: \.snapshotDisk, set: \.snapshotDisk),
             ]),
         FieldGroup(

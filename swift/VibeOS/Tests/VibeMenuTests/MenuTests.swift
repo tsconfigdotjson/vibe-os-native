@@ -131,7 +131,7 @@ import VibeRPC
                         ["tool": "git", "account": "Octo Cat <octo@example.com>"],
                     ],
                 ] as [String: Any]))
-        #expect(known.headline == "Every new linux agent starts with these logins, from Linux home 2.")
+        #expect(known.headline == "Every new Linux agent starts with these logins, from Linux home 2.")
         #expect(known.rows.map(\.tool) == ["GitHub (gh)", "Git identity"])
         #expect(known.rows.map(\.account) == ["octocat on github.com", "Octo Cat <octo@example.com>"])
         #expect(known.claude == "Linux agents are logged in.")

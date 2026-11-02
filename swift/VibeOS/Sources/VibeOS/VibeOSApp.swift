@@ -34,6 +34,7 @@ enum WindowID {
 /// running.
 struct VibeOSApp: App {
     @StateObject private var model: MenuModel
+    @StateObject private var menuBar = MenuBarAppearance()
 
     init() {
         let model = MenuModel(daemon: VibedClient(), terminal: AppleScriptTerminal(), notifier: UserNotifier())
@@ -45,7 +46,7 @@ struct VibeOSApp: App {
         MenuBarExtra {
             MenuView(model: model)
         } label: {
-            MenuBarLabel(icon: model.icon, connected: model.connection == .connected)
+            MenuBarLabel(icon: model.icon, connected: model.connection == .connected, onDark: menuBar.dark)
         }
         .menuBarExtraStyle(.window)
 
@@ -83,17 +84,68 @@ struct VibeOSApp: App {
 struct MenuBarLabel: View {
     let icon: IconSummary
     let connected: Bool
+    /// Whether the menu bar is dark, for a badged glyph's windows.
+    var onDark = false
 
     var body: some View {
         let state = GlyphState(icon: icon, connected: connected)
         HStack(spacing: 3) {
-            Image(nsImage: MenuBarGlyph.image(state, awake: icon.awake))
+            Image(nsImage: MenuBarGlyph.image(state, awake: icon.awake, onDark: onDark))
             if connected {
                 Text("\(icon.awake)").monospacedDigit()
             }
         }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(state.accessibilityLabel(awake: icon.awake))
+    }
+}
+
+/// Whether the menu bar is dark, as the status item sees it: on macOS 26 the
+/// menu bar follows the wallpaper as well as Dark Mode. A badged glyph isn't
+/// a template, so it's drawn for this. It's read from the view the
+/// MenuBarExtra's status item draws in, watched once found; until then (a
+/// moment at launch) a short timer looks for it, and the app's appearance
+/// stands in.
+@MainActor
+final class MenuBarAppearance: ObservableObject {
+    @Published private(set) var dark = false
+    private var appObservation: NSKeyValueObservation?
+    private var viewObservation: NSKeyValueObservation?
+    private weak var watched: NSView?
+    private var timer: Timer?
+
+    init() {
+        appObservation = NSApplication.shared.observe(\.effectiveAppearance) { [weak self] _, _ in
+            DispatchQueue.main.async { MainActor.assumeIsolated { self?.update() } }
+        }
+        update()
+    }
+
+    func update() {
+        if watched == nil {
+            viewObservation = nil
+            if let view = Self.statusItemView() {
+                watched = view
+                viewObservation = view.observe(\.effectiveAppearance) { [weak self] _, _ in
+                    DispatchQueue.main.async { MainActor.assumeIsolated { self?.update() } }
+                }
+                timer?.invalidate()
+                timer = nil
+            } else if timer == nil {
+                timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+                    DispatchQueue.main.async { MainActor.assumeIsolated { self?.update() } }
+                }
+            }
+        }
+        let appearance = watched?.effectiveAppearance ?? NSApplication.shared.effectiveAppearance
+        let now = appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+        if now != dark { dark = now }
+    }
+
+    /// The view the status item draws in: its window is the app's
+    /// NSStatusBarWindow.
+    static func statusItemView() -> NSView? {
+        NSApplication.shared.windows.first { String(describing: type(of: $0)).contains("StatusBarWindow") }?.contentView
     }
 }
 

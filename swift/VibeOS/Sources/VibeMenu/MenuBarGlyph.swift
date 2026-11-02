@@ -65,23 +65,32 @@ public enum MenuBarGlyph {
         rect(column: 1, row: question ? 0 : 1)
     }
 
-    public static func image(_ state: GlyphState, awake: Int? = nil) -> NSImage {
+    /// The glyph as an image. Without a badge it's a template, so the menu
+    /// bar tints it as it does its own icons. A badge's colour needs a plain
+    /// image, whose windows can't follow the menu bar on their own: they're
+    /// drawn for `onDark`, the menu bar's look (MenuBarAppearance in the
+    /// app), white on a dark bar and black on a light one. Drawing them in
+    /// `labelColor` came out black on a dark bar, as the image is drawn
+    /// against the app's appearance, not the menu bar's.
+    public static func image(_ state: GlyphState, awake: Int? = nil, onDark: Bool = false) -> NSImage {
         let image = NSImage(size: size, flipped: true) { _ in
-            draw(state)
+            draw(state, onDark: onDark)
             return true
         }
-        // Without a badge it's a template, so the menu bar tints it as it
-        // does its own icons; a badge's colour needs a plain image.
         image.isTemplate = !state.badged
         image.accessibilityDescription = state.accessibilityLabel(awake: awake ?? state.lit)
         return image
     }
 
+    /// The windows' colour: a template's is ignored, so black; a badged
+    /// glyph's is the menu bar's own text colour.
+    static func ink(_ state: GlyphState, onDark: Bool) -> NSColor {
+        state.badged && onDark ? .white : .black
+    }
+
     /// Draws into the current context, top-left origin.
-    static func draw(_ state: GlyphState) {
-        // A template's colour is ignored; a badged glyph takes the label
-        // colour the menu bar's appearance resolves.
-        let ink = state.badged ? NSColor.labelColor : NSColor.black
+    static func draw(_ state: GlyphState, onDark: Bool = false) {
+        let ink = Self.ink(state, onDark: onDark)
         NSGraphicsContext.saveGraphicsState()
         let alpha: CGFloat = state.connected ? 1 : 0.45
         for (index, window) in order.enumerated() {

@@ -149,8 +149,10 @@ struct GallerySurface {
     }
 }
 
-/// The menu bar glyph in each of its states, at size and enlarged, on a
-/// strip like the menu bar.
+/// The menu bar glyph in each of its states, on a light menu bar and a
+/// dark one side by side, whatever the window's own look, at size and
+/// enlarged. A badged glyph isn't a template, so this is where its windows
+/// show they follow the bar.
 struct GlyphSheet: View {
     private let states: [(String, GlyphState, Int)] = [
         ("None awake", GlyphState(lit: 0), 0),
@@ -171,20 +173,27 @@ struct GlyphSheet: View {
                 BrandMark(lit: 0, size: 72)
                 BrandMark(lit: 3, size: 72, night: false)
             }
-            Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 10) {
+            Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 8) {
+                GridRow {
+                    Text("")
+                    Text("Light menu bar").font(.caption).foregroundStyle(.secondary)
+                    Text("Dark menu bar").font(.caption).foregroundStyle(.secondary)
+                    Text("Light, enlarged").font(.caption).foregroundStyle(.secondary)
+                    Text("Dark, enlarged").font(.caption).foregroundStyle(.secondary)
+                }
                 ForEach(states.indices, id: \.self) { i in
                     let state = states[i].1
                     let awake = states[i].2
                     GridRow {
                         Text(states[i].0).foregroundStyle(.secondary)
-                        HStack(spacing: 3) {
-                            glyph(state, awake: awake, size: 16)
-                            if state.connected { Text("\(awake)").monospacedDigit() }
-                        }
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 3)
-                        .background(Capsule().fill(Color.primary.opacity(0.06)))
-                        glyph(state, awake: awake, size: 64)
+                        bar(state, awake: awake, dark: false)
+                        bar(state, awake: awake, dark: true)
+                        glyph(state, awake: awake, dark: false, size: 48)
+                            .padding(6)
+                            .background(RoundedRectangle(cornerRadius: 6).fill(Self.lightBar))
+                        glyph(state, awake: awake, dark: true, size: 48)
+                            .padding(6)
+                            .background(RoundedRectangle(cornerRadius: 6).fill(Self.darkBar))
                     }
                 }
             }
@@ -192,11 +201,29 @@ struct GlyphSheet: View {
         .padding(24)
     }
 
-    private func glyph(_ state: GlyphState, awake: Int, size: CGFloat) -> some View {
-        Image(nsImage: MenuBarGlyph.image(state, awake: awake))
+    private static let lightBar = Color(white: 0.93)
+    private static let darkBar = Color(white: 0.16)
+
+    /// The glyph and its count, as they sit in a menu bar of that look.
+    private func bar(_ state: GlyphState, awake: Int, dark: Bool) -> some View {
+        HStack(spacing: 3) {
+            glyph(state, awake: awake, dark: dark, size: 16)
+            if state.connected {
+                Text("\(awake)").monospacedDigit().foregroundStyle(dark ? Color.white : Color.black)
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 4)
+        .background(RoundedRectangle(cornerRadius: 5).fill(dark ? Self.darkBar : Self.lightBar))
+    }
+
+    /// A template is tinted as the menu bar tints it; a badged glyph is
+    /// drawn for the bar's look, as the app draws it.
+    private func glyph(_ state: GlyphState, awake: Int, dark: Bool, size: CGFloat) -> some View {
+        Image(nsImage: MenuBarGlyph.image(state, awake: awake, onDark: dark))
             .resizable()
             .renderingMode(state.badged ? .original : .template)
-            .foregroundStyle(.primary)
+            .foregroundStyle(dark ? Color.white : Color.black)
             .frame(width: size, height: size)
     }
 }
@@ -262,7 +289,7 @@ final class GalleryRunner: NSObject, NSApplicationDelegate {
             print("ready")
             fflush(stdout)
         case .render(let directory):
-            exit(render(into: directory))
+            exit(await render(into: directory))
         }
     }
 
@@ -305,8 +332,10 @@ final class GalleryRunner: NSObject, NSApplicationDelegate {
         return window
     }
 
-    /// Draws every window into `directory`; 0 if each came out drawn.
-    private func render(into directory: URL) -> Int32 {
+    /// Draws every window into `directory`; 0 if each came out drawn. A
+    /// surface that comes out blank gets a second look a moment later, as
+    /// one may still be laying out, then fails the run.
+    private func render(into directory: URL) async -> Int32 {
         var failed = false
         var manifest: [String] = []
         do {
@@ -316,34 +345,47 @@ final class GalleryRunner: NSObject, NSApplicationDelegate {
             return 1
         }
         for (name, window) in windows {
-            guard let view = window.contentView else { continue }
-            view.layoutSubtreeIfNeeded()
-            view.display()
-            guard let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else {
+            var shot = capture(window)
+            if shot.map({ !ink($0).drawn }) ?? true {
+                try? await Task.sleep(for: .seconds(1))
+                shot = capture(window)
+            }
+            guard let image = shot else {
                 FileHandle.standardError.write(Data("VibeOS: \(name) has nothing to draw\n".utf8))
                 failed = true
                 continue
             }
-            view.cacheDisplay(in: view.bounds, to: rep)
-            // SwiftUI draws through layers, which cacheDisplay can miss: if
-            // it came out blank, draw the layer tree instead.
-            let drawn = looksDrawn(rep) ? rep : (layerImage(view) ?? rep)
             let file = directory.appendingPathComponent("\(name).png")
-            guard let png = drawn.representation(using: .png, properties: [:]), (try? png.write(to: file)) != nil else {
+            guard let png = image.representation(using: .png, properties: [:]), (try? png.write(to: file)) != nil else {
                 FileHandle.standardError.write(Data("VibeOS: can't write \(file.path)\n".utf8))
                 failed = true
                 continue
             }
-            if !looksDrawn(drawn) {
-                FileHandle.standardError.write(Data("VibeOS: \(name) came out blank\n".utf8))
+            let measured = ink(image)
+            let percent = (measured.share * 1000).rounded() / 10
+            let stats = "\(image.pixelsWide)x\(image.pixelsHigh), \(percent)% drawn, \(measured.colours) colours"
+            if !measured.drawn {
+                FileHandle.standardError.write(Data("VibeOS: \(name) came out blank (\(stats))\n".utf8))
                 failed = true
             }
-            manifest.append("\(name).png \(drawn.pixelsWide)x\(drawn.pixelsHigh)")
-            print("rendered \(name) \(drawn.pixelsWide)x\(drawn.pixelsHigh)")
+            manifest.append("\(name).png \(stats)")
+            print("rendered \(name): \(stats)")
         }
         let list = manifest.joined(separator: "\n") + "\n"
         try? list.write(to: directory.appendingPathComponent("manifest.txt"), atomically: true, encoding: .utf8)
         return failed ? 1 : 0
+    }
+
+    /// The window's content as it draws now: through cacheDisplay, or, if
+    /// that misses SwiftUI's layers, the layer tree.
+    private func capture(_ window: NSWindow) -> NSBitmapImageRep? {
+        guard let view = window.contentView else { return nil }
+        view.layoutSubtreeIfNeeded()
+        window.displayIfNeeded()
+        view.display()
+        guard let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return nil }
+        view.cacheDisplay(in: view.bounds, to: rep)
+        return ink(rep).drawn ? rep : (layerImage(view) ?? rep)
     }
 
     /// The view's layer tree, drawn into a bitmap at the window's scale.
@@ -369,18 +411,8 @@ final class GalleryRunner: NSObject, NSApplicationDelegate {
         return rep
     }
 
-    /// Whether an image holds a drawing rather than one flat colour: it
-    /// samples a grid and wants a spread of colours.
-    private func looksDrawn(_ rep: NSBitmapImageRep) -> Bool {
-        var seen = Set<Int>()
-        let step = max(1, min(rep.pixelsWide, rep.pixelsHigh) / 48)
-        for y in stride(from: 0, to: rep.pixelsHigh, by: step) {
-            for x in stride(from: 0, to: rep.pixelsWide, by: step) {
-                guard let c = rep.colorAt(x: x, y: y)?.usingColorSpace(.sRGB) else { continue }
-                let key = Int(c.redComponent * 31) << 10 | Int(c.greenComponent * 31) << 5 | Int(c.blueComponent * 31)
-                seen.insert(key)
-            }
-        }
-        return seen.count >= 6
+    /// How much of a capture is drawing (SurfaceInk, in VibeMenu).
+    private func ink(_ rep: NSBitmapImageRep) -> SurfaceInk {
+        rep.cgImage.map { SurfaceInk($0) } ?? SurfaceInk(share: 0, colours: 0)
     }
 }

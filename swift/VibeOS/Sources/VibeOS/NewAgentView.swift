@@ -4,7 +4,7 @@ import VibeRPC
 
 /// New agent…: the prompt first, as it's the point, then a host, a project
 /// and one of its profiles, and an optional name (PRD: Key user flows,
-/// Start an agent). ⌘↩ starts it.
+/// Start an agent). Return starts it, or ⌘↩ from the prompt.
 struct NewAgentView: View {
     @ObservedObject var model: MenuModel
     @Environment(\.dismissWindow) private var dismissWindow
@@ -54,6 +54,8 @@ struct NewAgentView: View {
                     .focused($promptFocused)
                     .padding(8)
                     .accessibilityLabel("Prompt")
+                    // Its scroller shows only while it scrolls.
+                    .background(OverlayScrollers(target: .nearbyTextView))
                 if prompt.isEmpty {
                     Text("What should it work on?")
                         .foregroundStyle(.tertiary)
@@ -84,6 +86,7 @@ struct NewAgentView: View {
                             }
                         }
                         .labelsHidden()
+                        .frame(width: Self.controlWidth)
                     }
                 }
                 GridRow {
@@ -93,8 +96,10 @@ struct NewAgentView: View {
                         ForEach(projects, id: \.name) { p in Text(p.name).tag(p.name) }
                     }
                     .labelsHidden()
+                    .frame(width: Self.controlWidth)
                 }
-                GridRow {
+                // The label sits by the pop-up, not by the summary under it.
+                GridRow(alignment: .firstTextBaseline) {
                     label("Profile")
                     VStack(alignment: .leading, spacing: 4) {
                         Picker("Profile", selection: $profile) {
@@ -104,6 +109,7 @@ struct NewAgentView: View {
                             }
                         }
                         .labelsHidden()
+                        .frame(width: Self.controlWidth)
                         if let chosen {
                             ProfileSummary(profile: chosen)
                         }
@@ -114,6 +120,7 @@ struct NewAgentView: View {
                     TextField("Name", text: $name, prompt: Text("Three random words"))
                         .labelsHidden()
                         .autocorrectionDisabled()
+                        .frame(width: Self.controlWidth)
                         .help("The agent's ref and branch. Left empty, it gets three random words, such as quiet-amber-otter.")
                 }
             }
@@ -128,16 +135,30 @@ struct NewAgentView: View {
                 Spacer()
                 Button("Cancel") { dismissWindow(id: WindowID.newAgent) }
                     .keyboardShortcut(.cancelAction)
+                // In the accent colour, live once there's a prompt. Return
+                // starts it from the other fields; in the prompt, Return is
+                // a new line, so it isn't the default button there, and ⌘↩
+                // starts it instead.
                 Button("Start Agent") { Task { await start() } }
-                    .keyboardShortcut(.return, modifiers: .command)
                     .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(promptFocused ? nil : .defaultAction)
                     .disabled(!canStart)
-                    .help("⌘↩")
+                    .help("Return, or ⌘↩ from the prompt")
+                    .background {
+                        Button("Start Agent") { Task { await start() } }
+                            .keyboardShortcut(.return, modifiers: .command)
+                            .disabled(!canStart)
+                            .opacity(0)
+                            .accessibilityHidden(true)
+                    }
             }
         }
         .padding(20)
         .onAppear { promptFocused = true }
     }
+
+    /// Every control in the form is this wide, so they line up.
+    private static let controlWidth: CGFloat = 300
 
     private func label(_ text: String) -> some View {
         Text(text)
@@ -211,25 +232,21 @@ struct NewAgentView: View {
     }
 }
 
-/// A profile in a line: `linux · Opus · high · auto · 4G`, warning of
-/// bypass on macos.
+/// A profile in a line: `Linux · Opus · High · Auto · 4G`, warning of
+/// bypass on macOS.
 struct ProfileSummary: View {
     let profile: Profile
 
     var body: some View {
-        let parts = [
-            profile.environment.rawValue, profile.model.rawValue.capitalized, profile.reasoning.rawValue,
-            profile.mode.rawValue, formatBytes(profile.memory),
-        ]
         HStack(spacing: 6) {
-            Text(parts.joined(separator: " · "))
+            Text(profileSummary(profile))
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
             if profile.mode == .bypass && profile.environment == .macos {
                 Label("acts as you", systemImage: "exclamationmark.shield")
                     .font(.subheadline)
                     .foregroundStyle(Palette.attention)
-                    .help("Bypass skips every permission prompt, and a macos agent acts as you.")
+                    .help("Bypass skips every permission prompt, and a macOS agent acts as you.")
             }
         }
         .accessibilityElement(children: .combine)

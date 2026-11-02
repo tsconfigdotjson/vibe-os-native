@@ -262,3 +262,112 @@ import VibeRPC
             ).complete)
     }
 }
+
+@Suite @MainActor struct RoundOneTests {
+    /// The glyph drawn at 2x, as in GlyphTests, for a menu bar's look.
+    func render(_ state: GlyphState, onDark: Bool) throws -> NSBitmapImageRep {
+        let rep = try #require(
+            NSBitmapImageRep(
+                bitmapDataPlanes: nil, pixelsWide: 32, pixelsHigh: 32, bitsPerSample: 8, samplesPerPixel: 4,
+                hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0))
+        rep.size = MenuBarGlyph.size
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+        MenuBarGlyph.image(state, onDark: onDark).draw(in: NSRect(origin: .zero, size: MenuBarGlyph.size))
+        NSGraphicsContext.restoreGraphicsState()
+        return rep
+    }
+
+    /// The colour at the centre of the top left window.
+    func topLeft(_ rep: NSBitmapImageRep) throws -> NSColor {
+        let r = MenuBarGlyph.rect(column: 0, row: 0)
+        return try #require(rep.colorAt(x: Int(r.midX * 2), y: Int(r.midY * 2))?.usingColorSpace(.sRGB))
+    }
+
+    @Test func aBadgedGlyphsWindowsFollowTheMenuBar() throws {
+        let badged = GlyphState(lit: 3, question: true, paused: true)
+        // White on a dark menu bar: black there was invisible.
+        let dark = try topLeft(try render(badged, onDark: true))
+        #expect(dark.alphaComponent > 0.9)
+        #expect(dark.redComponent > 0.9 && dark.greenComponent > 0.9 && dark.blueComponent > 0.9)
+        let light = try topLeft(try render(badged, onDark: false))
+        #expect(light.alphaComponent > 0.9)
+        #expect(light.redComponent < 0.1 && light.greenComponent < 0.1 && light.blueComponent < 0.1)
+        // The dots keep their colours either way.
+        let (qx, qy) = (MenuBarGlyph.badgeRect(question: true).midX, MenuBarGlyph.badgeRect(question: true).midY)
+        let dot = try #require(try render(badged, onDark: true).colorAt(x: Int(qx * 2), y: Int(qy * 2))?.usingColorSpace(.sRGB))
+        #expect(dot.redComponent > 0.8 && dot.blueComponent < 0.3)
+        // A template is tinted by the menu bar, so its look doesn't matter.
+        #expect(MenuBarGlyph.image(GlyphState(lit: 2), onDark: true).isTemplate)
+        #expect(MenuBarGlyph.ink(GlyphState(lit: 2), onDark: true) == .black)
+    }
+
+    @Test func theHeaderIsOneQuietLineWithColourOnlyForTrouble() throws {
+        let hosts = try [
+            decode(HostInfo.self, hostJSON("local", mcp: true)),
+            decode(HostInfo.self, hostJSON("vps", link: .connected, external: true, tunnel: .up)),
+            decode(HostInfo.self, hostJSON("box", link: .down, detail: "ssh: timed out")),
+        ]
+        let gh = try decode(GhStatus.self, ["state": "logged_in", "account": "octocat"])
+        let parts = headerStatus(memory: HostMemory(used: 3 << 30, total: 32 << 30), gh: gh, mcp: true, hosts: hosts)
+        #expect(parts.map(\.text) == ["3G of 32G", "gh octocat", "MCP on", "vps public", "box down"])
+        #expect(parts.map(\.tone) == [.normal, .normal, .normal, .normal, .trouble])
+        #expect(parts.last?.spoken == "box, link down")
+        // Trouble shows in colour, and only trouble.
+        let out = try decode(GhStatus.self, ["state": "logged_out"])
+        let unreachable = try decode(HostInfo.self, hostJSON("vps", link: .connected, external: true, tunnel: .down))
+        let worse = headerStatus(memory: nil, gh: out, mcp: false, hosts: [unreachable])
+        #expect(worse.map(\.text) == ["gh logged out", "MCP off", "vps not reachable"])
+        #expect(worse.map(\.tone) == [.attention, .normal, .attention])
+        // Before gh has been checked, it says nothing.
+        #expect(headerStatus(memory: nil, gh: nil, mcp: true, hosts: []).map(\.text) == ["MCP on"])
+    }
+
+    @Test func valuesHaveOneVoice() throws {
+        #expect(AgentEnvironment.allCases.map(\.title) == ["Linux", "macOS"])
+        #expect(ClaudeModel.allCases.map(\.title) == ["Opus", "Sonnet"])
+        #expect(ReasoningLevel.allCases.map(\.title) == ["Low", "Medium", "High", "Extra High", "Max"])
+        #expect(PermissionMode.allCases.map(\.title) == ["Auto", "Bypass"])
+        let profile = try decode(
+            Profile.self,
+            ["name": "reviewer", "environment": "linux", "model": "sonnet", "reasoning": "xhigh", "mode": "bypass",
+             "memory": 4 << 30] as [String: Any])
+        #expect(profileSummary(profile) == "Linux · Sonnet · Extra High · Bypass · 4G")
+        #expect(SetupProgress(hasProject: false, hasKey: false, linuxClaude: false).steps[1].title
+            == "Log in to Claude for Linux agents")
+    }
+
+    /// An image of `size` pixels, filled with white, with `draw` on top.
+    func image(_ size: Int, draw: (CGContext) -> Void = { _ in }) throws -> CGImage {
+        let context = try #require(
+            CGContext(
+                data: nil, width: size, height: size, bitsPerComponent: 8, bytesPerRow: 0,
+                space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        context.setFillColor(CGColor(gray: 1, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: size, height: size))
+        draw(context)
+        return try #require(context.makeImage())
+    }
+
+    @Test func theBlankCheckFailsAFlatImageAndPassesASparseDrawing() throws {
+        // A window that drew nothing: one colour.
+        let blank = SurfaceInk(try image(400))
+        #expect(!blank.drawn)
+        #expect(blank.share == 0)
+        // An empty state's worth: a small antialiased symbol and a line of
+        // text-sized marks on a big plain background. The old grid sample
+        // could miss all of it.
+        let sparse = SurfaceInk(
+            try image(800) { c in
+                c.setShouldAntialias(true)
+                c.setFillColor(CGColor(gray: 0.45, alpha: 1))
+                c.fillEllipse(in: CGRect(x: 380, y: 500, width: 40, height: 40))
+                for i in 0..<30 {
+                    c.setFillColor(CGColor(gray: 0.1 + Double(i % 7) * 0.08, alpha: 1))
+                    c.fill(CGRect(x: 250.5 + Double(i) * 10, y: 420.3, width: 6.4, height: 11.7))
+                }
+            })
+        #expect(sparse.drawn)
+        #expect(sparse.share < 0.05)
+    }
+}

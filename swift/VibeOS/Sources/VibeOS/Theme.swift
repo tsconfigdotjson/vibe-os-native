@@ -185,50 +185,6 @@ struct HoverRow: ViewModifier {
     }
 }
 
-/// Lays its views out in lines, wrapping as a paragraph does: the header's
-/// chips.
-struct Flow: Layout {
-    var spacing: CGFloat = 6
-    var lineSpacing: CGFloat = 5
-
-    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
-        let width = proposal.width ?? .infinity
-        var x: CGFloat = 0
-        var y: CGFloat = 0
-        var line: CGFloat = 0
-        var widest: CGFloat = 0
-        for view in subviews {
-            let size = view.sizeThatFits(.unspecified)
-            if x > 0, x + size.width > width {
-                x = 0
-                y += line + lineSpacing
-                line = 0
-            }
-            widest = max(widest, x + size.width)
-            x += size.width + spacing
-            line = max(line, size.height)
-        }
-        return CGSize(width: proposal.width ?? widest, height: y + line)
-    }
-
-    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
-        var x = bounds.minX
-        var y = bounds.minY
-        var line: CGFloat = 0
-        for view in subviews {
-            let size = view.sizeThatFits(.unspecified)
-            if x > bounds.minX, x + size.width > bounds.maxX {
-                x = bounds.minX
-                y += line + lineSpacing
-                line = 0
-            }
-            view.place(at: CGPoint(x: x, y: y), anchor: .topLeading, proposal: ProposedViewSize(size))
-            x += size.width + spacing
-            line = max(line, size.height)
-        }
-    }
-}
-
 /// A footer row that reads like a menu item: a symbol, a title, and its
 /// shortcut or a chevron.
 struct MenuItemLabel: View {
@@ -263,37 +219,6 @@ struct MenuItemLabel: View {
         .padding(.horizontal, Metrics.gutter)
         .padding(.vertical, 5)
         .frame(maxWidth: .infinity, alignment: .leading)
-    }
-}
-
-/// A small capsule of metadata: a profile, a link, MCP. It leads with a
-/// symbol, or with a coloured dot.
-struct Chip: View {
-    let text: String
-    var symbol: String?
-    var dot: Color?
-    var tint: Color = .secondary
-    @Environment(\.colorSchemeContrast) private var contrast
-
-    var body: some View {
-        HStack(spacing: 4) {
-            if let dot {
-                Circle().fill(dot).frame(width: 6, height: 6)
-            } else if let symbol {
-                Image(systemName: symbol).imageScale(.small).foregroundStyle(tint)
-            }
-            Text(text).lineLimit(1)
-        }
-        .font(.caption2.weight(.medium))
-        .foregroundStyle(.secondary)
-        .padding(.horizontal, 6)
-        .padding(.vertical, 2)
-        .background(Capsule().fill(Color.primary.opacity(contrast == .increased ? 0.12 : 0.06)))
-        .overlay {
-            if contrast == .increased {
-                Capsule().strokeBorder(Color.primary.opacity(0.4), lineWidth: 1)
-            }
-        }
     }
 }
 
@@ -571,5 +496,89 @@ struct BrandMark: View {
                 .opacity(on ? 1 : 0)
         }
         .frame(width: cell, height: cell)
+    }
+}
+
+// MARK: Scrollers
+
+/// Gives a scroll view overlay scrollers, which show only while scrolling,
+/// as the menu and the prompt want, unless the owner set "Show scroll bars"
+/// to Always (System Settings → Appearance), which it leaves alone. Put it
+/// in a ScrollView's content (`.enclosing`), or beside a TextEditor
+/// (`.nearbyTextView`), whose scroll view it finds among its neighbours.
+/// It sets the style again when the system's preferred style changes, as
+/// when a mouse is plugged in, and on every update.
+struct OverlayScrollers: NSViewRepresentable {
+    enum Target {
+        case enclosing, nearbyTextView
+    }
+
+    var target: Target = .enclosing
+
+    func makeNSView(context: Context) -> Probe { Probe(target: target) }
+
+    func updateNSView(_ view: Probe, context: Context) { view.apply() }
+
+    final class Probe: NSView {
+        let target: Target
+
+        init(target: Target) {
+            self.target = target
+            super.init(frame: .zero)
+            NotificationCenter.default.addObserver(
+                self, selector: #selector(styleChanged), name: NSScroller.preferredScrollerStyleDidChangeNotification,
+                object: nil)
+        }
+
+        @available(*, unavailable)
+        required init?(coder: NSCoder) { fatalError("not from a nib") }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            apply()
+            // SwiftUI may set its scroll view up after this view arrives.
+            DispatchQueue.main.async { [weak self] in MainActor.assumeIsolated { self?.apply() } }
+        }
+
+        @objc private func styleChanged(_ notification: Notification) {
+            // After the scroll view's own response to the same change.
+            DispatchQueue.main.async { [weak self] in MainActor.assumeIsolated { self?.apply() } }
+        }
+
+        func apply() {
+            if UserDefaults.standard.string(forKey: "AppleShowScrollBars") == "Always" { return }
+            for scroll in scrollViews() {
+                if scroll.scrollerStyle != .overlay { scroll.scrollerStyle = .overlay }
+                scroll.autohidesScrollers = true
+            }
+        }
+
+        private func scrollViews() -> [NSScrollView] {
+            switch target {
+            case .enclosing:
+                return enclosingScrollView.map { [$0] } ?? []
+            case .nearbyTextView:
+                var ancestor = superview
+                for _ in 0..<4 {
+                    guard let view = ancestor else { break }
+                    let found = Self.textScrollViews(in: view)
+                    if !found.isEmpty { return found }
+                    ancestor = view.superview
+                }
+                return []
+            }
+        }
+
+        private static func textScrollViews(in view: NSView) -> [NSScrollView] {
+            var found: [NSScrollView] = []
+            for sub in view.subviews {
+                if let scroll = sub as? NSScrollView, scroll.documentView is NSTextView {
+                    found.append(scroll)
+                } else {
+                    found += textScrollViews(in: sub)
+                }
+            }
+            return found
+        }
     }
 }

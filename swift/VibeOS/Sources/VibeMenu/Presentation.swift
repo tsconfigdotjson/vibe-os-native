@@ -314,7 +314,7 @@ public struct LoginsSummary: Equatable, Sendable {
         }
         switch (logins.home, logins.logins) {
         case (nil, _):
-            headline = "There's no Linux home yet. Open the toolbox shell, log in to what your linux agents "
+            headline = "There's no Linux home yet. Open the toolbox shell, log in to what your Linux agents "
                 + "need (gh auth login, say), and exit to save it."
         case (let home?, nil):
             headline = "VibeOS couldn't tell which logins Linux home \(home) holds: the check failed, or an "
@@ -323,7 +323,7 @@ public struct LoginsSummary: Equatable, Sendable {
             headline = "No gh, gcloud, git or SSH logins in Linux home \(home) yet. Log in from the toolbox "
                 + "shell (gh auth login, gcloud auth login, git config --global user.name …), then exit to save."
         case (let home?, _):
-            headline = "Every new linux agent starts with these logins, from Linux home \(home)."
+            headline = "Every new Linux agent starts with these logins, from Linux home \(home)."
         }
         needsClaude = !logins.claude
         if logins.claude {
@@ -455,6 +455,59 @@ public func activitySymbol(_ agent: Agent) -> String? {
     }
 }
 
+// The app's one voice for vibed's values: display names, as a person
+// writes them, never the wire's lowercase. Profile names are the owner's
+// own and are shown as typed.
+
+extension AgentEnvironment {
+    /// `Linux`, `macOS`.
+    public var title: String {
+        switch self {
+        case .linux: "Linux"
+        case .macos: "macOS"
+        }
+    }
+}
+
+extension ClaudeModel {
+    public var title: String {
+        switch self {
+        case .opus: "Opus"
+        case .sonnet: "Sonnet"
+        }
+    }
+}
+
+extension ReasoningLevel {
+    public var title: String {
+        switch self {
+        case .low: "Low"
+        case .medium: "Medium"
+        case .high: "High"
+        case .xhigh: "Extra High"
+        case .max: "Max"
+        }
+    }
+}
+
+extension PermissionMode {
+    public var title: String {
+        switch self {
+        case .auto: "Auto"
+        case .bypass: "Bypass"
+        }
+    }
+}
+
+/// A profile's settings in a line, in the app's voice: `Linux · Opus · High
+/// · Auto · 4G`.
+public func profileSummary(_ profile: Profile) -> String {
+    [
+        profile.environment.title, profile.model.title, profile.reasoning.title, profile.mode.title,
+        formatBytes(profile.memory),
+    ].joined(separator: " · ")
+}
+
 /// The SF Symbol for an environment: a compartment, or this Mac.
 public func environmentSymbol(_ environment: AgentEnvironment) -> String {
     switch environment {
@@ -554,7 +607,7 @@ public struct SetupProgress: Equatable, Sendable {
         if let linuxClaude {
             steps.append(
                 Step(
-                    id: .claude, title: "Log in to Claude for linux agents",
+                    id: .claude, title: "Log in to Claude for Linux agents",
                     detail: "One browser sign-in. The token stays in your Keychain.", done: linuxClaude))
         }
         steps.append(
@@ -566,4 +619,65 @@ public struct SetupProgress: Equatable, Sendable {
 
     public var done: Int { steps.filter(\.done).count }
     public var complete: Bool { steps.allSatisfy(\.done) }
+}
+
+// MARK: The header's status line
+
+/// One part of the header's status line: quiet when all is well, in colour
+/// only when something isn't.
+public struct StatusSegment: Equatable, Sendable {
+    public enum Tone: Equatable, Sendable {
+        case normal, attention, trouble
+    }
+
+    public var text: String
+    public var tone: Tone
+    /// The same, for VoiceOver.
+    public var spoken: String
+}
+
+/// The header's one line (PRD: Menu bar, Header): the Mac's memory, `gh`,
+/// MCP, and each Linux host's link and external address. Every host shows,
+/// by name when it's well; a link down, a `gh` login missing or an
+/// external address in trouble shows in colour.
+public func headerStatus(memory: HostMemory?, gh: GhStatus?, mcp: Bool, hosts: [HostInfo]) -> [StatusSegment] {
+    var parts: [StatusSegment] = []
+    if let memory {
+        let text = "\(formatBytes(memory.used)) of \(formatBytes(memory.total))"
+        parts.append(StatusSegment(text: text, tone: .normal, spoken: "Mac memory, \(text) in use"))
+    }
+    switch gh?.state {
+    case .loggedIn?:
+        let account = gh?.account ?? "logged in"
+        parts.append(StatusSegment(text: "gh \(account)", tone: .normal, spoken: "GitHub, logged in as \(account)"))
+    case .loggedOut?:
+        parts.append(StatusSegment(text: "gh logged out", tone: .attention, spoken: "GitHub, logged out"))
+    case .notInstalled?:
+        parts.append(StatusSegment(text: "gh not installed", tone: .attention, spoken: "GitHub CLI not installed"))
+    case .error?:
+        parts.append(StatusSegment(text: "gh can't check", tone: .attention, spoken: "GitHub login can't be checked"))
+    case .unknown?, nil:
+        break
+    }
+    parts.append(StatusSegment(text: mcp ? "MCP on" : "MCP off", tone: .normal, spoken: mcp ? "MCP on" : "MCP off"))
+    for host in hosts where host.link != .local {
+        let external = externalStatus(host)
+        if host.link == .down {
+            parts.append(
+                StatusSegment(
+                    text: "\(host.name) down", tone: .trouble,
+                    spoken: "\(host.name), link down" + (external.map { ", external address \($0.short)" } ?? "")))
+            continue
+        }
+        var text = host.name
+        var tone = StatusSegment.Tone.normal
+        var spoken = "\(host.name), connected"
+        if let external {
+            text += " \(external.short)"
+            spoken += ", external address \(external.short)"
+            if external.tone == .trouble { tone = .attention }
+        }
+        parts.append(StatusSegment(text: text, tone: tone, spoken: spoken))
+    }
+    return parts
 }

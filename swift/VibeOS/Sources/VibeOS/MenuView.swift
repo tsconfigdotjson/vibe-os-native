@@ -89,65 +89,48 @@ struct HeaderView: View {
                 }
             }
             if model.connection == .connected {
-                Flow {
-                    if let memory = model.memory {
-                        Chip(text: "\(formatBytes(memory.used)) of \(formatBytes(memory.total))", symbol: "memorychip")
-                            .help("This Mac's memory in use")
-                            .accessibilityElement(children: .ignore)
-                            .accessibilityLabel("Mac memory, \(formatBytes(memory.used)) of \(formatBytes(memory.total)) in use")
-                    }
-                    gh
-                    let mcp = model.localHost?.mcp == true
-                    Chip(text: mcp ? "MCP on" : "MCP off", dot: mcp ? Palette.signal : Palette.rest)
-                        .help(mcp ? "MCP clients reach this Mac at \(model.mcp?.url ?? MCPSetup.url)" : "MCP is off")
-                        .accessibilityElement(children: .ignore)
-                        .accessibilityLabel(mcp ? "MCP on" : "MCP off")
-                    ForEach(model.otherHosts, id: \.name) { host in
-                        hostChip(host)
-                    }
-                }
+                let parts = headerStatus(
+                    memory: model.memory, gh: model.gh, mcp: model.localHost?.mcp == true, hosts: model.hosts)
+                // It wraps rather than truncates: what's cut would be the
+                // end, where a host that's down shows.
+                statusLine(parts)
+                    .font(.subheadline)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .help(tooltip)
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel(parts.map(\.spoken).joined(separator: ", "))
             }
         }
     }
 
-    @ViewBuilder
-    private var gh: some View {
-        let status = ghText
-        Chip(
-            text: status.text, symbol: status.ok ? "checkmark.circle.fill" : "exclamationmark.circle.fill",
-            tint: status.ok ? Palette.signal : Palette.attention
-        )
-        .help(model.gh?.detail ?? "GitHub CLI login")
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel("GitHub, \(status.text)")
+    /// The parts, one after another: quiet, with colour only where
+    /// something's wrong.
+    private func statusLine(_ parts: [StatusSegment]) -> Text {
+        var line = Text("")
+        for (i, part) in parts.enumerated() {
+            let piece = Text(part.text).foregroundStyle(color(part.tone))
+            line = i == 0 ? piece : Text("\(line)\(Text("  ·  ").foregroundStyle(.tertiary))\(piece)")
+        }
+        return line
     }
 
-    /// What the `gh` chip says, and whether all is well.
-    private var ghText: (text: String, ok: Bool) {
-        guard let gh = model.gh else { return ("gh checking…", true) }
-        switch gh.state {
-        case .loggedIn: return ("gh · \(gh.account ?? "logged in")", true)
-        case .loggedOut: return ("gh logged out", false)
-        case .notInstalled: return ("gh not installed", false)
-        case .error: return ("gh can't check", false)
-        case .unknown: return ("gh checking…", true)
+    private func color(_ tone: StatusSegment.Tone) -> Color {
+        switch tone {
+        case .normal: .secondary
+        case .attention: Palette.attention
+        case .trouble: Palette.trouble
         }
     }
 
-    private func hostChip(_ host: HostInfo) -> some View {
-        let up = host.link == .connected
-        let external = externalStatus(host)
-        return HStack(spacing: 4) {
-            Chip(text: up ? host.name : "\(host.name) · down", dot: up ? Palette.signal : Palette.trouble)
-            if let external {
-                Chip(text: external.short, symbol: external.symbol, tint: external.tone.color)
-            }
+    /// The line's tooltip: where MCP is, `gh`'s own words, and each host's.
+    private var tooltip: String {
+        var lines: [String] = []
+        if model.localHost?.mcp == true { lines.append("MCP at \(model.mcp?.url ?? MCPSetup.url)") }
+        if let detail = model.gh?.detail { lines.append(detail) }
+        for host in model.otherHosts {
+            lines.append("\(host.name): " + hostHelp(host).replacingOccurrences(of: "\n", with: "; "))
         }
-        .help(hostHelp(host))
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel(
-            "\(host.name), \(up ? "connected" : "link down")"
-                + (external.map { ", external address \($0.short)" } ?? ""))
+        return lines.joined(separator: "\n")
     }
 
     /// A host's tooltip: why its link is down, or its hostname; and while
@@ -199,6 +182,7 @@ struct AgentList: View {
                 }
                 .padding(.top, 2)
                 .padding(.bottom, 6)
+                .background(OverlayScrollers())
             }
             .frame(maxHeight: 440)
             .fixedSize(horizontal: false, vertical: true)
@@ -296,14 +280,17 @@ struct AgentRow: View {
             HStack(alignment: .top, spacing: 10) {
                 StatusDot(dot: StateDot(agent.state))
                     .padding(.top, 4)
-                VStack(alignment: .leading, spacing: 3) {
+                VStack(alignment: .leading, spacing: 4) {
                     HStack(spacing: 6) {
                         Text(agent.ref)
                             .font(.system(.callout, design: .monospaced).weight(.medium))
                             .lineLimit(1)
                             .truncationMode(.middle)
-                        Chip(text: agent.profile, symbol: environmentSymbol(agent.environment))
-                            .layoutPriority(-1)
+                        // The environment, as a symbol: the profile is in the
+                        // tooltip and in what VoiceOver says.
+                        Image(systemName: environmentSymbol(agent.environment))
+                            .imageScale(.small)
+                            .foregroundStyle(.tertiary)
                         Spacer(minLength: 6)
                         if model.attaching.contains(agent.key) {
                             ProgressView().controlSize(.mini)
@@ -340,13 +327,15 @@ struct AgentRow: View {
                 }
             }
             .padding(.horizontal, Metrics.gutter)
-            .padding(.vertical, 7)
+            .padding(.vertical, 9)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .buttonStyle(MenuRowStyle(selected: selected))
         .opacity(unavailable ? 0.45 : 1)
         .disabled(unavailable)
-        .help(unavailable ? "\(agent.host) can't be reached. Its agents keep running there." : "Open in Terminal")
+        .help(
+            "\(agent.profile) · \(agent.environment.title)\n"
+                + (unavailable ? "\(agent.host) can't be reached. Its agents keep running there." : "Click to open it in Terminal."))
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(rowAccessibilityLabel(agent, now: model.now, unavailable: unavailable))
         .accessibilityHint(unavailable ? "" : "Opens it in Terminal")
@@ -577,12 +566,6 @@ struct OfflineView: View {
                 .font(.callout)
                 .multilineTextAlignment(.center)
                 .fixedSize(horizontal: false, vertical: true)
-            Text(sentence(why))
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .textSelection(.enabled)
-                .fixedSize(horizontal: false, vertical: true)
             Button {
                 Task {
                     trying = true
@@ -593,6 +576,19 @@ struct OfflineView: View {
                 if trying { ProgressView().controlSize(.small) } else { Text("Try Again") }
             }
             .disabled(trying)
+            DisclosureGroup("Details") {
+                Text(sentence(why))
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.top, 4)
+            }
+            .font(.subheadline)
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: 280)
+            .help(sentence(why))
         }
         .padding(.vertical, 22)
         .padding(.horizontal, 28)
