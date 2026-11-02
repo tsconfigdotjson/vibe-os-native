@@ -432,17 +432,25 @@ struct ProfileRow: View {
                     ForEach(ClaudeModel.allCases, id: \.self) { Text($0.title).tag($0) }
                 }
                 .pickerStyle(.segmented)
-                Picker("Reasoning", selection: binding(\.reasoning, \.reasoning)) {
-                    ForEach(ReasoningLevel.allCases, id: \.self) { Text($0.title).tag($0) }
+                // Five levels don't fit a segmented control here, so a
+                // bordered pop-up, as New Agent's are.
+                LabeledContent("Reasoning") {
+                    PopUp(
+                        label: "Reasoning",
+                        items: ReasoningLevel.allCases.map { PopUp<ReasoningLevel>.Item(title: $0.title, value: $0) },
+                        selection: binding(\.reasoning, \.reasoning)
+                    )
+                    .frame(width: 140)
                 }
                 Picker("Mode", selection: binding(\.mode, \.mode)) {
                     ForEach(PermissionMode.allCases, id: \.self) { Text($0.title).tag($0) }
                 }
                 .pickerStyle(.segmented)
+                // A compact field, as Host Limits' are, beside its stepper.
                 LabeledContent("Memory") {
                     HStack(spacing: 6) {
                         CommitField(
-                            title: "Memory", value: formatSize(profile.memory), width: 80,
+                            title: "Memory", value: formatSize(profile.memory), width: 72,
                             help: "1G to 1T, in whole MB, such as 4G or 6144M", isValid: validMemory
                         ) { text in
                             await update { $0.memory = parseBytes(text) }
@@ -455,6 +463,7 @@ struct ProfileRow: View {
                         .help("A gigabyte more or less")
                         .accessibilityLabel("Memory, a gigabyte more or less")
                     }
+                    .fixedSize()
                 }
                 if shown.mode == .bypass {
                     Label(
@@ -777,21 +786,14 @@ struct NewKeySheet: View {
                 .accessibilityLabel("The key")
             HStack {
                 CopyButton(title: "Copy Key", text: created.secret)
-                CopyButton(
-                    title: "Copy Setup Command",
-                    text: MCPSetup.command(secret: created.secret, url: model.mcp?.url ?? MCPSetup.url), prominent: true)
-            }
-            let others = otherSetups(created.secret)
-            if !others.isEmpty {
-                HStack {
-                    Text("Also for").font(.callout).foregroundStyle(.secondary)
-                    ForEach(others, id: \.title) { setup in
-                        CopyButton(title: setup.title, text: setup.command)
-                            .help(setup.help)
-                    }
+                let lines = setups(created.secret)
+                if lines.count > 1 {
+                    SetupMenu(setups: lines)
+                } else if let only = lines.first {
+                    CopyButton(title: "Copy Setup Command", text: only.command, prominent: true)
                 }
             }
-            Text("A setup command is a claude mcp add line: paste it where Claude Code runs.")
+            Text("A setup command is a \(Text("claude mcp add").font(.caption.monospaced())) line: paste it where Claude Code runs.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
             HStack {
@@ -808,25 +810,25 @@ struct NewKeySheet: View {
         }
     }
 
-    private struct Setup {
-        let title: String
-        let command: String
-        let help: String
-    }
-
-    /// Setup lines for clients elsewhere: on the tailnet, while MCP is
-    /// served there, and anywhere, through the external address.
-    private func otherSetups(_ secret: String) -> [Setup] {
-        var setups: [Setup] = []
+    /// The setup lines a client can use (PRD: MCP interface, Auth): this
+    /// Mac's, always; on the tailnet, while MCP is served there; and
+    /// anywhere, through the external address.
+    private func setups(_ secret: String) -> [KeySetup] {
+        let local = model.mcp?.url ?? MCPSetup.url
+        var setups = [
+            KeySetup(
+                title: "This Mac", command: MCPSetup.command(secret: secret, url: local),
+                help: "Sets up a client on this Mac, at \(local)")
+        ]
         if let tailscale = model.mcp?.tailscaleUrls.first {
             setups.append(
-                Setup(
+                KeySetup(
                     title: "Tailscale", command: MCPSetup.command(secret: secret, url: tailscale),
                     help: "Sets up a client on your tailnet, at \(tailscale)"))
         }
         if let host = model.externalHost, let url = host.url {
             setups.append(
-                Setup(
+                KeySetup(
                     title: "The Internet", command: MCPSetup.command(secret: secret, url: url),
                     help: "Sets up a client anywhere, through \(host.name), at \(url)"))
         }
@@ -842,6 +844,55 @@ struct NewKeySheet: View {
             error = nil
         } catch {
             self.error = describe(error)
+        }
+    }
+}
+
+/// A setup line for a new key: where it's for, and the line.
+struct KeySetup {
+    let title: String
+    let command: String
+    let help: String
+}
+
+/// Copy Setup Command as one split button: a click copies this Mac's line,
+/// and its menu has a line for each place a client can be. It says Copied
+/// for a moment, as CopyButton does.
+struct SetupMenu: View {
+    let setups: [KeySetup]
+    @State private var copied = false
+    @State private var reset: Task<Void, Never>?
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        Menu {
+            ForEach(setups, id: \.title) { setup in
+                Button("For \(setup.title)") { copy(setup) }
+                    .help(setup.help)
+            }
+        } label: {
+            Label(copied ? "Copied" : "Copy Setup Command", systemImage: copied ? "checkmark" : "doc.on.doc")
+                .contentTransition(.symbolEffect(.replace))
+        } primaryAction: {
+            if let first = setups.first { copy(first) }
+        }
+        // The sheet's main action, prominent as it is with one line.
+        .menuStyle(.button)
+        .buttonStyle(.borderedProminent)
+        .fixedSize()
+        .help("Copies this Mac's setup line; the menu has one for each place a client can be")
+        .accessibilityLabel(copied ? "Copied" : "Copy Setup Command")
+    }
+
+    private func copy(_ setup: KeySetup) {
+        WorktreeActions.copy(setup.command)
+        withAnimation(motion(.snappy, reduce: reduceMotion)) { copied = true }
+        // Copied lasts 1.6 s from the last copy, not the first.
+        reset?.cancel()
+        reset = Task {
+            try? await Task.sleep(for: .seconds(1.6))
+            guard !Task.isCancelled else { return }
+            withAnimation(motion(.snappy, reduce: reduceMotion)) { copied = false }
         }
     }
 }

@@ -638,7 +638,13 @@ public struct HeaderAlert: Equatable, Sendable, Identifiable {
     public var id: String
     /// An SF Symbol.
     public var symbol: String
-    public var title: String
+    /// The host it's about, if any: shown as a name, in monospace, as
+    /// agents' refs are, so `box is down` doesn't read as a typo.
+    public var name: String?
+    /// The rest of the headline, after the name.
+    public var headline: String
+    /// The whole headline, for VoiceOver.
+    public var title: String { name.map { "\($0) \(headline)" } ?? headline }
     /// What it means, plainly.
     public var detail: String
     /// The technical reason, for a tooltip.
@@ -664,7 +670,7 @@ public func headerAlerts(gh: GhStatus?, hosts: [HostInfo]) -> [HeaderAlert] {
     for host in hosts where host.link == .down {
         alerts.append(
             HeaderAlert(
-                id: "host:\(host.name)", symbol: "exclamationmark.triangle.fill", title: "\(host.name) is down",
+                id: "host:\(host.name)", symbol: "exclamationmark.triangle.fill", name: host.name, headline: "is down",
                 detail: "Its agents keep running. VibeOS reconnects on its own.",
                 reason: host.detail.map(sentence), tone: .trouble))
     }
@@ -672,7 +678,8 @@ public func headerAlerts(gh: GhStatus?, hosts: [HostInfo]) -> [HeaderAlert] {
         guard let external = externalStatus(host), external.tone == .trouble else { continue }
         alerts.append(
             HeaderAlert(
-                id: "external:\(host.name)", symbol: "globe", title: "\(host.name) isn't reachable from outside",
+                id: "external:\(host.name)", symbol: "globe", name: host.name,
+                headline: "isn't reachable from outside",
                 detail: external.summary, reason: external.detail.map(sentence), tone: .attention))
     }
     let ghAlert: (String, String)?
@@ -685,7 +692,7 @@ public func headerAlerts(gh: GhStatus?, hosts: [HostInfo]) -> [HeaderAlert] {
     if let ghAlert {
         alerts.append(
             HeaderAlert(
-                id: "gh", symbol: "person.crop.circle.badge.exclamationmark", title: ghAlert.0, detail: ghAlert.1,
+                id: "gh", symbol: "person.crop.circle.badge.exclamationmark", headline: ghAlert.0, detail: ghAlert.1,
                 reason: gh?.detail, tone: .attention))
     }
     return alerts

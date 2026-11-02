@@ -338,14 +338,17 @@ struct CopyButton: View {
     let text: String
     var prominent = false
     @State private var copied = false
+    @State private var reset: Task<Void, Never>?
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         let button = Button {
             WorktreeActions.copy(text)
             withAnimation(motion(.snappy, reduce: reduceMotion)) { copied = true }
-            Task {
+            reset?.cancel()
+            reset = Task {
                 try? await Task.sleep(for: .seconds(1.6))
+                guard !Task.isCancelled else { return }
                 withAnimation(motion(.snappy, reduce: reduceMotion)) { copied = false }
             }
         } label: {

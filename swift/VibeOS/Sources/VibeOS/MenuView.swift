@@ -164,7 +164,7 @@ struct AlertRow: View {
                 .foregroundStyle(tint)
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 2) {
-                Text(alert.title).font(.callout.weight(.semibold))
+                headline.font(.callout.weight(.semibold))
                 Text(alert.detail)
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
@@ -179,8 +179,16 @@ struct AlertRow: View {
             RoundedRectangle(cornerRadius: Metrics.cardRadius, style: .continuous)
                 .strokeBorder(tint.opacity(0.45), lineWidth: 0.5)
         )
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(alert.title). \(alert.detail)")
+        .accessibilityHint(alert.reason ?? "")
         .help(alert.reason ?? "")
-        .accessibilityElement(children: .combine)
+    }
+
+    /// The host's name in monospace, as agents' refs are, then the rest.
+    private var headline: Text {
+        guard let name = alert.name else { return Text(alert.headline) }
+        return Text("\(Text(name).font(.system(.callout, design: .monospaced).weight(.semibold))) \(alert.headline)")
     }
 }
 
@@ -237,6 +245,8 @@ struct AgentList: View {
     /// vibed can't be reached: every row shows, unavailable.
     var offline = false
     @State private var selection: String?
+    /// The rows' height, to know when they run past the list's.
+    @State private var contentHeight: CGFloat = 0
     @FocusState private var focused: Bool
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -263,11 +273,23 @@ struct AgentList: View {
                         }
                     }
                 }
+                // The rows alone, before the padding that depends on it.
+                .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { contentHeight = $0 }
                 .padding(.top, 2)
-                .padding(.bottom, 6)
+                // Room for the last row to clear the fade at the very end.
+                .padding(.bottom, overflows ? Self.fade : 6)
                 .background(OverlayScrollers())
             }
-            .frame(maxHeight: 440)
+            .frame(maxHeight: Self.maxHeight)
+            // A soft fade at the bottom edge while more rows are below, so
+            // a cut-off group reads as more to scroll to, not a hard edge.
+            .mask {
+                VStack(spacing: 0) {
+                    Color.black
+                    LinearGradient(colors: [.black, .black.opacity(0)], startPoint: .top, endPoint: .bottom)
+                        .frame(height: overflows ? Self.fade : 0)
+                }
+            }
             .fixedSize(horizontal: false, vertical: true)
             .focusable()
             .focused($focused)
@@ -290,6 +312,13 @@ struct AgentList: View {
             .animation(motion(.smooth(duration: 0.3), reduce: reduceMotion), value: model.agents.map(\.key))
         }
     }
+
+    private static let maxHeight: CGFloat = 440
+    private static let fade: CGFloat = 24
+
+    /// Whether the rows (with their usual padding) run past the list's
+    /// height, so it scrolls.
+    private var overflows: Bool { contentHeight + 2 + 6 > Self.maxHeight + 1 }
 
     private func isUnavailable(_ host: String) -> Bool {
         offline || model.unavailableHosts.contains(host)
