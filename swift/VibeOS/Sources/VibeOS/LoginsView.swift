@@ -9,6 +9,7 @@ import VibeRPC
 /// boots nothing.
 struct LoginsView: View {
     @ObservedObject var model: MenuModel
+    @Environment(\.dismissWindow) private var dismissWindow
     @State private var logins: ToolboxLogins?
     @State private var error: String?
 
@@ -74,6 +75,7 @@ struct LoginsView: View {
             .padding(14)
         }
         .frame(width: 480, height: 440)
+        .onExitCommand { dismissWindow(id: WindowID.logins) }
         // Again after each toolbox change, as a save notes a new home's,
         // and on coming back to the app, as from `vibe setup-token`.
         .task(id: model.toolbox) { await load() }

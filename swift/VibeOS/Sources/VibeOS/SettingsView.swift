@@ -212,7 +212,7 @@ struct ProjectLabel: View {
 
     var body: some View {
         HStack(spacing: 10) {
-            Image(systemName: project.source == .github ? "chevron.left.forwardslash.chevron.right" : "folder")
+            Image(systemName: projectSymbol(project))
                 .foregroundStyle(.secondary)
                 .frame(width: 20)
             VStack(alignment: .leading, spacing: 2) {
@@ -232,15 +232,18 @@ struct ProjectLabel: View {
     }
 }
 
+/// A project's kind, as a glyph: a GitHub repo's branch, or a folder.
+func projectSymbol(_ project: Project) -> String {
+    project.source == .github ? "arrow.triangle.branch" : "folder.fill"
+}
+
 /// A project's page header: its name, where it comes from, and where it is.
 struct ProjectHeader: View {
     let project: Project
 
     var body: some View {
         HStack(spacing: 12) {
-            IconTile(
-                symbol: project.source == .github ? "chevron.left.forwardslash.chevron.right" : "folder.fill",
-                color: .blue, size: 40)
+            IconTile(symbol: projectSymbol(project), color: .blue, size: 40)
             VStack(alignment: .leading, spacing: 3) {
                 Text(project.name).font(.title2.weight(.semibold))
                 Text(project.repo.map { "github.com/\($0)" } ?? "A folder")
@@ -266,9 +269,18 @@ struct ProjectDetail: View {
     let host: String
     let name: String
     @State private var project: Project?
+    /// The profiles open for editing.
+    @State private var expanded: Set<String>
     @State private var newProfile = ""
     @State private var error: String?
     @Environment(\.dismiss) private var dismiss
+
+    init(model: MenuModel, host: String, name: String, expanded: Set<String> = []) {
+        self.model = model
+        self.host = host
+        self.name = name
+        _expanded = State(initialValue: expanded)
+    }
 
     var body: some View {
         Form {
@@ -276,8 +288,27 @@ struct ProjectDetail: View {
                 Section {
                     ProjectHeader(project: project)
                 }
-                ForEach(project.profiles, id: \.name) { profile in
-                    ProfileSection(model: model, host: host, project: name, profile: profile) { await load() }
+                Section {
+                    ForEach(project.profiles, id: \.name) { profile in
+                        ProfileRow(
+                            model: model, host: host, project: name, profile: profile,
+                            expanded: Binding(
+                                get: { expanded.contains(profile.name) },
+                                set: { open in
+                                    if open { expanded.insert(profile.name) } else { expanded.remove(profile.name) }
+                                }),
+                            renamed: { new in
+                                // The old name is kept too, so the row stays
+                                // open while the rename is on its way.
+                                if expanded.contains(profile.name) { expanded.insert(new) }
+                            }
+                        ) { await load() }
+                    }
+                } header: {
+                    Text("Profiles")
+                } footer: {
+                    Text("Click a profile to change it. Memory is a Linux VM's RAM, or a macOS agent's hard limit.")
+                        .foregroundStyle(.secondary)
                 }
                 Section {
                     HStack {
@@ -354,11 +385,14 @@ struct ProjectDetail: View {
 
 /// One profile: environment, model, reasoning, mode and memory (PRD:
 /// Profiles). Each change is sent as it's made.
-struct ProfileSection: View {
+struct ProfileRow: View {
     @ObservedObject var model: MenuModel
     let host: String
     let project: String
     let profile: Profile
+    @Binding var expanded: Bool
+    /// Called with the new name once a rename took, so the row stays open.
+    var renamed: (String) -> Void = { _ in }
     let changed: () async -> Void
     /// What a change just made shows until vibed's answer comes back.
     @State private var pending: Profile?
@@ -372,13 +406,17 @@ struct ProfileSection: View {
     }
 
     var body: some View {
-        Section {
+        DisclosureGroup(isExpanded: $expanded) {
             LabeledContent("Name") {
                 CommitField(
                     title: "Name", value: profile.name, width: 220,
                     isValid: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
                 ) { text in
-                    await update { $0.name = text.trimmingCharacters(in: .whitespaces) }
+                    let name = text.trimmingCharacters(in: .whitespaces)
+                    // Before the reload the update makes, so the row is
+                    // open under its new name when it comes back.
+                    renamed(name)
+                    return await update { $0.name = name }
                 }
             }
             Picker("Environment", selection: binding(\.environment, \.environment)) {
@@ -396,37 +434,59 @@ struct ProfileSection: View {
                 ForEach(PermissionMode.allCases, id: \.self) { Text($0.title).tag($0) }
             }
             .pickerStyle(.segmented)
-            LabeledContent {
+            LabeledContent("Memory") {
                 CommitField(
                     title: "Memory", value: formatSize(profile.memory), width: 90,
                     help: "1G to 1T, in whole MB, such as 4G or 6144M", isValid: validMemory
                 ) { text in
                     await update { $0.memory = parseBytes(text) }
                 }
-            } label: {
-                Text("Memory")
-                Text("A Linux VM's RAM, or a macOS agent's hard limit")
             }
+            if shown.mode == .bypass {
+                Label(
+                    shown.environment == .macos
+                        ? "Bypass skips every permission prompt, and a macOS agent acts as you."
+                        : "Bypass skips every permission prompt; the VM is its sandbox.",
+                    systemImage: "exclamationmark.shield"
+                )
+                .font(.callout)
+                .foregroundStyle(shown.environment == .macos ? Palette.attention : Color.secondary)
+            }
+            ErrorText(error: error)
             HStack {
                 Spacer()
                 Button("Delete Profile…", role: .destructive) { Task { await delete() } }
-                    .buttonStyle(.borderless)
                     .accessibilityLabel("Delete profile \(profile.name)")
             }
-        } footer: {
-            VStack(alignment: .leading, spacing: 4) {
-                if shown.mode == .bypass {
-                    Label(
-                        shown.environment == .macos
-                            ? "Bypass skips every permission prompt, and a macOS agent acts as you."
-                            : "Bypass skips every permission prompt; the VM is its sandbox.",
-                        systemImage: "exclamationmark.shield"
-                    )
-                    .foregroundStyle(shown.environment == .macos ? Palette.attention : Color.secondary)
-                }
-                ErrorText(error: error)
+        } label: {
+            // A click anywhere on the row opens it, as a button, so VoiceOver
+            // has it too.
+            Button { expanded.toggle() } label: { summary }
+                .buttonStyle(.plain)
+                .accessibilityHint(expanded ? "Closes its settings" : "Opens its settings")
+        }
+    }
+
+    private var summary: some View {
+        HStack(spacing: 10) {
+            Image(systemName: environmentSymbol(shown.environment))
+                .foregroundStyle(.secondary)
+                .frame(width: 20)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(profile.name)
+                Text(profileSummary(shown))
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 0)
+            if shown.mode == .bypass && shown.environment == .macos {
+                Image(systemName: "exclamationmark.shield")
+                    .foregroundStyle(Palette.attention)
+                    .help("Bypass on macOS: this agent acts as you")
+                    .accessibilityLabel("Bypass on macOS")
             }
         }
+        .contentShape(Rectangle())
     }
 
     private func validMemory(_ text: String) -> Bool {
@@ -519,12 +579,8 @@ struct KeysPane: View {
     }
 
     private var keysNote: String {
-        var note = "A key is as good as a shell on this Mac. Every key has full access, so revoke one that leaks."
-        if let host = model.externalHost {
-            note += " Keys also work from the internet, through \(host.name); revoking one cuts it off there and "
-                + "on this Mac at once."
-        }
-        return note
+        let reach = model.externalHost.map { "this Mac, and through \($0.name)" } ?? "this Mac"
+        return "A key is as good as a shell on \(reach). Revoke one you no longer trust, and it stops at once."
     }
 
     private func load() async {
@@ -570,8 +626,10 @@ struct KeyRow: View {
             // The name and details read as one; Revoke stays its own button.
             .accessibilityElement(children: .combine)
             Spacer()
+            // Red, as it can't be undone; it asks first.
             Button("Revoke…", role: .destructive, action: revoke)
-                .controlSize(.small)
+                .buttonStyle(.bordered)
+                .tint(Palette.trouble)
                 .accessibilityLabel("Revoke \(key.name)")
         }
     }
@@ -592,6 +650,7 @@ struct NewKeySheet: View {
     @State private var working = false
     @State private var error: String?
     @State private var appeared = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     init(model: MenuModel, preview: KeyCreated? = nil) {
         self.model = model
@@ -610,6 +669,8 @@ struct NewKeySheet: View {
         }
         .padding(20)
         .frame(width: 520)
+        // Escape closes it, before or after the key is made.
+        .onExitCommand { dismiss() }
     }
 
     private var form: some View {
@@ -643,10 +704,14 @@ struct NewKeySheet: View {
     private func made(_ created: KeyCreated) -> some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .top, spacing: 12) {
+                // A small success: it springs in, then bounces once.
+                // Under Reduce Motion it's simply there.
                 Image(systemName: "checkmark.seal.fill")
                     .font(.system(size: 30))
                     .foregroundStyle(Palette.signal)
-                    .symbolEffect(.bounce, value: appeared)
+                    .scaleEffect(appeared || reduceMotion ? 1 : 0.3)
+                    .opacity(appeared || reduceMotion ? 1 : 0)
+                    .symbolEffect(.bounce, value: reduceMotion ? false : appeared)
                 VStack(alignment: .leading, spacing: 3) {
                     Text("\(created.key.name) is ready").font(.headline)
                     Text("Copy it now: it isn't shown again.").font(.callout).foregroundStyle(.secondary)
@@ -657,7 +722,7 @@ struct NewKeySheet: View {
                 .textSelection(.enabled)
                 .padding(10)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Color.primary.opacity(0.05)))
+                .background(RoundedRectangle(cornerRadius: Metrics.cardRadius, style: .continuous).fill(Color.primary.opacity(0.05)))
                 .accessibilityLabel("The key")
             HStack {
                 CopyButton(title: "Copy Key", text: created.secret)
@@ -684,7 +749,12 @@ struct NewKeySheet: View {
                     .keyboardShortcut(.defaultAction)
             }
         }
-        .onAppear { appeared = true }
+        .task {
+            try? await Task.sleep(for: .milliseconds(120))
+            withAnimation(motion(.spring(response: 0.42, dampingFraction: 0.55), reduce: reduceMotion)) {
+                appeared = true
+            }
+        }
     }
 
     private struct Setup {
@@ -1023,7 +1093,7 @@ struct ExternalAddressSheet: View {
                     .onSubmit { Task { await turnOn() } }
                 Text("https://\(name ?? "public name")/mcp")
                     .font(.callout.monospaced())
-                    .foregroundStyle(name == nil ? HierarchicalShapeStyle.tertiary : HierarchicalShapeStyle.secondary)
+                    .foregroundStyle(.secondary)
                     .accessibilityLabel("Clients use https://\(name ?? "the public name")/mcp")
             }
             .disabled(working)

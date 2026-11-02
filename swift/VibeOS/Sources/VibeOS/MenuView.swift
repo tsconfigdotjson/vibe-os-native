@@ -9,11 +9,13 @@ import VibeRPC
 /// and that the agents keep running.
 struct MenuView: View {
     @ObservedObject var model: MenuModel
+    /// The host facts open under the header, for the gallery.
+    var showFacts = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HeaderView(model: model)
+            HeaderView(model: model, showFacts: showFacts)
                 .padding(.horizontal, Metrics.gutter)
                 .padding(.top, 12)
                 .padding(.bottom, 10)
@@ -68,61 +70,65 @@ struct MenuView: View {
 
 // MARK: Header
 
-/// The agent count, and how the host is doing: the Mac's memory, `gh`,
-/// MCP, and each Linux host's link and external address.
+/// The count of agents, then only what needs the owner, each on a row of
+/// its own (PRD: Menu bar, Header). The steady facts (the Mac's memory,
+/// `gh`, MCP, each Linux host's link and external address) sit behind one
+/// quiet button beside the count, and open in place.
 struct HeaderView: View {
     @ObservedObject var model: MenuModel
+    @State private var showFacts: Bool
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
+    init(model: MenuModel, showFacts: Bool = false) {
+        self.model = model
+        _showFacts = State(initialValue: showFacts)
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(alignment: .firstTextBaseline) {
+        let connected = model.connection == .connected
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
                 Text("VibeOS").font(.headline)
                 Spacer()
-                if model.connection == .connected {
+                if connected {
                     Text(agentSummary(model.agents))
                         .font(.callout)
                         .monospacedDigit()
                         .foregroundStyle(.secondary)
                         .contentTransition(.numericText())
                         .animation(motion(.snappy, reduce: reduceMotion), value: agentSummary(model.agents))
+                    Button {
+                        withAnimation(motion(.snappy(duration: 0.22), reduce: reduceMotion)) { showFacts.toggle() }
+                    } label: {
+                        Image(systemName: "info.circle")
+                            .symbolVariant(showFacts ? .fill : .none)
+                            .foregroundStyle(.secondary)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help(showFacts ? "Hide host status" : "Memory, GitHub, MCP and hosts")
+                    .accessibilityLabel("Host status")
+                    .accessibilityValue(showFacts ? "Shown" : "Hidden")
+                    .accessibilityAddTraits(.isToggle)
                 }
             }
-            if model.connection == .connected {
-                let parts = headerStatus(
-                    memory: model.memory, gh: model.gh, mcp: model.localHost?.mcp == true, hosts: model.hosts)
-                // It wraps rather than truncates: what's cut would be the
-                // end, where a host that's down shows.
-                statusLine(parts)
-                    .font(.subheadline)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .help(tooltip)
-                    .accessibilityElement(children: .ignore)
-                    .accessibilityLabel(parts.map(\.spoken).joined(separator: ", "))
+            if connected {
+                ForEach(headerAlerts(gh: model.gh, hosts: model.hosts)) { alert in
+                    AlertRow(alert: alert)
+                }
+                if showFacts {
+                    FactsGrid(
+                        facts: headerFacts(
+                            memory: model.memory, gh: model.gh, mcp: model.localHost?.mcp == true, hosts: model.hosts),
+                        tooltip: tooltip
+                    )
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+                }
             }
         }
     }
 
-    /// The parts, one after another: quiet, with colour only where
-    /// something's wrong.
-    private func statusLine(_ parts: [StatusSegment]) -> Text {
-        var line = Text("")
-        for (i, part) in parts.enumerated() {
-            let piece = Text(part.text).foregroundStyle(color(part.tone))
-            line = i == 0 ? piece : Text("\(line)\(Text("  ·  ").foregroundStyle(.tertiary))\(piece)")
-        }
-        return line
-    }
-
-    private func color(_ tone: StatusSegment.Tone) -> Color {
-        switch tone {
-        case .normal: .secondary
-        case .attention: Palette.attention
-        case .trouble: Palette.trouble
-        }
-    }
-
-    /// The line's tooltip: where MCP is, `gh`'s own words, and each host's.
+    /// The facts' tooltip: where MCP is, `gh`'s own words, and each host's.
     private var tooltip: String {
         var lines: [String] = []
         if model.localHost?.mcp == true { lines.append("MCP at \(model.mcp?.url ?? MCPSetup.url)") }
@@ -143,6 +149,78 @@ struct HeaderView: View {
             if let detail = external.detail { lines.append(sentence(detail)) }
         }
         return lines.joined(separator: "\n")
+    }
+}
+
+/// One thing that needs the owner: a glyph, what's wrong, and what it
+/// means, on a tint of its colour.
+struct AlertRow: View {
+    let alert: HeaderAlert
+
+    var body: some View {
+        let tint = alert.tone == .trouble ? Palette.trouble : Palette.attention
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: alert.symbol)
+                .foregroundStyle(tint)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(alert.title).font(.callout.weight(.semibold))
+                Text(alert.detail)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(RoundedRectangle(cornerRadius: Metrics.cardRadius, style: .continuous).fill(tint.opacity(0.12)))
+        .help(alert.reason ?? "")
+        .accessibilityElement(children: .combine)
+    }
+}
+
+/// The steady facts, in two aligned columns.
+struct FactsGrid: View {
+    let facts: [HeaderFact]
+    let tooltip: String
+
+    var body: some View {
+        Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 5) {
+            ForEach(facts) { fact in
+                GridRow {
+                    // One element per fact for VoiceOver: a GridRow's
+                    // modifiers go to each cell, so the label cell speaks
+                    // for both.
+                    Label(fact.label, systemImage: fact.symbol)
+                        .foregroundStyle(.secondary)
+                        .accessibilityElement(children: .ignore)
+                        .accessibilityLabel("\(fact.label), \(fact.value)")
+                    Text(fact.value)
+                        .foregroundStyle(color(fact.tone))
+                        .monospacedDigit()
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .accessibilityHidden(true)
+                }
+            }
+        }
+        .font(.subheadline)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: Metrics.cardRadius, style: .continuous).fill(Color.primary.opacity(0.05))
+        )
+        .help(tooltip)
+    }
+
+    private func color(_ tone: StatusTone) -> Color {
+        switch tone {
+        case .normal: .primary
+        case .attention: Palette.attention
+        case .trouble: Palette.trouble
+        }
     }
 }
 
@@ -167,7 +245,8 @@ struct AgentList: View {
                             GroupHeader(
                                 model: model, group: project,
                                 showHost: model.groups.count > 1 || host.host != VibeRPC.localHost,
-                                unavailable: isUnavailable(project.host))
+                                unavailable: isUnavailable(project.host),
+                                first: project.id == model.groups.first?.projects.first?.id)
                             ForEach(project.agents, id: \.key) { agent in
                                 AgentRow(
                                     model: model, agent: agent,
@@ -237,16 +316,17 @@ struct GroupHeader: View {
     let group: ProjectGroup
     let showHost: Bool
     let unavailable: Bool
+    /// The first heading sits close under the header; each after it has
+    /// room above, so groups read as groups.
+    var first = false
 
     var body: some View {
         HStack(spacing: 5) {
-            if showHost {
-                Image(systemName: group.host == VibeRPC.localHost ? "laptopcomputer" : "server.rack")
-                    .imageScale(.small)
-                Text(hostName)
-                Text("·").foregroundStyle(.tertiary)
-            }
             Text(group.project)
+                .foregroundStyle(.primary)
+            if showHost {
+                Text("on \(hostName)")
+            }
             if unavailable {
                 Text("· unavailable").foregroundStyle(Palette.trouble)
             }
@@ -254,8 +334,8 @@ struct GroupHeader: View {
         .font(.subheadline.weight(.semibold))
         .foregroundStyle(.secondary)
         .padding(.horizontal, Metrics.gutter)
-        .padding(.top, 10)
-        .padding(.bottom, 3)
+        .padding(.top, first ? 8 : 16)
+        .padding(.bottom, 2)
         .accessibilityElement(children: .combine)
         .accessibilityAddTraits(.isHeader)
     }
@@ -290,7 +370,7 @@ struct AgentRow: View {
                         // tooltip and in what VoiceOver says.
                         Image(systemName: environmentSymbol(agent.environment))
                             .imageScale(.small)
-                            .foregroundStyle(.tertiary)
+                            .foregroundStyle(.secondary)
                         Spacer(minLength: 6)
                         if model.attaching.contains(agent.key) {
                             ProgressView().controlSize(.mini)
@@ -302,8 +382,13 @@ struct AgentRow: View {
                         }
                     }
                     if let title = lines.title {
-                        Text(title).lineLimit(1)
+                        Text(title)
+                            .font(.body.weight(.medium))
+                            .lineLimit(1)
                     }
+                    // One quiet status line: what it's doing, and its
+                    // memory as a thin bar that only speaks up (in words and
+                    // colour) near or at its limit.
                     if lines.line != nil || MemoryGauge(agent) != nil {
                         HStack(spacing: 6) {
                             if let line = lines.line {
@@ -315,14 +400,14 @@ struct AgentRow: View {
                                     }
                                     Text(line).lineLimit(1)
                                 }
+                                .foregroundStyle(.secondary)
                             }
                             Spacer(minLength: 6)
                             if let gauge = MemoryGauge(agent) {
-                                MemoryBar(gauge: gauge)
+                                MemoryBar(gauge: gauge, note: memoryNote(agent))
                             }
                         }
                         .font(.subheadline)
-                        .foregroundStyle(.secondary)
                     }
                 }
             }
@@ -513,7 +598,7 @@ struct SetupStepRow: View {
             if !step.done {
                 Image(systemName: "chevron.right")
                     .font(.caption.weight(.semibold))
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.secondary)
                     .padding(.top, 3)
             }
         }

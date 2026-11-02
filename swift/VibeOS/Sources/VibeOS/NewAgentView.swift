@@ -1,10 +1,11 @@
+import AppKit
 import SwiftUI
 import VibeMenu
 import VibeRPC
 
 /// New agent…: the prompt first, as it's the point, then a host, a project
 /// and one of its profiles, and an optional name (PRD: Key user flows,
-/// Start an agent). Return starts it, or ⌘↩ from the prompt.
+/// Start an agent). Return starts it; Shift-Return is a new line.
 struct NewAgentView: View {
     @ObservedObject var model: MenuModel
     @Environment(\.dismissWindow) private var dismissWindow
@@ -40,46 +41,20 @@ struct NewAgentView: View {
             }
         }
         .frame(width: 540)
+        // Escape closes it, whichever state it's in.
+        .onExitCommand { dismissWindow(id: WindowID.newAgent) }
         .task(id: host) { await loadProjects() }
         .onChange(of: model.settingsRevision) { Task { await loadProjects() } }
         .onChange(of: project) { pickProfile() }
     }
 
     private var composer: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            ZStack(alignment: .topLeading) {
-                TextEditor(text: $prompt)
-                    .font(.body)
-                    .scrollContentBackground(.hidden)
-                    .focused($promptFocused)
-                    .padding(8)
-                    .accessibilityLabel("Prompt")
-                    // Its scroller shows only while it scrolls.
-                    .background(OverlayScrollers(target: .nearbyTextView))
-                if prompt.isEmpty {
-                    Text("What should it work on?")
-                        .foregroundStyle(.tertiary)
-                        .padding(.horizontal, 13)
-                        .padding(.vertical, 8)
-                        .allowsHitTesting(false)
-                        .accessibilityHidden(true)
-                }
-            }
-            .frame(minHeight: 150)
-            .background(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .fill(Color(nsColor: .textBackgroundColor))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .strokeBorder(promptFocused ? Color.accentColor.opacity(0.6) : Color.primary.opacity(0.12))
-            )
-            .disabled(starting)
-
-            Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 10) {
+        VStack(alignment: .leading, spacing: 18) {
+            PromptField(text: $prompt, focused: $promptFocused) { Task { await start() } }
+                .disabled(starting)
+            Form {
                 if model.hosts.count > 1 {
-                    GridRow {
-                        label("Host")
+                    LabeledContent("Host:") {
                         Picker("Host", selection: $host) {
                             ForEach(model.hosts, id: \.name) { h in
                                 Text(h.link == .local ? "\(h.label) (this Mac)" : h.name).tag(h.name)
@@ -89,8 +64,7 @@ struct NewAgentView: View {
                         .frame(width: Self.controlWidth)
                     }
                 }
-                GridRow {
-                    label("Project")
+                LabeledContent("Project:") {
                     Picker("Project", selection: $project) {
                         if projects.isEmpty { Text("—").tag("") }
                         ForEach(projects, id: \.name) { p in Text(p.name).tag(p.name) }
@@ -98,9 +72,7 @@ struct NewAgentView: View {
                     .labelsHidden()
                     .frame(width: Self.controlWidth)
                 }
-                // The label sits by the pop-up, not by the summary under it.
-                GridRow(alignment: .firstTextBaseline) {
-                    label("Profile")
+                LabeledContent("Profile:") {
                     VStack(alignment: .leading, spacing: 4) {
                         Picker("Profile", selection: $profile) {
                             if profiles.isEmpty { Text("—").tag("") }
@@ -110,20 +82,22 @@ struct NewAgentView: View {
                         }
                         .labelsHidden()
                         .frame(width: Self.controlWidth)
+                        // Under its pop-up, in the controls' column.
                         if let chosen {
                             ProfileSummary(profile: chosen)
+                                .frame(width: Self.controlWidth, alignment: .leading)
                         }
                     }
                 }
-                GridRow {
-                    label("Name")
-                    TextField("Name", text: $name, prompt: Text("Three random words"))
+                LabeledContent("Name:") {
+                    TextField("Name", text: $name, prompt: Text("Optional, picked for you"))
                         .labelsHidden()
                         .autocorrectionDisabled()
                         .frame(width: Self.controlWidth)
                         .help("The agent's ref and branch. Left empty, it gets three random words, such as quiet-amber-otter.")
                 }
             }
+            .formStyle(.columns)
             .disabled(starting)
 
             ErrorText(error: error)
@@ -135,15 +109,11 @@ struct NewAgentView: View {
                 Spacer()
                 Button("Cancel") { dismissWindow(id: WindowID.newAgent) }
                     .keyboardShortcut(.cancelAction)
-                // In the accent colour, live once there's a prompt. Return
-                // starts it from the other fields; in the prompt, Return is
-                // a new line, so it isn't the default button there, and ⌘↩
-                // starts it instead.
+                // The default button: Return starts it, from the prompt too,
+                // where Shift-Return is the new line. ⌘↩ works as well.
                 Button("Start Agent") { Task { await start() } }
-                    .buttonStyle(.borderedProminent)
-                    .keyboardShortcut(promptFocused ? nil : .defaultAction)
+                    .keyboardShortcut(.defaultAction)
                     .disabled(!canStart)
-                    .help("Return, or ⌘↩ from the prompt")
                     .background {
                         Button("Start Agent") { Task { await start() } }
                             .keyboardShortcut(.return, modifiers: .command)
@@ -159,12 +129,6 @@ struct NewAgentView: View {
 
     /// Every control in the form is this wide, so they line up.
     private static let controlWidth: CGFloat = 300
-
-    private func label(_ text: String) -> some View {
-        Text(text)
-            .foregroundStyle(.secondary)
-            .gridColumnAlignment(.trailing)
-    }
 
     /// No projects on this host: say how to add one.
     private var noProjects: some View {
@@ -188,7 +152,7 @@ struct NewAgentView: View {
                     dismissWindow(id: WindowID.newAgent)
                     showSettings(.projects, with: openWindow)
                 }
-                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
             }
         }
         .padding(24)
@@ -250,5 +214,64 @@ struct ProfileSummary: View {
             }
         }
         .accessibilityElement(children: .combine)
+    }
+}
+
+/// The prompt, as the sheet's hero: large type, room to write, a clear focus
+/// ring and a calm placeholder. Return starts the agent and Shift-Return is
+/// a new line, as in Raycast and Claude.
+struct PromptField: View {
+    @Binding var text: String
+    var focused: FocusState<Bool>.Binding
+    let submit: () -> Void
+
+    var body: some View {
+        let isFocused = focused.wrappedValue
+        VStack(alignment: .trailing, spacing: 6) {
+            ZStack(alignment: .topLeading) {
+                TextEditor(text: $text)
+                    .font(.title3)
+                    .scrollContentBackground(.hidden)
+                    .focused(focused)
+                    .padding(10)
+                    .accessibilityLabel("Prompt")
+                    .accessibilityHint("Return starts the agent; Shift-Return adds a new line")
+                    .background(OverlayScrollers(target: .nearbyTextView))
+                    .onKeyPress(.return, phases: .down) { press in
+                        if press.modifiers.contains(.shift) || press.modifiers.contains(.option) { return .ignored }
+                        // Mid-composition (Japanese, Chinese, Korean input),
+                        // Return confirms the text: it's the input method's.
+                        if let editor = NSApp.keyWindow?.firstResponder as? NSTextView, editor.hasMarkedText() {
+                            return .ignored
+                        }
+                        submit()
+                        return .handled
+                    }
+                if text.isEmpty {
+                    Text("What should it work on?")
+                        .font(.title3)
+                        .foregroundStyle(Color(nsColor: .placeholderTextColor))
+                        .padding(.horizontal, 15)
+                        .padding(.vertical, 10)
+                        .allowsHitTesting(false)
+                        .accessibilityHidden(true)
+                }
+            }
+            .frame(minHeight: 140)
+            .background(
+                RoundedRectangle(cornerRadius: Metrics.cardRadius, style: .continuous)
+                    .fill(Color(nsColor: .textBackgroundColor))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: Metrics.cardRadius, style: .continuous)
+                    .strokeBorder(
+                        isFocused ? Color.accentColor : Color.primary.opacity(0.14), lineWidth: isFocused ? 2 : 1)
+            )
+            .shadow(color: isFocused ? Color.accentColor.opacity(0.22) : .clear, radius: 6)
+            Text("Return to start · Shift-Return for a new line")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .accessibilityHidden(true)
+        }
     }
 }

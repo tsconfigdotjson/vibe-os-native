@@ -845,7 +845,7 @@ s_surfaces() {
   rm -rf "$out"
   "$app" --render-surfaces "$out" || { echo "a surface didn't draw"; return 1; }
   [ -s "$out/manifest.txt" ] || { echo "no manifest"; return 1; }
-  for name in menu menu-welcome menu-quiet menu-offline menu-bar new-agent new-agent-empty add-host \
+  for name in menu menu-status menu-welcome menu-quiet menu-offline menu-bar new-agent new-agent-empty add-host \
     add-host-done logins logins-first-run settings-projects settings-keys settings-hosts settings-limits \
     settings-general settings-project settings-projects-first-run new-key new-key-made external-address; do
     for look in light dark; do

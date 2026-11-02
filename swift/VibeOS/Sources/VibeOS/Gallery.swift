@@ -92,6 +92,7 @@ struct GallerySurface {
         let settings = CGSize(width: 780, height: 600)
         var surfaces: [GallerySurface] = [
             GallerySurface(name: "menu", frame: .menu, view: AnyView(MenuView(model: m.busy))),
+            GallerySurface(name: "menu-status", frame: .menu, view: AnyView(MenuView(model: m.busy, showFacts: true))),
             GallerySurface(name: "menu-welcome", frame: .menu, view: AnyView(MenuView(model: m.firstRun))),
             GallerySurface(name: "menu-quiet", frame: .menu, view: AnyView(MenuView(model: m.quiet))),
             GallerySurface(name: "menu-offline", frame: .menu, view: AnyView(MenuView(model: m.offline))),
@@ -125,7 +126,10 @@ struct GallerySurface {
             GallerySurface(
                 name: "settings-project", frame: .window("Settings", CGSize(width: 600, height: 760)),
                 view: AnyView(
-                    NavigationStack { ProjectDetail(model: m.busy, host: VibeRPC.localHost, name: "app") })))
+                    NavigationStack {
+                        ProjectDetail(
+                            model: m.busy, host: VibeRPC.localHost, name: "app", expanded: ["software-eng-linux"])
+                    })))
         surfaces.append(
             GallerySurface(
                 name: "settings-projects-first-run", frame: .window("Settings", settings),

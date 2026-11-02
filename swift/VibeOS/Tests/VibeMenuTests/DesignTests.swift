@@ -302,25 +302,61 @@ import VibeRPC
         #expect(MenuBarGlyph.ink(GlyphState(lit: 2), onDark: true) == .black)
     }
 
-    @Test func theHeaderIsOneQuietLineWithColourOnlyForTrouble() throws {
+    @Test func theHeaderShowsOnlyWhatNeedsTheOwner() throws {
         let hosts = try [
             decode(HostInfo.self, hostJSON("local", mcp: true)),
             decode(HostInfo.self, hostJSON("vps", link: .connected, external: true, tunnel: .up)),
             decode(HostInfo.self, hostJSON("box", link: .down, detail: "ssh: timed out")),
         ]
         let gh = try decode(GhStatus.self, ["state": "logged_in", "account": "octocat"])
-        let parts = headerStatus(memory: HostMemory(used: 3 << 30, total: 32 << 30), gh: gh, mcp: true, hosts: hosts)
-        #expect(parts.map(\.text) == ["3G of 32G", "gh octocat", "MCP on", "vps public", "box down"])
-        #expect(parts.map(\.tone) == [.normal, .normal, .normal, .normal, .trouble])
-        #expect(parts.last?.spoken == "box, link down")
-        // Trouble shows in colour, and only trouble.
+        // All well but box: one row, for box, with the reason kept for a
+        // tooltip, as spelt.
+        let alerts = headerAlerts(gh: gh, hosts: hosts)
+        #expect(alerts.map(\.title) == ["box is down"])
+        #expect(alerts.first?.tone == .trouble)
+        #expect(alerts.first?.reason == "ssh: timed out")
+        #expect(alerts.first?.detail == "Its agents keep running there. It reconnects on its own.")
+        // A gh login missing and an external address outside can't reach.
         let out = try decode(GhStatus.self, ["state": "logged_out"])
         let unreachable = try decode(HostInfo.self, hostJSON("vps", link: .connected, external: true, tunnel: .down))
-        let worse = headerStatus(memory: nil, gh: out, mcp: false, hosts: [unreachable])
-        #expect(worse.map(\.text) == ["gh logged out", "MCP off", "vps not reachable"])
-        #expect(worse.map(\.tone) == [.attention, .normal, .attention])
-        // Before gh has been checked, it says nothing.
-        #expect(headerStatus(memory: nil, gh: nil, mcp: true, hosts: []).map(\.text) == ["MCP on"])
+        let worse = headerAlerts(gh: out, hosts: [unreachable])
+        #expect(worse.map(\.title) == ["vps isn't reachable from outside", "GitHub CLI is logged out"])
+        #expect(worse.map(\.tone) == [.attention, .attention])
+        // Nothing wrong, nothing shown.
+        #expect(headerAlerts(gh: gh, hosts: Array(hosts.prefix(2))).isEmpty)
+        #expect(headerAlerts(gh: nil, hosts: []).isEmpty)
+    }
+
+    @Test func theSteadyFactsAreAllThereOnRequest() throws {
+        let hosts = try [
+            decode(HostInfo.self, hostJSON("local", mcp: true)),
+            decode(HostInfo.self, hostJSON("vps", link: .connected, external: true, tunnel: .up)),
+            decode(HostInfo.self, hostJSON("box", link: .down)),
+        ]
+        let gh = try decode(GhStatus.self, ["state": "logged_in", "account": "octocat"])
+        let facts = headerFacts(memory: HostMemory(used: 3 << 30, total: 32 << 30), gh: gh, mcp: true, hosts: hosts)
+        #expect(facts.map(\.label) == ["Memory", "GitHub", "MCP", "vps", "box"])
+        #expect(facts.map(\.value) == ["3G of 32G", "octocat", "On", "Connected, public", "Down"])
+        #expect(facts.map(\.tone) == [.normal, .normal, .normal, .normal, .trouble])
+        // A host may be named anything, "Memory" too: ids never collide.
+        #expect(facts.map(\.id) == ["memory", "gh", "mcp", "host:vps", "host:box"])
+        let named = try decode(HostInfo.self, hostJSON("Memory", link: .connected))
+        let ids = headerFacts(memory: HostMemory(used: 1, total: 2), gh: nil, mcp: true, hosts: [named]).map(\.id)
+        #expect(Set(ids).count == ids.count)
+        #expect(headerFacts(memory: nil, gh: nil, mcp: false, hosts: []).map(\.value) == ["Checking…", "Off"])
+    }
+
+    @Test func memorySpeaksUpOnlyNearItsLimit() throws {
+        // A quarter: the quiet bar alone.
+        #expect(memoryNote(try agent("a", memoryUsed: 1 << 30)) == nil)
+        #expect(memoryNote(try agent("a")) == nil)
+        // Past 80%: how near, in amber.
+        let near = try #require(memoryNote(try agent("a", memoryUsed: 3_543_348_019)))
+        #expect(near.tone == .attention)
+        #expect(near.text == "3.3G of 4G")
+        // At it: a state, red once it paused the agent.
+        #expect(memoryNote(try agent("a", state: .busy, memoryUsed: 4 << 30)) == MemoryNote(text: "At its memory limit", tone: .attention))
+        #expect(memoryNote(try agent("a", state: .paused, memoryUsed: 4 << 30)) == MemoryNote(text: "At its memory limit", tone: .trouble))
     }
 
     @Test func valuesHaveOneVoice() throws {

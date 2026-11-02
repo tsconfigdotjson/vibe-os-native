@@ -44,6 +44,8 @@ enum Palette {
 }
 
 enum Metrics {
+    /// Every grouped box, card and field: one corner radius.
+    static let cardRadius: CGFloat = 10
     /// The menu's width and side gutter.
     static let menuWidth: CGFloat = 360
     static let gutter: CGFloat = 14
@@ -211,7 +213,7 @@ struct MenuItemLabel: View {
             if let trailingSymbol {
                 Image(systemName: trailingSymbol)
                     .font(.caption.weight(.semibold))
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.secondary)
                     .accessibilityHidden(true)
             }
         }
@@ -222,26 +224,38 @@ struct MenuItemLabel: View {
     }
 }
 
-/// A thin memory bar: phosphor while there's room, amber past 80%.
+/// A row's memory: a thin, quiet bar against the profile's limit (PRD:
+/// Menu bar, agent rows). Near the limit it becomes a state, an amber
+/// badge saying how near; at the limit it says so, red when that paused it.
 struct MemoryBar: View {
     let gauge: MemoryGauge
+    var note: MemoryNote?
 
     var body: some View {
-        HStack(spacing: 6) {
+        let tint = note?.tone == .trouble ? Palette.trouble : Palette.attention
+        HStack(spacing: 5) {
+            if let note {
+                Text(note.text)
+                    .font(.caption.weight(.medium))
+                    .monospacedDigit()
+                    .foregroundStyle(tint)
+            }
             GeometryReader { proxy in
                 ZStack(alignment: .leading) {
-                    Capsule().fill(Color.primary.opacity(0.1))
+                    Capsule().fill(Color.primary.opacity(0.12))
                     Capsule()
-                        .fill(gauge.fraction > 0.8 ? Palette.attention : Palette.signal)
+                        .fill(note == nil ? Color.primary.opacity(0.35) : tint)
                         .frame(width: max(3, proxy.size.width * gauge.fraction))
                 }
             }
-            .frame(width: 44, height: 4)
-            Text(gauge.label)
-                .font(.caption2)
-                .monospacedDigit()
-                .foregroundStyle(.secondary)
+            .frame(width: 32, height: 3)
         }
+        .padding(.horizontal, note == nil ? 0 : 7)
+        .padding(.vertical, note == nil ? 0 : 2)
+        .background {
+            if note != nil { Capsule().fill(tint.opacity(0.14)) }
+        }
+        .help("Memory: \(gauge.label.replacingOccurrences(of: " / ", with: " of "))")
         .accessibilityHidden(true)
     }
 }
@@ -279,7 +293,7 @@ struct InlineMessage: View {
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
-        .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(tint.opacity(0.12)))
+        .background(RoundedRectangle(cornerRadius: Metrics.cardRadius, style: .continuous).fill(tint.opacity(0.12)))
         // Contain, not combine, so Dismiss stays a button of its own.
         .accessibilityElement(children: .contain)
     }

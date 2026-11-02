@@ -13,6 +13,10 @@ struct AddHostView: View {
     @State private var error: String?
     @State private var installed: HostInstall?
     @State private var lastSuggestion = ""
+    /// Bumped each time the window closes: an install still going when it
+    /// closed carries on in vibed, and its host shows in the menu, but its
+    /// answer doesn't land on the next opening.
+    @State private var opening = 0
 
     init(model: MenuModel, preview: HostInstall? = nil) {
         self.model = model
@@ -41,6 +45,8 @@ struct AddHostView: View {
         }
         .padding(20)
         .frame(width: 480)
+        // Escape closes it in either state; Return is Add Host, or Done.
+        .onExitCommand { close() }
     }
 
     private var form: some View {
@@ -106,17 +112,23 @@ struct AddHostView: View {
 
     private func add() async {
         guard canAdd else { return }
+        let mine = opening
         installing = true
-        defer { installing = false }
         do {
-            installed = try await model.addHost(name: trimmedName, address: trimmedAddress)
+            let done = try await model.addHost(name: trimmedName, address: trimmedAddress)
+            guard mine == opening else { return }
+            installed = done
             error = nil
         } catch {
+            guard mine == opening else { return }
             self.error = describe(error)
         }
+        installing = false
     }
 
     private func close() {
+        opening += 1
+        installing = false
         dismissWindow(id: WindowID.addHost)
         name = ""
         address = ""

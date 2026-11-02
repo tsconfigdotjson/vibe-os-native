@@ -621,63 +621,123 @@ public struct SetupProgress: Equatable, Sendable {
     public var complete: Bool { steps.allSatisfy(\.done) }
 }
 
-// MARK: The header's status line
+// MARK: The header
 
-/// One part of the header's status line: quiet when all is well, in colour
+/// How loud a part of the header is: quiet when all is well, in colour
 /// only when something isn't.
-public struct StatusSegment: Equatable, Sendable {
-    public enum Tone: Equatable, Sendable {
-        case normal, attention, trouble
-    }
-
-    public var text: String
-    public var tone: Tone
-    /// The same, for VoiceOver.
-    public var spoken: String
+public enum StatusTone: Equatable, Sendable {
+    case normal, attention, trouble
 }
 
-/// The header's one line (PRD: Menu bar, Header): the Mac's memory, `gh`,
-/// MCP, and each Linux host's link and external address. Every host shows,
-/// by name when it's well; a link down, a `gh` login missing or an
-/// external address in trouble shows in colour.
-public func headerStatus(memory: HostMemory?, gh: GhStatus?, mcp: Bool, hosts: [HostInfo]) -> [StatusSegment] {
-    var parts: [StatusSegment] = []
-    if let memory {
-        let text = "\(formatBytes(memory.used)) of \(formatBytes(memory.total))"
-        parts.append(StatusSegment(text: text, tone: .normal, spoken: "Mac memory, \(text) in use"))
+/// Something in the header that needs the owner: a host that's down, a
+/// `gh` login missing, an external address outside clients can't reach.
+/// Each gets a row of its own.
+public struct HeaderAlert: Equatable, Sendable, Identifiable {
+    public var id: String
+    /// An SF Symbol.
+    public var symbol: String
+    public var title: String
+    /// What it means, plainly.
+    public var detail: String
+    /// The technical reason, for a tooltip.
+    public var reason: String?
+    public var tone: StatusTone
+}
+
+/// A steady fact about the hosts: the Mac's memory, `gh`, MCP, each Linux
+/// host's link and external address. They show together, on request, under
+/// the header.
+public struct HeaderFact: Equatable, Sendable, Identifiable {
+    /// `memory`, `gh`, `mcp`, or `host:<name>`: a host may be named anything.
+    public var id: String
+    public var label: String
+    public var value: String
+    public var symbol: String
+    public var tone: StatusTone
+}
+
+/// What needs the owner, worst first (PRD: Menu bar, Header).
+public func headerAlerts(gh: GhStatus?, hosts: [HostInfo]) -> [HeaderAlert] {
+    var alerts: [HeaderAlert] = []
+    for host in hosts where host.link == .down {
+        alerts.append(
+            HeaderAlert(
+                id: "host:\(host.name)", symbol: "exclamationmark.triangle.fill", title: "\(host.name) is down",
+                detail: "Its agents keep running there. It reconnects on its own.",
+                reason: host.detail.map(sentence), tone: .trouble))
     }
+    for host in hosts where host.link == .connected {
+        guard let external = externalStatus(host), external.tone == .trouble else { continue }
+        alerts.append(
+            HeaderAlert(
+                id: "external:\(host.name)", symbol: "globe", title: "\(host.name) isn't reachable from outside",
+                detail: external.summary, reason: external.detail.map(sentence), tone: .attention))
+    }
+    let ghAlert: (String, String)?
     switch gh?.state {
-    case .loggedIn?:
-        let account = gh?.account ?? "logged in"
-        parts.append(StatusSegment(text: "gh \(account)", tone: .normal, spoken: "GitHub, logged in as \(account)"))
-    case .loggedOut?:
-        parts.append(StatusSegment(text: "gh logged out", tone: .attention, spoken: "GitHub, logged out"))
-    case .notInstalled?:
-        parts.append(StatusSegment(text: "gh not installed", tone: .attention, spoken: "GitHub CLI not installed"))
-    case .error?:
-        parts.append(StatusSegment(text: "gh can't check", tone: .attention, spoken: "GitHub login can't be checked"))
-    case .unknown?, nil:
-        break
+    case .loggedOut?: ghAlert = ("GitHub CLI is logged out", "Agents on this Mac push with it. Run gh auth login.")
+    case .notInstalled?: ghAlert = ("GitHub CLI isn't installed", "Agents on this Mac push with it. Install gh.")
+    case .error?: ghAlert = ("Can't check the GitHub login", "gh auth status didn't answer.")
+    case .loggedIn?, .unknown?, nil: ghAlert = nil
     }
-    parts.append(StatusSegment(text: mcp ? "MCP on" : "MCP off", tone: .normal, spoken: mcp ? "MCP on" : "MCP off"))
+    if let ghAlert {
+        alerts.append(
+            HeaderAlert(
+                id: "gh", symbol: "person.crop.circle.badge.exclamationmark", title: ghAlert.0, detail: ghAlert.1,
+                reason: gh?.detail, tone: .attention))
+    }
+    return alerts
+}
+
+/// Every steady fact the header can show, in order: memory, `gh`, MCP, then
+/// each Linux host.
+public func headerFacts(memory: HostMemory?, gh: GhStatus?, mcp: Bool, hosts: [HostInfo]) -> [HeaderFact] {
+    var facts: [HeaderFact] = []
+    if let memory {
+        facts.append(
+            HeaderFact(
+                id: "memory", label: "Memory", value: "\(formatBytes(memory.used)) of \(formatBytes(memory.total))",
+                symbol: "memorychip", tone: .normal))
+    }
+    let gitHub: (String, StatusTone)
+    switch gh?.state {
+    case .loggedIn?: gitHub = (gh?.account ?? "Logged in", .normal)
+    case .loggedOut?: gitHub = ("Logged out", .attention)
+    case .notInstalled?: gitHub = ("Not installed", .attention)
+    case .error?: gitHub = ("Can't check", .attention)
+    case .unknown?, nil: gitHub = ("Checking…", .normal)
+    }
+    facts.append(HeaderFact(id: "gh", label: "GitHub", value: gitHub.0, symbol: "person.crop.circle", tone: gitHub.1))
+    facts.append(HeaderFact(id: "mcp", label: "MCP", value: mcp ? "On" : "Off", symbol: "network", tone: .normal))
     for host in hosts where host.link != .local {
-        let external = externalStatus(host)
-        if host.link == .down {
-            parts.append(
-                StatusSegment(
-                    text: "\(host.name) down", tone: .trouble,
-                    spoken: "\(host.name), link down" + (external.map { ", external address \($0.short)" } ?? "")))
-            continue
+        var value = host.link == .down ? "Down" : "Connected"
+        var tone: StatusTone = host.link == .down ? .trouble : .normal
+        if let external = externalStatus(host) {
+            value += ", \(external.short)"
+            if tone == .normal, external.tone == .trouble { tone = .attention }
         }
-        var text = host.name
-        var tone = StatusSegment.Tone.normal
-        var spoken = "\(host.name), connected"
-        if let external {
-            text += " \(external.short)"
-            spoken += ", external address \(external.short)"
-            if external.tone == .trouble { tone = .attention }
-        }
-        parts.append(StatusSegment(text: text, tone: tone, spoken: spoken))
+        facts.append(
+            HeaderFact(id: "host:\(host.name)", label: host.name, value: value, symbol: "server.rack", tone: tone))
     }
-    return parts
+    return facts
+}
+
+// MARK: Memory in a row
+
+/// What a row says about memory, beyond its quiet bar: only something
+/// notable. Near the limit, how near; at it, that it's at it, as a state.
+public struct MemoryNote: Equatable, Sendable {
+    public var text: String
+    public var tone: StatusTone
+}
+
+public func memoryNote(_ agent: Agent) -> MemoryNote? {
+    guard let gauge = MemoryGauge(agent) else { return nil }
+    if gauge.fraction >= 0.995 {
+        return MemoryNote(text: "At its memory limit", tone: agent.state == .paused ? .trouble : .attention)
+    }
+    if gauge.fraction >= 0.8 {
+        return MemoryNote(text: gauge.label.replacingOccurrences(of: " / ", with: " of "), tone: .attention)
+    }
+    return nil
 }
