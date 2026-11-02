@@ -234,7 +234,7 @@ import VibeRPC
         #expect(setup.next == .command)
         let step = { (id: SetupProgress.Step.ID) in setup.steps.first { $0.id == id } }
         #expect(step(.check(.ghGit))?.action == .fix(.ghGit))
-        #expect(step(.check(.power))?.action == .terminal("sudo pmset -a sleep 0"))
+        #expect(step(.check(.power))?.action == .terminal("sudo pmset -c sleep 0"))
         #expect(step(.check(.tailscale))?.status == .optional)
         #expect(step(.check(.tailscale))?.needed == false)
         #expect(step(.check(.linux))?.status == .working(40))
@@ -244,9 +244,16 @@ import VibeRPC
         #expect(step(.claude)?.action == .vibe(["setup-token"]))
         // The toolbox waits on the download.
         #expect(step(.toolbox)?.action == nil)
-        // A step that isn't done says what to do: the check's hint.
-        #expect(step(.check(.power))?.detail == "power found. Do power.")
+        // A step that isn't done says, in a line of its own, why it matters;
+        // vibe doctor's hints are for Terminal.
+        #expect(
+            step(.check(.power))?.detail
+                == "Agents can't answer while this Mac sleeps. Turning it off asks for your password.")
         #expect(step(.check(.power))?.title == "Keep this Mac awake")
+        #expect(step(.check(.linux))?.detail == "linux found.")
+        #expect(setup.steps.allSatisfy { !$0.detail.contains("`") })
+        // Without Tailscale, there's nothing to turn on for other machines.
+        #expect(step(.remote) == nil)
     }
 
     @Test func eachCheckHasItsButton() {
@@ -294,6 +301,19 @@ import VibeRPC
         #expect(setup.complete)
         #expect(setup.passedTitle == "This Mac is ready")
         #expect(setup.lit == 4)
+    }
+
+    @Test func withTailscaleUpMCPCanBeServedThere() {
+        var setup = Self.fiveMinute
+        setup.remoteMCP = false
+        let ids = setup.steps.map(\.id)
+        // Before the key, so the key's setup line has the Tailscale address.
+        #expect(ids.suffix(3) == [.project, .remote, .key])
+        let remote = setup.steps.first { $0.id == .remote }
+        #expect(remote?.action == .serveOnTailscale)
+        #expect(remote?.needed == true)
+        setup.remoteMCP = true
+        #expect(setup.steps.first { $0.id == .remote }?.done == true)
     }
 
     @Test func theCommandStepSaysWhatsThere() {
@@ -383,16 +403,72 @@ import VibeRPC
         #expect(model3.install == .notManaged)
     }
 
-    @Test func aNoteForEachWayVibedIsntThere() async {
+    @Test func aNoteForEachWayVibedIsntThere() async throws {
         let fromDisk = await MenuModel.fixture(.offline, install: .fromDiskImage)
         #expect(fromDisk.install.location == .notMoved)
+        #expect(InstallNote(fromDisk.install)?.action == .reveal)
         let off = await MenuModel.fixture(.offline, install: .turnedOff)
         #expect(off.install.service == .requiresApproval)
-        await off.registerService()
+        let note = InstallNote(off.install)
+        #expect(note?.action == .loginItems)
+        #expect(note?.title == "Let VibeOS run in the background")
+        let installer = off.installer as? FixedInstaller
+        await off.act(on: try #require(note))
+        #expect(installer?.calls.last == "login items")
         let failed = InstallStatus(
-            location: .applications, service: .failed("Operation not permitted"), command: .linked, terminal: .granted)
-        #expect(failed.registerFailure == "Operation not permitted")
-        #expect(InstallStatus.justInstalled.registerFailure == nil)
+            location: .applications, service: .failed("operation not permitted"), command: .linked, terminal: .granted)
+        #expect(failed.registerFailure == "operation not permitted")
+        #expect(InstallNote(failed)?.action == .register)
+        #expect(InstallNote(failed)?.detail == "Operation not permitted")
+        // Installed and running: no note; nor for a development build.
+        #expect(InstallNote(.justInstalled) == nil)
+        #expect(InstallNote(.notManaged) == nil)
+    }
+
+    /// A register that failed stays failed in the menu, though SMAppService
+    /// says only "not registered", until a Try Again works.
+    @Test func aFailedRegisterIsKept() async {
+        final class Refusing: FixedInstaller {
+            override func registerService() -> ServiceStatus { .failed("Operation not permitted") }
+        }
+        let refusing = Refusing(
+            InstallStatus(location: .applications, service: .notRegistered, command: .linked, terminal: .granted))
+        let model = MenuModel(daemon: FixtureDaemon(.offline), terminal: FixtureTerminal(), installer: refusing)
+        await model.firstLaunch()
+        #expect(model.install.registerFailure == "Operation not permitted")
+    }
+
+    /// After an update, an older vibed is restarted from the new app, once;
+    /// a newer one, or the same, is left be.
+    @Test func anOlderVibedIsRestartedOnce() async {
+        let installer = FixedInstaller(.justInstalled)
+        let model = MenuModel(daemon: FixtureDaemon(.quiet), terminal: FixtureTerminal(), installer: installer)
+        // Read vibed first, while the install isn't known yet, so this
+        // test's calls are the only ones that can restart it.
+        await model.refresh()
+        await model.refreshInstall()
+        let before = installer.calls
+        // The fixture's vibed is 0.1.0.
+        model.takeOverIfUpdated(appVersion: "0.1.0")
+        model.takeOverIfUpdated(appVersion: "0.0.9")
+        #expect(installer.calls == before)
+        model.takeOverIfUpdated(appVersion: "0.2.0")
+        model.takeOverIfUpdated(appVersion: "0.3.0")
+        #expect(installer.calls == before + ["restart"])
+        #expect(versionIsOlder("0.9.0", than: "0.10.0"))
+        #expect(!versionIsOlder("1.0", than: "1.0.0"))
+        #expect(!versionIsOlder("2.0.0", than: "1.9.9"))
+    }
+
+    /// Permission to control Terminal, once given, isn't asked for again;
+    /// once refused, the button opens the settings it's turned on in.
+    @Test func terminalPermission() async {
+        let denied = FixedInstaller(
+            InstallStatus(location: .applications, service: .enabled, command: .linked, terminal: .denied))
+        let model = MenuModel(daemon: FixtureDaemon(.quiet), terminal: FixtureTerminal(), installer: denied)
+        await model.refreshInstall()
+        await model.allowTerminal()
+        #expect(denied.calls == ["automation settings"])
     }
 }
 

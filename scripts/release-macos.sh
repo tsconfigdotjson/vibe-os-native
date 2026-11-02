@@ -18,8 +18,8 @@
 # secrets still works, ad hoc signed, for trying on this Mac:
 #
 #   MACOS_SIGN_IDENTITY  a Developer ID Application identity in a keychain
-#                        on the search list: signs with it, under the
-#                        hardened runtime (else ad hoc)
+#                        on the search list, by name or SHA-1: signs with
+#                        it, under the hardened runtime (else ad hoc)
 #   APPLE_TEAM_ID        the identity's team, which it's checked against
 #   NOTARY_KEY_ID, NOTARY_ISSUER_ID, NOTARY_KEY_P8
 #                        an App Store Connect API key (the .p8's text):
@@ -53,7 +53,7 @@ while [ $# -gt 0 ]; do
   case $1 in
     --out) OUT=$2; shift 2 ;;
     --tag) TAG=$2; shift 2 ;;
-    -h | --help) sed -n '2,46p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h | --help) sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "release-macos.sh: unexpected $1" >&2; exit 2 ;;
   esac
 done
@@ -96,10 +96,9 @@ if [ "$REQUIRE" = 1 ]; then
   command -v cargo-zigbuild >/dev/null || die "the Linux builds need cargo-zigbuild and zig"
 fi
 if [ -n "$IDENTITY" ] && [ -n "${APPLE_TEAM_ID:-}" ]; then
-  case $IDENTITY in
-    *"($APPLE_TEAM_ID)"*) ;;
-    *) die "the identity isn't team APPLE_TEAM_ID's" ;;
-  esac
+  # The identity, by name or SHA-1, must be the team's Developer ID.
+  security find-identity -v -p codesigning | grep -F -- "$IDENTITY" | grep -q "Developer ID Application: .*($APPLE_TEAM_ID)\"" ||
+    die "$IDENTITY isn't a Developer ID Application identity of team APPLE_TEAM_ID in the keychains"
 fi
 $NOTARIZE && [ -z "$IDENTITY" ] && die "notarizing needs a Developer ID identity (MACOS_SIGN_IDENTITY)"
 

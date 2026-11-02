@@ -157,4 +157,4 @@ Mac:
 scripts/release-macos.sh               # build/release/out/VibeOS-<version>.dmg
 ```
 
-Sparkle can fetch updates from Releases only once the repo is public.
+While the repo is private, a Mac without a GitHub login can't download from its Releases: neither the Linux base image `vibed` boots linux agents from, nor Sparkle's updates. Both work once the repo is public. Only a tag on a commit that's on `main` releases.

@@ -589,6 +589,8 @@ public enum SetupAction: Equatable, Sendable {
     case open(String)
     /// Apple's Command Line Tools installer.
     case installCommandLineTools
+    /// Serves MCP on this Mac's Tailscale address too (`mcp.set`).
+    case serveOnTailscale
     case openToolbox
     case projects, keys
 }
@@ -606,7 +608,10 @@ public struct SetupProgress: Equatable, Sendable {
             case command
             case check(CheckId)
             case terminal
-            case claude, toolbox, project, key
+            case claude, toolbox, project
+            /// MCP on Tailscale, for Claude Code on the owner's other machines.
+            case remote
+            case key
         }
 
         public enum Status: Equatable, Sendable {
@@ -705,11 +710,16 @@ public struct SetupProgress: Equatable, Sendable {
     public var install: InstallStatus
     /// Whether gh is installed at all, which the gh check's button needs.
     public var ghInstalled: Bool
+    /// Whether other machines can reach MCP here: on Tailscale, or through
+    /// a Linux host that's the external address. Nil where Tailscale isn't
+    /// up, so there's nothing to turn on.
+    public var remoteMCP: Bool?
 
     public init(
         hasProject: Bool, hasKey: Bool, linuxClaude: Bool?, linuxGitHub: Bool? = nil, doctor: [DoctorCheck] = [],
-        install: InstallStatus = .notManaged, ghInstalled: Bool = true
+        install: InstallStatus = .notManaged, ghInstalled: Bool = true, remoteMCP: Bool? = nil
     ) {
+        self.remoteMCP = remoteMCP
         self.hasProject = hasProject
         self.hasKey = hasKey
         self.linuxClaude = linuxClaude
@@ -763,6 +773,16 @@ public struct SetupProgress: Equatable, Sendable {
                 id: .project, title: "Add a project",
                 detail: "A GitHub repo or a folder on this Mac. It comes with two profiles, ready to use.",
                 status: hasProject ? .done : .todo, action: hasProject ? nil : .projects, actionTitle: "Add…"))
+        if let remoteMCP {
+            steps.append(
+                Step(
+                    id: .remote, title: "Reach MCP from your other machines",
+                    detail: remoteMCP
+                        ? "Claude Code on your other machines can reach MCP here."
+                        : "Serves MCP on this Mac's Tailscale address too, for Claude Code on your laptop.",
+                    status: remoteMCP ? .done : .todo, action: remoteMCP ? nil : .serveOnTailscale,
+                    actionTitle: "Turn On"))
+        }
         steps.append(
             Step(
                 id: .key, title: "Make an API key",
@@ -823,10 +843,11 @@ public struct SetupProgress: Equatable, Sendable {
         case .working: status = .working(check.progress)
         }
         let passed = check.state == .pass
-        let detail = passed || check.hint == nil ? check.detail : check.detail + " " + (check.hint ?? "")
-        var step = Step(id: .check(check.id), title: checkTitle(check.id, passed: passed), detail: detail, status: status)
-        guard !passed, check.state != .working else { return step }
         let claudeReady = doctor.contains { $0.id == .claude && $0.state == .pass }
+        var step = Step(
+            id: .check(check.id), title: checkTitle(check.id, passed: passed),
+            detail: welcomeDetail(check, claudeReady: claudeReady), status: status)
+        guard !passed, check.state != .working else { return step }
         switch check.id {
         case .git:
             step.action = .installCommandLineTools
@@ -848,7 +869,7 @@ public struct SetupProgress: Equatable, Sendable {
                 step.actionTitle = "Sign In…"
             }
         case .power:
-            step.action = .terminal("sudo pmset -a sleep 0")
+            step.action = .terminal("sudo pmset -c sleep 0")
             step.actionTitle = "Turn Off…"
         case .tailscale:
             step.action = .open("https://tailscale.com/download/mac")
@@ -860,6 +881,27 @@ public struct SetupProgress: Equatable, Sendable {
             }
         }
         return step
+    }
+
+    /// What a check says in the welcome: what it found once it passed, or
+    /// while it's under way; otherwise why it matters and what the button
+    /// does, in a line. `vibe doctor`'s hints are for Terminal, and longer.
+    private func welcomeDetail(_ check: DoctorCheck, claudeReady: Bool) -> String {
+        if check.state == .pass || check.state == .working { return check.detail }
+        switch check.id {
+        case .git: return "Agents' worktrees need git, from Apple's Command Line Tools."
+        case .gh:
+            return ghInstalled
+                ? "Log in once, in Terminal, so agents can clone, push and open pull requests."
+                : "GitHub's command line tool, for cloning, pushing and pull requests."
+        case .ghGit:
+            return check.fixable ? "So git pushes with gh's login. One click sets it up." : "Once gh is logged in."
+        case .claude: return "macos agents run your own Claude Code."
+        case .claudeLogin: return claudeReady ? "Sign in once, in Terminal, with /login." : "Once Claude Code is installed."
+        case .power: return "Agents can't answer while this Mac sleeps. Turning it off asks for your password."
+        case .tailscale: return "Lets your other machines reach MCP here."
+        case .linux: return check.detail
+        }
     }
 
     /// The welcome's rows: this Mac's checks that passed fold into one, at

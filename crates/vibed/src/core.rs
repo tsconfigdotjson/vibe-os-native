@@ -195,6 +195,15 @@ pub fn find_program(name: &str, path: Option<&OsStr>) -> OsString {
         .unwrap_or_else(|| name.into())
 }
 
+/// `program` if it's a path; or else a bare name, as [`find_program`]
+/// finds it now, which may be somewhere it wasn't when `vibed` started.
+pub fn resolve_program(program: &OsStr, path: Option<&OsStr>) -> OsString {
+    if Path::new(program).is_absolute() {
+        return program.to_owned();
+    }
+    find_program(&program.to_string_lossy(), path)
+}
+
 /// `vibe-shim` beside `exe`, as it's installed next to `vibed`; or else
 /// the one [`find_program`] finds.
 pub fn find_shim(exe: Option<&Path>, path: Option<&OsStr>) -> OsString {
@@ -317,6 +326,8 @@ pub struct Core {
     pub(crate) gh_status: Mutex<GhStatus>,
     pub(crate) checks: Arc<dyn crate::doctor::HostChecks>,
     pub(crate) linux_images: Option<Arc<crate::linux::Watch>>,
+    /// What the doctor last found on the machine, and when.
+    pub(crate) doctor_found: Mutex<Option<(std::time::Instant, crate::doctor::Found)>>,
     pub(crate) toolbox: Option<Arc<dyn vibe_env::toolbox::ToolboxHost>>,
     /// What the toolbox is doing, for `toolbox.status`.
     pub(crate) toolbox_state: Mutex<vibe_core::model::ToolboxState>,
@@ -496,6 +507,7 @@ impl Core {
             }),
             checks: config.checks,
             linux_images: config.linux_images,
+            doctor_found: Mutex::new(None),
             toolbox: config.toolbox,
             toolbox_state: Mutex::new(vibe_core::model::ToolboxState::Closed),
             toolbox_op: tokio::sync::Mutex::new(()),
@@ -634,7 +646,7 @@ impl Core {
                 let name = p.name.unwrap_or_else(|| repo.name.clone());
                 _reserved = self.reserve_project(host, &name)?;
                 let dest = self.layout.projects_dir().join(&name);
-                let path = projects::github_clone(&self.gh, &repo, &dest).await?;
+                let path = projects::github_clone(&self.gh_program(), &repo, &dest).await?;
                 NewProject {
                     host: host.into(),
                     name,
@@ -866,10 +878,17 @@ impl Core {
         }
     }
 
+    /// The `gh` to run: the one configured, or, when none was found at
+    /// startup, the one there is now, so a `gh` installed since (from the
+    /// first run's checklist, say) is found without a restart.
+    pub(crate) fn gh_program(&self) -> OsString {
+        resolve_program(&self.gh, std::env::var_os("PATH").as_deref())
+    }
+
     /// Runs `gh auth status` now, and publishes a `gh.status` event if the
     /// result changed.
     pub async fn check_gh(&self) -> GhStatus {
-        let check = gh::check(&self.gh).await;
+        let check = gh::check(&self.gh_program()).await;
         let status = GhStatus {
             state: check.state,
             account: check.account,

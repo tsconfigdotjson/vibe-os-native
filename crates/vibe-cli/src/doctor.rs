@@ -70,10 +70,16 @@ pub(crate) fn render(report: &DoctorReport) -> String {
         }
     }
     let failed = failures(report).count();
-    out.push_str(&match failed {
-        0 => "This host is ready for agents.\n".to_owned(),
-        1 => "1 check needs you.\n".to_owned(),
-        n => format!("{n} checks need you.\n"),
+    let working = report
+        .checks
+        .iter()
+        .filter(|c| c.state == CheckState::Working)
+        .count();
+    out.push_str(&match (failed, working) {
+        (0, 0) => "This host is ready for agents.\n".to_owned(),
+        (0, _) => "Nothing needs you; the rest is under way.\n".to_owned(),
+        (1, _) => "1 check needs you.\n".to_owned(),
+        (n, _) => format!("{n} checks need you.\n"),
     });
     out
 }
@@ -165,5 +171,12 @@ ok  git             git said so.
             checks: vec![check(CheckId::Git, CheckState::Pass, None, false)],
         };
         assert!(render(&ready).ends_with("This host is ready for agents.\n"));
+        let downloading = DoctorReport {
+            checks: vec![
+                check(CheckId::Git, CheckState::Pass, None, false),
+                check(CheckId::Linux, CheckState::Working, None, false),
+            ],
+        };
+        assert!(render(&downloading).ends_with("Nothing needs you; the rest is under way.\n"));
     }
 }

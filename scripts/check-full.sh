@@ -1141,7 +1141,11 @@ s_doctor() {
   # git, gh, git through gh, Claude Code and its login, Tailscale; and on a
   # Mac, system sleep (and the Linux images, with vibe-vm beside vibed).
   [ "$lines" -ge 6 ] || { echo "$lines checks, not 6 or more"; return 1; }
-  case $out in *"This host is ready for agents."* | *" need you."* | *" needs you."*) ;; *) echo "no summary"; return 1 ;; esac
+  case $out in
+    *"This host is ready for agents."* | *"the rest is under way."*) [ $rc -eq 0 ] ;;
+    *" need you."* | *" needs you."*) [ $rc -eq 1 ] ;;
+    *) echo "no summary"; return 1 ;;
+  esac
   stop_vibed
 }
 

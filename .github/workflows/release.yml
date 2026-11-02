@@ -43,8 +43,27 @@ permissions:
   contents: read
 
 jobs:
+  # Only what's on main ships: CI tests every merge there (ci.yml), and a
+  # tag on a commit main never had would put untested code in every
+  # VibeOS through Sparkle.
+  on-main:
+    name: The tag is on main
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: The tagged commit is on main
+        run: |
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "$GITHUB_REF_NAME ($GITHUB_SHA) isn't on main: merge it first, then tag"
+            exit 1
+          fi
+
   base-image:
     name: Linux base image
+    needs: on-main
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 120
     permissions:
@@ -136,8 +155,10 @@ jobs:
           rm -f "$RUNNER_TEMP/cert.p12"
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" "$keychain" >/dev/null
           security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          # By its SHA-1, which no other certificate can share; the name
+          # could be another's in the search list.
           identity=$(security find-identity -v -p codesigning "$keychain" \
-            | sed -n "s/.*\"\(Developer ID Application: .*($APPLE_TEAM_ID)\)\"$/\1/p" | head -n 1)
+            | sed -n "s/^ *[0-9]*) \([0-9A-F]\{40\}\) \"Developer ID Application: .*($APPLE_TEAM_ID)\"$/\1/p" | head -n 1)
           [ -n "$identity" ] || { echo "the certificate has no Developer ID Application identity for the team"; exit 1; }
           echo "MACOS_SIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
           echo "RELEASE_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
@@ -159,10 +180,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           version=${GITHUB_REF_NAME#v}
-          gh release create "$GITHUB_REF_NAME" build/release/out/* \
-            --repo "$GITHUB_REPOSITORY" --verify-tag --latest \
-            --title "VibeOS $version" \
-            --notes "Drag VibeOS into Applications and open it: it starts vibed, and its welcome walks through the rest. Signed with a Developer ID and notarized. VibeOS already installed updates itself, through Sparkle."
+          # A rerun of a release that got this far replaces its files.
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" build/release/out/* --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --latest
+          else
+            gh release create "$GITHUB_REF_NAME" build/release/out/* \
+              --repo "$GITHUB_REPOSITORY" --verify-tag --latest \
+              --title "VibeOS $version" \
+              --notes "Drag VibeOS into Applications and open it: it starts vibed, and its welcome walks through the rest. Signed with a Developer ID and notarized. VibeOS already installed updates itself, through Sparkle."
+          fi
 
       - name: Remove the keychain
         if: always()

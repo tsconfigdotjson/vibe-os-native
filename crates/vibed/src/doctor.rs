@@ -138,8 +138,9 @@ impl Machine {
     }
 }
 
-impl HostChecks for Machine {
-    fn git(&self) -> Result<String, String> {
+impl Machine {
+    /// The git agents run, unless it's only macOS's stand-in for it.
+    fn git_program(&self) -> Result<PathBuf, String> {
         let git = self.which("git").ok_or("git isn't installed")?;
         // On a Mac without the Command Line Tools, /usr/bin/git is a stub
         // that offers to install them; asking it anything opens that offer.
@@ -149,6 +150,13 @@ impl HostChecks for Machine {
                 return Err("git needs Apple's Command Line Tools, which aren't installed".into());
             }
         }
+        Ok(git)
+    }
+}
+
+impl HostChecks for Machine {
+    fn git(&self) -> Result<String, String> {
+        let git = self.git_program()?;
         match self.run(&[&git.to_string_lossy(), "--version"])? {
             (true, text) => Ok(first_line(&text)),
             (false, text) => Err(format!("git --version failed: {}", first_line(&text))),
@@ -156,7 +164,7 @@ impl HostChecks for Machine {
     }
 
     fn git_uses_gh(&self) -> Result<bool, String> {
-        let git = self.which("git").ok_or("git isn't installed")?;
+        let git = self.git_program()?;
         let git = git.to_string_lossy();
         let mut helpers = String::new();
         for key in ["credential.https://github.com.helper", "credential.helper"] {
@@ -338,8 +346,14 @@ fn fail(id: CheckId, detail: impl AsRef<str>, hint: &str) -> DoctorCheck {
     }
 }
 
+/// How long what the machine said is taken as still true: the welcome
+/// asks again every few seconds while Linux downloads, and each time would
+/// otherwise run git, claude, security and pmset again.
+pub const FOUND_FOR: Duration = Duration::from_secs(15);
+
 /// What the machine said, before any of it is put into checks.
-struct Found {
+#[derive(Debug, Clone)]
+pub(crate) struct Found {
     git: Result<String, String>,
     git_uses_gh: Result<bool, String>,
     claude: Result<(PathBuf, String), String>,
@@ -451,7 +465,7 @@ fn report(
                 if *minutes == 1 { "" } else { "s" }
             ),
             "In System Settings → Energy, turn on Prevent automatic sleeping when the display is \
-             off (on a laptop, in Battery → Options, on power adapter); or run `sudo pmset -a \
+             off (on a laptop, in Battery → Options, on power adapter); or run `sudo pmset -c \
              sleep 0` in Terminal.",
         )),
         Err(why) => checks.push(fail(
@@ -493,16 +507,51 @@ impl Core {
                 self.check_gh().await
             }
         };
+        let cached = lock(&self.doctor_found)
+            .as_ref()
+            .filter(|(at, _)| at.elapsed() < FOUND_FOR)
+            .map(|(_, f)| f.clone());
         let checks = Arc::clone(&self.checks);
-        let found = tokio::task::spawn_blocking(move || Found {
-            git: checks.git(),
-            git_uses_gh: checks.git_uses_gh(),
-            claude: checks.claude(),
-            claude_login: checks.claude_login(),
-            system_sleep: checks.system_sleep(),
+        let linux = self.linux_images.clone();
+        let found = tokio::task::spawn_blocking(move || {
+            let found = cached.unwrap_or_else(|| {
+                let git = checks.git();
+                // Without git there's no config to read, and on a Mac
+                // without the Command Line Tools, asking opens their
+                // installer again.
+                let git_uses_gh = match &git {
+                    Ok(_) => checks.git_uses_gh(),
+                    Err(why) => Err(why.clone()),
+                };
+                Found {
+                    git,
+                    git_uses_gh,
+                    claude: checks.claude(),
+                    claude_login: checks.claude_login(),
+                    system_sleep: checks.system_sleep(),
+                }
+            });
+            (found, linux.map(|w| w.check()))
         })
         .await;
-        let found = found.unwrap_or_else(|e| {
+        let (found, linux) = match found {
+            Ok((found, linux)) => {
+                *lock(&self.doctor_found) = Some((std::time::Instant::now(), found.clone()));
+                (found, linux)
+            }
+            Err(e) => (Self::found_failed(&e.to_string()), None),
+        };
+        report(
+            found,
+            &gh,
+            &(self.tailscale)(),
+            linux,
+            self.info().os == "macos",
+        )
+    }
+
+    fn found_failed(e: &str) -> Found {
+        {
             let why = format!("the check failed: {e}");
             Found {
                 git: Err(why.clone()),
@@ -511,15 +560,7 @@ impl Core {
                 claude_login: Err(why.clone()),
                 system_sleep: Err(why),
             }
-        });
-        let linux = self.linux_images.as_ref().map(|w| w.check());
-        report(
-            found,
-            &gh,
-            &(self.tailscale)(),
-            linux,
-            self.info().os == "macos",
-        )
+        }
     }
 
     /// `doctor.fix`: `gh_git` and `linux` are VibeOS's to fix; the rest are
@@ -535,12 +576,13 @@ impl Core {
                             .to_owned(),
                     ));
                 }
-                let (checks, gh) = (Arc::clone(&self.checks), self.gh.clone());
+                let (checks, gh) = (Arc::clone(&self.checks), self.gh_program());
                 tokio::task::spawn_blocking(move || checks.setup_git(&gh))
                     .await
                     .map_err(|e| error(ErrorCode::InternalError, e.to_string()))?
                     .map_err(|e| error(ErrorCode::CommandFailed, e))?;
                 crate::log!("vibed: git now asks gh for GitHub's credentials (gh auth setup-git)");
+                *lock(&self.doctor_found) = None;
             }
             CheckId::Linux => match &self.linux_images {
                 Some(watch) => watch.kick(),
@@ -587,6 +629,26 @@ mod tests {
         );
         assert_eq!(system_sleep_minutes(" displaysleep 2\n"), None);
         assert_eq!(system_sleep_minutes(" sleep  never\n"), None);
+    }
+
+    /// A gh installed after vibed started, which found none then, is found
+    /// at the next check: the first run's "Get gh" works without a restart.
+    #[test]
+    fn a_gh_installed_later_is_found() {
+        use crate::core::resolve_program;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().as_os_str();
+        assert_eq!(resolve_program(OsStr::new("gh"), Some(path)), "gh");
+        let gh = script(tmp.path(), "gh", "exit 0");
+        assert_eq!(
+            resolve_program(OsStr::new("gh"), Some(path)),
+            gh.as_os_str()
+        );
+        // One given by its path stays that one.
+        assert_eq!(
+            resolve_program(OsStr::new("/opt/gh"), Some(path)),
+            "/opt/gh"
+        );
     }
 
     #[test]

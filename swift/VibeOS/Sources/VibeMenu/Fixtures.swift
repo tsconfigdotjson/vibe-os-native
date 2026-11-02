@@ -282,10 +282,7 @@ public final class FixtureDaemon: DaemonConnection, @unchecked Sendable {
                 check(
                     .power, .fail, "This Mac sleeps after 10 minutes idle, and agents stop answering while it sleeps.",
                     hint: "In System Settings → Energy, turn on Prevent automatic sleeping when the display is off."),
-                check(
-                    .tailscale, .optional,
-                    "Tailscale isn't running. It's optional: it lets your other machines reach MCP here.",
-                    hint: "Install Tailscale from tailscale.com and log in, if you want it."),
+                tailscale,
                 downloading,
             ]
         case .freshMac:

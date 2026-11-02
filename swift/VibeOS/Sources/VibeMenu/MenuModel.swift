@@ -551,6 +551,15 @@ extension MenuModel {
         installer.openLoginItems()
     }
 
+    /// Does what an install note's button says.
+    public func act(on note: InstallNote) async {
+        switch note.action {
+        case .reveal: WorktreeActions.reveal(Bundle.main.bundlePath)
+        case .loginItems: installer.openLoginItems()
+        case .register: await registerService()
+        }
+    }
+
     /// Adds the vibe command, asking for a password if macOS needs one.
     public func linkCommand() async {
         do {
@@ -596,10 +605,11 @@ extension MenuModel {
 
     /// After an update the running vibed is the old one, until its
     /// LaunchAgent restarts it from the new app. Agents keep running
-    /// through that (PRD: Restarts).
-    func takeOverIfUpdated() {
+    /// through that (PRD: Restarts). Only an older vibed is restarted, once
+    /// a launch: never one that's newer, as a development build may be.
+    func takeOverIfUpdated(appVersion mine: String? = appVersion()) {
         guard !restartedForUpdate, install.service == .enabled,
-            let running = localHost?.version, let mine = appVersion(), running != mine
+            let running = localHost?.version, let mine, versionIsOlder(running, than: mine)
         else { return }
         restartedForUpdate = true
         do {

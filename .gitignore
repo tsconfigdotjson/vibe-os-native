@@ -4,3 +4,4 @@
 .swiftpm/
 *.xcodeproj/
 .DS_Store
+swift/VibeOS/Package.resolved

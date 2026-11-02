@@ -108,8 +108,10 @@ pub struct Watch {
 
 #[derive(Debug, Default)]
 struct WatchState {
-    /// A round is under way, or asked for.
+    /// A round is under way.
     running: bool,
+    /// A round is asked for, and hasn't started yet.
+    pending: bool,
     /// Whether a round has finished since `vibed` started.
     rounds: u32,
     last: Refreshed,
@@ -128,7 +130,11 @@ impl Watch {
 
     /// One [`refresh`], noted for [`Watch::check`].
     pub fn refresh(&self) -> Refreshed {
-        lock(&self.state).running = true;
+        {
+            let mut st = lock(&self.state);
+            st.running = true;
+            st.pending = false;
+        }
         let done = refresh(&self.images, &self.agents_dir, &self.sources);
         let mut st = lock(&self.state);
         st.running = false;
@@ -140,7 +146,7 @@ impl Watch {
     /// Asks for a round now, rather than at the next daily one. It shows
     /// as under way at once.
     pub fn kick(&self) {
-        lock(&self.state).running = true;
+        lock(&self.state).pending = true;
         self.kick.notify_one();
     }
 
@@ -154,6 +160,7 @@ impl Watch {
             .filter(|b| b.version >= self.sources.base_release);
         let managed = self.images.managed();
         let st = lock(&self.state);
+        let busy = st.running || st.pending;
         let check = |state, detail: String, hint: Option<&str>, progress| DoctorCheck {
             id: CheckId::Linux,
             state,
@@ -177,9 +184,7 @@ impl Watch {
             (None, _) => st.last.base_error.as_deref(),
             _ => st.last.claude_error.as_deref(),
         };
-        if !st.running
-            && let Some(e) = error
-        {
+        if !busy && let Some(e) = error {
             return check(
                 CheckState::Fail,
                 sentence(e),
@@ -192,13 +197,13 @@ impl Watch {
             .then(|| self.images.base_progress(self.sources.base_release))
             .flatten()
             .map(|(done, total)| percent(done, total));
-        let detail = match (&base, st.running || st.rounds == 0) {
+        let detail = match (&base, busy || st.rounds == 0) {
             (None, true) => "Downloading the Linux base image.".to_owned(),
             (None, false) => "The Linux base image isn't downloaded yet.".to_owned(),
             (Some(_), true) => "Downloading Claude Code for linux agents.".to_owned(),
             (Some(_), false) => "Claude Code for linux agents isn't downloaded yet.".to_owned(),
         };
-        if st.running || st.rounds == 0 {
+        if busy || st.rounds == 0 {
             check(CheckState::Working, detail, None, progress)
         } else {
             check(
@@ -245,7 +250,8 @@ pub fn spawn(watch: Arc<Watch>, every: Duration) -> tokio::task::JoinHandle<()> 
             }
             let round = Arc::clone(&watch);
             if let Err(e) = tokio::task::spawn_blocking(move || round.refresh()).await {
-                lock(&watch.state).running = false;
+                let mut st = lock(&watch.state);
+                st.running = false;
                 crate::log!("vibed: the Linux image check failed: {e}");
             }
         }
@@ -378,8 +384,12 @@ mod tests {
         assert!(c.detail.ends_with('.'));
         assert!(c.hint.is_some());
 
-        // A retry asked for shows as under way at once.
+        // A retry asked for shows as under way at once, and stays so
+        // while a round that began before it ends.
+        lock(&watch.state).running = true;
         watch.kick();
+        assert_eq!(watch.check().state, CheckState::Working);
+        lock(&watch.state).running = false;
         assert_eq!(watch.check().state, CheckState::Working);
 
         // Mid-download, the manifest says how far along it is.

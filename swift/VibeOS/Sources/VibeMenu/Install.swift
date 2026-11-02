@@ -231,9 +231,31 @@ public final class SystemInstaller: Installer {
         }
     }
 
+    /// Where the last answer macOS gave is kept: Terminal has to be
+    /// running to be asked, and isn't always.
+    static let lastTerminalAnswer = "terminalPermission"
+
     public func terminalPermission() async -> TerminalPermission {
-        guard isTerminalRunning else { return .unknown }
-        return await Task.detached { automationPermission(ask: false) }.value
+        guard isTerminalRunning else { return remembered }
+        return remember(await Task.detached { automationPermission(ask: false) }.value)
+    }
+
+    private var remembered: TerminalPermission {
+        switch UserDefaults.standard.string(forKey: Self.lastTerminalAnswer) {
+        case "granted": return .granted
+        case "denied": return .denied
+        default: return .unknown
+        }
+    }
+
+    private func remember(_ answer: TerminalPermission) -> TerminalPermission {
+        switch answer {
+        case .granted: UserDefaults.standard.set("granted", forKey: Self.lastTerminalAnswer)
+        case .denied: UserDefaults.standard.set("denied", forKey: Self.lastTerminalAnswer)
+        case .notAsked: UserDefaults.standard.removeObject(forKey: Self.lastTerminalAnswer)
+        case .unknown: break
+        }
+        return answer
     }
 
     public func askTerminalPermission() async -> TerminalPermission {
@@ -247,9 +269,9 @@ public final class SystemInstaller: Installer {
             }
             try? await Task.sleep(for: .milliseconds(500))
         }
-        guard isTerminalRunning else { return .unknown }
+        guard isTerminalRunning else { return remembered }
         // It waits on the owner's answer, so it's off the main thread.
-        return await Task.detached { automationPermission(ask: true) }.value
+        return remember(await Task.detached { automationPermission(ask: true) }.value)
     }
 
     public func openAutomationSettings() {
@@ -303,7 +325,7 @@ public struct InstallError: Error, CustomStringConvertible, Equatable {
 /// An installer that installs nothing and says what it's told, for the
 /// gallery and tests.
 @MainActor
-public final class FixedInstaller: Installer {
+public class FixedInstaller: Installer {
     public var state: InstallStatus
     /// What each call did, in order.
     public private(set) var calls: [String] = []
@@ -342,4 +364,55 @@ public final class FixedInstaller: Installer {
     }
 
     public func openAutomationSettings() { calls.append("automation settings") }
+}
+
+/// What stands between this copy and a running vibed, when it's how it's
+/// installed: opened from the disk image, turned off in Login Items, or a
+/// LaunchAgent macOS wouldn't take. The menu shows it instead of "Can't
+/// reach vibed".
+public struct InstallNote: Equatable, Sendable {
+    public enum Action: Equatable, Sendable {
+        /// Shows the app in Finder, to drag to Applications.
+        case reveal
+        case loginItems
+        case register
+    }
+
+    public var title: String
+    public var detail: String
+    public var action: Action
+    public var actionTitle: String
+
+    public init?(_ install: InstallStatus) {
+        if install.location == .notMoved {
+            title = "Move VibeOS to Applications"
+            detail = "VibeOS runs from your Applications folder. Drag it there, then open it from there."
+            action = .reveal
+            actionTitle = "Show in Finder"
+        } else if install.service == .requiresApproval {
+            title = "Let VibeOS run in the background"
+            detail = "vibed, which runs your agents, is turned off in Login Items. Turn on VibeOS there."
+            action = .loginItems
+            actionTitle = "Open Login Items"
+        } else if let why = install.registerFailure {
+            title = "VibeOS couldn't start vibed"
+            detail = sentence(why)
+            action = .register
+            actionTitle = "Try Again"
+        } else {
+            return nil
+        }
+    }
+}
+
+/// Whether version `a` comes before `b`, part by part: `0.9.0` before
+/// `0.10.0`. Parts that aren't numbers count as 0.
+public func versionIsOlder(_ a: String, than b: String) -> Bool {
+    let parts = { (v: String) in v.split(separator: ".").map { Int($0) ?? 0 } }
+    let (x, y) = (parts(a), parts(b))
+    for i in 0..<max(x.count, y.count) {
+        let (p, q) = (i < x.count ? x[i] : 0, i < y.count ? y[i] : 0)
+        if p != q { return p < q }
+    }
+    return false
 }

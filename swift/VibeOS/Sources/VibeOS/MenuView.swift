@@ -549,7 +549,7 @@ struct EmptyMenuView: View {
                 setup = await loadSetup()
                 loaded = true
                 guard setup?.steps.contains(where: \.isWorking) == true else { break }
-                try? await Task.sleep(for: .seconds(3))
+                try? await Task.sleep(for: .seconds(5))
             } while !Task.isCancelled
         }
     }
@@ -567,9 +567,14 @@ struct EmptyMenuView: View {
             // A vibed from before vibe doctor has none to give.
             let doctor = (try? await model.call(DoctorCheckGet.self, NoParams(), timeout: 90))?.checks ?? []
             await model.refreshInstall()
+            // With Tailscale up, other machines reach MCP through it once
+            // it's on there, or through a Linux host's external address.
+            let tailscale = doctor.first { $0.id == .tailscale }?.state == .pass
+            let remote = tailscale ? (model.mcp?.tailscale == true || model.externalHost != nil) : nil
             return SetupProgress(
                 hasProject: !projects.isEmpty, hasKey: !keys.isEmpty, linuxClaude: claude, linuxGitHub: github,
-                doctor: doctor, install: model.install, ghInstalled: model.gh?.state != .notInstalled)
+                doctor: doctor, install: model.install, ghInstalled: model.gh?.state != .notInstalled,
+                remoteMCP: remote)
         } catch {
             return nil
         }
@@ -585,6 +590,15 @@ struct EmptyMenuView: View {
         case .open(let link):
             if let url = URL(string: link) { NSWorkspace.shared.open(url) }
         case .installCommandLineTools: SetupActions.installCommandLineTools()
+        case .serveOnTailscale:
+            Task {
+                do {
+                    try await model.setMCPTailscale(true)
+                } catch {
+                    model.message = "Can't serve MCP on Tailscale: \(describe(error))"
+                }
+                model.setupMayHaveChanged()
+            }
         case .openToolbox: Task { await model.openToolbox() }
         case .projects: showSettings(.projects, with: openWindow)
         case .keys: showSettings(.keys, with: openWindow)
@@ -684,10 +698,11 @@ struct SetupStepRow: View {
                                 .background(Capsule().strokeBorder(Color.secondary.opacity(0.4)))
                         }
                     }
-                    if current || step.isWorking {
+                    if !step.done {
                         Text(step.detail)
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
+                            .lineLimit(3)
                             .fixedSize(horizontal: false, vertical: true)
                     }
                     if let progress = step.progress {
@@ -742,7 +757,7 @@ struct StepMark: View {
         case .working:
             ProgressView().controlSize(.small)
         case .optional:
-            Image(systemName: "circle.dashed").font(.title3).foregroundStyle(.tertiary)
+            Image(systemName: "circle.dashed").font(.title3).foregroundStyle(.secondary)
         case .todo:
             Image(systemName: "circle").font(.title3).foregroundStyle(.secondary)
         }
@@ -773,37 +788,6 @@ struct QuietView: View {
     }
 }
 
-/// What stands between this copy and a running vibed, when it's how it's
-/// installed: run from the disk image, turned off in Login Items, or a
-/// LaunchAgent macOS wouldn't take.
-struct InstallNote: Equatable {
-    enum Action: Equatable { case loginItems, register }
-
-    var title: String
-    var detail: String
-    var action: Action?
-    var actionTitle: String?
-
-    init?(_ install: InstallStatus) {
-        if install.location == .notMoved {
-            title = "Move VibeOS to Applications"
-            detail = "VibeOS runs from your Applications folder. Drag it there from the disk image, then open it again."
-        } else if install.service == .requiresApproval {
-            title = "Let VibeOS run in the background"
-            detail = "vibed, which runs your agents, is turned off in Login Items. Turn on VibeOS there."
-            action = .loginItems
-            actionTitle = "Open Login Items"
-        } else if let why = install.registerFailure {
-            title = "VibeOS couldn't start vibed"
-            detail = sentence(why)
-            action = .register
-            actionTitle = "Try Again"
-        } else {
-            return nil
-        }
-    }
-}
-
 struct InstallNoteView: View {
     @ObservedObject var model: MenuModel
     let note: InstallNote
@@ -817,15 +801,8 @@ struct InstallNoteView: View {
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
                 .fixedSize(horizontal: false, vertical: true)
-            if let action = note.action, let title = note.actionTitle {
-                Button(title) {
-                    switch action {
-                    case .loginItems: model.openLoginItems()
-                    case .register: Task { await model.registerService() }
-                    }
-                }
+            Button(note.actionTitle) { Task { await model.act(on: note) } }
                 .buttonStyle(.borderedProminent)
-            }
         }
         .padding(.vertical, 22)
         .padding(.horizontal, 28)
