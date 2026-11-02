@@ -799,8 +799,12 @@ typealias StepStatus = SetupProgress.Step.Status
             ["name": "reviewer", "environment": "linux", "model": "sonnet", "reasoning": "xhigh", "mode": "bypass",
              "memory": 4 << 30] as [String: Any])
         #expect(profileSummary(profile) == "Linux · Sonnet · Extra High · Bypass · 4G")
-        #expect(SetupProgress(hasProject: false, hasKey: false, linuxClaude: false).steps[1].title
-            == "Log in to Claude for Linux agents")
+        // The step's words, wherever it sits in the list (SetupTests has
+        // the order).
+        let setup = SetupProgress(hasProject: false, hasKey: false, linuxClaude: false)
+        let claude: SetupProgress.Step? = SetupTests.step(setup, StepID.claude)
+        let claudeTitle: String? = claude?.title
+        #expect(claudeTitle == "Log in to Claude for Linux agents")
     }
 
     /// An image of `size` pixels, filled with white, with `draw` on top.
