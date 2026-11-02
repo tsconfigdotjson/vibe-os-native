@@ -115,7 +115,8 @@ struct StatusDot: View {
         .onChange(of: dot) { _, now in
             guard now == .question, !reduceMotion else { return }
             withAnimation(.spring(response: 0.22, dampingFraction: 0.45)) { bounce = true }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
+            Task {
+                try? await Task.sleep(for: .milliseconds(180))
                 withAnimation(.spring(response: 0.3, dampingFraction: 0.6)) { bounce = false }
             }
         }
@@ -401,7 +402,8 @@ struct CopyButton: View {
         let button = Button {
             WorktreeActions.copy(text)
             withAnimation(motion(.snappy, reduce: reduceMotion)) { copied = true }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) {
+            Task {
+                try? await Task.sleep(for: .seconds(1.6))
                 withAnimation(motion(.snappy, reduce: reduceMotion)) { copied = false }
             }
         } label: {

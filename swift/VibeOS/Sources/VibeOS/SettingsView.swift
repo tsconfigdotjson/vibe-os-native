@@ -49,7 +49,7 @@ enum SettingsPane: String, CaseIterable, Identifiable {
 
 struct SettingsView: View {
     @ObservedObject var model: MenuModel
-    /// A pane to show whatever was last shown, for the gallery.
+    /// A pane to show instead of the one last shown, for the gallery.
     var showing: SettingsPane?
     @AppStorage(SettingsPane.storageKey) private var stored = SettingsPane.projects.rawValue
 

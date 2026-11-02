@@ -333,15 +333,20 @@ struct AgentRow: View {
         .accessibilityLabel(rowAccessibilityLabel(agent, now: model.now, unavailable: unavailable))
         .accessibilityHint(unavailable ? "" : "Opens it in Terminal")
         .accessibilityAddTraits(.isButton)
-        .accessibilityAction { Task { await model.attach(agent) } }
-        .accessibilityAction(named: "Interrupt") { Task { await model.interrupt(agent) } }
+        // The context menu's actions, for VoiceOver, on the same terms.
+        .accessibilityAction {
+            if !unavailable { Task { await model.attach(agent) } }
+        }
+        .accessibilityAction(named: "Interrupt") {
+            if canInterrupt { Task { await model.interrupt(agent) } }
+        }
         .accessibilityAction(named: "Copy Attach Command") { WorktreeActions.copy(agent.attach) }
-        .accessibilityAction(named: "Delete Agent") { delete() }
+        .accessibilityAction(named: "Delete Agent") {
+            if !unavailable { delete() }
+        }
         .contextMenu {
-            // Not while paused: its tree is stopped, so the Escape would
-            // wait, and cancel the turn it resumes into.
             Button("Interrupt", systemImage: "stop.circle") { Task { await model.interrupt(agent) } }
-                .disabled(!agent.state.isAwake || agent.state == .paused || unavailable)
+                .disabled(!canInterrupt)
             Divider()
             Button("Reveal Worktree in Finder", systemImage: "folder") { WorktreeActions.reveal(agent.worktree) }
                 .disabled(!agent.isLocal)
@@ -354,6 +359,12 @@ struct AgentRow: View {
             Button("Delete Agent…", systemImage: "trash", role: .destructive) { delete() }
                 .disabled(unavailable)
         }
+    }
+
+    /// Not while paused: its tree is stopped, so the Escape would wait, and
+    /// cancel the turn it resumes into.
+    private var canInterrupt: Bool {
+        agent.state.isAwake && agent.state != .paused && !unavailable
     }
 
     private func delete() {
