@@ -7,6 +7,9 @@ import VibeRPC
 /// and one of its profiles, and an optional name (PRD: Key user flows,
 /// Start an agent). Return starts it; Shift-Return is a new line.
 struct NewAgentView: View {
+    /// A pop-up's item: hosts, projects and profiles go by name.
+    typealias Choice = PopUp<String>.Item
+
     @ObservedObject var model: MenuModel
     @Environment(\.dismissWindow) private var dismissWindow
     @Environment(\.openWindow) private var openWindow
@@ -52,52 +55,49 @@ struct NewAgentView: View {
         VStack(alignment: .leading, spacing: 18) {
             PromptField(text: $prompt, focused: $promptFocused) { Task { await start() } }
                 .disabled(starting)
-            Form {
+            // One column of right-aligned labels, every control at the
+            // same x and width, the profile's summary under its pop-up.
+            VStack(alignment: .leading, spacing: 10) {
                 if model.hosts.count > 1 {
-                    LabeledContent("Host:") {
-                        Picker("Host", selection: $host) {
-                            ForEach(model.hosts, id: \.name) { h in
-                                Text(h.link == .local ? "\(h.label) (this Mac)" : h.name).tag(h.name)
-                            }
-                        }
-                        .labelsHidden()
-                        .frame(width: Self.controlWidth)
+                    FormRow(label: "Host") {
+                        PopUp(
+                            label: "Host",
+                            items: model.hosts.map {
+                                Choice(title: $0.link == .local ? "\($0.label) (this Mac)" : $0.name, value: $0.name)
+                            },
+                            selection: $host)
                     }
                 }
-                LabeledContent("Project:") {
-                    Picker("Project", selection: $project) {
-                        if projects.isEmpty { Text("—").tag("") }
-                        ForEach(projects, id: \.name) { p in Text(p.name).tag(p.name) }
-                    }
-                    .labelsHidden()
-                    .frame(width: Self.controlWidth)
+                FormRow(label: "Project") {
+                    PopUp(
+                        label: "Project",
+                        items: projects.isEmpty
+                            ? [Choice(title: "—", value: "")] : projects.map { Choice(title: $0.name, value: $0.name) },
+                        selection: $project)
                 }
-                LabeledContent("Profile:") {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Picker("Profile", selection: $profile) {
-                            if profiles.isEmpty { Text("—").tag("") }
-                            ForEach(profiles, id: \.name) { p in
-                                Label(p.name, systemImage: environmentSymbol(p.environment)).tag(p.name)
-                            }
-                        }
-                        .labelsHidden()
-                        .frame(width: Self.controlWidth)
-                        // Under its pop-up, in the controls' column.
-                        if let chosen {
-                            ProfileSummary(profile: chosen)
-                                .frame(width: Self.controlWidth, alignment: .leading)
-                        }
+                FormRow(label: "Profile") {
+                    PopUp(
+                        label: "Profile",
+                        items: profiles.isEmpty
+                            ? [Choice(title: "—", value: "")]
+                            : profiles.map {
+                                Choice(title: $0.name, value: $0.name, symbol: environmentSymbol($0.environment))
+                            },
+                        selection: $profile)
+                }
+                if let chosen {
+                    FormRow(label: "") {
+                        ProfileSummary(profile: chosen)
                     }
                 }
-                LabeledContent("Name:") {
+                FormRow(label: "Name") {
                     TextField("Name", text: $name, prompt: Text("Optional, picked for you"))
+                        .textFieldStyle(.roundedBorder)
                         .labelsHidden()
                         .autocorrectionDisabled()
-                        .frame(width: Self.controlWidth)
                         .help("The agent's ref and branch. Left empty, it gets three random words, such as quiet-amber-otter.")
                 }
             }
-            .formStyle(.columns)
             .disabled(starting)
 
             ErrorText(error: error)
@@ -126,9 +126,6 @@ struct NewAgentView: View {
         .padding(20)
         .onAppear { promptFocused = true }
     }
-
-    /// Every control in the form is this wide, so they line up.
-    private static let controlWidth: CGFloat = 300
 
     /// No projects on this host: say how to add one.
     private var noProjects: some View {
@@ -206,6 +203,8 @@ struct ProfileSummary: View {
             Text(profileSummary(profile))
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
             if profile.mode == .bypass && profile.environment == .macos {
                 Label("acts as you", systemImage: "exclamationmark.shield")
                     .font(.subheadline)

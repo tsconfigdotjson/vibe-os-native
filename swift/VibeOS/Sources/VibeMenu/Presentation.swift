@@ -201,7 +201,9 @@ public struct MemoryGauge: Equatable, Sendable {
 public func rowLines(_ agent: Agent, timeZone: TimeZone = .current) -> (title: String?, line: String?) {
     let status = agent.status
     var line = status.line
-    if status.stopReason == .usageLimit {
+    if agent.state == .paused, let gauge = MemoryGauge(agent), gauge.fraction >= 0.995 {
+        line = "Paused at its \(formatBytes(agent.memory)) memory limit"
+    } else if status.stopReason == .usageLimit {
         if let resets = status.resetsAt.flatMap(parseTime) {
             var style = Date.FormatStyle(date: .omitted, time: .shortened)
             style.timeZone = timeZone
@@ -663,7 +665,7 @@ public func headerAlerts(gh: GhStatus?, hosts: [HostInfo]) -> [HeaderAlert] {
         alerts.append(
             HeaderAlert(
                 id: "host:\(host.name)", symbol: "exclamationmark.triangle.fill", title: "\(host.name) is down",
-                detail: "Its agents keep running there. It reconnects on its own.",
+                detail: "Its agents keep running. VibeOS reconnects on its own.",
                 reason: host.detail.map(sentence), tone: .trouble))
     }
     for host in hosts where host.link == .connected {
@@ -726,15 +728,19 @@ public func headerFacts(memory: HostMemory?, gh: GhStatus?, mcp: Bool, hosts: [H
 
 /// What a row says about memory, beyond its quiet bar: only something
 /// notable. Near the limit, how near; at it, that it's at it, as a state.
+/// Paused there, the status line already says so: the bar just turns red,
+/// with no words of its own.
 public struct MemoryNote: Equatable, Sendable {
-    public var text: String
+    /// The badge's words; nil when the status line says it.
+    public var text: String?
     public var tone: StatusTone
 }
 
 public func memoryNote(_ agent: Agent) -> MemoryNote? {
     guard let gauge = MemoryGauge(agent) else { return nil }
     if gauge.fraction >= 0.995 {
-        return MemoryNote(text: "At its memory limit", tone: agent.state == .paused ? .trouble : .attention)
+        if agent.state == .paused { return MemoryNote(text: nil, tone: .trouble) }
+        return MemoryNote(text: "At its memory limit", tone: .attention)
     }
     if gauge.fraction >= 0.8 {
         return MemoryNote(text: gauge.label.replacingOccurrences(of: " / ", with: " of "), tone: .attention)

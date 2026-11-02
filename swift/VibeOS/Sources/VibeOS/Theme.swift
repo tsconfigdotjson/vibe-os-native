@@ -226,16 +226,18 @@ struct MenuItemLabel: View {
 
 /// A row's memory: a thin, quiet bar against the profile's limit (PRD:
 /// Menu bar, agent rows). Near the limit it becomes a state, an amber
-/// badge saying how near; at the limit it says so, red when that paused it.
+/// badge saying how near; at the limit it says so. Paused there, the bar
+/// only turns red: the status line says the rest.
 struct MemoryBar: View {
     let gauge: MemoryGauge
     var note: MemoryNote?
 
     var body: some View {
         let tint = note?.tone == .trouble ? Palette.trouble : Palette.attention
+        let badge = note?.text != nil
         HStack(spacing: 5) {
-            if let note {
-                Text(note.text)
+            if let text = note?.text {
+                Text(text)
                     .font(.caption.weight(.medium))
                     .monospacedDigit()
                     .foregroundStyle(tint)
@@ -250,10 +252,10 @@ struct MemoryBar: View {
             }
             .frame(width: 32, height: 3)
         }
-        .padding(.horizontal, note == nil ? 0 : 7)
-        .padding(.vertical, note == nil ? 0 : 2)
+        .padding(.horizontal, badge ? 7 : 0)
+        .padding(.vertical, badge ? 2 : 0)
         .background {
-            if note != nil { Capsule().fill(tint.opacity(0.14)) }
+            if badge { Capsule().fill(tint.opacity(0.14)) }
         }
         .help("Memory: \(gauge.label.replacingOccurrences(of: " / ", with: " of "))")
         .accessibilityHidden(true)
@@ -368,6 +370,8 @@ struct CommitField: View {
     var prompt: String?
     var width: CGFloat = 120
     var help: String?
+    /// Numbers line up on the right; words read from the left.
+    var trailing = true
     let isValid: (String) -> Bool
     /// Saves the text; true if it took.
     let commit: (String) async -> Bool
@@ -385,9 +389,12 @@ struct CommitField: View {
                 .opacity(saved ? 1 : 0)
                 .scaleEffect(saved || reduceMotion ? 1 : 0.6)
                 .accessibilityHidden(true)
+            // Bordered, so it reads as a field wherever it sits: a grouped
+            // form otherwise draws its text fields as plain text.
             TextField(title, text: $text, prompt: prompt.map { Text($0) })
+                .textFieldStyle(.roundedBorder)
                 .labelsHidden()
-                .multilineTextAlignment(.trailing)
+                .multilineTextAlignment(trailing ? .trailing : .leading)
                 .monospacedDigit()
                 .foregroundStyle(isValid(text) ? Color.primary : Palette.trouble)
                 .frame(width: width)
@@ -594,5 +601,105 @@ struct OverlayScrollers: NSViewRepresentable {
             }
             return found
         }
+    }
+}
+
+// MARK: Aligned forms
+
+/// A form row: its label right-aligned in a column of `labelWidth`, its
+/// control leading-aligned at `controlWidth`, so every row's label ends and
+/// every control starts at the same x. Laid out explicitly, rather than by
+/// a form style, so it comes out the same everywhere.
+struct FormRow<Content: View>: View {
+    let label: String
+    var labelWidth: CGFloat = 92
+    var controlWidth: CGFloat = 260
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 8) {
+            Text(label)
+                .foregroundStyle(.secondary)
+                .frame(width: labelWidth, alignment: .trailing)
+                .accessibilityHidden(true)
+            content
+                .frame(width: controlWidth, alignment: .leading)
+            Spacer(minLength: 0)
+        }
+    }
+}
+
+/// A native pop-up button that takes the width it's given, not its own:
+/// SwiftUI's menu Picker sizes to its longest item and centres in a wider
+/// frame, so pop-ups in a column came out at different widths.
+struct PopUp<Value: Hashable>: NSViewRepresentable {
+    struct Item {
+        let title: String
+        let value: Value
+        var symbol: String?
+    }
+
+    let label: String
+    let items: [Item]
+    @Binding var selection: Value
+
+    func makeNSView(context: Context) -> NSPopUpButton {
+        let button = NSPopUpButton(frame: .zero, pullsDown: false)
+        button.target = context.coordinator
+        button.action = #selector(PopUpTarget.changed(_:))
+        button.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        button.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        return button
+    }
+
+    func updateNSView(_ button: NSPopUpButton, context: Context) {
+        let items = self.items
+        let selection = $selection
+        context.coordinator.select = { index in
+            if items.indices.contains(index) { selection.wrappedValue = items[index].value }
+        }
+        button.setAccessibilityLabel(label)
+        // The menu is made again only when its items change, not on every
+        // update (each keystroke in the prompt is one), so an open menu
+        // stays as it is. Items go in as menu items, as addItem(withTitle:)
+        // drops a repeated title.
+        let shape = items.map { [$0.title, $0.symbol ?? ""] }
+        if shape != context.coordinator.shape {
+            context.coordinator.shape = shape
+            let menu = NSMenu()
+            for item in items {
+                let entry = NSMenuItem(title: item.title, action: nil, keyEquivalent: "")
+                if let symbol = item.symbol {
+                    entry.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
+                }
+                menu.addItem(entry)
+            }
+            button.menu = menu
+        }
+        if let index = items.firstIndex(where: { $0.value == self.selection }) {
+            button.selectItem(at: index)
+        }
+        button.isEnabled = context.environment.isEnabled
+    }
+
+    /// The width proposed, if it's a real one; its own otherwise.
+    func sizeThatFits(_ proposal: ProposedViewSize, nsView: NSPopUpButton, context: Context) -> CGSize? {
+        let natural = nsView.intrinsicContentSize
+        let width = proposal.width.flatMap { $0.isFinite ? $0 : nil } ?? natural.width
+        return CGSize(width: width, height: natural.height)
+    }
+
+    func makeCoordinator() -> PopUpTarget { PopUpTarget() }
+}
+
+/// A PopUp's target: what choosing an item does, and the items its menu
+/// was last made from.
+@MainActor
+final class PopUpTarget: NSObject {
+    var select: @MainActor (Int) -> Void = { _ in }
+    var shape: [[String]] = []
+
+    @objc func changed(_ sender: NSPopUpButton) {
+        select(sender.indexOfSelectedItem)
     }
 }

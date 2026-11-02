@@ -396,6 +396,9 @@ struct ProfileRow: View {
     let changed: () async -> Void
     /// What a change just made shows until vibed's answer comes back.
     @State private var pending: Profile?
+    /// The memory the stepper is headed to, and whether it's sending.
+    @State private var stepTarget: Int?
+    @State private var stepping = false
     @State private var error: String?
 
     private var shown: Profile { pending ?? profile }
@@ -407,57 +410,72 @@ struct ProfileRow: View {
 
     var body: some View {
         DisclosureGroup(isExpanded: $expanded) {
-            LabeledContent("Name") {
-                CommitField(
-                    title: "Name", value: profile.name, width: 220,
-                    isValid: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
-                ) { text in
-                    let name = text.trimmingCharacters(in: .whitespaces)
-                    // Before the reload the update makes, so the row is
-                    // open under its new name when it comes back.
-                    renamed(name)
-                    return await update { $0.name = name }
+            // Indented to the profile's name, so they read as its own.
+            Group {
+                LabeledContent("Name") {
+                    CommitField(
+                        title: "Name", value: profile.name, width: 220, trailing: false,
+                        isValid: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+                    ) { text in
+                        let name = text.trimmingCharacters(in: .whitespaces)
+                        // Before the reload the update makes, so the row is
+                        // open under its new name when it comes back.
+                        renamed(name)
+                        return await update { $0.name = name }
+                    }
+                }
+                Picker("Environment", selection: binding(\.environment, \.environment)) {
+                    ForEach(environments, id: \.self) { Text($0.title).tag($0) }
+                }
+                .pickerStyle(.segmented)
+                Picker("Model", selection: binding(\.model, \.model)) {
+                    ForEach(ClaudeModel.allCases, id: \.self) { Text($0.title).tag($0) }
+                }
+                .pickerStyle(.segmented)
+                Picker("Reasoning", selection: binding(\.reasoning, \.reasoning)) {
+                    ForEach(ReasoningLevel.allCases, id: \.self) { Text($0.title).tag($0) }
+                }
+                Picker("Mode", selection: binding(\.mode, \.mode)) {
+                    ForEach(PermissionMode.allCases, id: \.self) { Text($0.title).tag($0) }
+                }
+                .pickerStyle(.segmented)
+                LabeledContent("Memory") {
+                    HStack(spacing: 6) {
+                        CommitField(
+                            title: "Memory", value: formatSize(profile.memory), width: 80,
+                            help: "1G to 1T, in whole MB, such as 4G or 6144M", isValid: validMemory
+                        ) { text in
+                            await update { $0.memory = parseBytes(text) }
+                        }
+                        Stepper(
+                            "Memory", onIncrement: { Task { await stepMemory(by: 1) } },
+                            onDecrement: { Task { await stepMemory(by: -1) } }
+                        )
+                        .labelsHidden()
+                        .help("A gigabyte more or less")
+                        .accessibilityLabel("Memory, a gigabyte more or less")
+                    }
+                }
+                if shown.mode == .bypass {
+                    Label(
+                        shown.environment == .macos
+                            ? "Bypass skips every permission prompt, and a macOS agent acts as you."
+                            : "Bypass skips every permission prompt; the VM is its sandbox.",
+                        systemImage: "exclamationmark.shield"
+                    )
+                    .font(.callout)
+                    .foregroundStyle(shown.environment == .macos ? Palette.attention : Color.secondary)
+                }
+                ErrorText(error: error)
+                HStack {
+                    Button("Delete Profile…", role: .destructive) { Task { await delete() } }
+                        .buttonStyle(.bordered)
+                        .tint(Palette.trouble)
+                        .accessibilityLabel("Delete profile \(profile.name)")
+                    Spacer()
                 }
             }
-            Picker("Environment", selection: binding(\.environment, \.environment)) {
-                ForEach(environments, id: \.self) { Text($0.title).tag($0) }
-            }
-            .pickerStyle(.segmented)
-            Picker("Model", selection: binding(\.model, \.model)) {
-                ForEach(ClaudeModel.allCases, id: \.self) { Text($0.title).tag($0) }
-            }
-            .pickerStyle(.segmented)
-            Picker("Reasoning", selection: binding(\.reasoning, \.reasoning)) {
-                ForEach(ReasoningLevel.allCases, id: \.self) { Text($0.title).tag($0) }
-            }
-            Picker("Mode", selection: binding(\.mode, \.mode)) {
-                ForEach(PermissionMode.allCases, id: \.self) { Text($0.title).tag($0) }
-            }
-            .pickerStyle(.segmented)
-            LabeledContent("Memory") {
-                CommitField(
-                    title: "Memory", value: formatSize(profile.memory), width: 90,
-                    help: "1G to 1T, in whole MB, such as 4G or 6144M", isValid: validMemory
-                ) { text in
-                    await update { $0.memory = parseBytes(text) }
-                }
-            }
-            if shown.mode == .bypass {
-                Label(
-                    shown.environment == .macos
-                        ? "Bypass skips every permission prompt, and a macOS agent acts as you."
-                        : "Bypass skips every permission prompt; the VM is its sandbox.",
-                    systemImage: "exclamationmark.shield"
-                )
-                .font(.callout)
-                .foregroundStyle(shown.environment == .macos ? Palette.attention : Color.secondary)
-            }
-            ErrorText(error: error)
-            HStack {
-                Spacer()
-                Button("Delete Profile…", role: .destructive) { Task { await delete() } }
-                    .accessibilityLabel("Delete profile \(profile.name)")
-            }
+            .padding(.leading, 30)
         } label: {
             // A click anywhere on the row opens it, as a button, so VoiceOver
             // has it too.
@@ -489,6 +507,32 @@ struct ProfileRow: View {
         .contentShape(Rectangle())
     }
 
+    /// The stepper: a whole gigabyte up or down from where it's headed,
+    /// within 1G to 1T. Steps go to vibed one at a time, so quick clicks
+    /// land in order on the last one.
+    private func stepMemory(by gigabytes: Int) async {
+        let gib = 1 << 30
+        let from = stepTarget ?? shown.memory
+        let whole = gigabytes > 0 ? from / gib * gib : (from + gib - 1) / gib * gib
+        let next = min(max(whole + gigabytes * gib, gib), 1 << 40)
+        guard next != from else { return }
+        stepTarget = next
+        var moved = shown
+        moved.memory = next
+        pending = moved
+        // A send under way takes this one too, when it's done.
+        guard !stepping else { return }
+        stepping = true
+        var sent: Int?
+        while let target = stepTarget, target != sent {
+            sent = target
+            guard await update(keepPending: true, { $0.memory = target }) else { break }
+        }
+        stepping = false
+        stepTarget = nil
+        pending = nil
+    }
+
     private func validMemory(_ text: String) -> Bool {
         guard let bytes = parseBytes(text) else { return false }
         return bytes >= 1 << 30 && bytes <= 1 << 40 && bytes % (1 << 20) == 0
@@ -509,15 +553,17 @@ struct ProfileRow: View {
             })
     }
 
+    /// Sends a change. The pending view clears once it's back, unless
+    /// `keepPending` (the stepper's later steps are still to come).
     @discardableResult
-    private func update(_ edit: (inout ProfileUpdateParams) -> Void) async -> Bool {
+    private func update(keepPending: Bool = false, _ edit: (inout ProfileUpdateParams) -> Void) async -> Bool {
         var params = ProfileUpdateParams(host: host, project: project, profile: profile.name)
         edit(&params)
         do {
             _ = try await model.call(ProfilesUpdate.self, params)
             error = nil
             await changed()
-            pending = nil
+            if !keepPending { pending = nil }
             return true
         } catch {
             pending = nil
@@ -553,7 +599,9 @@ struct KeysPane: View {
     var body: some View {
         Form {
             Section {
-                if keys.isEmpty {
+                if keys.isEmpty, let error {
+                    ErrorText(error: error)
+                } else if keys.isEmpty {
                     Text(loaded ? "No keys yet. An MCP client needs one to reach your agents." : "Loading…")
                         .foregroundStyle(.secondary)
                 }
@@ -561,13 +609,16 @@ struct KeysPane: View {
                     KeyRow(key: key) { Task { await revoke(key) } }
                 }
             } header: {
-                Text("Keys")
+                HStack {
+                    Text("Keys")
+                    Spacer()
+                    Button("New Key…") { creating = true }
+                }
             } footer: {
-                Text(keysNote).foregroundStyle(.secondary)
-            }
-            Section {
-                Button("New Key…") { creating = true }
-                ErrorText(error: error)
+                VStack(alignment: .leading, spacing: 6) {
+                    if !keys.isEmpty { ErrorText(error: error) }
+                    Text(keysNote).foregroundStyle(.secondary)
+                }
             }
         }
         .formStyle(.grouped)

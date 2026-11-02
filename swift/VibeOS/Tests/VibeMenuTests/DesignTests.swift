@@ -315,7 +315,7 @@ import VibeRPC
         #expect(alerts.map(\.title) == ["box is down"])
         #expect(alerts.first?.tone == .trouble)
         #expect(alerts.first?.reason == "ssh: timed out")
-        #expect(alerts.first?.detail == "Its agents keep running there. It reconnects on its own.")
+        #expect(alerts.first?.detail == "Its agents keep running. VibeOS reconnects on its own.")
         // A gh login missing and an external address outside can't reach.
         let out = try decode(GhStatus.self, ["state": "logged_out"])
         let unreachable = try decode(HostInfo.self, hostJSON("vps", link: .connected, external: true, tunnel: .down))
@@ -354,9 +354,18 @@ import VibeRPC
         let near = try #require(memoryNote(try agent("a", memoryUsed: 3_543_348_019)))
         #expect(near.tone == .attention)
         #expect(near.text == "3.3G of 4G")
-        // At it: a state, red once it paused the agent.
+        // At it: a state, in amber words.
         #expect(memoryNote(try agent("a", state: .busy, memoryUsed: 4 << 30)) == MemoryNote(text: "At its memory limit", tone: .attention))
-        #expect(memoryNote(try agent("a", state: .paused, memoryUsed: 4 << 30)) == MemoryNote(text: "At its memory limit", tone: .trouble))
+        // Paused there, it's said once, in the status line; the bar only
+        // turns red.
+        let paused = try agent("a", state: .paused, memoryUsed: 4 << 30)
+        #expect(memoryNote(paused) == MemoryNote(text: nil, tone: .trouble))
+        #expect(rowLines(paused).line == "Paused at its 4G memory limit")
+        // Paused below it (processes, disk), vibed's own line stands.
+        var processes = try agent("b", state: .paused, memoryUsed: 1 << 30)
+        processes.status.line = "Paused: past max_processes"
+        #expect(rowLines(processes).line == "Paused: past max_processes")
+        #expect(memoryNote(processes) == nil)
     }
 
     @Test func valuesHaveOneVoice() throws {

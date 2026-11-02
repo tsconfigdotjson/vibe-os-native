@@ -174,7 +174,11 @@ struct AlertRow: View {
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
-        .background(RoundedRectangle(cornerRadius: Metrics.cardRadius, style: .continuous).fill(tint.opacity(0.12)))
+        .background(RoundedRectangle(cornerRadius: Metrics.cardRadius, style: .continuous).fill(tint.opacity(0.06)))
+        .overlay(
+            RoundedRectangle(cornerRadius: Metrics.cardRadius, style: .continuous)
+                .strokeBorder(tint.opacity(0.45), lineWidth: 0.5)
+        )
         .help(alert.reason ?? "")
         .accessibilityElement(children: .combine)
     }
@@ -737,7 +741,7 @@ struct FooterView: View {
             }
             .buttonStyle(MenuRowStyle())
             .keyboardShortcut("q")
-            .help("vibed and your agents keep running")
+            .help("Closes this menu. vibed and every agent keep running.")
         }
     }
 }
