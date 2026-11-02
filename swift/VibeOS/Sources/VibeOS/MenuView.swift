@@ -46,7 +46,9 @@ struct MenuView: View {
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 28)
         case .unavailable(let why):
-            if model.agents.isEmpty {
+            if model.agents.isEmpty, let note = InstallNote(model.install) {
+                InstallNoteView(model: model, note: note)
+            } else if model.agents.isEmpty {
                 OfflineView(model: model, why: why)
             } else {
                 // The last rows vibed gave, all unavailable, under a note.
@@ -534,16 +536,21 @@ struct EmptyMenuView: View {
             if !loaded {
                 ProgressView().controlSize(.small).frame(maxWidth: .infinity).padding(.vertical, 40)
             } else if let setup, !setup.complete {
-                WelcomeView(setup: setup) { act(on: $0) }
+                WelcomeView(setup: setup) { act($0) }
             } else {
                 QuietView { show(WindowID.newAgent, with: openWindow) }
             }
         }
         // Again on each open and each settings change, so a step just done
-        // in Settings or Terminal shows as done.
+        // in Settings or Terminal shows as done; and every few seconds
+        // while one is under way, as the Linux download is.
         .task(id: model.settingsRevision) {
-            setup = await loadSetup()
-            loaded = true
+            repeat {
+                setup = await loadSetup()
+                loaded = true
+                guard setup?.steps.contains(where: \.isWorking) == true else { break }
+                try? await Task.sleep(for: .seconds(3))
+            } while !Task.isCancelled
         }
     }
 
@@ -552,32 +559,49 @@ struct EmptyMenuView: View {
             let projects = try await model.call(ProjectsList.self, HostParams()).projects
             let keys = try await model.call(KeysList.self, NoParams()).keys
             var claude: Bool?
-            if let toolbox = model.toolbox, toolbox.state != .unavailable {
-                claude = (try? await model.toolboxLogins())?.claude
+            var github: Bool?
+            if let toolbox = model.toolbox, toolbox.state != .unavailable, let logins = try? await model.toolboxLogins() {
+                claude = logins.claude
+                github = logins.logins.map { found in found.contains { $0.tool == .gh } }
             }
-            return SetupProgress(hasProject: !projects.isEmpty, hasKey: !keys.isEmpty, linuxClaude: claude)
+            // A vibed from before vibe doctor has none to give.
+            let doctor = (try? await model.call(DoctorCheckGet.self, NoParams(), timeout: 90))?.checks ?? []
+            await model.refreshInstall()
+            return SetupProgress(
+                hasProject: !projects.isEmpty, hasKey: !keys.isEmpty, linuxClaude: claude, linuxGitHub: github,
+                doctor: doctor, install: model.install, ghInstalled: model.gh?.state != .notInstalled)
         } catch {
             return nil
         }
     }
 
-    private func act(on step: SetupProgress.Step.ID) {
-        switch step {
-        case .project: showSettings(.projects, with: openWindow)
-        case .claude: model.runInTerminal(["setup-token"], exec: true)
-        case .key: showSettings(.keys, with: openWindow)
+    private func act(_ action: SetupAction) {
+        switch action {
+        case .linkCommand: Task { await model.linkCommand() }
+        case .allowTerminal: Task { await model.allowTerminal() }
+        case .fix(let check): Task { await model.fix(check) }
+        case .terminal(let line): model.runCommandInTerminal(line)
+        case .vibe(let words): model.runInTerminal(words, exec: true)
+        case .open(let link):
+            if let url = URL(string: link) { NSWorkspace.shared.open(url) }
+        case .installCommandLineTools: SetupActions.installCommandLineTools()
+        case .openToolbox: Task { await model.openToolbox() }
+        case .projects: showSettings(.projects, with: openWindow)
+        case .keys: showSettings(.keys, with: openWindow)
         }
     }
 }
 
-/// The first run: the mark lights a window for each step done.
+/// The first run: one list, in order, of what this Mac needs and what's
+/// left to set up. The checks that passed fold into one row; the next step
+/// says what it does; the mark lights a window as the steps get done.
 struct WelcomeView: View {
     let setup: SetupProgress
-    let act: (SetupProgress.Step.ID) -> Void
+    let act: (SetupAction) -> Void
 
     var body: some View {
         VStack(spacing: 14) {
-            BrandMark(lit: setup.done, size: 64)
+            BrandMark(lit: setup.lit, size: 64)
             VStack(spacing: 4) {
                 Text("Welcome to VibeOS").font(.title3.weight(.semibold))
                 Text("A few steps and this Mac is ready to host agents.")
@@ -585,15 +609,20 @@ struct WelcomeView: View {
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
             }
-            VStack(spacing: 0) {
-                ForEach(Array(setup.steps.enumerated()), id: \.element.id) { index, step in
-                    Button { act(step.id) } label: {
-                        SetupStepRow(step: step, number: index + 1)
+            ScrollView {
+                VStack(spacing: 0) {
+                    ForEach(setup.rows) { row in
+                        switch row {
+                        case .passed(let steps):
+                            PassedRow(title: setup.passedTitle, steps: steps)
+                        case .step(let step):
+                            SetupStepRow(step: step, current: step.id == setup.next, act: act)
+                        }
                     }
-                    .buttonStyle(MenuRowStyle())
-                    .disabled(step.done)
                 }
             }
+            .frame(maxHeight: 400)
+            .fixedSize(horizontal: false, vertical: true)
         }
         .padding(.top, 20)
         .padding(.bottom, 10)
@@ -601,45 +630,122 @@ struct WelcomeView: View {
     }
 }
 
-struct SetupStepRow: View {
-    let step: SetupProgress.Step
-    let number: Int
+/// This Mac's checks that passed, as one row.
+struct PassedRow: View {
+    let title: String
+    let steps: [SetupProgress.Step]
 
     var body: some View {
-        HStack(alignment: .top, spacing: 10) {
-            ZStack {
-                if step.done {
-                    Image(systemName: "checkmark.circle.fill")
-                        .font(.title3)
-                        .foregroundStyle(Palette.signal)
-                        .transition(.scale.combined(with: .opacity))
-                } else {
-                    Circle().strokeBorder(Color.secondary.opacity(0.5), lineWidth: 1.25)
-                    Text("\(number)").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                }
-            }
-            .frame(width: 20, height: 20)
+        HStack(alignment: .center, spacing: 10) {
+            Image(systemName: "checkmark.circle.fill")
+                .font(.title3)
+                .foregroundStyle(Palette.signal)
+                .frame(width: 20, height: 20)
             VStack(alignment: .leading, spacing: 2) {
-                Text(step.title)
-                    .foregroundStyle(step.done ? Color.secondary : Color.primary)
-                Text(step.detail)
+                Text(title).foregroundStyle(.secondary)
+                Text(steps.map(\.title).joined(separator: ", "))
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                    .lineLimit(2)
             }
-            Spacer(minLength: 4)
-            if !step.done {
-                Image(systemName: "chevron.right")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                    .padding(.top, 3)
-            }
+            Spacer(minLength: 0)
         }
         .padding(.horizontal, Metrics.gutter)
         .padding(.vertical, 7)
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .help(steps.map { "\($0.title): \($0.detail)" }.joined(separator: "\n"))
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("Step \(number), \(step.title)\(step.done ? ", done" : ""). \(step.detail)")
+        .accessibilityLabel("\(title): \(steps.map(\.title).joined(separator: ", "))")
+    }
+}
+
+/// One step: a mark for how it stands, its title, what it does when it's
+/// the next one (or under way), and its button.
+struct SetupStepRow: View {
+    let step: SetupProgress.Step
+    /// The next step to do, which says what it does.
+    let current: Bool
+    let act: (SetupAction) -> Void
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 10) {
+            HStack(alignment: .center, spacing: 10) {
+                StepMark(status: step.status)
+                    .frame(width: 20, height: 20)
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 6) {
+                        Text(step.title)
+                            .foregroundStyle(step.done ? Color.secondary : Color.primary)
+                        if step.status == .optional {
+                            Text("Optional")
+                                .font(.caption2.weight(.medium))
+                                .foregroundStyle(.secondary)
+                                .padding(.horizontal, 5)
+                                .padding(.vertical, 1)
+                                .background(Capsule().strokeBorder(Color.secondary.opacity(0.4)))
+                        }
+                    }
+                    if current || step.isWorking {
+                        Text(step.detail)
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    if let progress = step.progress {
+                        ProgressView(value: Double(progress), total: 100)
+                            .controlSize(.small)
+                            .frame(maxWidth: 180)
+                    }
+                }
+            }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("\(step.title), \(step.statusWords)")
+            .accessibilityHint(step.detail)
+            Spacer(minLength: 6)
+            if let action = step.action, let title = step.actionTitle {
+                StepButton(title: title, prominent: current) { act(action) }
+                    .accessibilityHint(step.detail)
+            }
+        }
+        .padding(.horizontal, Metrics.gutter)
+        .padding(.vertical, 6)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
+        .help(step.detail)
+    }
+}
+
+/// A step's button: the system's small bordered button, prominent for the
+/// next step.
+struct StepButton: View {
+    let title: String
+    let prominent: Bool
+    let action: () -> Void
+
+    var body: some View {
+        if prominent {
+            Button(title, action: action).buttonStyle(.borderedProminent).controlSize(.small)
+        } else {
+            Button(title, action: action).buttonStyle(.bordered).controlSize(.small)
+        }
+    }
+}
+
+/// How a step stands: a checkmark when done, a spinner while under way, a
+/// dashed ring when optional, a ring when it's still to do.
+struct StepMark: View {
+    let status: SetupProgress.Step.Status
+
+    var body: some View {
+        switch status {
+        case .done:
+            Image(systemName: "checkmark.circle.fill").font(.title3).foregroundStyle(Palette.signal)
+        case .working:
+            ProgressView().controlSize(.small)
+        case .optional:
+            Image(systemName: "circle.dashed").font(.title3).foregroundStyle(.tertiary)
+        case .todo:
+            Image(systemName: "circle").font(.title3).foregroundStyle(.secondary)
+        }
     }
 }
 
@@ -664,6 +770,67 @@ struct QuietView: View {
         .padding(.vertical, 22)
         .padding(.horizontal, 28)
         .frame(maxWidth: .infinity)
+    }
+}
+
+/// What stands between this copy and a running vibed, when it's how it's
+/// installed: run from the disk image, turned off in Login Items, or a
+/// LaunchAgent macOS wouldn't take.
+struct InstallNote: Equatable {
+    enum Action: Equatable { case loginItems, register }
+
+    var title: String
+    var detail: String
+    var action: Action?
+    var actionTitle: String?
+
+    init?(_ install: InstallStatus) {
+        if install.location == .notMoved {
+            title = "Move VibeOS to Applications"
+            detail = "VibeOS runs from your Applications folder. Drag it there from the disk image, then open it again."
+        } else if install.service == .requiresApproval {
+            title = "Let VibeOS run in the background"
+            detail = "vibed, which runs your agents, is turned off in Login Items. Turn on VibeOS there."
+            action = .loginItems
+            actionTitle = "Open Login Items"
+        } else if let why = install.registerFailure {
+            title = "VibeOS couldn't start vibed"
+            detail = sentence(why)
+            action = .register
+            actionTitle = "Try Again"
+        } else {
+            return nil
+        }
+    }
+}
+
+struct InstallNoteView: View {
+    @ObservedObject var model: MenuModel
+    let note: InstallNote
+
+    var body: some View {
+        VStack(spacing: 10) {
+            BrandMark(lit: 0, size: 44)
+            Text(note.title).font(.headline)
+            Text(note.detail)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+            if let action = note.action, let title = note.actionTitle {
+                Button(title) {
+                    switch action {
+                    case .loginItems: model.openLoginItems()
+                    case .register: Task { await model.registerService() }
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+            }
+        }
+        .padding(.vertical, 22)
+        .padding(.horizontal, 28)
+        .frame(maxWidth: .infinity)
+        .accessibilityElement(children: .contain)
     }
 }
 

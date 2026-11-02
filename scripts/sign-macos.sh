@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # Builds VibeOS.app and vibe-vm into build/ and signs both ad hoc for local
 # development. vibe-vm gets the com.apple.security.virtualization
-# entitlement it needs to run VMs. Release signing comes with #14.
+# entitlement it needs to run VMs. The app is bundled as a release is
+# (scripts/release-macos.sh, which signs with a Developer ID): vibe-vm in
+# Contents/MacOS, with vibed, vibe and vibe-shim from target/ when they're
+# built, and vibed's LaunchAgent. Only a copy in Applications registers it;
+# build/VibeOS.app installs nothing.
 #
 #   scripts/sign-macos.sh             debug build
 #   CONFIG=release scripts/sign-macos.sh
@@ -28,6 +32,9 @@ mkdir -p "$APP/Contents/MacOS"
 cp swift/VibeOS/Support/Info.plist "$APP/Contents/Info.plist"
 plutil -lint "$APP/Contents/Info.plist"
 cp "$app_bin" "$APP/Contents/MacOS/VibeOS"
+mkdir -p "$APP/Contents/Library/LaunchAgents"
+cp swift/VibeOS/Support/io.github.tsconfigdotjson.VibeOS.vibed.plist "$APP/Contents/Library/LaunchAgents/"
+plutil -lint "$APP/Contents/Library/LaunchAgents/io.github.tsconfigdotjson.VibeOS.vibed.plist"
 # The app icon, "Night Shift": scripts/app-icon.py draws it with nothing but
 # python3's standard library, and iconutil makes the .icns. It's drawn again
 # only when the script changes.
@@ -44,9 +51,6 @@ cp "$icns" "$APP/Contents/Resources/AppIcon.icns"
 if [ -d "$OUT/host-bundle" ]; then
   cp -R "$OUT/host-bundle" "$APP/Contents/Resources/linux"
 fi
-codesign --force --sign - --timestamp=none "$APP"
-codesign --verify --strict --verbose=2 "$APP"
-
 # vibe-vm, with the virtualization entitlement.
 swift build --package-path swift/vibe-vm -c "$CONFIG" --product vibe-vm
 vm_bin="$(swift build --package-path swift/vibe-vm -c "$CONFIG" --show-bin-path)/vibe-vm"
@@ -63,5 +67,20 @@ case $entitlements in
     exit 1
     ;;
 esac
+
+# Inside the app, as a release has them: vibe-vm, and the Rust programs
+# when this build has them. Each is signed before the bundle that seals it.
+cp "$OUT/vibe-vm" "$APP/Contents/MacOS/vibe-vm"
+for b in vibed vibe vibe-shim; do
+  if [ -x "target/$CONFIG/$b" ]; then
+    cp "target/$CONFIG/$b" "$APP/Contents/MacOS/$b"
+    codesign --force --sign - --timestamp=none "$APP/Contents/MacOS/$b"
+  else
+    echo "sign-macos.sh: no target/$CONFIG/$b (cargo build first); the app has none" >&2
+  fi
+done
+codesign --force --sign - --timestamp=none \
+  --entitlements swift/VibeOS/Support/VibeOS.entitlements "$APP"
+codesign --verify --strict --deep --verbose=2 "$APP"
 
 echo "signed ad hoc: $APP and $OUT/vibe-vm (with $ENTITLEMENT)"

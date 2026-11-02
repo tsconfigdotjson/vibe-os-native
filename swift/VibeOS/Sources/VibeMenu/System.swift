@@ -105,10 +105,28 @@ public enum WorktreeActions {
 }
 
 /// Where the `vibe` CLI is: `$VIBE_CLI` if set (for development), else
-/// `/usr/local/bin/vibe`, where setup links it.
-public func defaultVibePath(environment: [String: String] = ProcessInfo.processInfo.environment) -> String {
+/// `/usr/local/bin/vibe`, where setup links it; until it's linked, the one
+/// in the app bundle, beside the app.
+public func defaultVibePath(
+    environment: [String: String] = ProcessInfo.processInfo.environment, linked: String = linkedVibePath,
+    bundled: String? = Bundle.main.executableURL?.deletingLastPathComponent().appendingPathComponent("vibe").path
+) -> String {
     if let path = environment["VIBE_CLI"], !path.isEmpty { return path }
-    return "/usr/local/bin/vibe"
+    let fm = FileManager.default
+    if !fm.isExecutableFile(atPath: linked), let bundled, fm.isExecutableFile(atPath: bundled) { return bundled }
+    return linked
+}
+
+/// What setup's steps do that isn't vibed's or Terminal's.
+@MainActor
+public enum SetupActions {
+    /// Apple's Command Line Tools, which git needs: macOS's own installer.
+    public static func installCommandLineTools() {
+        let installer = Process()
+        installer.executableURL = URL(fileURLWithPath: "/usr/bin/xcode-select")
+        installer.arguments = ["--install"]
+        try? installer.run()
+    }
 }
 
 /// The socket `vibe attach` must be told about: the app's, when it isn't

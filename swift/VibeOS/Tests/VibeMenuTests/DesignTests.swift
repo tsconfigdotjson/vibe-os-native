@@ -174,19 +174,225 @@ import VibeRPC
 @Suite struct SetupTests {
     @Test func aFreshMacHasThreeStepsToGo() {
         let fresh = SetupProgress(hasProject: false, hasKey: false, linuxClaude: false)
-        #expect(fresh.steps.map(\.id) == [.project, .claude, .key])
+        #expect(fresh.steps.map(\.id) == [.claude, .project, .key])
         #expect(fresh.done == 0)
         #expect(!fresh.complete)
+        #expect(fresh.lit == 0)
         let halfway = SetupProgress(hasProject: true, hasKey: false, linuxClaude: true)
         #expect(halfway.steps.map(\.done) == [true, true, false])
         #expect(halfway.done == 2)
-        #expect(SetupProgress(hasProject: true, hasKey: true, linuxClaude: true).complete)
+        #expect(halfway.lit == 2)
+        let all = SetupProgress(hasProject: true, hasKey: true, linuxClaude: true)
+        #expect(all.complete)
+        #expect(all.lit == 4)
     }
 
     @Test func withoutLinuxAgentsThereIsNoClaudeStep() {
         let setup = SetupProgress(hasProject: true, hasKey: true, linuxClaude: nil)
         #expect(setup.steps.map(\.id) == [.project, .key])
         #expect(setup.complete)
+    }
+
+    static func check(_ id: CheckId, _ state: CheckState, fixable: Bool = false, progress: Int? = nil) -> DoctorCheck {
+        DoctorCheck(
+            id: id, state: state, detail: "\(id.rawValue) found.", hint: state == .pass ? nil : "Do \(id.rawValue).",
+            fixable: fixable, progress: progress)
+    }
+
+    /// The five-minute Mac (PRD: Goals, Short setup): gh and claude logged
+    /// in, the app just installed from the disk image.
+    static let fiveMinute = SetupProgress(
+        hasProject: false, hasKey: false, linuxClaude: false, linuxGitHub: false,
+        doctor: [
+            check(.git, .pass), check(.gh, .pass), check(.ghGit, .fail, fixable: true), check(.claude, .pass),
+            check(.claudeLogin, .pass), check(.power, .fail), check(.tailscale, .optional),
+            check(.linux, .working, progress: 40),
+        ],
+        install: .justInstalled)
+
+    /// The first launch and the first run in one list, in order: the vibe
+    /// command, the doctor's checks with Terminal among them, then the
+    /// Linux download, Claude and GitHub for linux agents, a project, a key.
+    @Test func doctorChecksAreStepsInTheSameList() {
+        let setup = Self.fiveMinute
+        #expect(
+            setup.steps.map(\.id) == [
+                .command, .check(.git), .check(.gh), .check(.ghGit), .check(.claude), .check(.claudeLogin),
+                .terminal, .check(.power), .check(.tailscale), .check(.linux), .claude, .toolbox, .project, .key,
+            ])
+        #expect(!setup.complete)
+        // What passed on this Mac folds into one row at the top; what's
+        // left is a row each.
+        guard case .passed(let passed) = setup.rows.first else {
+            Issue.record("no passed row: \(setup.rows)")
+            return
+        }
+        #expect(passed.map(\.id) == [.check(.git), .check(.gh), .check(.claude), .check(.claudeLogin)])
+        #expect(setup.passedTitle == "4 checks passed")
+        #expect(setup.rows.count == 1 + setup.steps.count - passed.count)
+        // The next step is the first with something to do.
+        #expect(setup.next == .command)
+        let step = { (id: SetupProgress.Step.ID) in setup.steps.first { $0.id == id } }
+        #expect(step(.check(.ghGit))?.action == .fix(.ghGit))
+        #expect(step(.check(.power))?.action == .terminal("sudo pmset -a sleep 0"))
+        #expect(step(.check(.tailscale))?.status == .optional)
+        #expect(step(.check(.tailscale))?.needed == false)
+        #expect(step(.check(.linux))?.status == .working(40))
+        #expect(step(.check(.linux))?.progress == 40)
+        #expect(step(.check(.linux))?.action == nil)
+        #expect(step(.terminal)?.action == .allowTerminal)
+        #expect(step(.claude)?.action == .vibe(["setup-token"]))
+        // The toolbox waits on the download.
+        #expect(step(.toolbox)?.action == nil)
+        // A step that isn't done says what to do: the check's hint.
+        #expect(step(.check(.power))?.detail == "power found. Do power.")
+        #expect(step(.check(.power))?.title == "Keep this Mac awake")
+    }
+
+    @Test func eachCheckHasItsButton() {
+        let fresh = SetupProgress(
+            hasProject: true, hasKey: true, linuxClaude: true, linuxGitHub: true,
+            doctor: [
+                check(.git, .fail), check(.gh, .fail), check(.ghGit, .fail), check(.claude, .fail),
+                check(.claudeLogin, .fail), check(.linux, .fail, fixable: true),
+            ],
+            ghInstalled: false)
+        let actions = Dictionary(uniqueKeysWithValues: fresh.steps.map { ($0.id, $0.action) })
+        #expect(actions[.check(.git)] == .installCommandLineTools)
+        #expect(actions[.check(.gh)] == .open("https://cli.github.com"))
+        // git can't use gh before gh is logged in, nor can claude sign in
+        // before it's installed: they wait.
+        #expect(actions[.check(.ghGit)] == .some(nil))
+        #expect(actions[.check(.claude)] == .open("https://claude.com/claude-code"))
+        #expect(actions[.check(.claudeLogin)] == .some(nil))
+        #expect(actions[.check(.linux)] == .fix(.linux))
+        // Not installed (a development build): no command or Terminal steps.
+        #expect(!fresh.steps.contains { $0.id == .command || $0.id == .terminal })
+        // With gh there, its button logs in, in Terminal.
+        var withGh = fresh
+        withGh.ghInstalled = true
+        #expect(withGh.steps.first { $0.id == .check(.gh) }?.action == .terminal("gh auth login"))
+    }
+
+    @Test func setupIsCompleteOnceNothingNeedsTheOwner() {
+        var setup = Self.fiveMinute
+        setup.hasProject = true
+        setup.hasKey = true
+        setup.linuxClaude = true
+        setup.linuxGitHub = true
+        setup.install.command = .linked
+        setup.install.terminal = .denied
+        setup.doctor = setup.doctor.map { c in
+            var c = c
+            if c.state != .optional { c.state = .pass }
+            c.progress = nil
+            return c
+        }
+        // Tailscale is optional, and Terminal turned off falls back to a
+        // file Terminal opens: neither holds up the welcome.
+        #expect(setup.steps.first { $0.id == .terminal }?.status == .optional)
+        #expect(setup.complete)
+        #expect(setup.passedTitle == "This Mac is ready")
+        #expect(setup.lit == 4)
+    }
+
+    @Test func theCommandStepSaysWhatsThere() {
+        var setup = Self.fiveMinute
+        setup.install.command = .other("/opt/homebrew/bin/vibe")
+        let step = setup.steps.first { $0.id == .command }
+        #expect(step?.title == "Point vibe at this VibeOS")
+        #expect(step?.detail.contains("/opt/homebrew/bin/vibe") == true)
+        setup.install.command = .linked
+        #expect(setup.steps.first { $0.id == .command }?.done == true)
+    }
+
+    @Test func everyStepSpeaksItsState() {
+        for step in Self.fiveMinute.steps {
+            #expect(!step.statusWords.isEmpty)
+            #expect(step.detail.hasSuffix("."), "\(step.id): \(step.detail)")
+            if step.action != nil { #expect(step.actionTitle?.isEmpty == false, "\(step.id)") }
+        }
+        #expect(SetupProgress.Step(id: .key, title: "k", detail: "d.", status: .working(7)).statusWords == "under way, 7 percent")
+    }
+}
+
+@Suite @MainActor struct InstallTests {
+    @Test func whereTheAppRunsFrom() {
+        #expect(AppLocation.of(bundlePath: "/Applications/VibeOS.app", home: "/Users/me") == .applications)
+        #expect(AppLocation.of(bundlePath: "/Users/me/Applications/VibeOS.app", home: "/Users/me") == .applications)
+        #expect(AppLocation.of(bundlePath: "/Volumes/VibeOS/VibeOS.app", home: "/Users/me") == .notMoved)
+        #expect(
+            AppLocation.of(
+                bundlePath: "/private/var/folders/x/T/AppTranslocation/0A1B/d/VibeOS.app", home: "/Users/me")
+                == .notMoved)
+        #expect(AppLocation.of(bundlePath: "/Users/me/src/vibe-os-native/build/VibeOS.app", home: "/Users/me") == .development)
+        #expect(AppLocation.of(bundlePath: "/Applications/Tools/VibeOS.app", home: "/Users/me") == .development)
+    }
+
+    @Test func theCommandLink() throws {
+        let fm = FileManager.default
+        let dir = fm.temporaryDirectory.appendingPathComponent("vibe-link-\(UUID().uuidString)")
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: dir) }
+        let ours = dir.appendingPathComponent("VibeOS.app-vibe").path
+        let other = dir.appendingPathComponent("other-vibe").path
+        fm.createFile(atPath: ours, contents: Data())
+        fm.createFile(atPath: other, contents: Data())
+        let link = dir.appendingPathComponent("vibe").path
+        #expect(commandLink(at: link, ours: ours) == .missing)
+        try fm.createSymbolicLink(atPath: link, withDestinationPath: ours)
+        #expect(commandLink(at: link, ours: ours) == .linked)
+        try fm.removeItem(atPath: link)
+        try fm.createSymbolicLink(atPath: link, withDestinationPath: other)
+        #expect(commandLink(at: link, ours: ours) == .other((other as NSString).resolvingSymlinksInPath))
+        // A link to a copy since moved counts as missing.
+        try fm.removeItem(atPath: link)
+        try fm.createSymbolicLink(atPath: link, withDestinationPath: dir.appendingPathComponent("gone").path)
+        #expect(commandLink(at: link, ours: ours) == .missing)
+    }
+
+    /// The first launch from Applications: vibed's LaunchAgent registered,
+    /// vibe linked where no password is needed, and nothing at all done by
+    /// a copy that isn't installed.
+    @Test func theFirstLaunchRegistersVibedAndLinksVibe() async {
+        let fresh = FixedInstaller(
+            InstallStatus(location: .applications, service: .notRegistered, command: .missing, terminal: .notAsked))
+        fresh.linkNeedsPassword = false
+        let model = MenuModel(daemon: FixtureDaemon(.firstRun), terminal: FixtureTerminal(), installer: fresh)
+        await model.firstLaunch()
+        #expect(fresh.calls == ["register", "link"])
+        #expect(model.install.service == .enabled)
+        #expect(model.install.command == .linked)
+
+        // /usr/local/bin needs a password: the welcome's step asks for it.
+        let rooted = FixedInstaller(.justInstalled)
+        let model2 = MenuModel(daemon: FixtureDaemon(.firstRun), terminal: FixtureTerminal(), installer: rooted)
+        await model2.firstLaunch()
+        #expect(rooted.calls == ["link"])
+        #expect(model2.install.command == .missing)
+        await model2.linkCommand()
+        #expect(rooted.calls == ["link", "link, asking"])
+        #expect(model2.install.command == .linked)
+        await model2.allowTerminal()
+        #expect(model2.install.terminal == .granted)
+
+        let dev = FixedInstaller()
+        let model3 = MenuModel(daemon: FixtureDaemon(.firstRun), terminal: FixtureTerminal(), installer: dev)
+        await model3.firstLaunch()
+        #expect(dev.calls.isEmpty)
+        #expect(model3.install == .notManaged)
+    }
+
+    @Test func aNoteForEachWayVibedIsntThere() async {
+        let fromDisk = await MenuModel.fixture(.offline, install: .fromDiskImage)
+        #expect(fromDisk.install.location == .notMoved)
+        let off = await MenuModel.fixture(.offline, install: .turnedOff)
+        #expect(off.install.service == .requiresApproval)
+        await off.registerService()
+        let failed = InstallStatus(
+            location: .applications, service: .failed("Operation not permitted"), command: .linked, terminal: .granted)
+        #expect(failed.registerFailure == "Operation not permitted")
+        #expect(InstallStatus.justInstalled.registerFailure == nil)
     }
 }
 
@@ -224,7 +430,7 @@ import VibeRPC
     /// Every call a surface makes is answered, and decodes, so the gallery
     /// draws each one with data.
     @Test func everyCallTheSurfacesMakeDecodes() throws {
-        for scenario in [FixtureDaemon.Scenario.busy, .quiet, .firstRun] {
+        for scenario in [FixtureDaemon.Scenario.busy, .quiet, .firstRun, .freshMac] {
             let d = FixtureDaemon(scenario)
             for host in ["local", "vps"] {
                 _ = try d.call(ProjectsList.self, HostParams(host: host))
@@ -235,6 +441,7 @@ import VibeRPC
             _ = try d.call(ToolboxStatusGet.self, NoParams())
             _ = try d.call(ToolboxLoginsGet.self, NoParams())
             _ = try d.call(GhStatusGet.self, GhStatusParams())
+            #expect(try d.call(DoctorCheckGet.self, NoParams()).checks.count == CheckId.allCases.count)
             _ = try d.call(SessionsList.self, HostParams())
             #expect(try d.call(KeysCreate.self, KeyCreateParams(name: "laptop")).key.name == "laptop")
             #expect(try d.call(HostsAdd.self, HostAddParams(name: "vps", address: "me@vps.example.com")).host.name == "vps")
@@ -253,6 +460,14 @@ import VibeRPC
             hasKey: !(try d.call(KeysList.self, NoParams()).keys.isEmpty),
             linuxClaude: try d.call(ToolboxLoginsGet.self, NoParams()).claude)
         #expect(setup.done == 0)
+        // With the doctor's checks, it's the five-minute Mac: some passed,
+        // some to do, Linux downloading.
+        let doctor = try d.call(DoctorCheckGet.self, NoParams()).checks
+        #expect(doctor.map(\.id) == CheckId.allCases)
+        #expect(doctor.last?.state == .working && doctor.last?.progress == 40)
+        let fresh = try FixtureDaemon(.freshMac).call(DoctorCheckGet.self, NoParams()).checks
+        #expect(fresh.filter { $0.state == .fail }.count == 6)
+        #expect(try FixtureDaemon(.freshMac).call(GhStatusGet.self, GhStatusParams()).state == .notInstalled)
         let quiet = FixtureDaemon(.quiet)
         #expect(
             SetupProgress(

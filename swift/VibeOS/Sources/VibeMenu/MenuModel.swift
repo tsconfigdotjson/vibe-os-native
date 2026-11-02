@@ -45,6 +45,8 @@ public final class MenuModel: ObservableObject {
     @Published public private(set) var now = Date()
     /// Refs being attached, so a second click waits for the first.
     @Published public private(set) var attaching: Set<String> = []
+    /// How this copy of the app is installed (Install.swift).
+    @Published public private(set) var install: InstallStatus = .notManaged
 
     /// While the menu is open it polls more often, for memory bars.
     public var menuIsOpen = false {
@@ -53,6 +55,12 @@ public final class MenuModel: ObservableObject {
 
     public let daemon: any DaemonConnection
     public let attacher: Attacher
+    public let installer: any Installer
+    /// How the last register went, which SMAppService doesn't keep.
+    private var registered: ServiceStatus?
+    /// Whether vibed's LaunchAgent was restarted for an updated app, which
+    /// happens once a launch at most.
+    private var restartedForUpdate = false
     public var notifier: Notifier? {
         didSet { wireNotifier() }
     }
@@ -72,12 +80,16 @@ public final class MenuModel: ObservableObject {
 
     public init(
         daemon: any DaemonConnection, terminal: TerminalScripting, notifier: Notifier? = nil,
+        installer: (any Installer)? = nil,
         vibePath: String = defaultVibePath(), socket: String? = attachSocket(),
         openPoll: Duration = .seconds(3), closedPoll: Duration = .seconds(30),
         endOfTurn: @escaping () -> Bool = { UserDefaults.standard.bool(forKey: Preferences.notifyEndOfTurn) }
     ) {
         self.daemon = daemon
         self.attacher = Attacher(terminal: terminal, vibePath: vibePath, socket: socket)
+        // Made here, not as a default: a default argument is evaluated off
+        // the main actor.
+        self.installer = installer ?? FixedInstaller()
         self.notifier = notifier
         self.openPoll = openPoll
         self.closedPoll = closedPoll
@@ -88,6 +100,7 @@ public final class MenuModel: ObservableObject {
     /// Starts following vibed: its events, and the poll. Once.
     public func start() {
         guard tasks.isEmpty else { return }
+        tasks.append(Task { [weak self] in await self?.firstLaunch() })
         tasks.append(Task { [weak self] in await self?.followEvents() })
         tasks.append(Task { [weak self] in await self?.poll() })
     }
@@ -197,6 +210,7 @@ public final class MenuModel: ObservableObject {
         changedDuringRefresh = []
         unavailableHosts = unavailable
         connection = .connected
+        takeOverIfUpdated()
         gh = (try? await call(GhStatusGet.self, GhStatusParams())) ?? gh
         toolbox = (try? await call(ToolboxStatusGet.self, NoParams())) ?? toolbox
         mcp = (try? await call(McpGet.self, HostParams())) ?? mcp
@@ -292,7 +306,12 @@ public final class MenuModel: ObservableObject {
     /// In to Claude do. With `exec`, the window's shell becomes it. `words`
     /// are shell words, as `Attacher.vibeCommand` takes them.
     public func runInTerminal(_ words: [String], exec: Bool) {
-        let command = (exec ? "exec " : "") + attacher.vibeCommand(words)
+        runCommandInTerminal((exec ? "exec " : "") + attacher.vibeCommand(words))
+    }
+
+    /// Runs a shell command line in a new Terminal window, in the owner's
+    /// own shell: `gh auth login`, say.
+    public func runCommandInTerminal(_ command: String) {
         do {
             do {
                 _ = try attacher.terminal.run(command)
@@ -491,4 +510,107 @@ public func describe(_ error: any Error) -> String {
     default:
         return error.localizedDescription
     }
+}
+
+// MARK: Install and setup
+
+extension MenuModel {
+    /// The first launch, and every launch after: where this copy is
+    /// installed, registers vibed's LaunchAgent if it isn't, which starts
+    /// it, and links vibe if that needs no password. A copy moved, or
+    /// turned off in Login Items, is put right the same way.
+    public func firstLaunch() async {
+        if installer.location == .applications {
+            if installer.service == .notRegistered {
+                registered = installer.registerService()
+            }
+            if installer.command == .missing {
+                try? installer.linkCommand(askingForPassword: false)
+            }
+        }
+        await refreshInstall()
+    }
+
+    /// Reads how this copy is installed again.
+    public func refreshInstall() async {
+        var status = await installer.currentStatus()
+        if status.service == .notRegistered, case .failed = registered {
+            status.service = registered ?? status.service
+        }
+        if install != status { install = status }
+    }
+
+    /// Registers vibed's LaunchAgent again, as Try Again does.
+    public func registerService() async {
+        registered = installer.registerService()
+        await refreshInstall()
+        await refresh()
+    }
+
+    public func openLoginItems() {
+        installer.openLoginItems()
+    }
+
+    /// Adds the vibe command, asking for a password if macOS needs one.
+    public func linkCommand() async {
+        do {
+            try installer.linkCommand(askingForPassword: true)
+            message = nil
+        } catch let e as InstallError where e.description == "cancelled" {
+            // The owner said no to the password prompt.
+        } catch {
+            message = "Can't add the vibe command: \(describe(error))"
+        }
+        await refreshInstall()
+        settingsRevision += 1
+    }
+
+    /// Asks macOS for permission to control Terminal, which it does once;
+    /// after a no, opens the settings where it's turned back on.
+    public func allowTerminal() async {
+        if install.terminal == .denied {
+            installer.openAutomationSettings()
+            return
+        }
+        _ = await installer.askTerminalPermission()
+        await refreshInstall()
+        settingsRevision += 1
+    }
+
+    /// Has vibed fix a doctor check, and reads the setup again.
+    public func fix(_ check: CheckId) async {
+        do {
+            _ = try await call(DoctorFix.self, DoctorFixParams(check: check), timeout: 120)
+            message = nil
+        } catch {
+            message = "Can't fix that: \(describe(error))"
+        }
+        settingsRevision += 1
+    }
+
+    /// Notes that something setup lists may have changed, so the welcome
+    /// reads again: a step done in Terminal or Settings, say.
+    public func setupMayHaveChanged() {
+        settingsRevision += 1
+    }
+
+    /// After an update the running vibed is the old one, until its
+    /// LaunchAgent restarts it from the new app. Agents keep running
+    /// through that (PRD: Restarts).
+    func takeOverIfUpdated() {
+        guard !restartedForUpdate, install.service == .enabled,
+            let running = localHost?.version, let mine = appVersion(), running != mine
+        else { return }
+        restartedForUpdate = true
+        do {
+            try installer.restartService()
+        } catch {
+            message = "This VibeOS is \(mine), but vibed is still \(running): \(describe(error))"
+        }
+    }
+}
+
+/// This app's version, from its Info.plist; none for a bare executable.
+public func appVersion(_ bundle: Bundle = .main) -> String? {
+    bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
 }

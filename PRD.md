@@ -450,7 +450,7 @@ The menu bar lists every agent this app started, across all hosts and projects, 
 An API key is a shell on the Mac, so keys are mandatory and the server listens on loopback by default. Logins follow one rule: a `macos` agent uses the Mac's own logins, and a `linux` agent uses the Linux home, which the owner sets up once.
 
 - **No root.** `vibed` runs as the logged-in user. v1 has no privileged helper.
-- **Distribution.** Open source under MIT, in a public repo. Releases are a DMG signed with the owner's existing Developer ID and notarized and a Homebrew cask, with Sparkle for updates. Not the Mac App Store, whose sandbox blocks most of this. `vibe-vm` carries the `com.apple.security.virtualization` entitlement.
+- **Distribution.** Open source under MIT, in a public repo. Releases are a DMG signed with the owner's existing Developer ID and notarized, with Sparkle for updates. Not the Mac App Store, whose sandbox blocks most of this. `vibe-vm` carries the `com.apple.security.virtualization` entitlement.
 - **Network exposure.** On the Mac, loopback by default, and Settings can also bind the Tailscale address; never `0.0.0.0`. Nothing listens publicly on the Mac, even with external access on. A Linux host chosen as the external address serves HTTPS publicly; every other host listens on loopback only and is reached over SSH.
 - **GitHub.** `vibed` checks `gh auth status` at startup and every hour, and the menu header shows the result. Worktrees fetch through `gh` as git's credential helper.
 

@@ -1379,6 +1379,7 @@ struct LimitsPane: View {
 struct GeneralPane: View {
     @AppStorage(Preferences.notifyEndOfTurn) private var endOfTurn = false
     @AppStorage(Preferences.editor) private var editor = ""
+    @ObservedObject private var updater = Updater.shared
 
     var body: some View {
         Form {
@@ -1417,6 +1418,12 @@ struct GeneralPane: View {
                 }
                 .padding(.vertical, 4)
                 .accessibilityElement(children: .combine)
+                if updater.available {
+                    LabeledContent("Updates") {
+                        Button("Check for Updates…") { updater.check() }
+                            .disabled(!updater.canCheck)
+                    }
+                }
             }
         }
         .formStyle(.grouped)

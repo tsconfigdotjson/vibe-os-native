@@ -8,6 +8,10 @@
 #   - cargo check of the workspace for every host target it doesn't run on
 #     (macOS and Linux, arm64 and x86_64)
 #   - a vibed hello-world smoke test, through `vibe hello` and `vibe rpc`
+#   - `vibe doctor` against a live vibed, on this machine as it is: a line
+#     for every check, and an exit that says whether one needs the owner
+#     (crates/vibe-cli/tests/cli.rs, in the test step, holds its every word
+#     to the golden host's, and --fix to running gh auth setup-git)
 #   - the registry through `vibe rpc`: add a project, edit a profile, change
 #     a host limit, restart vibed, and find all of it
 #   - sessions: a shell held by vibe-shim keeps running when vibed is killed,
@@ -108,10 +112,31 @@
 #     menu's model, Terminal attach and notifications against stand-ins
 #   - the app icon (scripts/app-icon.py): every size of the iconset, drawn
 #     with python3's standard library, as PNGs of the right size
+#   - the release's tools, which need no Mac: Sparkle's Ed25519 signing and
+#     its appcast (scripts/sparkle.py self-test: RFC 8032's vectors, and the
+#     cryptography package's answers where it's installed); the release
+#     workflow running on version tags alone, reading the secrets the
+#     release needs and printing none; the versions in Cargo.toml and
+#     Info.plist agreeing, and the base release in images.rs and
+#     base-image.sh; vibed's LaunchAgent naming the app and its vibed; and
+#     the entitlements
+#   - a release build, ad hoc signed (scripts/release-macos.sh), with
+#     Sparkle built in and a key made for the check: the DMG holds the app
+#     and Applications; the app holds VibeOS, vibed, vibe, vibe-shim and
+#     vibe-vm for Apple Silicon, vibed's LaunchAgent and Sparkle.framework,
+#     and the Linux builds when cargo-zigbuild is there; its signature
+#     verifies, vibe-vm keeps the virtualization entitlement and the app the
+#     Apple Events one; Info.plist has the version, the appcast's URL and
+#     the public key of the key the DMG is signed with; the appcast names
+#     this DMG, its size and a signature that verifies; and the app as
+#     shipped launches, Sparkle and all, and draws its welcome. It fetches
+#     Sparkle the first time, so it needs the network. Developer ID signing
+#     and notarization need the secrets, so release CI does those
 #   - ad hoc signing, with the virtualization entitlement on vibe-vm, and
 #     the app icon in the bundle
-#   - every surface of the app (the menu in each state, the menu bar glyph,
-#     Settings' panes, the sheets) drawn on canned data in light and dark
+#   - every surface of the app (the menu in each state, the first run's
+#     welcome and install notes among them, the menu bar glyph, Settings'
+#     panes, the sheets) drawn on canned data in light and dark
 #     by `VibeOS --render-surfaces`: none blank, each different in dark, and
 #     kept in build/check/surfaces/ for a look. scripts/surfaces.sh takes
 #     the same as real screenshots, materials and all
@@ -188,6 +213,10 @@ mkdir -p "$LOGS"
 WORK=$(mktemp -d /tmp/vibe-check.XXXXXX) || exit 1
 
 cleanup() {
+  # A release-build step that failed with its DMG still mounted.
+  if [ -d "$WORK/release-dmg" ] && [ "$OS" = Darwin ]; then
+    hdiutil detach -force "$WORK/release-dmg" >/dev/null 2>&1
+  fi
   if [ -f "$WORK/pids" ]; then
     while read -r pid; do kill "$pid" 2>/dev/null; done <"$WORK/pids"
   fi
@@ -845,7 +874,8 @@ s_surfaces() {
   rm -rf "$out"
   "$app" --render-surfaces "$out" || { echo "a surface didn't draw"; return 1; }
   [ -s "$out/manifest.txt" ] || { echo "no manifest"; return 1; }
-  for name in menu menu-status menu-welcome menu-quiet menu-offline menu-bar new-agent new-agent-empty add-host \
+  for name in menu menu-status menu-welcome menu-welcome-fresh menu-install-move menu-install-login-items \
+    menu-quiet menu-offline menu-bar new-agent new-agent-empty add-host \
     add-host-done logins logins-first-run settings-projects settings-keys settings-hosts settings-limits \
     settings-general settings-project settings-projects-first-run new-key new-key-made external-address; do
     for look in light dark; do
@@ -1098,6 +1128,167 @@ s_app_launch() {
   echo "VibeOS.app launched and said hello to vibed"
 }
 
+# vibe doctor against a live vibed, on this machine as it is: whatever it
+# finds, a line for every check, and exit 0 (ready) or 1 (one needs you).
+s_doctor() {
+  local rc=0 lines
+  start_vibed "$WORK/doctor/run/vibed.sock" "$WORK/doctor-vibed.log"
+  out=$(HOME="$WORK/doctor/home" target/debug/vibe --socket "$VIBED_SOCKET" doctor) || rc=$?
+  echo "$out"
+  echo "exit $rc"
+  [ $rc -eq 0 ] || [ $rc -eq 1 ] || { echo "vibe doctor exited $rc"; return 1; }
+  lines=$(printf '%s\n' "$out" | grep -cE '^(ok|!!|--|\.\.)  ')
+  # git, gh, git through gh, Claude Code and its login, Tailscale; and on a
+  # Mac, system sleep (and the Linux images, with vibe-vm beside vibed).
+  [ "$lines" -ge 6 ] || { echo "$lines checks, not 6 or more"; return 1; }
+  case $out in *"This host is ready for agents."* | *" need you."* | *" needs you."*) ;; *) echo "no summary"; return 1 ;; esac
+  stop_vibed
+}
+
+# The release's tools and settings, which need no Mac.
+s_release_tools() {
+  python3 -I scripts/sparkle.py self-test
+  python3 -I - "$ROOT" <<'PY'
+import plistlib, re, sys
+root = sys.argv[1]
+read = lambda p: open(f"{root}/{p}", encoding="utf-8").read()
+fail = []
+
+# The release workflow runs on version tags alone: never a pull request,
+# a branch push, a schedule or by hand.
+wf = read(".github/workflows/release.yml")
+lines = [l.split(" #")[0].rstrip() for l in wf.splitlines() if l.strip() and not l.lstrip().startswith("#")]
+on = lines.index("on:")
+block = []
+for l in lines[on + 1:]:
+    if not l.startswith(" "):
+        break
+    block.append(l)
+keys = lambda indent: [l.strip().rstrip(":") for l in block if len(l) - len(l.lstrip()) == indent and l.strip().endswith(":")]
+if keys(2) != ["push"] or keys(4) != ["tags"]:
+    fail.append(f"release.yml runs on {keys(2)} {keys(4)}, not push: tags alone")
+tags = [l.strip()[2:].strip('"') for l in block if l.strip().startswith("- ")]
+if not tags or not all(t.startswith("v") for t in tags):
+    fail.append(f"release.yml's tags aren't version tags: {tags}")
+for word in ["pull_request", "branches", "workflow_dispatch", "schedule"]:
+    if word in "\n".join(block):
+        fail.append(f"release.yml's trigger has {word}")
+# The CI workflow, for its part, never runs on tags.
+ci = read(".github/workflows/ci.yml")
+if "tags" in ci.split("jobs:")[0]:
+    fail.append("ci.yml runs on tags")
+
+# The secrets it reads are the ones the release needs, and none is printed:
+# each one echoed or printed goes straight into a pipe or a file.
+want = {"MACOS_CERT_P12", "MACOS_CERT_PASSWORD", "APPLE_TEAM_ID", "NOTARY_KEY_ID", "NOTARY_ISSUER_ID",
+        "NOTARY_KEY_P8", "APPLE_ID", "APPLE_APP_PASSWORD", "SPARKLE_PRIVATE_KEY"}
+got = set(re.findall(r"secrets\.(\w+)", wf))
+if got != want:
+    fail.append(f"release.yml reads secrets {sorted(got)}, not {sorted(want)}")
+secret = {"MACOS_CERT_P12", "MACOS_CERT_PASSWORD", "NOTARY_KEY_P8", "APPLE_APP_PASSWORD", "SPARKLE_PRIVATE_KEY"}
+for name in [".github/workflows/release.yml", "scripts/release-macos.sh"]:
+    for n, l in enumerate(read(name).splitlines(), 1):
+        if l.lstrip().startswith("#"):
+            continue
+        for s in secret:
+            m = re.search(r"\b(echo|printf|print|say|cat)\b[^|>]*\$\{?" + s + r"\b", l)
+            if m and not re.search(r"[|>]", l[m.end():]):
+                fail.append(f"{name}:{n} prints {s}")
+        if re.search(r"set -x|set -o xtrace", l):
+            fail.append(f"{name}:{n} traces commands, secrets and all")
+
+# The versions agree: Cargo's, the app's, and its build's.
+cargo = re.search(r'^version = "(.+)"$', read("Cargo.toml"), re.M).group(1)
+info = plistlib.loads(read("swift/VibeOS/Support/Info.plist").encode())
+for key in ["CFBundleShortVersionString", "CFBundleVersion"]:
+    if info[key] != cargo:
+        fail.append(f"Info.plist's {key} is {info[key]}, Cargo.toml's version {cargo}")
+# The base release vibed boots is the one base-image.sh builds.
+images = re.search(r"pub const BASE_RELEASE: u32 = (\d+);", read("crates/vibe-env/src/images.rs")).group(1)
+script = re.search(r"N=\$\{BASE_RELEASE:-(\d+)\}", read("scripts/base-image.sh")).group(1)
+if images != script:
+    fail.append(f"images.rs boots base {images}, base-image.sh builds {script}")
+
+# vibed's LaunchAgent: the label the app registers, the vibed inside it.
+label = re.search(r'label = "([^"]+)"', read("swift/VibeOS/Sources/VibeMenu/Install.swift")).group(1)
+agent = plistlib.loads(read(f"swift/VibeOS/Support/{label}.plist").encode())
+if agent.get("Label") != label or agent.get("BundleProgram") != "Contents/MacOS/vibed":
+    fail.append(f"the LaunchAgent is {agent.get('Label')} running {agent.get('BundleProgram')}")
+if info["CFBundleIdentifier"] not in agent.get("AssociatedBundleIdentifiers", []):
+    fail.append("the LaunchAgent isn't associated with the app")
+if agent.get("KeepAlive") is not True or agent.get("RunAtLoad") is not True:
+    fail.append("the LaunchAgent doesn't keep vibed running from login")
+for path, key in [("swift/vibe-vm/vibe-vm.entitlements", "com.apple.security.virtualization"),
+                  ("swift/VibeOS/Support/VibeOS.entitlements", "com.apple.security.automation.apple-events")]:
+    if plistlib.loads(read(path).encode()).get(key) is not True:
+        fail.append(f"{path} lacks {key}")
+
+for f in fail:
+    print(f)
+if fail:
+    sys.exit(1)
+print("the release workflow, its secrets, the versions, the LaunchAgent and the entitlements check out")
+PY
+}
+
+# A release build as scripts/release-macos.sh makes it, ad hoc signed, with
+# Sparkle and a key made for the check; then everything in its DMG.
+s_release_build() {
+  local out="$WORK/release" mnt="$WORK/release-dmg" key public version dmg app b archs plist a
+  version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+  key=$(python3 -I scripts/sparkle.py keygen)
+  public=$(SPARKLE_PRIVATE_KEY="$key" python3 -I scripts/sparkle.py public-key)
+  env -u MACOS_SIGN_IDENTITY -u NOTARY_KEY_ID -u APPLE_ID -u RELEASE_REQUIRE SPARKLE_PRIVATE_KEY="$key" \
+    scripts/release-macos.sh --out "$out" --tag "v$version"
+  dmg="$out/VibeOS-$version.dmg"
+  for f in "$dmg" "$out/appcast.xml" "$out/SHA256SUMS"; do [ -s "$f" ] || { echo "no $f"; return 1; }; done
+  (cd "$out" && shasum -a 256 -c SHA256SUMS)
+  mkdir -p "$mnt"
+  hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "$dmg" >/dev/null
+  app="$mnt/VibeOS.app"
+  [ "$(readlink "$mnt/Applications")" = /Applications ] || { echo "the DMG has no Applications to drag to"; return 1; }
+  for b in VibeOS vibed vibe vibe-shim vibe-vm; do
+    archs=$(lipo -archs "$app/Contents/MacOS/$b")
+    case " $archs " in *" arm64 "*) ;; *) echo "$b is $archs"; return 1 ;; esac
+  done
+  "$app/Contents/MacOS/vibed" --version | grep -qx "vibed $version"
+  "$app/Contents/MacOS/vibe" --version | grep -qx "vibe $version"
+  plutil -lint "$app/Contents/Library/LaunchAgents/io.github.tsconfigdotjson.VibeOS.vibed.plist"
+  codesign --verify --strict --deep --verbose=2 "$app"
+  codesign -d --entitlements - --xml "$app/Contents/MacOS/vibe-vm" 2>/dev/null | grep -q com.apple.security.virtualization
+  codesign -d --entitlements - --xml "$app" 2>/dev/null | grep -q com.apple.security.automation.apple-events
+  plist="$app/Contents/Info.plist"
+  [ "$(plutil -extract CFBundleShortVersionString raw "$plist")" = "$version" ]
+  [ "$(plutil -extract CFBundleVersion raw "$plist")" = "$version" ]
+  [ "$(plutil -extract SUPublicEDKey raw "$plist")" = "$public" ] || { echo "SUPublicEDKey isn't the key's"; return 1; }
+  plutil -extract SUFeedURL raw "$plist" | grep -q '/releases/latest/download/appcast.xml$'
+  [ -d "$app/Contents/Frameworks/Sparkle.framework" ] || { echo "no Sparkle.framework"; return 1; }
+  otool -l "$app/Contents/MacOS/VibeOS" | grep -q '@executable_path/../Frameworks'
+  if command -v cargo-zigbuild >/dev/null; then
+    for a in x86_64 aarch64; do
+      [ -x "$app/Contents/Resources/linux/$a/vibed" ] || { echo "no Linux vibed for $a"; return 1; }
+    done
+  else
+    echo "no cargo-zigbuild here, so no Linux builds to look for"
+  fi
+  python3 -I - "$ROOT" "$out/appcast.xml" "$dmg" "$version" "$public" <<'PY'
+import base64, os, sys
+sys.path.insert(0, os.path.join(sys.argv[1], "scripts"))
+import sparkle
+_, _, appcast, dmg, version, public = sys.argv
+got = sparkle.read_appcast(open(appcast).read())
+assert got["version"] == got["short"] == version, got
+assert got["url"].endswith(f"/releases/download/v{version}/VibeOS-{version}.dmg"), got["url"]
+assert got["length"] == os.path.getsize(dmg), got
+assert sparkle.verify(base64.b64decode(public), open(dmg, "rb").read(), base64.b64decode(got["signature"]))
+print("the appcast names this DMG, and its signature verifies")
+PY
+  # The app as shipped launches, loading Sparkle from its bundle, and draws.
+  "$app/Contents/MacOS/VibeOS" --render-surfaces "$WORK/release-surfaces" --surface menu-welcome
+  [ -s "$WORK/release-surfaces/menu-welcome-light.png" ]
+  hdiutil detach "$mnt" >/dev/null
+}
+
 s_linux_host() {
   cargo test -p vibe-cli --test linux_host --locked -- a_linux_host an_unreachable external_access --test-threads=1
 }
@@ -1193,6 +1384,7 @@ step guest "vibe-guest: static aarch64-unknown-linux-musl, clippy for musl" s_gu
 mac_step test-guest "test guests: kernel, initrd, initrd-guest, modloop" s_test_guest
 step cross "cargo check for macOS and Linux, arm64 and x86_64" s_cross
 step smoke "vibed hello world via vibe hello and vibe rpc" s_smoke build
+step doctor "vibe doctor against a live vibed, on this machine" s_doctor build
 step registry "registry via vibe rpc survives a vibed restart" s_registry build
 step sessions "a session outlives a killed vibed and is re-adopted" s_sessions build
 step agents "agents start, outlive vibed, and delete to nothing but the branch" s_agents build
@@ -1208,6 +1400,7 @@ mac_step swift-app-test "swift test swift/VibeOS (Swift contract tests)" s_swift
 mac_step swift-vm-build "swift build swift/vibe-vm" s_swift_vm_build
 mac_step swift-vm-test "swift test swift/vibe-vm" s_swift_vm_test swift-vm-build
 step app-icon "the app icon: every iconset size, drawn by scripts/app-icon.py" s_app_icon
+step release-tools "the release: Sparkle's signing, tag-only CI and its secrets, versions" s_release_tools
 mac_step sign "ad hoc signing; vibe-vm gets the virtualization entitlement" s_sign swift-app-build swift-vm-build
 mac_step surfaces "every surface draws on canned data, in light and dark" s_surfaces sign
 mac_step vm-check "vibe-vm check, signed and unsigned" s_vm_check sign
@@ -1218,6 +1411,7 @@ mac_step live-contract "Swift client against a live vibed" s_live_contract build
 mac_step menu-live "the menu follows a live agent through vibed's events" s_menu_live build swift-app-test
 mac_step app-launch "VibeOS.app launches and says hello to vibed" s_app_launch build sign
 mac_step terminal-attach "two clicks give one Terminal tab attached to the agent" s_terminal_attach build sign
+mac_step release-build "a release DMG, ad hoc: the bundle, Sparkle, the appcast, a launch" s_release_build release-tools sign
 
 echo
 echo "================================ summary ================================"

@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- vibed as a LaunchAgent (PRD: Architecture; Key user flows, Install and
+     setup). VibeOS.app registers it with SMAppService from
+     Contents/Library/LaunchAgents/ the first time it runs from Applications:
+     vibed starts at login, as the user, from inside the app, and launchd
+     starts it again if it stops. It logs to ~/Library/Logs/VibeOS/vibed.log
+     itself. Agents' shims lead sessions of their own, and launchd leaves the
+     processes vibed started alone when it stops or restarts it, so agents
+     outlive both (PRD: Restarts). -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>io.github.tsconfigdotjson.VibeOS.vibed</string>
+	<key>BundleProgram</key>
+	<string>Contents/MacOS/vibed</string>
+	<!-- Login Items shows it as VibeOS's. -->
+	<key>AssociatedBundleIdentifiers</key>
+	<array>
+		<string>io.github.tsconfigdotjson.VibeOS</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>AbandonProcessGroup</key>
+	<true/>
+	<!-- Not throttled as a background job: agents' builds run under it. -->
+	<key>ProcessType</key>
+	<string>Standard</string>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+</dict>
+</plist>

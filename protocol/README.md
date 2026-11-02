@@ -60,7 +60,11 @@ identity; linux agents have no Claude login yet) and a `toolbox.toml` whose
 `[update]` runs `true` and whose one `[[install]]` fails the first time it's
 run. `dark-mode-review`'s transcript has a turn in it already, so its
 conversation reads the same every time. Every Linux host it adds is an
-x86_64 server called `vps-1` without `claude`, and no link comes up. The
+x86_64 server called `vps-1` without `claude`, and no link comes up. Its
+`vibe doctor` finds git 2.50.1, `gh` logged in, git not yet using it, Claude
+Code 2.1.314 signed in, a Mac that sleeps after 10 minutes, and the Linux
+images on their way: Claude Code's layer in, base release 2 40% downloaded.
+The
 Rust replays build that world in a temp directory and put its path in place
 of `/Users/me`.
 
