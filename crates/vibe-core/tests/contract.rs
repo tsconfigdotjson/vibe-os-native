@@ -9,9 +9,9 @@ use serde::de::{self, DeserializeOwned, Deserializer, Visitor};
 use serde::{Serialize, forward_to_deserialize_any};
 use serde_json::Value;
 use vibe_core::model::{
-    Activity, AgentState, Certainty, Environment, EventKind, GhState, HostLink, LoginTool,
-    MessageRole, Mode, Model, ProjectSource, Reasoning, SessionState, StopReason, ToolboxAction,
-    ToolboxState, TunnelState, WakeupKind,
+    Activity, AgentState, Certainty, CheckId, CheckState, Environment, EventKind, GhState,
+    HostLink, LoginTool, MessageRole, Mode, Model, ProjectSource, Reasoning, SessionState,
+    StopReason, ToolboxAction, ToolboxState, TunnelState, WakeupKind,
 };
 use vibe_core::paths;
 use vibe_core::rpc::*;
@@ -214,6 +214,9 @@ fn rust_types() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
         entry::<ToolboxRun>(),
         entry::<ToolboxLogins>(),
         entry::<Login>(),
+        entry::<DoctorReport>(),
+        entry::<DoctorCheck>(),
+        entry::<DoctorFixParams>(),
     ])
 }
 
@@ -291,6 +294,8 @@ fn rust_methods() -> BTreeMap<&'static str, MethodTypes> {
         method::<ToolboxUpdate>(),
         method::<ToolboxRebuild>(),
         method::<ToolboxLoginsGet>(),
+        method::<DoctorCheckGet>(),
+        method::<DoctorFix>(),
     ])
 }
 
@@ -339,6 +344,8 @@ fn rust_enums() -> BTreeMap<&'static str, Vec<&'static str>> {
             names(ToolboxAction::ALL, ToolboxAction::as_str),
         ),
         ("LoginTool", names(LoginTool::ALL, LoginTool::as_str)),
+        ("CheckId", names(CheckId::ALL, CheckId::as_str)),
+        ("CheckState", names(CheckState::ALL, CheckState::as_str)),
         ("MessageRole", names(MessageRole::ALL, MessageRole::as_str)),
     ])
 }

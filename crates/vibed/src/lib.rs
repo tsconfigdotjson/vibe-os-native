@@ -5,6 +5,7 @@ pub mod acme;
 pub mod agents;
 pub mod core;
 pub mod dispatch;
+pub mod doctor;
 pub mod external;
 pub mod gh;
 pub mod hosts;

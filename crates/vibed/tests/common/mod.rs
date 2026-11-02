@@ -203,6 +203,20 @@ esac
 /// The golden host's Tailscale address (protocol/README.md).
 pub const GOLDEN_TAILSCALE: &str = "100.101.102.103";
 
+/// The doctor's answers on the golden host.
+pub fn golden_checks() -> vibed::doctor::FixedChecks {
+    vibed::doctor::FixedChecks {
+        git: Ok("git version 2.50.1".into()),
+        git_uses_gh: std::sync::Mutex::new(Ok(false)),
+        claude: Ok((
+            "/usr/local/bin/claude".into(),
+            "2.1.314 (Claude Code)".into(),
+        )),
+        claude_login: Ok("Claude Code is signed in, with its login in your Keychain".into()),
+        system_sleep: Ok(Some(10)),
+    }
+}
+
 pub struct Golden {
     pub dir: tempfile::TempDir,
     /// Canonical, so paths vibed canonicalizes match it (macOS's temp dir
@@ -278,6 +292,21 @@ impl Golden {
             fs::write(base.join(f), f).unwrap();
         }
         fs::write(layout.linux_dir().join("home-1.img"), "").unwrap();
+        // And for the doctor's linux check: Claude Code's managed layer, and
+        // base release 2 being downloaded, 400 bytes of 1000 in so far.
+        fs::write(layout.linux_dir().join("managed-2.1.314.img"), "").unwrap();
+        let downloads = layout.linux_dir().join("downloads");
+        fs::create_dir_all(&downloads).unwrap();
+        fs::write(
+            downloads.join("base.json"),
+            r#"{"version": 2, "files": {
+                "Image": {"sha256": "00", "size": 100},
+                "initrd": {"sha256": "00", "size": 100},
+                "base.img.gz": {"sha256": "00", "size": 800}}}"#,
+        )
+        .unwrap();
+        fs::write(downloads.join("Image"), [0u8; 100]).unwrap();
+        fs::write(downloads.join("base.img.gz"), [0u8; 300]).unwrap();
         // What the toolbox found in that home when it saved it.
         Images::new(layout.linux_dir())
             .note_logins(1, &golden_logins())
@@ -322,6 +351,18 @@ impl Golden {
         config.remote = Arc::new(GoldenRemote);
         // One Tailscale address, whatever this machine has.
         config.tailscale = Arc::new(|| vec![GOLDEN_TAILSCALE.parse().unwrap()]);
+        // What vibe doctor finds: everything there but git using gh, and a
+        // Mac that sleeps after 10 minutes; and the Linux images, with base
+        // release 2 on its way (for_examples has it 40% downloaded).
+        config.checks = Arc::new(golden_checks());
+        config.linux_images = Some(vibed::linux::Watch::new(
+            &Layout::new(&self.home, "macos"),
+            vibed::linux::Sources {
+                base_releases: "file:///nowhere".into(),
+                base_release: 2,
+                claude_releases: "file:///nowhere".into(),
+            },
+        ));
         // Bytes 0, 1, 2, … for the first key, 32, 33, … for the next.
         let calls = AtomicU8::new(0);
         config.entropy = Arc::new(move || {

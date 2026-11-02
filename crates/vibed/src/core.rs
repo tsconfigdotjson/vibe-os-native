@@ -110,6 +110,12 @@ pub struct Config {
     pub sleep_timing: crate::sleep::Timing,
     /// How a Linux host serves the external address.
     pub external: crate::external::ExternalConfig,
+    /// What `vibe doctor` asks of the machine: the machine itself, by
+    /// default.
+    pub checks: Arc<dyn crate::doctor::HostChecks>,
+    /// The Linux images kept current in the background, on a Mac that
+    /// runs `linux` agents in VMs: the doctor's `linux` check.
+    pub linux_images: Option<Arc<crate::linux::Watch>>,
 }
 
 impl std::fmt::Debug for Config {
@@ -138,6 +144,7 @@ impl Config {
     /// backends: `vibed`'s `main` picks them for the machine it's on.
     pub fn new(info: DaemonInfo, layout: Layout) -> Self {
         let path = std::env::var_os("PATH");
+        let checks = Arc::new(crate::doctor::Machine::new(layout.home()));
         Config {
             label: hostname(),
             layout,
@@ -159,6 +166,8 @@ impl Config {
                 serve_here: info.os == "linux",
                 ..crate::external::ExternalConfig::default()
             },
+            checks,
+            linux_images: None,
             info,
         }
     }
@@ -257,7 +266,7 @@ pub struct Core {
     info: DaemonInfo,
     label: String,
     pub(crate) layout: Layout,
-    gh: OsString,
+    pub(crate) gh: OsString,
     pub(crate) shim: OsString,
     clock: Clock,
     entropy: Entropy,
@@ -305,7 +314,9 @@ pub struct Core {
     /// ahead.
     adding: Mutex<HashSet<String>>,
     events: EventBus,
-    gh_status: Mutex<GhStatus>,
+    pub(crate) gh_status: Mutex<GhStatus>,
+    pub(crate) checks: Arc<dyn crate::doctor::HostChecks>,
+    pub(crate) linux_images: Option<Arc<crate::linux::Watch>>,
     pub(crate) toolbox: Option<Arc<dyn vibe_env::toolbox::ToolboxHost>>,
     /// What the toolbox is doing, for `toolbox.status`.
     pub(crate) toolbox_state: Mutex<vibe_core::model::ToolboxState>,
@@ -483,6 +494,8 @@ impl Core {
                 detail: None,
                 checked_at: None,
             }),
+            checks: config.checks,
+            linux_images: config.linux_images,
             toolbox: config.toolbox,
             toolbox_state: Mutex::new(vibe_core::model::ToolboxState::Closed),
             toolbox_op: tokio::sync::Mutex::new(()),

@@ -6,13 +6,13 @@ use serde_json::Value;
 use tokio::sync::broadcast;
 use vibe_core::rpc::{
     AgentsCheck, AgentsDelete, AgentsInterrupt, AgentsList, AgentsMessages, AgentsOutput,
-    AgentsSend, AgentsStart, ErrorCode, ErrorObject, Event, EventsSubscribe, GhStatusGet, Hello,
-    HelloParams, HelloResult, HostsAdd, HostsExternal, HostsList, HostsRemove, HostsUpgrade, Id,
-    KeysCreate, KeysList, KeysRevoke, KeysSync, KeysVerify, LimitsGet, LimitsSet, McpGet, McpSet,
-    Method, PROTOCOL_VERSION, ProfilesCreate, ProfilesDelete, ProfilesList, ProfilesUpdate,
-    ProjectsAdd, ProjectsList, ProjectsRemove, ProtocolMismatchData, Request, Response,
-    SessionsAttach, SessionsList, Subscribed, ToolboxLoginsGet, ToolboxOpen, ToolboxRebuild,
-    ToolboxStatusGet, ToolboxUpdate, TunnelPrepare,
+    AgentsSend, AgentsStart, DoctorCheckGet, DoctorFix, ErrorCode, ErrorObject, Event,
+    EventsSubscribe, GhStatusGet, Hello, HelloParams, HelloResult, HostsAdd, HostsExternal,
+    HostsList, HostsRemove, HostsUpgrade, Id, KeysCreate, KeysList, KeysRevoke, KeysSync,
+    KeysVerify, LimitsGet, LimitsSet, McpGet, McpSet, Method, PROTOCOL_VERSION, ProfilesCreate,
+    ProfilesDelete, ProfilesList, ProfilesUpdate, ProjectsAdd, ProjectsList, ProjectsRemove,
+    ProtocolMismatchData, Request, Response, SessionsAttach, SessionsList, Subscribed,
+    ToolboxLoginsGet, ToolboxOpen, ToolboxRebuild, ToolboxStatusGet, ToolboxUpdate, TunnelPrepare,
 };
 
 use crate::core::Core;
@@ -261,6 +261,11 @@ async fn call(
             core.toolbox_logins(decode::<ToolboxLoginsGet>(params)?)
                 .await,
         ),
+        DoctorCheckGet::NAME => {
+            decode::<DoctorCheckGet>(params)?;
+            encode_result(Ok(core.doctor().await))
+        }
+        DoctorFix::NAME => encode_result(core.doctor_fix(decode::<DoctorFix>(params)?).await),
         _ => Err(ErrorObject::new(
             ErrorCode::MethodNotFound,
             format!("Method not found: {method}"),

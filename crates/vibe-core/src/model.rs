@@ -276,6 +276,31 @@ names! {
     LoginTool { Gh = "gh", Gcloud = "gcloud", Git = "git", Ssh = "ssh" }
 }
 
+names! {
+    /// What `vibe doctor` checks (PRD: Key user flows, Install and setup),
+    /// in the order it reports them: git; `gh`'s login, and git using `gh`
+    /// for GitHub (`gh auth setup-git`); the `claude` macos agents run, and
+    /// its login; system sleep off; Tailscale, which is optional; and on a
+    /// Mac, the Linux base image and Claude Code for linux agents.
+    CheckId {
+        Git = "git",
+        Gh = "gh",
+        GhGit = "gh_git",
+        Claude = "claude",
+        ClaudeLogin = "claude_login",
+        Power = "power",
+        Tailscale = "tailscale",
+        Linux = "linux",
+    }
+}
+
+names! {
+    /// How a doctor check went: `pass`; `fail`, which needs the owner;
+    /// `optional`, missing but not needed; or `working`, still under way
+    /// (a download).
+    CheckState { Pass = "pass", Fail = "fail", Optional = "optional", Working = "working" }
+}
+
 /// The default memory of a profile.
 pub const DEFAULT_PROFILE_MEMORY: u64 = 4 * GIB;
 pub const MIN_PROFILE_MEMORY: u64 = GIB;

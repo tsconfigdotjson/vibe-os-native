@@ -1,0 +1,12 @@
+{
+  "description": "A check VibeOS can't fix for the owner is refused, with what to do.",
+  "request": {"jsonrpc": "2.0", "id": 103, "method": "doctor.fix", "params": {"check": "power"}},
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 103,
+    "error": {
+      "code": -32602,
+      "message": "Invalid params: VibeOS can't fix power for you: In System Settings → Energy, turn on Prevent automatic sleeping when the display is off (on a laptop, in Battery → Options, on power adapter); or run `sudo pmset -a sleep 0` in Terminal."
+    }
+  }
+}

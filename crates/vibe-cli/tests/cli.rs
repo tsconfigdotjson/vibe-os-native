@@ -145,6 +145,67 @@ fn rpc_bridges_the_whole_contract() {
     assert_eq!(got, expected);
 }
 
+/// `vibe doctor` on the golden host: a line a check, what to do about each
+/// that needs it, and exit 1 while one does. `--fix` has vibed run `gh auth
+/// setup-git`; the Mac's sleep setting is the owner's to change, so it
+/// still fails.
+#[test]
+fn doctor_lists_every_check_and_fixes_what_it_can() {
+    let golden = common::Golden::new().for_examples();
+    let core = Core::open(golden.config()).unwrap();
+    let s = start_core(core, tempfile::tempdir().unwrap());
+    let out = vibe(&["doctor"], &s.path, b"");
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    let report = text(&out.stdout);
+    assert_eq!(
+        report
+            .lines()
+            .filter(|l| ["ok  ", "!!  ", "--  ", "..  "]
+                .iter()
+                .any(|m| l.starts_with(m)))
+            .count(),
+        8,
+        "a line a check:\n{report}"
+    );
+    assert!(
+        report.contains("ok  git             git 2.50.1 is installed.\n"),
+        "{report}"
+    );
+    assert!(
+        report.contains("!!  git through gh  git doesn't ask gh"),
+        "{report}"
+    );
+    assert!(
+        report.contains("`vibe doctor --fix` can do it."),
+        "{report}"
+    );
+    assert!(
+        report.contains("!!  system sleep    This Mac sleeps after 10 minutes"),
+        "{report}"
+    );
+    assert!(
+        report.contains("..  Linux images    Downloading the Linux base image (40%)."),
+        "{report}"
+    );
+    assert!(report.ends_with("2 checks need you.\n"), "{report}");
+
+    let out = vibe(&["doctor", "--fix"], &s.path, b"");
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    let report = text(&out.stdout);
+    assert!(report.starts_with("fixed: git through gh\n"), "{report}");
+    assert!(
+        report.contains("ok  git through gh  git asks gh for GitHub's credentials."),
+        "{report}"
+    );
+    assert!(report.ends_with("1 check needs you.\n"), "{report}");
+
+    // Without vibed, it says so, as every command does.
+    let dir = tempfile::tempdir().unwrap();
+    let out = vibe(&["doctor"], &dir.path().join("none.sock"), b"");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(text(&out.stderr).contains("can't reach vibed at"));
+}
+
 /// `ssh <host> vibe rpc` is a conversation: each reply comes as soon as
 /// it's made, while stdin is still open, not when it ends.
 #[test]

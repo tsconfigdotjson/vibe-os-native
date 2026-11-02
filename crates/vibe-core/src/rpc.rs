@@ -17,9 +17,9 @@ use serde_json::Value;
 
 pub use crate::limits::HostLimits;
 pub use crate::model::{
-    Activity, AgentState, Certainty, Environment, EventKind, GhState, HostLink, LoginTool,
-    MessageRole, Mode, Model, Profile, ProjectSource, Reasoning, SessionState, StopReason,
-    ToolboxAction, ToolboxState, TunnelState, WakeupKind,
+    Activity, AgentState, Certainty, CheckId, CheckState, Environment, EventKind, GhState,
+    HostLink, LoginTool, MessageRole, Mode, Model, Profile, ProjectSource, Reasoning, SessionState,
+    StopReason, ToolboxAction, ToolboxState, TunnelState, WakeupKind,
 };
 
 /// Bumped on any incompatible change to the contract. Clients send theirs in
@@ -377,6 +377,8 @@ pub const METHODS: &[&str] = &[
     ToolboxUpdate::NAME,
     ToolboxRebuild::NAME,
     ToolboxLoginsGet::NAME,
+    DoctorCheckGet::NAME,
+    DoctorFix::NAME,
 ];
 
 /// Every notification the daemon sends.
@@ -660,6 +662,24 @@ method! {
     /// whether linux agents have a Claude login. Reads only what's kept on
     /// the Mac: it never boots a VM.
     ToolboxLoginsGet = "toolbox.logins", NoParams => ToolboxLogins
+}
+
+method! {
+    /// `doctor.check`: `vibe doctor`, and the first run's checklist (PRD:
+    /// Key user flows, Install and setup). Runs every check now, as this
+    /// host's `vibed` sees it: git, `gh`'s login and git using it, the
+    /// `claude` macos agents run and its login, system sleep, Tailscale,
+    /// and on a Mac the Linux images' download. Never changes anything.
+    DoctorCheckGet = "doctor.check", NoParams => DoctorReport
+}
+
+method! {
+    /// `doctor.fix`: does what VibeOS can about one check, then runs every
+    /// check again. `gh_git` runs `gh auth setup-git`; `linux` downloads
+    /// the Linux images now rather than at the next daily check. Every
+    /// other check is the owner's to fix, as its `hint` says, and is
+    /// refused.
+    DoctorFix = "doctor.fix", DoctorFixParams => DoctorReport
 }
 
 method! {
@@ -1390,6 +1410,36 @@ pub struct ToolboxLogins {
     /// Without one, why, as a sentence: none kept yet, or it can't be read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_problem: Option<String>,
+}
+
+/// What `doctor.check` found, check by check, in [`CheckId`]'s order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DoctorReport {
+    pub checks: Vec<DoctorCheck>,
+}
+
+/// One doctor check.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DoctorCheck {
+    pub id: CheckId,
+    pub state: CheckState,
+    /// What it found, as a sentence: `git version 2.50.1`, `logged in to
+    /// github.com as octocat`.
+    pub detail: String,
+    /// Unless it passed, what to do about it, as a sentence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+    /// Whether `doctor.fix` can do that.
+    pub fixable: bool,
+    /// While it's `working`, how far along, in percent, when that's known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DoctorFixParams {
+    pub check: CheckId,
 }
 
 /// One login the Linux home holds. Never its secret.
