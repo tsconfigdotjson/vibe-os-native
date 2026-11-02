@@ -4,12 +4,15 @@
 # ad hoc signing and the vibe-vm and VibeOS.app smoke tests. The runner is
 # itself a VM, so the step that boots real VMs (vm-cycle) is N/A there; it
 # needs a Mac on real hardware.
+#
+# Pull requests are gated by local checks: scripts/check-full.sh on the box
+# and on Lee's Mac. CI runs only on merges to main or by hand
+# (workflow_dispatch), so PRs don't spend GitHub Actions minutes.
 name: CI
 
 on:
   push:
     branches: [main]
-  pull_request:
   workflow_dispatch:
 
 concurrency:
