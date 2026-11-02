@@ -546,14 +546,16 @@ struct KeyRow: View {
                 .frame(width: 20)
             VStack(alignment: .leading, spacing: 2) {
                 Text(key.name)
-                (Text(key.prefix + "…").font(.caption.monospaced()) + Text(" · " + details).font(.caption))
+                Text("\(Text(key.prefix + "…").font(.caption.monospaced()))\(Text(" · " + details).font(.caption))")
                     .foregroundStyle(.secondary)
             }
+            // The name and details read as one; Revoke stays its own button.
+            .accessibilityElement(children: .combine)
             Spacer()
             Button("Revoke…", role: .destructive, action: revoke)
                 .controlSize(.small)
+                .accessibilityLabel("Revoke \(key.name)")
         }
-        .accessibilityElement(children: .combine)
     }
 
     private var details: String {
@@ -894,6 +896,7 @@ struct HostRow: View {
                             Text(host.link == .connected ? "Connected" : "Down")
                         }
                     }
+                    if !local { Text(host.mcp ? "MCP on" : "MCP off") }
                     if let version = host.version { Text("vibed \(version)") }
                     if let address = host.address { Text(address).lineLimit(1).truncationMode(.middle) }
                 }

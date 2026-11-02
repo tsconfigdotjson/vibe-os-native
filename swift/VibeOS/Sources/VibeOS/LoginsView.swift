@@ -48,10 +48,12 @@ struct LoginsView: View {
                             }
                         }
                     }
-                } else if let error {
-                    ErrorText(error: error)
-                } else {
+                } else if error == nil {
                     ProgressView().frame(maxWidth: .infinity)
+                }
+                // A failed read shows, over the last logins read, if any.
+                if let error {
+                    Section { ErrorText(error: error) }
                 }
                 Section {
                 } footer: {

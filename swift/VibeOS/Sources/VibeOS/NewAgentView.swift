@@ -148,8 +148,18 @@ struct NewAgentView: View {
     /// No projects on this host: say how to add one.
     private var noProjects: some View {
         VStack(spacing: 14) {
+            if model.hosts.count > 1 {
+                Picker("Host", selection: $host) {
+                    ForEach(model.hosts, id: \.name) { h in
+                        Text(h.link == .local ? "\(h.label) (this Mac)" : h.name).tag(h.name)
+                    }
+                }
+                .fixedSize()
+            }
             ContentUnavailableView {
-                Label("No projects yet", systemImage: "folder.badge.plus")
+                Label(
+                    host == VibeRPC.localHost ? "No projects yet" : "No projects on \(host) yet",
+                    systemImage: "folder.badge.plus")
             } description: {
                 Text("An agent works in a project: a GitHub repo or a folder. Add one in Settings and it's ready.")
             } actions: {

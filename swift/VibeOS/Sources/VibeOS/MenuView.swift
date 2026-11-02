@@ -44,7 +44,18 @@ struct MenuView: View {
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 28)
         case .unavailable(let why):
-            OfflineView(model: model, why: why)
+            if model.agents.isEmpty {
+                OfflineView(model: model, why: why)
+            } else {
+                // The last rows vibed gave, all unavailable, under a note.
+                InlineMessage(
+                    text: "Can't reach vibed. Your agents keep running; the menu reconnects on its own.",
+                    symbol: "bolt.horizontal.circle")
+                    .padding(.horizontal, 10)
+                    .padding(.top, 8)
+                    .help(sentence(why))
+                AgentList(model: model, offline: true)
+            }
         case .connected:
             if model.agents.isEmpty {
                 EmptyMenuView(model: model)
@@ -158,6 +169,8 @@ struct HeaderView: View {
 /// opens it, as in a menu.
 struct AgentList: View {
     @ObservedObject var model: MenuModel
+    /// vibed can't be reached: every row shows, unavailable.
+    var offline = false
     @State private var selection: String?
     @FocusState private var focused: Bool
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -170,11 +183,12 @@ struct AgentList: View {
                         ForEach(host.projects) { project in
                             GroupHeader(
                                 model: model, group: project,
-                                showHost: model.groups.count > 1 || host.host != VibeRPC.localHost)
+                                showHost: model.groups.count > 1 || host.host != VibeRPC.localHost,
+                                unavailable: isUnavailable(project.host))
                             ForEach(project.agents, id: \.key) { agent in
                                 AgentRow(
                                     model: model, agent: agent,
-                                    unavailable: model.unavailableHosts.contains(agent.host),
+                                    unavailable: isUnavailable(agent.host),
                                     selected: selection == agent.key
                                 )
                                 .id(agent.key)
@@ -210,9 +224,13 @@ struct AgentList: View {
         }
     }
 
+    private func isUnavailable(_ host: String) -> Bool {
+        offline || model.unavailableHosts.contains(host)
+    }
+
     /// The rows a click can open, top to bottom.
     private var openable: [Agent] {
-        model.groups.flatMap { $0.projects.flatMap(\.agents) }.filter { !model.unavailableHosts.contains($0.host) }
+        model.groups.flatMap { $0.projects.flatMap(\.agents) }.filter { !isUnavailable($0.host) }
     }
 
     private func move(by step: Int, _ proxy: ScrollViewProxy) {
@@ -234,9 +252,9 @@ struct GroupHeader: View {
     @ObservedObject var model: MenuModel
     let group: ProjectGroup
     let showHost: Bool
+    let unavailable: Bool
 
     var body: some View {
-        let unavailable = model.unavailableHosts.contains(group.host)
         HStack(spacing: 5) {
             if showHost {
                 Image(systemName: group.host == VibeRPC.localHost ? "laptopcomputer" : "server.rack")
@@ -332,7 +350,7 @@ struct AgentRow: View {
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(rowAccessibilityLabel(agent, now: model.now, unavailable: unavailable))
         .accessibilityHint(unavailable ? "" : "Opens it in Terminal")
-        .accessibilityAddTraits(.isButton)
+        .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
         // The context menu's actions, for VoiceOver, on the same terms.
         .accessibilityAction {
             if !unavailable { Task { await model.attach(agent) } }

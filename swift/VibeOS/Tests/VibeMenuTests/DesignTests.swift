@@ -164,6 +164,10 @@ import VibeRPC
         #expect(sentence("can't reach vibed") == "Can't reach vibed")
         #expect(sentence("Already one") == "Already one")
         #expect(sentence("") == "")
+        // A command's name stays as it's spelt.
+        #expect(sentence("ssh: connect to host box port 22: timed out") == "ssh: connect to host box port 22: timed out")
+        #expect(sentence("gh auth status failed") == "gh auth status failed")
+        #expect(sentence("vibed: port 7878 is taken") == "vibed: port 7878 is taken")
     }
 }
 

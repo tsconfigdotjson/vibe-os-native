@@ -53,7 +53,7 @@ public final class FixtureDaemon: DaemonConnection, @unchecked Sendable {
     private var populated: Bool { scenario == .busy }
     private var setUp: Bool { scenario != .firstRun }
 
-    func answer(_ method: String, host: String, params: [String: Any]) -> Any? {
+    func answer(_ method: String, host: String, params: [String: Any]) -> [String: Any]? {
         switch method {
         case HostsList.name:
             return ["hosts": hosts]

@@ -355,7 +355,8 @@ struct InlineMessage: View {
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
         .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(tint.opacity(0.12)))
-        .accessibilityElement(children: .combine)
+        // Contain, not combine, so Dismiss stays a button of its own.
+        .accessibilityElement(children: .contain)
     }
 }
 
@@ -466,9 +467,19 @@ struct CommitField: View {
     private func save() async {
         guard !saving, text != value, isValid(text) else { return }
         saving = true
-        let took = await commit(text)
+        let sent = text
+        let took = await commit(sent)
         saving = false
-        guard took else { return }
+        guard took else {
+            // Show what's really saved; the form says why it didn't take.
+            if text == sent { text = value }
+            return
+        }
+        // Edited again while that was on its way: send the newer text too.
+        if text != sent {
+            await save()
+            return
+        }
         withAnimation(motion(.spring(response: 0.3, dampingFraction: 0.6), reduce: reduceMotion)) { saved = true }
         try? await Task.sleep(for: .seconds(1.4))
         withAnimation(motion(.easeOut(duration: 0.3), reduce: reduceMotion)) { saved = false }

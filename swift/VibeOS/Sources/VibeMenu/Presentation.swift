@@ -500,11 +500,20 @@ public func agentSummary(_ agents: [Agent]) -> String {
 }
 
 /// A clause from vibed (`can't reach…`), capitalised to stand on its own as
-/// a sentence.
+/// a sentence. One that starts with a command's name (`ssh: connect…`,
+/// `gh auth …`) is left as it is: the name is spelt that way.
 public func sentence(_ text: String) -> String {
     guard let first = text.first else { return text }
+    let word = text.prefix { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" }
+    if commandNames.contains(String(word)) { return text }
     return first.uppercased() + text.dropFirst()
 }
+
+/// Commands whose names a sentence may start with, in lowercase.
+let commandNames: Set<String> = [
+    "ssh", "scp", "gh", "git", "gcloud", "claude", "vibe", "vibed", "vibe-shim", "vibe-vm", "systemctl", "sudo",
+    "apt", "npm",
+]
 
 // MARK: First run
 

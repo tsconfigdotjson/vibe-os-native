@@ -325,22 +325,48 @@ final class GalleryRunner: NSObject, NSApplicationDelegate {
                 continue
             }
             view.cacheDisplay(in: view.bounds, to: rep)
+            // SwiftUI draws through layers, which cacheDisplay can miss: if
+            // it came out blank, draw the layer tree instead.
+            let drawn = looksDrawn(rep) ? rep : (layerImage(view) ?? rep)
             let file = directory.appendingPathComponent("\(name).png")
-            guard let png = rep.representation(using: .png, properties: [:]), (try? png.write(to: file)) != nil else {
+            guard let png = drawn.representation(using: .png, properties: [:]), (try? png.write(to: file)) != nil else {
                 FileHandle.standardError.write(Data("VibeOS: can't write \(file.path)\n".utf8))
                 failed = true
                 continue
             }
-            if !looksDrawn(rep) {
+            if !looksDrawn(drawn) {
                 FileHandle.standardError.write(Data("VibeOS: \(name) came out blank\n".utf8))
                 failed = true
             }
-            manifest.append("\(name).png \(rep.pixelsWide)x\(rep.pixelsHigh)")
-            print("rendered \(name) \(rep.pixelsWide)x\(rep.pixelsHigh)")
+            manifest.append("\(name).png \(drawn.pixelsWide)x\(drawn.pixelsHigh)")
+            print("rendered \(name) \(drawn.pixelsWide)x\(drawn.pixelsHigh)")
         }
         let list = manifest.joined(separator: "\n") + "\n"
         try? list.write(to: directory.appendingPathComponent("manifest.txt"), atomically: true, encoding: .utf8)
         return failed ? 1 : 0
+    }
+
+    /// The view's layer tree, drawn into a bitmap at the window's scale.
+    private func layerImage(_ view: NSView) -> NSBitmapImageRep? {
+        guard let layer = view.layer else { return nil }
+        let scale = view.window?.backingScaleFactor ?? 2
+        let width = Int(view.bounds.width * scale)
+        let height = Int(view.bounds.height * scale)
+        guard width > 0, height > 0,
+            let rep = NSBitmapImageRep(
+                bitmapDataPlanes: nil, pixelsWide: width, pixelsHigh: height, bitsPerSample: 8,
+                samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB,
+                bytesPerRow: 0, bitsPerPixel: 0),
+            let context = NSGraphicsContext(bitmapImageRep: rep)
+        else { return nil }
+        rep.size = view.bounds.size
+        context.cgContext.scaleBy(x: scale, y: scale)
+        if layer.isGeometryFlipped == false && view.isFlipped {
+            context.cgContext.translateBy(x: 0, y: view.bounds.height)
+            context.cgContext.scaleBy(x: 1, y: -1)
+        }
+        layer.render(in: context.cgContext)
+        return rep
     }
 
     /// Whether an image holds a drawing rather than one flat colour: it
