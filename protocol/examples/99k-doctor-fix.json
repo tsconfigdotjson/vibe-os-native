@@ -1,0 +1,62 @@
+{
+  "description": "vibe doctor --fix, or the first run's Fix button: gh_git runs `gh auth setup-git`, and every check runs again.",
+  "request": {"jsonrpc": "2.0", "id": 102, "method": "doctor.fix", "params": {"check": "gh_git"}},
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 102,
+    "result": {
+      "checks": [
+        {
+          "id": "git",
+          "state": "pass",
+          "detail": "git 2.50.1 is installed.",
+          "fixable": false
+        },
+        {
+          "id": "gh",
+          "state": "pass",
+          "detail": "GitHub's gh is logged in to github.com as me.",
+          "fixable": false
+        },
+        {
+          "id": "gh_git",
+          "state": "pass",
+          "detail": "git asks gh for GitHub's credentials.",
+          "fixable": false
+        },
+        {
+          "id": "claude",
+          "state": "pass",
+          "detail": "Claude Code 2.1.314 is at /usr/local/bin/claude.",
+          "fixable": false
+        },
+        {
+          "id": "claude_login",
+          "state": "pass",
+          "detail": "Claude Code is signed in, with its login in your Keychain.",
+          "fixable": false
+        },
+        {
+          "id": "power",
+          "state": "fail",
+          "detail": "This Mac sleeps after 10 minutes idle, and agents stop answering while it sleeps.",
+          "hint": "In System Settings → Energy, turn on Prevent automatic sleeping when the display is off (on a laptop, in Battery → Options, on power adapter); or run `sudo pmset -c sleep 0` in Terminal.",
+          "fixable": false
+        },
+        {
+          "id": "tailscale",
+          "state": "pass",
+          "detail": "Tailscale is up, at 100.101.102.103; Settings can serve MCP there too.",
+          "fixable": false
+        },
+        {
+          "id": "linux",
+          "state": "working",
+          "detail": "Downloading the Linux base image.",
+          "fixable": false,
+          "progress": 40
+        }
+      ]
+    }
+  }
+}

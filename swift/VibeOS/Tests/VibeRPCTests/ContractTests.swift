@@ -171,6 +171,9 @@ let swiftTypes: [String: Set<String>] = [
     "ToolboxRun": keys(ToolboxRun.CodingKeys.self),
     "ToolboxLogins": keys(ToolboxLogins.CodingKeys.self),
     "Login": keys(Login.CodingKeys.self),
+    "DoctorReport": keys(DoctorReport.CodingKeys.self),
+    "DoctorCheck": keys(DoctorCheck.CodingKeys.self),
+    "DoctorFixParams": keys(DoctorFixParams.CodingKeys.self),
 ]
 
 /// The index's enums, from the Swift ones.
@@ -193,6 +196,8 @@ let swiftEnums: [String: [String]] = [
     "ToolboxState": ToolboxState.allCases.map(\.rawValue),
     "ToolboxAction": ToolboxAction.allCases.map(\.rawValue),
     "LoginTool": LoginTool.allCases.map(\.rawValue),
+    "CheckId": CheckId.allCases.map(\.rawValue),
+    "CheckState": CheckState.allCases.map(\.rawValue),
     "MessageRole": MessageRole.allCases.map(\.rawValue),
 ]
 
@@ -257,6 +262,8 @@ func methodChecks() -> [String: MethodCheck] {
         check(ToolboxUpdate.self),
         check(ToolboxRebuild.self),
         check(ToolboxLoginsGet.self),
+        check(DoctorCheckGet.self),
+        check(DoctorFix.self),
     ])
 }
 

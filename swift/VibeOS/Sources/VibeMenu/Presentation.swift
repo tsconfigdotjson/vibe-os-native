@@ -572,19 +572,128 @@ let commandNames: Set<String> = [
 
 // MARK: First run
 
+/// What a setup step's button does.
+public enum SetupAction: Equatable, Sendable {
+    /// Links vibe into /usr/local/bin.
+    case linkCommand
+    /// Asks macOS for permission to control Terminal, or after a no, opens
+    /// where it's turned back on.
+    case allowTerminal
+    /// Has vibed fix a doctor check (`doctor.fix`).
+    case fix(CheckId)
+    /// Runs a command line in Terminal, in the owner's own shell.
+    case terminal(String)
+    /// Runs `vibe <words>` in Terminal, as its shell.
+    case vibe([String])
+    /// Opens a web page or a System Settings pane.
+    case open(String)
+    /// Apple's Command Line Tools installer.
+    case installCommandLineTools
+    /// Serves MCP on this Mac's Tailscale address too (`mcp.set`).
+    case serveOnTailscale
+    case openToolbox
+    case projects, keys
+}
+
 /// How far the owner is through setting up (PRD: Key user flows, Install
-/// and setup): a project, the Claude login linux agents need, and an API
-/// key for MCP clients. The menu shows it as a welcome until agents exist.
+/// and setup), as one list in order. First launch: the vibe command, vibe
+/// doctor's checks (git, gh and git using it, Claude Code and its login,
+/// system sleep, Tailscale) and the app's permission to control Terminal.
+/// First run: the Linux download, Claude's login for linux agents, the
+/// Linux toolbox's GitHub login, a project, and an API key for MCP clients.
+/// The menu shows it as a welcome until agents exist.
 public struct SetupProgress: Equatable, Sendable {
     public struct Step: Equatable, Sendable, Identifiable {
-        public enum ID: String, Sendable {
-            case project, claude, key
+        public enum ID: Hashable, Sendable {
+            case command
+            case check(CheckId)
+            case terminal
+            case claude, toolbox, project
+            /// MCP on Tailscale, for Claude Code on the owner's other machines.
+            case remote
+            case key
+        }
+
+        public enum Status: Equatable, Sendable {
+            case todo
+            case done
+            /// Under way, and how far in percent when that's known.
+            case working(Int?)
+            /// Missing, but not needed.
+            case optional
         }
 
         public var id: ID
         public var title: String
+        /// What it is, or what to do, as a sentence.
         public var detail: String
-        public var done: Bool
+        public var status: Status
+        /// The button that does it, and its title; none while it's done,
+        /// under way, or waiting on another step.
+        public var action: SetupAction?
+        public var actionTitle: String?
+
+        public init(
+            id: ID, title: String, detail: String, status: Status, action: SetupAction? = nil,
+            actionTitle: String? = nil
+        ) {
+            self.id = id
+            self.title = title
+            self.detail = detail
+            self.status = status
+            self.action = action
+            self.actionTitle = actionTitle
+        }
+
+        public var done: Bool { status == .done }
+        /// While it's under way, how far in percent, if that's known.
+        public var progress: Int? {
+            if case .working(let p) = status { return p }
+            return nil
+        }
+        public var isWorking: Bool {
+            if case .working = status { return true }
+            return false
+        }
+        /// Its state in words, for VoiceOver.
+        public var statusWords: String {
+            switch status {
+            case .done: return "done"
+            case .todo: return "to do"
+            case .optional: return "optional"
+            case .working(let p?): return "under way, \(p) percent"
+            case .working(nil): return "under way"
+            }
+        }
+        /// Whether it holds up the welcome.
+        public var needed: Bool {
+            switch status {
+            case .todo, .working: true
+            case .done, .optional: false
+            }
+        }
+        /// One of this Mac's own checks, as against a first-run step.
+        public var onThisMac: Bool {
+            switch id {
+            case .command, .terminal: true
+            case .check(let c): c != .linux
+            default: false
+            }
+        }
+    }
+
+    /// A row of the welcome: a step, or this Mac's checks that passed,
+    /// folded into one.
+    public enum Row: Equatable, Sendable, Identifiable {
+        case step(Step)
+        case passed([Step])
+
+        public var id: String {
+            switch self {
+            case .step(let s): "\(s.id)"
+            case .passed: "passed"
+            }
+        }
     }
 
     public var hasProject: Bool
@@ -592,35 +701,265 @@ public struct SetupProgress: Equatable, Sendable {
     /// Whether linux agents can log in to Claude; nil where there are none,
     /// as on a host with no Linux toolbox.
     public var linuxClaude: Bool?
+    /// Whether the Linux home has a gh login; nil where there's no toolbox,
+    /// or VibeOS couldn't tell.
+    public var linuxGitHub: Bool?
+    /// `vibe doctor`'s checks; none from a vibed too old to have them.
+    public var doctor: [DoctorCheck]
+    /// How this copy is installed.
+    public var install: InstallStatus
+    /// Whether gh is installed at all, which the gh check's button needs.
+    public var ghInstalled: Bool
+    /// Whether other machines can reach MCP here: on Tailscale, or through
+    /// a Linux host that's the external address. Nil where Tailscale isn't
+    /// up, so there's nothing to turn on.
+    public var remoteMCP: Bool?
 
-    public init(hasProject: Bool, hasKey: Bool, linuxClaude: Bool?) {
+    public init(
+        hasProject: Bool, hasKey: Bool, linuxClaude: Bool?, linuxGitHub: Bool? = nil, doctor: [DoctorCheck] = [],
+        install: InstallStatus = .notManaged, ghInstalled: Bool = true, remoteMCP: Bool? = nil
+    ) {
+        self.remoteMCP = remoteMCP
         self.hasProject = hasProject
         self.hasKey = hasKey
         self.linuxClaude = linuxClaude
+        self.linuxGitHub = linuxGitHub
+        self.doctor = doctor
+        self.install = install
+        self.ghInstalled = ghInstalled
     }
 
     public var steps: [Step] {
-        var steps = [
-            Step(
-                id: .project, title: "Add a project",
-                detail: "A GitHub repo or a folder on this Mac. It comes with two profiles, ready to use.",
-                done: hasProject)
-        ]
+        var steps: [Step] = []
+        if let command = commandStep { steps.append(command) }
+        let machine = doctor.filter { $0.id != .linux }
+        for check in machine {
+            steps.append(step(for: check))
+            // Terminal goes with the tools agents need, before the Mac's
+            // power and Tailscale.
+            if check.id == .claudeLogin, let terminal = terminalStep { steps.append(terminal) }
+        }
+        if !machine.contains(where: { $0.id == .claudeLogin }), let terminal = terminalStep {
+            steps.append(terminal)
+        }
+        let linux = doctor.first { $0.id == .linux }
+        if let linux { steps.append(step(for: linux)) }
         if let linuxClaude {
             steps.append(
                 Step(
                     id: .claude, title: "Log in to Claude for Linux agents",
-                    detail: "One browser sign-in. The token stays in your Keychain.", done: linuxClaude))
+                    detail: linuxClaude
+                        ? "Linux agents sign in with a token kept in your Keychain."
+                        : "One browser sign-in. The token stays in your Keychain.",
+                    status: linuxClaude ? .done : .todo,
+                    action: linuxClaude ? nil : .vibe(["setup-token"]), actionTitle: "Log In…"))
+        }
+        if let linuxGitHub {
+            let ready = linux.map { $0.state == .pass } ?? true
+            steps.append(
+                Step(
+                    id: .toolbox, title: "Set up the Linux toolbox",
+                    detail: linuxGitHub
+                        ? "Linux agents start logged in to GitHub."
+                        : ready
+                            ? "A Linux shell opens in Terminal. Run gh auth login, add anything every Linux agent "
+                                + "should have, then exit to save."
+                            : "Once Linux is downloaded: a shell where you log in to GitHub for Linux agents.",
+                    status: linuxGitHub ? .done : .todo,
+                    action: linuxGitHub || !ready ? nil : .openToolbox, actionTitle: "Open Shell"))
+        }
+        steps.append(
+            Step(
+                id: .project, title: "Add a project",
+                detail: "A GitHub repo or a folder on this Mac. It comes with two profiles, ready to use.",
+                status: hasProject ? .done : .todo, action: hasProject ? nil : .projects, actionTitle: "Add…"))
+        if let remoteMCP {
+            steps.append(
+                Step(
+                    id: .remote, title: "Reach MCP from your other machines",
+                    detail: remoteMCP
+                        ? "Claude Code on your other machines can reach MCP here."
+                        : "Serves MCP on this Mac's Tailscale address too, for Claude Code on your laptop.",
+                    status: remoteMCP ? .done : .todo, action: remoteMCP ? nil : .serveOnTailscale,
+                    actionTitle: "Turn On"))
         }
         steps.append(
             Step(
                 id: .key, title: "Make an API key",
-                detail: "So Claude Code and other MCP clients can start agents here.", done: hasKey))
+                detail: "So Claude Code and other MCP clients can start agents here.",
+                status: hasKey ? .done : .todo, action: hasKey ? nil : .keys, actionTitle: "Make…"))
         return steps
     }
 
+    private var commandStep: Step? {
+        switch install.command {
+        case .notManaged:
+            return nil
+        case .linked:
+            return Step(
+                id: .command, title: "vibe command", detail: "Terminal and ssh find vibe in /usr/local/bin.",
+                status: .done)
+        case .missing:
+            return Step(
+                id: .command, title: "Add the vibe command",
+                detail: "Links vibe into /usr/local/bin, for Terminal and ssh. macOS asks for your password.",
+                status: .todo, action: .linkCommand, actionTitle: "Add…")
+        case .other(let path):
+            return Step(
+                id: .command, title: "Point vibe at this VibeOS",
+                detail: "/usr/local/bin/vibe is another vibe, at \(path).", status: .todo, action: .linkCommand,
+                actionTitle: "Replace…")
+        }
+    }
+
+    private var terminalStep: Step? {
+        guard install.managed else { return nil }
+        switch install.terminal {
+        case .granted:
+            return Step(
+                id: .terminal, title: "Terminal", detail: "Clicking an agent opens Terminal attached to it.",
+                status: .done)
+        case .denied:
+            return Step(
+                id: .terminal, title: "Let VibeOS control Terminal",
+                detail: "It's off in Privacy & Security. Agents still open in Terminal, in a new window each time.",
+                status: .optional, action: .allowTerminal, actionTitle: "Settings…")
+        case .notAsked, .unknown:
+            return Step(
+                id: .terminal, title: "Let VibeOS control Terminal",
+                detail: "So clicking an agent opens, or brings back, the Terminal window attached to it.",
+                status: .todo, action: .allowTerminal, actionTitle: "Allow…")
+        }
+    }
+
+    /// A doctor check as a step: its title, what it found, and the button
+    /// that does something about it.
+    private func step(for check: DoctorCheck) -> Step {
+        let status: Step.Status
+        switch check.state {
+        case .pass: status = .done
+        case .fail: status = .todo
+        case .optional: status = .optional
+        case .working: status = .working(check.progress)
+        }
+        let passed = check.state == .pass
+        let claudeReady = doctor.contains { $0.id == .claude && $0.state == .pass }
+        var step = Step(
+            id: .check(check.id), title: checkTitle(check.id, passed: passed),
+            detail: welcomeDetail(check, claudeReady: claudeReady), status: status)
+        guard !passed, check.state != .working else { return step }
+        switch check.id {
+        case .git:
+            step.action = .installCommandLineTools
+            step.actionTitle = "Install…"
+        case .gh:
+            step.action = ghInstalled ? .terminal("gh auth login") : .open("https://cli.github.com")
+            step.actionTitle = ghInstalled ? "Log In…" : "Get gh"
+        case .ghGit:
+            if check.fixable {
+                step.action = .fix(.ghGit)
+                step.actionTitle = "Set Up"
+            }
+        case .claude:
+            step.action = .open("https://claude.com/claude-code")
+            step.actionTitle = "Get Claude Code"
+        case .claudeLogin:
+            if claudeReady {
+                step.action = .terminal("claude")
+                step.actionTitle = "Sign In…"
+            }
+        case .power:
+            step.action = .terminal("sudo pmset -c sleep 0")
+            step.actionTitle = "Turn Off…"
+        case .tailscale:
+            step.action = .open("https://tailscale.com/download/mac")
+            step.actionTitle = "Get Tailscale"
+        case .linux:
+            if check.fixable {
+                step.action = .fix(.linux)
+                step.actionTitle = "Try Again"
+            }
+        }
+        return step
+    }
+
+    /// What a check says in the welcome: what it found once it passed, or
+    /// while it's under way; otherwise why it matters and what the button
+    /// does, in a line. `vibe doctor`'s hints are for Terminal, and longer.
+    private func welcomeDetail(_ check: DoctorCheck, claudeReady: Bool) -> String {
+        if check.state == .pass || check.state == .working { return check.detail }
+        switch check.id {
+        case .git: return "Agents' worktrees need git, from Apple's Command Line Tools."
+        case .gh:
+            return ghInstalled
+                ? "Log in once, in Terminal, so agents can clone, push and open pull requests."
+                : "GitHub's command line tool, for cloning, pushing and pull requests."
+        case .ghGit:
+            return check.fixable ? "So git pushes with gh's login. One click sets it up." : "Once gh is logged in."
+        case .claude: return "macos agents run your own Claude Code."
+        case .claudeLogin: return claudeReady ? "Sign in once, in Terminal, with /login." : "Once Claude Code is installed."
+        case .power: return "Agents can't answer while this Mac sleeps. Turning it off asks for your password."
+        case .tailscale: return "Lets your other machines reach MCP here."
+        case .linux: return check.detail
+        }
+    }
+
+    /// The welcome's rows: this Mac's checks that passed fold into one, at
+    /// the top; every other step is a row of its own.
+    public var rows: [Row] {
+        let all = steps
+        let passed = all.filter { $0.onThisMac && $0.done }
+        var rows: [Row] = passed.isEmpty ? [] : [.passed(passed)]
+        rows += all.filter { !($0.onThisMac && $0.done) }.map(Row.step)
+        return rows
+    }
+
+    /// The step to do next: the first that's needed and has a button.
+    public var next: Step.ID? {
+        steps.first { $0.status == .todo && $0.action != nil }?.id
+    }
+
+    /// The row this Mac's passed checks fold into: ready, once nothing on
+    /// this Mac still needs the owner.
+    public var passedTitle: String {
+        let all = steps.filter(\.onThisMac)
+        if all.allSatisfy({ !$0.needed }) { return "This Mac is ready" }
+        let n = all.filter(\.done).count
+        return n == 1 ? "1 check passed" : "\(n) checks passed"
+    }
+
     public var done: Int { steps.filter(\.done).count }
-    public var complete: Bool { steps.allSatisfy(\.done) }
+    public var complete: Bool { steps.allSatisfy { !$0.needed } }
+    /// How many of the mark's four windows are lit: a share of the steps
+    /// done, all four only once it's complete.
+    public var lit: Int {
+        if complete { return 4 }
+        let count = max(1, steps.count)
+        return min(3, done * 4 / count)
+    }
+}
+
+/// A doctor check's name, as the welcome lists it: what it is once it
+/// passed, what to do while it hasn't.
+public func checkTitle(_ id: CheckId, passed: Bool) -> String {
+    switch (id, passed) {
+    case (.git, true): "git"
+    case (.git, false): "Install git"
+    case (.gh, true): "GitHub"
+    case (.gh, false): "Log in to GitHub"
+    case (.ghGit, true): "git through gh"
+    case (.ghGit, false): "Let git use gh for GitHub"
+    case (.claude, true): "Claude Code"
+    case (.claude, false): "Install Claude Code"
+    case (.claudeLogin, true): "Claude login"
+    case (.claudeLogin, false): "Sign in to Claude Code"
+    case (.power, true): "Sleep off"
+    case (.power, false): "Keep this Mac awake"
+    case (.tailscale, true): "Tailscale"
+    case (.tailscale, false): "Tailscale"
+    case (.linux, true): "Linux"
+    case (.linux, false): "Download Linux"
+    }
 }
 
 // MARK: The header

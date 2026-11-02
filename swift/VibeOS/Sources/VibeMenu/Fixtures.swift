@@ -13,8 +13,13 @@ public final class FixtureDaemon: DaemonConnection, @unchecked Sendable {
         case busy
         /// Set up, with nothing running.
         case quiet
-        /// A fresh install: no projects, no keys, no Claude login.
+        /// A fresh install on a Mac where gh and claude are already logged
+        /// in: no projects, no keys, no Claude login for linux agents, git
+        /// not yet using gh, a Mac that sleeps, and Linux downloading.
         case firstRun = "first-run"
+        /// A fresh install on a Mac with nothing on it yet: no Command Line
+        /// Tools, no gh, no Claude Code.
+        case freshMac = "fresh-mac"
         /// vibed isn't there.
         case offline
     }
@@ -51,7 +56,7 @@ public final class FixtureDaemon: DaemonConnection, @unchecked Sendable {
     }
 
     private var populated: Bool { scenario == .busy }
-    private var setUp: Bool { scenario != .firstRun }
+    private var setUp: Bool { scenario != .firstRun && scenario != .freshMac }
 
     func answer(_ method: String, host: String, params: [String: Any]) -> [String: Any]? {
         switch method {
@@ -60,7 +65,10 @@ public final class FixtureDaemon: DaemonConnection, @unchecked Sendable {
         case AgentsList.name:
             return ["agents": populated ? agents(on: host) : []]
         case GhStatusGet.name:
+            if scenario == .freshMac { return ["state": "not_installed", "detail": "gh isn't installed"] }
             return ["state": "logged_in", "account": "octocat", "checked_at": time(600)]
+        case DoctorCheckGet.name, DoctorFix.name:
+            return ["checks": doctor]
         case ToolboxStatusGet.name:
             return ["state": "closed", "template": 3, "home": 2, "base": 1, "newest_base": 2]
         case McpGet.name:
@@ -85,7 +93,8 @@ public final class FixtureDaemon: DaemonConnection, @unchecked Sendable {
                 "idle_debounce": 60, "snapshot_disk": 20 << 30,
             ]
         case ToolboxLoginsGet.name:
-            guard setUp else { return ["claude": false] }
+            // No Linux home yet: no logins in it.
+            guard setUp else { return ["claude": false, "logins": [Any]()] }
             return [
                 "home": 2, "claude": true,
                 "logins": [
@@ -120,7 +129,7 @@ public final class FixtureDaemon: DaemonConnection, @unchecked Sendable {
             "version": "0.1.0", "missing": [String](),
         ]
         guard populated else {
-            local["mcp"] = scenario != .firstRun
+            local["mcp"] = setUp
             return [local]
         }
         return [
@@ -240,6 +249,71 @@ public final class FixtureDaemon: DaemonConnection, @unchecked Sendable {
         ]
     }
 
+    /// What vibe doctor finds on this scenario's Mac.
+    var doctor: [[String: Any]] {
+        func check(_ id: CheckId, _ state: CheckState, _ detail: String, hint: String? = nil, fixable: Bool = false)
+            -> [String: Any]
+        {
+            var c: [String: Any] = ["id": id.rawValue, "state": state.rawValue, "detail": detail, "fixable": fixable]
+            if let hint { c["hint"] = hint }
+            return c
+        }
+        let git = check(.git, .pass, "git 2.50.1 is installed.")
+        let gh = check(.gh, .pass, "GitHub's gh is logged in to github.com as octocat.")
+        let claude = check(.claude, .pass, "Claude Code 2.1.314 is at /Users/me/.local/bin/claude.")
+        let login = check(.claudeLogin, .pass, "Claude Code is signed in, with its login in your Keychain.")
+        let tailscale = check(.tailscale, .pass, "Tailscale is up, at 100.101.102.103; Settings can serve MCP there too.")
+        let linux = check(.linux, .pass, "Linux base image 2 and Claude Code 2.1.314 are ready for linux agents.")
+        switch scenario {
+        case .busy, .quiet, .offline:
+            return [
+                git, gh, check(.ghGit, .pass, "git asks gh for GitHub's credentials."), claude, login,
+                check(.power, .pass, "This Mac never sleeps on its own."), tailscale, linux,
+            ]
+        case .firstRun:
+            var downloading = check(.linux, .working, "Downloading the Linux base image.")
+            downloading["progress"] = 40
+            return [
+                git, gh,
+                check(
+                    .ghGit, .fail, "git doesn't ask gh for GitHub's credentials yet.",
+                    hint: "Run `gh auth setup-git` in Terminal.", fixable: true),
+                claude, login,
+                check(
+                    .power, .fail, "This Mac sleeps after 10 minutes idle, and agents stop answering while it sleeps.",
+                    hint: "In System Settings → Energy, turn on Prevent automatic sleeping when the display is off."),
+                tailscale,
+                downloading,
+            ]
+        case .freshMac:
+            return [
+                check(
+                    .git, .fail, "git needs Apple's Command Line Tools, which aren't installed.",
+                    hint: "Install Apple's Command Line Tools: run `xcode-select --install` in Terminal."),
+                check(
+                    .gh, .fail, "GitHub's gh isn't installed.",
+                    hint: "Install gh from cli.github.com (or `brew install gh`), then run `gh auth login` in Terminal."),
+                check(
+                    .ghGit, .fail, "git can use gh for GitHub once gh is logged in.",
+                    hint: "Log gh in first, with `gh auth login`."),
+                check(
+                    .claude, .fail, "claude isn't on your login shell's PATH.",
+                    hint: "Install Claude Code (claude.com/claude-code), then check `claude` runs in Terminal."),
+                check(
+                    .claudeLogin, .fail, "Claude Code can sign in once it's installed.",
+                    hint: "Install Claude Code first."),
+                check(.power, .pass, "This Mac never sleeps on its own."),
+                check(
+                    .tailscale, .optional,
+                    "Tailscale isn't running. It's optional: it lets your other machines reach MCP here.",
+                    hint: "Install Tailscale from tailscale.com and log in, if you want it."),
+                check(
+                    .linux, .fail, "Can't download the Linux base image: the network is unreachable.",
+                    hint: "Check this Mac is online, then try again.", fixable: true),
+            ]
+        }
+    }
+
     var keys: [[String: Any]] {
         [
             ["name": "laptop Claude Code", "prefix": "vk_aaaqeaye", "created_at": time(3 * 86400), "last_used_at": time(240)],
@@ -257,10 +331,28 @@ public final class FixtureTerminal: TerminalScripting {
     public func runWithoutScripting(_ command: String) throws {}
 }
 
+extension InstallStatus {
+    /// Installed from the disk image just now: vibed's LaunchAgent on, vibe
+    /// not linked yet, and macOS yet to ask about Terminal.
+    public static let justInstalled = InstallStatus(
+        location: .applications, service: .enabled, command: .missing, terminal: .notAsked)
+    /// Opened from the disk image, not moved to Applications.
+    public static let fromDiskImage = InstallStatus(
+        location: .notMoved, service: .notManaged, command: .notManaged, terminal: .unknown)
+    /// Installed, with vibed turned off in Login Items.
+    public static let turnedOff = InstallStatus(
+        location: .applications, service: .requiresApproval, command: .linked, terminal: .granted)
+}
+
 extension MenuModel {
-    /// A model on the fixture vibed, read once: what the gallery draws.
-    public static func fixture(_ scenario: FixtureDaemon.Scenario) async -> MenuModel {
-        let model = MenuModel(daemon: FixtureDaemon(scenario), terminal: FixtureTerminal(), endOfTurn: { false })
+    /// A model on the fixture vibed, read once: what the gallery draws. A
+    /// first run is a copy just installed, unless `install` says otherwise.
+    public static func fixture(_ scenario: FixtureDaemon.Scenario, install: InstallStatus? = nil) async -> MenuModel {
+        let firstRun = scenario == .firstRun || scenario == .freshMac
+        let installer = FixedInstaller(install ?? (firstRun ? .justInstalled : .notManaged))
+        let model = MenuModel(
+            daemon: FixtureDaemon(scenario), terminal: FixtureTerminal(), installer: installer, endOfTurn: { false })
+        await model.refreshInstall()
         await model.refresh()
         return model
     }

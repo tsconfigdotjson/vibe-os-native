@@ -60,14 +60,22 @@ struct GalleryModels {
     let busy: MenuModel
     let quiet: MenuModel
     let firstRun: MenuModel
+    let freshMac: MenuModel
     let offline: MenuModel
+    /// Opened from the disk image, and turned off in Login Items: the first
+    /// launch's two ways not to reach vibed.
+    let fromDiskImage: MenuModel
+    let turnedOff: MenuModel
 
     static func load() async -> GalleryModels {
-        let busy = await MenuModel.fixture(.busy)
-        let quiet = await MenuModel.fixture(.quiet)
-        let firstRun = await MenuModel.fixture(.firstRun)
-        let offline = await MenuModel.fixture(.offline)
-        return GalleryModels(busy: busy, quiet: quiet, firstRun: firstRun, offline: offline)
+        GalleryModels(
+            busy: await MenuModel.fixture(.busy),
+            quiet: await MenuModel.fixture(.quiet),
+            firstRun: await MenuModel.fixture(.firstRun),
+            freshMac: await MenuModel.fixture(.freshMac),
+            offline: await MenuModel.fixture(.offline),
+            fromDiskImage: await MenuModel.fixture(.offline, install: .fromDiskImage),
+            turnedOff: await MenuModel.fixture(.offline, install: .turnedOff))
     }
 }
 
@@ -94,6 +102,10 @@ struct GallerySurface {
             GallerySurface(name: "menu", frame: .menu, view: AnyView(MenuView(model: m.busy))),
             GallerySurface(name: "menu-status", frame: .menu, view: AnyView(MenuView(model: m.busy, showFacts: true))),
             GallerySurface(name: "menu-welcome", frame: .menu, view: AnyView(MenuView(model: m.firstRun))),
+            GallerySurface(name: "menu-welcome-fresh", frame: .menu, view: AnyView(MenuView(model: m.freshMac))),
+            GallerySurface(name: "menu-install-move", frame: .menu, view: AnyView(MenuView(model: m.fromDiskImage))),
+            GallerySurface(
+                name: "menu-install-login-items", frame: .menu, view: AnyView(MenuView(model: m.turnedOff))),
             GallerySurface(name: "menu-quiet", frame: .menu, view: AnyView(MenuView(model: m.quiet))),
             GallerySurface(name: "menu-offline", frame: .menu, view: AnyView(MenuView(model: m.offline))),
             GallerySurface(name: "menu-bar", frame: .window("Menu Bar Glyph", nil), view: AnyView(GlyphSheet())),

@@ -37,7 +37,11 @@ struct VibeOSApp: App {
     @StateObject private var menuBar = MenuBarAppearance()
 
     init() {
-        let model = MenuModel(daemon: VibedClient(), terminal: AppleScriptTerminal(), notifier: UserNotifier())
+        let model = MenuModel(
+            daemon: VibedClient(), terminal: AppleScriptTerminal(), notifier: UserNotifier(),
+            installer: SystemInstaller())
+        // Sparkle, in a release build: checks for updates on its own.
+        Updater.shared.start()
         model.start()
         _model = StateObject(wrappedValue: model)
     }

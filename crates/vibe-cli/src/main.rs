@@ -2,6 +2,7 @@
 
 mod attach;
 mod client;
+mod doctor;
 mod key;
 mod mcp;
 mod setup;
@@ -30,6 +31,11 @@ commands:
               the window. From elsewhere: ssh -t <host> vibe attach REF
   ls          list the sessions on this host
   hello       check that vibed is up, and print what it reports
+  doctor      check what agents here need: git, gh's login and git using it,
+              claude and its login, system sleep off, Tailscale (optional),
+              and on a Mac the Linux images; exits 1 if one needs you.
+              --fix has vibed do what it can (gh auth setup-git, the
+              download). VibeOS.app checks its own Terminal permission
   rpc         the vibed socket API on stdin and stdout, one JSON-RPC message per line
   setup-token log linux agents in to Claude: runs `claude setup-token` and keeps
               its long-lived token in the Keychain, for vibed to hand each VM
@@ -87,6 +93,9 @@ enum Command {
     Attach(String),
     Ls,
     Hello,
+    Doctor {
+        fix: bool,
+    },
     Rpc,
     SetupToken,
     Toolbox(toolbox::Command),
@@ -123,6 +132,13 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
             "attach" => Command::Attach(iter.next().ok_or("attach needs a ref")?.clone()),
             "ls" => Command::Ls,
             "hello" => Command::Hello,
+            "doctor" => {
+                let fix = iter.as_slice().first().is_some_and(|w| w == "--fix");
+                if fix {
+                    iter.next();
+                }
+                Command::Doctor { fix }
+            }
             "rpc" => Command::Rpc,
             "setup-token" => Command::SetupToken,
             "toolbox" => {
@@ -267,6 +283,16 @@ fn main() -> ExitCode {
         }
         Command::Ls => ls(&socket),
         Command::Hello => hello(&socket),
+        Command::Doctor { fix } => {
+            return match doctor::run(&socket, fix) {
+                Ok(true) => ExitCode::SUCCESS,
+                Ok(false) => ExitCode::FAILURE,
+                Err(e) => {
+                    eprintln!("vibe: {e}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
         Command::Rpc => rpc(&socket),
         Command::SetupToken | Command::Mcp { .. } => unreachable!("handled above"),
         Command::Key(command) => {
@@ -444,6 +470,21 @@ mod tests {
         assert_eq!(parse(&["hello", "--help"]), Ok(Args::Help));
         assert!(parse(&[]).is_err());
         assert!(parse(&["hello", "rpc"]).is_err());
+        assert_eq!(
+            parse(&["doctor"]),
+            Ok(Args::Run {
+                socket: None,
+                command: Command::Doctor { fix: false }
+            })
+        );
+        assert_eq!(
+            parse(&["doctor", "--fix", "--socket", "/s"]),
+            Ok(Args::Run {
+                socket: Some("/s".into()),
+                command: Command::Doctor { fix: true }
+            })
+        );
+        assert!(parse(&["doctor", "--fxi"]).is_err());
         assert!(parse(&["attach"]).is_err());
         assert_eq!(
             parse(&["setup-token"]),

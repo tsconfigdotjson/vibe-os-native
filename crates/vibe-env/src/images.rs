@@ -462,6 +462,36 @@ impl Images {
         })
     }
 
+    /// How far [`Images::install_base`] has got with base release
+    /// `version`: bytes in hand and bytes in all, by its manifest. `None`
+    /// before the manifest is in, or when nothing is being installed. A
+    /// file counts whole once it has moved on from the download (checked,
+    /// and kept or unpacked).
+    pub fn base_progress(&self, version: u32) -> Option<(u64, u64)> {
+        let scratch = self.dir.join("downloads");
+        let manifest: BaseManifest =
+            serde_json::from_slice(&fs::read(scratch.join(BASE_MANIFEST)).ok()?).ok()?;
+        if manifest.version != version {
+            return None;
+        }
+        let staged = self.dir.join(format!(".base-{version}.partial"));
+        let mut done = 0u64;
+        let mut total = 0u64;
+        for (name, file) in &manifest.files {
+            total += file.size;
+            let kept = match name.as_str() {
+                "base.img.gz" => staged.join(BASE_DISK),
+                other => staged.join(other),
+            };
+            done += match fs::metadata(scratch.join(name)) {
+                Ok(m) => m.len().min(file.size),
+                Err(_) if kept.exists() => file.size,
+                Err(_) => 0,
+            };
+        }
+        (total > 0).then_some((done, total))
+    }
+
     /// Checks `releases` (normally [`CLAUDE_RELEASES`]) for a Claude Code
     /// newer than the newest managed layer, and if there is one, downloads
     /// its [`CLAUDE_PLATFORM`] build, checks it against the release

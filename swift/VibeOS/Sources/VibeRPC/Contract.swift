@@ -56,6 +56,8 @@ public enum VibeRPC {
         ToolboxUpdate.name,
         ToolboxRebuild.name,
         ToolboxLoginsGet.name,
+        DoctorCheckGet.name,
+        DoctorFix.name,
     ]
     /// Every notification vibed sends.
     public static let notifications = [EventNotice.name]
@@ -490,6 +492,24 @@ public enum LoginTool: String, Codable, CaseIterable, Hashable, Sendable {
     case gh, gcloud, git, ssh
 }
 
+/// What `vibe doctor` checks, in the order it reports them: git; `gh`'s
+/// login, and git using `gh` for GitHub; the `claude` macos agents run, and
+/// its login; system sleep off; Tailscale (optional); and on a Mac, the
+/// Linux images.
+public enum CheckId: String, Codable, CaseIterable, Hashable, Sendable {
+    case git, gh
+    case ghGit = "gh_git"
+    case claude
+    case claudeLogin = "claude_login"
+    case power, tailscale, linux
+}
+
+/// How a doctor check went: `pass`; `fail`, which needs the owner;
+/// `optional`, missing but not needed; or `working`, under way.
+public enum CheckState: String, Codable, CaseIterable, Hashable, Sendable {
+    case pass, fail, optional, working
+}
+
 /// Who said a message of an agent's conversation.
 public enum MessageRole: String, Codable, CaseIterable, Hashable, Sendable {
     case user, assistant
@@ -783,6 +803,23 @@ public enum ToolboxLoginsGet: RPCMethod {
     public typealias Params = NoParams
     public typealias Result = ToolboxLogins
     public static let name = "toolbox.logins"
+}
+
+/// `doctor.check`: `vibe doctor`, and the first run's checklist. Runs every
+/// check now, as this host's vibed sees it. Changes nothing.
+public enum DoctorCheckGet: RPCMethod {
+    public typealias Params = NoParams
+    public typealias Result = DoctorReport
+    public static let name = "doctor.check"
+}
+
+/// `doctor.fix`: does what VibeOS can about one check (`gh_git` runs `gh
+/// auth setup-git`; `linux` downloads now), then checks again. Any other is
+/// refused, with what to do.
+public enum DoctorFix: RPCMethod {
+    public typealias Params = DoctorFixParams
+    public typealias Result = DoctorReport
+    public static let name = "doctor.fix"
 }
 
 /// `events.event`: one event, sent to subscribed connections.
@@ -1764,5 +1801,60 @@ public struct Login: Codable, Hashable, Sendable {
 
     public enum CodingKeys: String, CodingKey, CaseIterable {
         case tool, account
+    }
+}
+
+/// What `doctor.check` found, check by check.
+public struct DoctorReport: Codable, Hashable, Sendable {
+    public var checks: [DoctorCheck]
+
+    public init(checks: [DoctorCheck]) {
+        self.checks = checks
+    }
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case checks
+    }
+}
+
+/// One doctor check.
+public struct DoctorCheck: Codable, Hashable, Sendable {
+    public var id: CheckId
+    public var state: CheckState
+    /// What it found, as a sentence.
+    public var detail: String
+    /// Unless it passed, what to do about it, as a sentence.
+    public var hint: String?
+    /// Whether `doctor.fix` can do that.
+    public var fixable: Bool
+    /// While it's `working`, how far along, in percent, when that's known.
+    public var progress: Int?
+
+    public init(
+        id: CheckId, state: CheckState, detail: String, hint: String? = nil, fixable: Bool = false,
+        progress: Int? = nil
+    ) {
+        self.id = id
+        self.state = state
+        self.detail = detail
+        self.hint = hint
+        self.fixable = fixable
+        self.progress = progress
+    }
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case id, state, detail, hint, fixable, progress
+    }
+}
+
+public struct DoctorFixParams: Codable, Hashable, Sendable {
+    public var check: CheckId
+
+    public init(check: CheckId) {
+        self.check = check
+    }
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case check
     }
 }

@@ -21,11 +21,28 @@ truth.
 | `swift/VibeOS` | `VibeOS.app`, the SwiftUI menu bar app, and `VibeRPC`, its socket client |
 | `swift/vibe-vm` | `vibe-vm`, the Virtualization.framework helper |
 | `protocol/` | The socket contract both sides are tested against, `vibe-vm`'s in `protocol/vibe-vm/` and `vibe-guest`'s in `protocol/vibe-guest/`; see the READMEs |
-| `scripts/` | `check-full.sh` runs every check; `sign-macos.sh` signs for local use; `test-guest.sh` builds the test guest; `base-image.sh` builds the Linux base image (with Docker); `vm-reboot-test.sh` checks a saved VM survives a reboot; `host-bundle.sh` builds the Linux `vibed` that Add Linux Host installs |
+| `scripts/` | `check-full.sh` runs every check; `sign-macos.sh` signs for local use; `test-guest.sh` builds the test guest; `base-image.sh` builds the Linux base image (with Docker); `vm-reboot-test.sh` checks a saved VM survives a reboot; `host-bundle.sh` builds the Linux `vibed` that Add Linux Host installs; `release-macos.sh` builds a release DMG; `sparkle.py` signs it for Sparkle and writes the appcast |
 
 Every crate builds on macOS and Linux (x86_64 and arm64); `vibe-guest` and
 `vibe-testguest` do their work only as static `aarch64-unknown-linux-musl`
 binaries in a VM. The Swift packages are macOS 26 only.
+
+## Install
+
+Download `VibeOS-<version>.dmg` from
+[Releases](https://github.com/tsconfigdotjson/vibe-os-native/releases), drag
+VibeOS into Applications, and open it from there. It registers `vibed` as a
+login item (System Settings → General → Login Items lists it under
+VibeOS), and its menu walks through the rest in one list: adding the `vibe`
+command to `/usr/local/bin` (macOS asks for your password), what
+`vibe doctor` checks, letting VibeOS control Terminal, the Linux download,
+Claude's login and the toolbox for Linux agents, a project and an API key.
+It updates itself through Sparkle.
+
+```sh
+vibe doctor          # git, gh and git using it, claude and its login, sleep off, Tailscale, Linux
+vibe doctor --fix    # and what vibed can fix: gh auth setup-git, the Linux download
+```
 
 ## Develop
 
@@ -105,10 +122,39 @@ real server with `VIBE_TEST_LINUX_HOST` set), and external access through it
 it too); real
 VMs booted, saved and restored through `vibe-vm`, the Linux base image, and
 `linux` agents on it: the backend's conformance suite, and real Claude across
-a sleep. It prints a
+a sleep; `vibe doctor` against a live `vibed`; and a release DMG, built ad
+hoc with Sparkle and checked inside and out. It prints a
 PASS/FAIL table and leaves logs in `build/check/`. On Linux the macOS steps
 are skipped. CI runs the same script.
 
 A saved VM must also survive a reboot of the Mac. That takes a reboot, so
 it's two commands around one: `scripts/vm-reboot-test.sh save`, reboot,
 then `scripts/vm-reboot-test.sh restore`.
+
+## Release
+
+Push a tag `vX.Y.Z`, where `X.Y.Z` is the version in `Cargo.toml` and
+`swift/VibeOS/Support/Info.plist` (both of its version keys; check-full.sh
+checks they agree). `.github/workflows/release.yml` runs on version tags
+only. It publishes the Linux base image as release `base-<n>` if that isn't
+out yet, then builds the app with `scripts/release-macos.sh`: signed with
+the Developer ID under the hardened runtime, notarized and stapled, in a
+notarized DMG, with Sparkle and its appcast. It publishes those as release
+`vX.Y.Z`, marked latest, where Sparkle looks for updates. It reads these
+repository Actions secrets:
+
+| Secret | What |
+| --- | --- |
+| `MACOS_CERT_P12`, `MACOS_CERT_PASSWORD` | The Developer ID Application certificate and key, as a base64 `.p12`, and its password |
+| `APPLE_TEAM_ID` | The Developer ID's team |
+| `NOTARY_KEY_ID`, `NOTARY_ISSUER_ID`, `NOTARY_KEY_P8` | An App Store Connect API key for notarization (the `.p8`'s text); or `APPLE_ID` and `APPLE_APP_PASSWORD` instead |
+| `SPARKLE_PRIVATE_KEY` | Sparkle's EdDSA private key, as Sparkle's `generate_keys -x` exports it, or from `scripts/sparkle.py keygen`. The app's public key is derived from it |
+
+Without them, the same script makes an ad hoc signed DMG for trying on this
+Mac:
+
+```sh
+scripts/release-macos.sh               # build/release/out/VibeOS-<version>.dmg
+```
+
+While the repo is private, a Mac without a GitHub login can't download from its Releases: neither the Linux base image `vibed` boots linux agents from, nor Sparkle's updates. Both work once the repo is public. Only a tag on a commit that's on `main` releases.

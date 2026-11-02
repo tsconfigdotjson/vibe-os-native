@@ -189,8 +189,18 @@ import VibeRPC
     }
 
     @Test func vibeAndItsSocket() {
-        #expect(defaultVibePath(environment: [:]) == "/usr/local/bin/vibe")
+        #expect(defaultVibePath(environment: [:], bundled: nil) == "/usr/local/bin/vibe")
         #expect(defaultVibePath(environment: ["VIBE_CLI": "/x/vibe"]) == "/x/vibe")
+        // Until setup links it, the app's own.
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("vibe-path-\(UUID().uuidString)")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let bundled = dir.appendingPathComponent("vibe").path
+        FileManager.default.createFile(atPath: bundled, contents: Data("#!/bin/sh\n".utf8), attributes: [.posixPermissions: 0o755])
+        let missing = dir.appendingPathComponent("not-linked").path
+        #expect(defaultVibePath(environment: [:], linked: missing, bundled: bundled) == bundled)
+        #expect(defaultVibePath(environment: [:], linked: bundled, bundled: "/nowhere/vibe") == bundled)
+        #expect(defaultVibePath(environment: [:], linked: missing, bundled: "/nowhere/vibe") == missing)
         #expect(attachSocket(environment: [:]) == nil)
         #expect(attachSocket(environment: ["VIBE_SOCKET": ""]) == nil)
         #expect(attachSocket(environment: ["VIBE_SOCKET": "/tmp/v.sock"]) == "/tmp/v.sock")

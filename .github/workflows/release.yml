@@ -1,0 +1,197 @@
+# A release of VibeOS (PRD: Auth, security and trust, Distribution), on a
+# version tag only: never on a pull request or a plain push. Push a tag
+# vX.Y.Z, where X.Y.Z is the Cargo workspace's version (and Info.plist's),
+# and this:
+#
+#   1. publishes the Linux base image this version boots, base-<n>, as a
+#      release of its own, if it isn't one already: vibed downloads it from
+#      there at first launch. A base release is never changed once out
+#      (PRD: never change a disk image in place), so a later version that
+#      boots the same one leaves it be
+#   2. builds VibeOS.app for Apple Silicon with scripts/release-macos.sh:
+#      signed with the owner's Developer ID under the hardened runtime,
+#      vibe-vm with com.apple.security.virtualization; notarized and stapled;
+#      in a DMG, notarized and stapled too; with Sparkle, and its appcast
+#   3. publishes the DMG and appcast.xml as release vX.Y.Z, the latest one,
+#      where the app's Sparkle looks for updates
+#
+# It reads these repository Actions secrets, and never prints them:
+#   MACOS_CERT_P12       the Developer ID Application certificate and its
+#                        key, as a base64 .p12
+#   MACOS_CERT_PASSWORD  the .p12's password
+#   APPLE_TEAM_ID        the Developer ID's team
+#   NOTARY_KEY_ID, NOTARY_ISSUER_ID, NOTARY_KEY_P8
+#                        an App Store Connect API key for notarytool (the
+#                        .p8's text); or instead APPLE_ID and
+#                        APPLE_APP_PASSWORD (an app-specific password)
+#   SPARKLE_PRIVATE_KEY  Sparkle's EdDSA private key, base64, as Sparkle's
+#                        generate_keys -x exports it (or scripts/sparkle.py
+#                        keygen makes one): the app's SUPublicEDKey is
+#                        derived from it
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # Only what's on main ships: CI tests every merge there (ci.yml), and a
+  # tag on a commit main never had would put untested code in every
+  # VibeOS through Sparkle.
+  on-main:
+    name: The tag is on main
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: The tagged commit is on main
+        run: |
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "$GITHUB_REF_NAME ($GITHUB_SHA) isn't on main: merge it first, then tag"
+            exit 1
+          fi
+
+  base-image:
+    name: Linux base image
+    needs: on-main
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Which base release this version boots
+        id: base
+        run: |
+          n=$(sed -n 's/^pub const BASE_RELEASE: u32 = \([0-9]*\);$/\1/p' crates/vibe-env/src/images.rs)
+          [ -n "$n" ] || { echo "no BASE_RELEASE in crates/vibe-env/src/images.rs"; exit 1; }
+          echo "n=$n" >> "$GITHUB_OUTPUT"
+          if gh release view "base-$n" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "base-$n is published already"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install the Rust toolchain
+        if: steps.base.outputs.publish == 'true'
+        run: |
+          if ! command -v rustup >/dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          rustup toolchain install
+
+      - name: scripts/base-image.sh
+        if: steps.base.outputs.publish == 'true'
+        env:
+          BASE_RELEASE: ${{ steps.base.outputs.n }}
+        run: scripts/base-image.sh build/base-image
+
+      - name: Publish base-${{ steps.base.outputs.n }}
+        if: steps.base.outputs.publish == 'true'
+        env:
+          N: ${{ steps.base.outputs.n }}
+        run: |
+          gh release create "base-$N" build/base-image/base-$N/* \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --latest=false \
+            --title "Linux base image $N" \
+            --notes "The Linux image every linux agent boots, release $N: an arm64 kernel, its initrd, and a read-only Debian image (scripts/base-image.sh). VibeOS downloads it at first launch and checks each file against base.json. Not an app release."
+
+  macos:
+    name: VibeOS.app
+    needs: base-image
+    runs-on: macos-26
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the Rust toolchain, zig and cargo-zigbuild
+        run: |
+          if ! command -v rustup >/dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          rustup toolchain install
+          brew install zig
+          cargo install cargo-zigbuild --locked
+
+      # The certificate goes into a keychain of this run's own, which goes
+      # with the runner.
+      - name: Import the Developer ID certificate
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          [ -n "$MACOS_CERT_P12" ] || { echo "the MACOS_CERT_P12 secret isn't set"; exit 1; }
+          [ -n "$APPLE_TEAM_ID" ] || { echo "the APPLE_TEAM_ID secret isn't set"; exit 1; }
+          keychain="$RUNNER_TEMP/release.keychain-db"
+          password=$(openssl rand -hex 24)
+          echo "::add-mask::$password"
+          (umask 077; printf '%s' "$MACOS_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12")
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" -P "$MACOS_CERT_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security >/dev/null
+          rm -f "$RUNNER_TEMP/cert.p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          # By its SHA-1, which no other certificate can share; the name
+          # could be another's in the search list.
+          identity=$(security find-identity -v -p codesigning "$keychain" \
+            | sed -n "s/^ *[0-9]*) \([0-9A-F]\{40\}\) \"Developer ID Application: .*($APPLE_TEAM_ID)\"$/\1/p" | head -n 1)
+          [ -n "$identity" ] || { echo "the certificate has no Developer ID Application identity for the team"; exit 1; }
+          echo "MACOS_SIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
+          echo "RELEASE_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+
+      - name: scripts/release-macos.sh
+        env:
+          RELEASE_REQUIRE: "1"
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
+          NOTARY_KEY_P8: ${{ secrets.NOTARY_KEY_P8 }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: scripts/release-macos.sh --tag "$GITHUB_REF_NAME" --out build/release/out
+
+      - name: Publish ${{ github.ref_name }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          # A rerun of a release that got this far replaces its files.
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" build/release/out/* --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --latest
+          else
+            gh release create "$GITHUB_REF_NAME" build/release/out/* \
+              --repo "$GITHUB_REPOSITORY" --verify-tag --latest \
+              --title "VibeOS $version" \
+              --notes "Drag VibeOS into Applications and open it: it starts vibed, and its welcome walks through the rest. Signed with a Developer ID and notarized. VibeOS already installed updates itself, through Sparkle."
+          fi
+
+      - name: Remove the keychain
+        if: always()
+        run: |
+          if [ -n "${RELEASE_KEYCHAIN:-}" ]; then security delete-keychain "$RELEASE_KEYCHAIN" || true; fi

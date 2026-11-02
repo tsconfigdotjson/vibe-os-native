@@ -284,11 +284,10 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
                 )));
                 let backend = LinuxVm::new(config.layout.clone(), vibe_vm);
                 config.backends = config.backends.with(Environment::Linux, Arc::new(backend));
-                images = Some(vibed::linux::spawn(
-                    config.layout.clone(),
-                    vibed::linux::Sources::from_env(),
-                    vibed::linux::CHECK_EVERY,
-                ));
+                let watch =
+                    vibed::linux::Watch::new(&config.layout, vibed::linux::Sources::from_env());
+                config.linux_images = Some(Arc::clone(&watch));
+                images = Some(vibed::linux::spawn(watch, vibed::linux::CHECK_EVERY));
             }
             None => vibed::log!(
                 "vibed: no vibe-vm beside vibed, nor in VIBE_VM, so linux agents can't start"

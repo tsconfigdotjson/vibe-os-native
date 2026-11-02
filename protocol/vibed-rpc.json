@@ -48,7 +48,9 @@
     { "name": "toolbox.open", "params": "NoParams", "result": "SessionAttach" },
     { "name": "toolbox.update", "params": "NoParams", "result": "ToolboxRun" },
     { "name": "toolbox.rebuild", "params": "NoParams", "result": "ToolboxRun" },
-    { "name": "toolbox.logins", "params": "NoParams", "result": "ToolboxLogins" }
+    { "name": "toolbox.logins", "params": "NoParams", "result": "ToolboxLogins" },
+    { "name": "doctor.check", "params": "NoParams", "result": "DoctorReport" },
+    { "name": "doctor.fix", "params": "DoctorFixParams", "result": "DoctorReport" }
   ],
   "notifications": [
     { "name": "events.event", "params": "Event" }
@@ -86,6 +88,8 @@
     "ToolboxState": ["unavailable", "closed", "open", "saving", "updating", "rebuilding"],
     "ToolboxAction": ["shell", "update", "rebuild"],
     "LoginTool": ["gh", "gcloud", "git", "ssh"],
+    "CheckId": ["git", "gh", "gh_git", "claude", "claude_login", "power", "tailscale", "linux"],
+    "CheckState": ["pass", "fail", "optional", "working"],
     "MessageRole": ["user", "assistant", "tool"]
   },
   "types": {
@@ -138,6 +142,9 @@
     "ToolboxRun": ["action", "at", "template", "uncovered", "error"],
     "ToolboxLogins": ["home", "logins", "claude", "claude_problem"],
     "Login": ["tool", "account"],
+    "DoctorReport": ["checks"],
+    "DoctorCheck": ["id", "state", "detail", "hint", "fixable", "progress"],
+    "DoctorFixParams": ["check"],
     "HostAddParams": ["name", "address"],
     "HostNameParams": ["host"],
     "HostInstall": ["host", "changed", "notes"],
@@ -204,6 +211,9 @@
     "ToolboxRun": ["template", "error"],
     "ToolboxLogins": ["home", "logins", "claude_problem"],
     "Login": [],
+    "DoctorReport": [],
+    "DoctorCheck": ["hint", "progress"],
+    "DoctorFixParams": [],
     "HostAddParams": [],
     "HostNameParams": [],
     "HostInstall": [],
@@ -236,6 +246,7 @@
     "AgentList": { "agents": "Agent" },
     "ToolboxStatus": { "last": "ToolboxRun" },
     "ToolboxLogins": { "logins": "Login" },
+    "DoctorReport": { "checks": "DoctorCheck" },
     "HostInstall": { "host": "HostInfo" },
     "KeySyncParams": { "keys": "KeyHash" },
     "MessageList": { "messages": "Message" }
