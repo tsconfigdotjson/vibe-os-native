@@ -106,7 +106,15 @@
 #   - both Swift packages (swift/VibeOS, swift/vibe-vm): build and test,
 #     including the Swift half of the Rust<->Swift contract test, and the
 #     menu's model, Terminal attach and notifications against stand-ins
-#   - ad hoc signing, with the virtualization entitlement on vibe-vm
+#   - the app icon (scripts/app-icon.py): every size of the iconset, drawn
+#     with python3's standard library, as PNGs of the right size
+#   - ad hoc signing, with the virtualization entitlement on vibe-vm, and
+#     the app icon in the bundle
+#   - every surface of the app (the menu in each state, the menu bar glyph,
+#     Settings' panes, the sheets) drawn on canned data in light and dark
+#     by `VibeOS --render-surfaces`: none blank, each different in dark, and
+#     kept in build/check/surfaces/ for a look. scripts/surfaces.sh takes
+#     the same as real screenshots, materials and all
 #   - vibe-vm check, signed and unsigned
 #   - the test guests (scripts/test-guest.sh): Alpine's netboot kernel, and
 #     initrds with vibe-testguest or vibe-guest as PID 1
@@ -809,7 +817,48 @@ s_swift_vm_build() { swift build --package-path swift/vibe-vm; }
 
 s_swift_vm_test() { swift test --package-path swift/vibe-vm; }
 
-s_sign() { scripts/sign-macos.sh; }
+s_sign() {
+  scripts/sign-macos.sh
+  [ -s build/VibeOS.app/Contents/Resources/AppIcon.icns ] || { echo "the app has no icon"; return 1; }
+}
+
+# The app icon, every size iconutil wants, at its size. The script is only
+# python3's standard library, so this runs on Linux too.
+s_app_icon() {
+  local set="$WORK/AppIcon.iconset" name size got
+  python3 scripts/app-icon.py "$set"
+  for name in 16x16:16 16x16@2x:32 32x32:32 32x32@2x:64 128x128:128 128x128@2x:256 \
+    256x256:256 256x256@2x:512 512x512:512 512x512@2x:1024; do
+    size=${name#*:}
+    name=icon_${name%:*}.png
+    [ -s "$set/$name" ] || { echo "no $name"; return 1; }
+    got=$(python3 -c 'import struct,sys; d=open(sys.argv[1],"rb").read(24); print(*struct.unpack(">II", d[16:24]))' "$set/$name")
+    [ "$got" = "$size $size" ] || { echo "$name is $got, not $size $size"; return 1; }
+  done
+  echo "the iconset is complete"
+}
+
+# Every surface, drawn offscreen on canned data in light and dark. The app
+# exits non-zero if one comes out blank; each must differ in dark.
+s_surfaces() {
+  local out="$LOGS/surfaces" app="$ROOT/build/VibeOS.app/Contents/MacOS/VibeOS" name look n=0
+  rm -rf "$out"
+  "$app" --render-surfaces "$out" || { echo "a surface didn't draw"; return 1; }
+  [ -s "$out/manifest.txt" ] || { echo "no manifest"; return 1; }
+  for name in menu menu-status menu-welcome menu-quiet menu-offline menu-bar new-agent new-agent-empty add-host \
+    add-host-done logins logins-first-run settings-projects settings-keys settings-hosts settings-limits \
+    settings-general settings-project settings-projects-first-run new-key new-key-made external-address; do
+    for look in light dark; do
+      [ -s "$out/$name-$look.png" ] || { echo "no $name-$look.png"; return 1; }
+    done
+    if cmp -s "$out/$name-light.png" "$out/$name-dark.png"; then
+      echo "$name looks the same in light and dark"
+      return 1
+    fi
+    n=$((n + 1))
+  done
+  echo "$n surfaces drew in light and dark, in build/check/surfaces/"
+}
 
 s_vm_check() {
   local unsigned out rc=0 in_vm
@@ -1158,7 +1207,9 @@ mac_step swift-app-build "swift build swift/VibeOS" s_swift_app_build
 mac_step swift-app-test "swift test swift/VibeOS (Swift contract tests)" s_swift_app_test swift-app-build
 mac_step swift-vm-build "swift build swift/vibe-vm" s_swift_vm_build
 mac_step swift-vm-test "swift test swift/vibe-vm" s_swift_vm_test swift-vm-build
+step app-icon "the app icon: every iconset size, drawn by scripts/app-icon.py" s_app_icon
 mac_step sign "ad hoc signing; vibe-vm gets the virtualization entitlement" s_sign swift-app-build swift-vm-build
+mac_step surfaces "every surface draws on canned data, in light and dark" s_surfaces sign
 mac_step vm-check "vibe-vm check, signed and unsigned" s_vm_check sign
 mac_step vm-cycle "VMs boot, save and restore; vibe-guest's question survives" s_vm_cycle build sign test-guest
 mac_step base-image "the Linux base image: kernel, initrd, Debian image" s_base_image

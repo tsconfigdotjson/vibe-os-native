@@ -201,7 +201,9 @@ public struct MemoryGauge: Equatable, Sendable {
 public func rowLines(_ agent: Agent, timeZone: TimeZone = .current) -> (title: String?, line: String?) {
     let status = agent.status
     var line = status.line
-    if status.stopReason == .usageLimit {
+    if agent.state == .paused, let gauge = MemoryGauge(agent), gauge.fraction >= 0.995 {
+        line = "Paused at its \(formatBytes(agent.memory)) memory limit"
+    } else if status.stopReason == .usageLimit {
         if let resets = status.resetsAt.flatMap(parseTime) {
             var style = Date.FormatStyle(date: .omitted, time: .shortened)
             style.timeZone = timeZone
@@ -279,6 +281,16 @@ public func toolName(_ tool: LoginTool) -> String {
     }
 }
 
+/// A login's tool, as an SF Symbol.
+public func toolSymbol(_ tool: LoginTool) -> String {
+    switch tool {
+    case .gh: "chevron.left.forwardslash.chevron.right"
+    case .gcloud: "cloud"
+    case .git: "person.text.rectangle"
+    case .ssh: "key"
+    }
+}
+
 /// What See Logins says (PRD: Menu bar, Footer; Core concepts, Linux
 /// home): what every new linux agent starts logged in to, or plainly that
 /// there's nothing yet, or that it isn't known, and Claude's login.
@@ -286,40 +298,42 @@ public struct LoginsSummary: Equatable, Sendable {
     public struct Row: Equatable, Sendable, Identifiable {
         public var tool: String
         public var account: String
+        /// An SF Symbol for the tool.
+        public var symbol: String
         public var id: String { tool + "\u{0}" + account }
     }
 
     public var headline: String
     public var rows: [Row]
+    /// Claude's login for linux agents, as a sentence.
     public var claude: String
     /// Whether linux agents still need the Claude login.
     public var needsClaude: Bool
 
     public init(_ logins: ToolboxLogins) {
-        rows = (logins.logins ?? []).map { Row(tool: toolName($0.tool), account: $0.account) }
+        rows = (logins.logins ?? []).map {
+            Row(tool: toolName($0.tool), account: $0.account, symbol: toolSymbol($0.tool))
+        }
         switch (logins.home, logins.logins) {
         case (nil, _):
-            headline = "There's no Linux home yet. Open the toolbox shell and log in to what your linux "
-                + "agents need, such as gh auth login. Exiting the shell saves it."
+            headline = "There's no Linux home yet. Open the toolbox shell, log in to what your Linux agents "
+                + "need (gh auth login, say), and exit to save it."
         case (let home?, nil):
-            headline = "VibeOS couldn't tell which logins Linux home \(home) holds when it was saved "
-                + "(the look failed, or an older VibeOS saved it). Open the toolbox shell and exit it, "
-                + "and they'll show here."
+            headline = "VibeOS couldn't tell which logins Linux home \(home) holds: the check failed, or an "
+                + "older VibeOS saved it. Open the toolbox shell and exit it, and they'll show here."
         case (let home?, let found?) where found.isEmpty:
-            headline = "VibeOS found no gh, gcloud, git or SSH logins in Linux home \(home). Open the "
-                + "toolbox shell and log in there (gh auth login, gcloud auth login, "
-                + "git config --global user.name …). Exiting the shell saves them."
+            headline = "No gh, gcloud, git or SSH logins in Linux home \(home) yet. Log in from the toolbox "
+                + "shell (gh auth login, gcloud auth login, git config --global user.name …), then exit to save."
         case (let home?, _):
-            headline = "Every new linux agent starts with what Linux home \(home) holds. "
-                + "Its gh, gcloud, git and SSH logins:"
+            headline = "Every new Linux agent starts with these logins, from Linux home \(home)."
         }
         needsClaude = !logins.claude
         if logins.claude {
-            claude = "Claude: linux agents are logged in."
+            claude = "Linux agents are logged in."
         } else if let why = logins.claudeProblem {
-            claude = "Claude: \(why)"
+            claude = sentence(why)
         } else {
-            claude = "Claude: linux agents aren't logged in yet."
+            claude = "Linux agents aren't logged in yet."
         }
     }
 }
@@ -402,4 +416,341 @@ public func normalizedDomain(_ text: String) -> String? {
     // An IPv4 address's last part is all digits; a name's never is.
     if let last = labels.last, last.allSatisfy(\.isNumber) { return nil }
     return name
+}
+
+// MARK: Rows, in words and symbols
+
+extension AgentState {
+    /// The state in a word or two, for people and VoiceOver.
+    public var spoken: String {
+        switch self {
+        case .busy: "working"
+        case .idle: "idle"
+        case .question: "has a question"
+        case .asleep: "asleep"
+        case .paused: "paused by a limit"
+        case .exited: "exited"
+        }
+    }
+}
+
+/// The SF Symbol before a row's activity line: what the agent is doing, or
+/// why it isn't. Nil when there's nothing to say.
+public func activitySymbol(_ agent: Agent) -> String? {
+    switch agent.state {
+    case .asleep: return "moon.zzz"
+    case .paused: return "pause.circle"
+    case .exited: return "stop.circle"
+    case .busy, .idle, .question: break
+    }
+    if agent.status.stopReason == .usageLimit { return "hourglass" }
+    switch agent.status.activity {
+    case .thinking: return "sparkle"
+    case .runningTool: return "terminal"
+    case .backgroundWork: return "gearshape.2"
+    case .awaitingAnswer: return "questionmark.bubble"
+    case .awaitingApproval: return "hand.raised"
+    case .done: return "checkmark"
+    case .interrupted: return "pause"
+    case .errored: return "exclamationmark.triangle"
+    case .unknown: return nil
+    }
+}
+
+// The app's one voice for vibed's values: display names, as a person
+// writes them, never the wire's lowercase. Profile names are the owner's
+// own and are shown as typed.
+
+extension AgentEnvironment {
+    /// `Linux`, `macOS`.
+    public var title: String {
+        switch self {
+        case .linux: "Linux"
+        case .macos: "macOS"
+        }
+    }
+}
+
+extension ClaudeModel {
+    public var title: String {
+        switch self {
+        case .opus: "Opus"
+        case .sonnet: "Sonnet"
+        }
+    }
+}
+
+extension ReasoningLevel {
+    public var title: String {
+        switch self {
+        case .low: "Low"
+        case .medium: "Medium"
+        case .high: "High"
+        case .xhigh: "Extra High"
+        case .max: "Max"
+        }
+    }
+}
+
+extension PermissionMode {
+    public var title: String {
+        switch self {
+        case .auto: "Auto"
+        case .bypass: "Bypass"
+        }
+    }
+}
+
+/// A profile's settings in a line, in the app's voice: `Linux · Opus · High
+/// · Auto · 4G`.
+public func profileSummary(_ profile: Profile) -> String {
+    [
+        profile.environment.title, profile.model.title, profile.reasoning.title, profile.mode.title,
+        formatBytes(profile.memory),
+    ].joined(separator: " · ")
+}
+
+/// The SF Symbol for an environment: a compartment, or this Mac.
+public func environmentSymbol(_ environment: AgentEnvironment) -> String {
+    switch environment {
+    case .linux: "cube"
+    case .macos: "laptopcomputer"
+    }
+}
+
+/// A duration spelled out, for VoiceOver: `2 hours 5 minutes`.
+public func spokenElapsed(_ seconds: TimeInterval) -> String {
+    let s = max(0, Int(seconds))
+    func unit(_ n: Int, _ word: String) -> String { n == 1 ? "1 \(word)" : "\(n) \(word)s" }
+    if s < 60 { return unit(s, "second") }
+    let m = s / 60
+    if m < 60 { return unit(m, "minute") }
+    let h = m / 60
+    if h < 24 { return m % 60 == 0 ? unit(h, "hour") : "\(unit(h, "hour")) \(unit(m % 60, "minute"))" }
+    let d = h / 24
+    return h % 24 == 0 ? unit(d, "day") : "\(unit(d, "day")) \(unit(h % 24, "hour"))"
+}
+
+/// Everything a row shows, in one sentence, for VoiceOver.
+public func rowAccessibilityLabel(_ agent: Agent, now: Date, unavailable: Bool = false) -> String {
+    let lines = rowLines(agent)
+    var parts = [agent.ref, unavailable ? "unavailable, \(agent.host) can't be reached" : agent.state.spoken]
+    if let title = lines.title { parts.append(title) }
+    if let line = lines.line { parts.append(line) }
+    parts.append(agent.profile)
+    if let started = parseTime(agent.createdAt) {
+        parts.append("started \(spokenElapsed(now.timeIntervalSince(started))) ago")
+    }
+    if let gauge = MemoryGauge(agent) {
+        parts.append("memory \(gauge.label.replacingOccurrences(of: " / ", with: " of "))")
+    }
+    return parts.joined(separator: ", ")
+}
+
+/// The header's count: `5 agents · 3 awake`, or `No agents`.
+public func agentSummary(_ agents: [Agent]) -> String {
+    guard !agents.isEmpty else { return "No agents" }
+    let awake = agents.filter { $0.state.isAwake }.count
+    return "\(agents.count == 1 ? "1 agent" : "\(agents.count) agents") · \(awake) awake"
+}
+
+/// A clause from vibed (`can't reach…`), capitalised to stand on its own as
+/// a sentence. One that starts with a command's name (`ssh: connect…`,
+/// `gh auth …`) is left as it is: the name is spelt that way.
+public func sentence(_ text: String) -> String {
+    guard let first = text.first else { return text }
+    let word = text.prefix { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" }
+    if commandNames.contains(String(word)) { return text }
+    return first.uppercased() + text.dropFirst()
+}
+
+/// Commands whose names a sentence may start with, in lowercase.
+let commandNames: Set<String> = [
+    "ssh", "scp", "gh", "git", "gcloud", "claude", "vibe", "vibed", "vibe-shim", "vibe-vm", "systemctl", "sudo",
+    "apt", "npm",
+]
+
+// MARK: First run
+
+/// How far the owner is through setting up (PRD: Key user flows, Install
+/// and setup): a project, the Claude login linux agents need, and an API
+/// key for MCP clients. The menu shows it as a welcome until agents exist.
+public struct SetupProgress: Equatable, Sendable {
+    public struct Step: Equatable, Sendable, Identifiable {
+        public enum ID: String, Sendable {
+            case project, claude, key
+        }
+
+        public var id: ID
+        public var title: String
+        public var detail: String
+        public var done: Bool
+    }
+
+    public var hasProject: Bool
+    public var hasKey: Bool
+    /// Whether linux agents can log in to Claude; nil where there are none,
+    /// as on a host with no Linux toolbox.
+    public var linuxClaude: Bool?
+
+    public init(hasProject: Bool, hasKey: Bool, linuxClaude: Bool?) {
+        self.hasProject = hasProject
+        self.hasKey = hasKey
+        self.linuxClaude = linuxClaude
+    }
+
+    public var steps: [Step] {
+        var steps = [
+            Step(
+                id: .project, title: "Add a project",
+                detail: "A GitHub repo or a folder on this Mac. It comes with two profiles, ready to use.",
+                done: hasProject)
+        ]
+        if let linuxClaude {
+            steps.append(
+                Step(
+                    id: .claude, title: "Log in to Claude for Linux agents",
+                    detail: "One browser sign-in. The token stays in your Keychain.", done: linuxClaude))
+        }
+        steps.append(
+            Step(
+                id: .key, title: "Make an API key",
+                detail: "So Claude Code and other MCP clients can start agents here.", done: hasKey))
+        return steps
+    }
+
+    public var done: Int { steps.filter(\.done).count }
+    public var complete: Bool { steps.allSatisfy(\.done) }
+}
+
+// MARK: The header
+
+/// How loud a part of the header is: quiet when all is well, in colour
+/// only when something isn't.
+public enum StatusTone: Equatable, Sendable {
+    case normal, attention, trouble
+}
+
+/// Something in the header that needs the owner: a host that's down, a
+/// `gh` login missing, an external address outside clients can't reach.
+/// Each gets a row of its own.
+public struct HeaderAlert: Equatable, Sendable, Identifiable {
+    public var id: String
+    /// An SF Symbol.
+    public var symbol: String
+    /// The host it's about, if any: shown as a name, in monospace, as
+    /// agents' refs are, so `box is down` doesn't read as a typo.
+    public var name: String?
+    /// The rest of the headline, after the name.
+    public var headline: String
+    /// The whole headline, for VoiceOver.
+    public var title: String { name.map { "\($0) \(headline)" } ?? headline }
+    /// What it means, plainly.
+    public var detail: String
+    /// The technical reason, for a tooltip.
+    public var reason: String?
+    public var tone: StatusTone
+}
+
+/// A steady fact about the hosts: the Mac's memory, `gh`, MCP, each Linux
+/// host's link and external address. They show together, on request, under
+/// the header.
+public struct HeaderFact: Equatable, Sendable, Identifiable {
+    /// `memory`, `gh`, `mcp`, or `host:<name>`: a host may be named anything.
+    public var id: String
+    public var label: String
+    public var value: String
+    public var symbol: String
+    public var tone: StatusTone
+}
+
+/// What needs the owner, worst first (PRD: Menu bar, Header).
+public func headerAlerts(gh: GhStatus?, hosts: [HostInfo]) -> [HeaderAlert] {
+    var alerts: [HeaderAlert] = []
+    for host in hosts where host.link == .down {
+        alerts.append(
+            HeaderAlert(
+                id: "host:\(host.name)", symbol: "exclamationmark.triangle.fill", name: host.name, headline: "is down",
+                detail: "Its agents keep running. VibeOS reconnects on its own.",
+                reason: host.detail.map(sentence), tone: .trouble))
+    }
+    for host in hosts where host.link == .connected {
+        guard let external = externalStatus(host), external.tone == .trouble else { continue }
+        alerts.append(
+            HeaderAlert(
+                id: "external:\(host.name)", symbol: "globe", name: host.name,
+                headline: "isn't reachable from outside",
+                detail: external.summary, reason: external.detail.map(sentence), tone: .attention))
+    }
+    let ghAlert: (String, String)?
+    switch gh?.state {
+    case .loggedOut?: ghAlert = ("GitHub CLI is logged out", "Agents on this Mac push with it. Run gh auth login.")
+    case .notInstalled?: ghAlert = ("GitHub CLI isn't installed", "Agents on this Mac push with it. Install gh.")
+    case .error?: ghAlert = ("Can't check the GitHub login", "gh auth status didn't answer.")
+    case .loggedIn?, .unknown?, nil: ghAlert = nil
+    }
+    if let ghAlert {
+        alerts.append(
+            HeaderAlert(
+                id: "gh", symbol: "person.crop.circle.badge.exclamationmark", headline: ghAlert.0, detail: ghAlert.1,
+                reason: gh?.detail, tone: .attention))
+    }
+    return alerts
+}
+
+/// Every steady fact the header can show, in order: memory, `gh`, MCP, then
+/// each Linux host.
+public func headerFacts(memory: HostMemory?, gh: GhStatus?, mcp: Bool, hosts: [HostInfo]) -> [HeaderFact] {
+    var facts: [HeaderFact] = []
+    if let memory {
+        facts.append(
+            HeaderFact(
+                id: "memory", label: "Memory", value: "\(formatBytes(memory.used)) of \(formatBytes(memory.total))",
+                symbol: "memorychip", tone: .normal))
+    }
+    let gitHub: (String, StatusTone)
+    switch gh?.state {
+    case .loggedIn?: gitHub = (gh?.account ?? "Logged in", .normal)
+    case .loggedOut?: gitHub = ("Logged out", .attention)
+    case .notInstalled?: gitHub = ("Not installed", .attention)
+    case .error?: gitHub = ("Can't check", .attention)
+    case .unknown?, nil: gitHub = ("Checking…", .normal)
+    }
+    facts.append(HeaderFact(id: "gh", label: "GitHub", value: gitHub.0, symbol: "person.crop.circle", tone: gitHub.1))
+    facts.append(HeaderFact(id: "mcp", label: "MCP", value: mcp ? "On" : "Off", symbol: "network", tone: .normal))
+    for host in hosts where host.link != .local {
+        var value = host.link == .down ? "Down" : "Connected"
+        var tone: StatusTone = host.link == .down ? .trouble : .normal
+        if let external = externalStatus(host) {
+            value += ", \(external.short)"
+            if tone == .normal, external.tone == .trouble { tone = .attention }
+        }
+        facts.append(
+            HeaderFact(id: "host:\(host.name)", label: host.name, value: value, symbol: "server.rack", tone: tone))
+    }
+    return facts
+}
+
+// MARK: Memory in a row
+
+/// What a row says about memory, beyond its quiet bar: only something
+/// notable. Near the limit, how near; at it, that it's at it, as a state.
+/// Paused there, the status line already says so: the bar just turns red,
+/// with no words of its own.
+public struct MemoryNote: Equatable, Sendable {
+    /// The badge's words; nil when the status line says it.
+    public var text: String?
+    public var tone: StatusTone
+}
+
+public func memoryNote(_ agent: Agent) -> MemoryNote? {
+    guard let gauge = MemoryGauge(agent) else { return nil }
+    if gauge.fraction >= 0.995 {
+        if agent.state == .paused { return MemoryNote(text: nil, tone: .trouble) }
+        return MemoryNote(text: "At its memory limit", tone: .attention)
+    }
+    if gauge.fraction >= 0.8 {
+        return MemoryNote(text: gauge.label.replacingOccurrences(of: " / ", with: " of "), tone: .attention)
+    }
+    return nil
 }

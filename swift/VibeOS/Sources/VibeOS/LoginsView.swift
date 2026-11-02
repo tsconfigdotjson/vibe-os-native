@@ -9,59 +9,73 @@ import VibeRPC
 /// boots nothing.
 struct LoginsView: View {
     @ObservedObject var model: MenuModel
+    @Environment(\.dismissWindow) private var dismissWindow
     @State private var logins: ToolboxLogins?
     @State private var error: String?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("Linux agents use the logins and dotfiles you set up once in the Linux toolbox. "
-                + "Secrets stay in the Linux home: this shows only which logins are there, and whose. "
-                + "Anything else you set up there, such as ~/.aws or ~/.npmrc, reaches agents too.")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-            if let logins {
-                let summary = LoginsSummary(logins)
-                Text(summary.headline).fixedSize(horizontal: false, vertical: true)
-                if !summary.rows.isEmpty {
-                    Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 6) {
+        VStack(spacing: 0) {
+            Form {
+                if let logins {
+                    let summary = LoginsSummary(logins)
+                    Section {
                         ForEach(summary.rows) { row in
-                            GridRow {
-                                Text(row.tool).foregroundStyle(.secondary)
-                                Text(row.account).textSelection(.enabled)
+                            LabeledContent {
+                                Text(row.account).textSelection(.enabled).lineLimit(1).truncationMode(.middle)
+                            } label: {
+                                Label(row.tool, systemImage: row.symbol)
+                            }
+                        }
+                        if model.toolbox?.state == .open {
+                            Label("The toolbox shell is open. What you log in to there shows here once you exit it.",
+                                systemImage: "terminal")
+                                .foregroundStyle(.secondary)
+                        }
+                    } header: {
+                        Text(logins.home.map { "Linux home v\($0)" } ?? "Linux home")
+                    } footer: {
+                        Text(summary.headline).foregroundStyle(.secondary)
+                    }
+                    Section("Claude") {
+                        HStack(spacing: 8) {
+                            Image(systemName: summary.needsClaude ? "exclamationmark.circle.fill" : "checkmark.circle.fill")
+                                .foregroundStyle(summary.needsClaude ? Palette.attention : Palette.signal)
+                                .accessibilityHidden(true)
+                            Text(summary.claude).fixedSize(horizontal: false, vertical: true)
+                            Spacer()
+                            if summary.needsClaude {
+                                Button("Log In…") { model.runInTerminal(["setup-token"], exec: true) }
+                                    .help("Runs vibe setup-token in Terminal: one browser sign-in, kept in your Keychain")
                             }
                         }
                     }
-                    .padding(.leading, 8)
+                } else if error == nil {
+                    ProgressView().frame(maxWidth: .infinity)
                 }
-                if model.toolbox?.state == .open {
-                    Text("The toolbox shell is open now: what you log in to there shows here once you exit it.")
-                        .font(.callout)
+                // A failed read shows, over the last logins read, if any.
+                if let error {
+                    Section { ErrorText(error: error) }
+                }
+                Section {
+                } footer: {
+                    Text("Linux agents use the logins and dotfiles you set up once in the toolbox shell. Secrets stay "
+                        + "in the Linux home; this shows only which logins are there, and whose. Anything else you set "
+                        + "up there, such as ~/.aws or ~/.npmrc, reaches agents too.")
                         .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
                 }
-                Divider()
-                HStack {
-                    Text(summary.claude)
-                    if summary.needsClaude {
-                        Button("Log In to Claude for Linux Agents…") {
-                            model.runInTerminal(["setup-token"], exec: true)
-                        }
-                    }
-                }
-            } else if error == nil {
-                ProgressView().controlSize(.small)
             }
-            ErrorText(error: error)
+            .formStyle(.grouped)
+            Divider()
             HStack {
                 Button("Open Shell") { Task { await model.openToolbox() } }
                     .disabled(!model.toolboxCanOpen)
                 Spacer()
                 Button("Refresh") { Task { await load() } }
             }
+            .padding(14)
         }
-        .padding()
-        .frame(width: 460)
+        .frame(width: 480, height: 440)
+        .onExitCommand { dismissWindow(id: WindowID.logins) }
         // Again after each toolbox change, as a save notes a new home's,
         // and on coming back to the app, as from `vibe setup-token`.
         .task(id: model.toolbox) { await load() }

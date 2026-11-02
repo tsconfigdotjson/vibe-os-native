@@ -28,10 +28,20 @@ mkdir -p "$APP/Contents/MacOS"
 cp swift/VibeOS/Support/Info.plist "$APP/Contents/Info.plist"
 plutil -lint "$APP/Contents/Info.plist"
 cp "$app_bin" "$APP/Contents/MacOS/VibeOS"
+# The app icon, "Night Shift": scripts/app-icon.py draws it with nothing but
+# python3's standard library, and iconutil makes the .icns. It's drawn again
+# only when the script changes.
+icns="$OUT/AppIcon.icns"
+if [ ! -s "$icns" ] || [ scripts/app-icon.py -nt "$icns" ]; then
+  rm -rf "$OUT/AppIcon.iconset"
+  python3 scripts/app-icon.py "$OUT/AppIcon.iconset"
+  iconutil -c icns "$OUT/AppIcon.iconset" -o "$icns"
+fi
+mkdir -p "$APP/Contents/Resources"
+cp "$icns" "$APP/Contents/Resources/AppIcon.icns"
 # The Linux builds Add Linux Host installs, when scripts/host-bundle.sh has
 # made them.
 if [ -d "$OUT/host-bundle" ]; then
-  mkdir -p "$APP/Contents/Resources"
   cp -R "$OUT/host-bundle" "$APP/Contents/Resources/linux"
 fi
 codesign --force --sign - --timestamp=none "$APP"
