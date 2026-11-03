@@ -117,6 +117,9 @@ import VibeRPC
         #expect(activitySymbol(try agent("a", state: .busy, activity: .runningTool)) == "terminal")
         #expect(activitySymbol(try agent("a", state: .question, activity: .awaitingAnswer)) == "questionmark.bubble")
         #expect(activitySymbol(try agent("a", state: .question, activity: .awaitingApproval)) == "hand.raised")
+        // A long silent tool run agent-tail guesses is a prompt, before vibed
+        // confirms it: still at work, no hand.
+        #expect(activitySymbol(try agent("a", state: .busy, activity: .awaitingApproval)) == "terminal")
         #expect(activitySymbol(try agent("a", state: .idle, activity: .done)) == "checkmark")
         #expect(activitySymbol(try agent("a", state: .idle, activity: .unknown)) == nil)
         // Why it isn't working comes first.
@@ -198,27 +201,31 @@ typealias StepStatus = SetupProgress.Step.Status
     }
 
     @Test func aFreshMacHasThreeStepsToGo() {
-        let fresh = SetupProgress(hasProject: false, hasKey: false, linuxClaude: false)
-        let freshIDs: [StepID] = [StepID.claude, StepID.project, StepID.key]
+        let fresh = SetupProgress(hasProject: false, hasKey: false, linuxGitHub: false)
+        let freshIDs: [StepID] = [StepID.toolbox, StepID.project, StepID.key]
         #expect(Self.ids(fresh) == freshIDs)
         #expect(fresh.done == 0)
         #expect(!fresh.complete)
         #expect(fresh.lit == 0)
-        let halfway = SetupProgress(hasProject: true, hasKey: false, linuxClaude: true)
+        let halfway = SetupProgress(hasProject: true, hasKey: false, linuxGitHub: true)
         let halfwayDone: [Bool] = halfway.steps.map { (s: SetupProgress.Step) -> Bool in s.done }
         #expect(halfwayDone == [true, true, false])
         #expect(halfway.done == 2)
         #expect(halfway.lit == 2)
-        let all = SetupProgress(hasProject: true, hasKey: true, linuxClaude: true)
+        let all = SetupProgress(hasProject: true, hasKey: true, linuxGitHub: true)
         #expect(all.complete)
         #expect(all.lit == 4)
     }
 
-    @Test func withoutLinuxAgentsThereIsNoClaudeStep() {
-        let setup = SetupProgress(hasProject: true, hasKey: true, linuxClaude: nil)
+    /// Agents' own sign-in is theirs to do: setup never walks through it
+    /// (#46), and without a Linux toolbox there's no toolbox step either.
+    @Test func setupHasNoAgentSignInStep() {
+        let setup = SetupProgress(hasProject: true, hasKey: true, linuxGitHub: nil)
         let want: [StepID] = [StepID.project, StepID.key]
         #expect(Self.ids(setup) == want)
         #expect(setup.complete)
+        let all = Self.fiveMinute.steps.map { (s: SetupProgress.Step) -> String in s.title + " " + s.detail }
+        #expect(!all.contains { (t: String) -> Bool in t.contains("setup-token") || t.contains("Log in to Claude") })
     }
 
     static func check(_ id: CheckId, _ state: CheckState, fixable: Bool = false, progress: Int? = nil) -> DoctorCheck {
@@ -230,7 +237,7 @@ typealias StepStatus = SetupProgress.Step.Status
     /// The five-minute Mac (PRD: Goals, Short setup): gh and claude logged
     /// in, the app just installed from the disk image.
     static let fiveMinute = SetupProgress(
-        hasProject: false, hasKey: false, linuxClaude: false, linuxGitHub: false,
+        hasProject: false, hasKey: false, linuxGitHub: false,
         doctor: [
             check(CheckId.git, CheckState.pass), check(CheckId.gh, CheckState.pass),
             check(CheckId.ghGit, CheckState.fail, fixable: true), check(CheckId.claude, CheckState.pass),
@@ -241,14 +248,14 @@ typealias StepStatus = SetupProgress.Step.Status
 
     /// The first launch and the first run in one list, in order: the vibe
     /// command, the doctor's checks with Terminal among them, then the
-    /// Linux download, Claude and GitHub for linux agents, a project, a key.
+    /// Linux download, GitHub for linux agents, a project, a key.
     @Test func doctorChecksAreStepsInTheSameList() {
         let setup = Self.fiveMinute
         let order: [StepID] = [
             StepID.command, StepID.check(CheckId.git), StepID.check(CheckId.gh), StepID.check(CheckId.ghGit),
             StepID.check(CheckId.claude), StepID.check(CheckId.claudeLogin), StepID.terminal,
             StepID.check(CheckId.power), StepID.check(CheckId.tailscale), StepID.check(CheckId.linux),
-            StepID.claude, StepID.toolbox, StepID.project, StepID.key,
+            StepID.toolbox, StepID.project, StepID.key,
         ]
         #expect(Self.ids(setup) == order)
         #expect(!setup.complete)
@@ -294,9 +301,6 @@ typealias StepStatus = SetupProgress.Step.Status
         let terminal: SetupAction? = Self.action(setup, StepID.terminal)
         let wantTerminal: SetupAction? = SetupAction.allowTerminal
         #expect(terminal == wantTerminal)
-        let claude: SetupAction? = Self.action(setup, StepID.claude)
-        let wantClaude: SetupAction? = SetupAction.vibe(["setup-token"])
-        #expect(claude == wantClaude)
         // The toolbox waits on the download.
         let toolboxStep: SetupProgress.Step? = Self.step(setup, StepID.toolbox)
         #expect(toolboxStep != nil)
@@ -320,7 +324,7 @@ typealias StepStatus = SetupProgress.Step.Status
 
     @Test func eachCheckHasItsButton() {
         let fresh = SetupProgress(
-            hasProject: true, hasKey: true, linuxClaude: true, linuxGitHub: true,
+            hasProject: true, hasKey: true, linuxGitHub: true,
             doctor: [
                 Self.check(CheckId.git, CheckState.fail), Self.check(CheckId.gh, CheckState.fail),
                 Self.check(CheckId.ghGit, CheckState.fail), Self.check(CheckId.claude, CheckState.fail),
@@ -366,7 +370,6 @@ typealias StepStatus = SetupProgress.Step.Status
         var setup = Self.fiveMinute
         setup.hasProject = true
         setup.hasKey = true
-        setup.linuxClaude = true
         setup.linuxGitHub = true
         setup.install.command = CommandLink.linked
         setup.install.terminal = TerminalPermission.denied
@@ -658,8 +661,7 @@ typealias StepStatus = SetupProgress.Step.Status
         let d = FixtureDaemon(.firstRun)
         let setup = SetupProgress(
             hasProject: !(try d.call(ProjectsList.self, HostParams()).projects.isEmpty),
-            hasKey: !(try d.call(KeysList.self, NoParams()).keys.isEmpty),
-            linuxClaude: try d.call(ToolboxLoginsGet.self, NoParams()).claude)
+            hasKey: !(try d.call(KeysList.self, NoParams()).keys.isEmpty))
         #expect(setup.done == 0)
         // With the doctor's checks, it's the five-minute Mac: some passed,
         // some to do, Linux downloading.
@@ -678,8 +680,7 @@ typealias StepStatus = SetupProgress.Step.Status
         #expect(
             SetupProgress(
                 hasProject: !(try quiet.call(ProjectsList.self, HostParams()).projects.isEmpty),
-                hasKey: !(try quiet.call(KeysList.self, NoParams()).keys.isEmpty),
-                linuxClaude: try quiet.call(ToolboxLoginsGet.self, NoParams()).claude
+                hasKey: !(try quiet.call(KeysList.self, NoParams()).keys.isEmpty)
             ).complete)
     }
 }
@@ -835,10 +836,10 @@ typealias StepStatus = SetupProgress.Step.Status
         #expect(profileSummary(profile) == "Linux · Sonnet · Extra High · Bypass · 4G")
         // The step's words, wherever it sits in the list (SetupTests has
         // the order).
-        let setup = SetupProgress(hasProject: false, hasKey: false, linuxClaude: false)
-        let claude: SetupProgress.Step? = SetupTests.step(setup, StepID.claude)
-        let claudeTitle: String? = claude?.title
-        #expect(claudeTitle == "Log in to Claude for Linux agents")
+        let setup = SetupProgress(hasProject: false, hasKey: false, linuxGitHub: false)
+        let toolbox: SetupProgress.Step? = SetupTests.step(setup, StepID.toolbox)
+        let toolboxTitle: String? = toolbox?.title
+        #expect(toolboxTitle == "Set up the Linux toolbox")
     }
 
     /// An image of `size` pixels, filled with white, with `draw` on top.

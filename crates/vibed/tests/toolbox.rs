@@ -187,6 +187,39 @@ async fn exiting_the_shell_saves_and_the_next_one_starts_afresh() {
     assert_eq!((status.template, status.home), (Some(2), Some(2)));
 }
 
+/// The toolbox said to be open when nothing of its shell is left is closed,
+/// and says so: Settings never goes on showing a shell open that isn't
+/// (#46).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_toolbox_with_no_shell_left_is_closed_and_says_so() {
+    let w = world();
+    let core = w.core(&["sleep", "600"]);
+    core.open_toolbox(NoParams {}).await.unwrap();
+    let pid = running(&w.socket()).await.unwrap();
+    let (_, mut events) = core.subscribe();
+    // While the shell runs, it's open, and stays so.
+    core.check_toolbox().await;
+    assert_eq!(
+        core.toolbox_status(NoParams {}).await.unwrap().state,
+        ToolboxState::Open
+    );
+    assert!(events.try_recv().is_err());
+    // What it had is thrown away under it.
+    fs::remove_file(w.layout.agent_dir("toolbox").join("open.json")).unwrap();
+    kill_shim(pid);
+    wait_gone(&w.socket()).await;
+    core.check_toolbox().await;
+    assert_eq!(
+        core.toolbox_status(NoParams {}).await.unwrap().state,
+        ToolboxState::Closed
+    );
+    let e = events.try_recv().expect("the close is told");
+    assert_eq!(e.kind, EventKind::ToolboxChanged);
+    // Told once.
+    core.check_toolbox().await;
+    assert!(events.try_recv().is_err());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_toolbox_at_a_time() {
     let w = world();

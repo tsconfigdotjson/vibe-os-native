@@ -228,42 +228,60 @@ public enum MCPSetup {
     }
 }
 
-/// What the Linux toolbox menu says about the toolbox (PRD: The toolbox
-/// shell): the versions new agents boot, what it's doing, a newer base
-/// image that Rebuild template would move to, and how the last run went.
-public func toolboxLines(_ status: ToolboxStatus?) -> [String] {
-    guard let status else { return [] }
-    guard status.state != .unavailable else { return ["This host has no Linux toolbox"] }
-    var lines: [String] = []
-    var versions: [String] = []
-    if let template = status.template { versions.append("template v\(template)") }
-    if let home = status.home { versions.append("Linux home v\(home)") }
-    if let base = status.base { versions.append("base \(base)") }
-    if !versions.isEmpty { lines.append("New agents boot " + versions.joined(separator: ", ")) }
-    switch status.state {
-    case .open: lines.append("The shell is open: exit it to save")
-    case .saving: lines.append("Saving the template and Linux home…")
-    case .updating: lines.append("Running toolbox.toml's [update]…")
-    case .rebuilding: lines.append("Rebuilding the template…")
-    case .closed, .unavailable: break
-    }
-    if let newest = status.newestBase, newest > (status.base ?? 0) {
-        lines.append("Base \(newest) is installed: Rebuild Template moves to it")
-    }
-    if let last = status.last {
-        let what: String
-        switch last.action {
-        case .shell: what = "shell"
-        case .update: what = "update"
-        case .rebuild: what = "rebuild"
+/// What Settings → Linux Toolbox says about the toolbox (PRD: The toolbox
+/// shell): what it's doing, the versions new agents boot, and a note or two
+/// (a newer base image Rebuild Template would move to, how the last run
+/// went). Only what vibed says now: the shell shows as open only while it
+/// is.
+public struct ToolboxSummary: Equatable, Sendable {
+    /// What the toolbox is doing, in a word or two.
+    public var state: String
+    /// Whether it's busy with something that ends on its own.
+    public var working: Bool
+    /// "Template v3 · Linux home v2 · Base 1", once there's any.
+    public var versions: String?
+    public var notes: [String]
+
+    public init(_ status: ToolboxStatus?) {
+        working = false
+        versions = nil
+        notes = []
+        guard let status else {
+            state = "Loading…"
+            return
         }
-        if let error = last.error {
-            lines.append("The last \(what) failed: \(error)")
-        } else if !last.uncovered.isEmpty {
-            lines.append("Not in toolbox.toml: " + last.uncovered.joined(separator: ", "))
+        switch status.state {
+        case .unavailable: state = "Not on this host"
+        case .closed: state = "Closed"
+        case .open: state = "Open: exit the shell to save"
+        case .saving: state = "Saving…"
+        case .updating: state = "Running [update]…"
+        case .rebuilding: state = "Rebuilding…"
+        }
+        working = [.saving, .updating, .rebuilding].contains(status.state)
+        guard status.state != .unavailable else { return }
+        var parts: [String] = []
+        if let template = status.template { parts.append("Template v\(template)") }
+        if let home = status.home { parts.append("Linux home v\(home)") }
+        if let base = status.base { parts.append("Base \(base)") }
+        if !parts.isEmpty { versions = parts.joined(separator: " · ") }
+        if let newest = status.newestBase, newest > (status.base ?? 0) {
+            notes.append("Base \(newest) is installed. Rebuild Template moves to it.")
+        }
+        if let last = status.last {
+            let what: String
+            switch last.action {
+            case .shell: what = "save"
+            case .update: what = "update"
+            case .rebuild: what = "rebuild"
+            }
+            if let error = last.error {
+                notes.append("The last \(what) failed: \(error)")
+            } else if !last.uncovered.isEmpty {
+                notes.append("Not in toolbox.toml: " + last.uncovered.joined(separator: ", "))
+            }
         }
     }
-    return lines
 }
 
 /// Quotes `word` for a POSIX shell.
@@ -291,9 +309,10 @@ public func toolSymbol(_ tool: LoginTool) -> String {
     }
 }
 
-/// What See Logins says (PRD: Menu bar, Footer; Core concepts, Linux
-/// home): what every new linux agent starts logged in to, or plainly that
-/// there's nothing yet, or that it isn't known, and Claude's login.
+/// The logins every new Linux agent starts with, from the Linux home
+/// (PRD: Core concepts, Linux home): which, or plainly that there are none
+/// yet or that it isn't known. Agents' own sign-in is only a hint, there
+/// when it's missing.
 public struct LoginsSummary: Equatable, Sendable {
     public struct Row: Equatable, Sendable, Identifiable {
         public var tool: String
@@ -303,12 +322,11 @@ public struct LoginsSummary: Equatable, Sendable {
         public var id: String { tool + "\u{0}" + account }
     }
 
+    /// What the rows are, or why there are none.
     public var headline: String
     public var rows: [Row]
-    /// Claude's login for linux agents, as a sentence.
-    public var claude: String
-    /// Whether linux agents still need the Claude login.
-    public var needsClaude: Bool
+    /// How Linux agents get signed in, while they aren't.
+    public var signInHint: String?
 
     public init(_ logins: ToolboxLogins) {
         rows = (logins.logins ?? []).map {
@@ -316,26 +334,54 @@ public struct LoginsSummary: Equatable, Sendable {
         }
         switch (logins.home, logins.logins) {
         case (nil, _):
-            headline = "There's no Linux home yet. Open the toolbox shell, log in to what your Linux agents "
-                + "need (gh auth login, say), and exit to save it."
+            headline = "No Linux home yet. Log in to what agents need in the shell, then exit to save."
         case (let home?, nil):
-            headline = "VibeOS couldn't tell which logins Linux home \(home) holds: the check failed, or an "
-                + "older VibeOS saved it. Open the toolbox shell and exit it, and they'll show here."
+            headline = "VibeOS couldn't tell which logins Linux home \(home) holds. Open the shell and exit it "
+                + "to look again."
         case (let home?, let found?) where found.isEmpty:
-            headline = "No gh, gcloud, git or SSH logins in Linux home \(home) yet. Log in from the toolbox "
-                + "shell (gh auth login, gcloud auth login, git config --global user.name …), then exit to save."
+            headline = "No logins in Linux home \(home) yet."
         case (let home?, _):
-            headline = "Every new Linux agent starts with these logins, from Linux home \(home)."
+            headline = "New Linux agents start with these, from Linux home \(home)."
         }
-        needsClaude = !logins.claude
         if logins.claude {
-            claude = "Linux agents are logged in."
+            signInHint = nil
         } else if let why = logins.claudeProblem {
-            claude = sentence(why)
+            signInHint = sentence(why)
         } else {
-            claude = "Linux agents aren't logged in yet."
+            signInHint = "Linux agents aren't signed in yet."
         }
     }
+}
+
+/// Where Settings is within its panes: the project drilled into, and the
+/// host each per-host pane shows. Picking a pane in the sidebar, the one
+/// shown included, takes it back to its first level, never a page drilled
+/// into before; the hosts picked stay as they were.
+public struct SettingsPlace: Equatable, Sendable {
+    /// The Projects pane's navigation path: the project shown, if any.
+    public var projects: [String] = []
+    public var projectsHost = VibeRPC.localHost
+    public var limitsHost = VibeRPC.localHost
+
+    public init() {}
+
+    /// A pane was picked in the sidebar.
+    public mutating func picked() {
+        projects.removeAll()
+    }
+}
+
+/// When an API key was last used, as Settings → API Keys says it: "Last
+/// used 3 minutes ago", or "Never used".
+public func keyUsage(_ lastUsedAt: String?, now: Date) -> String {
+    guard let used = lastUsedAt.flatMap(parseTime) else { return "Never used" }
+    if now.timeIntervalSince(used) < 60 { return "Last used just now" }
+    // In the app's own words, English, measured from `now`.
+    let relative = RelativeDateTimeFormatter()
+    relative.dateTimeStyle = .named
+    relative.unitsStyle = .full
+    relative.locale = Locale(identifier: "en_US")
+    return "Last used \(relative.localizedString(for: used, relativeTo: now))"
 }
 
 // MARK: External access
@@ -449,7 +495,9 @@ public func activitySymbol(_ agent: Agent) -> String? {
     case .runningTool: return "terminal"
     case .backgroundWork: return "gearshape.2"
     case .awaitingAnswer: return "questionmark.bubble"
-    case .awaitingApproval: return "hand.raised"
+    // An inferred prompt vibed hasn't confirmed is still a tool at work:
+    // only a question raises the hand.
+    case .awaitingApproval: return agent.state == .question ? "hand.raised" : "terminal"
     case .done: return "checkmark"
     case .interrupted: return "pause"
     case .errored: return "exclamationmark.triangle"
@@ -600,8 +648,8 @@ public enum SetupAction: Equatable, Sendable {
 /// and setup), as one list in order. First launch: the vibe command, vibe
 /// doctor's checks (git, gh and git using it, Claude Code and its login,
 /// system sleep, Tailscale) and the app's permission to control Terminal.
-/// First run: the Linux download, Claude's login for linux agents, the
-/// Linux toolbox's GitHub login, a project, and an API key for MCP clients.
+/// First run: the Linux download, the Linux toolbox's GitHub login, a
+/// project, and an API key for MCP clients.
 /// The menu shows it as a welcome until agents exist.
 public struct SetupProgress: Equatable, Sendable {
     public struct Step: Equatable, Sendable, Identifiable {
@@ -609,7 +657,7 @@ public struct SetupProgress: Equatable, Sendable {
             case command
             case check(CheckId)
             case terminal
-            case claude, toolbox, project
+            case toolbox, project
             /// MCP on Tailscale, for Claude Code on the owner's other machines.
             case remote
             case key
@@ -699,9 +747,6 @@ public struct SetupProgress: Equatable, Sendable {
 
     public var hasProject: Bool
     public var hasKey: Bool
-    /// Whether linux agents can log in to Claude; nil where there are none,
-    /// as on a host with no Linux toolbox.
-    public var linuxClaude: Bool?
     /// Whether the Linux home has a gh login; nil where there's no toolbox,
     /// or VibeOS couldn't tell.
     public var linuxGitHub: Bool?
@@ -717,13 +762,12 @@ public struct SetupProgress: Equatable, Sendable {
     public var remoteMCP: Bool?
 
     public init(
-        hasProject: Bool, hasKey: Bool, linuxClaude: Bool?, linuxGitHub: Bool? = nil, doctor: [DoctorCheck] = [],
+        hasProject: Bool, hasKey: Bool, linuxGitHub: Bool? = nil, doctor: [DoctorCheck] = [],
         install: InstallStatus = .notManaged, ghInstalled: Bool = true, remoteMCP: Bool? = nil
     ) {
         self.remoteMCP = remoteMCP
         self.hasProject = hasProject
         self.hasKey = hasKey
-        self.linuxClaude = linuxClaude
         self.linuxGitHub = linuxGitHub
         self.doctor = doctor
         self.install = install
@@ -745,16 +789,6 @@ public struct SetupProgress: Equatable, Sendable {
         }
         let linux = doctor.first { $0.id == .linux }
         if let linux { steps.append(step(for: linux)) }
-        if let linuxClaude {
-            steps.append(
-                Step(
-                    id: .claude, title: "Log in to Claude for Linux agents",
-                    detail: linuxClaude
-                        ? "Linux agents sign in with a token kept in your Keychain."
-                        : "One browser sign-in. The token stays in your Keychain.",
-                    status: linuxClaude ? .done : .todo,
-                    action: linuxClaude ? nil : .vibe(["setup-token"]), actionTitle: "Log In…"))
-        }
         if let linuxGitHub {
             let ready = linux.map { $0.state == .pass } ?? true
             steps.append(
@@ -763,9 +797,9 @@ public struct SetupProgress: Equatable, Sendable {
                     detail: linuxGitHub
                         ? "Linux agents start logged in to GitHub."
                         : ready
-                            ? "A Linux shell opens in Terminal. Run gh auth login, add anything every Linux agent "
-                                + "should have, then exit to save."
-                            : "Once Linux is downloaded: a shell where you log in to GitHub for Linux agents.",
+                            ? "A Linux shell in Terminal. Log in to GitHub (gh auth login) and install what agents "
+                                + "need, then exit to save."
+                            : "Once Linux is downloaded: a shell to log Linux agents in to GitHub.",
                     status: linuxGitHub ? .done : .todo,
                     action: linuxGitHub || !ready ? nil : .openToolbox, actionTitle: "Open Shell"))
         }

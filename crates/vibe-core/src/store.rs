@@ -587,6 +587,7 @@ impl Store {
             path,
             added_at: rfc3339(added_at),
             profiles: profiles_of(&self.conn, id)?,
+            deleted: false,
         })
     }
 
@@ -1002,6 +1003,19 @@ impl Store {
         self.conn
             .execute("DELETE FROM api_keys WHERE name = ?1", [name])?;
         Ok(key)
+    }
+
+    /// Records that this host's own key `name` (with `prefix`, so a key
+    /// made again under the same name isn't confused with it) was used at
+    /// `at` somewhere else: on a Linux host it was pushed to. Only a later
+    /// use than the one known moves it. Says whether it did.
+    pub fn note_key_used(&mut self, name: &str, prefix: &str, at: i64) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE api_keys SET last_used_at = ?3 \
+             WHERE name = ?1 AND prefix = ?2 AND (last_used_at IS NULL OR last_used_at < ?3)",
+            params![name, prefix, at],
+        )?;
+        Ok(n > 0)
     }
 
     /// The key with this hash, now marked as used, or `None` if there's no
@@ -1592,6 +1606,27 @@ mod tests {
         assert_eq!(used.last_used_at.as_deref(), Some("1970-01-01T00:00:20Z"));
         let names: Vec<_> = s.keys().unwrap().into_iter().map(|k| k.name).collect();
         assert_eq!(names, ["laptop", "ci"]);
+
+        // A use on a host the key was pushed to: only a later one counts,
+        // and only for the key with that prefix.
+        assert!(!s.note_key_used("laptop", "vk_aaaaaaaa", 15).unwrap());
+        assert!(!s.note_key_used("laptop", "vk_other", 40).unwrap());
+        assert!(!s.note_key_used("nope", "vk_aaaaaaaa", 40).unwrap());
+        assert!(s.note_key_used("laptop", "vk_aaaaaaaa", 25).unwrap());
+        assert!(s.note_key_used("ci", "vk_bbbbbbbb", 12).unwrap());
+        let used: Vec<_> = s
+            .keys()
+            .unwrap()
+            .into_iter()
+            .map(|k| k.last_used_at)
+            .collect();
+        assert_eq!(
+            used,
+            [
+                Some("1970-01-01T00:00:25Z".into()),
+                Some("1970-01-01T00:00:12Z".into())
+            ]
+        );
 
         s.revoke_key("laptop").unwrap();
         assert_eq!(

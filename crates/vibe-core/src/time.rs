@@ -32,6 +32,42 @@ pub fn unix_seconds(y: i64, m: u32, d: u32, h: u32, min: u32, s: u32) -> Option<
     Some(days_from_civil(y, m, d) * 86_400 + i64::from(h * 3600 + min * 60 + s))
 }
 
+/// Seconds since the epoch of `YYYY-MM-DDTHH:MM:SSZ`, as [`rfc3339`]
+/// writes it (fractions of a second are dropped); `None` for anything else.
+pub fn parse_rfc3339(s: &str) -> Option<i64> {
+    let b = s.as_bytes();
+    let shaped = b.len() >= 20
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b[10] == b'T'
+        && b[13] == b':'
+        && b[16] == b':'
+        && s.ends_with('Z');
+    if !shaped {
+        return None;
+    }
+    let rest = &s[19..s.len() - 1];
+    if !(rest.is_empty()
+        || rest.len() > 1 && rest.starts_with('.') && rest[1..].bytes().all(|c| c.is_ascii_digit()))
+    {
+        return None;
+    }
+    let n = |a: usize, b: usize| -> Option<u32> {
+        let p = s.get(a..b)?;
+        p.bytes()
+            .all(|c| c.is_ascii_digit())
+            .then(|| p.parse().ok())?
+    };
+    unix_seconds(
+        i64::from(n(0, 4)?),
+        n(5, 7)?,
+        n(8, 10)?,
+        n(11, 13)?,
+        n(14, 16)?,
+        n(17, 19)?,
+    )
+}
+
 /// The day count from 1970-01-01 of a proleptic Gregorian date (Howard
 /// Hinnant's `days_from_civil`).
 fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
@@ -90,6 +126,28 @@ mod tests {
                 Some(t),
                 "{s}"
             );
+        }
+    }
+
+    #[test]
+    fn parses_what_it_writes() {
+        for t in [0, 1_793_361_600, 951_782_400, 4_107_542_399] {
+            assert_eq!(parse_rfc3339(&rfc3339(t)), Some(t));
+        }
+        assert_eq!(
+            parse_rfc3339("2026-10-30T12:00:00.750Z"),
+            Some(1_793_361_600)
+        );
+        for bad in [
+            "",
+            "2026-10-30",
+            "2026-10-30T12:00:00",
+            "2026-10-30T12:00:00+01:00",
+            "2026-1x-30T12:00:00Z",
+            "2026-13-30T12:00:00Z",
+            "2026-10-30T12:00:00.Z",
+        ] {
+            assert_eq!(parse_rfc3339(bad), None, "{bad}");
         }
     }
 

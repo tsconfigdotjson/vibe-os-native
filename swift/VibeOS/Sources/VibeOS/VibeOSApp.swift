@@ -25,7 +25,6 @@ enum Main {
 enum WindowID {
     static let newAgent = "new-agent"
     static let settings = "settings"
-    static let logins = "linux-logins"
     static let addHost = "add-linux-host"
 }
 
@@ -62,12 +61,6 @@ struct VibeOSApp: App {
 
         Window("Add Linux Host", id: WindowID.addHost) {
             AddHostView(model: model)
-        }
-        .windowResizability(.contentSize)
-        .defaultLaunchBehavior(.suppressed)
-
-        Window("Linux Logins", id: WindowID.logins) {
-            LoginsView(model: model)
         }
         .windowResizability(.contentSize)
         .defaultLaunchBehavior(.suppressed)

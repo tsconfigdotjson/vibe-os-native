@@ -57,7 +57,11 @@ commands:
   project add OWNER/NAME|PATH [--name NAME]
               clone a GitHub repo with this host's gh login, or register a
               local checkout; it starts with this host's starter profiles
-  project remove NAME   forget a project; its files stay on disk
+  project remove NAME [--delete]
+              forget a project. On the Mac its files stay on disk. On a
+              Linux host, --delete also deletes the clone VibeOS made in
+              ~/VibeOS/projects (with any branches never pushed); without
+              it, a removal that would delete one is refused
   profile list PROJECT  a project's profiles
   profile create PROJECT NAME [--environment linux|macos] [--model opus|sonnet]
               [--reasoning low|medium|high|xhigh|max] [--mode auto|bypass]

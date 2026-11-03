@@ -130,10 +130,12 @@ fn a_session_with_tools_a_title_and_a_permission_prompt() {
                 );
                 assert!(s.since.is_some());
             }),
-            // A tool call with no result for 30 s may be a permission prompt:
-            // a question, but only a guess.
-            with(check(24, 30.0, Question, AwaitingApproval, Inferred), |s| {
+            // A tool call with no result for 30 s may be a permission prompt,
+            // but it's only a guess: a long tool run looks the same, so it's
+            // still at work until the screen or a longer quiet confirms it.
+            with(check(24, 30.0, Busy, AwaitingApproval, Inferred), |s| {
                 assert!(!s.at_rest());
+                assert!(s.unconfirmed_approval());
             }),
             with(check(64, 0.0, Idle, Done, Firm), |s| {
                 assert!(s.at_rest());
@@ -173,9 +175,10 @@ fn a_bash_permission_prompt_is_an_inferred_question() {
         "bash-approval",
         &[
             check(13, 5.0, Busy, RunningTool, Firm),
-            check(13, 30.0, Question, AwaitingApproval, Inferred),
-            // Past the debounce, it's what it was: an inferred prompt, which
-            // sleeps only after the longer quiet the caller holds it to.
+            check(13, 30.0, Busy, AwaitingApproval, Inferred),
+            // Past INFERRED_QUIET (and the debounce), it's what it was: an
+            // inferred prompt, now a question, which sleeps only after the
+            // longer quiet the caller holds it to.
             with(
                 check(13, 400.0, Question, AwaitingApproval, Inferred),
                 |s| {

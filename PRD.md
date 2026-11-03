@@ -84,7 +84,7 @@ An agent, its worktree and its compartment are one unit. They're created togethe
 | Linux home | Logins and dotfiles every `linux` agent starts with (`gh`, `gcloud`, `~/.gitconfig`), set up in the toolbox shell. Kept apart from the template so a rebuild doesn't lose them. | Host disk image |
 | Linux Claude config | Your Claude setup for `linux` agents (CLAUDE.md, settings, skills, MCP servers), made in the toolbox shell. Copied into each agent's own `~/.claude` when it starts. | `~/VibeOS/linux-claude/` |
 | Managed layer | Tools the daemon keeps current for every `linux` VM. In v1 that's only Claude Code. | Host disk image |
-| Toolbox shell | A Terminal session in a writable Linux VM, for changing the template and the Linux home. | Menu → Linux toolbox, or `vibe toolbox` |
+| Toolbox shell | A Terminal session in a writable Linux VM, for changing the template and the Linux home. | Settings → Linux Toolbox, or `vibe toolbox` |
 | Host limits | Everything that isn't per profile: cores kept for macOS, CPU cores per agent, agents awake at once, process count, disk. | Settings → Host, or `~/.config/vibeos/host.toml` |
 | Snapshot | A sleeping `linux` agent's whole VM, RAM included, saved to disk. Restoring it resumes the agent exactly. | `~/VibeOS/snapshots/<ref>` |
 | Session | The PTY the agent runs in. A shim holds it, so it outlives every client. | `…/run/<ref>.sock` |
@@ -103,9 +103,9 @@ An agent's life runs setup → start (worktree and compartment included) → wor
    - Tailscale (optional, for remote MCP)
 
    Meanwhile it downloads the Linux base image and the current Claude Code. Then it offers two last steps:
-   - **Set up Linux.** Log in to Claude for Linux agents: the app runs `claude setup-token` (through `vibe setup-token`), which opens the same browser sign-in as `/login`, and keeps the long-lived token in Keychain. Then the toolbox shell opens in Terminal: run `gh auth login`, and anything else you want every Linux agent to have (`gcloud auth login`, `apt install …`, your Claude settings). Exit to save.
+   - **Set up Linux.** The toolbox shell opens in Terminal: run `gh auth login`, and anything else you want every Linux agent to have (`gcloud auth login`, `apt install …`, your agent settings). Exit to save. Linux agents sign in to Claude with a long-lived token that `vibe setup-token` gets (it runs `claude setup-token`, the same browser sign-in as `/login`) and keeps in Keychain. Setup doesn't walk through that sign-in; Settings → Linux Toolbox shows a one-line hint while it's missing.
    - **Settings → API keys → New key**, with a ready `claude mcp add …` line to copy.
-2. **Add a project.** Settings → Projects → Add takes a GitHub `owner/name`, cloned with the Mac's `gh` login into `~/VibeOS/projects/`, or a local path. The project starts with two profiles, one per environment (see Profiles), which you can edit or add to. Removing a project forgets it and its profiles but leaves its files on disk; adding the same repo again picks up its existing clone. A project with agents can't be removed.
+2. **Add a project.** Settings → Projects → Add takes a GitHub `owner/name`, cloned with the Mac's `gh` login into `~/VibeOS/projects/`, or a local path. The project starts with two profiles, one per environment (see Profiles), which you can edit or add to. On the Mac, removing a project forgets it and its profiles but leaves its files on disk; adding the same repo again picks up its existing clone. On a Linux host, removing a project cloned from GitHub can also delete its clone, and only that: a git repo directly inside `~/VibeOS/projects/`, reached without a symlink, whose `origin` is the project's repo, never the folder itself or anything holding the home folder. Deleting takes explicit intent: Settings asks first, and `vibe project remove` needs `--delete` (the socket call, `delete`); without it, a removal that would delete a clone is refused and says what it would delete. A clone that fails those checks is never deleted: with `--delete` the removal is refused with the reason, and without it the project is only forgotten, its files left. The answer says whether the clone was deleted. A removal waits for starts and git maintenance under way in the project, and holds new ones off until it's done. A local repo registered by path is the owner's own and is left as it is. While the host can't be reached, the removal fails and says so, and nothing changes. A project with agents can't be removed.
 3. **Start an agent.** `vibe_start_agent {project, profile, prompt}`, or New agent… in the menu. One call does it all:
    - fetch `origin` and cut a worktree on a new branch from the default branch (or from `from`), with `push.autoSetupRemote` set. Agents get their git settings through their environment (`GIT_CONFIG_*`), so the shared `.git/config` is unchanged
    - check there's room: disk to spare, and fewer than `max_awake_agents` awake. Never memory: the profile's memory is the agent's ceiling, not a reservation
@@ -285,7 +285,7 @@ agent VM = base image      ships with the app: Debian slim, git, gh, curl,
 
 #### The toolbox shell
 
-Menu → Linux toolbox → Open shell (or `vibe toolbox`) opens Terminal in a VM where the template and the Linux home are writable. Install any way you like (`apt install`, `curl … | sh`, `npm -g`) and log in to whatever you need. Exiting saves a new version of each as a new image file; an image is never changed in place, because a sleeping agent's snapshot depends on the exact disks it was saved with. Old versions are deleted once no agent uses them. New agents boot the latest versions; running agents keep theirs until their next boot. Only one toolbox shell can be open at a time, and agents never change the template or the home. The shell runs as `vibe` with `sudo` (agents get no `sudo`), and `toolbox.toml`'s commands below run as root.
+Settings → Linux Toolbox → Open Shell (or `vibe toolbox`) opens Terminal in a VM where the template and the Linux home are writable. Install any way you like (`apt install`, `curl … | sh`, `npm -g`) and log in to whatever you need. Exiting saves a new version of each as a new image file; an image is never changed in place, because a sleeping agent's snapshot depends on the exact disks it was saved with. Old versions are deleted once no agent uses them. New agents boot the latest versions; running agents keep theirs until their next boot. Only one toolbox shell can be open at a time, and agents never change the template or the home. The shell runs as `vibe` with `sudo` (agents get no `sudo`), and `toolbox.toml`'s commands below run as root.
 
 `~/.config/vibeos/toolbox.toml` is optional. It's a recipe the daemon can replay into a fresh template, plus update commands to run on a schedule:
 
@@ -300,7 +300,7 @@ run  = "curl -sSL https://sdk.cloud.google.com | bash -s -- --disable-prompts --
 run = ["gcloud components update --quiet"]
 ```
 
-**Base image updates.** A new app release can ship a new base image, but the daemon never swaps it under your template. Instead the menu offers **Rebuild template**. That boots the new base, replays `toolbox.toml`, and lists anything you installed by hand that the recipe doesn't cover. The Linux home carries over unchanged.
+**Base image updates.** A new app release can ship a new base image, but the daemon never swaps it under your template. Instead Settings → Linux Toolbox offers **Rebuild Template**. That boots the new base, replays `toolbox.toml`, and lists anything you installed by hand that the recipe doesn't cover. The Linux home carries over unchanged.
 
 Repos don't customize the VM themselves. Project dependencies go in `.vibe/setup.sh`, which runs in every new agent in both environments.
 
@@ -342,7 +342,7 @@ A Linux server runs the same `vibed`, so it joins the Mac as another host. Its a
 
 ### Adding a Linux host
 
-- **Menu → Add Linux host…** takes an SSH destination, such as `me@vps.example.com` or a Tailscale name. The app installs or upgrades `vibed` over SSH (static builds of `vibed`, `vibe` and `vibe-shim` in `~/.local/lib/vibeos`, plus a systemd user service with lingering on), checks `git`, `gh` and `claude` there, and lists what's missing.
+- **Settings → Hosts → Add Linux Host…** takes an SSH destination, such as `me@vps.example.com` or a Tailscale name. The app installs or upgrades `vibed` over SSH (static builds of `vibed`, `vibe` and `vibe-shim` in `~/.local/lib/vibeos`, plus a systemd user service with lingering on), checks `git`, `gh` and `claude` there, and lists what's missing.
 - The server has its own logins, set up on the server itself: `gh auth login`, and `claude` with `/login`. It's one machine with one `~/.claude`, like a VibeOS box, so plain `/login` works; the cross-VM problem that forced `setup-token` doesn't apply.
 - Projects are cloned on the host that runs their agents. The same GitHub repo can be a project on the Mac and on a server.
 - There's no toolbox or Linux template on a server: install tools on it directly, as you would on any server.
@@ -391,7 +391,7 @@ MCP is the product. It keeps the shape of VibeOS's MCP, which already drives a w
 **Auth is always on.** There's no unauthenticated mode, not even on loopback.
 
 - **Settings → API keys** generates a key (`vk_…`, 256 bits) with a name such as "laptop Claude Code". The key is shown with **Copy** and **Copy setup command** buttons.
-- Keys are stored hashed (SHA-256; a key is 256 random bits, so nothing slower is needed), with their first characters to tell them apart. Each one can be revoked, which deletes it, and shows when it was last used.
+- Keys are stored hashed (SHA-256; a key is 256 random bits, so nothing slower is needed), with their first characters to tell them apart. Each one can be revoked, which deletes it, and shows when it was last used ("Last used 3 minutes ago", or "Never used"), wherever that was: a Linux host records each use of a key pushed to it, and the Mac asks its connected hosts when it lists keys and keeps the latest.
 - Clients send `Authorization: Bearer <key>`.
 - A key is equivalent to a shell on the Mac, and the Settings screen says so.
 
@@ -406,7 +406,7 @@ MCP is the product. It keeps the shape of VibeOS's MCP, which already drives a w
 | `vibe_read_output` | The screen, plus what scrolled into history since an `after` cursor | Same |
 | `vibe_delete_agent` | Ends the agent and removes everything VibeOS made for it: worktree, temp directory, transcripts, scrollback, compartment and snapshot. Keeps the branch. Refuses on uncommitted changes or unpushed commits unless `force` | Replaces `vibe_close_window` + `vibe_delete_workspace` |
 
-**States.** As in VibeOS, an agent is `busy`, `idle`, `question` or `asleep`, plus `paused` (a limit hit) and `exited`. `question` covers any prompt waiting on an answer: a menu, a yes/no, a permission prompt. agent-tail's finer `activity` (`thinking`, `running_tool`, `awaiting_approval`, …) rides along for clients that want it. Frozen and saved-to-disk agents both show as `asleep`, because a send wakes either.
+**States.** As in VibeOS, an agent is `busy`, `idle`, `question` or `asleep`, plus `paused` (a limit hit) and `exited`. `question` covers any prompt waiting on an answer: a menu, a yes/no, a permission prompt. A permission prompt agent-tail only infers (a tool call 20 s without a result, which a long silent tool run in auto mode looks like too) stays `busy` until the agent's screen shows the permission dialog; only then is it a `question` (only when the screen can't be read does the guess become one after standing for 5 min), so the hand, the menu bar's dot and the notification come only for a real prompt. agent-tail's finer `activity` (`thinking`, `running_tool`, `awaiting_approval`, …) rides along for clients that want it. Frozen and saved-to-disk agents both show as `asleep`, because a send wakes either.
 
 **Routing.** Every call after `vibe_start_agent` names an agent by its ref, which says which host it lives on, so `send`, `wait`, `read` and `delete` work the same on any host.
 
@@ -429,9 +429,7 @@ The menu bar lists every agent this app started, across all hosts and projects, 
 - **Click** a row to attach in Terminal. **Right-click** for: Interrupt, Reveal worktree in Finder, Open in editor, Copy attach command, Delete agent.
 - **Footer:**
   - New agent… (a small sheet: project, profile, prompt)
-  - Linux toolbox (open shell, rebuild template, see logins)
-  - Add Linux host…
-  - Settings… (API keys, hosts and external access, projects and their profiles, host limits)
+  - Settings… (projects and their profiles, API keys, hosts and external access with Add Linux host…, the Linux toolbox: its state, open shell, rebuild template and the logins new agents start with, host limits)
   - Quit menu. This leaves `vibed` and every agent running.
 
 **Notifications** fire on a question, an error, a limit hit, and the end of a turn (off by default). Clicking one attaches.
@@ -564,7 +562,7 @@ Never put to sleep: `thinking`, `running_tool` or `background_work`.
 
 - SQLite at `~/Library/Application Support/VibeOS/vibe.db`: hosts, projects, profiles, agents (ref, profile and the settings it was started with, shim socket, Claude session id, worktree, last state, the compartment's handle; one agent has one worktree, so it's a column), API key hashes. The state directory is private (`0700`), and a lock in it allows one `vibed` at a time
 - snapshots in `~/VibeOS/snapshots/`; each `linux` agent's `vm.json`, console log and `vibe-vm.log` in its directory under `~/VibeOS/agents/`
-- logs in `~/Library/Logs/VibeOS/vibed.log`, with anything shaped like an API key redacted
+- logs in `~/Library/Logs/VibeOS/vibed.log`, with anything shaped like an API key redacted; each agent's changes of state, and of activity with its certainty, are logged there
 - sockets in `…/VibeOS/run/`
 - host limits in `~/.config/vibeos/host.toml`
 - on a Linux host: the same layout under `~/.local/share/vibeos/` (logs in its `logs/`), with projects and worktrees in `~/VibeOS/` and host limits in `~/.config/vibeos/host.toml`

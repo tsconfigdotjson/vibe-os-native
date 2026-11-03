@@ -583,9 +583,10 @@ public enum ProjectsAdd: RPCMethod {
     public static let name = "projects.add"
 }
 
-/// `projects.remove`: forgets a project; its files stay on disk.
+/// `projects.remove`: forgets a project. On a Linux host, with `delete`, its
+/// clone is deleted too; the answer's `deleted` says whether it was.
 public enum ProjectsRemove: RPCMethod {
-    public typealias Params = ProjectParams
+    public typealias Params = ProjectRemoveParams
     public typealias Result = Project
     public static let name = "projects.remove"
 }
@@ -1048,11 +1049,13 @@ public struct Project: Codable, Hashable, Sendable {
     public var path: String
     public var addedAt: String
     public var profiles: [Profile]
+    /// Only in `projects.remove`'s answer: its clone was deleted too.
+    public var deleted: Bool?
 
     public enum CodingKeys: String, CodingKey, CaseIterable {
         case host, name, source, repo, path
         case addedAt = "added_at"
-        case profiles
+        case profiles, deleted
     }
 }
 
@@ -1094,6 +1097,24 @@ public struct ProjectParams: Codable, Hashable, Sendable {
 
     public enum CodingKeys: String, CodingKey, CaseIterable {
         case host, project
+    }
+}
+
+/// `projects.remove`. On a Linux host, `delete` deletes the clone VibeOS
+/// made too; a removal there that would delete one is refused without it.
+public struct ProjectRemoveParams: Codable, Hashable, Sendable {
+    public var host: String?
+    public var project: String
+    public var delete: Bool?
+
+    public init(host: String? = nil, project: String, delete: Bool? = nil) {
+        self.host = host
+        self.project = project
+        self.delete = delete
+    }
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case host, project, delete
     }
 }
 

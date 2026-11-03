@@ -409,6 +409,186 @@ async fn projects_with_agents_cannot_be_removed() {
     );
 }
 
+/// Removing a project on a Linux host deletes the clone VibeOS made there
+/// when asked to, and nothing else (#46): not without `delete`, not a local
+/// repo it was given, not a folder whose origin is another repo, nor
+/// anything a symlink points to. The answer says whether it deleted.
+#[tokio::test]
+async fn a_linux_host_deletes_a_removed_projects_clone_and_only_that() {
+    let golden = Golden::new();
+    let mut config = golden.config();
+    config.info.os = "linux".into();
+    config.layout = Layout::new(&golden.home, "linux");
+    let core = Arc::new(Core::open(config).unwrap());
+    let projects_dir = core.layout().projects_dir();
+    let server = serve(core, tempfile::tempdir().unwrap(), MAX_MESSAGE_BYTES);
+    let mut c = Conn::open(&server.path).await;
+
+    let added = c
+        .call("projects.add", json!({"repo": "me/web", "name": "site"}))
+        .await;
+    let site = projects_dir.join("site");
+    assert_eq!(ok(&added)["path"], site.to_str().unwrap());
+    ok(&c
+        .call("projects.add", json!({"repo": "me/web", "name": "next"}))
+        .await);
+    ok(&c
+        .call("projects.add", json!({"repo": "me/web", "name": "other"}))
+        .await);
+    let mine = golden.home.join("src/mine");
+    repo(&mine);
+    ok(&c.call("projects.add", json!({"path": mine})).await);
+    fs::write(site.join("work.txt"), "scratch").unwrap();
+
+    // Without delete it's refused, and says what it would delete.
+    let refused = c.call("projects.remove", json!({"project": "site"})).await;
+    assert_eq!(code(&refused), -32002, "{refused}");
+    let why = refused["error"]["message"].as_str().unwrap();
+    assert!(
+        why.contains(&format!("deletes its clone at {}", site.display()))
+            && why.contains("--delete"),
+        "{why}"
+    );
+    assert!(site.join("work.txt").exists());
+
+    let removed = c
+        .call(
+            "projects.remove",
+            json!({"project": "site", "delete": true}),
+        )
+        .await;
+    assert_eq!(ok(&removed)["deleted"], true, "{removed}");
+    assert!(!site.exists(), "the clone is deleted");
+    assert!(
+        projects_dir.join("next/README.md").exists(),
+        "its neighbour stays"
+    );
+    let left: Vec<_> = fs::read_dir(&projects_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    let mut left = left;
+    left.sort();
+    assert_eq!(left, ["next", "other"], "nothing set aside is left");
+
+    // A local repo is the owner's own: forgotten, never deleted, and the
+    // answer says so.
+    let kept = c
+        .call(
+            "projects.remove",
+            json!({"project": "mine", "delete": true}),
+        )
+        .await;
+    assert_eq!(ok(&kept).get("deleted"), None, "{kept}");
+    assert!(mine.join("README.md").exists());
+
+    // A clone whose origin is now another repo isn't this project's to
+    // delete: refused with delete, only forgotten without.
+    let other = projects_dir.join("other");
+    common::git(&[
+        "-C",
+        other.to_str().unwrap(),
+        "remote",
+        "set-url",
+        "origin",
+        "https://github.com/someone/else.git",
+    ]);
+    let refused = c
+        .call(
+            "projects.remove",
+            json!({"project": "other", "delete": true}),
+        )
+        .await;
+    assert_eq!(code(&refused), -32002, "{refused}");
+    let why = refused["error"]["message"].as_str().unwrap();
+    assert!(
+        why.contains("not me/web") && why.contains("Nothing was changed"),
+        "{why}"
+    );
+    let forgotten = c.call("projects.remove", json!({"project": "other"})).await;
+    assert_eq!(ok(&forgotten).get("deleted"), None);
+    assert!(other.join("README.md").exists(), "kept");
+
+    // A clone swapped for a symlink out of the projects folder is refused
+    // with delete, and the project kept.
+    let next = projects_dir.join("next");
+    fs::rename(&next, golden.home.join("moved")).unwrap();
+    std::os::unix::fs::symlink(golden.home.join("moved"), &next).unwrap();
+    let refused = c
+        .call(
+            "projects.remove",
+            json!({"project": "next", "delete": true}),
+        )
+        .await;
+    assert_eq!(code(&refused), -32002, "{refused}");
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("is a symlink"),
+        "{refused}"
+    );
+    assert!(golden.home.join("moved/README.md").exists());
+    let listed = c.call("projects.list", json!({})).await;
+    assert_eq!(ok(&listed)["projects"][0]["name"], "next");
+    // Without delete it's forgotten, and what the symlink points to stays.
+    ok(&c.call("projects.remove", json!({"project": "next"})).await);
+    assert!(golden.home.join("moved/README.md").exists());
+}
+
+/// A removal waits for a start in the project that's under way, so nothing
+/// writes into a clone while it's deleted; and a start waits for a removal
+/// under way, then finds no project.
+#[tokio::test]
+async fn a_removal_and_a_start_in_one_project_take_turns() {
+    let golden = Golden::new();
+    let mut config = golden.config();
+    config.info.os = "linux".into();
+    config.layout = Layout::new(&golden.home, "linux");
+    let core = Arc::new(Core::open(config).unwrap());
+    let added = core
+        .add_project(vibe_core::rpc::ProjectAddParams {
+            repo: Some("me/web".into()),
+            name: Some("site".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let held = core.project_in_use("site").await;
+    let removal = {
+        let core = Arc::clone(&core);
+        tokio::spawn(async move {
+            core.remove_project(vibe_core::rpc::ProjectRemoveParams {
+                project: "site".into(),
+                delete: true,
+                ..Default::default()
+            })
+            .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!removal.is_finished(), "it waits for the start");
+    assert!(std::path::Path::new(&added.path).join("README.md").exists());
+    drop(held);
+    let removed = removal.await.unwrap().unwrap();
+    assert!(removed.deleted);
+    assert!(!std::path::Path::new(&added.path).exists());
+    let start = core
+        .start_agent(vibe_core::rpc::AgentStartParams {
+            project: "site".into(),
+            profile: "software-eng-linux".into(),
+            prompt: "hi".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        start.code,
+        vibe_core::rpc::ErrorCode::NotFound.code(),
+        "{start:?}"
+    );
+}
+
 #[tokio::test]
 async fn github_projects_clone_once_and_leave_nothing_half_done() {
     let golden = Golden::new();

@@ -4,11 +4,12 @@ import VibeMenu
 import VibeRPC
 
 /// Settings… (PRD: Menu bar, Footer): projects and their profiles, API keys,
-/// hosts and external access, host limits, and the menu's own preferences,
-/// in a sidebar as System Settings has. Every value is vibed's; nothing is
-/// kept here but the menu's own preferences. Fields save themselves.
+/// hosts and external access, the Linux toolbox, host limits, and the
+/// menu's own preferences, in a sidebar as System Settings has. Every value
+/// is vibed's; nothing is kept here but the menu's own preferences. Fields
+/// save themselves.
 enum SettingsPane: String, CaseIterable, Identifiable {
-    case projects, keys, hosts, limits, general
+    case projects, keys, hosts, toolbox, limits, general
 
     /// Where the last pane shown is kept, so Settings opens where it was
     /// and the menu can open it on a pane.
@@ -21,6 +22,7 @@ enum SettingsPane: String, CaseIterable, Identifiable {
         case .projects: "Projects"
         case .keys: "API Keys"
         case .hosts: "Hosts"
+        case .toolbox: "Linux Toolbox"
         case .limits: "Host Limits"
         case .general: "General"
         }
@@ -31,6 +33,7 @@ enum SettingsPane: String, CaseIterable, Identifiable {
         case .projects: "folder.fill"
         case .keys: "key.fill"
         case .hosts: "server.rack"
+        case .toolbox: "shippingbox.fill"
         case .limits: "gauge.with.dots.needle.67percent"
         case .general: "gearshape.fill"
         }
@@ -41,6 +44,7 @@ enum SettingsPane: String, CaseIterable, Identifiable {
         case .projects: .blue
         case .keys: .orange
         case .hosts: .indigo
+        case .toolbox: .brown
         case .limits: .green
         case .general: .gray
         }
@@ -52,11 +56,17 @@ struct SettingsView: View {
     /// A pane to show instead of the one last shown, for the gallery.
     var showing: SettingsPane?
     @AppStorage(SettingsPane.storageKey) private var stored = SettingsPane.projects.rawValue
+    /// Where each pane is: picking one in the sidebar, the one shown
+    /// included, takes it back to its first level.
+    @State private var place = SettingsPlace()
 
     private var pane: Binding<SettingsPane?> {
         Binding(
             get: { showing ?? SettingsPane(rawValue: stored) ?? .projects },
-            set: { if let pane = $0 { stored = pane.rawValue } })
+            set: {
+                if let pane = $0 { stored = pane.rawValue }
+                place.picked()
+            })
     }
 
     var body: some View {
@@ -68,15 +78,22 @@ struct SettingsView: View {
                     IconTile(symbol: item.symbol, color: item.color)
                 }
                 .tag(item)
+                // A click on the pane already shown takes it back to its
+                // first level too.
+                .simultaneousGesture(TapGesture().onEnded { if item == pane.wrappedValue { place.picked() } })
             }
             .navigationSplitViewColumnWidth(min: 180, ideal: 200, max: 240)
             .toolbar(removing: .sidebarToggle)
         } detail: {
             switch pane.wrappedValue ?? .projects {
-            case .projects: NavigationStack { ProjectsPane(model: model) }
+            case .projects:
+                NavigationStack(path: $place.projects) {
+                    ProjectsPane(model: model, host: $place.projectsHost)
+                }
             case .keys: KeysPane(model: model)
             case .hosts: HostsPane(model: model)
-            case .limits: LimitsPane(model: model)
+            case .toolbox: ToolboxPane(model: model)
+            case .limits: LimitsPane(model: model, host: $place.limitsHost)
             case .general: GeneralPane()
             }
         }
@@ -102,7 +119,7 @@ struct HostPicker: View {
 
 struct ProjectsPane: View {
     @ObservedObject var model: MenuModel
-    @State private var host = VibeRPC.localHost
+    @Binding var host: String
     @State private var projects: [Project] = []
     @State private var loaded = false
     @State private var source = ""
@@ -123,9 +140,7 @@ struct ProjectsPane: View {
                         .foregroundStyle(.secondary)
                 }
                 ForEach(projects, id: \.name) { project in
-                    NavigationLink {
-                        ProjectDetail(model: model, host: host, name: project.name)
-                    } label: {
+                    NavigationLink(value: project.name) {
                         ProjectLabel(project: project)
                     }
                 }
@@ -160,6 +175,9 @@ struct ProjectsPane: View {
         }
         .formStyle(.grouped)
         .navigationTitle("Projects")
+        .navigationDestination(for: String.self) { name in
+            ProjectDetail(model: model, host: host, name: name)
+        }
         .task(id: "\(host)#\(model.settingsRevision)") { await load() }
     }
 
@@ -329,8 +347,7 @@ struct ProjectDetail: View {
                     Button("Remove Project…", role: .destructive) { Task { await remove(project) } }
                     ErrorText(error: error)
                 } footer: {
-                    Text("VibeOS forgets the project and its profiles; its files stay at \(project.path). "
-                        + "A project with agents can't be removed.")
+                    Text(removalNote(project) + " A project with agents can't be removed.")
                         .foregroundStyle(.secondary)
                 }
             } else if let error {
@@ -366,16 +383,33 @@ struct ProjectDetail: View {
         }
     }
 
+    /// Whether removing `project` deletes its clone: on a Linux host, the
+    /// clone VibeOS made goes with it (PRD: Add a project). A local repo,
+    /// and anything on this Mac, stays.
+    private func deletesFiles(_ project: Project) -> Bool {
+        project.source == .github && model.hosts.first { $0.name == host }?.os == "linux"
+    }
+
+    private func removalNote(_ project: Project) -> String {
+        deletesFiles(project)
+            ? "VibeOS forgets the project and its profiles, and deletes its clone at \(project.path) on \(host)."
+            : "VibeOS forgets the project and its profiles; its files stay at \(project.path)."
+    }
+
     private func remove(_ project: Project) async {
-        guard
-            confirm(
-                "Remove \(project.name)?",
-                detail: "VibeOS forgets it and its profiles. Its files stay at \(project.path), and adding it "
-                    + "again picks them up.",
-                action: "Remove")
+        let detail =
+            deletesFiles(project)
+            ? "This deletes \(project.path) on \(host), with any branches there that were never pushed. "
+                + "It can't be undone."
+            : "VibeOS forgets it and its profiles. Its files stay at \(project.path), and adding it again picks "
+                + "them up."
+        guard confirm("Remove \(project.name)?", detail: detail, action: deletesFiles(project) ? "Delete" : "Remove")
         else { return }
         do {
-            _ = try await model.call(ProjectsRemove.self, ProjectParams(host: host, project: project.name))
+            // Confirmed above, so on a Linux host the clone goes too.
+            _ = try await model.call(
+                ProjectsRemove.self,
+                ProjectRemoveParams(host: host, project: project.name, delete: deletesFiles(project) ? true : nil))
             dismiss()
         } catch {
             self.error = describe(error)
@@ -635,7 +669,14 @@ struct KeysPane: View {
         .sheet(isPresented: $creating, onDismiss: { Task { await load() } }) {
             NewKeySheet(model: model)
         }
-        .task(id: model.settingsRevision) { await load() }
+        // Again every half minute while it shows, as keys are used all the
+        // while, here and on Linux hosts.
+        .task(id: model.settingsRevision) {
+            repeat {
+                await load()
+                try? await Task.sleep(for: .seconds(30))
+            } while !Task.isCancelled
+        }
     }
 
     private var keysNote: String {
@@ -680,8 +721,13 @@ struct KeyRow: View {
                 .frame(width: 20)
             VStack(alignment: .leading, spacing: 2) {
                 Text(key.name)
-                Text("\(Text(key.prefix + "…").font(.caption.monospaced()))\(Text(" · " + details).font(.caption))")
+                // "Last used 3 minutes ago" stays true as the minutes pass.
+                TimelineView(.periodic(from: .now, by: 30)) { context in
+                    Text(
+                        "\(Text(key.prefix + "…").font(.caption.monospaced()))\(Text(" · " + details(now: context.date)).font(.caption))"
+                    )
                     .foregroundStyle(.secondary)
+                }
             }
             // The name and details read as one; Revoke stays its own button.
             .accessibilityElement(children: .combine)
@@ -694,10 +740,9 @@ struct KeyRow: View {
         }
     }
 
-    private var details: String {
-        let made = parseTime(key.createdAt).map { "made \($0.formatted(.dateTime.month(.abbreviated).day()))" }
-        let used = key.lastUsedAt.flatMap(parseTime).map { "used \($0.formatted(.relative(presentation: .named)))" }
-        return [made, used ?? "never used"].compactMap { $0 }.joined(separator: " · ")
+    private func details(now: Date) -> String {
+        let made = parseTime(key.createdAt).map { "Made \($0.formatted(.dateTime.month(.abbreviated).day()))" }
+        return [made, keyUsage(key.lastUsedAt, now: now)].compactMap { $0 }.joined(separator: " · ")
     }
 }
 
@@ -1241,11 +1286,16 @@ struct ExternalAddressSheet: View {
 
 struct LimitsPane: View {
     @ObservedObject var model: MenuModel
-    @State private var host = VibeRPC.localHost
+    @Binding var host: String
     @State private var limits: HostLimits?
     @State private var error: String?
 
+    /// The selected host's OS, as vibed says: the labels follow it.
+    private var os: String { model.hosts.first { $0.name == host }?.os ?? "macos" }
+
     /// Each limit: its key in `host.toml`, a label, its kind, and its value.
+    /// A Linux host has its own words for a few, and some don't apply there
+    /// at all: it has no VMs to give disks or snapshots to.
     struct Field {
         enum Kind { case bytes, count, seconds }
         let key: String
@@ -1253,6 +1303,15 @@ struct LimitsPane: View {
         let kind: Kind
         let value: KeyPath<HostLimits, Int>
         let set: WritableKeyPath<LimitsSetParams, Int?>
+        /// The label on a Linux host, if it differs; `.some(nil)` where it
+        /// doesn't apply.
+        var onLinux: String?? = .none
+
+        /// The label on a host running `os`, or nil where it doesn't apply.
+        func label(on os: String) -> String? {
+            guard os == "linux", let linux = onLinux else { return label }
+            return linux
+        }
     }
 
     struct FieldGroup {
@@ -1265,13 +1324,13 @@ struct LimitsPane: View {
             title: "Agents and CPU",
             fields: [
                 Field(key: "reserve_cores", label: "Cores kept for macOS", kind: .count,
-                      value: \.reserveCores, set: \.reserveCores),
+                      value: \.reserveCores, set: \.reserveCores, onLinux: "Cores kept for the server"),
                 Field(key: "cpu_cores", label: "CPU cores per agent", kind: .count,
                       value: \.cpuCores, set: \.cpuCores),
                 Field(key: "max_awake_agents", label: "Most agents awake at once", kind: .count,
                       value: \.maxAwakeAgents, set: \.maxAwakeAgents),
                 Field(key: "max_processes", label: "Processes per macOS agent", kind: .count,
-                      value: \.maxProcesses, set: \.maxProcesses),
+                      value: \.maxProcesses, set: \.maxProcesses, onLinux: "Processes per agent"),
             ]),
         FieldGroup(
             title: "Disk",
@@ -1281,9 +1340,9 @@ struct LimitsPane: View {
                 Field(key: "disk_hard", label: "Worktree disk: pause past", kind: .bytes,
                       value: \.diskHard, set: \.diskHard),
                 Field(key: "vm_disk", label: "A Linux agent's own disk", kind: .bytes,
-                      value: \.vmDisk, set: \.vmDisk),
+                      value: \.vmDisk, set: \.vmDisk, onLinux: .some(nil)),
                 Field(key: "snapshot_disk", label: "Disk for all sleeping Linux agents", kind: .bytes,
-                      value: \.snapshotDisk, set: \.snapshotDisk),
+                      value: \.snapshotDisk, set: \.snapshotDisk, onLinux: .some(nil)),
             ]),
         FieldGroup(
             title: "Sleep",
@@ -1302,16 +1361,18 @@ struct LimitsPane: View {
                 ForEach(Self.groups, id: \.title) { group in
                     Section(group.title) {
                         ForEach(group.fields, id: \.key) { field in
-                            LabeledContent {
-                                CommitField(
-                                    title: field.label, value: text(field, limits[keyPath: field.value]), width: 90,
-                                    help: "\(field.key) in host.toml", isValid: { parse(field.kind, $0) != nil }
-                                ) { text in
-                                    await save(field, text)
+                            if let label = field.label(on: os) {
+                                LabeledContent {
+                                    CommitField(
+                                        title: label, value: text(field, limits[keyPath: field.value]), width: 90,
+                                        help: "\(field.key) in host.toml", isValid: { parse(field.kind, $0) != nil }
+                                    ) { text in
+                                        await save(field, text)
+                                    }
+                                } label: {
+                                    Text(label)
+                                    Text(field.key).font(.caption.monospaced())
                                 }
-                            } label: {
-                                Text(field.label)
-                                Text(field.key).font(.caption.monospaced())
                             }
                         }
                     }

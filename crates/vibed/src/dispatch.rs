@@ -183,7 +183,7 @@ async fn call(
         ProjectsList::NAME => encode_result(core.projects(decode::<ProjectsList>(params)?)),
         ProjectsAdd::NAME => encode_result(core.add_project(decode::<ProjectsAdd>(params)?).await),
         ProjectsRemove::NAME => {
-            encode_result(core.remove_project(decode::<ProjectsRemove>(params)?))
+            encode_result(core.remove_project(decode::<ProjectsRemove>(params)?).await)
         }
         ProfilesList::NAME => encode_result(core.profiles(decode::<ProfilesList>(params)?)),
         ProfilesCreate::NAME => {
@@ -201,7 +201,7 @@ async fn call(
         McpSet::NAME => encode_result(core.set_mcp(decode::<McpSet>(params)?)),
         KeysList::NAME => {
             decode::<KeysList>(params)?;
-            encode_result(core.keys())
+            encode_result(core.keys_everywhere().await)
         }
         KeysCreate::NAME => encode_result(core.create_key(decode::<KeysCreate>(params)?)),
         KeysRevoke::NAME => encode_result(core.revoke_key(decode::<KeysRevoke>(params)?)),

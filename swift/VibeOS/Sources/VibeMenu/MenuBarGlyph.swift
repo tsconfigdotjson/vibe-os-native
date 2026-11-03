@@ -1,11 +1,11 @@
 import AppKit
 import VibeRPC
 
-/// What the menu bar icon shows (PRD: Menu bar icon): the app icon's four
-/// windows, lit one by one as agents wake. While any agent has a question,
-/// the top right window is an amber dot; while any is paused by a limit,
-/// the bottom right one is a red dot. The count of awake agents sits beside
-/// it as text.
+/// What the menu bar icon shows (PRD: Menu bar icon): four windows, the
+/// compartments agents run in, lit one by one as agents wake. While any
+/// agent has a question, the top right window is an amber dot; while any is
+/// paused by a limit, the bottom right one is a red dot. The count of awake
+/// agents sits beside it as text.
 public struct GlyphState: Equatable, Sendable {
     /// Windows lit, 0 to 4: one per awake agent, all four from four up.
     public var lit: Int
@@ -44,7 +44,7 @@ public enum MenuBarGlyph {
     public static let size = NSSize(width: 16, height: 16)
 
     /// The windows in the order they light: top left, bottom left, bottom
-    /// right, then top right, the one the app icon shows asleep.
+    /// right, then top right, the one the brand mark shows asleep.
     static let order: [(column: Int, row: Int)] = [(0, 0), (0, 1), (1, 1), (1, 0)]
     static let cell: CGFloat = 6.5
     static let gap: CGFloat = 2

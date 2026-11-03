@@ -16,12 +16,16 @@ use vibe_core::model::{
     validate_ssh_destination,
 };
 use vibe_core::rpc::{
-    Agent, AgentList, AgentsList, ErrorCode, ErrorObject, HostAddParams, HostExternalParams,
-    HostInfo, HostInstall, HostList, HostNameParams, HostsExternal, KeyList, KeySyncParams,
-    KeysSync, Method,
+    Agent, AgentList, AgentsList, ApiKey, ErrorCode, ErrorObject, HostAddParams,
+    HostExternalParams, HostInfo, HostInstall, HostList, HostNameParams, HostsExternal, KeyList,
+    KeySyncParams, KeysList, KeysSync, Method, NoParams,
 };
+use vibe_core::time::parse_rfc3339;
 
 use crate::core::{Core, error, invalid, lock, store_error};
+
+/// How long a connected host has to say when keys were last used there.
+const KEYS_ASK: Duration = Duration::from_secs(3);
 use std::sync::atomic::Ordering;
 
 use crate::link::{Link, tried_upgrade};
@@ -55,11 +59,13 @@ pub const FORWARDED: &[&str] = &[
 
 /// How long a forwarded call may take. Starting an agent fetches, cuts a
 /// worktree and runs `.vibe/setup.sh`, and adding a project may clone a
-/// big repo: those get as long as they need here, within reason. A send
-/// may wake an agent first.
+/// big repo, and removing one on a Linux host may delete it: those get as
+/// long as they need here, within reason. A send may wake an agent first.
 pub(crate) fn call_timeout(method: &str) -> Duration {
     match method {
-        "agents.start" | "projects.add" | "agents.delete" => Duration::from_secs(60 * 60),
+        "agents.start" | "projects.add" | "projects.remove" | "agents.delete" => {
+            Duration::from_secs(60 * 60)
+        }
         "agents.send" | "sessions.attach" => Duration::from_secs(5 * 60),
         _ => Duration::from_secs(2 * 60),
     }
@@ -639,7 +645,8 @@ impl Core {
                 .forward_typed::<KeysSync>(&link, &KeySyncParams { keys })
                 .await
             {
-                Ok(_) => {
+                Ok(there) => {
+                    core.note_key_uses(&link.name, &there.keys);
                     link.keys_stale.store(false, Ordering::SeqCst);
                     crate::log!(
                         "vibed: pushed {n} API key{} to {}",
@@ -658,6 +665,70 @@ impl Core {
                 }
             }
         });
+    }
+
+    /// `keys.list`: every key, with when it was last used anywhere. A key
+    /// made here and pushed to Linux hosts is used there too, where the
+    /// host records it; each connected host is asked, and what it saw is
+    /// kept here, so the time stands while the host is away.
+    pub async fn keys_everywhere(&self) -> Result<KeyList, ErrorObject> {
+        let links: Vec<Arc<Link>> = lock(&self.links)
+            .values()
+            .filter(|l| l.connected())
+            .cloned()
+            .collect();
+        // All at once, each given the same few seconds: connected hosts
+        // answer at once, and one that doesn't is let go. Links run only
+        // where this core knows itself, as an `Arc`.
+        if let Some(core) = self.me.get().and_then(std::sync::Weak::upgrade) {
+            let mut asked = tokio::task::JoinSet::new();
+            for link in links {
+                let core = Arc::clone(&core);
+                asked.spawn(async move { core.ask_key_uses(&link).await });
+            }
+            asked.join_all().await;
+        } else {
+            for link in links {
+                self.ask_key_uses(&link).await;
+            }
+        }
+        self.keys()
+    }
+
+    /// Asks `link`'s host when the keys pushed to it were last used there,
+    /// for [`KEYS_ASK`] at most, and keeps what it says.
+    async fn ask_key_uses(&self, link: &Link) {
+        let there =
+            tokio::time::timeout(KEYS_ASK, self.forward_typed::<KeysList>(link, &NoParams {}))
+                .await;
+        match there {
+            Ok(Ok(there)) => self.note_key_uses(&link.name, &there.keys),
+            Ok(Err(e)) => crate::log!(
+                "vibed: can't ask {} when keys were last used: {}",
+                link.name,
+                e.message
+            ),
+            Err(_) => crate::log!(
+                "vibed: {} didn't say when keys were last used in {}s",
+                link.name,
+                KEYS_ASK.as_secs()
+            ),
+        }
+    }
+
+    /// Keeps the uses a host recorded of the keys pushed to it.
+    pub(crate) fn note_key_uses(&self, host: &str, there: &[ApiKey]) {
+        let mut store = self.store();
+        for k in there.iter().filter(|k| k.pushed) {
+            let Some(at) = k.last_used_at.as_deref().and_then(parse_rfc3339) else {
+                continue;
+            };
+            match store.note_key_used(&k.name, &k.prefix, at) {
+                Ok(true) => crate::log!("vibed: API key {} was used on {host}", k.name),
+                Ok(false) => {}
+                Err(e) => crate::log!("vibed: can't record {}'s use on {host}: {e}", k.name),
+            }
+        }
     }
 
     /// `keys.sync`: the keys a Mac pushed here, by their hashes, in place of

@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use vibe_core::model::{AgentState, validate_ref};
+use vibe_core::model::{Activity, AgentState, validate_ref};
 use vibe_core::rpc::{
     AgentCheck, AgentCheckParams, AgentMessagesParams, AgentOutput, AgentOutputParams,
     AgentSendParams, AgentSent, ErrorCode, ErrorObject, MessageList,
@@ -73,7 +73,7 @@ pub fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
 
 /// The screen only, with no history, and whether the program wants
 /// bracketed paste: a read from past the end of the history.
-fn screen_now(socket: &Path) -> std::io::Result<Output> {
+pub(crate) fn screen_now(socket: &Path) -> std::io::Result<Output> {
     let mut c = shim::connect(socket, &shim::control_hello("vibed"), SHIM_TIMEOUT)
         .map_err(|e| std::io::Error::other(e.to_string()))?;
     c.read_output(Some(u64::MAX))
@@ -321,6 +321,11 @@ impl Core {
         } else {
             self.observed_state(&record, &status).await
         };
+        // A permission prompt agent-tail only guesses at is no answer while
+        // the agent is busy, as a long silent tool run is: the wait goes on
+        // until the screen shows the dialog, or the tool ends.
+        let answered = answered
+            && !(status.activity == Activity::AwaitingApproval && state == AgentState::Busy);
         Ok(Check {
             state,
             activity: status.activity,

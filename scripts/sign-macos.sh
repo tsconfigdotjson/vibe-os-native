@@ -35,14 +35,13 @@ cp "$app_bin" "$APP/Contents/MacOS/VibeOS"
 mkdir -p "$APP/Contents/Library/LaunchAgents"
 cp swift/VibeOS/Support/io.github.tsconfigdotjson.VibeOS.vibed.plist "$APP/Contents/Library/LaunchAgents/"
 plutil -lint "$APP/Contents/Library/LaunchAgents/io.github.tsconfigdotjson.VibeOS.vibed.plist"
-# The app icon, "Night Shift": scripts/app-icon.py draws it with nothing but
-# python3's standard library, and iconutil makes the .icns. It's drawn again
-# only when the script changes.
+# The app icon: VibeOS's own (swift/VibeOS/Support/AppIcon.svg), every size
+# of it checked in as AppIcon.iconset (scripts/app-icon.swift renders them).
+# iconutil makes the .icns, again only when the iconset changes.
+iconset=swift/VibeOS/Support/AppIcon.iconset
 icns="$OUT/AppIcon.icns"
-if [ ! -s "$icns" ] || [ scripts/app-icon.py -nt "$icns" ]; then
-  rm -rf "$OUT/AppIcon.iconset"
-  python3 scripts/app-icon.py "$OUT/AppIcon.iconset"
-  iconutil -c icns "$OUT/AppIcon.iconset" -o "$icns"
+if [ ! -s "$icns" ] || [ -n "$(find "$iconset" -newer "$icns")" ]; then
+  iconutil -c icns "$iconset" -o "$icns"
 fi
 mkdir -p "$APP/Contents/Resources"
 cp "$icns" "$APP/Contents/Resources/AppIcon.icns"

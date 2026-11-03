@@ -11,8 +11,8 @@ use vibe_core::rpc::{
     HostAddParams, HostExternalParams, HostInfo, HostInstall, HostLink, HostNameParams, HostParams,
     HostsAdd, HostsExternal, HostsList, HostsRemove, HostsUpgrade, NoParams, Profile,
     ProfileCreateParams, ProfileParams, ProfileUpdateParams, ProfilesCreate, ProfilesDelete,
-    ProfilesList, ProfilesUpdate, Project, ProjectAddParams, ProjectParams, ProjectsAdd,
-    ProjectsList, ProjectsRemove,
+    ProfilesList, ProfilesUpdate, Project, ProjectAddParams, ProjectParams, ProjectRemoveParams,
+    ProjectsAdd, ProjectsList, ProjectsRemove,
 };
 use vibe_core::units::{format_size, parse_size};
 
@@ -48,6 +48,8 @@ pub(crate) enum Command {
     RemoveProject {
         host: Option<String>,
         project: String,
+        /// On a Linux host, delete the clone too (`--delete`).
+        delete: bool,
     },
     Profiles {
         host: Option<String>,
@@ -151,7 +153,13 @@ const PROFILE_FLAGS: [&str; 6] = [
 impl Command {
     /// From the words after `project`.
     pub(crate) fn parse_project(words: &[String]) -> Result<Command, String> {
-        let (plain, found) = flags(words, &["host", "name"])?;
+        // `--delete` takes no value.
+        let delete = words.iter().any(|w| w == "--delete");
+        let words: Vec<String> = words.iter().filter(|w| *w != "--delete").cloned().collect();
+        let (plain, found) = flags(&words, &["host", "name"])?;
+        if delete && !matches!(plain.first(), Some(&("remove" | "rm"))) {
+            return Err("--delete goes with project remove".into());
+        }
         let host = value(&found, "host").map(str::to_owned);
         match plain.as_slice() {
             [] | ["list" | "ls"] => Ok(Command::Projects { host }),
@@ -163,10 +171,14 @@ impl Command {
             ["remove" | "rm", project] => Ok(Command::RemoveProject {
                 host,
                 project: (*project).to_owned(),
+                delete,
             }),
             ["add"] => Err("project add needs a GitHub owner/name or a path".into()),
             ["remove" | "rm"] => Err("project remove needs a project's name".into()),
-            _ => Err("project takes list, add OWNER/NAME|PATH [--name NAME] or remove NAME".into()),
+            _ => Err(
+                "project takes list, add OWNER/NAME|PATH [--name NAME] or remove NAME [--delete]"
+                    .into(),
+            ),
         }
     }
 
@@ -270,6 +282,15 @@ impl Command {
 }
 
 /// A project and its profiles, as lines.
+/// What `project remove` did, as it was: the clone deleted, or left.
+pub(crate) fn describe_removal(p: &Project) -> String {
+    if p.deleted {
+        format!("removed {} and deleted its clone at {}", p.name, p.path)
+    } else {
+        format!("removed {}; {} is left as it was", p.name, p.path)
+    }
+}
+
 pub(crate) fn describe_project(p: &Project) -> String {
     let mut out = format!("{}  {}", p.name, p.path);
     if let Some(repo) = &p.repo {
@@ -426,11 +447,19 @@ pub(crate) fn run(socket: &Path, command: Command) -> Result<(), String> {
             let p = client::call::<ProjectsAdd>(socket, &params, LONG_TIMEOUT).map_err(e)?;
             print!("added {}", describe_project(&p));
         }
-        Command::RemoveProject { host, project } => {
-            let p =
-                client::call::<ProjectsRemove>(socket, &ProjectParams { host, project }, TIMEOUT)
-                    .map_err(e)?;
-            println!("removed {}; {} is left as it was", p.name, p.path);
+        Command::RemoveProject {
+            host,
+            project,
+            delete,
+        } => {
+            let params = ProjectRemoveParams {
+                host,
+                project,
+                delete,
+            };
+            // Deleting a big clone takes a while.
+            let p = client::call::<ProjectsRemove>(socket, &params, LONG_TIMEOUT).map_err(e)?;
+            println!("{}", describe_removal(&p));
         }
         Command::Profiles { host, project } => {
             let list =
@@ -568,9 +597,19 @@ mod tests {
             Command::parse_project(&words(&["remove", "web"])),
             Ok(Command::RemoveProject {
                 host: None,
-                project: "web".into()
+                project: "web".into(),
+                delete: false
             })
         );
+        assert_eq!(
+            Command::parse_project(&words(&["rm", "--delete", "web", "--host", "vps"])),
+            Ok(Command::RemoveProject {
+                host: Some("vps".into()),
+                project: "web".into(),
+                delete: true
+            })
+        );
+        assert!(Command::parse_project(&words(&["add", "me/web", "--delete"])).is_err());
         assert!(Command::parse_project(&words(&["add"])).is_err());
         assert!(Command::parse_project(&words(&["add", "a", "b"])).is_err());
         assert!(Command::parse_project(&words(&["add", "a", "--nmae", "b"])).is_err());
@@ -687,7 +726,20 @@ mod tests {
             path: "/home/me/VibeOS/projects/web".into(),
             added_at: "t".into(),
             profiles: vibe_core::model::starter_profiles("linux"),
+            deleted: false,
         };
+        assert_eq!(
+            describe_removal(&p),
+            "removed web; /home/me/VibeOS/projects/web is left as it was"
+        );
+        let gone = Project {
+            deleted: true,
+            ..p.clone()
+        };
+        assert_eq!(
+            describe_removal(&gone),
+            "removed web and deleted its clone at /home/me/VibeOS/projects/web"
+        );
         assert_eq!(
             describe_project(&p),
             "web  /home/me/VibeOS/projects/web  (me/web)  on vps\n  \

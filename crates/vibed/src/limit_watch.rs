@@ -128,7 +128,8 @@ impl Core {
                 }
                 None if a.state == AgentState::Paused => {
                     let status = self.agent_status(&mut a, self.idle_debounce()).await;
-                    self.set_state(&mut a, status.state());
+                    let state = self.running_state(&a.agent_ref, &status).await;
+                    self.set_state(&mut a, state);
                 }
                 _ => {}
             }

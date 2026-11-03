@@ -1,6 +1,6 @@
 {
-  "description": "Forgets a project and its profiles, and returns it. Its files stay on disk. Refused while it has agents.",
-  "request": {"jsonrpc": "2.0", "id": 34, "method": "projects.remove", "params": {"host": "local", "project": "app"}},
+  "description": "Forgets a project and its profiles, and returns it. On the Mac its files stay on disk, delete or not. On a Linux host, delete also deletes the clone VibeOS made, and the answer's deleted says so; without delete, a removal there that would delete one is refused. Refused while it has agents.",
+  "request": {"jsonrpc": "2.0", "id": 34, "method": "projects.remove", "params": {"host": "local", "project": "app", "delete": true}},
   "response": {
     "jsonrpc": "2.0",
     "id": 34,

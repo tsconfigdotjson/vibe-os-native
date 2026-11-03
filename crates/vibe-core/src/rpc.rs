@@ -494,7 +494,7 @@ method! {
 method! {
     /// `projects.remove`: forgets a project and its profiles. Its files stay
     /// on disk. Refused while it has agents.
-    ProjectsRemove = "projects.remove", ProjectParams => Project
+    ProjectsRemove = "projects.remove", ProjectRemoveParams => Project
 }
 
 method! {
@@ -910,6 +910,10 @@ pub struct Project {
     pub path: String,
     pub added_at: String,
     pub profiles: Vec<Profile>,
+    /// Only in `projects.remove`'s answer: its clone was deleted from disk
+    /// too, as on a Linux host with `delete`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deleted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -940,6 +944,21 @@ pub struct ProjectParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
     pub project: String,
+}
+
+/// What `projects.remove` takes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectRemoveParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    pub project: String,
+    /// On a Linux host, delete the clone VibeOS made for it as well. A
+    /// removal there that would delete a clone is refused without it, and
+    /// says what it would delete; with it, one that can't safely delete
+    /// the clone is refused, and without it that one is only forgotten.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub delete: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

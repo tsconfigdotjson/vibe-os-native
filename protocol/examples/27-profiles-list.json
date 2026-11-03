@@ -1,6 +1,6 @@
 {
   "description": "A project's profiles, oldest first. Memory is in bytes.",
-  "request": {"jsonrpc": "2.0", "id": 27, "method": "profiles.list", "params": {"project": "web"}},
+  "request": {"jsonrpc": "2.0", "id": 27, "method": "profiles.list", "params": {"host": "local", "project": "web"}},
   "response": {
     "jsonrpc": "2.0",
     "id": 27,

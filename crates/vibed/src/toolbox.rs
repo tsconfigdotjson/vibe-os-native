@@ -155,8 +155,22 @@ impl Core {
         }
     }
 
-    fn set_toolbox(&self, state: ToolboxState) {
-        *lock(&self.toolbox_state) = state;
+    /// Sets what the toolbox is doing. Says whether that changed.
+    fn set_toolbox(&self, state: ToolboxState) -> bool {
+        let was = std::mem::replace(&mut *lock(&self.toolbox_state), state);
+        if was != state {
+            crate::log!("vibed: the toolbox is {state} now, was {was}");
+        }
+        was != state
+    }
+
+    /// The toolbox is closed again without a run to report, as when an
+    /// open fails or its shell is gone with nothing to save: subscribers
+    /// are told, so none goes on showing a shell open that isn't (#46).
+    fn toolbox_closed(&self) {
+        if self.set_toolbox(ToolboxState::Closed) {
+            self.publish(self.event(EventKind::ToolboxChanged));
+        }
     }
 
     fn toolbox_event(&self, message: String) {
@@ -346,12 +360,12 @@ impl Core {
             Ok(Ok(end)) => end,
             Ok(Err(e)) => {
                 if !host.is_open() {
-                    self.set_toolbox(ToolboxState::Closed);
+                    self.toolbox_closed();
                 }
                 return Err(failed(format!("can't open the toolbox: {e}")));
             }
             Err(e) => {
-                self.set_toolbox(ToolboxState::Closed);
+                self.toolbox_closed();
                 return Err(e);
             }
         };
@@ -363,7 +377,7 @@ impl Core {
                 if !was_open {
                     let host = Arc::clone(&host);
                     let _ = blocking(move || host.discard()).await;
-                    self.set_toolbox(ToolboxState::Closed);
+                    self.toolbox_closed();
                 }
                 return Err(failed(format!("can't hold the toolbox shell: {why}")));
             }
@@ -403,7 +417,7 @@ impl Core {
         let result = match result {
             Ok(r) => r,
             Err(e) => {
-                self.set_toolbox(ToolboxState::Closed);
+                self.toolbox_closed();
                 return Err(e);
             }
         };
@@ -426,7 +440,7 @@ impl Core {
         let result = match result {
             Ok(r) => r,
             Err(e) => {
-                self.set_toolbox(ToolboxState::Closed);
+                self.toolbox_closed();
                 return Err(e);
             }
         };
@@ -437,7 +451,7 @@ impl Core {
     async fn close_toolbox(&self, host: Arc<dyn ToolboxHost>) {
         let _op = self.toolbox_op.lock().await;
         if !host.is_open() {
-            self.set_toolbox(ToolboxState::Closed);
+            self.toolbox_closed();
             return;
         }
         // Opened again while this waited: its shell runs on.
@@ -462,6 +476,17 @@ impl Core {
             return;
         };
         if !host.is_open() {
+            // Said to be open, but nothing is: what the shell had is gone
+            // (an unfinished toolbox thrown away, say), so it's closed. Not
+            // while something holds the toolbox, as an open about to boot.
+            if *lock(&self.toolbox_state) == ToolboxState::Open
+                && let Ok(_op) = self.toolbox_op.try_lock()
+                && !host.is_open()
+                && *lock(&self.toolbox_state) == ToolboxState::Open
+            {
+                crate::log!("vibed: the toolbox was said to be open, but no shell is");
+                self.toolbox_closed();
+            }
             return;
         }
         let socket = self.layout.session_socket(TOOLBOX_REF);
