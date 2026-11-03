@@ -41,8 +41,9 @@ public final class MenuModel: ObservableObject {
     @Published public var message: String?
     /// Bumped by every event about settings, so open settings re-read.
     @Published public private(set) var settingsRevision = 0
-    /// The time rows count elapsed time to; moves on with each refresh.
-    @Published public private(set) var now = Date()
+    /// The time rows count elapsed time to, to the second: it moves on
+    /// with each refresh while the menu is open, which alone shows it.
+    @Published public private(set) var now = MenuModel.second(Date())
     /// Refs being attached, so a second click waits for the first.
     @Published public private(set) var attaching: Set<String> = []
     /// How this copy of the app is installed (Install.swift).
@@ -53,7 +54,12 @@ public final class MenuModel: ObservableObject {
 
     /// While the menu is open it polls more often, for memory bars.
     public var menuIsOpen = false {
-        didSet { if menuIsOpen && !oldValue { pollNow() } }
+        didSet {
+            if menuIsOpen && !oldValue {
+                set(\.now, MenuModel.second(Date()))
+                pollNow()
+            }
+        }
     }
 
     public let daemon: any DaemonConnection
@@ -183,13 +189,15 @@ public final class MenuModel: ObservableObject {
     private func refreshOnce() async {
         changedDuringRefresh = []
         defer { changedDuringRefresh = nil }
-        memory = HostMemory.current()
-        now = Date()
+        // Only the menu shows these, and they change on every poll: with
+        // it closed, they'd only rebuild Settings for nothing (#54).
+        if menuIsOpen || memory == nil { set(\.memory, HostMemory.current()) }
+        if menuIsOpen { set(\.now, MenuModel.second(Date())) }
         let hosts: [HostInfo]
         do {
             hosts = try await call(HostsList.self, NoParams()).hosts
         } catch {
-            connection = .unavailable(describe(error))
+            set(\.connection, .unavailable(describe(error)))
             return
         }
         var agents: [Agent] = []
@@ -203,7 +211,7 @@ public final class MenuModel: ObservableObject {
                 continue
             } catch {
                 if host.link == .local {
-                    connection = .unavailable(describe(error))
+                    set(\.connection, .unavailable(describe(error)))
                     return
                 }
             }
@@ -211,18 +219,30 @@ public final class MenuModel: ObservableObject {
             unavailable.insert(host.name)
             agents += self.agents.filter { $0.host == host.name }
         }
-        self.hosts = hosts
-        self.agents = agents
+        set(\.hosts, hosts)
+        set(\.agents, agents)
         for changed in changedDuringRefresh ?? [] {
             apply(host: changed.host, ref: changed.ref, changed.change)
         }
         changedDuringRefresh = []
-        unavailableHosts = unavailable
-        connection = .connected
+        set(\.unavailableHosts, unavailable)
+        set(\.connection, .connected)
         takeOverIfUpdated()
-        gh = (try? await call(GhStatusGet.self, GhStatusParams())) ?? gh
-        toolbox = (try? await call(ToolboxStatusGet.self, NoParams())) ?? toolbox
-        mcp = (try? await call(McpGet.self, HostParams())) ?? mcp
+        set(\.gh, (try? await call(GhStatusGet.self, GhStatusParams())) ?? gh)
+        set(\.toolbox, (try? await call(ToolboxStatusGet.self, NoParams())) ?? toolbox)
+        set(\.mcp, (try? await call(McpGet.self, HostParams())) ?? mcp)
+    }
+
+    /// Sets `keyPath` to `value` only if that changes it, so a poll that
+    /// finds nothing new publishes nothing, and the views watching the
+    /// model aren't rebuilt for it (#54).
+    private func set<T: Equatable>(_ keyPath: ReferenceWritableKeyPath<MenuModel, T>, _ value: T) {
+        if self[keyPath: keyPath] != value { self[keyPath: keyPath] = value }
+    }
+
+    /// `date` to the whole second, the finest a row counts time in.
+    nonisolated static func second(_ date: Date) -> Date {
+        Date(timeIntervalSince1970: date.timeIntervalSince1970.rounded(.down))
     }
 
     /// Opens Terminal on `agent`: raises its tab if it has one, or opens
@@ -308,8 +328,21 @@ public final class MenuModel: ObservableObject {
     /// Reads the toolbox's status again, as Settings does while it shows
     /// it, so what it says is what vibed says now.
     public func refreshToolbox() async {
-        toolbox = (try? await call(ToolboxStatusGet.self, NoParams())) ?? toolbox
+        set(\.toolbox, (try? await call(ToolboxStatusGet.self, NoParams())) ?? toolbox)
     }
+
+    /// Settings → Linux Toolbox → Save & Close: hangs up on the open shell,
+    /// as closing its Terminal window does, and saves the template and the
+    /// Linux home, as exiting does. It waits for the save, which can take
+    /// minutes after a big install; an error says why nothing was kept.
+    public func closeToolbox() async throws {
+        let status = try await call(ToolboxClose.self, NoParams(), timeout: MenuModel.saveTimeout)
+        set(\.toolbox, status)
+    }
+
+    /// How long Save & Close may take: as long as `vibe toolbox` waits for
+    /// a save after a big install.
+    public nonisolated static let saveTimeout: TimeInterval = 15 * 60
 
     /// What the Linux home holds, and whether Linux agents are signed in.
     /// It boots nothing, so it's fine to ask whenever Settings shows it.
@@ -429,14 +462,14 @@ public final class MenuModel: ObservableObject {
                     switch message {
                     case .subscribed:
                         backoff = 1
-                        live = true
+                        set(\.live, true)
                         await refresh()
                     case .event(let event):
                         await handle(event)
                     }
                 }
             } catch {}
-            live = false
+            set(\.live, false)
             if Task.isCancelled { return }
             // vibed went away, or isn't up yet: say so, and try again.
             await refresh()
@@ -466,14 +499,14 @@ public final class MenuModel: ObservableObject {
         case .agentAdded, .agentDeleted, .agentLimit:
             await refresh()
         case .ghStatus:
-            gh = (try? await call(GhStatusGet.self, GhStatusParams())) ?? gh
+            set(\.gh, (try? await call(GhStatusGet.self, GhStatusParams())) ?? gh)
         case .lagged:
             settingsRevision += 1
             await refresh()
         case .projectAdded, .projectRemoved, .profilesChanged, .limitsChanged, .keysChanged:
             settingsRevision += 1
         case .toolboxChanged:
-            toolbox = (try? await call(ToolboxStatusGet.self, NoParams())) ?? toolbox
+            set(\.toolbox, (try? await call(ToolboxStatusGet.self, NoParams())) ?? toolbox)
         case .mcpChanged:
             // Where it's served, and whether it is, for the header.
             settingsRevision += 1
@@ -492,7 +525,9 @@ public final class MenuModel: ObservableObject {
 
     private func apply(host: String, ref: String, _ change: (inout Agent) -> Void) {
         guard let i = agents.firstIndex(where: { $0.host == host && $0.ref == ref }) else { return }
-        change(&agents[i])
+        var changed = agents[i]
+        change(&changed)
+        if changed != agents[i] { agents[i] = changed }
     }
 
     private func replace(_ agent: Agent) {

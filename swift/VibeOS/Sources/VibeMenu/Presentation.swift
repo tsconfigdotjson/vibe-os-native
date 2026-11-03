@@ -241,11 +241,19 @@ public struct ToolboxSummary: Equatable, Sendable {
     /// "Template v3 · Linux home v2 · Base 1", once there's any.
     public var versions: String?
     public var notes: [String]
+    /// Whether the shell is open, for Save & Close.
+    public var closable: Bool
+    /// Whether a Terminal may be attached to the open shell, where someone
+    /// may be at work: Save & Close asks first. A vibed too old to count
+    /// them may have one.
+    public var inTerminal: Bool
 
     public init(_ status: ToolboxStatus?) {
         working = false
         versions = nil
         notes = []
+        closable = status?.state == .open
+        inTerminal = closable && (status?.clients ?? 1) > 0
         guard let status else {
             state = "Loading…"
             return
@@ -253,7 +261,13 @@ public struct ToolboxSummary: Equatable, Sendable {
         switch status.state {
         case .unavailable: state = "Not on this host"
         case .closed: state = "Closed"
-        case .open: state = "Open: exit the shell to save"
+        case .open:
+            switch status.clients {
+            // A vibed before #54 doesn't say whether one is attached.
+            case nil: state = "Open: exit the shell to save"
+            case 0: state = "Open in the background, no Terminal attached"
+            default: state = "Open in Terminal"
+            }
         case .saving: state = "Saving…"
         case .updating: state = "Running [update]…"
         case .rebuilding: state = "Rebuilding…"

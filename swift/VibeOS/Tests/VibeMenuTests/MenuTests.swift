@@ -170,18 +170,31 @@ import VibeRPC
         var summary = ToolboxSummary(status)
         // Closed says closed: only an open shell says to exit it (#46).
         #expect(summary.state == "Closed")
-        #expect(!summary.working)
+        #expect(!summary.working && !summary.closable)
         #expect(summary.versions == "Template v3 · Linux home v2 · Base 1")
         #expect(summary.notes == ["Base 2 is installed. Rebuild Template moves to it.", "Not in toolbox.toml: apt: htop"])
         status.state = .open
         status.newestBase = 1
         status.last?.error = "installing gcloud exited with code 3"
         summary = ToolboxSummary(status)
+        // A vibed too old to count the terminals: as before, and Save &
+        // Close asks first, as one may be attached.
         #expect(summary.state == "Open: exit the shell to save")
+        #expect(summary.closable && summary.inTerminal)
         #expect(summary.notes == ["The last rebuild failed: installing gcloud exited with code 3"])
+        // Open with no Terminal attached says so, not just "Open" (#54).
+        status.clients = 0
+        summary = ToolboxSummary(status)
+        #expect(summary.state == "Open in the background, no Terminal attached")
+        #expect(summary.closable && !summary.inTerminal)
+        status.clients = 2
+        summary = ToolboxSummary(status)
+        #expect(summary.state == "Open in Terminal")
+        #expect(summary.closable && summary.inTerminal)
         status.state = .saving
         #expect(ToolboxSummary(status).state == "Saving…")
         #expect(ToolboxSummary(status).working)
+        #expect(!ToolboxSummary(status).closable && !ToolboxSummary(status).inTerminal)
         // Copy for every agent, not one harness.
         for state in ToolboxState.allCases {
             status.state = state
@@ -201,7 +214,7 @@ import VibeRPC
         place.picked()
         #expect(place.projects.isEmpty)
         #expect(place.projectsHost == "vps" && place.limitsHost == "vps")
-        // Twice, as a click on the pane shown is, is the same.
+        // Twice, as opening Settings on the pane shown is, is the same.
         place.picked()
         #expect(place == {
             var p = SettingsPlace()
@@ -649,6 +662,33 @@ import VibeRPC
         state.value = "rebuilding"
         await model.handle(try event(.toolboxChanged))
         #expect(!model.toolboxCanOpen)
+    }
+
+    /// Save & Close asks vibed to close the toolbox, and shows what it
+    /// says after; a refusal comes back for the pane to show (#54).
+    @Test func saveAndCloseAsksVibedAndShowsTheResult() async throws {
+        let daemon = fakeDaemon()
+        daemon.on(ToolboxStatusGet.name) { _ in ["state": "open", "clients": 0] }
+        daemon.on(ToolboxClose.name) { _ in
+            ["state": "closed", "template": 2, "home": 2, "clients": 0,
+             "last": ["action": "shell", "at": "2026-10-30T12:00:00Z", "template": 2, "uncovered": [String]()]
+                as [String: Any]]
+        }
+        let model = makeModel(daemon)
+        await model.refresh()
+        #expect(ToolboxSummary(model.toolbox).state == "Open in the background, no Terminal attached")
+        try await model.closeToolbox()
+        #expect(model.toolbox?.state == .closed)
+        #expect(model.toolbox?.template == 2)
+        #expect(daemon.calls.filter { $0 == ToolboxClose.name }.count == 1)
+        #expect(daemon.timeout(of: ToolboxClose.name) == MenuModel.saveTimeout)
+        daemon.on(ToolboxClose.name) { _ in
+            throw VibedClientError.rpc(
+                RPCError(code: RPCErrorCode.conflict.rawValue,
+                         message: "the toolbox is busy updating the template; try again when it's done"))
+        }
+        await #expect(throws: VibedClientError.self) { try await model.closeToolbox() }
+        #expect(model.toolbox?.state == .closed, "a refusal changes nothing shown")
     }
 
     @Test func rebuildAndTheClaudeLoginRunInTerminal() async throws {

@@ -2,8 +2,9 @@
 //! (PRD: How a click becomes a Terminal window). `vibed` says where the
 //! session is; from then on bytes go straight to its shim, so restarting
 //! `vibed` doesn't interrupt it. `Ctrl-\` detaches, as in dtach, and so does
-//! closing the window. It needs only a terminal, so `ssh -t host vibe attach
-//! <ref>` works from anywhere.
+//! closing the window (which `vibe toolbox` takes as Save & Close instead).
+//! It needs only a terminal, so `ssh -t host vibe attach <ref>` works from
+//! anywhere.
 
 use std::fmt;
 use std::io::{self, Write};
@@ -68,6 +69,9 @@ impl From<io::Error> for AttachError {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum End {
     Detached,
+    /// The terminal hung up, as when its window closes: a detach, for an
+    /// agent's session.
+    HungUp,
     Exited(SessionExit),
     /// The shim went away without saying why.
     Lost,
@@ -338,6 +342,13 @@ fn locate(socket: &Path, agent: &str) -> Result<SessionAttach, AttachError> {
 /// Why the session's stream stopped, when this end stopped it.
 static STOPPED_BY: AtomicU8 = AtomicU8::new(0);
 const BY_DETACH: u8 = 1;
+const BY_HANGUP: u8 = 2;
+
+/// Notes why this end stops the stream: the first reason given stands, as
+/// a hangup also ends the terminal's input.
+fn stop(by: u8) {
+    let _ = STOPPED_BY.compare_exchange(0, by, Ordering::SeqCst, Ordering::SeqCst);
+}
 
 pub(crate) fn attach(socket: &Path, agent: &str) -> Result<End, AttachError> {
     if !is_tty(libc::STDIN_FILENO) || !is_tty(libc::STDOUT_FILENO) {
@@ -354,6 +365,7 @@ pub(crate) fn attach_to(found: &SessionAttach) -> Result<End, AttachError> {
         return Err(AttachError::NotATerminal);
     }
     let agent = found.agent.as_str();
+    STOPPED_BY.store(0, Ordering::SeqCst);
     // Caught before the size is read, so a resize in between isn't lost.
     // SIGHUP too: closing the window must detach even if whoever started
     // this left hangups ignored.
@@ -393,10 +405,10 @@ pub(crate) fn attach_to(found: &SessionAttach) -> Result<End, AttachError> {
         let frame = match shim::read_frame(&mut reading) {
             Ok(Some(f)) => f,
             Ok(None) | Err(_) => {
-                break if STOPPED_BY.load(Ordering::SeqCst) == BY_DETACH {
-                    End::Detached
-                } else {
-                    End::Lost
+                break match STOPPED_BY.load(Ordering::SeqCst) {
+                    BY_DETACH => End::Detached,
+                    BY_HANGUP => End::HungUp,
+                    _ => End::Lost,
                 };
             }
         };
@@ -418,7 +430,7 @@ pub(crate) fn attach_to(found: &SessionAttach) -> Result<End, AttachError> {
     drop(raw);
     let leave_alternate = if filter.alternate { "\x1b[?1049l" } else { "" };
     let said = match &end {
-        End::Detached => format!("detached from {agent}"),
+        End::Detached | End::HungUp => format!("detached from {agent}"),
         End::Exited(exit) => match (&exit.code, &exit.signal) {
             (Some(code), _) => format!("{agent} exited with code {code}"),
             (None, Some(signal)) => format!("{agent} was ended by {signal}"),
@@ -433,10 +445,12 @@ pub(crate) fn attach_to(found: &SessionAttach) -> Result<End, AttachError> {
 }
 
 /// Sends what's typed to the session, until `Ctrl-\` or the end of input.
+/// A raw terminal has no end of input of its own (`Ctrl-D` is a key like
+/// any other), so its end is the terminal going away: a hangup.
 fn spawn_keys(stream: UnixStream, writer: Arc<Mutex<UnixStream>>) {
     std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
-        loop {
+        let by = loop {
             // SAFETY: reads into buf, within its length.
             let n = unsafe { libc::read(libc::STDIN_FILENO, buf.as_mut_ptr().cast(), buf.len()) };
             if n < 0 {
@@ -458,7 +472,7 @@ fn spawn_keys(stream: UnixStream, writer: Arc<Mutex<UnixStream>>) {
                 }
             }
             if n <= 0 {
-                break;
+                break BY_HANGUP;
             }
             let typed = &buf[..n as usize];
             let (keys, detach) = split_detach(typed);
@@ -470,10 +484,10 @@ fn spawn_keys(stream: UnixStream, writer: Arc<Mutex<UnixStream>>) {
                 }
             }
             if detach {
-                break;
+                break BY_DETACH;
             }
-        }
-        STOPPED_BY.store(BY_DETACH, Ordering::SeqCst);
+        };
+        stop(by);
         let _ = stream.shutdown(Shutdown::Both);
     });
 }
@@ -507,7 +521,14 @@ fn spawn_signals(mut signals: std::fs::File, stream: UnixStream, writer: Arc<Mut
                     return;
                 }
             } else {
-                STOPPED_BY.store(BY_DETACH, Ordering::SeqCst);
+                // A hangup is told apart, for `vibe toolbox`; any other
+                // polite kill is a detach.
+                let by = if libc::c_int::from(byte[0]) == libc::SIGHUP {
+                    BY_HANGUP
+                } else {
+                    BY_DETACH
+                };
+                stop(by);
                 let _ = stream.shutdown(Shutdown::Both);
                 return;
             }

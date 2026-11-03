@@ -972,3 +972,45 @@ fn logins_parse_known_tools_once_each() {
         ]
     );
 }
+
+/// Save & Close (`toolbox.close`) hangs up on the shell before it saves:
+/// a `SIGHUP` to its group in the guest, as closing its terminal sends.
+#[test]
+fn hanging_up_signals_the_shells_group_in_the_guest() {
+    let s = Setup::new();
+    assert!(
+        s.toolbox.hang_up(42).is_err(),
+        "nothing to hang up on while it's closed"
+    );
+    s.toolbox.open().unwrap();
+    s.fake.state.lock().unwrap().run_handler = Some(Arc::new(|_, _| proto::Ran {
+        code: Some(0),
+        signal: None,
+        timed_out: false,
+        output: String::new(),
+    }));
+    s.toolbox.hang_up(42).unwrap();
+    let runs = s.fake.state.lock().unwrap().runs.clone();
+    let hup = runs.last().unwrap();
+    assert_eq!(
+        hup.command,
+        ["/bin/sh", "-c", "kill -s HUP -- \"-$1\"", "hang-up", "42"]
+    );
+    assert!(s.toolbox.hang_up(1).is_err(), "never init's group");
+    // A kill the guest refuses says so.
+    s.fake.state.lock().unwrap().run_handler = Some(Arc::new(|_, _| proto::Ran {
+        code: Some(1),
+        signal: None,
+        timed_out: false,
+        output: "kill: No such process\n".into(),
+    }));
+    let e = s.toolbox.hang_up(42).unwrap_err().to_string();
+    assert!(
+        e.contains("hanging up on the toolbox shell exited with code 1"),
+        "{e}"
+    );
+    // Then the shell exits, and the save goes on as for an exit.
+    s.fake.exit(&s.socket(), 129);
+    let saved = s.toolbox.close().unwrap();
+    assert_eq!((saved.template, saved.home), (Some(1), Some(1)));
+}

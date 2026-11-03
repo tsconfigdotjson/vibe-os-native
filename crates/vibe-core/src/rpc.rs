@@ -377,6 +377,7 @@ pub const METHODS: &[&str] = &[
     ToolboxUpdate::NAME,
     ToolboxRebuild::NAME,
     ToolboxLoginsGet::NAME,
+    ToolboxClose::NAME,
     DoctorCheckGet::NAME,
     DoctorFix::NAME,
 ];
@@ -664,6 +665,16 @@ method! {
     /// whether linux agents have a Claude login. Reads only what's kept on
     /// the Mac: it never boots a VM.
     ToolboxLoginsGet = "toolbox.logins", NoParams => ToolboxLogins
+}
+
+method! {
+    /// `toolbox.close`: **Save & Close**. Hangs up the open shell, as
+    /// closing its Terminal window does, then saves a new template and
+    /// Linux home version as exiting the shell does, and gives the status
+    /// after. Attached terminals see the shell exit. A toolbox that's
+    /// already closed is left as it is, so calling it twice is harmless; one
+    /// busy updating or rebuilding is refused.
+    ToolboxClose = "toolbox.close", NoParams => ToolboxStatus
 }
 
 method! {
@@ -1421,6 +1432,11 @@ pub struct ToolboxStatus {
     /// The last shell, update or rebuild to finish.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last: Option<ToolboxRun>,
+    /// How many terminals are attached to the open shell: 0 when it's open
+    /// in the background, as after a detach, and whenever it's closed.
+    /// Absent from a `vibed` before it, which reads as 0.
+    #[serde(default)]
+    pub clients: u32,
 }
 
 /// How a toolbox run went.

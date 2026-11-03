@@ -2,20 +2,23 @@
 //! asks `vibed` to open the toolbox and attaches this terminal to its
 //! shell; when the shell exits, `vibed` saves a new template and Linux home
 //! version, and this waits to say which. `Ctrl-\` detaches and leaves the
-//! shell open, for `vibe toolbox` to attach to again.
+//! shell open, for `vibe toolbox` to attach to again. Closing the window
+//! saves and closes it, as Save & Close does, rather than leave it open
+//! with no terminal (#54); unless another terminal is still attached to it.
 //!
-//! `vibe toolbox status`, `update` and `rebuild` show the versions, run
-//! `toolbox.toml`'s `[update]` now, and rebuild the template on the newest
-//! base image.
+//! `vibe toolbox status`, `update`, `rebuild` and `close` show the
+//! versions, run `toolbox.toml`'s `[update]` now, rebuild the template on
+//! the newest base image, and save and close an open shell.
 
 use std::fmt::Write as _;
+use std::io::Write as _;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 use vibe_core::model::{LoginTool, ToolboxAction, ToolboxState};
 use vibe_core::rpc::{
-    NoParams, ToolboxLogins, ToolboxLoginsGet, ToolboxOpen, ToolboxRebuild, ToolboxRun,
-    ToolboxStatus, ToolboxStatusGet, ToolboxUpdate,
+    NoParams, ToolboxClose, ToolboxLogins, ToolboxLoginsGet, ToolboxOpen, ToolboxRebuild,
+    ToolboxRun, ToolboxStatus, ToolboxStatusGet, ToolboxUpdate,
 };
 
 use crate::attach::{self, End};
@@ -30,6 +33,10 @@ const RUN_TIMEOUT: Duration = Duration::from_secs(4 * 60 * 60);
 /// How long saving may take once the shell exits: flushing a big install.
 const SAVE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
+/// How long, after a hangup, the shim may take to see this terminal go,
+/// before another terminal still attached is taken to hold the shell.
+const LEAVING: Duration = Duration::from_secs(2);
+
 /// Which `vibe toolbox`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Command {
@@ -38,6 +45,7 @@ pub(crate) enum Command {
     Update,
     Rebuild,
     Logins,
+    Close,
 }
 
 impl Command {
@@ -47,6 +55,7 @@ impl Command {
             "update" => Command::Update,
             "rebuild" => Command::Rebuild,
             "logins" => Command::Logins,
+            "close" => Command::Close,
             _ => return None,
         })
     }
@@ -84,6 +93,23 @@ pub(crate) fn run(socket: &Path, command: Command) -> Result<(), String> {
             println!("{}", describe_run(&run));
             Ok(())
         }
+        Command::Close => {
+            let was_open = matches!(
+                status(socket)?.state,
+                ToolboxState::Open | ToolboxState::Saving
+            );
+            if was_open {
+                eprintln!("Saving the template and the Linux home…");
+            }
+            let after = client::call::<ToolboxClose>(socket, &NoParams {}, SAVE_TIMEOUT)
+                .map_err(|e| e.to_string())?;
+            if was_open {
+                report_saved(&after)
+            } else {
+                println!("The toolbox isn't open: there's nothing to save.");
+                Ok(())
+            }
+        }
     }
 }
 
@@ -103,16 +129,20 @@ fn open(socket: &Path) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     eprintln!(
         "What you install here (sudo apt install …, curl … | sh, npm -g) and log in to \
-         (gh auth login) every new linux agent gets. Exit the shell to save; Ctrl-\\ \
-         leaves it open."
+         (gh auth login) every new linux agent gets. Exit the shell to save, or close the \
+         window; Ctrl-\\ leaves it open."
     );
     let mut lost = 0;
     loop {
         match attach::attach_to(&found).map_err(|e| e.to_string())? {
+            End::HungUp => {
+                close_after_hangup(socket);
+                return Ok(());
+            }
             End::Detached => {
                 eprintln!(
                     "The toolbox is still open: `vibe toolbox` attaches to it again. Exit its \
-                     shell to save."
+                     shell, or run `vibe toolbox close`, to save."
                 );
                 return Ok(());
             }
@@ -131,16 +161,43 @@ fn open(socket: &Path) -> Result<(), String> {
         }
     }
     eprintln!("Saving the template and the Linux home…");
-    let status = wait_saved(socket)?;
+    report_saved(&wait_saved(socket)?)
+}
+
+/// Says what a save kept, or why it kept nothing.
+fn report_saved(status: &ToolboxStatus) -> Result<(), String> {
     match &status.last {
         Some(run) if run.action == ToolboxAction::Shell => match &run.error {
             Some(e) => Err(format!("the toolbox couldn't save: {e}")),
             None => {
-                println!("{}", describe_saved(&status));
+                println!("{}", describe_saved(status));
                 Ok(())
             }
         },
         _ => Err("the toolbox closed, but vibed didn't say what it saved".into()),
+    }
+}
+
+/// After the window closed: Save & Close, unless another terminal still
+/// holds the shell. Nobody sees this terminal any more, so it says nothing
+/// it can't, and an error goes only where stderr still leads, if anywhere.
+fn close_after_hangup(socket: &Path) {
+    let deadline = Instant::now() + LEAVING;
+    loop {
+        match status(socket) {
+            Ok(s) if s.state != ToolboxState::Open => return,
+            Ok(s) if s.clients == 0 => break,
+            Ok(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            // Another terminal is attached: it keeps the shell open.
+            Ok(_) => return,
+            Err(e) => {
+                let _ = writeln!(std::io::stderr(), "vibe: {e}");
+                return;
+            }
+        }
+    }
+    if let Err(e) = client::call::<ToolboxClose>(socket, &NoParams {}, SAVE_TIMEOUT) {
+        let _ = writeln!(std::io::stderr(), "vibe: the toolbox couldn't save: {e}");
     }
 }
 
@@ -255,7 +312,15 @@ pub(crate) fn describe_status(s: &ToolboxStatus) -> String {
         return "This host has no Linux toolbox: install tools on it directly.\n".into();
     }
     let mut out = String::new();
-    let _ = writeln!(out, "state     {}", s.state);
+    if s.state == ToolboxState::Open && s.clients == 0 {
+        let _ = writeln!(
+            out,
+            "state     open in the background, no terminal attached: `vibe toolbox` attaches to \
+             it, `vibe toolbox close` saves it"
+        );
+    } else {
+        let _ = writeln!(out, "state     {}", s.state);
+    }
     let _ = writeln!(
         out,
         "template  {}",
@@ -302,6 +367,7 @@ mod tests {
             base: Some(1),
             newest_base: Some(1),
             last: None,
+            clients: 0,
         }
     }
 
@@ -311,6 +377,7 @@ mod tests {
         assert_eq!(Command::parse("update"), Some(Command::Update));
         assert_eq!(Command::parse("rebuild"), Some(Command::Rebuild));
         assert_eq!(Command::parse("logins"), Some(Command::Logins));
+        assert_eq!(Command::parse("close"), Some(Command::Close));
         assert_eq!(Command::parse("open"), None);
     }
 
@@ -386,6 +453,17 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("\n            apt: htop\n"), "{text}");
+        // Open with no terminal attached says so, and how to go on.
+        s.state = ToolboxState::Open;
+        assert!(
+            describe_status(&s).starts_with(
+                "state     open in the background, no terminal attached: `vibe toolbox` attaches"
+            ),
+            "{}",
+            describe_status(&s)
+        );
+        s.clients = 1;
+        assert!(describe_status(&s).starts_with("state     open\n"));
         let none = ToolboxStatus {
             state: ToolboxState::Unavailable,
             template: None,
@@ -393,6 +471,7 @@ mod tests {
             base: None,
             newest_base: None,
             last: None,
+            clients: 0,
         };
         assert!(describe_status(&none).contains("no Linux toolbox"));
     }

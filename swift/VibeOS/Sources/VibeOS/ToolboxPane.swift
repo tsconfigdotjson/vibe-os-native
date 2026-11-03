@@ -3,13 +3,18 @@ import VibeMenu
 import VibeRPC
 
 /// Settings → Linux Toolbox (PRD: The toolbox shell): the shell the Linux
-/// template and home are made in, what it's doing now, and the logins new
-/// Linux agents start with. The Linux home's logins were noted when the
-/// toolbox saved it, so reading them boots nothing.
+/// template and home are made in, what it's doing now (open in Terminal,
+/// or in the background with none attached), Save & Close, and the logins
+/// new Linux agents start with. The Linux home's logins were noted when
+/// the toolbox saved it, so reading them boots nothing.
 struct ToolboxPane: View {
     @ObservedObject var model: MenuModel
     @State private var logins: ToolboxLogins?
     @State private var error: String?
+    /// While Save & Close runs: from the click until vibed has saved.
+    @State private var closing = false
+    @State private var closeError: String?
+    @State private var confirmingClose = false
 
     private var available: Bool { model.toolbox?.state != .unavailable }
 
@@ -42,12 +47,15 @@ struct ToolboxPane: View {
 
     private var toolbox: some View {
         let summary = ToolboxSummary(model.toolbox)
+        // vibed says it's saving only once the shell has gone; until then,
+        // the click is what's known.
+        let saving = closing && !summary.working
         return Form {
             Section {
                 LabeledContent("Shell") {
                     HStack(spacing: 6) {
-                        if summary.working { ProgressView().controlSize(.small) }
-                        Text(summary.state)
+                        if summary.working || saving { ProgressView().controlSize(.small) }
+                        Text(saving ? "Saving…" : summary.state)
                     }
                 }
                 if let versions = summary.versions {
@@ -58,9 +66,10 @@ struct ToolboxPane: View {
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
+                ErrorText(error: closeError)
             } footer: {
                 Text("A Linux shell in Terminal. What you install or log in to there, every new Linux agent "
-                    + "starts with. Exit the shell to save.")
+                    + "starts with. Exit the shell or close its window to save; Control-\\ leaves it open.")
                     .foregroundStyle(.secondary)
             }
             logInsSection
@@ -71,13 +80,41 @@ struct ToolboxPane: View {
                         .disabled(model.toolbox?.state != .closed)
                         .help("Replays toolbox.toml onto the newest base image, in Terminal")
                     Spacer()
+                    if summary.closable || closing {
+                        Button("Save & Close") {
+                            if summary.inTerminal { confirmingClose = true } else { saveAndClose() }
+                        }
+                        .disabled(closing)
+                        .help("Ends the shell and saves the template and Linux home, as exiting does")
+                    }
                     Button("Open Shell") { Task { await model.openToolbox() } }
                         .buttonStyle(.borderedProminent)
-                        .disabled(!model.toolboxCanOpen)
+                        .disabled(!model.toolboxCanOpen || closing)
+                        .help(summary.closable ? "Shows the shell in Terminal" : "Opens the shell in Terminal")
                 }
             }
         }
         .formStyle(.grouped)
+        .confirmationDialog("Save and close the toolbox?", isPresented: $confirmingClose) {
+            Button("Save & Close") { saveAndClose() }
+        } message: {
+            Text("The shell open in Terminal ends, and what you installed and logged in to is saved for new "
+                + "Linux agents.")
+        }
+    }
+
+    private func saveAndClose() {
+        closing = true
+        closeError = nil
+        Task {
+            do {
+                try await model.closeToolbox()
+            } catch {
+                closeError = describe(error)
+                await model.refreshToolbox()
+            }
+            closing = false
+        }
     }
 
     @ViewBuilder private var logInsSection: some View {

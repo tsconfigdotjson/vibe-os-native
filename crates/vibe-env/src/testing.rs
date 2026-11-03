@@ -523,6 +523,25 @@ impl crate::toolbox::ToolboxHost for TestToolbox {
         self.outlives_shim && self.is_open()
     }
 
+    /// Its shell runs here, under the shim's PTY, leading its own group.
+    fn hang_up(&self, shell_pid: u32) -> Result<()> {
+        if !self.is_open() {
+            return Err(EnvError::new("no toolbox shell is open"));
+        }
+        let group = libc::pid_t::try_from(shell_pid)
+            .ok()
+            .filter(|&p| p > 1)
+            .ok_or_else(|| EnvError::new(format!("{shell_pid} isn't the shell's pid")))?;
+        // SAFETY: kill has no memory effects; a negative pid names the group.
+        if unsafe { libc::kill(-group, libc::SIGHUP) } == -1 {
+            return Err(EnvError::new(format!(
+                "can't hang up on the test toolbox's shell: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        Ok(())
+    }
+
     fn close(&self) -> Result<crate::toolbox::Saved> {
         use crate::images::Kind;
         if !self.is_open() {

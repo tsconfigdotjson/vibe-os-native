@@ -22,7 +22,8 @@
         "uncovered": [
           "apt: htop"
         ]
-      }
+      },
+      "clients": 0
     }
   }
 }

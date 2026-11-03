@@ -264,6 +264,7 @@ func methodChecks() -> [String: MethodCheck] {
         check(ToolboxUpdate.self),
         check(ToolboxRebuild.self),
         check(ToolboxLoginsGet.self),
+        check(ToolboxClose.self),
         check(DoctorCheckGet.self),
         check(DoctorFix.self),
     ])

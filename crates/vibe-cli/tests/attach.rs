@@ -592,3 +592,68 @@ fn the_toolbox_shell_detaches_open_and_saves_on_exit() {
         "{out:?}"
     );
 }
+
+/// Closing the toolbox's window saves and closes it, as exiting does, so
+/// it isn't left open with no terminal (#54); unless another terminal still
+/// holds the shell. An agent's window still only detaches
+/// (`closing_the_window_detaches`), and so does Ctrl-\ here.
+#[test]
+fn closing_the_toolbox_window_saves_it_unless_another_terminal_holds_it() {
+    let w = toolbox_world();
+    let size = Size { rows: 24, cols: 80 };
+    let toolbox = || {
+        let mut cmd = w.vibe();
+        cmd.arg("toolbox");
+        Term::spawn(cmd, size)
+    };
+    let template = w.layout.linux_dir().join("template-1.img");
+    let state = || {
+        let out = w.vibe().args(["toolbox", "status"]).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let mut first = toolbox();
+    first.attached();
+    first.type_line("echo $((6*7))-first");
+    first.expect("42-first");
+    let mut second = toolbox();
+    second.attached();
+    // The first window closes: the second still has the shell.
+    // SAFETY: a signal to the process this test started.
+    unsafe { libc::kill(first.child.id() as libc::pid_t, libc::SIGHUP) };
+    assert_eq!(first.wait(), Some(0));
+    assert!(!template.exists(), "nothing saved under the other window");
+    assert!(state().starts_with("state     open\n"), "{}", state());
+    second.type_line("echo $((6*7))-second");
+    second.expect("42-second");
+    // The last one closes: saved, as an exit is.
+    // SAFETY: as above.
+    unsafe { libc::kill(second.child.id() as libc::pid_t, libc::SIGHUP) };
+    assert_eq!(second.wait(), Some(0), "{}", second.text());
+    assert!(template.exists(), "{}", state());
+    let text = state();
+    assert!(text.starts_with("state     closed\n"), "{text}");
+    assert!(
+        text.contains("The toolbox shell saved template 1"),
+        "{text}"
+    );
+
+    // Ctrl-\ still leaves it open, in the background, until Save & Close.
+    let mut term = toolbox();
+    term.attached();
+    term.type_bytes(b"\x1c");
+    assert_eq!(term.wait(), Some(0));
+    term.expect("`vibe toolbox close`, to save");
+    wait_until("the detach", || state().contains("no terminal attached"));
+    let out = w.vibe().args(["toolbox", "close"]).output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("Saved template 2 and Linux home 2"),
+        "{out:?}"
+    );
+    let out = w.vibe().args(["toolbox", "close"]).output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("isn't open: there's nothing to save"),
+        "{out:?}"
+    );
+}

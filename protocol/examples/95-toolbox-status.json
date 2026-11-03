@@ -20,7 +20,8 @@
         "at": "2026-10-30T12:00:00Z",
         "uncovered": [],
         "error": "installing gcloud exited with code 3"
-      }
+      },
+      "clients": 0
     }
   }
 }

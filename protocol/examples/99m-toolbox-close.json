@@ -1,0 +1,35 @@
+{
+  "description": "Save & Close: hangs up on the open toolbox shell, as closing its Terminal window does, saves a new template and Linux home version as exiting it does, and gives the status after. Any terminal attached sees the shell end.",
+  "request": {"jsonrpc": "2.0", "id": 104, "method": "toolbox.close", "params": {}},
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 104,
+    "result": {
+      "state": "closed",
+      "template": 3,
+      "home": 2,
+      "base": 1,
+      "newest_base": 1,
+      "last": {
+        "action": "shell",
+        "at": "2026-10-30T12:00:00Z",
+        "template": 3,
+        "uncovered": []
+      },
+      "clients": 0
+    }
+  },
+  "events": [
+    {
+      "jsonrpc": "2.0",
+      "method": "events.event",
+      "params": {
+        "at": "2026-10-30T12:00:00Z",
+        "host": "local",
+        "kind": "toolbox.changed",
+        "message": "The toolbox saved template 3 and Linux home 2",
+        "seq": 29
+      }
+    }
+  ]
+}

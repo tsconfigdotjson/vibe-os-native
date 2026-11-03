@@ -1,0 +1,22 @@
+{
+  "description": "Save & Close on a toolbox that's closed already leaves it as it is, and says how it is: calling it twice is harmless.",
+  "request": {"jsonrpc": "2.0", "id": 105, "method": "toolbox.close", "params": {}},
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 105,
+    "result": {
+      "state": "closed",
+      "template": 3,
+      "home": 2,
+      "base": 1,
+      "newest_base": 1,
+      "last": {
+        "action": "shell",
+        "at": "2026-10-30T12:00:00Z",
+        "template": 3,
+        "uncovered": []
+      },
+      "clients": 0
+    }
+  }
+}
