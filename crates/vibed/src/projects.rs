@@ -200,6 +200,69 @@ pub async fn github_clone(
     utf8(fs::canonicalize(dest).map_err(|e| failed(format!("{}: {e}", dest.display())))?)
 }
 
+/// The clone at `path` that removing its project deletes, on a Linux host
+/// (PRD: Key user flows, Add a project), checked so that nothing else can
+/// go: it must be a git repo directly inside `root` (the projects folder),
+/// itself and not through a symlink, and neither `root`, `/`, nor `home` or
+/// a folder holding it. `None` if it's gone already. An error says why it
+/// isn't safe to delete; then it's left alone.
+pub fn clone_to_delete(root: &Path, home: &Path, path: &Path) -> Result<Option<PathBuf>, String> {
+    let shown = path.display();
+    if !path.is_absolute() {
+        return Err(format!("{shown} isn't an absolute path"));
+    }
+    let meta = match fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("{shown}: {e}")),
+    };
+    if meta.file_type().is_symlink() {
+        return Err(format!("{shown} is a symlink"));
+    }
+    if !meta.is_dir() {
+        return Err(format!("{shown} isn't a directory"));
+    }
+    let root = fs::canonicalize(root).map_err(|e| format!("{}: {e}", root.display()))?;
+    let real = fs::canonicalize(path).map_err(|e| format!("{shown}: {e}"))?;
+    // The path as given, and where it really is, must both be one level
+    // inside the projects folder: that rules out `..`, a symlink anywhere
+    // on the way, the folder itself and anything deeper or outside it.
+    let given_parent = path
+        .parent()
+        .map(fs::canonicalize)
+        .transpose()
+        .map_err(|e| format!("{shown}: {e}"))?;
+    let inside = real.parent() == Some(root.as_path())
+        && given_parent.as_deref() == Some(root.as_path())
+        && real.file_name() == path.file_name();
+    if !inside {
+        return Err(format!("{shown} isn't a folder in {}", root.display()));
+    }
+    let home = fs::canonicalize(home).unwrap_or_else(|_| home.to_owned());
+    if real == Path::new("/") || home.starts_with(&real) || root.starts_with(&real) {
+        return Err(format!("{shown} holds {}", home.display()));
+    }
+    if fs::symlink_metadata(real.join(".git")).is_err() {
+        return Err(format!("{shown} isn't a git repo"));
+    }
+    Ok(Some(real))
+}
+
+/// Deletes the clone `dir` that [`clone_to_delete`] passed. It's first
+/// moved aside, under a name no project can have, so a delete cut short
+/// never leaves a half-deleted repo under the project's name.
+pub fn delete_clone(dir: &Path) -> io::Result<()> {
+    let mut aside = OsStr::new(".").to_owned();
+    aside.push(dir.file_name().unwrap_or_default());
+    aside.push(".removing");
+    let aside = dir.with_file_name(aside);
+    if fs::symlink_metadata(&aside).is_ok() {
+        fs::remove_dir_all(&aside)?;
+    }
+    fs::rename(dir, &aside)?;
+    fs::remove_dir_all(&aside)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,5 +395,111 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(Path::new(&got), fs::canonicalize(&same).unwrap());
+    }
+
+    mod deleting {
+        use super::super::{clone_to_delete, delete_clone};
+        use std::fs;
+        use std::os::unix::fs::symlink;
+        use std::path::{Path, PathBuf};
+
+        struct Home {
+            _dir: tempfile::TempDir,
+            home: PathBuf,
+            root: PathBuf,
+        }
+
+        fn home() -> Home {
+            let dir = tempfile::tempdir().unwrap();
+            let home = dir.path().canonicalize().unwrap().join("home");
+            let root = home.join("VibeOS/projects");
+            fs::create_dir_all(&root).unwrap();
+            Home {
+                _dir: dir,
+                home,
+                root,
+            }
+        }
+
+        fn clone_at(dir: &Path) {
+            fs::create_dir_all(dir.join(".git")).unwrap();
+            fs::write(dir.join("README.md"), "hi").unwrap();
+        }
+
+        #[test]
+        fn a_clone_in_the_projects_folder_goes_and_nothing_else() {
+            let h = home();
+            let app = h.root.join("app");
+            let web = h.root.join("web");
+            clone_at(&app);
+            clone_at(&web);
+            let target = clone_to_delete(&h.root, &h.home, &app).unwrap().unwrap();
+            assert_eq!(target, app);
+            delete_clone(&target).unwrap();
+            assert!(!app.exists());
+            assert!(web.join("README.md").exists(), "its neighbour stays");
+            assert!(h.root.is_dir(), "the projects folder stays");
+            let left: Vec<_> = fs::read_dir(&h.root)
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            assert_eq!(left, ["web"], "nothing set aside is left");
+            // Gone already: nothing to do.
+            assert_eq!(clone_to_delete(&h.root, &h.home, &app).unwrap(), None);
+        }
+
+        #[test]
+        fn anything_but_a_clone_directly_inside_is_refused() {
+            let h = home();
+            clone_at(&h.root.join("app"));
+            let outside = h.home.join("src/mine");
+            clone_at(&outside);
+            let deeper = h.root.join("app/vendor/lib");
+            clone_at(&deeper);
+            fs::create_dir_all(h.root.join("plain")).unwrap();
+            fs::write(h.root.join("file"), "x").unwrap();
+            // A symlink in the projects folder to a repo elsewhere.
+            symlink(&outside, h.root.join("link")).unwrap();
+            // A real folder reached through a symlinked parent.
+            symlink(h.home.join("src"), h.root.join("via")).unwrap();
+            let cases: Vec<(PathBuf, &str)> = vec![
+                (h.root.clone(), "the projects folder itself"),
+                (h.root.join("."), "the projects folder, by another name"),
+                (h.root.join("app/.."), "the projects folder, by .."),
+                (
+                    h.root.join("../projects"),
+                    "the projects folder, from above",
+                ),
+                (outside.clone(), "a repo outside it"),
+                (h.root.join("../../src/mine"), "a repo outside it, by .."),
+                (deeper.clone(), "a repo deeper in"),
+                (h.root.join("plain"), "a folder that isn't a repo"),
+                (h.root.join("file"), "a file"),
+                (h.root.join("link"), "a symlink to a repo"),
+                (h.root.join("via/mine"), "a repo through a symlink"),
+                (h.home.clone(), "home"),
+                (PathBuf::from("/"), "the root"),
+                (PathBuf::from("VibeOS/projects/app"), "a relative path"),
+            ];
+            for (path, what) in cases {
+                assert!(
+                    clone_to_delete(&h.root, &h.home, &path).is_err(),
+                    "{what}: {}",
+                    path.display()
+                );
+            }
+            assert!(outside.join("README.md").exists());
+            assert!(deeper.join("README.md").exists());
+        }
+
+        #[test]
+        fn a_projects_folder_that_is_home_or_root_deletes_nothing_holding_home() {
+            let h = home();
+            // Home is a repo, and the projects folder is its parent.
+            clone_at(&h.home);
+            let parent = h.home.parent().unwrap().to_owned();
+            assert!(clone_to_delete(&parent, &h.home, &h.home).is_err());
+            assert!(clone_to_delete(Path::new("/"), &h.home, Path::new("/")).is_err());
+        }
     }
 }

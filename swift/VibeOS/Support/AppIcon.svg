@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="vibe-os">
+  <title>vibe-os</title>
+  <!--
+    The installed-app icon: the same mark as icon.svg, with no transparency.
+    Edge to edge and fully opaque on purpose.
+
+    Every platform that installs this composites it into an icon of its own —
+    macOS builds an .icns, Android masks it to whichever shape the launcher
+    likes, iOS rounds it. A transparent corner is not left transparent by any of
+    them; it is filled, and Chromium-family browsers fill it white, which reads
+    as a white border around a dark icon in the Dock.
+
+    So the rounding lives in the platform's mask rather than in the file.
+    public/icon.svg keeps its rounded corners for the favicon and the README,
+    where the page behind it is the background and transparency is correct.
+  -->
+  <rect width="512" height="512" fill="#0d1117"/>
+  <rect x="128" y="128" width="160" height="256" rx="8" fill="#56cfe1"/>
+</svg>

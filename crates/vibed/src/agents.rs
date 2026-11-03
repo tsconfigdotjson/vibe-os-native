@@ -1121,6 +1121,7 @@ impl Core {
         }
         match changed {
             Ok(true) => {
+                crate::log!("vibed: {} is {state} now, was {}", a.agent_ref, a.state);
                 a.state = state;
                 let mut e = self.event(EventKind::AgentState);
                 e.project = Some(a.project.clone());

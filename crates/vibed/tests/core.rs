@@ -409,6 +409,72 @@ async fn projects_with_agents_cannot_be_removed() {
     );
 }
 
+/// Removing a project on a Linux host deletes the clone VibeOS made there,
+/// and nothing else (#46): not a local repo it was given, nor anything a
+/// symlink points to.
+#[tokio::test]
+async fn a_linux_host_deletes_a_removed_projects_clone_and_only_that() {
+    let golden = Golden::new();
+    let mut config = golden.config();
+    config.info.os = "linux".into();
+    config.layout = Layout::new(&golden.home, "linux");
+    let core = Arc::new(Core::open(config).unwrap());
+    let projects_dir = core.layout().projects_dir();
+    let server = serve(core, tempfile::tempdir().unwrap(), MAX_MESSAGE_BYTES);
+    let mut c = Conn::open(&server.path).await;
+
+    let added = c
+        .call("projects.add", json!({"repo": "me/web", "name": "site"}))
+        .await;
+    let site = projects_dir.join("site");
+    assert_eq!(ok(&added)["path"], site.to_str().unwrap());
+    ok(&c
+        .call("projects.add", json!({"repo": "me/web", "name": "next"}))
+        .await);
+    let mine = golden.home.join("src/mine");
+    repo(&mine);
+    ok(&c.call("projects.add", json!({"path": mine})).await);
+
+    fs::write(site.join("work.txt"), "scratch").unwrap();
+    ok(&c.call("projects.remove", json!({"project": "site"})).await);
+    assert!(!site.exists(), "the clone is deleted");
+    assert!(
+        projects_dir.join("next/README.md").exists(),
+        "its neighbour stays"
+    );
+    let left: Vec<_> = fs::read_dir(&projects_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(left, ["next"], "nothing set aside is left");
+
+    // A local repo is the owner's own: forgotten, never deleted.
+    ok(&c.call("projects.remove", json!({"project": "mine"})).await);
+    assert!(mine.join("README.md").exists());
+
+    // A clone swapped for a symlink out of the projects folder is refused,
+    // and the project kept.
+    let next = projects_dir.join("next");
+    fs::rename(&next, golden.home.join("moved")).unwrap();
+    std::os::unix::fs::symlink(golden.home.join("moved"), &next).unwrap();
+    let refused = c.call("projects.remove", json!({"project": "next"})).await;
+    assert_eq!(code(&refused), -32002, "{refused}");
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("is a symlink"),
+        "{refused}"
+    );
+    assert!(golden.home.join("moved/README.md").exists());
+    let listed = c.call("projects.list", json!({})).await;
+    assert_eq!(ok(&listed)["projects"][0]["name"], "next");
+    // Once it's dealt with by hand, the project goes.
+    fs::remove_file(&next).unwrap();
+    ok(&c.call("projects.remove", json!({"project": "next"})).await);
+    assert!(golden.home.join("moved/README.md").exists());
+}
+
 #[tokio::test]
 async fn github_projects_clone_once_and_leave_nothing_half_done() {
     let golden = Golden::new();

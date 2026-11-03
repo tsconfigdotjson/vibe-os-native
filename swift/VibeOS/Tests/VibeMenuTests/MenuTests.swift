@@ -120,7 +120,7 @@ import VibeRPC
                 == "claude mcp add --transport http vibeos http://100.101.102.103:9123/mcp --header \"Authorization: Bearer vk_abc\"")
     }
 
-    @Test func seeLoginsSaysWhatAgentsStartWithOrPlainlyThatItsNothing() throws {
+    @Test func theLoginsSayWhatAgentsStartWithOrPlainlyThatItsNothing() throws {
         let known = LoginsSummary(
             try decode(
                 ToolboxLogins.self,
@@ -131,18 +131,18 @@ import VibeRPC
                         ["tool": "git", "account": "Octo Cat <octo@example.com>"],
                     ],
                 ] as [String: Any]))
-        #expect(known.headline == "Every new Linux agent starts with these logins, from Linux home 2.")
+        #expect(known.headline == "New Linux agents start with these, from Linux home 2.")
         #expect(known.rows.map(\.tool) == ["GitHub (gh)", "Git identity"])
         #expect(known.rows.map(\.account) == ["octocat on github.com", "Octo Cat <octo@example.com>"])
-        #expect(known.claude == "Linux agents are logged in.")
         #expect(known.rows.map(\.symbol) == ["chevron.left.forwardslash.chevron.right", "person.text.rectangle"])
-        #expect(!known.needsClaude)
+        // Signed in: nothing to say about it.
+        #expect(known.signInHint == nil)
 
         let empty = LoginsSummary(try decode(ToolboxLogins.self, ["home": 2, "logins": [Any](), "claude": false] as [String: Any]))
-        #expect(empty.headline.hasPrefix("No gh, gcloud, git or SSH logins in Linux home 2 yet."))
+        #expect(empty.headline == "No logins in Linux home 2 yet.")
         #expect(empty.rows.isEmpty)
-        #expect(empty.needsClaude)
-        #expect(empty.claude == "Linux agents aren't logged in yet.")
+        // Not signed in: a hint, no walk-through.
+        #expect(empty.signInHint == "Linux agents aren't signed in yet: run vibe setup-token in Terminal.")
         let unknown = LoginsSummary(
             try decode(
                 ToolboxLogins.self,
@@ -150,37 +150,53 @@ import VibeRPC
                     as [String: Any]))
         #expect(unknown.headline.contains("couldn't tell which logins Linux home 3 holds"))
         // vibed's clause, as a sentence.
-        #expect(unknown.claude == "Can't read the Claude login for linux agents: locked")
-        #expect(unknown.needsClaude)
+        #expect(unknown.signInHint == "Can't read the Claude login for linux agents: locked")
         let none = LoginsSummary(try decode(ToolboxLogins.self, ["logins": [Any](), "claude": true] as [String: Any]))
-        #expect(none.headline.hasPrefix("There's no Linux home yet."))
+        #expect(none.headline.hasPrefix("No Linux home yet."))
         #expect(LoginTool.allCases.map(toolName) == ["GitHub (gh)", "Google Cloud", "Git identity", "SSH key"])
     }
 
-    @Test func theToolboxMenuSaysWhatTheToolboxIsDoing() throws {
-        #expect(toolboxLines(nil).isEmpty)
-        #expect(toolboxLines(try decode(ToolboxStatus.self, ["state": "unavailable"])) == ["This host has no Linux toolbox"])
+    @Test func theToolboxSaysWhatItsDoingNow() throws {
+        #expect(ToolboxSummary(nil).state == "Loading…")
+        let none = ToolboxSummary(try decode(ToolboxStatus.self, ["state": "unavailable"]))
+        #expect(none.state == "Not on this host")
+        #expect(none.versions == nil && none.notes.isEmpty)
         var status = try decode(
             ToolboxStatus.self,
             [
                 "state": "closed", "template": 3, "home": 2, "base": 1, "newest_base": 2,
                 "last": ["action": "rebuild", "at": "2026-10-30T12:00:00Z", "uncovered": ["apt: htop"]] as [String: Any],
             ] as [String: Any])
-        #expect(
-            toolboxLines(status) == [
-                "New agents boot template v3, Linux home v2, base 1",
-                "Base 2 is installed: Rebuild Template moves to it",
-                "Not in toolbox.toml: apt: htop",
-            ])
+        var summary = ToolboxSummary(status)
+        // Closed says closed: only an open shell says to exit it (#46).
+        #expect(summary.state == "Closed")
+        #expect(!summary.working)
+        #expect(summary.versions == "Template v3 · Linux home v2 · Base 1")
+        #expect(summary.notes == ["Base 2 is installed. Rebuild Template moves to it.", "Not in toolbox.toml: apt: htop"])
         status.state = .open
         status.newestBase = 1
         status.last?.error = "installing gcloud exited with code 3"
-        #expect(
-            toolboxLines(status) == [
-                "New agents boot template v3, Linux home v2, base 1",
-                "The shell is open: exit it to save",
-                "The last rebuild failed: installing gcloud exited with code 3",
-            ])
+        summary = ToolboxSummary(status)
+        #expect(summary.state == "Open: exit the shell to save")
+        #expect(summary.notes == ["The last rebuild failed: installing gcloud exited with code 3"])
+        status.state = .saving
+        #expect(ToolboxSummary(status).state == "Saving…")
+        #expect(ToolboxSummary(status).working)
+        // Copy for every agent, not one harness.
+        for state in ToolboxState.allCases {
+            status.state = state
+            let words = ([ToolboxSummary(status).state] + ToolboxSummary(status).notes).joined(separator: " ")
+            #expect(!words.contains("Claude"), "\(state)")
+        }
+    }
+
+    @Test func aKeySaysWhenItWasLastUsed() {
+        let now = Date(timeIntervalSince1970: 1_793_361_600)
+        #expect(keyUsage(nil, now: now) == "Never used")
+        #expect(keyUsage("not a time", now: now) == "Never used")
+        #expect(keyUsage("2026-10-30T11:59:40Z", now: now) == "Last used just now")
+        #expect(keyUsage("2026-10-30T11:57:00Z", now: now) == "Last used 3 minutes ago")
+        #expect(keyUsage("2026-10-29T12:00:00Z", now: now) == "Last used yesterday")
     }
 
     @Test func quoting() {

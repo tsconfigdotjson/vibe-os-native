@@ -12,7 +12,7 @@
 	<string>6.0</string>
 	<key>CFBundleName</key>
 	<string>VibeOS</string>
-	<!-- Drawn by scripts/app-icon.py; scripts/sign-macos.sh makes the .icns. -->
+	<!-- AppIcon.svg, checked in as AppIcon.iconset; scripts/sign-macos.sh makes the .icns. -->
 	<key>CFBundleIconFile</key>
 	<string>AppIcon</string>
 	<key>CFBundlePackageType</key>

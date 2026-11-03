@@ -222,17 +222,17 @@ impl Tail {
         let quiet =
             last.is_some_and(|t| now.as_secs_f64() - t.as_secs_f64() > self.debounce.as_secs_f64());
         if state.activity != agent_tail::Activity::Idle {
-            return Status::from_state(&state, quiet, last, &f.path);
+            return Status::from_state(&state, quiet, last, &f.path, now);
         }
         let Some(last) = last else {
-            return Status::from_state(&state, quiet, None, &f.path);
+            return Status::from_state(&state, quiet, None, &f.path, now);
         };
         // agent-tail says only that nothing was written for its idle window.
         // What the agent was doing as the window closed is still what it's
         // doing: a question stays a question. A millisecond inside it, as
         // its end is a sum of floats.
         let at = Timestamp::from_secs_f64(last.as_secs_f64() + self.window().as_secs_f64() - 0.001);
-        Status::from_state(&f.reducer.state(at), quiet, Some(last), &f.path)
+        Status::from_state(&f.reducer.state(at), quiet, Some(last), &f.path, now)
     }
 
     /// Where the transcript is now, for [`Tail::answered`]. Poll first, so
@@ -244,7 +244,9 @@ impl Tail {
             received: f.map_or(0, |f| f.reducer.received()),
             last_at: f.and_then(|f| f.reducer.state(Timestamp::EPOCH).last_at),
             inputs: f.map_or(0, |f| f.inputs),
-            busy: self.status(now).state() == AgentState::Busy,
+            // At work by the transcript alone: an inferred permission
+            // prompt isn't, as approving one writes no prompt of the user's.
+            busy: state_of(self.status(now).activity) == AgentState::Busy,
         }
     }
 
@@ -611,6 +613,13 @@ pub struct Status {
     pub error: Option<String>,
     /// The transcript it's from; none before one is found.
     pub transcript: Option<PathBuf>,
+    /// When it was read: what an inferred permission prompt's quiet is
+    /// measured to. None before a transcript is found.
+    pub as_of: Option<Timestamp>,
+    /// The agent's screen shows a permission dialog (see
+    /// [`approval_on_screen`]), which confirms an inferred one at once.
+    /// Set by the caller, which can read the screen.
+    pub prompt_on_screen: bool,
 }
 
 /// A wakeup the agent has armed and that hasn't fired.
@@ -623,8 +632,9 @@ pub struct Wakeup {
     pub reason: Option<String>,
 }
 
-/// The state clients see for an activity, while the agent's session runs
-/// (PRD: MCP interface, States). Asleep, paused and exited are `vibed`'s.
+/// The state clients see for a firm activity, while the agent's session
+/// runs (PRD: MCP interface, States). Asleep, paused and exited are
+/// `vibed`'s. An inferred permission prompt is [`Status::state`]'s call.
 pub fn state_of(activity: Activity) -> AgentState {
     match activity {
         Activity::Thinking | Activity::RunningTool | Activity::BackgroundWork => AgentState::Busy,
@@ -652,6 +662,8 @@ impl Status {
             resets_at: None,
             error: None,
             transcript: None,
+            as_of: None,
+            prompt_on_screen: false,
         }
     }
 
@@ -660,6 +672,7 @@ impl Status {
         quiet: bool,
         quiet_since: Option<Timestamp>,
         transcript: &Path,
+        now: Timestamp,
     ) -> Status {
         let activity = activity(s.activity);
         Status {
@@ -696,12 +709,46 @@ impl Status {
             resets_at: s.resets_at,
             error: s.error.clone(),
             transcript: Some(transcript.to_owned()),
+            as_of: Some(now),
+            prompt_on_screen: false,
         }
     }
 
-    /// The state clients see, while the agent's session runs.
+    /// The state clients see, while the agent's session runs: what
+    /// [`state_of`] says, but an inferred permission prompt is still busy
+    /// until it's confirmed (see [`Status::asks_approval`]). Claude in auto
+    /// mode writes nothing while a long tool call runs, so 20 s of quiet
+    /// mid-call looks just like a prompt; only a real one raises the hand.
     pub fn state(&self) -> AgentState {
+        if self.activity == Activity::AwaitingApproval && !self.asks_approval() {
+            return AgentState::Busy;
+        }
         state_of(self.activity)
+    }
+
+    /// Whether it's surely waiting on a permission prompt: agent-tail says
+    /// so firmly, the screen shows the dialog, or the guess has stood for
+    /// [`INFERRED_QUIET`] (PRD: Going to sleep, Permission prompts).
+    pub fn asks_approval(&self) -> bool {
+        match (self.activity, self.certainty) {
+            (Activity::AwaitingApproval, Certainty::Firm) => true,
+            (Activity::AwaitingApproval, Certainty::Inferred) => {
+                self.prompt_on_screen || self.as_of.is_some_and(|now| self.inferred_quiet(now))
+            }
+            _ => false,
+        }
+    }
+
+    /// An inferred permission prompt not yet confirmed: what the caller
+    /// should look at the screen for.
+    pub fn unconfirmed_approval(&self) -> bool {
+        self.activity == Activity::AwaitingApproval && !self.asks_approval()
+    }
+
+    /// Quiet for [`INFERRED_QUIET`] as of `now`.
+    fn inferred_quiet(&self, now: Timestamp) -> bool {
+        self.quiet_since
+            .is_some_and(|t| now.as_secs_f64() - t.as_secs_f64() >= INFERRED_QUIET.as_secs_f64())
     }
 
     /// Firmly at rest: what an agent may sleep in (PRD: Going to sleep,
@@ -727,11 +774,7 @@ impl Status {
         }
         match (self.activity, self.certainty) {
             (Activity::AwaitingApproval, Certainty::Firm) => true,
-            (Activity::AwaitingApproval, Certainty::Inferred) => {
-                self.quiet_since.is_some_and(|t| {
-                    now.as_secs_f64() - t.as_secs_f64() >= INFERRED_QUIET.as_secs_f64()
-                })
-            }
+            (Activity::AwaitingApproval, Certainty::Inferred) => self.inferred_quiet(now),
             _ => false,
         }
     }
@@ -982,8 +1025,20 @@ mod tests {
         );
         assert_eq!(s.line.as_deref(), Some("$ cargo test"));
         // After 20 s with no result, it may be waiting on a permission
-        // prompt: a guess, and it says so. It stays one past the window.
-        for now in ["2026-10-30T12:00:30Z", "2026-10-30T14:00:00Z"] {
+        // prompt: a guess, and it says so. Until the guess has stood for
+        // INFERRED_QUIET it's still at work, as a long tool run looks the
+        // same; past that it's a question, and stays one past the window.
+        let s = tail.status(t("2026-10-30T12:00:30Z"));
+        assert_eq!(
+            (s.activity, s.certainty, s.state()),
+            (
+                Activity::AwaitingApproval,
+                Certainty::Inferred,
+                AgentState::Busy
+            )
+        );
+        assert!(s.unconfirmed_approval() && !s.asks_approval());
+        for now in ["2026-10-30T12:05:01Z", "2026-10-30T14:00:00Z"] {
             let s = tail.status(t(now));
             assert_eq!(
                 (s.activity, s.certainty, s.state()),
@@ -994,8 +1049,63 @@ mod tests {
                 ),
                 "{now}"
             );
-            assert!(!s.at_rest());
+            assert!(!s.at_rest() && s.asks_approval() && !s.unconfirmed_approval());
         }
+        // The dialog on screen confirms the guess at once.
+        let mut s = tail.status(t("2026-10-30T12:00:30Z"));
+        s.prompt_on_screen = true;
+        assert_eq!(s.state(), AgentState::Question);
+        assert!(!s.unconfirmed_approval());
+    }
+
+    /// The false hand-up of #46: Claude in auto mode runs `sleep 60`, so
+    /// its transcript stalls mid tool call for a minute with no prompt on
+    /// screen. It's at work all the while, never a question.
+    #[test]
+    fn an_auto_mode_sleep_60_does_not_raise_the_hand_at_20s() {
+        let w = world();
+        let path = w.project.join(format!("{ID}.jsonl"));
+        let mode = serde_json::json!({"type": "permission-mode", "permissionMode": "auto",
+            "sessionId": ID});
+        append(&path, &format!("{mode}\n"));
+        append(
+            &path,
+            &user("/w/app", "2026-10-30T12:00:00Z", "wait a minute"),
+        );
+        let call = serde_json::json!({"type": "assistant", "sessionId": ID, "cwd": "/w/app",
+            "permissionMode": "auto", "timestamp": "2026-10-30T12:00:01Z",
+            "message": {"id": "m1", "role": "assistant", "stop_reason": "tool_use",
+                "content": [{"type": "tool_use", "id": "toolu_s", "name": "Bash",
+                    "input": {"command": "sleep 60", "description": "Wait a minute"}}]}});
+        append(&path, &format!("{call}\n"));
+        let mut tail = Tail::new(w.project.clone(), &w.worktree, ID, Duration::from_secs(60));
+        tail.poll();
+        let screen = "\
+⏺ Bash(sleep 60)
+  ⎿  Running…
+✻ Waiting… (25s · esc to interrupt)
+  ⏵⏵ auto mode on (shift+tab to cycle)
+";
+        for now in [
+            "2026-10-30T12:00:21Z",
+            "2026-10-30T12:00:25Z",
+            "2026-10-30T12:00:45Z",
+            "2026-10-30T12:01:00Z",
+        ] {
+            let mut s = tail.status(t(now));
+            s.prompt_on_screen = crate::approval_on_screen(screen);
+            assert_eq!(s.state(), AgentState::Busy, "{now}: {s:?}");
+            assert!(!s.asks_approval(), "{now}");
+        }
+        // The command ends and Claude finishes its turn.
+        let result = serde_json::json!({"type": "user", "sessionId": ID, "cwd": "/w/app",
+            "timestamp": "2026-10-30T12:01:01Z", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_s", "content": ""}]}});
+        append(&path, &format!("{result}\n"));
+        append(&path, &reply("/w/app", "2026-10-30T12:01:03Z", "Waited."));
+        tail.poll();
+        let s = tail.status(t("2026-10-30T12:01:04Z"));
+        assert_eq!((s.activity, s.state()), (Activity::Done, AgentState::Idle));
     }
 
     #[test]

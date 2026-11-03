@@ -119,7 +119,10 @@ impl Core {
 
     /// The state clients see: `vibed`'s own `asleep` and `paused` while
     /// they hold, `exited` once its session has gone, and otherwise what
-    /// its transcript says.
+    /// its transcript says. A permission prompt agent-tail only guesses at
+    /// is a question once the screen shows its dialog, and busy until then
+    /// (or until the guess has stood for `INFERRED_QUIET`; see
+    /// [`Status::state`]), so a long silent tool run never raises the hand.
     pub(crate) async fn observed_state(&self, a: &AgentRecord, status: &Status) -> AgentState {
         // Frozen or saved to disk; a send wakes it (#6). Its session isn't
         // asked: a saved one has none.
@@ -130,6 +133,17 @@ impl Core {
         match (runs, a.state) {
             (true, AgentState::Paused) => AgentState::Paused,
             (false, _) => AgentState::Exited,
+            (true, _) if status.unconfirmed_approval() => {
+                let socket = self.layout.session_socket(&a.agent_ref);
+                let shown = tokio::task::spawn_blocking(move || crate::talk::screen_now(&socket))
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .is_some_and(|o| vibe_status::approval_on_screen(&o.screen));
+                let mut status = status.clone();
+                status.prompt_on_screen = shown;
+                status.state()
+            }
             (true, _) => status.state(),
         }
     }
@@ -203,6 +217,18 @@ impl Core {
             let changed = published.get(&a.agent_ref) != Some(&wire);
             if !full && !changed {
                 continue;
+            }
+            let before = published
+                .get(&a.agent_ref)
+                .map(|s| (s.activity, s.certainty));
+            if before != Some((wire.activity, wire.certainty)) {
+                crate::log!(
+                    "vibed: {} is {} ({}) now{}",
+                    a.agent_ref,
+                    wire.activity,
+                    wire.certainty,
+                    before.map_or(String::new(), |(a, c)| format!(", was {a} ({c})"))
+                );
             }
             let was = a.state;
             let state = self.observed_state(&a, &status).await;

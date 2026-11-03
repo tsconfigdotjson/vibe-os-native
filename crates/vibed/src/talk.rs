@@ -73,7 +73,7 @@ pub fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
 
 /// The screen only, with no history, and whether the program wants
 /// bracketed paste: a read from past the end of the history.
-fn screen_now(socket: &Path) -> std::io::Result<Output> {
+pub(crate) fn screen_now(socket: &Path) -> std::io::Result<Output> {
     let mut c = shim::connect(socket, &shim::control_hello("vibed"), SHIM_TIMEOUT)
         .map_err(|e| std::io::Error::other(e.to_string()))?;
     c.read_output(Some(u64::MAX))

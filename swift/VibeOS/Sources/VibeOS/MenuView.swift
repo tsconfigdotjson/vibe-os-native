@@ -558,10 +558,8 @@ struct EmptyMenuView: View {
         do {
             let projects = try await model.call(ProjectsList.self, HostParams()).projects
             let keys = try await model.call(KeysList.self, NoParams()).keys
-            var claude: Bool?
             var github: Bool?
             if let toolbox = model.toolbox, toolbox.state != .unavailable, let logins = try? await model.toolboxLogins() {
-                claude = logins.claude
                 github = logins.logins.map { found in found.contains { $0.tool == .gh } }
             }
             // A vibed from before vibe doctor has none to give.
@@ -572,7 +570,7 @@ struct EmptyMenuView: View {
             let tailscale = doctor.first { $0.id == .tailscale }?.state == .pass
             let remote = tailscale ? (model.mcp?.tailscale == true || model.externalHost != nil) : nil
             return SetupProgress(
-                hasProject: !projects.isEmpty, hasKey: !keys.isEmpty, linuxClaude: claude, linuxGitHub: github,
+                hasProject: !projects.isEmpty, hasKey: !keys.isEmpty, linuxGitHub: github,
                 doctor: doctor, install: model.install, ghInstalled: model.gh?.state != .notInstalled,
                 remoteMCP: remote)
         } catch {
@@ -872,33 +870,6 @@ struct FooterView: View {
             }
             .buttonStyle(MenuRowStyle())
             .keyboardShortcut("n")
-            .disabled(!connected)
-            Menu {
-                Button("Open Shell") { Task { await model.openToolbox() } }
-                    .disabled(!model.toolboxCanOpen)
-                // In Terminal, as it can take many minutes and says how it goes.
-                Button("Rebuild Template") { model.runInTerminal(["toolbox", "rebuild"], exec: false) }
-                    .disabled(model.toolbox?.state != .closed)
-                Button("See Logins…") { show(WindowID.logins, with: openWindow) }
-                    .disabled(model.toolbox == nil || model.toolbox?.state == .unavailable)
-                let lines = toolboxLines(model.toolbox)
-                if !lines.isEmpty {
-                    Divider()
-                    ForEach(lines, id: \.self) { Text($0) }
-                }
-                Divider()
-                Button("Log In to Claude for Linux Agents…") { model.runInTerminal(["setup-token"], exec: true) }
-            } label: {
-                MenuItemLabel(title: "Linux Toolbox", symbol: "shippingbox", trailingSymbol: "chevron.right")
-            }
-            .menuStyle(.button)
-            .buttonStyle(.plain)
-            .menuIndicator(.hidden)
-            .modifier(HoverRow())
-            Button { show(WindowID.addHost, with: openWindow) } label: {
-                MenuItemLabel(title: "Add Linux Host…", symbol: "server.rack")
-            }
-            .buttonStyle(MenuRowStyle())
             .disabled(!connected)
             Button { show(WindowID.settings, with: openWindow) } label: {
                 MenuItemLabel(title: "Settings…", symbol: "gearshape", trailing: "⌘,")

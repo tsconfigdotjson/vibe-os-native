@@ -471,6 +471,24 @@ async fn a_linux_hosts_agents_join_the_macs_view_over_the_link() {
         on_host.iter().any(|k| k.name == "laptop" && k.pushed),
         "{on_host:?}"
     );
+    // It was used there, not on the Mac: the Mac's list asks the host, and
+    // keeps what it said.
+    let laptop =
+        |keys: Vec<vibe_core::rpc::ApiKey>| keys.into_iter().find(|k| k.name == "laptop").unwrap();
+    let used_there = laptop(on_host).last_used_at;
+    assert!(used_there.is_some(), "the host recorded the use");
+    assert_eq!(laptop(w.mac.keys().unwrap().keys).last_used_at, None);
+    let listed = w.rpc("keys.list", json!({})).await;
+    assert_eq!(
+        listed["result"]["keys"][0]["last_used_at"].as_str(),
+        used_there.as_deref(),
+        "{listed}"
+    );
+    assert_eq!(
+        laptop(w.mac.keys().unwrap().keys).last_used_at,
+        used_there,
+        "kept on the Mac"
+    );
     let refused = w
         .host
         .revoke_key(KeyParams {
@@ -541,6 +559,30 @@ async fn a_pulled_network_shows_the_host_down_and_it_reconnects() {
     assert!(!views[0].available);
     let refused = w.rpc("projects.list", json!({"host": "vps"})).await;
     assert_eq!(refused["error"]["code"], ErrorCode::HostUnavailable.code());
+    // Removing a project there says it can't, and the host keeps it.
+    let kept = w
+        .rpc("projects.remove", json!({"host": "vps", "project": "app"}))
+        .await;
+    assert_eq!(
+        kept["error"]["code"],
+        ErrorCode::HostUnavailable.code(),
+        "{kept}"
+    );
+    assert!(
+        kept["error"]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("vps is unavailable"),
+        "{kept}"
+    );
+    assert_eq!(
+        w.host
+            .projects(HostParams::default())
+            .unwrap()
+            .projects
+            .len(),
+        1
+    );
     // Nothing stopped on the host.
     let there = w.host.agents(HostParams::default()).await.unwrap().agents;
     assert_eq!(there[0].agent, "keeps-going");

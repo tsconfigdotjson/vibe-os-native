@@ -110,8 +110,9 @@
 #   - both Swift packages (swift/VibeOS, swift/vibe-vm): build and test,
 #     including the Swift half of the Rust<->Swift contract test, and the
 #     menu's model, Terminal attach and notifications against stand-ins
-#   - the app icon (scripts/app-icon.py): every size of the iconset, drawn
-#     with python3's standard library, as PNGs of the right size
+#   - the app icon (swift/VibeOS/Support/AppIcon.iconset): every size, a PNG
+#     of the right size in the icon's two colours, and on a Mac the same
+#     pixels as AppIcon.svg rendered afresh by scripts/app-icon.swift
 #   - the release's tools, which need no Mac: Sparkle's Ed25519 signing and
 #     its appcast (scripts/sparkle.py self-test: RFC 8032's vectors, and the
 #     cryptography package's answers where it's installed); the release
@@ -849,19 +850,49 @@ s_sign() {
   [ -s build/VibeOS.app/Contents/Resources/AppIcon.icns ] || { echo "the app has no icon"; return 1; }
 }
 
-# The app icon, every size iconutil wants, at its size. The script is only
-# python3's standard library, so this runs on Linux too.
+# The app icon's checked-in iconset: every size iconutil wants, at its size,
+# with AppIcon.svg's ink in the corner and its cyan at 40%,50%. That much is
+# python3's standard library, so it runs on Linux too; on a Mac the iconset
+# is also rendered afresh from the SVG and compared pixel for pixel.
 s_app_icon() {
-  local set="$WORK/AppIcon.iconset" name size got
-  python3 scripts/app-icon.py "$set"
+  local set=swift/VibeOS/Support/AppIcon.iconset name size got
   for name in 16x16:16 16x16@2x:32 32x32:32 32x32@2x:64 128x128:128 128x128@2x:256 \
     256x256:256 256x256@2x:512 512x512:512 512x512@2x:1024; do
     size=${name#*:}
     name=icon_${name%:*}.png
     [ -s "$set/$name" ] || { echo "no $name"; return 1; }
-    got=$(python3 -c 'import struct,sys; d=open(sys.argv[1],"rb").read(24); print(*struct.unpack(">II", d[16:24]))' "$set/$name")
-    [ "$got" = "$size $size" ] || { echo "$name is $got, not $size $size"; return 1; }
+    got=$(python3 - "$set/$name" <<'PY'
+import struct, sys, zlib
+d = open(sys.argv[1], "rb").read()
+i, idat = 8, b""
+while i < len(d):
+    n, t = struct.unpack(">I4s", d[i:i + 8])
+    if t == b"IHDR":
+        w, h, depth, kind = struct.unpack(">IIBB", d[i + 8:i + 18])
+    if t == b"IDAT":
+        idat += d[i + 8:i + 8 + n]
+    i += 12 + n
+bpp = {(8, 2): 3, (8, 6): 4}[depth, kind]
+stride, raw, prev, rows = w * bpp, zlib.decompress(idat), bytearray(w * bpp), []
+for y in range(h // 2 + 1):  # rows down to the one sampled
+    f, row = raw[y * (stride + 1)], bytearray(raw[y * (stride + 1) + 1:(y + 1) * (stride + 1)])
+    for x in range(stride):
+        a, b = row[x - bpp] if x >= bpp else 0, prev[x]
+        c = prev[x - bpp] if x >= bpp else 0
+        p = a + b - c
+        row[x] = (row[x] + [0, a, b, (a + b) // 2,
+                            a if abs(p - a) <= min(abs(p - b), abs(p - c)) else b if abs(p - b) <= abs(p - c) else c][f]) & 255
+    rows.append(row)
+    prev = row
+px = lambda x, y: "%02x%02x%02x" % tuple(rows[y][x * bpp:x * bpp + 3])
+print(w, h, px(0, 0), px(w * 2 // 5, h // 2))
+PY
+)
+    [ "$got" = "$size $size 0d1117 56cfe1" ] || { echo "$name is $got, not $size $size 0d1117 56cfe1"; return 1; }
   done
+  if [ "$OS" = Darwin ]; then
+    swift scripts/app-icon.swift --check swift/VibeOS/Support/AppIcon.svg "$set"
+  fi
   echo "the iconset is complete"
 }
 
@@ -874,7 +905,7 @@ s_surfaces() {
   [ -s "$out/manifest.txt" ] || { echo "no manifest"; return 1; }
   for name in menu menu-status menu-welcome menu-welcome-fresh menu-install-move menu-install-login-items \
     menu-quiet menu-offline menu-bar new-agent new-agent-empty add-host add-host-local-network \
-    add-host-done logins logins-first-run settings-projects settings-keys settings-hosts settings-limits \
+    add-host-done settings-projects settings-keys settings-hosts settings-toolbox settings-limits \
     settings-general settings-project settings-projects-first-run new-key new-key-made external-address; do
     for look in light dark; do
       [ -s "$out/$name-$look.png" ] || { echo "no $name-$look.png"; return 1; }
@@ -1407,7 +1438,7 @@ mac_step swift-app-build "swift build swift/VibeOS" s_swift_app_build
 mac_step swift-app-test "swift test swift/VibeOS (Swift contract tests)" s_swift_app_test swift-app-build
 mac_step swift-vm-build "swift build swift/vibe-vm" s_swift_vm_build
 mac_step swift-vm-test "swift test swift/vibe-vm" s_swift_vm_test swift-vm-build
-step app-icon "the app icon: every iconset size, drawn by scripts/app-icon.py" s_app_icon
+step app-icon "the app icon: the checked-in iconset, every size, as AppIcon.svg renders" s_app_icon
 step release-tools "the release: Sparkle's signing, tag-only CI and its secrets, versions" s_release_tools
 mac_step sign "ad hoc signing; vibe-vm gets the virtualization entitlement" s_sign swift-app-build swift-vm-build
 mac_step surfaces "every surface draws on canned data, in light and dark" s_surfaces sign

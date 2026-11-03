@@ -201,7 +201,7 @@ async fn call(
         McpSet::NAME => encode_result(core.set_mcp(decode::<McpSet>(params)?)),
         KeysList::NAME => {
             decode::<KeysList>(params)?;
-            encode_result(core.keys())
+            encode_result(core.keys_everywhere().await)
         }
         KeysCreate::NAME => encode_result(core.create_key(decode::<KeysCreate>(params)?)),
         KeysRevoke::NAME => encode_result(core.revoke_key(decode::<KeysRevoke>(params)?)),

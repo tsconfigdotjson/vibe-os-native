@@ -721,18 +721,75 @@ impl Core {
         })
     }
 
-    /// Forgets a project and its profiles; its files stay on disk.
+    /// Forgets a project and its profiles. On the Mac its files stay on
+    /// disk, and adding the repo again picks its clone up. On a Linux host
+    /// the clone VibeOS made goes too, and only that: a directory directly
+    /// in the projects folder that is a git repo (see
+    /// [`projects::clone_to_delete`]). A local repo registered by path is
+    /// the owner's own, and is left as it was.
     pub fn remove_project(&self, p: ProjectParams) -> Result<Project, ErrorObject> {
         let host = self.host(p.host.as_deref())?;
         let project = self
             .store()
+            .project(host, &p.project)
+            .map_err(store_error)?;
+        let clone = if self.info.os == "linux" && project.source == ProjectSource::Github {
+            projects::clone_to_delete(
+                &self.layout.projects_dir(),
+                self.layout.home(),
+                Path::new(&project.path),
+            )
+            .map_err(|why| {
+                error(
+                    ErrorCode::Conflict,
+                    format!(
+                        "{} is kept: {why}, so it isn't safe to delete. Move or delete it by \
+                         hand, then remove the project again",
+                        project.name
+                    ),
+                )
+            })?
+        } else {
+            None
+        };
+        // The record goes first, so a project with agents keeps its files;
+        // then the clone, while nothing can start an agent in it.
+        let project = self
+            .store()
             .remove_project(host, &p.project)
             .map_err(store_error)?;
-        crate::log!(
-            "vibed: removed project {}; {} is left as it was",
-            project.name,
-            project.path
-        );
+        match &clone {
+            Some(dir) => match projects::delete_clone(dir) {
+                Ok(()) => crate::log!(
+                    "vibed: removed project {} and deleted {}",
+                    project.name,
+                    dir.display()
+                ),
+                Err(e) => {
+                    crate::log!(
+                        "vibed: removed project {}, but can't delete {}: {e}",
+                        project.name,
+                        dir.display()
+                    );
+                    let mut removed = self.event(EventKind::ProjectRemoved);
+                    removed.project = Some(project.name.clone());
+                    self.publish(removed);
+                    return Err(error(
+                        ErrorCode::CommandFailed,
+                        format!(
+                            "{} is removed, but {} couldn't be deleted: {e}; delete it by hand",
+                            project.name,
+                            dir.display()
+                        ),
+                    ));
+                }
+            },
+            None => crate::log!(
+                "vibed: removed project {}; {} is left as it was",
+                project.name,
+                project.path
+            ),
+        }
         let mut e = self.event(EventKind::ProjectRemoved);
         e.project = Some(project.name.clone());
         self.publish(e);

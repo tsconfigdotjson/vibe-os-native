@@ -36,7 +36,8 @@ login item (System Settings → General → Login Items lists it under
 VibeOS), and its menu walks through the rest in one list: adding the `vibe`
 command to `/usr/local/bin` (macOS asks for your password), what
 `vibe doctor` checks, letting VibeOS control Terminal, the Linux download,
-Claude's login and the toolbox for Linux agents, a project and an API key.
+the toolbox for Linux agents (Settings → Linux Toolbox), a project and an API
+key.
 It updates itself through Sparkle.
 
 ```sh
@@ -83,7 +84,7 @@ them and point `vibed` at them:
 ```sh
 scripts/host-bundle.sh          # build/host-bundle/{x86_64,aarch64}: static musl builds (needs zig, cargo-zigbuild)
 VIBE_HOST_BUNDLE=$PWD/build/host-bundle target/debug/vibed
-target/debug/vibe host add vps me@vps.example.com   # or Add Linux Host… in the menu
+target/debug/vibe host add vps me@vps.example.com   # or Settings → Hosts → Add Linux Host…
 ```
 
 On the server, `vibe project`, `vibe profile` and `vibe key` set it up

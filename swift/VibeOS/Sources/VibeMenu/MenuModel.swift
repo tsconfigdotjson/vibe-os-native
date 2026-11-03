@@ -282,9 +282,10 @@ public final class MenuModel: ObservableObject {
         }
     }
 
-    /// Opens the Linux toolbox shell in Terminal, as Linux Toolbox → Open
-    /// Shell does: raises its tab if one is attached, or opens one running
-    /// `vibe toolbox`, which boots it and attaches. Twice gives one tab.
+    /// Opens the Linux toolbox shell in Terminal, as Settings → Linux
+    /// Toolbox → Open Shell does: raises its tab if one is attached, or
+    /// opens one running `vibe toolbox`, which boots it and attaches. Twice
+    /// gives one tab.
     public func openToolbox() async {
         // The terminals attached to its shell, if it runs, from the
         // session list, which changes nothing: toolbox.open could boot it.
@@ -304,8 +305,14 @@ public final class MenuModel: ObservableObject {
         toolbox?.state == .closed || toolbox?.state == .open
     }
 
-    /// See Logins: what the Linux home holds, and Claude's login. It boots
-    /// nothing, so it's fine to ask whenever the window shows.
+    /// Reads the toolbox's status again, as Settings does while it shows
+    /// it, so what it says is what vibed says now.
+    public func refreshToolbox() async {
+        toolbox = (try? await call(ToolboxStatusGet.self, NoParams())) ?? toolbox
+    }
+
+    /// What the Linux home holds, and whether Linux agents are signed in.
+    /// It boots nothing, so it's fine to ask whenever Settings shows it.
     public func toolboxLogins() async throws -> ToolboxLogins {
         try await call(ToolboxLoginsGet.self, NoParams())
     }

@@ -154,9 +154,7 @@ for b in vibed vibe vibe-shim; do cp "$RUST/$b" "$APP/Contents/MacOS/$b"; done
 cp "$vm_bin" "$APP/Contents/MacOS/vibe-vm"
 cp "swift/VibeOS/Support/$LABEL.plist" "$APP/Contents/Library/LaunchAgents/$LABEL.plist"
 icns=$WORK/AppIcon.icns
-rm -rf "$WORK/AppIcon.iconset"
-python3 scripts/app-icon.py "$WORK/AppIcon.iconset"
-iconutil -c icns "$WORK/AppIcon.iconset" -o "$icns"
+iconutil -c icns swift/VibeOS/Support/AppIcon.iconset -o "$icns"
 cp "$icns" "$APP/Contents/Resources/AppIcon.icns"
 if [ -n "$HOST_BUNDLE" ]; then cp -R "$HOST_BUNDLE" "$APP/Contents/Resources/linux"; fi
 if $SPARKLE; then

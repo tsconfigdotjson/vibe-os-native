@@ -11,7 +11,7 @@ import VibeRPC
 // MARK: Palette
 
 extension NSColor {
-    /// Phosphor: the lit windows of the app icon. It marks what's alive (a
+    /// Phosphor: the lit windows of the brand mark. It marks what's alive (a
     /// working agent, a connected host, MCP on), never text.
     static let vibeSignal = NSColor(name: NSColor.Name("VibeSignal")) { appearance in
         let match = appearance.bestMatch(from: [
@@ -37,7 +37,7 @@ enum Palette {
     static let trouble = Color.red
     /// At rest.
     static let rest = Color.gray
-    /// The night of the app icon, for the mark.
+    /// The night behind the brand mark.
     static let inkTop = Color(red: 0x26 / 255, green: 0x2B / 255, blue: 0x5E / 255)
     static let inkBottom = Color(red: 0x0A / 255, green: 0x0C / 255, blue: 0x1F / 255)
     static let moon = Color(red: 0xE6 / 255, green: 0xE4 / 255, blue: 0xFF / 255)
@@ -168,32 +168,12 @@ struct MenuRowBody: View {
     }
 }
 
-/// The same highlight as `MenuRowStyle`, for a row that isn't a button,
-/// such as a menu.
-struct HoverRow: ViewModifier {
-    @State private var hovering = false
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
-    func body(content: Content) -> some View {
-        content
-            .contentShape(Rectangle())
-            .background {
-                RoundedRectangle(cornerRadius: Metrics.rowRadius, style: .continuous)
-                    .fill(Color.primary.opacity(hovering ? 0.075 : 0))
-                    .padding(.horizontal, Metrics.rowInset)
-            }
-            .animation(motion(.snappy(duration: 0.16), reduce: reduceMotion), value: hovering)
-            .onHover { hovering = $0 }
-    }
-}
-
 /// A footer row that reads like a menu item: a symbol, a title, and its
-/// shortcut or a chevron.
+/// shortcut.
 struct MenuItemLabel: View {
     let title: String
     let symbol: String
     var trailing: String?
-    var trailingSymbol: String?
     @Environment(\.isEnabled) private var isEnabled
 
     var body: some View {
@@ -207,12 +187,6 @@ struct MenuItemLabel: View {
             if let trailing {
                 Text(trailing)
                     .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .accessibilityHidden(true)
-            }
-            if let trailingSymbol {
-                Image(systemName: trailingSymbol)
-                    .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
                     .accessibilityHidden(true)
             }
@@ -456,15 +430,14 @@ struct IconTile: View {
 
 // MARK: The mark
 
-/// The app icon's four windows, drawn: three lit by agents at work, one
-/// asleep with a moon. `lit` lights them in the menu bar glyph's order (top
+/// The menu bar glyph's four windows, drawn large: three lit by agents at
+/// work, one asleep with a moon. `lit` lights them in the glyph's order (top
 /// left, bottom left, bottom right, then top right), so the welcome can
 /// light one per setup step done.
 struct BrandMark: View {
     var lit = 3
     var size: CGFloat = 56
-    /// The night behind the windows, as on the icon; off, it sits on
-    /// whatever is behind it.
+    /// The night behind the windows; off, it sits on whatever is behind it.
     var night = true
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
