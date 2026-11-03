@@ -345,6 +345,8 @@ A Linux server runs the same `vibed`, so it joins the Mac as another host. Its a
 - The server has its own logins, set up on the server itself: `gh auth login`, and `claude` with `/login`. It's one machine with one `~/.claude`, like a VibeOS box, so plain `/login` works; the cross-VM problem that forced `setup-token` doesn't apply.
 - Projects are cloned on the host that runs their agents. The same GitHub repo can be a project on the Mac and on a server.
 - There's no toolbox or Linux template on a server: install tools on it directly, as you would on any server.
+- A server on the Mac's local network needs VibeOS's Local Network access (macOS counts `vibed` and its `ssh` as the app's, but only the app can ask). Before the install, the app asks for it when the destination is on the local network, and while it's off says so and how to turn it on (System Settings > Privacy & Security > Local Network > VibeOS). A server out on the internet needs nothing.
+- When `ssh` can't connect, `vibed` says what really happened at each of the server's addresses (refused, no answer, Local Network access off), not just `ssh`'s last error.
 
 ### How agents run on a Linux host
 
@@ -356,6 +358,7 @@ A Linux server runs the same `vibed`, so it joins the Mac as another host. Its a
 ### The link between the Mac and a host
 
 - The Mac's `vibed` drives each host through SSH: `ssh <host> vibe rpc` carries the same JSON-RPC as the local socket, both ways. Nothing new is opened on the server, and SSH keys are the authentication.
+- A host's install steps, link and calls share one SSH connection (OpenSSH connection sharing, its socket in the run directory), so a server that limits how often a client may connect (ufw `limit`, fail2ban) doesn't turn them away. The external-access tunnel keeps a connection of its own.
 - `vibed` supervises the link: keepalives, reconnect with backoff, and a connected/down state in the menu. When a link is down, that host's agents show as unavailable; nothing on either side stops.
 - Clicking a remote agent opens Terminal with `ssh -t <host> vibe attach <ref>`.
 - A host runs on its own too. It serves its own MCP for its own agents, and `vibe key`, `vibe project` and `vibe profile` replace the Settings screens. When the Mac is connected, its menu and MCP show the host's agents as well.

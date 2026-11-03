@@ -723,6 +723,7 @@ mod tests {
         Ssh {
             program: "ssh".into(),
             bundle: None,
+            shared: None,
         }
     }
 

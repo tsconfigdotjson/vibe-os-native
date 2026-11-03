@@ -145,6 +145,7 @@ impl Config {
     pub fn new(info: DaemonInfo, layout: Layout) -> Self {
         let path = std::env::var_os("PATH");
         let checks = Arc::new(crate::doctor::Machine::new(layout.home()));
+        let run_dir = layout.run_dir();
         Config {
             label: hostname(),
             layout,
@@ -157,7 +158,7 @@ impl Config {
             pressure: Arc::new(crate::pressure::HostPressure),
             toolbox: None,
             tailscale: Arc::new(vibe_mcp::net::tailscale_addresses),
-            remote: Arc::new(Ssh::new()),
+            remote: Arc::new(Ssh::new().sharing_in(run_dir)),
             link_timing: Timing::default(),
             power: Arc::new(crate::power::HostPower::default()),
             free_disk: Arc::new(crate::sleep::free_space),

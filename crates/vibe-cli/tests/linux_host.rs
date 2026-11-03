@@ -364,9 +364,12 @@ fn mac(golden: &common::Golden, ssh: &Path, bundle: PathBuf) -> Mac {
         .build()
         .unwrap();
     let mut config = golden.config();
+    // Sharing a connection per host as the app's vibed does: with real ssh
+    // (the real-host tests), that's what's tested.
     config.remote = Arc::new(Ssh {
         program: ssh.into(),
         bundle: Some(bundle),
+        shared: Some(config.layout.run_dir()),
     });
     config.link_timing = Timing {
         ping_every: Duration::from_millis(500),

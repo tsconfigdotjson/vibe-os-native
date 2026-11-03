@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 import VibeMenu
 import VibeRPC
@@ -17,11 +18,25 @@ struct AddHostView: View {
     /// closed carries on in vibed, and its host shows in the menu, but its
     /// answer doesn't land on the next opening.
     @State private var opening = 0
+    /// The add under way, cancelled when the window closes while it waits
+    /// for Local Network access.
+    @State private var adding: Task<Void, Never>?
+    /// For the gallery: the wait for Local Network access, as it reads.
+    private let previewLocalNetworkOff: String?
 
-    init(model: MenuModel, preview: HostInstall? = nil) {
+    init(model: MenuModel, preview: HostInstall? = nil, previewLocalNetworkOff: String? = nil) {
         self.model = model
         _installed = State(initialValue: preview)
+        self.previewLocalNetworkOff = previewLocalNetworkOff
+        if previewLocalNetworkOff != nil {
+            _installing = State(initialValue: true)
+            _address = State(initialValue: "me@nas.local")
+            _name = State(initialValue: "nas")
+        }
     }
+
+    /// Why adding waits, while Local Network access is off.
+    private var localNetworkOff: String? { previewLocalNetworkOff ?? (installing ? model.localNetworkOff : nil) }
 
     private var trimmedName: String { name.trimmingCharacters(in: .whitespaces) }
     private var trimmedAddress: String { address.trimmingCharacters(in: .whitespaces) }
@@ -75,19 +90,24 @@ struct AddHostView: View {
                     TextField("Name", text: $name, prompt: Text("vps"))
                         .labelsHidden()
                         .autocorrectionDisabled()
-                        .onSubmit { if canAdd { Task { await add() } } }
+                        .onSubmit { if canAdd { start() } }
                 }
             }
             .disabled(installing)
             ErrorText(error: error)
+            if let localNetworkOff {
+                LocalNetworkOff(message: localNetworkOff)
+            }
             HStack {
                 if installing {
-                    Working(text: "Installing vibed on \(trimmedAddress)…")
+                    Working(
+                        text: localNetworkOff == nil
+                            ? "Installing vibed on \(trimmedAddress)…" : "Waiting for Local Network access…")
                 }
                 Spacer()
                 Button("Cancel") { close() }
                     .keyboardShortcut(.cancelAction)
-                Button("Add Host") { Task { await add() } }
+                Button("Add Host") { start() }
                     .keyboardShortcut(.defaultAction)
                     .disabled(!canAdd)
             }
@@ -110,6 +130,10 @@ struct AddHostView: View {
         }
     }
 
+    private func start() {
+        adding = Task { await add() }
+    }
+
     private func add() async {
         guard canAdd else { return }
         let mine = opening
@@ -127,6 +151,10 @@ struct AddHostView: View {
     }
 
     private func close() {
+        // Waiting for Local Network access ends; an install under way in
+        // vibed carries on.
+        adding?.cancel()
+        adding = nil
         opening += 1
         installing = false
         dismissWindow(id: WindowID.addHost)
@@ -135,6 +163,23 @@ struct AddHostView: View {
         lastSuggestion = ""
         error = nil
         installed = nil
+    }
+}
+
+/// Local Network access is off: why adding waits, and where to turn it on.
+struct LocalNetworkOff: View {
+    let message: String
+
+    var body: some View {
+        Label {
+            VStack(alignment: .leading, spacing: 8) {
+                Text(message).fixedSize(horizontal: false, vertical: true)
+                Button("Open Local Network Settings") { NSWorkspace.shared.open(LocalNetwork.settingsURL) }
+            }
+        } icon: {
+            Image(systemName: "network.badge.shield.half.filled").foregroundStyle(Palette.attention)
+        }
+        .font(.callout)
     }
 }
 
