@@ -208,10 +208,15 @@ impl Link {
     }
 
     /// Notes what the host says of itself, and returns whether that
-    /// changed.
+    /// changed. Its memory changes with every ping, so it's kept but isn't
+    /// a change: `hosts.list` reads it, and no `host.link` event is due.
     fn set_report(&self, own: HostInfo) -> bool {
         let mut s = lock(&self.status);
-        let changed = s.connected && s.own.as_ref() != Some(&own);
+        let steady = |h: &HostInfo| HostInfo {
+            memory: None,
+            ..h.clone()
+        };
+        let changed = s.connected && s.own.as_ref().map(steady) != Some(steady(&own));
         if s.connected {
             s.own = Some(own);
         }

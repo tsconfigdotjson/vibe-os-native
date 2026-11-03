@@ -27,8 +27,9 @@
 //! [`WAKE_BEFORE_DUE`] is woken, so the loop fires on time. A send or an
 //! attach wakes one too ([`crate::talk`], [`Core::attach_session`]).
 //!
-//! The same rule, without the debounce, picks the agents admission and
-//! memory pressure put to sleep early, oldest first.
+//! The same rule, without the debounce, picks the agents put to sleep
+//! early, oldest first: to make room under `max_awake_agents`, and under
+//! memory pressure. Never to make room in memory for a start (#47).
 
 use std::collections::HashMap;
 use std::fmt;
@@ -81,8 +82,6 @@ const CPU_WINDOW: Duration = Duration::from_secs(1);
 pub enum Early {
     /// Any: to make room under `max_awake_agents`.
     Any,
-    /// Only one whose sleep frees its memory.
-    FreesMemory,
     /// One whose sleep frees memory, or a supervised one, which its OS can
     /// swap out once frozen: under memory pressure.
     UnderPressure,
@@ -92,7 +91,6 @@ impl Early {
     fn allows(self, caps: vibe_env::Capabilities) -> bool {
         match self {
             Early::Any => true,
-            Early::FreesMemory => caps.sleep_frees_memory,
             Early::UnderPressure => caps.sleep_frees_memory || !caps.kernel_limits,
         }
     }

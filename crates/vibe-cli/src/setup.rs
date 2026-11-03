@@ -707,6 +707,7 @@ mod tests {
             url: None,
             tunnel: None,
             external_detail: None,
+            memory: None,
         };
         assert_eq!(
             describe_host(&h),
@@ -720,6 +721,7 @@ mod tests {
             url: Some("https://vps.example.com/mcp".into()),
             tunnel: Some(vibe_core::model::TunnelState::Down),
             external_detail: Some("can't listen on port 443".into()),
+            memory: None,
             ..h
         };
         assert_eq!(

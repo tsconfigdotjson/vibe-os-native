@@ -767,6 +767,40 @@ typealias StepStatus = SetupProgress.Step.Status
         #expect(headerFacts(memory: nil, gh: nil, mcp: false, hosts: []).map(\.value) == ["Checking…", "Off"])
     }
 
+    @Test func eachHostsMemoryIsWhatItReallyUses() throws {
+        var mac = try decode(HostInfo.self, hostJSON("local", mcp: true))
+        mac.memory = MemoryUse(total: 64 << 30, used: 58 << 30, swapTotal: 4 << 30, swapUsed: 3 << 30)
+        var vps = try decode(HostInfo.self, hostJSON("vps", link: .connected))
+        vps.memory = MemoryUse(total: 12 << 30, used: 5 << 30)
+        // vibed's reading of the Mac wins over the app's own, with the swap
+        // in use; a Linux host's sits beside its link.
+        let facts = headerFacts(memory: HostMemory(used: 1, total: 2), gh: nil, mcp: true, hosts: [mac, vps])
+        #expect(facts.map(\.value) == ["58G of 64G · 3G swap", "Checking…", "On", "Connected · 5G of 12G"])
+        #expect(facts.map(\.tone) == [.normal, .normal, .normal, .normal])
+        // No alert while there's no pressure, however full: memory is each
+        // agent's ceiling, and the host swaps.
+        #expect(headerAlerts(gh: nil, hosts: [mac, vps]).isEmpty)
+        // A little swap, as a Mac nearly always has, isn't worth the words.
+        #expect(memorySummary(MemoryUse(total: 16 << 30, used: 9 << 30, swapTotal: 1 << 30, swapUsed: 12 << 20)) == "9G of 16G")
+        #expect(memorySummary(MemoryUse(total: 16 << 30, used: 9 << 30, swapTotal: 2 << 30, swapUsed: 1 << 30)) == "9G of 16G · 1G swap")
+
+        // Short of memory: a warning, never a block, with the kernel's
+        // words for a tooltip.
+        mac.memory?.pressure = "macOS warns of memory pressure"
+        vps.memory?.pressure = "its programs waited on memory 45% of the last 10 s"
+        let alerts = headerAlerts(gh: nil, hosts: [mac, vps])
+        #expect(alerts.map(\.title) == ["This Mac is short of memory", "vps is short of memory"])
+        #expect(alerts.map(\.tone) == [.attention, .attention])
+        #expect(alerts.map(\.reason) == ["macOS warns of memory pressure", "Its programs waited on memory 45% of the last 10 s"])
+        #expect(alerts.first?.detail == "Agents keep running, and it swaps. Delete agents you're done with to free some.")
+        let warned = headerFacts(memory: nil, gh: nil, mcp: true, hosts: [mac, vps])
+        #expect(warned.first?.tone == .attention)
+        #expect(warned.last?.tone == .attention)
+        // A host that's down says nothing of its memory.
+        vps.link = .down
+        #expect(headerAlerts(gh: nil, hosts: [vps]).map(\.title) == ["vps is down"])
+    }
+
     @Test func memorySpeaksUpOnlyNearItsLimit() throws {
         // A quarter: the quiet bar alone.
         #expect(memoryNote(try agent("a", memoryUsed: 1 << 30)) == nil)

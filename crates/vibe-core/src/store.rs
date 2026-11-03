@@ -352,6 +352,7 @@ impl Store {
                     url: external.as_deref().map(external_url),
                     tunnel: None,
                     external_detail: None,
+                    memory: None,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
@@ -1219,6 +1220,7 @@ mod tests {
                 url: None,
                 tunnel: None,
                 external_detail: None,
+                memory: None,
             }]
         );
         assert!(s.has_host("local").unwrap());
@@ -1240,6 +1242,7 @@ mod tests {
             url: None,
             tunnel: None,
             external_detail: None,
+            memory: None,
         }
     }
 

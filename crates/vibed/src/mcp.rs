@@ -16,12 +16,12 @@ use serde_json::{Value, json};
 use tokio::task::JoinHandle;
 use vibe_core::limits::{self, HostLimits};
 use vibe_core::model::EventKind;
-use vibe_core::model::MAC_HOST;
+use vibe_core::model::{LOCAL_HOST, MAC_HOST};
 use vibe_core::rpc::{
     Agent, AgentCheckParams, AgentDeleteParams, AgentList, AgentMessagesParams, AgentOutputParams,
     AgentStartParams, AgentsCheck, AgentsDelete, AgentsList, AgentsMessages, AgentsOutput,
-    AgentsSend, AgentsStart, ErrorCode, ErrorObject, HostParams, McpSetParams, McpSettings, Method,
-    Project, ProjectList, ProjectsList,
+    AgentsSend, AgentsStart, ErrorCode, ErrorObject, HostList, HostParams, HostsList, McpSetParams,
+    McpSettings, Method, Project, ProjectList, ProjectsList,
 };
 use vibe_mcp::http::Settings;
 use vibe_mcp::{AgentView, Caller, Check, Daemon, Input, Message, Screen, Sent, Target};
@@ -256,6 +256,38 @@ impl Daemon for Core {
             hosts.push(MAC_HOST.to_owned());
         }
         Ok(hosts)
+    }
+
+    async fn memory(&self, c: &Caller) -> Vec<(String, vibe_core::rpc::MemoryUse)> {
+        let mut all: Vec<_> = Core::hosts(self)
+            .map(|l| l.hosts)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|h| Some((h.name, h.memory?)))
+            .collect();
+        // The Mac behind this host, while it's the external address: its
+        // own row, down the tunnel, with the caller's key. While the tunnel
+        // is down, or the Mac doesn't take the key, it's left out.
+        if let Some(mac) = self.mac()
+            && !all.iter().any(|(h, _)| h == MAC_HOST)
+        {
+            let own = mac
+                .call(
+                    c.key(),
+                    HostsList::NAME,
+                    json!({}),
+                    call_timeout(HostsList::NAME),
+                )
+                .await
+                .and_then(typed::<HostList>)
+                .ok()
+                .and_then(|l| l.hosts.into_iter().find(|h| h.name == LOCAL_HOST))
+                .and_then(|h| h.memory);
+            if let Some(m) = own {
+                all.push((MAC_HOST.to_owned(), m));
+            }
+        }
+        all
     }
 
     async fn projects(&self, c: &Caller, host: &str) -> Result<Vec<Project>, ErrorObject> {

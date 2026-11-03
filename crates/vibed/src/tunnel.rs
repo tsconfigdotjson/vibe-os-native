@@ -7,7 +7,9 @@
 //! Mac's tunnel socket, `run/tunnel.sock`. That socket isn't `vibed.sock`:
 //! it takes only `daemon.hello` and `tunnel.call`, which runs one of the
 //! agent calls MCP makes ([`TUNNEL_METHODS`]), for this Mac's own agents,
-//! after checking the outside caller's API key itself. A key the host took
+//! after checking the outside caller's API key itself. `hosts.list` there
+//! answers with this Mac's own row alone (its memory, for
+//! `vibe_list_agents`): never the hosts linked to it, or their addresses. A key the host took
 //! but this Mac doesn't know, revoked here and not yet there, say, or one
 //! of the host's own, gets nothing; so a host that's been taken over can
 //! use the tunnel, but can't drive the Mac without a key.
@@ -27,7 +29,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::task::JoinHandle;
 use vibe_core::model::{LOCAL_HOST, TunnelState};
 use vibe_core::rpc::{
-    ErrorCode, ErrorObject, Hello, HelloParams, Id, Method, NoParams, Request, Response,
+    ErrorCode, ErrorObject, Hello, HelloParams, HostsList, Id, Method, NoParams, Request, Response,
     TUNNEL_METHODS, TunnelCall, TunnelCallParams, TunnelPrepare,
 };
 
@@ -176,7 +178,15 @@ async fn tunnel_call(core: &Core, params: Option<Value>) -> Result<Value, ErrorO
         Err(e) => return Err(e),
     };
     crate::log!("vibed: tunnel: key {:?} called {}", key.name, p.method);
-    crate::dispatch::call_here(core, &p.method, Value::Object(params)).await
+    let mut answer = crate::dispatch::call_here(core, &p.method, Value::Object(params)).await?;
+    // This Mac's own row only: the hosts linked to it aren't the tunnel's
+    // to see.
+    if p.method == HostsList::NAME
+        && let Some(hosts) = answer.get_mut("hosts").and_then(Value::as_array_mut)
+    {
+        hosts.retain(|h| h.get("name").and_then(Value::as_str) == Some(LOCAL_HOST));
+    }
+    Ok(answer)
 }
 
 /// Serves one connection to the tunnel's socket: one message per line,

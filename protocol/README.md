@@ -52,7 +52,8 @@ a real `vibe-shim` running `sleep`, and the records of two that exited:
 `brave-copper-lynx` with code 0 and `calm-silver-heron` killed. `src/app`
 has an `origin` to fetch, and a `.vibe/setup.sh` that copies `.env.example`
 to `.env.local`. Agents run under `vibe-env`'s test backend, with its
-stand-in for Claude Code, on a host with 64G of memory; randomness is fixed,
+stand-in for Claude Code, on a host with 64G of memory, 58G of it in use and
+3G of its 4G of swap, while macOS warns of memory pressure; randomness is fixed,
 so refs and session ids are too. Its toolbox is `vibe-env`'s test toolbox
 (a shell of `sleep 600`, empty images for versions), with base release 1
 installed, a Linux home (version 1, holding a `gh` login and a git

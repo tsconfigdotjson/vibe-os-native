@@ -25,12 +25,12 @@
 #     a 1 s idle_debounce has passed, and a send wakes it to answer its
 #     question; a delete is refused while a commit is unpushed, and once
 #     it's pushed, leaves nothing behind but the branch
-#   - sleep, wake and admission (#6), one scripted scenario on every
+#   - sleep, wake and admission (#6, #47), one scripted scenario on every
 #     backend (crates/vibed/tests/sleep.rs): idle -> asleep once the
-#     debounce has passed; a send, and an attach, wake it; a start the
-#     host has no room for sleeps an idle agent first where sleep frees
-#     memory (refused otherwise, unless it's max_awake_agents that's full);
-#     a firm /loop wakeup fires on time from a sleeping agent. The test
+#     debounce has passed; a send, and an attach, wake it; a start past
+#     the host's memory goes ahead, as memory is a ceiling, not a
+#     reservation, and one past max_awake_agents sleeps an idle agent
+#     first; a firm /loop wakeup fires on time from a sleeping agent. The test
 #     step runs it on the test backend (keeping memory, and saving to
 #     disk) and, on a Mac, the macos backend; the cgroups step on this
 #     machine's cgroups; the linux-vm step on real VMs. The test step also
@@ -539,11 +539,10 @@ s_agents() {
   # and waits for the answer until it's hung up.
   export VIBE_TEST_BACKEND="$ROOT/crates/vibe-env/src/stand-in.sh"
   start_vibed "$socket" "$WORK/ag-vibed-1.log"
-  # 1G agents and nothing kept back, so one fits on any machine.
+  # A 1G agent: its memory is only its ceiling, so nothing is set aside.
   out=$(rpc \
     "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"projects.add\",\"params\":{\"path\":\"$repo\"}}" \
     '{"jsonrpc":"2.0","id":2,"method":"profiles.update","params":{"project":"app","profile":"software-eng-linux","memory":1073741824}}' \
-    '{"jsonrpc":"2.0","id":3,"method":"limits.set","params":{"reserve_memory":0}}' \
     '{"jsonrpc":"2.0","id":4,"method":"agents.start","params":{"project":"app","profile":"software-eng-linux","prompt":"commit question"}}')
   echo "start: $out"
   case $out in *'"error"'*) echo "a call failed"; return 1 ;; esac
@@ -647,10 +646,10 @@ s_mcp() {
   git -C "$origin" -c user.name=t -c user.email=t@example.com commit -q --allow-empty -m first
   git clone -q "$origin" "$repo"
   # A port of its own, so a vibed already serving 7878 here isn't the one
-  # asked; and nothing kept back, so a 1G agent fits anywhere.
+  # asked.
   port=$((20000 + RANDOM % 30000))
   mkdir -p "$home/.config/vibeos"
-  printf 'mcp_port = %s\nreserve_memory = 0\n' "$port" >"$home/.config/vibeos/host.toml"
+  printf 'mcp_port = %s\n' "$port" >"$home/.config/vibeos/host.toml"
   export VIBE_TEST_BACKEND="$ROOT/crates/vibe-env/src/stand-in.sh"
   start_vibed "$socket" "$WORK/mc-vibed.log"
   wait_for "$WORK/mc-vibed.log" "mcp: serving http://127.0.0.1:$port/mcp"
@@ -762,7 +761,6 @@ s_macos_agents() {
   out=$(rpc \
     "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"projects.add\",\"params\":{\"path\":\"$repo\"}}" \
     '{"jsonrpc":"2.0","id":2,"method":"profiles.update","params":{"project":"app","profile":"software-eng-mac","memory":1073741824}}' \
-    '{"jsonrpc":"2.0","id":3,"method":"limits.set","params":{"reserve_memory":0}}' \
     '{"jsonrpc":"2.0","id":4,"method":"agents.start","params":{"project":"app","profile":"software-eng-mac","prompt":"fork 3 commit question"}}')
   echo "start: $out"
   case $out in *'"error"'*) echo "a call failed"; return 1 ;; esac
@@ -1064,7 +1062,6 @@ s_terminal_attach() {
   out=$(rpc \
     "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"projects.add\",\"params\":{\"path\":\"$repo\"}}" \
     '{"jsonrpc":"2.0","id":2,"method":"profiles.update","params":{"project":"app","profile":"software-eng-mac","memory":1073741824}}' \
-    '{"jsonrpc":"2.0","id":3,"method":"limits.set","params":{"reserve_memory":0}}' \
     '{"jsonrpc":"2.0","id":4,"method":"agents.start","params":{"project":"app","profile":"software-eng-mac","prompt":"question"}}')
   echo "start: $out"
   case $out in *'"error"'*) echo "a call failed"; return 1 ;; esac

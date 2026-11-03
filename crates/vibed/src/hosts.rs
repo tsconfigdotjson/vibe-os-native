@@ -146,9 +146,11 @@ impl Core {
                 h.mcp = serving;
                 h.version = Some(self.info().version.clone());
                 h.missing = self.missing_tools();
+                h.memory = self.memory_use();
                 self.describe_public(h);
             } else if let Some(link) = self.link(&h.name) {
                 *h = link.describe(h.clone());
+                h.memory = link.reported().and_then(|own| own.memory);
                 self.describe_external(h, &link);
             }
         }
@@ -248,6 +250,7 @@ impl Core {
             url: None,
             tunnel: None,
             external_detail: None,
+            memory: None,
         };
         self.store()
             .add_host(&info, self.now())
@@ -536,6 +539,7 @@ impl Core {
             url: None,
             tunnel: None,
             external_detail: None,
+            memory: None,
         });
         e.state = Some(info.link.to_string());
         e.message = info.detail;

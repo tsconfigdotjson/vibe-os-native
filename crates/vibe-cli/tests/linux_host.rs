@@ -256,7 +256,7 @@ esac
         fs::create_dir_all(&config).unwrap();
         fs::write(
             config.join("host.toml"),
-            format!("mcp_port = {}\nreserve_memory = \"0\"\n", mcp.port()),
+            format!("mcp_port = {}\n", mcp.port()),
         )
         .unwrap();
         common::repo(&home.join("src/app"));

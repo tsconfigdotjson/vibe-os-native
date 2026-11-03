@@ -483,7 +483,7 @@ async fn no_agent_may_take_the_toolboxs_name() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_open_toolbox_counts_against_admission() {
+async fn an_open_toolbox_counts_as_awake() {
     let golden = common::Golden::new();
     let core = golden.core();
     core.add_project(ProjectAddParams {

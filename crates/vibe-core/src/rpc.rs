@@ -599,8 +599,10 @@ method! {
 method! {
     /// `agents.start`: one call does it all (PRD: Key user flows, Start an
     /// agent). It cuts a worktree on a new branch, named by the agent's
-    /// ref, from `origin`'s default branch or `from`; checks admission;
-    /// creates the compartment; runs `.vibe/setup.sh` there if the
+    /// ref, from `origin`'s default branch or `from`; checks the host has
+    /// disk to spare and room under `max_awake_agents` (never memory: an
+    /// agent's memory is its ceiling, not a reservation); creates the
+    /// compartment; runs `.vibe/setup.sh` there if the
     /// worktree has one; pre-fills Claude's state; and starts Claude on the
     /// prompt in a session of its own.
     AgentsStart = "agents.start", AgentStartParams => Agent
@@ -765,6 +767,33 @@ pub struct HostInfo {
     /// or Let's Encrypt not reaching the domain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_detail: Option<String>,
+    /// What its memory is doing now, as its kernel measures it: this
+    /// host's own, and a Linux host's from its last ping while its link
+    /// is up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<MemoryUse>,
+}
+
+/// A host's memory as its kernel measures it (#47). Nothing is admitted or
+/// refused by it: each agent's memory is a ceiling it's held to, and the
+/// host swaps if its agents use more than it has.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryUse {
+    /// Its physical memory, in bytes.
+    pub total: u64,
+    /// What's in use, in bytes: on macOS as Activity Monitor counts it
+    /// (app memory, wired and compressed); on Linux, all but
+    /// `MemAvailable`.
+    pub used: u64,
+    /// Its swap, in bytes: 0 with none.
+    pub swap_total: u64,
+    pub swap_used: u64,
+    /// While the host is short of memory, as its kernel says (macOS's
+    /// memory pressure at warn or critical; Linux's pressure stall
+    /// information past its marks, or under 5% free where it has none),
+    /// why. A warning only: no start or wake is refused for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pressure: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -800,8 +829,11 @@ impl Method for TunnelCall {
     type Result = Value;
 }
 
-/// The calls the tunnel takes, each for this Mac's own agents only.
+/// The calls the tunnel takes, each for this Mac's own agents only; and
+/// `hosts.list`, answered with this Mac's own row alone, for its memory in
+/// `vibe_list_agents`.
 pub const TUNNEL_METHODS: &[&str] = &[
+    "hosts.list",
     "projects.list",
     "agents.list",
     "agents.start",
@@ -976,8 +1008,6 @@ pub struct LimitsSetParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reserve_memory: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub reserve_cores: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_awake_agents: Option<u32>,
@@ -1028,7 +1058,6 @@ impl LimitsSetParams {
         let wide = |key, v: Option<u64>| v.map(|v| (key, v));
         let narrow = |key, v: Option<u32>| v.map(|v| (key, u64::from(v)));
         [
-            wide("reserve_memory", self.reserve_memory),
             narrow("reserve_cores", self.reserve_cores),
             narrow("max_awake_agents", self.max_awake_agents),
             narrow("cpu_cores", self.cpu_cores),
@@ -1693,7 +1722,6 @@ mod tests {
         assert_eq!(p.changes(), [("cpu_cores", 8), ("vm_disk", 1 << 30)]);
         let every = LimitsSetParams {
             host: None,
-            reserve_memory: Some(1),
             reserve_cores: Some(1),
             max_awake_agents: Some(1),
             cpu_cores: Some(1),

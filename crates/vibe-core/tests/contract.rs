@@ -158,6 +158,7 @@ fn rust_types() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
         entry::<NoParams>(),
         entry::<HostParams>(),
         entry::<HostInfo>(),
+        entry::<MemoryUse>(),
         entry::<HostList>(),
         entry::<HostAddParams>(),
         entry::<HostNameParams>(),

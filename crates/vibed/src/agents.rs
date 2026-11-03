@@ -2,7 +2,9 @@
 //! deleted as a unit (PRD: Core concepts; Key user flows, Start an agent and
 //! Delete). One ref names all three, and the branch too.
 //!
-//! A start, in order: admission; a fetch of `origin` and a worktree on a new
+//! A start, in order: a check that the host has disk to spare and room
+//! under `max_awake_agents` (never memory: an agent's memory is a ceiling,
+//! not a reservation, #47); a fetch of `origin` and a worktree on a new
 //! branch; the compartment, through the environment's backend; the
 //! worktree's `.vibe/setup.sh`, run inside it; Claude's state pre-filled;
 //! then Claude on the prompt, in a session of its own, held to its limits.
@@ -107,102 +109,20 @@ impl Backends {
     }
 }
 
-/// An agent that holds memory on the host, or is awake, as admission
-/// counts it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Awake {
-    pub agent_ref: String,
-    /// The memory it holds: its profile's, which it may grow to, unless its
-    /// sleep gave it back.
-    pub memory: u64,
-    /// Asleep, frozen with its memory held: it doesn't count against
-    /// `max_awake_agents`.
-    pub asleep: bool,
-}
-
-/// Why a start isn't admitted.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Refusal {
-    /// `max_awake_agents` are awake: putting any one to sleep makes room.
-    TooMany(String),
-    /// Not enough memory: only a sleep that frees memory makes room.
-    NoRoom(String),
-}
-
-impl fmt::Display for Refusal {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Refusal::TooMany(why) | Refusal::NoRoom(why) => f.write_str(why),
-        }
-    }
-}
-
-/// Decides whether a new agent may start (PRD: Host limits). When it says
-/// no, the start puts idle agents to sleep early, if that would help, and
-/// asks again.
-pub trait Admission: Send + Sync + fmt::Debug {
-    /// Whether an agent of `memory` bytes may start beside `awake`, or why
-    /// not.
-    fn admit(&self, memory: u64, limits: &HostLimits, awake: &[Awake]) -> Result<(), Refusal>;
-}
-
 /// Below this much free disk, no agent starts (PRD: Failures, Low disk).
 pub const MIN_FREE_DISK: u64 = 10 * GIB;
 
-/// Admission by the host's memory: each awake agent reserves its profile's
-/// memory, and `reserve_memory` is always left for the host; and by
-/// `max_awake_agents`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HostAdmission {
-    /// The host's physical memory.
-    pub total_memory: u64,
-}
-
-impl HostAdmission {
-    /// For this machine.
-    pub fn current() -> HostAdmission {
-        // SAFETY: sysconf has no preconditions.
-        let (pages, size) = unsafe {
-            (
-                libc::sysconf(libc::_SC_PHYS_PAGES),
-                libc::sysconf(libc::_SC_PAGESIZE),
-            )
-        };
-        let total = u64::try_from(pages)
-            .unwrap_or(0)
-            .saturating_mul(u64::try_from(size).unwrap_or(0));
-        HostAdmission {
-            total_memory: total,
-        }
-    }
-}
-
-impl Admission for HostAdmission {
-    fn admit(&self, memory: u64, limits: &HostLimits, awake: &[Awake]) -> Result<(), Refusal> {
-        let n = awake.iter().filter(|a| !a.asleep).count();
-        if n >= limits.max_awake_agents as usize {
-            return Err(Refusal::TooMany(format!(
-                "{n} agent{} awake already, the most this host takes (max_awake_agents)",
-                if n == 1 { " is" } else { "s are" }
-            )));
-        }
-        let held: u64 = awake.iter().map(|a| a.memory).sum();
-        let room = self
-            .total_memory
-            .saturating_sub(limits.reserve_memory)
-            .saturating_sub(held);
-        if memory > room {
-            return Err(Refusal::NoRoom(format!(
-                "there's no room for an agent with {} of memory: this host has {}, keeps {} for \
-                 itself (reserve_memory), and its agents hold {}",
-                size(memory),
-                size(self.total_memory),
-                size(limits.reserve_memory),
-                size(held)
-            )));
-        }
-        Ok(())
-    }
+/// Why another agent can't be awake beside `awake` others, if it can't:
+/// `max_awake_agents` are awake. Memory is never a reason (#47): each
+/// agent's memory is a ceiling it's held to, not a reservation, and the
+/// host swaps if its agents use more than it has.
+pub fn too_many_awake(awake: usize, limits: &HostLimits) -> Option<String> {
+    (awake >= limits.max_awake_agents as usize).then(|| {
+        format!(
+            "{awake} agent{} awake already, the most this host takes (max_awake_agents)",
+            if awake == 1 { " is" } else { "s are" }
+        )
+    })
 }
 
 /// A size for people: `4G`, `1.5G`, `512M`.
@@ -618,11 +538,9 @@ impl Core {
         })
     }
 
-    /// The agents whose sessions run, with the memory they hold, and the
-    /// toolbox's VM while it runs, which takes a profile's default memory.
-    /// One asleep there is frozen: it holds its memory unless its backend's
-    /// sleep gave it back, and isn't awake.
-    async fn awake(&self, host: &str) -> Result<Vec<Awake>, ErrorObject> {
+    /// The agents awake, by ref, but `except`: those whose sessions run
+    /// and aren't asleep (frozen), and the toolbox while it's open.
+    async fn awake(&self, host: &str, except: &str) -> Result<Vec<String>, ErrorObject> {
         let agents = self.store().agents(host).map_err(store_error)?;
         let mut awake = Vec::new();
         let toolbox = *lock(&self.toolbox_state);
@@ -630,24 +548,14 @@ impl Core {
             toolbox,
             vibe_core::model::ToolboxState::Closed | vibe_core::model::ToolboxState::Unavailable
         ) {
-            awake.push(Awake {
-                agent_ref: vibe_env::toolbox::TOOLBOX_REF.into(),
-                memory: vibe_core::model::DEFAULT_PROFILE_MEMORY,
-                asleep: false,
-            });
+            awake.push(vibe_env::toolbox::TOOLBOX_REF.to_owned());
         }
         for a in agents {
-            if self.session_runs(&a.agent_ref).await {
-                let asleep = a.state == AgentState::Asleep;
-                let freed = asleep
-                    && self
-                        .backend(a.environment)
-                        .is_ok_and(|b| b.capabilities().sleep_frees_memory);
-                awake.push(Awake {
-                    agent_ref: a.agent_ref,
-                    memory: if freed { 0 } else { a.memory },
-                    asleep,
-                });
+            if a.agent_ref != except
+                && a.state != AgentState::Asleep
+                && self.session_runs(&a.agent_ref).await
+            {
+                awake.push(a.agent_ref);
             }
         }
         Ok(awake)
@@ -747,15 +655,10 @@ impl Core {
             check_from(from)?;
         }
 
-        // 1. Admission. Not while the host is short of memory (PRD:
-        // Failures). Starts admitted earlier and still under way count as
-        // awake, and so does this one until its session runs.
-        if let Some(why) = self.short_of_memory() {
-            return Err(error(
-                ErrorCode::Conflict,
-                format!("can't start an agent: {why}"),
-            ));
-        }
+        // 1. Room for it: disk to spare, and under `max_awake_agents`.
+        // Never memory, nor memory pressure (#47): its profile's memory is
+        // the most it may use, not what it holds, and pressure is only
+        // warned of (`hosts.list`).
         let disk = self.layout.worktrees_dir();
         if let Some(free) = (self.free_disk)(&disk)
             && free < MIN_FREE_DISK
@@ -770,12 +673,12 @@ impl Core {
                 ),
             ));
         }
-        // If it doesn't fit, agents still inside their idle debounce sleep
-        // early, idle longest first, where that makes room; then it's
-        // refused. Starts never queue (PRD: Host limits).
-        let _reserved = self
-            .admit(host, "", profile.memory, "start an agent")
-            .await?;
+        // Past `max_awake_agents`, an agent still inside its idle debounce
+        // sleeps early, idle longest first; then it's refused. Starts
+        // admitted earlier and still under way count as awake, and so does
+        // this one until its session runs. Starts never queue (PRD: Host
+        // limits).
+        let _admitted = self.admit(host, "", "start an agent").await?;
 
         // The worktree, on a new branch.
         let base = {
@@ -1243,12 +1146,13 @@ impl Core {
         let host = self.host(host)?;
         let _held = self.hold(agent_ref)?;
         let record = self.store().agent(host, agent_ref).map_err(store_error)?;
-        // One that holds no memory now, or isn't awake, must fit like a
-        // start: idle agents sleep early to make room, or it's refused.
-        let _reserved;
+        // One that isn't awake must fit under `max_awake_agents` like a
+        // start: an idle agent sleeps early to make room, or it's refused.
+        // Never for memory (#47).
+        let _admitted;
         let runs = self.session_runs(agent_ref).await;
         if !runs || record.state == AgentState::Asleep {
-            _reserved = self.admit(host, agent_ref, record.memory, "wake").await?;
+            _admitted = self.admit(host, agent_ref, "wake").await?;
         }
         let woke = self.resume_steps(agent_ref, record).await;
         if woke.is_ok() {
@@ -1258,50 +1162,35 @@ impl Core {
         woke
     }
 
-    /// Admits `memory` more for `what` (`agent_ref`'s, or a new agent's when
-    /// it's empty) beside what the host holds: agents still inside their
-    /// idle debounce sleep early, idle longest first, where that makes
+    /// Admits one more awake agent for `what` (`agent_ref`, or a new
+    /// agent when it's empty) under `max_awake_agents`: agents still
+    /// inside their idle debounce sleep early, idle longest first, to make
     /// room; then it's refused. Starts and wakes never queue (PRD: Host
-    /// limits). The memory is held until the returned value is dropped.
+    /// limits). It counts as awake until the returned value is dropped.
     async fn admit(
         &self,
         host: &str,
         agent_ref: &str,
-        memory: u64,
         what: &str,
-    ) -> Result<Reserved<'_>, ErrorObject> {
+    ) -> Result<Admitted<'_>, ErrorObject> {
         let host_limits =
             limits::load(&self.layout.host_config()).map_err(|e| failed(e.to_string()))?;
         let _one_at_a_time = self.admitting.lock().await;
         let mut slept = Vec::new();
         loop {
-            let mut awake = self.awake(host).await?;
-            awake.retain(|a| a.agent_ref != agent_ref || agent_ref.is_empty());
-            awake.extend(lock(&self.starting).values().map(|memory| Awake {
-                agent_ref: String::new(),
-                memory: *memory,
-                asleep: false,
-            }));
-            let refusal = match self.admission.admit(memory, &host_limits, &awake) {
-                Ok(()) => return Ok(self.reserve(memory)),
-                Err(refusal) => refusal,
+            let awake = self.awake(host, agent_ref).await?.len() + *lock(&self.starting);
+            let Some(refusal) = too_many_awake(awake, &host_limits) else {
+                return Ok(self.count_starting());
             };
-            let frees = matches!(refusal, Refusal::NoRoom(_));
             let why = if agent_ref.is_empty() {
                 "early, to make room for a new agent".to_owned()
             } else {
                 format!("early, to make room for {agent_ref} to wake")
             };
-            let early = if frees {
-                Early::FreesMemory
-            } else {
-                Early::Any
-            };
-            match self.sleep_one_early(early, &why).await {
+            match self.sleep_one_early(Early::Any, &why).await {
                 Some(r) => slept.push(r),
                 None => {
                     let tried = match slept.len() {
-                        0 if frees => "No idle agent would free memory by going to sleep".into(),
                         0 => "No agent is idle, to go to sleep and make room".into(),
                         _ => format!(
                             "{} went to sleep to make room, and no other agent is idle",
@@ -1704,7 +1593,7 @@ impl Core {
         };
         // Not while a start is under way, nor while any of its agents is
         // awake or being started, deleted or resumed.
-        if !lock(&self.starting).is_empty() {
+        if *lock(&self.starting) > 0 {
             return;
         }
         for a in agents.iter().filter(|a| a.project == project_name) {
@@ -1788,24 +1677,22 @@ fn boot_id() -> Option<String> {
     (!id.is_empty()).then(|| format!("{id}\n"))
 }
 
-/// Memory reserved for a start until it's dropped.
-pub(crate) struct Reserved<'a> {
+/// A start or wake admitted and under way, counted as awake until it's
+/// dropped.
+pub(crate) struct Admitted<'a> {
     core: &'a Core,
-    token: u64,
 }
 
-impl Drop for Reserved<'_> {
+impl Drop for Admitted<'_> {
     fn drop(&mut self) {
-        lock(&self.core.starting).remove(&self.token);
+        *lock(&self.core.starting) -= 1;
     }
 }
 
 impl Core {
-    fn reserve(&self, memory: u64) -> Reserved<'_> {
-        let mut starting = lock(&self.starting);
-        let token = (0..).find(|t| !starting.contains_key(t)).unwrap_or(0);
-        starting.insert(token, memory);
-        Reserved { core: self, token }
+    fn count_starting(&self) -> Admitted<'_> {
+        *lock(&self.starting) += 1;
+        Admitted { core: self }
     }
 }
 
@@ -1912,48 +1799,20 @@ mod tests {
     }
 
     #[test]
-    fn admission_by_memory_and_count() {
-        let a = HostAdmission {
-            total_memory: 32 * GIB,
-        };
-        let limits = HostLimits::default();
-        let agent = |i: usize, asleep: bool, memory: u64| Awake {
-            agent_ref: format!("a{i}"),
-            memory,
-            asleep,
-        };
-        let awake = |n: usize| -> Vec<Awake> { (0..n).map(|i| agent(i, false, 4 * GIB)).collect() };
-        // 32G less 4G kept: seven 4G agents fit, as the PRD says.
-        assert_eq!(a.admit(4 * GIB, &limits, &awake(6)), Ok(()));
-        let err = a.admit(4 * GIB, &limits, &awake(7)).unwrap_err();
-        assert_eq!(
-            err,
-            Refusal::NoRoom(
-                "there's no room for an agent with 4G of memory: this host has 32G, keeps 4G for \
-                 itself (reserve_memory), and its agents hold 28G"
-                    .into()
-            )
-        );
-        // Frozen asleep, an agent still holds its memory; saved to disk, it
-        // holds none.
-        let mut held = awake(6);
-        held.push(agent(6, true, 4 * GIB));
-        assert!(matches!(
-            a.admit(4 * GIB, &limits, &held),
-            Err(Refusal::NoRoom(_))
-        ));
-        held[6].memory = 0;
-        assert_eq!(a.admit(4 * GIB, &limits, &held), Ok(()));
-        // Only awake agents count against max_awake_agents.
+    fn only_max_awake_agents_turns_an_agent_away() {
         let few = HostLimits {
             max_awake_agents: 2,
-            ..limits
+            ..HostLimits::default()
         };
-        let err = a.admit(GIB, &few, &awake(2)).unwrap_err();
-        assert!(matches!(&err, Refusal::TooMany(_)), "{err:?}");
-        assert!(err.to_string().contains("max_awake_agents"), "{err}");
-        let asleep = vec![agent(0, false, GIB), agent(1, true, GIB)];
-        assert_eq!(a.admit(GIB, &few, &asleep), Ok(()));
+        assert_eq!(too_many_awake(1, &few), None);
+        let err = too_many_awake(2, &few).unwrap();
+        assert_eq!(
+            err,
+            "2 agents are awake already, the most this host takes (max_awake_agents)"
+        );
+        // Memory never does (#47): sixteen 4G agents on any host are fine
+        // by default, whatever its RAM.
+        assert_eq!(too_many_awake(15, &HostLimits::default()), None);
         assert_eq!(size(1536 * MIB), "1.5G");
         assert_eq!(size(512 * MIB), "512M");
     }
