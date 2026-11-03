@@ -1028,10 +1028,90 @@ async fn a_restarted_host_keeps_the_macs_tunnel() {
             )
             .await;
         assert!(
-            refused.contains(&format!("`{name}` is reserved")),
+            refused.contains(&format!(
+                "`{name}` is a name VibeOS keeps for itself; pick another name"
+            )),
             "{refused}"
         );
     }
+}
+
+/// An agent called as an older `vibed` let one be, `mac` on a Linux host
+/// or `tunnel` on a Mac, before those names were kept for the tunnel's
+/// sockets.
+fn legacy_agent(home: &Path, os: &str, agent_ref: &str) {
+    let layout = Layout::new(home, os);
+    let mut store = vibe_core::store::Store::open(&layout.db()).unwrap();
+    store
+        .add_agent(&vibe_core::store::AgentRecord {
+            host: vibe_core::model::LOCAL_HOST.into(),
+            agent_ref: agent_ref.into(),
+            project: "app".into(),
+            profile: "software-eng-linux".into(),
+            environment: vibe_core::model::Environment::Linux,
+            model: vibe_core::model::Model::Opus,
+            reasoning: vibe_core::model::Reasoning::High,
+            mode: vibe_core::model::Mode::Auto,
+            memory: 1 << 30,
+            worktree: home
+                .join("VibeOS/worktrees/app")
+                .join(agent_ref)
+                .to_string_lossy()
+                .into_owned(),
+            branch: agent_ref.into(),
+            session_id: "s".into(),
+            shim_socket: None,
+            state: vibe_core::model::AgentState::Exited,
+            created_at: 0,
+            compartment: "{}".into(),
+            starting: false,
+        })
+        .unwrap();
+}
+
+/// An agent named `mac` or `tunnel` before 0.1.3 is still listed and can
+/// be deleted, and deleting it leaves the tunnel's sockets alone: sshd's
+/// end on the host has no lock, and the Mac's is the Mac's own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn agents_named_for_the_tunnel_from_before_can_be_deleted() {
+    let w = world(limits()).await;
+    w.turn_on().await;
+    let key = w.key("laptop");
+    w.pushed(&key).await;
+    w.mac_reachable(&key).await;
+    legacy_agent(&w.host_world.home, "linux", "mac");
+    legacy_agent(&w.mac_world.home, "macos", "tunnel");
+    let mac_end = w.mac.tunnel_socket();
+    assert!(mac_end.exists());
+
+    // Each is an agent as any other, and neither socket is a session.
+    for (core, name) in [(&w.host, "mac"), (&w.mac, "tunnel")] {
+        let listed = rpc(core, "agents.list", json!({})).await;
+        let refs: Vec<_> = listed["result"]["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["ref"].as_str().unwrap().to_owned())
+            .collect();
+        assert!(refs.contains(&name.to_owned()), "{listed}");
+        let sessions = rpc(core, "sessions.list", json!({})).await;
+        assert_eq!(sessions["result"]["sessions"], json!([]), "{sessions}");
+    }
+
+    for (core, name) in [(&w.host, "mac"), (&w.mac, "tunnel")] {
+        let deleted = rpc(core, "agents.delete", json!({"ref": name, "force": true})).await;
+        assert!(deleted.get("result").is_some(), "{name}: {deleted}");
+    }
+    assert!(
+        w.tunnel_end().exists(),
+        "deleting `mac` removed the tunnel's end"
+    );
+    assert!(
+        mac_end.exists(),
+        "deleting `tunnel` removed the Mac's socket"
+    );
+    w.mac_reachable(&key).await;
+    assert_eq!(w.vps().tunnel, Some(TunnelState::Up));
 }
 
 /// A tunnel whose end on the host is gone while `ssh` runs on (a cleanup

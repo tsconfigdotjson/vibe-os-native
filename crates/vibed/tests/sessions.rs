@@ -199,10 +199,12 @@ async fn attaching_says_why_it_cant() {
         assert_eq!(err.code, ErrorCode::InvalidParams.code(), "{bad:?}");
     }
 
-    // A socket nobody serves any more is cleaned up on the way.
+    // A socket nobody serves any more, with the lock its dead shim left,
+    // is cleaned up on the way.
     let stale = w.layout.session_socket("dead-end");
     std::fs::create_dir_all(stale.parent().unwrap()).unwrap();
     drop(std::os::unix::net::UnixListener::bind(&stale).unwrap());
+    std::fs::write(vibe_core::socket::lock_path(&stale), "").unwrap();
     let err = core
         .attach_session(attach_params("dead-end"))
         .await
@@ -218,9 +220,15 @@ async fn adopting_finds_running_shims_and_clears_stale_sockets() {
     let _b = start_shim(&w.layout, "brave-copper-lynx", &["sleep", "600"]);
     let stale = w.layout.session_socket("gone-away");
     drop(std::os::unix::net::UnixListener::bind(&stale).unwrap());
+    std::fs::write(vibe_core::socket::lock_path(&stale), "").unwrap();
+    // One with no lock was never a shim's, as sshd's end of a tunnel
+    // isn't: it stays.
+    let foreign = w.layout.session_socket("not-a-shim");
+    drop(std::os::unix::net::UnixListener::bind(&foreign).unwrap());
     let core = core(&w);
     assert_eq!(core.adopt_sessions().await, 2);
     assert!(!stale.exists(), "the stale socket is removed");
+    assert!(foreign.exists(), "a socket no shim made is kept");
 
     // A shim that dies is gone from the list; its command was hung up.
     let child = shim::connect(&a.socket, &control_hello("t"), Duration::from_secs(5))

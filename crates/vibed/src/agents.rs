@@ -24,7 +24,8 @@ use std::time::Duration;
 
 use vibe_core::limits::{self, HostLimits};
 use vibe_core::model::{
-    AgentState, Environment, EventKind, LOCAL_HOST, Mode, ref_from_bytes, validate_ref,
+    AgentState, Environment, EventKind, LOCAL_HOST, Mode, ref_from_bytes, validate_new_ref,
+    validate_ref,
 };
 use vibe_core::rpc::{
     Agent, AgentDeleteParams, AgentList, AgentParams, AgentStartParams, ErrorCode, ErrorObject,
@@ -495,34 +496,32 @@ fn remove(path: &Path) -> io::Result<()> {
 }
 
 /// Removes a session's socket and its lock, unless a shim holds the lock.
+/// A socket with no lock beside it was never a shim's, so it's kept: on a
+/// Linux host, `run/mac.sock` with no lock is sshd's end of the Mac's
+/// tunnel, even for an agent named `mac` (issue #45).
 pub(crate) fn remove_session_files(socket_path: &Path) -> io::Result<()> {
     let lock_path = socket::lock_path(socket_path);
     let lock = match OpenOptions::new().write(true).open(&lock_path) {
-        Ok(f) => Some(f),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e),
     };
-    if let Some(lock) = &lock {
-        match lock.try_lock() {
-            Ok(()) => {}
-            Err(TryLockError::WouldBlock) => {
-                return Err(io::Error::other(format!(
-                    "a session is still running on {}",
-                    socket_path.display()
-                )));
-            }
-            Err(TryLockError::Error(e)) => return Err(e),
+    match lock.try_lock() {
+        Ok(()) => {}
+        Err(TryLockError::WouldBlock) => {
+            return Err(io::Error::other(format!(
+                "a session is still running on {}",
+                socket_path.display()
+            )));
         }
+        Err(TryLockError::Error(e)) => return Err(e),
     }
     // Removed here, holding the lock: `remove_stale` would take the lock
     // again on a file of its own, and find it held, by us.
     if fs::symlink_metadata(socket_path).is_ok_and(|m| m.file_type().is_socket()) {
         remove(socket_path)?;
     }
-    if lock.is_some() {
-        remove(&lock_path)?;
-    }
-    Ok(())
+    remove(&lock_path)
 }
 
 /// What a start has done so far, to undo if a later step fails.
@@ -683,7 +682,7 @@ impl Core {
                 && fs::symlink_metadata(self.layout.agent_dir(&r)).is_err())
         };
         if let Some(name) = name {
-            validate_ref(name).map_err(invalid)?;
+            validate_new_ref(name).map_err(invalid)?;
             if name == vibe_env::toolbox::TOOLBOX_REF {
                 return Err(invalid(format!(
                     "`{name}` is the Linux toolbox's; pick another name"
@@ -1595,8 +1594,13 @@ impl Core {
             .await?;
         }
         remove_worktree(&project_path, &worktree).await?;
-        remove_session_files(&self.layout.session_socket(&p.agent))
-            .map_err(|e| failed(format!("can't remove {}'s socket: {e}", p.agent)))?;
+        // Not the tunnel's socket, for an agent named `tunnel` before the
+        // name was reserved.
+        let socket = self.layout.session_socket(&p.agent);
+        if !self.serves_itself(&socket) {
+            remove_session_files(&socket)
+                .map_err(|e| failed(format!("can't remove {}'s socket: {e}", p.agent)))?;
+        }
         let agent_dir = self.layout.agent_dir(&p.agent);
         remove(&agent_dir)
             .map_err(|e| failed(format!("can't remove {}: {e}", agent_dir.display())))?;

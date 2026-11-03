@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
-use vibe_core::model::{SessionState, validate_ref};
+use vibe_core::model::{SessionState, is_reserved_ref, validate_ref};
 use vibe_core::paths::Layout;
 use vibe_core::rpc::{SessionExit, SessionInfo};
 use vibe_core::shim::{
@@ -47,6 +47,11 @@ pub enum Probe {
 /// command exits, and holds the socket's lock for its whole life, so with
 /// the socket or the lock gone, so is the shim.
 pub async fn probe(socket: &Path) -> Probe {
+    // With no lock beside it, it was never a shim's (sshd's end of a
+    // tunnel, say): not asked, as it wouldn't answer.
+    if !socket::lock_path(socket).exists() {
+        return Probe::Gone;
+    }
     let why = match tokio::time::timeout(PROBE_TIMEOUT, ask_status(socket)).await {
         Ok(Ok(status)) => return Probe::Running(status),
         Ok(Err(e)) => e.to_string(),
@@ -161,34 +166,29 @@ async fn read_frame(stream: &mut UnixStream) -> io::Result<Frame> {
     Ok(Frame { kind, payload })
 }
 
-/// The sockets `vibed` keeps in `run/` for itself, beside the sessions'.
-/// None is a session, so the scan for sessions never probes one, nor
-/// removes it as stale: sshd makes a host's tunnel end and leaves no lock
-/// beside it, so nothing else would keep it (issue #45). Their names are
-/// in [`vibe_core::model::RESERVED_REFS`], so no session can take them.
-pub const DAEMON_SOCKETS: [&str; 3] = [
-    "vibed.sock",
-    crate::external::TUNNEL_END,
-    crate::tunnel::TUNNEL_SOCKET,
-];
-
-/// The refs that have a socket in `run/`: every `<ref>.sock` but the
-/// [`DAEMON_SOCKETS`], sorted.
-pub fn socket_refs(run_dir: &Path) -> Vec<String> {
+/// The refs that have a shim's socket in `run/`, sorted: every `<ref>.sock`
+/// with its lock beside it, as every shim binds it, but `vibed`'s own.
+///
+/// A socket with no lock was never a shim's: sshd makes a Linux host's
+/// tunnel end, `mac.sock`, and leaves none, so it's not taken for a dead
+/// session and removed (issue #45). The daemon's sockets that do have one,
+/// `vibed.sock` and the Mac's `tunnel.sock`, are skipped by name, as any of
+/// [`vibe_core::model::RESERVED_REFS`] is, unless `is_agent` says an agent
+/// has that name: one made before the name was reserved.
+pub fn socket_refs(run_dir: &Path, is_agent: impl Fn(&str) -> bool) -> Vec<String> {
     let Ok(entries) = fs::read_dir(run_dir) else {
         return Vec::new();
     };
     let mut refs: Vec<String> = entries
         .filter_map(Result::ok)
         .filter(|e| e.file_type().is_ok_and(|t| t.is_socket()))
+        .filter(|e| socket::lock_path(&e.path()).is_file())
         .filter_map(|e| {
             let name = e.file_name().into_string().ok()?;
-            if DAEMON_SOCKETS.iter().any(|d| d.eq_ignore_ascii_case(&name)) {
-                return None;
-            }
             let r = name.strip_suffix(".sock")?;
             validate_ref(r).is_ok().then(|| r.to_owned())
         })
+        .filter(|r| !is_reserved_ref(r) || is_agent(r))
         .collect();
     refs.sort();
     refs
@@ -222,21 +222,22 @@ pub fn read_record(layout: &Layout, agent_ref: &str) -> Option<Record> {
     }
 }
 
-/// Removes a socket nobody serves, unless a shim is starting on it: one
-/// holds the socket's lock for its whole life. Returns whether it did.
+/// Removes a shim's socket nobody serves, unless a shim is starting on it:
+/// one holds the socket's lock for its whole life. A socket with no lock
+/// beside it was never a shim's (every shim binds through
+/// [`vibe_core::socket::bind`], which leaves one), so it's kept: sshd's end
+/// of a tunnel is such a one (issue #45). Returns whether it removed it.
 pub fn remove_stale(socket_path: &Path) -> io::Result<bool> {
     let lock_path = socket::lock_path(socket_path);
     let lock = match OpenOptions::new().write(true).open(&lock_path) {
-        Ok(f) => Some(f),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(e),
     };
-    if let Some(lock) = &lock {
-        match lock.try_lock() {
-            Ok(()) => {}
-            Err(TryLockError::WouldBlock) => return Ok(false),
-            Err(TryLockError::Error(e)) => return Err(e),
-        }
+    match lock.try_lock() {
+        Ok(()) => {}
+        Err(TryLockError::WouldBlock) => return Ok(false),
+        Err(TryLockError::Error(e)) => return Err(e),
     }
     match fs::symlink_metadata(socket_path) {
         Ok(meta) if meta.file_type().is_socket() => fs::remove_file(socket_path).map(|()| true),
@@ -373,22 +374,34 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let run = tmp.path().join("run");
         fs::create_dir(&run).unwrap();
-        for name in ["vibed.sock", "b-ref.sock", "a-ref.sock", "not a ref.sock"] {
+        let socket = |name: &str, lock: bool| {
             drop(std::os::unix::net::UnixListener::bind(run.join(name)).unwrap());
-        }
-        fs::write(run.join("plain.sock"), "not a socket").unwrap();
-        fs::write(run.join("a-ref.sock.lock"), "").unwrap();
-        assert_eq!(socket_refs(&run), ["a-ref", "b-ref"]);
-        assert!(socket_refs(&tmp.path().join("none")).is_empty());
-
-        // The daemon's own sockets, with no lock beside them, as sshd
-        // leaves a tunnel's end, are never sessions.
-        for name in DAEMON_SOCKETS {
-            if !run.join(name).exists() {
-                drop(std::os::unix::net::UnixListener::bind(run.join(name)).unwrap());
+            if lock {
+                fs::write(socket::lock_path(&run.join(name)), "").unwrap();
             }
+        };
+        for name in ["vibed.sock", "b-ref.sock", "a-ref.sock", "not a ref.sock"] {
+            socket(name, true);
         }
-        assert_eq!(socket_refs(&run), ["a-ref", "b-ref"]);
+        // Every shim leaves a lock beside its socket: one without isn't a
+        // shim's.
+        socket("no-lock.sock", false);
+        fs::write(run.join("plain.sock"), "not a socket").unwrap();
+        fs::write(run.join("plain.sock.lock"), "").unwrap();
+        let none = |_: &str| false;
+        assert_eq!(socket_refs(&run, none), ["a-ref", "b-ref"]);
+        assert!(socket_refs(&tmp.path().join("none"), none).is_empty());
+
+        // The daemon's own sockets: a host's tunnel end, which sshd leaves
+        // with no lock, and the Mac's, with one. Neither is a session, but
+        // for an agent named so before the name was reserved.
+        socket(crate::external::TUNNEL_END, false);
+        socket(crate::tunnel::TUNNEL_SOCKET, true);
+        assert_eq!(socket_refs(&run, none), ["a-ref", "b-ref"]);
+        assert_eq!(
+            socket_refs(&run, |r| r == "tunnel" || r == "mac"),
+            ["a-ref", "b-ref", "tunnel"]
+        );
 
         let agents = tmp.path().join("agents");
         for r in ["x-ref", "y-ref", "no-record"] {
@@ -400,17 +413,15 @@ mod tests {
     }
 
     #[test]
-    fn no_session_can_take_a_daemon_socket() {
-        for name in DAEMON_SOCKETS {
+    fn the_daemons_sockets_have_reserved_names() {
+        for name in [
+            vibe_core::paths::SOCKET_NAME,
+            crate::external::TUNNEL_END,
+            crate::tunnel::TUNNEL_SOCKET,
+        ] {
             let stem = name.strip_suffix(".sock").unwrap();
-            let e = validate_ref(stem).unwrap_err();
-            assert!(e.contains("is reserved"), "{name}: {e}");
+            assert!(vibe_core::model::RESERVED_REFS.contains(&stem), "{name}");
         }
-        assert_eq!(
-            DAEMON_SOCKETS,
-            ["vibed.sock", "mac.sock", "tunnel.sock"],
-            "a new socket in run/ needs its name in RESERVED_REFS too"
-        );
     }
 
     #[test]
@@ -436,6 +447,13 @@ mod tests {
         fs::write(&path, "keep").unwrap();
         assert!(!remove_stale(&path).unwrap());
         assert!(path.exists());
+
+        // A socket with no lock beside it was never a shim's, as sshd's end
+        // of a tunnel isn't (issue #45): it's kept.
+        let tunnel_end = tmp.path().join("mac.sock");
+        drop(std::os::unix::net::UnixListener::bind(&tunnel_end).unwrap());
+        assert!(!remove_stale(&tunnel_end).unwrap());
+        assert!(tunnel_end.exists());
     }
 
     #[test]

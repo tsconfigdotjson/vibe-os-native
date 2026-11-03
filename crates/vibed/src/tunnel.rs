@@ -299,6 +299,15 @@ impl Core {
         self.layout.run_dir().join(TUNNEL_SOCKET)
     }
 
+    /// Whether `path` is a socket this `vibed` serves itself, in `run/`
+    /// beside the sessions': its own, or the tunnel's while it's served.
+    /// An agent named for one before the names were reserved has no
+    /// session there.
+    pub(crate) fn serves_itself(&self, path: &Path) -> bool {
+        path == self.layout.socket()
+            || (path == self.tunnel_socket() && lock(&self.tunnel_socket_served).is_some())
+    }
+
     /// Serves the tunnel's socket (private, with a lock beside it, as
     /// `vibed.sock` is), unless it's served already. It's there only while
     /// a host is the external address.

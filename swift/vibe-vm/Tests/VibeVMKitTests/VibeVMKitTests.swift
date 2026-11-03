@@ -77,8 +77,6 @@ import Testing
             ({ $0.version = 2 }, "version 2 isn't supported"),
             ({ $0.ref = "a/b" }, "isn't a valid ref"),
             ({ $0.ref = "vibed" }, "isn't a valid ref"),
-            ({ $0.ref = "mac" }, "isn't a valid ref"),
-            ({ $0.ref = "Tunnel" }, "isn't a valid ref"),
             ({ $0.ref = String(repeating: "a", count: 33) }, "isn't a valid ref"),
             ({ $0.cpus = 0 }, "cpus must be at least 1"),
             ({ $0.memory = (1 << 20) + 1 }, "whole number of MiB"),

@@ -481,20 +481,28 @@ pub fn validate_ssh_destination(dest: &str) -> Result<(), String> {
 /// `/Users/` and a name of up to 19 letters.
 pub const MAX_REF_LEN: usize = 32;
 
-/// Names `vibed` gives its own sockets in `run/`, beside the sessions'
-/// `<ref>.sock`, so no session may take them: a session there would be the
-/// daemon's socket, and the scan for stale sessions would remove the
-/// daemon's (issue #45). Each with what it's for, for the refusal. They're
-/// compared without case, as the Mac's file system does.
-pub const RESERVED_REFS: [(&str, &str); 3] = [
-    ("vibed", "vibed's own socket"),
-    ("mac", "the end of the Mac's tunnel on a Linux host"),
-    ("tunnel", "the Mac's end of its tunnel to a Linux host"),
-];
+/// The names `vibed` gives its own sockets in `run/`, beside the sessions'
+/// `<ref>.sock`: `vibed.sock`, `mac.sock` (where the Mac's tunnel ends on a
+/// Linux host) and `tunnel.sock` (the Mac's end of it). A new agent may not
+/// take one, in any case, as the Mac's file system ignores case: its session
+/// would be the daemon's socket (issue #45). Only `vibed` was reserved
+/// before 0.1.3, so an agent may already be called `mac` or `tunnel`; it's
+/// still a ref, and can be used and deleted ([`validate_ref`]).
+pub const RESERVED_REFS: [&str; 3] = ["vibed", "mac", "tunnel"];
+
+/// Whether `r` is one of [`RESERVED_REFS`], in any case.
+pub fn is_reserved_ref(r: &str) -> bool {
+    RESERVED_REFS.iter().any(|n| n.eq_ignore_ascii_case(r))
+}
+
+fn kept_for_vibeos(r: &str) -> String {
+    format!("`{r}` is a name VibeOS keeps for itself; pick another name")
+}
 
 /// An agent's ref, which also names its worktree, branch and session: like
 /// a name (see [`validate_name`]) but at most [`MAX_REF_LEN`] characters,
-/// and none of [`RESERVED_REFS`], whose sockets are in the same directory.
+/// and not `vibed`, whose socket is in the same directory. Every ref an
+/// agent may have; a new one is held to [`validate_new_ref`].
 pub fn validate_ref(r: &str) -> Result<(), String> {
     let ok = !r.is_empty()
         && r.len() <= MAX_REF_LEN
@@ -506,13 +514,18 @@ pub fn validate_ref(r: &str) -> Result<(), String> {
             "`{r}` isn't a valid ref: use up to {MAX_REF_LEN} letters, digits, `.`, `_` and `-`, starting with a letter or digit"
         ));
     }
-    if let Some((_, what)) = RESERVED_REFS
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case(r))
-    {
-        return Err(format!(
-            "`{r}` is reserved: it names {what}. Pick another name"
-        ));
+    if r == "vibed" {
+        return Err(kept_for_vibeos(r));
+    }
+    Ok(())
+}
+
+/// The ref of an agent about to be made: a valid ref, and none of
+/// [`RESERVED_REFS`] in any case.
+pub fn validate_new_ref(r: &str) -> Result<(), String> {
+    validate_ref(r)?;
+    if is_reserved_ref(r) {
+        return Err(kept_for_vibeos(r));
     }
     Ok(())
 }
@@ -640,22 +653,28 @@ mod tests {
         for bad in ["", "-x", "a/b", "a b", "vibed", "..", ".hidden"] {
             assert!(validate_ref(bad).is_err(), "{bad:?}");
         }
-        // The names of vibed's own sockets, whatever their case.
-        for reserved in ["vibed", "mac", "tunnel", "Mac", "TUNNEL", "Vibed"] {
-            let e = validate_ref(reserved).unwrap_err();
-            assert!(
-                e.starts_with(&format!("`{reserved}` is reserved: it names ")),
-                "{e}"
+        // An agent may already be called `mac` or `tunnel`, but no new one.
+        for reserved in ["mac", "tunnel", "Mac", "TUNNEL", "Vibed"] {
+            assert_eq!(validate_ref(reserved), Ok(()), "{reserved}");
+            assert_eq!(
+                validate_new_ref(reserved).unwrap_err(),
+                format!("`{reserved}` is a name VibeOS keeps for itself; pick another name")
             );
-            assert!(e.ends_with("Pick another name"), "{e}");
+            assert!(is_reserved_ref(reserved));
         }
-        assert!(
-            validate_ref("mac")
-                .unwrap_err()
-                .contains("tunnel on a Linux host")
+        assert_eq!(
+            validate_ref("vibed").unwrap_err(),
+            "`vibed` is a name VibeOS keeps for itself; pick another name"
         );
-        for near in ["macs", "mac-mini", "tunnels", "vibed2"] {
-            assert_eq!(validate_ref(near), Ok(()), "{near}");
+        assert!(validate_new_ref("vibed").is_err());
+        assert!(
+            validate_new_ref("a b")
+                .unwrap_err()
+                .contains("isn't a valid ref")
+        );
+        for near in ["macs", "mac-mini", "tunnels", "vibed2", "quiet-amber-otter"] {
+            assert_eq!(validate_new_ref(near), Ok(()), "{near}");
+            assert!(!is_reserved_ref(near));
         }
         let long = validate_ref(&"a".repeat(MAX_REF_LEN + 1)).unwrap_err();
         assert!(long.contains("up to 32"), "{long}");
