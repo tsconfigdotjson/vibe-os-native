@@ -30,6 +30,11 @@
 	     open, or raise, the window attached to that agent. -->
 	<key>NSAppleEventsUsageDescription</key>
 	<string>VibeOS opens Terminal attached to an agent's session, and brings forward the window already attached to it.</string>
+	<!-- Shown when macOS asks for Local Network access: the app asks the
+	     first time a Linux host being added is on the local network, and
+	     vibed's ssh to it counts as the app's (PRD: Adding a Linux host). -->
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>VibeOS connects over SSH to the Linux hosts you add, including ones on your local network.</string>
 	<!-- A menu bar app: no Dock icon, no main window. -->
 	<key>LSUIElement</key>
 	<true/>

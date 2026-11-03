@@ -17,6 +17,7 @@ pub mod mcp;
 pub mod power;
 pub mod pressure;
 pub mod projects;
+pub mod reach;
 pub mod remote;
 pub mod server;
 pub mod sessions;

@@ -117,9 +117,9 @@
 #     cryptography package's answers where it's installed); the release
 #     workflow running on version tags alone, reading the secrets the
 #     release needs and printing none; the versions in Cargo.toml and
-#     Info.plist agreeing, and the base release in images.rs and
-#     base-image.sh; vibed's LaunchAgent naming the app and its vibed; and
-#     the entitlements
+#     Info.plist agreeing, and its usage descriptions (Apple Events, Local
+#     Network); the base release in images.rs and base-image.sh; vibed's
+#     LaunchAgent naming the app and its vibed; and the entitlements
 #   - a release build, ad hoc signed (scripts/release-macos.sh), with
 #     Sparkle built in and a key made for the check: the DMG holds the app
 #     and Applications; the app holds VibeOS, vibed, vibe, vibe-shim and
@@ -875,7 +875,7 @@ s_surfaces() {
   "$app" --render-surfaces "$out" || { echo "a surface didn't draw"; return 1; }
   [ -s "$out/manifest.txt" ] || { echo "no manifest"; return 1; }
   for name in menu menu-status menu-welcome menu-welcome-fresh menu-install-move menu-install-login-items \
-    menu-quiet menu-offline menu-bar new-agent new-agent-empty add-host \
+    menu-quiet menu-offline menu-bar new-agent new-agent-empty add-host add-host-local-network \
     add-host-done logins logins-first-run settings-projects settings-keys settings-hosts settings-limits \
     settings-general settings-project settings-projects-first-run new-key new-key-made external-address; do
     for look in light dark; do
@@ -1207,6 +1207,12 @@ info = plistlib.loads(read("swift/VibeOS/Support/Info.plist").encode())
 for key in ["CFBundleShortVersionString", "CFBundleVersion"]:
     if info[key] != cargo:
         fail.append(f"Info.plist's {key} is {info[key]}, Cargo.toml's version {cargo}")
+# The usage descriptions macOS shows when it asks: Apple Events, and Local
+# Network, without which a Linux host on the local network can't be added
+# (issue #39).
+for key in ["NSAppleEventsUsageDescription", "NSLocalNetworkUsageDescription"]:
+    if not str(info.get(key, "")).strip():
+        fail.append(f"Info.plist lacks {key}")
 # The base release vibed boots is the one base-image.sh builds.
 images = re.search(r"pub const BASE_RELEASE: u32 = (\d+);", read("crates/vibe-env/src/images.rs")).group(1)
 script = re.search(r"N=\$\{BASE_RELEASE:-(\d+)\}", read("scripts/base-image.sh")).group(1)
@@ -1266,6 +1272,7 @@ s_release_build() {
   [ "$(plutil -extract CFBundleVersion raw "$plist")" = "$version" ]
   [ "$(plutil -extract SUPublicEDKey raw "$plist")" = "$public" ] || { echo "SUPublicEDKey isn't the key's"; return 1; }
   plutil -extract SUFeedURL raw "$plist" | grep -q '/releases/latest/download/appcast.xml$'
+  plutil -extract NSLocalNetworkUsageDescription raw "$plist" | grep -q . || { echo "Info.plist lacks NSLocalNetworkUsageDescription"; return 1; }
   [ -d "$app/Contents/Frameworks/Sparkle.framework" ] || { echo "no Sparkle.framework"; return 1; }
   otool -l "$app/Contents/MacOS/VibeOS" | grep -q '@executable_path/../Frameworks'
   if command -v cargo-zigbuild >/dev/null; then

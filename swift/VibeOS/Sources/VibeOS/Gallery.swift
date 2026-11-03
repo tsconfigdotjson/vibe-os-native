@@ -117,6 +117,10 @@ struct GallerySurface {
             GallerySurface(
                 name: "add-host", frame: .window("Add Linux Host", nil), view: AnyView(AddHostView(model: m.busy))),
             GallerySurface(
+                name: "add-host-local-network", frame: .window("Add Linux Host", nil),
+                view: AnyView(
+                    AddHostView(model: m.busy, previewLocalNetworkOff: LocalNetwork.offMessage("me@nas.local")))),
+            GallerySurface(
                 name: "logins", frame: .window("Linux Logins", nil), view: AnyView(LoginsView(model: m.busy))),
             GallerySurface(
                 name: "logins-first-run", frame: .window("Linux Logins", nil),

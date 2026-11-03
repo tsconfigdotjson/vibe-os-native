@@ -214,6 +214,7 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
         config.remote = Arc::new(vibed::remote::Ssh {
             program: ssh,
             bundle: vibed::remote::default_bundle(),
+            shared: Some(config.layout.run_dir()),
         });
     }
     if let Some(port) = env_text("VIBE_EXTERNAL_PORT") {

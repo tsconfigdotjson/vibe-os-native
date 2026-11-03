@@ -102,6 +102,16 @@ pub trait Remote: Send + Sync + fmt::Debug {
         Box::pin(async move { Err(format!("can't keep a tunnel to {address}")) })
     }
 
+    /// The same, for the link's own session, which may share a connection
+    /// with the install steps.
+    fn dial_link<'a>(&'a self, address: &'a str) -> BoxFuture<'a, Result<Channel, String>> {
+        self.dial(address)
+    }
+
+    /// Closes the connection `address`'s commands share, if there is one,
+    /// once it has stopped answering: the next command makes a new one.
+    fn drop_shared(&self, _address: &str) {}
+
     /// The command a terminal here runs to attach to `agent` on `address`
     /// (PRD: The link, "Clicking a remote agent opens Terminal with …").
     fn attach_line(&self, address: &str, agent: &str) -> String {
@@ -278,7 +288,7 @@ fn keep_last_line(
         let mut lines = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             let line = line.trim();
-            if !line.is_empty() {
+            if !line.is_empty() && !line.contains(NOT_SHARING) {
                 *keep.lock().unwrap_or_else(|e| e.into_inner()) =
                     line.chars().take(WHY_CHARS).collect();
             }
@@ -323,6 +333,19 @@ const SSH_OPTIONS: [&str; 20] = [
 /// take minutes.
 const STEP_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
+/// How long a host's shared connection stays up once nothing uses it.
+const SHARED_FOR: Duration = Duration::from_secs(60);
+
+/// The longest control socket path: a Unix socket's path is at most 103
+/// bytes on macOS (107 on Linux), and `ssh` makes the socket under its name
+/// and 17 more before moving it into place.
+const MOST_CONTROL_PATH: usize = 103 - 17;
+
+/// What `ssh` says when another of its commands made the shared
+/// connection's socket first. It carries on with a connection of its own,
+/// so that's no reason for anything.
+const NOT_SHARING: &str = "disabling multiplexing";
+
 /// The real thing: `ssh`, and the Linux builds of `vibed` this one carries.
 #[derive(Debug, Clone)]
 pub struct Ssh {
@@ -331,21 +354,89 @@ pub struct Ssh {
     /// Where the Linux builds are: `<bundle>/<arch>/vibed`, `vibe` and
     /// `vibe-shim`, for `x86_64` and `aarch64`.
     pub bundle: Option<PathBuf>,
+    /// The private directory for the sockets of the connections each host's
+    /// commands share (see [`Ssh::sharing`]), or none for a connection per
+    /// command.
+    pub shared: Option<PathBuf>,
 }
 
 impl Ssh {
-    /// `ssh` on `PATH`, and the bundle [`default_bundle`] finds.
+    /// `ssh` on `PATH`, and the bundle [`default_bundle`] finds. Each
+    /// command gets its own connection until [`Ssh::sharing_in`] says where
+    /// to keep shared ones.
     pub fn new() -> Ssh {
         let path = std::env::var_os("PATH");
         Ssh {
             program: crate::core::find_program("ssh", path.as_deref()),
             bundle: default_bundle(),
+            shared: None,
         }
     }
 
-    fn command(&self, address: &str, command: &str) -> tokio::process::Command {
+    /// This, with each host's commands sharing a connection whose socket is
+    /// in `dir` (the run directory).
+    pub fn sharing_in(mut self, dir: PathBuf) -> Ssh {
+        self.shared = Some(dir);
+        self
+    }
+
+    /// The options that have `address`'s install steps and its link share
+    /// one connection: the first starts it, the rest go through it, and it
+    /// closes a minute after the last ends. An install is five commands,
+    /// and the link follows at once; a server that limits how often a
+    /// client may connect (ufw's `limit`, fail2ban, sshd's `MaxStartups`)
+    /// would turn that many connections away (issue #39). The link's calls
+    /// keep connections of their own, so the shared one carries two
+    /// sessions at most, well inside sshd's `MaxSessions`.
+    ///
+    /// The socket goes in the run directory, or, when its path there would
+    /// be too long for a socket or can't be written in an option (a long
+    /// home directory), in `/tmp/vibeos-<uid>`. None, for a connection per
+    /// command, when neither will do.
+    pub fn sharing(&self, address: &str) -> Vec<String> {
+        let Some(dir) = &self.shared else {
+            return Vec::new();
+        };
+        let name = format!("ssh-{}", &sha256_hex(address.as_bytes())[..16]);
+        let usable = |dir: &std::path::Path| {
+            let path = dir.join(&name);
+            let text = path.to_str()?.to_owned();
+            // ssh expands % and ${…} in it, and unescapes \ in quotes.
+            (text.len() <= MOST_CONTROL_PATH
+                && !text.contains(['"', '%', '$', '\\'])
+                && private_dir(dir))
+            .then_some(text)
+        };
+        let Some(text) = usable(dir).or_else(|| usable(&fallback_dir())) else {
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| {
+                crate::log!(
+                    "vibed: each SSH command to a host gets a connection of its own: there's no \
+                     private directory with a short enough path for a shared one's socket"
+                );
+            });
+            return Vec::new();
+        };
+        [
+            "ControlMaster=auto".to_owned(),
+            format!("ControlPath=\"{text}\""),
+            format!("ControlPersist={}", SHARED_FOR.as_secs()),
+        ]
+        .into_iter()
+        .flat_map(|o| ["-o".to_owned(), o])
+        .collect()
+    }
+
+    /// `ssh` running `command` on `address`, over the shared connection
+    /// when `share`.
+    fn command(&self, address: &str, command: &str, share: bool) -> tokio::process::Command {
         let mut c = tokio::process::Command::new(&self.program);
         c.args(SSH_OPTIONS)
+            .args(if share {
+                self.sharing(address)
+            } else {
+                Vec::new()
+            })
             .arg("-T")
             .arg("--")
             .arg(address)
@@ -367,7 +458,7 @@ impl Ssh {
         input: Vec<u8>,
     ) -> Result<String, String> {
         let mut child = self
-            .command(address, command)
+            .command(address, command, true)
             .spawn()
             .map_err(|e| format!("can't run {}: {e}", self.program.to_string_lossy()))?;
         let mut stdin = child.stdin.take().expect("stdin is piped");
@@ -398,9 +489,57 @@ impl Ssh {
             .or_else(|| last_line(&String::from_utf8_lossy(&out.stderr)))
             .unwrap_or_else(|| format!("it ended with {}", out.status));
         Err(if out.status.code() == Some(255) {
-            unreachable_message(address, &said)
+            match self.explain_connect(address, &said).await {
+                Some(why) => why,
+                None => unreachable_message(address, &said),
+            }
         } else {
             format!("{what} on {address} failed: {said}")
+        })
+    }
+
+    /// When `ssh` couldn't connect to `address` (`said` is its "connect to
+    /// host" line), why: from connecting to each of the server's addresses
+    /// (see [`crate::reach`]). `None` when it wasn't that, or that adds
+    /// nothing.
+    async fn explain_connect(&self, address: &str, said: &str) -> Option<String> {
+        if !said.contains("connect to host") {
+            return None;
+        }
+        // Where ssh connects: its config may name another host or port.
+        let config = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::process::Command::new(&self.program)
+                .args(["-G", "--", address])
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .ok()?
+        .ok()
+        .filter(|o| o.status.success())?;
+        let target = crate::reach::target(&String::from_utf8_lossy(&config.stdout))?;
+        let tried = crate::reach::try_addresses(&target).await;
+        crate::reach::explain(address, &target, &tried, cfg!(target_os = "macos"))
+    }
+
+    /// `vibe rpc` on `address`, over the shared connection when `share`.
+    fn dial_over<'a>(
+        &'a self,
+        address: &'a str,
+        share: bool,
+    ) -> BoxFuture<'a, Result<Channel, String>> {
+        Box::pin(async move {
+            let mut child = self
+                .command(address, &format!("{HOST_VIBE} rpc"), share)
+                .spawn()
+                .map_err(|e| format!("can't run {}: {e}", self.program.to_string_lossy()))?;
+            let stdout = child.stdout.take().expect("stdout is piped");
+            let stdin = child.stdin.take().expect("stdin is piped");
+            let why = keep_last_line(child.stderr.take().expect("stderr is piped"));
+            Ok(Channel::new(BufReader::new(stdout), stdin, child, why))
         })
     }
 
@@ -535,20 +674,36 @@ impl Default for Ssh {
 
 impl Remote for Ssh {
     fn dial<'a>(&'a self, address: &'a str) -> BoxFuture<'a, Result<Channel, String>> {
-        Box::pin(async move {
-            let mut child = self
-                .command(address, &format!("{HOST_VIBE} rpc"))
-                .spawn()
-                .map_err(|e| format!("can't run {}: {e}", self.program.to_string_lossy()))?;
-            let stdout = child.stdout.take().expect("stdout is piped");
-            let stdin = child.stdin.take().expect("stdin is piped");
-            let why = keep_last_line(child.stderr.take().expect("stderr is piped"));
-            Ok(Channel::new(BufReader::new(stdout), stdin, child, why))
-        })
+        self.dial_over(address, false)
+    }
+
+    fn dial_link<'a>(&'a self, address: &'a str) -> BoxFuture<'a, Result<Channel, String>> {
+        self.dial_over(address, true)
     }
 
     fn install<'a>(&'a self, address: &'a str) -> BoxFuture<'a, Result<Installed, String>> {
         Box::pin(self.install_on(address))
+    }
+    fn drop_shared(&self, address: &str) {
+        let sharing = self.sharing(address);
+        if sharing.is_empty() {
+            return;
+        }
+        // `-O exit` asks the connection's own ssh over its socket, which
+        // answers even while the connection under it hangs.
+        let exit = tokio::process::Command::new(&self.program)
+            .args(sharing)
+            .args(["-O", "exit", "--", address])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn();
+        if let Ok(mut exit) = exit {
+            tokio::spawn(async move {
+                let _ = tokio::time::timeout(Duration::from_secs(10), exit.wait()).await;
+            });
+        }
     }
 
     fn tunnel<'a>(
@@ -668,7 +823,7 @@ fn report(stdout: &str) -> Report {
 fn last_line(text: &str) -> Option<String> {
     text.lines()
         .map(str::trim)
-        .rfind(|l| !l.is_empty())
+        .rfind(|l| !l.is_empty() && !l.contains(NOT_SHARING))
         .map(|l| l.chars().take(WHY_CHARS).collect())
 }
 
@@ -688,6 +843,11 @@ pub fn unreachable_message(address: &str, said: &str) -> String {
             " {address}'s host key isn't the one known for it. If the server was rebuilt, \
              remove the old key with `ssh-keygen -R` and connect once in Terminal."
         )
+    } else if said.contains("kex_exchange_identification") || said.contains("banner exchange") {
+        " The server closed the connection before SSH started. sshd turns clients away \
+         like this when they connect often (its MaxStartups or PerSourcePenalties): wait a \
+         minute, then try again."
+            .to_owned()
     } else {
         String::new()
     };
@@ -695,6 +855,27 @@ pub fn unreachable_message(address: &str, said: &str) -> String {
         "can't reach {address} over SSH: {}.{hint}",
         said.trim_end_matches('.')
     )
+}
+
+/// Where a shared connection's socket goes when the run directory's path is
+/// too long: one of this user's own under `/tmp`.
+fn fallback_dir() -> PathBuf {
+    // SAFETY: getuid can't fail.
+    PathBuf::from(format!("/tmp/vibeos-{}", unsafe { libc::getuid() }))
+}
+
+/// Makes `dir` if it isn't there, only its owner's, and says whether it's a
+/// directory (not a link to one) no one else may write to.
+fn private_dir(dir: &std::path::Path) -> bool {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    let _ = std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir);
+    std::fs::symlink_metadata(dir).is_ok_and(|m| {
+        // SAFETY: getuid can't fail.
+        m.is_dir() && m.mode() & 0o022 == 0 && m.uid() == unsafe { libc::getuid() }
+    })
 }
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
@@ -914,7 +1095,8 @@ mod tests {
         assert_eq!(
             Ssh {
                 program: "ssh".into(),
-                bundle: None
+                bundle: None,
+                shared: None,
             }
             .attach_line("me@vps", "quiet-amber-otter"),
             "ssh -t me@vps .local/lib/vibeos/vibe attach quiet-amber-otter"
@@ -924,6 +1106,7 @@ mod tests {
         let ssh = Ssh {
             program: "ssh".into(),
             bundle: None,
+            shared: None,
         };
         assert_eq!(
             ssh.attach_line("me@vps", "x; rm -rf ~"),
@@ -976,6 +1159,162 @@ mod tests {
         assert!(unit.contains("WantedBy=default.target"), "{unit}");
     }
 
+    /// Issue #39: an install's five commands, and the link after them,
+    /// share one connection, so a server that limits how often a client may
+    /// connect doesn't turn the later ones away.
+    #[test]
+    fn a_hosts_commands_share_one_connection() {
+        use std::os::unix::fs::PermissionsExt;
+        let run = tempfile::Builder::new()
+            .prefix("vibe")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let dir = run.path().join("run");
+        let ssh = Ssh {
+            program: "ssh".into(),
+            bundle: None,
+            shared: Some(dir.clone()),
+        };
+        let name = format!("ssh-{}", &sha256_hex(b"me@vps")[..16]);
+        let options = |ssh: &Ssh| ssh.sharing("me@vps");
+        let path_in = |options: Vec<String>| {
+            options
+                .iter()
+                .find_map(|o| o.strip_prefix("ControlPath="))
+                .map(|p| p.trim_matches('"').to_owned())
+        };
+        assert_eq!(
+            options(&ssh),
+            [
+                "-o",
+                "ControlMaster=auto",
+                "-o",
+                &format!("ControlPath=\"{}\"", dir.join(&name).display()),
+                "-o",
+                "ControlPersist=60",
+            ]
+        );
+        // The directory is made, and only its owner's.
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        // Each destination has its own.
+        assert_ne!(ssh.sharing("me@other"), options(&ssh));
+        // Install steps share, before `--`; a call's channel doesn't.
+        let args = |share| {
+            ssh.command("me@vps", "true", share)
+                .as_std()
+                .get_args()
+                .map(|a| a.to_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        let shared = args(true);
+        let dd = shared.iter().position(|a| a == "--").unwrap();
+        assert!(
+            shared[..dd].contains(&"ControlMaster=auto".to_owned()),
+            "{shared:?}"
+        );
+        assert!(!args(false).iter().any(|a| a.starts_with("Control")));
+
+        // None without a directory.
+        let without = Ssh {
+            shared: None,
+            ..ssh.clone()
+        };
+        assert!(without.sharing("me@vps").is_empty());
+        // A path too long for a socket, one ssh would read otherwise, or a
+        // directory others may write to: this user's own under /tmp.
+        let fallback = fallback_dir().join(&name).display().to_string();
+        let open = run.path().join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+        for dir in [
+            run.path().join("x".repeat(90)),
+            run.path().join("100%"),
+            run.path().join("back\\slash"),
+            open,
+        ] {
+            let other = Ssh {
+                shared: Some(dir.clone()),
+                ..ssh.clone()
+            };
+            assert_eq!(
+                path_in(other.sharing("me@vps")).as_deref(),
+                Some(fallback.as_str()),
+                "{}",
+                dir.display()
+            );
+        }
+        let mode = std::fs::metadata(fallback_dir())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
+    }
+
+    /// With real OpenSSH and a server that takes `VIBE_TEST_SSH_DEST`
+    /// without a prompt (`VIBE_TEST_SSH` may name an `ssh` wrapper adding
+    /// options): an install's worth of commands go over one connection,
+    /// which is still up after them, until it's dropped.
+    #[tokio::test]
+    #[ignore = "needs an SSH server: VIBE_TEST_SSH_DEST"]
+    async fn real_ssh_shares_one_connection() {
+        let dest = std::env::var("VIBE_TEST_SSH_DEST").expect("VIBE_TEST_SSH_DEST");
+        let program: OsString = std::env::var_os("VIBE_TEST_SSH").unwrap_or_else(|| "ssh".into());
+        // Under /tmp: a socket's path must be short.
+        let run = tempfile::Builder::new()
+            .prefix("vibe")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let ssh = Ssh {
+            program: program.clone(),
+            bundle: None,
+            shared: Some(run.path().join("run")),
+        };
+        for step in 0..5 {
+            let said = ssh
+                .run(&dest, "A step", "cat; echo done", vec![b'x'; 1 << 20])
+                .await
+                .unwrap();
+            assert!(said.ends_with("done\n"), "step {step}: {said:?}");
+        }
+        let check = std::process::Command::new(&program)
+            .args(ssh.sharing(&dest))
+            .args(["-O", "check", "--", &dest])
+            .output()
+            .unwrap();
+        assert!(
+            check.status.success(),
+            "{}",
+            String::from_utf8_lossy(&check.stderr)
+        );
+        // Once it stops answering, the link drops it, and it's gone.
+        ssh.drop_shared(&dest);
+        let mut gone = false;
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let check = std::process::Command::new(&program)
+                .args(ssh.sharing(&dest))
+                .args(["-O", "check", "--", &dest])
+                .output()
+                .unwrap();
+            if !check.status.success() {
+                gone = true;
+                break;
+            }
+        }
+        assert!(gone, "the shared connection is still up");
+    }
+
+    #[test]
+    fn not_sharing_is_no_reason() {
+        let said = "ssh: connect to host vps port 22: Connection refused\n\
+                    ControlSocket /x/ssh-1 already exists, disabling multiplexing\n";
+        assert_eq!(
+            last_line(said).as_deref(),
+            Some("ssh: connect to host vps port 22: Connection refused")
+        );
+    }
+
     #[test]
     fn unreachable_hosts_say_how_to_fix_the_usual_reasons() {
         let m = unreachable_message("me@vps", "me@vps: Permission denied (publickey)");
@@ -992,5 +1331,10 @@ mod tests {
             m,
             "can't reach vps over SSH: ssh: connect to host vps port 22: Network is unreachable."
         );
+        let m = unreachable_message(
+            "vps",
+            "kex_exchange_identification: Connection closed by remote host",
+        );
+        assert!(m.contains("wait a minute"), "{m}");
     }
 }

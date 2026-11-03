@@ -39,7 +39,7 @@ struct VibeOSApp: App {
     init() {
         let model = MenuModel(
             daemon: VibedClient(), terminal: AppleScriptTerminal(), notifier: UserNotifier(),
-            installer: SystemInstaller())
+            installer: SystemInstaller(), localNetwork: SystemLocalNetworkGate())
         // Sparkle, in a release build: checks for updates on its own.
         Updater.shared.start()
         model.start()

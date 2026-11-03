@@ -47,6 +47,9 @@ public final class MenuModel: ObservableObject {
     @Published public private(set) var attaching: Set<String> = []
     /// How this copy of the app is installed (Install.swift).
     @Published public private(set) var install: InstallStatus = .notManaged
+    /// While adding a Linux host waits for Local Network access: why, and
+    /// how to turn it on (LocalNetwork.swift).
+    @Published public private(set) var localNetworkOff: String?
 
     /// While the menu is open it polls more often, for memory bars.
     public var menuIsOpen = false {
@@ -56,6 +59,11 @@ public final class MenuModel: ObservableObject {
     public let daemon: any DaemonConnection
     public let attacher: Attacher
     public let installer: any Installer
+    /// Asks for Local Network access before a host is added; none, in
+    /// tests that don't, asks nothing.
+    public let localNetwork: (any LocalNetworkGate)?
+    /// The add whose wait for Local Network access `localNetworkOff` is.
+    private var askingForLocalNetwork: UUID?
     /// How the last register went, which SMAppService doesn't keep.
     private var registered: ServiceStatus?
     /// Whether vibed's LaunchAgent was restarted for an updated app, which
@@ -80,7 +88,7 @@ public final class MenuModel: ObservableObject {
 
     public init(
         daemon: any DaemonConnection, terminal: TerminalScripting, notifier: Notifier? = nil,
-        installer: (any Installer)? = nil,
+        installer: (any Installer)? = nil, localNetwork: (any LocalNetworkGate)? = nil,
         vibePath: String = defaultVibePath(), socket: String? = attachSocket(),
         openPoll: Duration = .seconds(3), closedPoll: Duration = .seconds(30),
         endOfTurn: @escaping () -> Bool = { UserDefaults.standard.bool(forKey: Preferences.notifyEndOfTurn) }
@@ -90,6 +98,7 @@ public final class MenuModel: ObservableObject {
         // Made here, not as a default: a default argument is evaluated off
         // the main actor.
         self.installer = installer ?? FixedInstaller()
+        self.localNetwork = localNetwork
         self.notifier = notifier
         self.openPoll = openPoll
         self.closedPoll = closedPoll
@@ -338,7 +347,27 @@ public final class MenuModel: ObservableObject {
 
     /// Add Linux Host…: vibed installs itself on the server over SSH and
     /// links to it. The answer says what the server still needs.
+    ///
+    /// A server on the local network needs the app's Local Network access,
+    /// which only the app can ask for: it asks first, and while access is
+    /// off says so in `localNetworkOff` and waits for it. Then vibed adds
+    /// the host either way; if access is still off, its answer says so.
     public func addHost(name: String, address: String) async throws -> HostInstall {
+        if let localNetwork {
+            let asking = UUID()
+            askingForLocalNetwork = asking
+            _ = await localNetwork.prepare(address) { [weak self] in
+                Task { @MainActor [weak self] in
+                    guard let self, self.askingForLocalNetwork == asking else { return }
+                    self.localNetworkOff = LocalNetwork.offMessage(address)
+                }
+            }
+            if askingForLocalNetwork == asking {
+                askingForLocalNetwork = nil
+                localNetworkOff = nil
+            }
+            try Task.checkCancellation()
+        }
         let installed = try await call(
             HostsAdd.self, HostAddParams(name: name, address: address), timeout: MenuModel.installTimeout)
         settingsRevision += 1
