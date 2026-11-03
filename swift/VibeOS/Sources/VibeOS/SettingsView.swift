@@ -56,17 +56,16 @@ struct SettingsView: View {
     /// A pane to show instead of the one last shown, for the gallery.
     var showing: SettingsPane?
     @AppStorage(SettingsPane.storageKey) private var stored = SettingsPane.projects.rawValue
-    /// Counts up each time a pane is picked in the sidebar, the one shown
-    /// included: its detail starts again at its first level, never on a
-    /// page drilled into before.
-    @State private var picked = 0
+    /// Where each pane is: picking one in the sidebar, the one shown
+    /// included, takes it back to its first level.
+    @State private var place = SettingsPlace()
 
     private var pane: Binding<SettingsPane?> {
         Binding(
             get: { showing ?? SettingsPane(rawValue: stored) ?? .projects },
             set: {
                 if let pane = $0 { stored = pane.rawValue }
-                picked += 1
+                place.picked()
             })
     }
 
@@ -81,22 +80,22 @@ struct SettingsView: View {
                 .tag(item)
                 // A click on the pane already shown takes it back to its
                 // first level too.
-                .simultaneousGesture(TapGesture().onEnded { if item == pane.wrappedValue { picked += 1 } })
+                .simultaneousGesture(TapGesture().onEnded { if item == pane.wrappedValue { place.picked() } })
             }
             .navigationSplitViewColumnWidth(min: 180, ideal: 200, max: 240)
             .toolbar(removing: .sidebarToggle)
         } detail: {
-            Group {
-                switch pane.wrappedValue ?? .projects {
-                case .projects: NavigationStack { ProjectsPane(model: model) }
-                case .keys: KeysPane(model: model)
-                case .hosts: HostsPane(model: model)
-                case .toolbox: ToolboxPane(model: model)
-                case .limits: LimitsPane(model: model)
-                case .general: GeneralPane()
+            switch pane.wrappedValue ?? .projects {
+            case .projects:
+                NavigationStack(path: $place.projects) {
+                    ProjectsPane(model: model, host: $place.projectsHost)
                 }
+            case .keys: KeysPane(model: model)
+            case .hosts: HostsPane(model: model)
+            case .toolbox: ToolboxPane(model: model)
+            case .limits: LimitsPane(model: model, host: $place.limitsHost)
+            case .general: GeneralPane()
             }
-            .id(picked)
         }
         .frame(minWidth: 720, minHeight: 480)
     }
@@ -120,7 +119,7 @@ struct HostPicker: View {
 
 struct ProjectsPane: View {
     @ObservedObject var model: MenuModel
-    @State private var host = VibeRPC.localHost
+    @Binding var host: String
     @State private var projects: [Project] = []
     @State private var loaded = false
     @State private var source = ""
@@ -141,9 +140,7 @@ struct ProjectsPane: View {
                         .foregroundStyle(.secondary)
                 }
                 ForEach(projects, id: \.name) { project in
-                    NavigationLink {
-                        ProjectDetail(model: model, host: host, name: project.name)
-                    } label: {
+                    NavigationLink(value: project.name) {
                         ProjectLabel(project: project)
                     }
                 }
@@ -178,6 +175,9 @@ struct ProjectsPane: View {
         }
         .formStyle(.grouped)
         .navigationTitle("Projects")
+        .navigationDestination(for: String.self) { name in
+            ProjectDetail(model: model, host: host, name: name)
+        }
         .task(id: "\(host)#\(model.settingsRevision)") { await load() }
     }
 
@@ -406,7 +406,10 @@ struct ProjectDetail: View {
         guard confirm("Remove \(project.name)?", detail: detail, action: deletesFiles(project) ? "Delete" : "Remove")
         else { return }
         do {
-            _ = try await model.call(ProjectsRemove.self, ProjectParams(host: host, project: project.name))
+            // Confirmed above, so on a Linux host the clone goes too.
+            _ = try await model.call(
+                ProjectsRemove.self,
+                ProjectRemoveParams(host: host, project: project.name, delete: deletesFiles(project) ? true : nil))
             dismiss()
         } catch {
             self.error = describe(error)
@@ -1283,7 +1286,7 @@ struct ExternalAddressSheet: View {
 
 struct LimitsPane: View {
     @ObservedObject var model: MenuModel
-    @State private var host = VibeRPC.localHost
+    @Binding var host: String
     @State private var limits: HostLimits?
     @State private var error: String?
 

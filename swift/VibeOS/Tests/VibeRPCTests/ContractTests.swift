@@ -126,6 +126,7 @@ let swiftTypes: [String: Set<String>] = [
     "ProjectList": keys(ProjectList.CodingKeys.self),
     "ProjectAddParams": keys(ProjectAddParams.CodingKeys.self),
     "ProjectParams": keys(ProjectParams.CodingKeys.self),
+    "ProjectRemoveParams": keys(ProjectRemoveParams.CodingKeys.self),
     "Profile": keys(Profile.CodingKeys.self),
     "ProfileList": keys(ProfileList.CodingKeys.self),
     "ProfileCreateParams": keys(ProfileCreateParams.CodingKeys.self),

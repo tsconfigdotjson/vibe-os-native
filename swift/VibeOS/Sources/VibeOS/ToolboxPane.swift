@@ -14,8 +14,35 @@ struct ToolboxPane: View {
     private var available: Bool { model.toolbox?.state != .unavailable }
 
     var body: some View {
+        Group {
+            if available {
+                toolbox
+            } else {
+                // Nothing to open or rebuild, and it says why.
+                ContentUnavailableView {
+                    Label("No Linux Toolbox", systemImage: "shippingbox")
+                } description: {
+                    Text("The toolbox comes with Linux agents in VMs on a Mac, and this one has none. On a "
+                        + "Linux host, install tools on the server itself.")
+                }
+            }
+        }
+        .navigationTitle("Linux Toolbox")
+        // What vibed says now, while this shows: the shell opens and exits
+        // in Terminal, out of sight.
+        .task {
+            repeat {
+                await model.refreshToolbox()
+                try? await Task.sleep(for: .seconds(3))
+            } while !Task.isCancelled
+        }
+        // Again after each change, as a save notes a new home's logins.
+        .task(id: model.toolbox) { await loadLogins() }
+    }
+
+    private var toolbox: some View {
         let summary = ToolboxSummary(model.toolbox)
-        Form {
+        return Form {
             Section {
                 LabeledContent("Shell") {
                     HStack(spacing: 6) {
@@ -36,9 +63,7 @@ struct ToolboxPane: View {
                     + "starts with. Exit the shell to save.")
                     .foregroundStyle(.secondary)
             }
-            if available {
-                logInsSection
-            }
+            logInsSection
             Section {
                 HStack {
                     // In Terminal, as it can take many minutes and says how it goes.
@@ -53,17 +78,6 @@ struct ToolboxPane: View {
             }
         }
         .formStyle(.grouped)
-        .navigationTitle("Linux Toolbox")
-        // What vibed says now, while this shows: the shell opens and exits
-        // in Terminal, out of sight.
-        .task {
-            repeat {
-                await model.refreshToolbox()
-                try? await Task.sleep(for: .seconds(3))
-            } while !Task.isCancelled
-        }
-        // Again after each change, as a save notes a new home's logins.
-        .task(id: model.toolbox) { await loadLogins() }
     }
 
     @ViewBuilder private var logInsSection: some View {
@@ -80,6 +94,15 @@ struct ToolboxPane: View {
                 if summary.rows.isEmpty {
                     Text(summary.headline).foregroundStyle(.secondary)
                 }
+                // Agents' own sign-in: a hint, and a way to do it, no more.
+                if let hint = summary.signInHint {
+                    LabeledContent {
+                        Button("Sign In…") { model.runInTerminal(["setup-token"], exec: true) }
+                            .help("Runs vibe setup-token in Terminal: one browser sign-in, kept in your Keychain")
+                    } label: {
+                        Text(hint).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    }
+                }
             } else if error == nil {
                 ProgressView().frame(maxWidth: .infinity)
             }
@@ -87,12 +110,8 @@ struct ToolboxPane: View {
         } header: {
             Text("Logins")
         } footer: {
-            if let summary {
-                VStack(alignment: .leading, spacing: 4) {
-                    if !summary.rows.isEmpty { Text(summary.headline) }
-                    if let hint = summary.signInHint { Text(hint) }
-                }
-                .foregroundStyle(.secondary)
+            if let summary, !summary.rows.isEmpty {
+                Text(summary.headline).foregroundStyle(.secondary)
             }
         }
     }

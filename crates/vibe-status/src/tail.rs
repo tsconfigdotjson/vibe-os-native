@@ -267,9 +267,10 @@ impl Tail {
     /// What `vibe_wait` takes for an answer to what was sent after `mark`:
     /// the transcript moved on since, as for [`Tail::answered`], and the
     /// agent has stopped. A permission prompt counts as soon as agent-tail
-    /// infers one, not after [`INFERRED_QUIET`]: that longer wait is for
-    /// sleeping, and a wait can't outlast it. The caller says it may be a
-    /// long silent tool run instead. Unless `background` is set, a turn
+    /// infers one, not after [`INFERRED_QUIET`]: the caller, which can read
+    /// the screen, holds an inferred one to the state clients see, which
+    /// stays busy through a long silent tool run until the screen shows the
+    /// dialog (see [`Status::asks_approval`]). Unless `background` is set, a turn
     /// that ended with work still running in the background counts too, as
     /// a server left running never finishes.
     pub fn answered_after(&self, mark: &Mark, now: Timestamp, background: bool) -> bool {
@@ -616,10 +617,12 @@ pub struct Status {
     /// When it was read: what an inferred permission prompt's quiet is
     /// measured to. None before a transcript is found.
     pub as_of: Option<Timestamp>,
-    /// The agent's screen shows a permission dialog (see
-    /// [`approval_on_screen`]), which confirms an inferred one at once.
-    /// Set by the caller, which can read the screen.
-    pub prompt_on_screen: bool,
+    /// What the agent's screen says of an inferred permission prompt, once
+    /// the caller has read it: `Some(true)` when it shows the dialog (see
+    /// [`approval_on_screen`]), which confirms the guess at once, and
+    /// `Some(false)` when it doesn't, which rules it out however long the
+    /// tool runs. `None` when it couldn't be read.
+    pub prompt_on_screen: Option<bool>,
 }
 
 /// A wakeup the agent has armed and that hasn't fired.
@@ -663,7 +666,7 @@ impl Status {
             error: None,
             transcript: None,
             as_of: None,
-            prompt_on_screen: false,
+            prompt_on_screen: None,
         }
     }
 
@@ -710,7 +713,7 @@ impl Status {
             error: s.error.clone(),
             transcript: Some(transcript.to_owned()),
             as_of: Some(now),
-            prompt_on_screen: false,
+            prompt_on_screen: None,
         }
     }
 
@@ -727,20 +730,29 @@ impl Status {
     }
 
     /// Whether it's surely waiting on a permission prompt: agent-tail says
-    /// so firmly, the screen shows the dialog, or the guess has stood for
-    /// [`INFERRED_QUIET`] (PRD: Going to sleep, Permission prompts).
+    /// so firmly, or the screen shows the dialog. Only where the screen
+    /// couldn't be read does a guess that has stood for [`INFERRED_QUIET`]
+    /// count (PRD: Going to sleep, Permission prompts); a screen without
+    /// the dialog is a long tool run, however long.
     pub fn asks_approval(&self) -> bool {
         match (self.activity, self.certainty) {
             (Activity::AwaitingApproval, Certainty::Firm) => true,
-            (Activity::AwaitingApproval, Certainty::Inferred) => {
-                self.prompt_on_screen || self.as_of.is_some_and(|now| self.inferred_quiet(now))
-            }
+            (Activity::AwaitingApproval, Certainty::Inferred) => match self.prompt_on_screen {
+                Some(shown) => shown,
+                None => self.as_of.is_some_and(|now| self.inferred_quiet(now)),
+            },
             _ => false,
         }
     }
 
-    /// An inferred permission prompt not yet confirmed: what the caller
+    /// A permission prompt agent-tail only guesses at: what the caller
     /// should look at the screen for.
+    pub fn inferred_approval(&self) -> bool {
+        self.activity == Activity::AwaitingApproval && self.certainty == Certainty::Inferred
+    }
+
+    /// An inferred permission prompt not confirmed: busy, as far as anyone
+    /// can tell.
     pub fn unconfirmed_approval(&self) -> bool {
         self.activity == Activity::AwaitingApproval && !self.asks_approval()
     }
@@ -1025,9 +1037,10 @@ mod tests {
         );
         assert_eq!(s.line.as_deref(), Some("$ cargo test"));
         // After 20 s with no result, it may be waiting on a permission
-        // prompt: a guess, and it says so. Until the guess has stood for
-        // INFERRED_QUIET it's still at work, as a long tool run looks the
-        // same; past that it's a question, and stays one past the window.
+        // prompt: a guess, and it says so. Unread, the screen leaves it at
+        // work until the guess has stood for INFERRED_QUIET, as a long tool
+        // run looks the same; past that it's a question, and stays one past
+        // the window.
         let s = tail.status(t("2026-10-30T12:00:30Z"));
         assert_eq!(
             (s.activity, s.certainty, s.state()),
@@ -1050,12 +1063,18 @@ mod tests {
                 "{now}"
             );
             assert!(!s.at_rest() && s.asks_approval() && !s.unconfirmed_approval());
+            // A screen read without the dialog: a long tool run, however
+            // long it goes (#46).
+            let mut read = s.clone();
+            read.prompt_on_screen = Some(false);
+            assert_eq!(read.state(), AgentState::Busy, "{now}");
+            assert!(read.inferred_approval() && read.unconfirmed_approval());
         }
         // The dialog on screen confirms the guess at once.
         let mut s = tail.status(t("2026-10-30T12:00:30Z"));
-        s.prompt_on_screen = true;
+        s.prompt_on_screen = Some(true);
         assert_eq!(s.state(), AgentState::Question);
-        assert!(!s.unconfirmed_approval());
+        assert!(!s.unconfirmed_approval() && s.inferred_approval());
     }
 
     /// The false hand-up of #46: Claude in auto mode runs `sleep 60`, so
@@ -1091,9 +1110,11 @@ mod tests {
             "2026-10-30T12:00:25Z",
             "2026-10-30T12:00:45Z",
             "2026-10-30T12:01:00Z",
+            // A longer run, the same: the screen shows no dialog.
+            "2026-10-30T12:06:00Z",
         ] {
             let mut s = tail.status(t(now));
-            s.prompt_on_screen = crate::approval_on_screen(screen);
+            s.prompt_on_screen = Some(crate::approval_on_screen(screen));
             assert_eq!(s.state(), AgentState::Busy, "{now}: {s:?}");
             assert!(!s.asks_approval(), "{now}");
         }

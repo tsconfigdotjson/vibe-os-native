@@ -348,8 +348,26 @@ public struct LoginsSummary: Equatable, Sendable {
         } else if let why = logins.claudeProblem {
             signInHint = sentence(why)
         } else {
-            signInHint = "Linux agents aren't signed in yet: run vibe setup-token in Terminal."
+            signInHint = "Linux agents aren't signed in yet."
         }
+    }
+}
+
+/// Where Settings is within its panes: the project drilled into, and the
+/// host each per-host pane shows. Picking a pane in the sidebar, the one
+/// shown included, takes it back to its first level, never a page drilled
+/// into before; the hosts picked stay as they were.
+public struct SettingsPlace: Equatable, Sendable {
+    /// The Projects pane's navigation path: the project shown, if any.
+    public var projects: [String] = []
+    public var projectsHost = VibeRPC.localHost
+    public var limitsHost = VibeRPC.localHost
+
+    public init() {}
+
+    /// A pane was picked in the sidebar.
+    public mutating func picked() {
+        projects.removeAll()
     }
 }
 

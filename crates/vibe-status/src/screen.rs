@@ -12,18 +12,25 @@
 const DIALOG_LINES: usize = 24;
 
 /// Whether `screen` shows a permission dialog: a question ("Do you want to
-/// proceed?", "Do you want to make this edit to …?") followed by numbered
-/// options, the first a yes and a later one a no.
+/// proceed?", "Do you want to make this edit to …?"), which a narrow
+/// terminal may wrap onto more lines, followed by numbered options, the
+/// first a yes and a later one a no.
 pub fn approval_on_screen(screen: &str) -> bool {
     let lines: Vec<&str> = screen.lines().map(bare).filter(|l| !l.is_empty()).collect();
     let tail = &lines[lines.len().saturating_sub(DIALOG_LINES)..];
-    let Some(asked) = tail
-        .iter()
-        .rposition(|l| l.starts_with("Do you want") && l.ends_with('?'))
-    else {
+    let Some(asked) = tail.iter().rposition(|l| l.starts_with("Do you want")) else {
         return false;
     };
-    let options = &tail[asked + 1..];
+    // The question runs on to the first option; wrapped, its `?` is on the
+    // last of its lines.
+    let rest = &tail[asked..];
+    let Some(first) = rest.iter().position(|l| numbered(l).is_some()) else {
+        return false;
+    };
+    if !rest[first - 1].ends_with('?') {
+        return false;
+    }
+    let options = &rest[first..];
     let yes = options.iter().position(|l| option(l, "Yes"));
     let no = options.iter().rposition(|l| option(l, "No"));
     matches!((yes, no), (Some(y), Some(n)) if y < n)
@@ -34,17 +41,19 @@ fn bare(line: &str) -> &str {
     line.trim_matches(|c: char| c.is_whitespace() || matches!(c, '│' | '┃' | '|' | '❯' | '›' | '>'))
 }
 
+/// A numbered option's words: `Yes` of `1. Yes`.
+fn numbered(line: &str) -> Option<&str> {
+    let (n, rest) = line.split_once(". ")?;
+    (!n.is_empty() && n.chars().all(|c| c.is_ascii_digit())).then_some(rest)
+}
+
 /// A numbered option whose words begin with `word`: `1. Yes`, `3. No, and
 /// tell Claude what to do differently (esc)`.
 fn option(line: &str, word: &str) -> bool {
-    let Some((n, rest)) = line.split_once(". ") else {
-        return false;
-    };
-    !n.is_empty()
-        && n.chars().all(|c| c.is_ascii_digit())
-        && rest
-            .strip_prefix(word)
+    numbered(line).is_some_and(|rest| {
+        rest.strip_prefix(word)
             .is_some_and(|r| r.is_empty() || r.starts_with([',', ' ', '.']))
+    })
 }
 
 #[cfg(test)]
@@ -83,6 +92,26 @@ mod tests {
  Esc to cancel
 ";
         assert!(approval_on_screen(screen));
+    }
+
+    #[test]
+    fn a_dialog_wrapped_in_a_narrow_terminal_is_one() {
+        let screen = "\
+╭────────────────────────────────────────╮
+│ Edit file                              │
+│ Do you want to make this edit to       │
+│ src/a/rather/long/path/to/the/file.rs? │
+│ ❯ 1. Yes                               │
+│   2. Yes, allow all edits during this  │
+│   session (shift+tab)                  │
+│   3. No, and tell Claude what to do    │
+│   differently (esc)                    │
+╰────────────────────────────────────────╯
+";
+        assert!(approval_on_screen(screen));
+        // A question that never ends in `?` before its options isn't one.
+        let screen = "Do you want to see the rest\n1. Yes\n2. No\n";
+        assert!(!approval_on_screen(screen));
     }
 
     #[test]

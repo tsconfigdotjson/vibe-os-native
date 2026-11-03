@@ -142,7 +142,7 @@ import VibeRPC
         #expect(empty.headline == "No logins in Linux home 2 yet.")
         #expect(empty.rows.isEmpty)
         // Not signed in: a hint, no walk-through.
-        #expect(empty.signInHint == "Linux agents aren't signed in yet: run vibe setup-token in Terminal.")
+        #expect(empty.signInHint == "Linux agents aren't signed in yet.")
         let unknown = LoginsSummary(
             try decode(
                 ToolboxLogins.self,
@@ -188,6 +188,27 @@ import VibeRPC
             let words = ([ToolboxSummary(status).state] + ToolboxSummary(status).notes).joined(separator: " ")
             #expect(!words.contains("Claude"), "\(state)")
         }
+    }
+
+    /// Settings → Projects → a project, then a click in the sidebar: the
+    /// pane starts again at its first level, and the hosts picked stay (#46).
+    @Test func pickingAPaneGoesBackToItsFirstLevel() {
+        var place = SettingsPlace()
+        #expect(place.projects.isEmpty)
+        place.projectsHost = "vps"
+        place.limitsHost = "vps"
+        place.projects = ["web"]
+        place.picked()
+        #expect(place.projects.isEmpty)
+        #expect(place.projectsHost == "vps" && place.limitsHost == "vps")
+        // Twice, as a click on the pane shown is, is the same.
+        place.picked()
+        #expect(place == {
+            var p = SettingsPlace()
+            p.projectsHost = "vps"
+            p.limitsHost = "vps"
+            return p
+        }())
     }
 
     @Test func aKeySaysWhenItWasLastUsed() {

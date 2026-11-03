@@ -587,6 +587,7 @@ impl Store {
             path,
             added_at: rfc3339(added_at),
             profiles: profiles_of(&self.conn, id)?,
+            deleted: false,
         })
     }
 

@@ -248,19 +248,50 @@ pub fn clone_to_delete(root: &Path, home: &Path, path: &Path) -> Result<Option<P
     Ok(Some(real))
 }
 
-/// Deletes the clone `dir` that [`clone_to_delete`] passed. It's first
-/// moved aside, under a name no project can have, so a delete cut short
-/// never leaves a half-deleted repo under the project's name.
-pub fn delete_clone(dir: &Path) -> io::Result<()> {
+/// Whether the clone at `dir` is still `repo`'s: its `origin` must be the
+/// repo the project was added from, as adding it again checks, so a folder
+/// that has become something else is never deleted for it. Says why not.
+pub async fn clone_is_of(dir: &Path, repo: &GithubRepo) -> Result<(), String> {
+    match git(dir, &["remote", "get-url", "origin"]).await {
+        Ok(Ok(url)) if repo.matches_remote(&url) => Ok(()),
+        Ok(Ok(url)) => Err(format!("{}'s origin is {url}, not {repo}", dir.display())),
+        Ok(Err(why)) => Err(format!("{} has no origin to check: {why}", dir.display())),
+        Err(e) => Err(e.message),
+    }
+}
+
+/// Where [`move_aside`] puts a clone: beside it, under a name no project
+/// can have.
+fn aside_of(dir: &Path) -> PathBuf {
     let mut aside = OsStr::new(".").to_owned();
     aside.push(dir.file_name().unwrap_or_default());
     aside.push(".removing");
-    let aside = dir.with_file_name(aside);
-    if fs::symlink_metadata(&aside).is_ok() {
-        fs::remove_dir_all(&aside)?;
+    dir.with_file_name(aside)
+}
+
+/// Moves the clone `dir` that [`clone_to_delete`] passed out of the
+/// project's name, in one rename, so a delete cut short never leaves a
+/// half-deleted repo under it, and returns where it went. Whatever an
+/// earlier delete left there goes first: a folder, or a file or symlink
+/// (only the link). An error means nothing was moved.
+pub fn move_aside(dir: &Path) -> Result<PathBuf, String> {
+    let aside = aside_of(dir);
+    if let Ok(meta) = fs::symlink_metadata(&aside) {
+        let cleared = if meta.is_dir() {
+            fs::remove_dir_all(&aside)
+        } else {
+            fs::remove_file(&aside)
+        };
+        cleared.map_err(|e| format!("can't clear {}: {e}", aside.display()))?;
     }
-    fs::rename(dir, &aside)?;
-    fs::remove_dir_all(&aside)
+    fs::rename(dir, &aside).map_err(|e| format!("can't move {} aside: {e}", dir.display()))?;
+    Ok(aside)
+}
+
+/// Puts a clone [`move_aside`] moved back, as when its project couldn't
+/// be removed after all.
+pub fn move_back(aside: &Path, dir: &Path) -> io::Result<()> {
+    fs::rename(aside, dir)
 }
 
 #[cfg(test)]
@@ -398,10 +429,11 @@ mod tests {
     }
 
     mod deleting {
-        use super::super::{clone_to_delete, delete_clone};
+        use super::super::{clone_is_of, clone_to_delete, move_aside, move_back};
         use std::fs;
         use std::os::unix::fs::symlink;
         use std::path::{Path, PathBuf};
+        use vibe_core::model::GithubRepo;
 
         struct Home {
             _dir: tempfile::TempDir,
@@ -435,7 +467,10 @@ mod tests {
             clone_at(&web);
             let target = clone_to_delete(&h.root, &h.home, &app).unwrap().unwrap();
             assert_eq!(target, app);
-            delete_clone(&target).unwrap();
+            let aside = move_aside(&target).unwrap();
+            assert_eq!(aside, h.root.join(".app.removing"));
+            assert!(!app.exists() && aside.join("README.md").exists());
+            fs::remove_dir_all(&aside).unwrap();
             assert!(!app.exists());
             assert!(web.join("README.md").exists(), "its neighbour stays");
             assert!(h.root.is_dir(), "the projects folder stays");
@@ -446,6 +481,58 @@ mod tests {
             assert_eq!(left, ["web"], "nothing set aside is left");
             // Gone already: nothing to do.
             assert_eq!(clone_to_delete(&h.root, &h.home, &app).unwrap(), None);
+        }
+
+        #[test]
+        fn moving_aside_clears_what_an_earlier_delete_left_and_can_be_undone() {
+            let h = home();
+            let app = h.root.join("app");
+            clone_at(&app);
+            // A file where the clone would go: cleared, not followed.
+            let outside = h.home.join("keep.txt");
+            fs::write(&outside, "keep").unwrap();
+            symlink(&outside, h.root.join(".app.removing")).unwrap();
+            let aside = move_aside(&app).unwrap();
+            assert!(aside.join("README.md").exists());
+            assert_eq!(fs::read_to_string(&outside).unwrap(), "keep");
+            move_back(&aside, &app).unwrap();
+            assert!(app.join("README.md").exists());
+            // A folder an interrupted delete left.
+            fs::create_dir_all(h.root.join(".app.removing/junk")).unwrap();
+            let aside = move_aside(&app).unwrap();
+            assert!(!aside.join("junk").exists() && aside.join("README.md").exists());
+            // Nothing to move: an error, and nothing changed.
+            assert!(move_aside(&h.root.join("gone")).is_err());
+        }
+
+        #[tokio::test]
+        async fn only_a_clone_of_the_projects_repo_is_its_clone() {
+            let h = home();
+            let app = h.root.join("app");
+            fs::create_dir_all(&app).unwrap();
+            let git = |args: &[&str]| {
+                let out = std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&app)
+                    .args(args)
+                    .output()
+                    .unwrap();
+                assert!(out.status.success(), "{out:?}");
+            };
+            git(&["init", "-q"]);
+            let repo = GithubRepo::parse("me/app").unwrap();
+            let none = clone_is_of(&app, &repo).await.unwrap_err();
+            assert!(none.contains("has no origin"), "{none}");
+            git(&[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/someone/else.git",
+            ]);
+            let other = clone_is_of(&app, &repo).await.unwrap_err();
+            assert!(other.contains("not me/app"), "{other}");
+            git(&["remote", "set-url", "origin", "git@github.com:Me/app.git"]);
+            clone_is_of(&app, &repo).await.unwrap();
         }
 
         #[test]

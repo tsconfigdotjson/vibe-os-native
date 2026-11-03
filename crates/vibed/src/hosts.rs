@@ -59,11 +59,13 @@ pub const FORWARDED: &[&str] = &[
 
 /// How long a forwarded call may take. Starting an agent fetches, cuts a
 /// worktree and runs `.vibe/setup.sh`, and adding a project may clone a
-/// big repo: those get as long as they need here, within reason. A send
-/// may wake an agent first.
+/// big repo, and removing one on a Linux host may delete it: those get as
+/// long as they need here, within reason. A send may wake an agent first.
 pub(crate) fn call_timeout(method: &str) -> Duration {
     match method {
-        "agents.start" | "projects.add" | "agents.delete" => Duration::from_secs(60 * 60),
+        "agents.start" | "projects.add" | "projects.remove" | "agents.delete" => {
+            Duration::from_secs(60 * 60)
+        }
         "agents.send" | "sessions.attach" => Duration::from_secs(5 * 60),
         _ => Duration::from_secs(2 * 60),
     }
@@ -675,28 +677,43 @@ impl Core {
             .filter(|l| l.connected())
             .cloned()
             .collect();
-        // Connected hosts answer at once; one that doesn't is let go.
-        for link in links {
-            let there = tokio::time::timeout(
-                KEYS_ASK,
-                self.forward_typed::<KeysList>(&link, &NoParams {}),
-            )
-            .await;
-            match there {
-                Ok(Ok(there)) => self.note_key_uses(&link.name, &there.keys),
-                Ok(Err(e)) => crate::log!(
-                    "vibed: can't ask {} when keys were last used: {}",
-                    link.name,
-                    e.message
-                ),
-                Err(_) => crate::log!(
-                    "vibed: {} didn't say when keys were last used in {}s",
-                    link.name,
-                    KEYS_ASK.as_secs()
-                ),
+        // All at once, each given the same few seconds: connected hosts
+        // answer at once, and one that doesn't is let go. Links run only
+        // where this core knows itself, as an `Arc`.
+        if let Some(core) = self.me.get().and_then(std::sync::Weak::upgrade) {
+            let mut asked = tokio::task::JoinSet::new();
+            for link in links {
+                let core = Arc::clone(&core);
+                asked.spawn(async move { core.ask_key_uses(&link).await });
+            }
+            asked.join_all().await;
+        } else {
+            for link in links {
+                self.ask_key_uses(&link).await;
             }
         }
         self.keys()
+    }
+
+    /// Asks `link`'s host when the keys pushed to it were last used there,
+    /// for [`KEYS_ASK`] at most, and keeps what it says.
+    async fn ask_key_uses(&self, link: &Link) {
+        let there =
+            tokio::time::timeout(KEYS_ASK, self.forward_typed::<KeysList>(link, &NoParams {}))
+                .await;
+        match there {
+            Ok(Ok(there)) => self.note_key_uses(&link.name, &there.keys),
+            Ok(Err(e)) => crate::log!(
+                "vibed: can't ask {} when keys were last used: {}",
+                link.name,
+                e.message
+            ),
+            Err(_) => crate::log!(
+                "vibed: {} didn't say when keys were last used in {}s",
+                link.name,
+                KEYS_ASK.as_secs()
+            ),
+        }
     }
 
     /// Keeps the uses a host recorded of the keys pushed to it.

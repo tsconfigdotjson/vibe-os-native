@@ -577,7 +577,8 @@ impl Core {
             match woke.await {
                 Ok(_) => {
                     let status = self.agent_status(&mut a, self.idle_debounce()).await;
-                    self.set_state(&mut a, status.state());
+                    let state = self.running_state(&a.agent_ref, &status).await;
+                    self.set_state(&mut a, state);
                     lock(&self.sleep_watch).woke(&r);
                     crate::log!("vibed: memory pressure eased, so {r} runs again");
                 }

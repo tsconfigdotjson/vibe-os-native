@@ -3,7 +3,7 @@
 // iconutil wants, each drawn from the SVG at its exact pixel size, in sRGB.
 //
 //   swift scripts/app-icon.swift swift/VibeOS/Support/AppIcon.svg swift/VibeOS/Support/AppIcon.iconset
-//   swift scripts/app-icon.swift --check <svg> <iconset>   # same pixels as a fresh render?
+//   swift scripts/app-icon.swift --check <svg> <iconset>   # as a fresh render draws it?
 //
 // The iconset is checked in; run this again only when the SVG changes.
 // scripts/sign-macos.sh and scripts/release-macos.sh make the .icns from it.
@@ -60,8 +60,16 @@ for (name, px) in sizes {
         let seen = render(px) {
             committed.draw(in: $0, from: .zero, operation: .copy, fraction: 1, respectFlipped: false, hints: nil)
         }
-        guard memcmp(seen.bitmapData!, fresh.bitmapData!, px * px * 4) == 0 else {
-            fail("\(file.lastPathComponent) isn't \(svg.lastPathComponent) rendered; run swift scripts/app-icon.swift \(args[0]) \(args[1])")
+        // Near enough, not byte for byte: another macOS may antialias an
+        // edge a little differently. Each channel within 2, but for a few
+        // edge pixels, which may be off by more.
+        let (a, b) = (seen.bitmapData!, fresh.bitmapData!)
+        var off = 0
+        for i in 0..<(px * px) {
+            if (0..<4).contains(where: { abs(Int(a[i * 4 + $0]) - Int(b[i * 4 + $0])) > 2 }) { off += 1 }
+        }
+        guard off * 200 <= px * px else {
+            fail("\(file.lastPathComponent) isn't \(svg.lastPathComponent) rendered (\(off) of \(px * px) pixels differ); run swift scripts/app-icon.swift \(args[0]) \(args[1])")
         }
     } else {
         try fresh.representation(using: .png, properties: [:])!.write(to: file)

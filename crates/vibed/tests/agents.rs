@@ -965,6 +965,78 @@ async fn the_status_loop_announces_states_and_statuses() {
     w.core.delete_agent(delete(&r, false)).await.unwrap();
 }
 
+/// The false hand-up of #46, end to end: a tool call whose transcript has
+/// stalled past agent-tail's 20 s guess, with no dialog on the screen, is
+/// busy, raises no question and answers no wait; once the screen shows a
+/// permission dialog, it's a question.
+#[tokio::test]
+async fn a_silent_tool_call_is_busy_until_its_screen_shows_a_dialog() {
+    let w = world_with(|c| c.clock = Arc::new(vibe_core::time::now)).await;
+    let a = w.core.start_agent(start("hello")).await.unwrap();
+    w.wait_screen(&a.agent, "Ready.");
+    // Claude in auto mode, 30 s into `sleep 60`.
+    let transcript = w
+        .claude(&a.agent)
+        .transcript(Path::new(&a.worktree), &a.session_id);
+    let at = vibe_core::time::now() - 30;
+    let entry = |v: Value| format!("{v}\n");
+    let mut lines = entry(
+        serde_json::json!({"type": "user", "sessionId": a.session_id,
+        "cwd": a.worktree, "timestamp": vibe_core::time::rfc3339(at - 1),
+        "message": {"role": "user", "content": "wait a minute"}}),
+    );
+    lines += &entry(
+        serde_json::json!({"type": "assistant", "sessionId": a.session_id,
+        "cwd": a.worktree, "permissionMode": "auto", "timestamp": vibe_core::time::rfc3339(at),
+        "message": {"id": "m1", "role": "assistant", "stop_reason": "tool_use",
+            "content": [{"type": "tool_use", "id": "toolu_s", "name": "Bash",
+                "input": {"command": "sleep 60"}}]}}),
+    );
+    {
+        use std::io::Write;
+        let mut f = fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap();
+        f.write_all(lines.as_bytes()).unwrap();
+        f.set_modified(std::time::UNIX_EPOCH + Duration::from_secs(at as u64))
+            .unwrap();
+    }
+    let (_, mut events) = w.core.subscribe();
+    let mut published = std::collections::HashMap::new();
+    w.core.refresh_status(&mut published, true).await;
+    let mut guessed = false;
+    while let Ok(e) = events.try_recv() {
+        assert_ne!(e.state.as_deref(), Some("question"), "no hand: {e:?}");
+        if let Some(s) = e
+            .status
+            .filter(|s| s.activity == Activity::AwaitingApproval)
+        {
+            assert_eq!(s.certainty, Certainty::Inferred);
+            guessed = true;
+        }
+    }
+    assert!(guessed, "agent-tail guessed a prompt");
+    assert_eq!(w.list().await[0].state, AgentState::Busy);
+    let check = w.core.check_agent(None, &a.agent, false).await.unwrap();
+    assert_eq!((check.state, check.answered), (AgentState::Busy, false));
+
+    // The dialog comes up.
+    for line in ["Do you want to proceed?", "1. Yes", "2. No"] {
+        w.type_line(&a.agent, line);
+    }
+    w.wait_screen(&a.agent, "2. No");
+    w.core.refresh_status(&mut published, true).await;
+    let mut raised = false;
+    while let Ok(e) = events.try_recv() {
+        raised |= e.kind == EventKind::AgentState && e.state.as_deref() == Some("question");
+    }
+    assert!(raised, "the hand goes up");
+    let check = w.core.check_agent(None, &a.agent, false).await.unwrap();
+    assert_eq!((check.state, check.answered), (AgentState::Question, true));
+    w.core.delete_agent(delete(&a.agent, true)).await.unwrap();
+}
+
 #[tokio::test]
 async fn sessions_are_asked_on_a_full_refresh_or_a_change() {
     let w = world().await;

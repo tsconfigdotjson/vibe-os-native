@@ -26,8 +26,8 @@ use vibe_core::rpc::{
     ApiKey, ErrorCode, ErrorObject, Event, GhStatus, GhStatusParams, HostLimits, HostParams,
     KeyCreateParams, KeyCreated, KeyList, KeyParams, KeyVerifyParams, LimitsSetParams,
     ProfileCreateParams, ProfileList, ProfileParams, ProfileUpdateParams, Project,
-    ProjectAddParams, ProjectList, ProjectParams, SessionAttach, SessionInfo, SessionList,
-    SessionParams,
+    ProjectAddParams, ProjectList, ProjectParams, ProjectRemoveParams, SessionAttach, SessionInfo,
+    SessionList, SessionParams,
 };
 use vibe_core::store::{NewProject, Store, StoreError};
 use vibe_core::time::rfc3339;
@@ -323,6 +323,10 @@ pub struct Core {
     /// One fetch at a time per project, as concurrent fetches of the same
     /// refs fail on each other's locks.
     pub(crate) fetching: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Per project: held shared by a start and by git maintenance for as
+    /// long as they work in its repo, and alone by its removal, so nothing
+    /// writes into a clone while it's deleted.
+    pub(crate) project_use: Mutex<HashMap<String, Arc<tokio::sync::RwLock<()>>>>,
     store: Mutex<Store>,
     /// One `host.toml` edit at a time.
     pub(crate) limits_lock: Mutex<()>,
@@ -497,6 +501,7 @@ impl Core {
             admitting: tokio::sync::Mutex::new(()),
             starting: Mutex::new(0),
             fetching: Mutex::new(HashMap::new()),
+            project_use: Mutex::new(HashMap::new()),
             tails: Mutex::new(HashMap::new()),
             sends: Mutex::new(HashMap::new()),
             typing: Mutex::new(HashMap::new()),
@@ -721,79 +726,188 @@ impl Core {
         })
     }
 
-    /// Forgets a project and its profiles. On the Mac its files stay on
-    /// disk, and adding the repo again picks its clone up. On a Linux host
-    /// the clone VibeOS made goes too, and only that: a directory directly
-    /// in the projects folder that is a git repo (see
-    /// [`projects::clone_to_delete`]). A local repo registered by path is
-    /// the owner's own, and is left as it was.
-    pub fn remove_project(&self, p: ProjectParams) -> Result<Project, ErrorObject> {
+    /// The lock a project's starts, maintenance and removal share (see
+    /// [`Core::project_use`]).
+    pub(crate) fn project_use(&self, name: &str) -> Arc<tokio::sync::RwLock<()>> {
+        Arc::clone(lock(&self.project_use).entry(name.to_owned()).or_default())
+    }
+
+    /// Holds `name`'s project in use until dropped, as a start does: what
+    /// tests hold a removal off with.
+    #[doc(hidden)]
+    pub async fn project_in_use(&self, name: &str) -> tokio::sync::OwnedRwLockReadGuard<()> {
+        self.project_use(name).read_owned().await
+    }
+
+    /// Forgets a project and its profiles (PRD: Key user flows, Add a
+    /// project). On the Mac its files stay on disk, and adding the repo
+    /// again picks its clone up. On a Linux host the clone VibeOS made goes
+    /// too when `delete` says so, and only that: a git repo directly in the
+    /// projects folder whose `origin` is the project's repo (see
+    /// [`projects::clone_to_delete`] and [`projects::clone_is_of`]). Without
+    /// `delete`, a removal that would delete a clone is refused and says
+    /// what it would delete; one whose clone isn't safe to delete is then
+    /// only forgotten. A local repo registered by path is the owner's own,
+    /// and is never deleted. The answer says whether the clone was.
+    pub async fn remove_project(&self, p: ProjectRemoveParams) -> Result<Project, ErrorObject> {
         let host = self.host(p.host.as_deref())?;
+        // Starts and maintenance in it finish first, and none begins until
+        // this is done.
+        let project_use = self.project_use(&p.project);
+        let _alone = project_use.write().await;
         let project = self
             .store()
             .project(host, &p.project)
             .map_err(store_error)?;
-        let clone = if self.info.os == "linux" && project.source == ProjectSource::Github {
-            projects::clone_to_delete(
-                &self.layout.projects_dir(),
-                self.layout.home(),
-                Path::new(&project.path),
-            )
-            .map_err(|why| {
-                error(
+        let agents = self
+            .store()
+            .agents(host)
+            .map_err(store_error)?
+            .into_iter()
+            .filter(|a| a.project == project.name)
+            .count();
+        if agents > 0 {
+            return Err(error(
+                ErrorCode::Conflict,
+                format!(
+                    "{} still has {agents} agent{}; delete {} first",
+                    project.name,
+                    if agents == 1 { "" } else { "s" },
+                    if agents == 1 { "it" } else { "them" }
+                ),
+            ));
+        }
+        let clone = match project.repo.as_deref().map(GithubRepo::parse) {
+            Some(Ok(repo))
+                if self.info.os == "linux" && project.source == ProjectSource::Github =>
+            {
+                let checked = projects::clone_to_delete(
+                    &self.layout.projects_dir(),
+                    self.layout.home(),
+                    Path::new(&project.path),
+                );
+                match checked {
+                    Ok(Some(dir)) => match projects::clone_is_of(&dir, &repo).await {
+                        Ok(()) => Ok(Some(dir)),
+                        Err(why) => Err(why),
+                    },
+                    other => other,
+                }
+            }
+            _ => Ok(None),
+        };
+        let clone = match (clone, p.delete) {
+            (Ok(Some(dir)), false) => {
+                return Err(error(
                     ErrorCode::Conflict,
                     format!(
-                        "{} is kept: {why}, so it isn't safe to delete. Move or delete it by \
-                         hand, then remove the project again",
+                        "removing {} deletes its clone at {}, with any branches there that were \
+                         never pushed, so it wasn't removed. To go ahead, remove it with delete \
+                         (vibe project remove --delete {})",
+                        project.name,
+                        dir.display(),
+                        project.name
+                    ),
+                ));
+            }
+            (Ok(clone), _) => clone,
+            (Err(why), true) => {
+                return Err(error(
+                    ErrorCode::Conflict,
+                    format!(
+                        "{}'s files weren't deleted: {why}, so it isn't safe to. Nothing was \
+                         changed; remove it without delete (vibe project remove {}) to forget \
+                         it and keep its files",
+                        project.name, project.name
+                    ),
+                ));
+            }
+            (Err(why), false) => {
+                crate::log!("vibed: {}'s clone stays: {why}", project.name);
+                None
+            }
+        };
+        // Out of the project's name first, so nothing half-deleted is left
+        // under it; then the record; then the files, off the runtime's
+        // threads, as a big clone takes a while.
+        let aside = match &clone {
+            Some(dir) => Some(projects::move_aside(dir).map_err(|why| {
+                error(
+                    ErrorCode::CommandFailed,
+                    format!(
+                        "{} wasn't removed: {why}; nothing was changed",
                         project.name
                     ),
                 )
-            })?
-        } else {
-            None
+            })?),
+            None => None,
         };
-        // The record goes first, so a project with agents keeps its files;
-        // then the clone, while nothing can start an agent in it.
-        let project = self
-            .store()
-            .remove_project(host, &p.project)
-            .map_err(store_error)?;
-        match &clone {
-            Some(dir) => match projects::delete_clone(dir) {
-                Ok(()) => crate::log!(
-                    "vibed: removed project {} and deleted {}",
-                    project.name,
-                    dir.display()
-                ),
-                Err(e) => {
+        let removed = self.store().remove_project(host, &p.project);
+        let mut project = match removed {
+            Ok(project) => project,
+            Err(e) => {
+                if let (Some(dir), Some(aside)) = (&clone, &aside)
+                    && let Err(back) = projects::move_back(aside, dir)
+                {
                     crate::log!(
-                        "vibed: removed project {}, but can't delete {}: {e}",
-                        project.name,
+                        "vibed: can't put {} back at {}: {back}",
+                        aside.display(),
                         dir.display()
                     );
-                    let mut removed = self.event(EventKind::ProjectRemoved);
-                    removed.project = Some(project.name.clone());
-                    self.publish(removed);
-                    return Err(error(
-                        ErrorCode::CommandFailed,
-                        format!(
-                            "{} is removed, but {} couldn't be deleted: {e}; delete it by hand",
-                            project.name,
-                            dir.display()
-                        ),
-                    ));
                 }
-            },
-            None => crate::log!(
-                "vibed: removed project {}; {} is left as it was",
-                project.name,
-                project.path
-            ),
-        }
+                return Err(store_error(e));
+            }
+        };
         let mut e = self.event(EventKind::ProjectRemoved);
         e.project = Some(project.name.clone());
         self.publish(e);
-        Ok(project)
+        let Some(aside) = aside else {
+            crate::log!(
+                "vibed: removed project {}; {} is left as it was",
+                project.name,
+                project.path
+            );
+            return Ok(project);
+        };
+        let gone = {
+            let aside = aside.clone();
+            tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&aside)).await
+        };
+        match gone {
+            Ok(Ok(())) => {
+                crate::log!(
+                    "vibed: removed project {} and deleted {}",
+                    project.name,
+                    project.path
+                );
+                project.deleted = true;
+                Ok(project)
+            }
+            Ok(Err(why)) => {
+                crate::log!(
+                    "vibed: removed project {}, but can't delete {}: {why}",
+                    project.name,
+                    aside.display()
+                );
+                Err(error(
+                    ErrorCode::CommandFailed,
+                    format!(
+                        "{} is removed, but its clone, moved to {}, couldn't all be deleted: \
+                         {why}; delete it by hand",
+                        project.name,
+                        aside.display()
+                    ),
+                ))
+            }
+            Err(why) => Err(error(
+                ErrorCode::InternalError,
+                format!(
+                    "Internal error: {} is removed, but deleting {} stopped: {why}",
+                    project.name,
+                    aside.display()
+                ),
+            )),
+        }
     }
 
     // Profiles.

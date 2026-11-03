@@ -61,7 +61,7 @@ struct LiveMenuTests {
         #expect(await model.delete(row, force: true) == .deleted)
         await model.refresh()
         #expect(model.agent(host: "local", ref: started.ref) == nil)
-        _ = try client.call(ProjectsRemove.self, ProjectParams(project: project.name))
+        _ = try client.call(ProjectsRemove.self, ProjectRemoveParams(project: project.name))
 
         if let marker = environment["VIBE_TEST_MARKER"] {
             try Data("ok\n".utf8).write(to: URL(fileURLWithPath: marker))

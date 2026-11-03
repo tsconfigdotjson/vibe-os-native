@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use vibe_core::model::{AgentState, validate_ref};
+use vibe_core::model::{Activity, AgentState, validate_ref};
 use vibe_core::rpc::{
     AgentCheck, AgentCheckParams, AgentMessagesParams, AgentOutput, AgentOutputParams,
     AgentSendParams, AgentSent, ErrorCode, ErrorObject, MessageList,
@@ -321,6 +321,11 @@ impl Core {
         } else {
             self.observed_state(&record, &status).await
         };
+        // A permission prompt agent-tail only guesses at is no answer while
+        // the agent is busy, as a long silent tool run is: the wait goes on
+        // until the screen shows the dialog, or the tool ends.
+        let answered = answered
+            && !(status.activity == Activity::AwaitingApproval && state == AgentState::Busy);
         Ok(Check {
             state,
             activity: status.activity,

@@ -639,6 +639,11 @@ impl Core {
         if p.prompt.trim().is_empty() {
             return Err(invalid("give the agent a prompt"));
         }
+        // The project stays until the start is done: a removal waits for
+        // it, and a start waits for a removal under way, then finds no
+        // project.
+        let project_use = self.project_use(&p.project);
+        let _in_use = project_use.read().await;
         let project = self
             .store()
             .project(host, &p.project)
@@ -1234,7 +1239,8 @@ impl Core {
                 blocking(move || b.wake(&h)).await?;
                 crate::log!("vibed: {agent_ref} resumed from being {}", record.state);
                 let status = self.agent_status(&mut record, self.idle_debounce()).await;
-                self.set_state(&mut record, status.state());
+                let state = self.running_state(agent_ref, &status).await;
+                self.set_state(&mut record, state);
                 return Ok(self.agent_info(&record, &status));
             }
             let status = self.agent_status(&mut record, self.idle_debounce()).await;
@@ -1257,7 +1263,8 @@ impl Core {
                         .await?;
                     crate::log!("vibed: {agent_ref} woke where it was");
                     let status = self.agent_status(&mut record, self.idle_debounce()).await;
-                    self.set_state(&mut record, status.state());
+                    let state = self.running_state(agent_ref, &status).await;
+                    self.set_state(&mut record, state);
                     return Ok(self.agent_info(&record, &status));
                 }
                 // What's left of its tree ends: it has no terminal.
@@ -1286,7 +1293,8 @@ impl Core {
             }
         );
         let status = self.agent_status(&mut record, self.idle_debounce()).await;
-        self.set_state(&mut record, status.state());
+        let state = self.running_state(agent_ref, &status).await;
+        self.set_state(&mut record, state);
         Ok(self.agent_info(&record, &status))
     }
 
@@ -1595,6 +1603,15 @@ impl Core {
         // Not while a start is under way, nor while any of its agents is
         // awake or being started, deleted or resumed.
         if *lock(&self.starting) > 0 {
+            return;
+        }
+        // Nor while it's being removed; and it holds off a removal until
+        // it's done.
+        let project_use = self.project_use(project_name);
+        let Ok(_in_use) = project_use.try_read() else {
+            return;
+        };
+        if !project.is_dir() {
             return;
         }
         for a in agents.iter().filter(|a| a.project == project_name) {

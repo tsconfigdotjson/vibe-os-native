@@ -111,8 +111,8 @@
 #     including the Swift half of the Rust<->Swift contract test, and the
 #     menu's model, Terminal attach and notifications against stand-ins
 #   - the app icon (swift/VibeOS/Support/AppIcon.iconset): every size, a PNG
-#     of the right size in the icon's two colours, and on a Mac the same
-#     pixels as AppIcon.svg rendered afresh by scripts/app-icon.swift
+#     of the right size in the icon's two colours, and on a Mac within a
+#     hair of AppIcon.svg rendered afresh by scripts/app-icon.swift
 #   - the release's tools, which need no Mac: Sparkle's Ed25519 signing and
 #     its appcast (scripts/sparkle.py self-test: RFC 8032's vectors, and the
 #     cryptography package's answers where it's installed); the release
@@ -853,7 +853,7 @@ s_sign() {
 # The app icon's checked-in iconset: every size iconutil wants, at its size,
 # with AppIcon.svg's ink in the corner and its cyan at 40%,50%. That much is
 # python3's standard library, so it runs on Linux too; on a Mac the iconset
-# is also rendered afresh from the SVG and compared pixel for pixel.
+# is also rendered afresh from the SVG and compared, within a hair.
 s_app_icon() {
   local set=swift/VibeOS/Support/AppIcon.iconset name size got
   for name in 16x16:16 16x16@2x:32 32x32:32 32x32@2x:64 128x128:128 128x128@2x:256 \

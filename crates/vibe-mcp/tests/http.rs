@@ -61,6 +61,7 @@ fn project(host: &str, name: &str) -> Project {
             "software-eng-linux",
             Environment::Linux,
         )],
+        deleted: false,
     }
 }
 
