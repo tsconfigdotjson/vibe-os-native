@@ -18,12 +18,12 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.1.2</string>
+	<string>0.1.3</string>
 	<!-- The version again: Sparkle compares builds by it, and a release's
 	     only goes up. scripts/release-macos.sh checks both against
 	     Cargo.toml's. -->
 	<key>CFBundleVersion</key>
-	<string>0.1.2</string>
+	<string>0.1.3</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>26.0</string>
 	<!-- Asked the first time a row is clicked: Terminal is scripted to
