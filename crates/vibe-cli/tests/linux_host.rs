@@ -377,6 +377,7 @@ fn mac(golden: &common::Golden, ssh: &Path, bundle: PathBuf) -> Mac {
         connect_timeout: Duration::from_secs(20),
         min_backoff: Duration::from_millis(200),
         max_backoff: Duration::from_secs(1),
+        ..Timing::default()
     };
     let core = Arc::new(Core::open(config).unwrap());
     {

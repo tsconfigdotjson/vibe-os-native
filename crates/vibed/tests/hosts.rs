@@ -165,6 +165,7 @@ fn quick() -> Timing {
         connect_timeout: Duration::from_secs(5),
         min_backoff: Duration::from_millis(50),
         max_backoff: Duration::from_millis(300),
+        ..Timing::default()
     }
 }
 

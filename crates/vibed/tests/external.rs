@@ -31,7 +31,7 @@ use vibe_core::model::{HostLink, TunnelState};
 use vibe_core::paths::Layout;
 use vibe_core::rpc::{ErrorCode, HostAddParams, KeyCreateParams, KeyParams, MAX_MESSAGE_BYTES};
 use vibe_mcp::public::Limits;
-use vibed::core::Core;
+use vibed::core::{Core, OpenError};
 use vibed::external::ExternalConfig;
 use vibed::link::Timing;
 use vibed::remote::{BoxFuture, Channel, Installed, Remote, TunnelChild};
@@ -45,6 +45,9 @@ const DOMAIN: &str = "vps.test";
 struct Wires {
     sockets: Mutex<HashMap<String, PathBuf>>,
     up: watch::Sender<bool>,
+    /// Bumped to end every dial, as stopping the host's `vibed` ends each
+    /// `vibe rpc`, while tunnels stay: sshd holds those.
+    hang_up: watch::Sender<u64>,
     tunnels: Mutex<u32>,
     /// Whether tunnels may be made (sshd might refuse to forward).
     forwarding: AtomicBool,
@@ -55,6 +58,7 @@ impl Wires {
         Arc::new(Wires {
             sockets: Mutex::new(HashMap::new()),
             up: watch::channel(true).0,
+            hang_up: watch::channel(0).0,
             tunnels: Mutex::new(0),
             forwarding: AtomicBool::new(true),
         })
@@ -66,6 +70,10 @@ impl Wires {
 
     fn plug_in(&self) {
         self.up.send_replace(true);
+    }
+
+    fn hang_up_dials(&self) {
+        self.hang_up.send_modify(|n| *n += 1);
     }
 }
 
@@ -108,7 +116,14 @@ impl Remote for Wires {
                 .await
                 .map_err(|e| format!("vibe: can't reach vibed: {e}"))?;
             let (ours, theirs) = UnixStream::pair().map_err(|e| e.to_string())?;
-            tokio::spawn(pump(host, theirs, self.up.subscribe()));
+            let up = self.up.subscribe();
+            let mut hang_up = self.hang_up.subscribe();
+            tokio::spawn(async move {
+                tokio::select! {
+                    () = pump(host, theirs, up) => {}
+                    _ = hang_up.changed() => {}
+                }
+            });
             let (r, w) = ours.into_split();
             Ok(Channel::new(
                 BufReader::new(r),
@@ -184,6 +199,7 @@ fn quick() -> Timing {
         connect_timeout: Duration::from_secs(5),
         min_backoff: Duration::from_millis(50),
         max_backoff: Duration::from_millis(300),
+        ..Timing::default()
     }
 }
 
@@ -214,6 +230,8 @@ struct World {
     host_world: Golden,
     public: SocketAddr,
     cert: CertificateDer<'static>,
+    /// The host's external config, to start it again with.
+    external: ExternalConfig,
     _server: TestServer,
     _certs: tempfile::TempDir,
 }
@@ -223,11 +241,16 @@ struct World {
 /// public endpoint, once it's on, on a port of its own with a fixed
 /// certificate, and a client gets `limits` there.
 async fn world(limits: Limits) -> World {
+    world_timed(limits, quick()).await
+}
+
+/// [`world`], with the Mac's link and tunnel timed by `timing`.
+async fn world_timed(limits: Limits, timing: Timing) -> World {
     let wires = Wires::new();
     let mac_world = Golden::new();
     let mut config = mac_world.config();
     config.remote = Arc::clone(&wires) as Arc<dyn Remote>;
-    config.link_timing = quick();
+    config.link_timing = timing;
     let mac = Arc::new(Core::open(config).unwrap());
     mac.spawn_links();
     mac.spawn_external();
@@ -236,14 +259,7 @@ async fn world(limits: Limits) -> World {
     let (cert_pem, key_pem, cert) = certificate(certs.path());
     let port = free_port();
     let host_world = Golden::new();
-    let mut config = host_world.config();
-    config.info.os = "linux".into();
-    config.label = "vps-1".into();
-    config.layout = Layout::new(&host_world.home, "linux");
-    config.toolbox = None;
-    // Its own keys aren't the Mac's.
-    config.entropy = Arc::new(vibe_core::keys::random_bytes);
-    config.external = ExternalConfig {
+    let external = ExternalConfig {
         serve_here: true,
         port,
         // Loopback only: the tests open nothing to the network.
@@ -253,19 +269,7 @@ async fn world(limits: Limits) -> World {
         limits,
         ..ExternalConfig::default()
     };
-    let host = Arc::new(Core::open(config).unwrap());
-    host.spawn_links();
-    host.spawn_external();
-    let server = serve(
-        Arc::clone(&host),
-        common::short_tempdir(),
-        MAX_MESSAGE_BYTES,
-    );
-    wires
-        .sockets
-        .lock()
-        .unwrap()
-        .insert("me@vps.example.com".into(), server.path.clone());
+    let (host, server) = open_host(&host_world, &external, &wires).await;
     let w = World {
         mac,
         host,
@@ -274,6 +278,7 @@ async fn world(limits: Limits) -> World {
         host_world,
         public: SocketAddr::from(([127, 0, 0, 1], port)),
         cert,
+        external,
         _server: server,
         _certs: certs,
     };
@@ -301,6 +306,55 @@ async fn world(limits: Limits) -> World {
     )
     .await);
     w
+}
+
+/// The Linux host's `vibed` on `host_world`, started as `vibed` starts,
+/// once an earlier one there has let go of its state, and served at
+/// `me@vps.example.com`.
+async fn open_host(
+    host_world: &Golden,
+    external: &ExternalConfig,
+    wires: &Wires,
+) -> (Arc<Core>, TestServer) {
+    let config = || {
+        let mut config = host_world.config();
+        config.info.os = "linux".into();
+        config.label = "vps-1".into();
+        config.layout = Layout::new(&host_world.home, "linux");
+        config.toolbox = None;
+        // Its own keys aren't the Mac's.
+        config.entropy = Arc::new(vibe_core::keys::random_bytes);
+        config.external = external.clone();
+        config
+    };
+    let mut host = None;
+    for _ in 0..1000 {
+        match Core::open(config()) {
+            Ok(core) => {
+                host = Some(Arc::new(core));
+                break;
+            }
+            Err(OpenError::AlreadyRunning { .. }) => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(e) => panic!("{e}"),
+        }
+    }
+    let host = host.expect("the last host's vibed let go of its state");
+    host.adopt_sessions().await;
+    host.spawn_links();
+    host.spawn_external();
+    let server = serve(
+        Arc::clone(&host),
+        common::short_tempdir(),
+        MAX_MESSAGE_BYTES,
+    );
+    wires
+        .sockets
+        .lock()
+        .unwrap()
+        .insert("me@vps.example.com".into(), server.path.clone());
+    (host, server)
 }
 
 /// One call through `core`'s dispatcher, as a socket client makes it.
@@ -358,6 +412,69 @@ impl World {
         assert_eq!(on["result"]["url"], format!("https://{DOMAIN}/mcp"));
         self.wait("the tunnel", |h| h.tunnel == Some(TunnelState::Up))
             .await;
+    }
+
+    /// Stops the host's `vibed` and starts it again, as an upgrade does:
+    /// its links end, and on start it scans `run/` for sessions. sshd, so
+    /// the Mac's tunnel and its end in `run/`, carries on.
+    async fn restart_host(self) -> World {
+        let World {
+            mac,
+            host,
+            wires,
+            mac_world,
+            host_world,
+            public,
+            cert,
+            external,
+            _server,
+            _certs,
+        } = self;
+        host.stop_external();
+        drop(_server);
+        drop(host);
+        wires.hang_up_dials();
+        let (host, server) = open_host(&host_world, &external, &wires).await;
+        World {
+            mac,
+            host,
+            wires,
+            mac_world,
+            host_world,
+            public,
+            cert,
+            external,
+            _server: server,
+            _certs,
+        }
+    }
+
+    /// The end of the Mac's tunnel on the host.
+    fn tunnel_end(&self) -> PathBuf {
+        Layout::new(&self.host_world.home, "linux")
+            .run_dir()
+            .join(vibed::external::TUNNEL_END)
+    }
+
+    /// Waits until an outside client with `key` reaches the Mac's
+    /// projects through the host.
+    async fn mac_reachable(&self, key: &str) {
+        for _ in 0..500 {
+            if TcpStream::connect(self.public).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let mut c = self.client(key);
+        let mut projects = String::new();
+        for _ in 0..300 {
+            projects = c.call("vibe_list_projects", json!({})).await;
+            if projects.contains("app (on mac)") {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("the Mac never came back through the tunnel: {projects}");
     }
 
     fn key(&self, name: &str) -> String {
@@ -868,6 +985,167 @@ async fn the_tunnel_says_why_it_is_down() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(!w.host.hosts().unwrap().hosts[0].external);
+}
+
+/// Issue #45: the host's `vibed` restarted, as an upgrade does, while the
+/// tunnel was up, took the tunnel's end in `run/` for a dead session's
+/// socket and removed it, and the Mac was unavailable from then on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restarted_host_keeps_the_macs_tunnel() {
+    let w = world(limits()).await;
+    w.turn_on().await;
+    let key = w.key("laptop");
+    w.pushed(&key).await;
+    w.mac_reachable(&key).await;
+    let tunnels = *w.wires.tunnels.lock().unwrap();
+
+    let w = w.restart_host().await;
+    // Its scan for sessions on start, and every one after, leaves the
+    // tunnel's end alone: it's no session.
+    let sessions = rpc(&w.host, "sessions.list", json!({})).await;
+    assert_eq!(sessions["result"]["sessions"], json!([]), "{sessions}");
+    assert!(w.tunnel_end().exists(), "the scan removed the tunnel's end");
+    w.pushed(&key).await;
+    w.mac_reachable(&key).await;
+    assert!(w.tunnel_end().exists());
+    // Through the same tunnel: nothing had to start it over.
+    assert_eq!(*w.wires.tunnels.lock().unwrap(), tunnels);
+    assert_eq!(w.vps().tunnel, Some(TunnelState::Up));
+
+    // Nor can an agent take the tunnel's end, or any socket of vibed's.
+    let mut c = w.client(&key);
+    for (host, profile, name) in [
+        ("local", "software-eng-linux", "mac"),
+        ("local", "software-eng-linux", "tunnel"),
+        ("mac", "software-eng-mac", "tunnel"),
+        ("mac", "software-eng-mac", "vibed"),
+    ] {
+        let refused = c
+            .fails(
+                "vibe_start_agent",
+                json!({"project": "app", "profile": profile, "prompt": "talk",
+                       "host": host, "name": name}),
+            )
+            .await;
+        assert!(
+            refused.contains(&format!(
+                "`{name}` is a name VibeOS keeps for itself; pick another name"
+            )),
+            "{refused}"
+        );
+    }
+}
+
+/// An agent called as an older `vibed` let one be, `mac` on a Linux host
+/// or `tunnel` on a Mac, before those names were kept for the tunnel's
+/// sockets.
+fn legacy_agent(home: &Path, os: &str, agent_ref: &str) {
+    let layout = Layout::new(home, os);
+    let mut store = vibe_core::store::Store::open(&layout.db()).unwrap();
+    store
+        .add_agent(&vibe_core::store::AgentRecord {
+            host: vibe_core::model::LOCAL_HOST.into(),
+            agent_ref: agent_ref.into(),
+            project: "app".into(),
+            profile: "software-eng-linux".into(),
+            environment: vibe_core::model::Environment::Linux,
+            model: vibe_core::model::Model::Opus,
+            reasoning: vibe_core::model::Reasoning::High,
+            mode: vibe_core::model::Mode::Auto,
+            memory: 1 << 30,
+            worktree: home
+                .join("VibeOS/worktrees/app")
+                .join(agent_ref)
+                .to_string_lossy()
+                .into_owned(),
+            branch: agent_ref.into(),
+            session_id: "s".into(),
+            shim_socket: None,
+            state: vibe_core::model::AgentState::Exited,
+            created_at: 0,
+            compartment: "{}".into(),
+            starting: false,
+        })
+        .unwrap();
+}
+
+/// An agent named `mac` or `tunnel` before 0.1.3 is still listed and can
+/// be deleted, and deleting it leaves the tunnel's sockets alone: sshd's
+/// end on the host has no lock, and the Mac's is the Mac's own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn agents_named_for_the_tunnel_from_before_can_be_deleted() {
+    let w = world(limits()).await;
+    w.turn_on().await;
+    let key = w.key("laptop");
+    w.pushed(&key).await;
+    w.mac_reachable(&key).await;
+    legacy_agent(&w.host_world.home, "linux", "mac");
+    legacy_agent(&w.mac_world.home, "macos", "tunnel");
+    let mac_end = w.mac.tunnel_socket();
+    assert!(mac_end.exists());
+
+    // Each is an agent as any other, and neither socket is a session.
+    for (core, name) in [(&w.host, "mac"), (&w.mac, "tunnel")] {
+        let listed = rpc(core, "agents.list", json!({})).await;
+        let refs: Vec<_> = listed["result"]["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["ref"].as_str().unwrap().to_owned())
+            .collect();
+        assert!(refs.contains(&name.to_owned()), "{listed}");
+        let sessions = rpc(core, "sessions.list", json!({})).await;
+        assert_eq!(sessions["result"]["sessions"], json!([]), "{sessions}");
+    }
+
+    for (core, name) in [(&w.host, "mac"), (&w.mac, "tunnel")] {
+        let deleted = rpc(core, "agents.delete", json!({"ref": name, "force": true})).await;
+        assert!(deleted.get("result").is_some(), "{name}: {deleted}");
+    }
+    assert!(
+        w.tunnel_end().exists(),
+        "deleting `mac` removed the tunnel's end"
+    );
+    assert!(
+        mac_end.exists(),
+        "deleting `tunnel` removed the Mac's socket"
+    );
+    w.mac_reachable(&key).await;
+    assert_eq!(w.vps().tunnel, Some(TunnelState::Up));
+}
+
+/// A tunnel whose end on the host is gone while `ssh` runs on (a cleanup
+/// of `run/`, or the scan of issue #45) has the host stop coming through
+/// it: the Mac starts it over, so it heals without anyone ending `ssh`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tunnel_whose_end_is_gone_starts_over() {
+    let timing = Timing {
+        tunnel_quiet: Duration::from_secs(2),
+        ..quick()
+    };
+    let w = world_timed(limits(), timing).await;
+    w.turn_on().await;
+    let key = w.key("laptop");
+    w.pushed(&key).await;
+    w.mac_reachable(&key).await;
+    let tunnels = *w.wires.tunnels.lock().unwrap();
+
+    std::fs::remove_file(w.tunnel_end()).unwrap();
+    for _ in 0..1000 {
+        if *w.wires.tunnels.lock().unwrap() > tunnels {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        *w.wires.tunnels.lock().unwrap() > tunnels,
+        "the Mac never started the tunnel over: {:?}",
+        w.vps()
+    );
+    w.wait("the tunnel back", |h| h.tunnel == Some(TunnelState::Up))
+        .await;
+    assert!(w.tunnel_end().exists());
+    w.mac_reachable(&key).await;
 }
 
 /// Reads one HTTP response off a kept-alive connection: its status, or

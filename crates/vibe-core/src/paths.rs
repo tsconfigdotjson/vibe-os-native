@@ -13,6 +13,9 @@ pub const SOCKET_ENV: &str = "VIBE_SOCKET";
 /// `~/VibeOS/agents/<ref>` for an agent's session.
 pub const TMP_DIR: &str = "tmp";
 
+/// The daemon's socket's name, in the run directory.
+pub const SOCKET_NAME: &str = "vibed.sock";
+
 /// The socket path relative to `$HOME` on macOS.
 pub const MACOS_SOCKET: &str = "Library/Application Support/VibeOS/run/vibed.sock";
 
@@ -107,7 +110,9 @@ impl Layout {
         self.data_dir().join("vibe.db")
     }
 
-    /// Sockets: `vibed.sock`, and `<ref>.sock` for each running session.
+    /// Sockets: `vibed.sock`, an external-access tunnel's (`mac.sock` on a
+    /// Linux host, `tunnel.sock` on a Mac), and `<ref>.sock` for each
+    /// running session.
     pub fn run_dir(&self) -> PathBuf {
         self.data_dir().join("run")
     }
@@ -127,7 +132,7 @@ impl Layout {
     /// The default socket, the same path [`resolve_socket`] gives without
     /// overrides.
     pub fn socket(&self) -> PathBuf {
-        self.run_dir().join("vibed.sock")
+        self.run_dir().join(SOCKET_NAME)
     }
 
     pub fn logs_dir(&self) -> PathBuf {
@@ -310,6 +315,9 @@ mod tests {
             Ok(PathBuf::from("/home/u/.local/share/vibeos/run/vibed.sock"))
         );
         assert_eq!(default_socket_relative("freebsd"), LINUX_SOCKET);
+        for s in [MACOS_SOCKET, LINUX_SOCKET] {
+            assert!(s.ends_with(&format!("/run/{SOCKET_NAME}")), "{s}");
+        }
     }
 
     #[test]

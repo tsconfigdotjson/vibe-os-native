@@ -982,7 +982,13 @@ impl Core {
     async fn scan_sessions(&self) -> Vec<(String, Probe)> {
         // All at once: a stuck shim costs one probe's timeout, not one each.
         let mut probes = tokio::task::JoinSet::new();
-        for r in sessions::socket_refs(&self.layout.run_dir()) {
+        // A ref the daemon keeps for a socket of its own is a session's only
+        // for an agent made with it before it was reserved.
+        let is_agent = |r: &str| {
+            self.store().agent(LOCAL_HOST, r).is_ok()
+                && !self.serves_itself(&self.layout.session_socket(r))
+        };
+        for r in sessions::socket_refs(&self.layout.run_dir(), is_agent) {
             let path = self.layout.session_socket(&r);
             probes.spawn(async move {
                 let probe = sessions::probe(&path).await;
