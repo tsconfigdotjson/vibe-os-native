@@ -191,6 +191,7 @@ async fn world() -> World {
     let host_world = Golden::new();
     let mut config = host_world.config();
     config.info.os = "linux".into();
+    config.info.version = env!("CARGO_PKG_VERSION").into();
     config.label = "vps-1".into();
     config.layout = Layout::new(&host_world.home, "linux");
     config.toolbox = None;

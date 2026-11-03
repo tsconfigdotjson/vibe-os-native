@@ -115,7 +115,7 @@ impl Fake {
             .collect();
         serde_json::from_value(json!({
             "protocol": proto::PROTOCOL,
-            "version": "0.1.0",
+            "version": env!("CARGO_PKG_VERSION"),
             "boot_id": "b",
             "uptime_ms": 10,
             "state": match vm.session {
