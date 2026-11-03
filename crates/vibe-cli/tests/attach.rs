@@ -12,7 +12,9 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use common::{RunningShim, alive, short_tempdir, start_shim, wait_until, write_record};
@@ -73,7 +75,11 @@ impl World {
     fn vibe(&self) -> Command {
         let mut cmd = Command::new(VIBE);
         cmd.env("VIBE_SOCKET", &self.socket)
-            .env("HOME", self.layout.home());
+            .env("HOME", self.layout.home())
+            // Not over SSH, even if these tests are run that way: a hangup
+            // means something else there.
+            .env_remove("SSH_CONNECTION")
+            .env_remove("SSH_TTY");
         cmd
     }
 
@@ -88,11 +94,14 @@ impl World {
 /// A terminal with a program on it, as Terminal.app would run it: the
 /// program leads a session whose controlling terminal this is.
 struct Term {
-    master: File,
-    /// Kept open, as a terminal emulator would.
-    _slave: OwnedFd,
+    master: Option<File>,
+    /// Kept open, as a terminal emulator would, until the window closes.
+    slave: Option<OwnedFd>,
     child: Child,
     seen: Arc<Mutex<Vec<u8>>>,
+    /// Tells the reader to stop reading, after what it's reading now.
+    stall: Arc<AtomicBool>,
+    reader: Option<JoinHandle<()>>,
 }
 
 fn check(rc: libc::c_int) -> std::io::Result<libc::c_int> {
@@ -127,6 +136,11 @@ impl Term {
             let s = OwnedFd::from_raw_fd(
                 check(libc::open(name.as_ptr(), libc::O_RDWR | libc::O_NOCTTY)).unwrap(),
             );
+            // Kept from the program, or closing the window wouldn't close
+            // the terminal: the program would hold both ends itself.
+            for fd in [&m, &s] {
+                check(libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC)).unwrap();
+            }
             (m, s)
         };
         set_size(master.as_raw_fd(), size);
@@ -146,21 +160,46 @@ impl Term {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let mut reader = master.try_clone().unwrap();
         let sink = seen.clone();
-        std::thread::spawn(move || {
+        let stall = Arc::new(AtomicBool::new(false));
+        let stalled = stall.clone();
+        let reader = std::thread::spawn(move || {
             let mut buf = [0u8; 4096];
             while let Ok(n) = reader.read(&mut buf) {
                 if n == 0 {
                     break;
                 }
                 sink.lock().unwrap().extend_from_slice(&buf[..n]);
+                if stalled.load(Ordering::SeqCst) {
+                    break;
+                }
             }
         });
         Term {
-            master,
-            _slave: slave,
+            master: Some(master),
+            slave: Some(slave),
             child,
             seen,
+            stall,
+            reader: Some(reader),
         }
+    }
+
+    fn master(&self) -> &File {
+        self.master.as_ref().expect("the window is open")
+    }
+
+    /// Closes the window for real, as an emulator does: it stops reading
+    /// while the program is still writing, so the program blocks with the
+    /// terminal's buffer full, and then every end of the terminal this
+    /// holds closes. The kernel hangs the terminal up, so the program's
+    /// write fails as its `SIGHUP` arrives. Needs output running: the
+    /// reader stops only once a read returns.
+    fn close_window_while_writing(&mut self) {
+        self.stall.store(true, Ordering::SeqCst);
+        self.reader.take().unwrap().join().unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        self.master = None;
+        self.slave = None;
     }
 
     fn text(&self) -> String {
@@ -180,7 +219,7 @@ impl Term {
     }
 
     fn type_bytes(&mut self, bytes: &[u8]) {
-        self.master.write_all(bytes).unwrap();
+        self.master().write_all(bytes).unwrap();
     }
 
     fn type_line(&mut self, line: &str) {
@@ -188,7 +227,7 @@ impl Term {
     }
 
     fn resize(&self, size: Size) {
-        set_size(self.master.as_raw_fd(), size);
+        set_size(self.master().as_raw_fd(), size);
     }
 
     /// Waits for the program to exit, and returns its exit code.
@@ -221,7 +260,7 @@ impl Term {
         // SAFETY: termios is plain data, filled in by tcgetattr.
         unsafe {
             let mut t: libc::termios = std::mem::zeroed();
-            check(libc::tcgetattr(self.master.as_raw_fd(), &mut t)).unwrap();
+            check(libc::tcgetattr(self.master().as_raw_fd(), &mut t)).unwrap();
             t.c_lflag & libc::ICANON != 0 && t.c_lflag & libc::ECHO != 0
         }
     }
@@ -230,7 +269,12 @@ impl Term {
 impl Drop for Term {
     fn drop(&mut self) {
         let _ = self.child.kill();
-        let _ = self.child.wait();
+        // Not forever: a program exiting with output nobody reads waits for
+        // its terminal to drain, which this must not hang the tests on.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && !matches!(self.child.try_wait(), Ok(Some(_)) | Err(_)) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 }
 
@@ -492,6 +536,12 @@ fn ls_lists_sessions() {
 /// A vibed with the test toolbox, whose shell is `sh`, and its supervisor,
 /// which saves the toolbox when the shell exits.
 fn toolbox_world() -> World {
+    toolbox_world_with(|toolbox| toolbox)
+}
+
+fn toolbox_world_with(
+    adjust: impl FnOnce(vibe_env::testing::TestToolbox) -> vibe_env::testing::TestToolbox,
+) -> World {
     let dir = short_tempdir();
     let home = dir.path().canonicalize().unwrap().join("home");
     let layout = Layout::new(&home, std::env::consts::OS);
@@ -503,10 +553,10 @@ fn toolbox_world() -> World {
     let mut config = Config::new(DaemonInfo::current(), layout.clone());
     config.gh = "/nonexistent/gh".into();
     config.shim = common::workspace_bin("vibe-shim").into_os_string();
-    config.toolbox = Some(Arc::new(vibe_env::testing::TestToolbox::new(
+    config.toolbox = Some(Arc::new(adjust(vibe_env::testing::TestToolbox::new(
         layout.clone(),
         vec!["sh".into()],
-    )));
+    ))));
     let core = Arc::new(Core::open(config).unwrap());
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
@@ -654,6 +704,136 @@ fn closing_the_toolbox_window_saves_it_unless_another_terminal_holds_it() {
     assert!(out.status.success(), "{out:?}");
     assert!(
         String::from_utf8_lossy(&out.stdout).contains("isn't open: there's nothing to save"),
+        "{out:?}"
+    );
+}
+
+/// The shell writes until the terminal is gone, then the window closes for
+/// real: the failed write is a hangup like the `SIGHUP`, whichever comes
+/// first, and the toolbox is saved all the same (#54).
+#[test]
+fn a_real_close_with_output_running_saves_the_toolbox() {
+    let w = toolbox_world();
+    let size = Size { rows: 24, cols: 80 };
+    for version in 1..=3 {
+        let mut cmd = w.vibe();
+        cmd.arg("toolbox");
+        let mut term = Term::spawn(cmd, size);
+        term.attached();
+        term.type_line("while :; do echo spam; done");
+        term.expect("spam\r\nspam");
+        term.close_window_while_writing();
+        assert_eq!(term.wait(), Some(0), "{}", term.text());
+        assert!(
+            w.layout
+                .linux_dir()
+                .join(format!("template-{version}.img"))
+                .exists(),
+            "round {version}"
+        );
+        let out = w.vibe().args(["toolbox", "status"]).output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(text.starts_with("state     closed\n"), "{text}");
+    }
+}
+
+/// An agent's window closing for real, with output running, is a detach:
+/// exit 0, and the agent goes on.
+#[test]
+fn a_real_close_with_output_running_detaches_from_an_agent() {
+    let w = world();
+    let shim = w.shell();
+    let mut term = w.attach("quiet-amber-otter", Size { rows: 24, cols: 80 });
+    term.attached();
+    term.type_line("while :; do echo spam; done");
+    term.expect("spam\r\nspam");
+    term.close_window_while_writing();
+    assert_eq!(term.wait(), Some(0));
+    wait_until("the detach", || clients(&w) == 0);
+    assert!(alive(shim.pid), "the session goes on");
+}
+
+/// Over SSH a hangup can be the network dropping: it detaches as ever, and
+/// the shell stays open to come back to.
+#[test]
+fn a_hangup_over_ssh_leaves_the_toolbox_open() {
+    let w = toolbox_world();
+    let size = Size { rows: 24, cols: 80 };
+    for (name, value) in [
+        ("SSH_CONNECTION", "192.0.2.1 50000 192.0.2.2 22"),
+        ("SSH_TTY", "/dev/ttys042"),
+    ] {
+        let mut cmd = w.vibe();
+        cmd.arg("toolbox").env(name, value);
+        let mut term = Term::spawn(cmd, size);
+        term.expect("Ctrl-\\ or a dropped connection leaves it open");
+        term.attached();
+        // SAFETY: a signal to the process this test started.
+        unsafe { libc::kill(term.child.id() as libc::pid_t, libc::SIGHUP) };
+        assert_eq!(term.wait(), Some(0), "{}", term.text());
+        assert!(
+            !w.layout.linux_dir().join("template-1.img").exists(),
+            "{name}"
+        );
+        let out = w.vibe().args(["toolbox", "status"]).output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(text.starts_with("state     open"), "{name}: {text}");
+    }
+    let out = w.vibe().args(["toolbox", "close"]).output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+}
+
+/// Closing the window during the boot closes what it was booting, rather
+/// than leave a VM open with nothing attached (#54).
+#[test]
+fn a_hangup_during_the_boot_saves_the_toolbox() {
+    let w = toolbox_world_with(|t| t.with_slow_open(Duration::from_secs(1)));
+    let mut cmd = w.vibe();
+    cmd.arg("toolbox");
+    let mut term = Term::spawn(cmd, Size { rows: 24, cols: 80 });
+    term.expect("Opening the Linux toolbox");
+    // SAFETY: a signal to the process this test started.
+    unsafe { libc::kill(term.child.id() as libc::pid_t, libc::SIGHUP) };
+    assert_eq!(term.wait(), Some(0), "{}", term.text());
+    let out = w.vibe().args(["toolbox", "status"]).output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(text.starts_with("state     closed\n"), "{text}");
+}
+
+/// `vibe toolbox close` with a failed save behind it doesn't say there's
+/// nothing to save: the changes are kept, unsaved.
+#[test]
+fn closing_after_a_failed_save_says_it_failed() {
+    let w = toolbox_world();
+    // Opened with no terminal: the answer's first byte says it's up.
+    let mut open = w
+        .vibe()
+        .args(["rpc"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(
+        open.stdin.as_mut().unwrap(),
+        r#"{{"jsonrpc":"2.0","id":1,"method":"toolbox.open","params":{{}}}}"#
+    )
+    .unwrap();
+    let mut reply = [0u8; 1];
+    open.stdout
+        .as_mut()
+        .unwrap()
+        .read_exact(&mut reply)
+        .unwrap();
+    let _ = open.kill();
+    let _ = open.wait();
+    // The test toolbox can't save with no base image.
+    std::fs::remove_dir_all(w.layout.linux_dir().join("base-1")).unwrap();
+    let out = w.vibe().args(["toolbox", "close"]).output().unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    let out = w.vibe().args(["toolbox", "close"]).output().unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("its last save failed"),
         "{out:?}"
     );
 }

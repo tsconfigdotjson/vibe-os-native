@@ -63,6 +63,8 @@ struct SettingsView: View {
     @AppStorage(SettingsPane.storageKey) private var stored = SettingsPane.projects.rawValue
     /// The sidebar's selection: its own, and mirrored to `stored` both ways.
     @State private var selection: SettingsPane?
+    /// The pane showing. Never none, unlike a `List`'s selection.
+    @State private var shown: SettingsPane
     /// Where each pane is: picking another pane takes it back to its first
     /// level.
     @State private var place = SettingsPlace()
@@ -71,14 +73,16 @@ struct SettingsView: View {
         self.model = model
         self.showing = showing
         let stored = UserDefaults.standard.string(forKey: SettingsPane.storageKey)
-        _selection = State(initialValue: showing ?? stored.flatMap(SettingsPane.init(rawValue:)) ?? .projects)
+        let pane = showing ?? stored.flatMap(SettingsPane.init(rawValue:)) ?? .projects
+        _selection = State(initialValue: pane)
+        _shown = State(initialValue: pane)
     }
 
     var body: some View {
         NavigationSplitView {
             SettingsSidebar(selection: $selection)
         } detail: {
-            switch selection ?? .projects {
+            switch shown {
             case .projects:
                 NavigationStack(path: $place.projects) {
                     ProjectsPane(model: model, host: $place.projectsHost)
@@ -91,10 +95,16 @@ struct SettingsView: View {
             }
         }
         .frame(minWidth: 720, minHeight: 480)
-        .onChange(of: selection) { _, pane in
-            place.picked()
-            // The gallery shows a pane without making it the one kept.
-            if showing == nil, let pane, pane.rawValue != stored { stored = pane.rawValue }
+        .onChange(of: selection) { _, picked in
+            switch sidebarPick(picked, shown: shown) {
+            case .nothing: break
+            case .restore: selection = shown
+            case .show(let pane):
+                shown = pane
+                place.picked()
+                // The gallery shows a pane without making it the one kept.
+                if showing == nil, pane.rawValue != stored { stored = pane.rawValue }
+            }
         }
         // The menu asks for a pane while Settings is open.
         .onChange(of: stored) { _, raw in

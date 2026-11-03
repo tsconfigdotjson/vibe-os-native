@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import Testing
 
@@ -177,24 +178,23 @@ import VibeRPC
         status.newestBase = 1
         status.last?.error = "installing gcloud exited with code 3"
         summary = ToolboxSummary(status)
-        // A vibed too old to count the terminals: as before, and Save &
-        // Close asks first, as one may be attached.
+        // Not counted (a boot, a slow shim, an older vibed): as before.
         #expect(summary.state == "Open: exit the shell to save")
-        #expect(summary.closable && summary.inTerminal)
+        #expect(summary.closable)
         #expect(summary.notes == ["The last rebuild failed: installing gcloud exited with code 3"])
         // Open with no Terminal attached says so, not just "Open" (#54).
         status.clients = 0
         summary = ToolboxSummary(status)
         #expect(summary.state == "Open in the background, no Terminal attached")
-        #expect(summary.closable && !summary.inTerminal)
+        #expect(summary.closable)
         status.clients = 2
         summary = ToolboxSummary(status)
-        #expect(summary.state == "Open in Terminal")
-        #expect(summary.closable && summary.inTerminal)
+        #expect(summary.state == "Attached in Terminal")
+        #expect(summary.closable)
         status.state = .saving
         #expect(ToolboxSummary(status).state == "Saving…")
         #expect(ToolboxSummary(status).working)
-        #expect(!ToolboxSummary(status).closable && !ToolboxSummary(status).inTerminal)
+        #expect(!ToolboxSummary(status).closable)
         // Copy for every agent, not one harness.
         for state in ToolboxState.allCases {
             status.state = state
@@ -214,7 +214,7 @@ import VibeRPC
         place.picked()
         #expect(place.projects.isEmpty)
         #expect(place.projectsHost == "vps" && place.limitsHost == "vps")
-        // Twice, as opening Settings on the pane shown is, is the same.
+        // Twice changes nothing more.
         place.picked()
         #expect(place == {
             var p = SettingsPlace()
@@ -222,6 +222,16 @@ import VibeRPC
             p.limitsHost = "vps"
             return p
         }())
+    }
+
+    /// The sidebar moves only to a pane it's asked for. A `List` clearing
+    /// its selection puts the row back, moves nothing and drops no
+    /// drill-down; the selection coming back to the pane shown does nothing
+    /// (#54).
+    @Test func theSidebarNeverLeavesNoPaneShown() {
+        #expect(sidebarPick("keys", shown: "projects") == .show("keys"))
+        #expect(sidebarPick(String?.none, shown: "projects") == .restore)
+        #expect(sidebarPick("projects", shown: "projects") == .nothing)
     }
 
     @Test func aKeySaysWhenItWasLastUsed() {
@@ -665,30 +675,122 @@ import VibeRPC
     }
 
     /// Save & Close asks vibed to close the toolbox, and shows what it
-    /// says after; a refusal comes back for the pane to show (#54).
+    /// says after (#54).
     @Test func saveAndCloseAsksVibedAndShowsTheResult() async throws {
         let daemon = fakeDaemon()
         daemon.on(ToolboxStatusGet.name) { _ in ["state": "open", "clients": 0] }
         daemon.on(ToolboxClose.name) { _ in
-            ["state": "closed", "template": 2, "home": 2, "clients": 0,
+            ["state": "closed", "template": 2, "home": 2,
              "last": ["action": "shell", "at": "2026-10-30T12:00:00Z", "template": 2, "uncovered": [String]()]
                 as [String: Any]]
         }
         let model = makeModel(daemon)
         await model.refresh()
         #expect(ToolboxSummary(model.toolbox).state == "Open in the background, no Terminal attached")
-        try await model.closeToolbox()
+        #expect(model.toolboxCanOpen)
+        await model.closeToolbox()
         #expect(model.toolbox?.state == .closed)
         #expect(model.toolbox?.template == 2)
+        #expect(!model.toolboxClosing && model.toolboxCloseError == nil)
         #expect(daemon.calls.filter { $0 == ToolboxClose.name }.count == 1)
         #expect(daemon.timeout(of: ToolboxClose.name) == MenuModel.saveTimeout)
+    }
+
+    /// A refusal shows until the toolbox moves on, and the state lives on
+    /// the model, so looking at another pane loses neither (#54).
+    @Test func saveAndCloseSaysWhyItDidntAndForgetsOnceTheToolboxMovesOn() async throws {
+        let state = Box("open")
+        let daemon = fakeDaemon()
+        daemon.on(ToolboxStatusGet.name) { _ in ["state": state.value] }
         daemon.on(ToolboxClose.name) { _ in
             throw VibedClientError.rpc(
                 RPCError(code: RPCErrorCode.conflict.rawValue,
-                         message: "the toolbox is busy updating the template; try again when it's done"))
+                         message: "the toolbox shell didn't exit when asked; exit it in Terminal to save"))
         }
-        await #expect(throws: VibedClientError.self) { try await model.closeToolbox() }
-        #expect(model.toolbox?.state == .closed, "a refusal changes nothing shown")
+        let model = makeModel(daemon)
+        await model.refresh()
+        await model.closeToolbox()
+        #expect(!model.toolboxClosing)
+        #expect(model.toolboxCloseError == "the toolbox shell didn't exit when asked; exit it in Terminal to save")
+        // A poll that finds it still open keeps saying so.
+        await model.refreshToolbox()
+        #expect(model.toolboxCloseError != nil)
+        // The owner exits in Terminal: it's closed, and that's old news.
+        state.value = "closed"
+        await model.refreshToolbox()
+        #expect(model.toolbox?.state == .closed)
+        #expect(model.toolboxCloseError == nil)
+    }
+
+    /// A failed save is the last run, which the pane's notes show: it isn't
+    /// said twice (#54).
+    @Test func aFailedSaveIsntSaidTwice() async throws {
+        let failed = "the toolbox VM stopped before its disks were sealed"
+        let state = Box("open")
+        let daemon = fakeDaemon()
+        daemon.on(ToolboxStatusGet.name) { _ in
+            state.value == "open"
+                ? ["state": "open"]
+                : ["state": "closed",
+                   "last": ["action": "shell", "at": "2026-10-30T12:00:00Z", "uncovered": [String](), "error": failed]
+                       as [String: Any]]
+        }
+        daemon.on(ToolboxClose.name) { _ in
+            state.value = "closed"
+            throw VibedClientError.rpc(RPCError(code: RPCErrorCode.commandFailed.rawValue, message: failed))
+        }
+        let model = makeModel(daemon)
+        await model.refresh()
+        await model.closeToolbox()
+        #expect(model.toolboxCloseError == nil)
+        #expect(ToolboxSummary(model.toolbox).notes == ["The last save failed: \(failed)"])
+    }
+
+    /// A poll that finds nothing new publishes nothing, so it rebuilds no
+    /// view; and with the menu closed, nor do the memory readings, which
+    /// only it shows, and which change every time (#54).
+    @Test func aPollThatFindsNothingNewPublishesNothing() async throws {
+        let reading = Box(1)
+        let state = Box(AgentState.busy)
+        let daemon = fakeDaemon()
+        daemon.on(HostsList.name) { _ in
+            var host = hostJSON("local")
+            host["memory"] = [
+                "total": 64 << 30, "used": reading.value << 30, "swap_total": 4 << 30, "swap_used": reading.value << 20,
+            ]
+            return ["hosts": [host]]
+        }
+        daemon.on(AgentsList.name) { _ in
+            ["agents": [agentJSON("quiet-amber-otter", state: state.value, memoryUsed: reading.value << 20)]]
+        }
+        daemon.on(ToolboxStatusGet.name) { _ in ["state": "closed"] }
+        let model = makeModel(daemon)
+        await model.refresh()
+        let published = Box(0)
+        let watching = model.objectWillChange.sink { published.value += 1 }
+        defer { watching.cancel() }
+
+        await model.refresh()
+        #expect(published.value == 0, "nothing changed")
+        reading.value = 2
+        await model.refresh()
+        #expect(published.value == 0, "only readings changed, and the menu is closed")
+        #expect(model.hosts.first?.memory?.used == 1 << 30)
+
+        // Something real still comes through, readings and all.
+        state.value = .idle
+        await model.refresh()
+        #expect(published.value > 0)
+        #expect(model.agents.first?.state == .idle)
+        #expect(model.agents.first?.memoryUsed == 2 << 20)
+
+        // With the menu open, the readings are what it shows.
+        model.menuIsOpen = true
+        published.value = 0
+        reading.value = 3
+        await model.refresh()
+        #expect(published.value > 0)
+        #expect(model.hosts.first?.memory?.used == 3 << 30)
     }
 
     @Test func rebuildAndTheClaudeLoginRunInTerminal() async throws {

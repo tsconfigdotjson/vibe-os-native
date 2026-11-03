@@ -1432,11 +1432,12 @@ pub struct ToolboxStatus {
     /// The last shell, update or rebuild to finish.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last: Option<ToolboxRun>,
-    /// How many terminals are attached to the open shell: 0 when it's open
-    /// in the background, as after a detach, and whenever it's closed.
-    /// Absent from a `vibed` before it, which reads as 0.
-    #[serde(default)]
-    pub clients: u32,
+    /// How many terminals are attached to the open shell, as its shim says:
+    /// 0 when it's open in the background, as after a detach. Absent when
+    /// that isn't known: it isn't open, its shim isn't up yet or didn't
+    /// answer, or a `vibed` from before this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clients: Option<u32>,
 }
 
 /// How a toolbox run went.

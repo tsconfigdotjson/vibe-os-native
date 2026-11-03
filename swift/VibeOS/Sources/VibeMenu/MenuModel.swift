@@ -30,7 +30,15 @@ public final class MenuModel: ObservableObject {
     @Published public private(set) var unavailableHosts: Set<String> = []
     @Published public private(set) var gh: GhStatus?
     /// This host's Linux toolbox: its versions and what it's doing.
-    @Published public private(set) var toolbox: ToolboxStatus?
+    @Published public private(set) var toolbox: ToolboxStatus? {
+        // What Save & Close last failed at is past once the toolbox moves on.
+        didSet { if toolbox?.state != oldValue?.state { set(\.toolboxCloseError, nil) } }
+    }
+    /// While Save & Close runs: from the click until vibed answers. Kept
+    /// here, not in the pane, so it outlasts a look at another pane.
+    @Published public private(set) var toolboxClosing = false
+    /// Why the last Save & Close didn't save, unless the last run says so.
+    @Published public private(set) var toolboxCloseError: String?
     /// Where this host serves MCP, for the setup command and Settings.
     @Published public private(set) var mcp: McpSettings?
     @Published public private(set) var memory: HostMemory?
@@ -41,9 +49,6 @@ public final class MenuModel: ObservableObject {
     @Published public var message: String?
     /// Bumped by every event about settings, so open settings re-read.
     @Published public private(set) var settingsRevision = 0
-    /// The time rows count elapsed time to, to the second: it moves on
-    /// with each refresh while the menu is open, which alone shows it.
-    @Published public private(set) var now = MenuModel.second(Date())
     /// Refs being attached, so a second click waits for the first.
     @Published public private(set) var attaching: Set<String> = []
     /// How this copy of the app is installed (Install.swift).
@@ -54,12 +59,7 @@ public final class MenuModel: ObservableObject {
 
     /// While the menu is open it polls more often, for memory bars.
     public var menuIsOpen = false {
-        didSet {
-            if menuIsOpen && !oldValue {
-                set(\.now, MenuModel.second(Date()))
-                pollNow()
-            }
-        }
+        didSet { if menuIsOpen && !oldValue { pollNow() } }
     }
 
     public let daemon: any DaemonConnection
@@ -189,10 +189,9 @@ public final class MenuModel: ObservableObject {
     private func refreshOnce() async {
         changedDuringRefresh = []
         defer { changedDuringRefresh = nil }
-        // Only the menu shows these, and they change on every poll: with
-        // it closed, they'd only rebuild Settings for nothing (#54).
+        // Only the menu shows this, and it changes on every poll: with it
+        // closed, it'd only rebuild Settings for nothing (#54).
         if menuIsOpen || memory == nil { set(\.memory, HostMemory.current()) }
-        if menuIsOpen { set(\.now, MenuModel.second(Date())) }
         let hosts: [HostInfo]
         do {
             hosts = try await call(HostsList.self, NoParams()).hosts
@@ -219,8 +218,14 @@ public final class MenuModel: ObservableObject {
             unavailable.insert(host.name)
             agents += self.agents.filter { $0.host == host.name }
         }
-        set(\.hosts, hosts)
-        set(\.agents, agents)
+        // So with the hosts' and agents' memory readings, which only the
+        // menu shows: opening it polls again at once.
+        if menuIsOpen || hosts.map(\.withoutReadings) != self.hosts.map(\.withoutReadings) {
+            set(\.hosts, hosts)
+        }
+        if menuIsOpen || agents.map(\.withoutReadings) != self.agents.map(\.withoutReadings) {
+            set(\.agents, agents)
+        }
         for changed in changedDuringRefresh ?? [] {
             apply(host: changed.host, ref: changed.ref, changed.change)
         }
@@ -240,10 +245,6 @@ public final class MenuModel: ObservableObject {
         if self[keyPath: keyPath] != value { self[keyPath: keyPath] = value }
     }
 
-    /// `date` to the whole second, the finest a row counts time in.
-    nonisolated static func second(_ date: Date) -> Date {
-        Date(timeIntervalSince1970: date.timeIntervalSince1970.rounded(.down))
-    }
 
     /// Opens Terminal on `agent`: raises its tab if it has one, or opens
     /// one running `vibe attach`. A second click while the first is still
@@ -322,7 +323,7 @@ public final class MenuModel: ObservableObject {
     /// Whether Open Shell can open the toolbox now: it's closed, or open
     /// already; an update, a rebuild or a save holds it.
     public var toolboxCanOpen: Bool {
-        toolbox?.state == .closed || toolbox?.state == .open
+        !toolboxClosing && (toolbox?.state == .closed || toolbox?.state == .open)
     }
 
     /// Reads the toolbox's status again, as Settings does while it shows
@@ -334,10 +335,20 @@ public final class MenuModel: ObservableObject {
     /// Settings → Linux Toolbox → Save & Close: hangs up on the open shell,
     /// as closing its Terminal window does, and saves the template and the
     /// Linux home, as exiting does. It waits for the save, which can take
-    /// minutes after a big install; an error says why nothing was kept.
-    public func closeToolbox() async throws {
-        let status = try await call(ToolboxClose.self, NoParams(), timeout: MenuModel.saveTimeout)
-        set(\.toolbox, status)
+    /// minutes after a big install. A click while one runs does nothing.
+    public func closeToolbox() async {
+        guard !toolboxClosing else { return }
+        toolboxClosing = true
+        defer { toolboxClosing = false }
+        set(\.toolboxCloseError, nil)
+        do {
+            set(\.toolbox, try await call(ToolboxClose.self, NoParams(), timeout: MenuModel.saveTimeout))
+        } catch {
+            await refreshToolbox()
+            // A failed save is the last run, which the pane shows already.
+            let why = describe(error)
+            set(\.toolboxCloseError, why == toolbox?.last?.error ? nil : why)
+        }
     }
 
     /// How long Save & Close may take: as long as `vibe toolbox` waits for
@@ -571,6 +582,25 @@ public final class MenuModel: ObservableObject {
 }
 
 /// An error in a sentence for the menu.
+/// What a poll compares of a host while the menu, which alone shows its
+/// memory readings, is closed: they change every time.
+extension HostInfo {
+    fileprivate var withoutReadings: HostInfo {
+        var host = self
+        host.memory?.used = 0
+        host.memory?.swapUsed = 0
+        return host
+    }
+}
+
+extension Agent {
+    fileprivate var withoutReadings: Agent {
+        var agent = self
+        agent.memoryUsed = nil
+        return agent
+    }
+}
+
 public func describe(_ error: any Error) -> String {
     switch error {
     case let error as VibedClientError:

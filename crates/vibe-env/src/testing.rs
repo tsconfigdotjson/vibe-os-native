@@ -401,6 +401,8 @@ pub struct TestToolbox {
     uncovered: Vec<String>,
     outlives_shim: bool,
     discard_takes: Duration,
+    open_takes: Duration,
+    hang_up_fails: bool,
     logins: Vec<vibe_core::rpc::Login>,
     claude: bool,
 }
@@ -414,6 +416,8 @@ impl TestToolbox {
             uncovered: Vec::new(),
             outlives_shim: false,
             discard_takes: Duration::ZERO,
+            open_takes: Duration::ZERO,
+            hang_up_fails: false,
             logins: Vec::new(),
             claude: false,
         }
@@ -431,6 +435,20 @@ impl TestToolbox {
     /// update left can, so tests can catch an open racing it.
     pub fn with_slow_discard(mut self, how_long: Duration) -> TestToolbox {
         self.discard_takes = how_long;
+        self
+    }
+
+    /// Its open takes `how_long`, as a VM's boot does, so tests can catch
+    /// what happens during one.
+    pub fn with_slow_open(mut self, how_long: Duration) -> TestToolbox {
+        self.open_takes = how_long;
+        self
+    }
+
+    /// Hanging up on its shell fails, as a `kill` does in the moment after
+    /// the shell has exited on its own.
+    pub fn with_failing_hang_up(mut self) -> TestToolbox {
+        self.hang_up_fails = true;
         self
     }
 
@@ -499,6 +517,7 @@ impl crate::toolbox::ToolboxHost for TestToolbox {
     }
 
     fn open(&self) -> Result<TerminalEnd> {
+        std::thread::sleep(self.open_takes);
         let dir = self.dir();
         fs::DirBuilder::new()
             .recursive(true)
@@ -527,6 +546,9 @@ impl crate::toolbox::ToolboxHost for TestToolbox {
     fn hang_up(&self, shell_pid: u32) -> Result<()> {
         if !self.is_open() {
             return Err(EnvError::new("no toolbox shell is open"));
+        }
+        if self.hang_up_fails {
+            return Err(EnvError::new("kill: No such process"));
         }
         let group = libc::pid_t::try_from(shell_pid)
             .ok()

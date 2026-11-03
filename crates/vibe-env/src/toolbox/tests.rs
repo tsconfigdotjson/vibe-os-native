@@ -1009,6 +1009,16 @@ fn hanging_up_signals_the_shells_group_in_the_guest() {
         e.contains("hanging up on the toolbox shell exited with code 1"),
         "{e}"
     );
+    // One that runs out of time says so, in the units it has.
+    s.fake.state.lock().unwrap().run_handler = Some(Arc::new(|_, _| proto::Ran {
+        code: None,
+        signal: Some("SIGKILL".into()),
+        timed_out: true,
+        output: String::new(),
+    }));
+    let e = s.toolbox.hang_up(42).unwrap_err().to_string();
+    assert!(e.contains("didn't finish in 5 seconds"), "{e}");
+    s.fake.state.lock().unwrap().run_handler = None;
     // Then the shell exits, and the save goes on as for an exit.
     s.fake.exit(&s.socket(), 129);
     let saved = s.toolbox.close().unwrap();

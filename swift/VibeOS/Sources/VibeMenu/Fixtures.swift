@@ -70,7 +70,7 @@ public final class FixtureDaemon: DaemonConnection, @unchecked Sendable {
         case DoctorCheckGet.name, DoctorFix.name:
             return ["checks": doctor]
         case ToolboxStatusGet.name, ToolboxClose.name:
-            return ["state": "closed", "template": 3, "home": 2, "base": 1, "newest_base": 2, "clients": 0]
+            return ["state": "closed", "template": 3, "home": 2, "base": 1, "newest_base": 2]
         case McpGet.name:
             return [
                 "port": 7878, "tailscale": populated, "url": "http://127.0.0.1:7878/mcp",

@@ -41,7 +41,7 @@ commands:
               its long-lived token in the Keychain, for vibed to hand each VM
   toolbox     open the Linux toolbox shell, where what you install and log in to
               every new linux agent gets; exiting or closing the window saves
-              it, Ctrl-\\ leaves it open
+              it, Ctrl-\\ leaves it open, and so does a dropped SSH connection
   toolbox status   the template and Linux home versions, and the last run
   toolbox update   run toolbox.toml's [update] commands on the template now
   toolbox rebuild  rebuild the template on the newest base image from toolbox.toml

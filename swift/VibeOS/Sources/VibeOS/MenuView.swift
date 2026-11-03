@@ -409,11 +409,17 @@ struct AgentRow: View {
                         Spacer(minLength: 6)
                         if model.attaching.contains(agent.key) {
                             ProgressView().controlSize(.mini)
-                        } else if let age = elapsed(agent, now: model.now) {
-                            Text(age)
-                                .font(.subheadline)
-                                .monospacedDigit()
-                                .foregroundStyle(.secondary)
+                        } else {
+                            // Its own clock: it runs whenever the row shows,
+                            // whatever the model knows of the menu being open.
+                            TimelineView(.periodic(from: .now, by: 1)) { context in
+                                if let age = elapsed(agent, now: context.date) {
+                                    Text(age)
+                                        .font(.subheadline)
+                                        .monospacedDigit()
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
                         }
                     }
                     if let title = lines.title {
@@ -457,7 +463,7 @@ struct AgentRow: View {
             "\(agent.profile) · \(agent.environment.title)\n"
                 + (unavailable ? "\(agent.host) can't be reached. Its agents keep running there." : "Click to open it in Terminal."))
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel(rowAccessibilityLabel(agent, now: model.now, unavailable: unavailable))
+        .accessibilityLabel(rowAccessibilityLabel(agent, now: Date(), unavailable: unavailable))
         .accessibilityHint(unavailable ? "" : "Opens it in Terminal")
         .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
         // The context menu's actions, for VoiceOver, on the same terms.

@@ -54,8 +54,9 @@ const TITLE: &str = "Linux toolbox";
 /// with it.
 const HANGUP_PATIENCE: Duration = Duration::from_secs(15);
 
-/// How long the status's look at the shell's shim may take.
-const CLIENTS_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long a shell whose hang-up failed may take to be seen gone: the
+/// `kill` fails too if the shell had just exited on its own.
+const JUST_EXITED: Duration = Duration::from_secs(2);
 
 /// What `state.json` keeps.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -272,24 +273,19 @@ impl Core {
     /// as every other handler's file work is.
     pub async fn toolbox_status(&self, _: NoParams) -> Result<ToolboxStatus, ErrorObject> {
         let Some(host) = self.toolbox.clone() else {
-            return Ok(self.toolbox_status_of(None, 0));
+            return Ok(self.toolbox_status_of(None, None));
         };
         let versions = blocking(move || Ok(host.versions())).await?.ok();
-        let clients = match self.toolbox_open_socket() {
-            Some(socket) => match sessions::probe(&socket).await {
-                Probe::Running(status) => status.clients.len() as u32,
-                _ => 0,
+        // Only a shim that answers knows: during a boot there's none yet.
+        let open = *lock(&self.toolbox_state) == ToolboxState::Open;
+        let clients = match open {
+            true => match sessions::probe(&self.layout.session_socket(TOOLBOX_REF)).await {
+                Probe::Running(status) => Some(status.clients.len() as u32),
+                _ => None,
             },
-            None => 0,
+            false => None,
         };
         Ok(self.toolbox_status_of(versions, clients))
-    }
-
-    /// The shell's session socket, while the toolbox is said to be open:
-    /// where to count the terminals attached to it.
-    fn toolbox_open_socket(&self) -> Option<PathBuf> {
-        (*lock(&self.toolbox_state) == ToolboxState::Open)
-            .then(|| self.layout.session_socket(TOOLBOX_REF))
     }
 
     /// `toolbox.logins`: what the newest Linux home holds, from the note
@@ -302,22 +298,7 @@ impl Core {
             .map_err(|e| error(ErrorCode::InternalError, e.to_string()))
     }
 
-    /// The status as it is now, without leaving the current thread.
-    pub fn toolbox_status_now(&self) -> ToolboxStatus {
-        let versions = self.toolbox.as_ref().map(|h| h.versions());
-        let clients = self
-            .toolbox_open_socket()
-            .filter(|socket| vibe_core::socket::lock_path(socket).exists())
-            .and_then(|socket| {
-                shim::connect(&socket, &shim::control_hello("vibed"), CLIENTS_TIMEOUT)
-                    .and_then(|mut c| c.status().map_err(Into::into))
-                    .ok()
-            })
-            .map_or(0, |status| status.clients.len() as u32);
-        self.toolbox_status_of(versions, clients)
-    }
-
-    fn toolbox_status_of(&self, versions: Option<Versions>, clients: u32) -> ToolboxStatus {
+    fn toolbox_status_of(&self, versions: Option<Versions>, clients: Option<u32>) -> ToolboxStatus {
         let Some(versions) = versions.filter(|_| self.toolbox.is_some()) else {
             return ToolboxStatus {
                 state: ToolboxState::Unavailable,
@@ -326,7 +307,7 @@ impl Core {
                 base: None,
                 newest_base: None,
                 last: None,
-                clients: 0,
+                clients: None,
             };
         };
         ToolboxStatus {
@@ -531,15 +512,18 @@ impl Core {
             Probe::Running(status) => {
                 let pid = status.child_pid;
                 let h = Arc::clone(&host);
-                blocking(move || h.hang_up(pid))
-                    .await?
-                    .map_err(|e| failed(format!("can't close the toolbox shell: {e}")))?;
-                crate::log!("vibed: hung up on the toolbox shell, to save it");
-                if !shim_gone(&socket, HANGUP_PATIENCE).await {
+                if let Err(e) = blocking(move || h.hang_up(pid)).await? {
+                    // A shell that had just exited can't be hung up on, and
+                    // is saved like one that was.
+                    if !shim_gone(&socket, JUST_EXITED).await {
+                        return Err(failed(format!("can't close the toolbox shell: {e}")));
+                    }
+                } else if !shim_gone(&socket, HANGUP_PATIENCE).await {
                     return Err(conflict(
                         "the toolbox shell didn't exit when asked; exit it in Terminal to save",
                     ));
                 }
+                crate::log!("vibed: the toolbox shell has gone, to be saved");
             }
             Probe::Broken(why) => {
                 return Err(failed(format!(
@@ -615,6 +599,11 @@ impl Core {
             let Ok(_op) = self.toolbox_op.try_lock() else {
                 return;
             };
+            // Saved and closed by `toolbox.close` since the look above: a new
+            // shim here would boot it again.
+            if !host.is_open() {
+                return;
+            }
             let end = {
                 let host = Arc::clone(&host);
                 blocking(move || host.open()).await

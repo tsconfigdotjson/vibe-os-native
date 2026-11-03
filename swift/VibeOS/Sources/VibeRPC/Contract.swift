@@ -1815,7 +1815,8 @@ public struct ToolboxStatus: Codable, Hashable, Sendable {
     /// The last shell, update or rebuild to finish.
     public var last: ToolboxRun?
     /// How many terminals are attached to the open shell: 0 when it's open
-    /// in the background. Nil from a vibed before it, which can't tell.
+    /// in the background. Nil when that isn't known: it isn't open, its shim
+    /// isn't up yet or didn't answer, or a vibed from before this field.
     public var clients: Int?
 
     public enum CodingKeys: String, CodingKey, CaseIterable {

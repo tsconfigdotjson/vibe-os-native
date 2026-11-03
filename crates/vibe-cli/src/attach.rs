@@ -7,11 +7,11 @@
 //! anywhere.
 
 use std::fmt;
-use std::io::{self, Write};
+use std::io;
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -103,7 +103,7 @@ pub(crate) fn window_size() -> Option<Size> {
     }
 }
 
-fn tty_name() -> Option<String> {
+pub(crate) fn tty_name() -> Option<String> {
     // SAFETY: ttyname's buffer is copied at once, while only this thread
     // runs.
     unsafe {
@@ -143,6 +143,9 @@ impl Drop for RawMode {
 /// Where the signal handler sends the signals it catches.
 static SIGNAL_PIPE: AtomicI32 = AtomicI32::new(-1);
 
+/// Whether a hangup has arrived since [`catch_hangup`] or [`catch`].
+static HUNG_UP: AtomicBool = AtomicBool::new(false);
+
 #[cfg(target_os = "linux")]
 fn errno() -> *mut libc::c_int {
     // SAFETY: returns this thread's errno.
@@ -156,6 +159,9 @@ fn errno() -> *mut libc::c_int {
 }
 
 extern "C" fn on_signal(signal: libc::c_int) {
+    if signal == libc::SIGHUP {
+        HUNG_UP.store(true, Ordering::SeqCst);
+    }
     let fd = SIGNAL_PIPE.load(Ordering::Relaxed);
     if fd >= 0 {
         let byte = signal as u8;
@@ -167,6 +173,29 @@ extern "C" fn on_signal(signal: libc::c_int) {
             *errno() = saved;
         }
     }
+}
+
+fn install_handler(signal: libc::c_int) -> io::Result<()> {
+    // SAFETY: the handler only sets a flag and writes to the pipe.
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = on_signal as *const () as libc::sighandler_t;
+        action.sa_flags = libc::SA_RESTART;
+        libc::sigemptyset(&mut action.sa_mask);
+        check(libc::sigaction(signal, &action, std::ptr::null_mut()))?;
+    }
+    Ok(())
+}
+
+/// Notes a hangup from now on, rather than dying of it, for a program with
+/// something to finish before it attaches: [`hung_up`] says if one came.
+pub(crate) fn catch_hangup() -> io::Result<()> {
+    install_handler(libc::SIGHUP)
+}
+
+/// Whether the terminal has hung up since [`catch_hangup`].
+pub(crate) fn hung_up() -> bool {
+    HUNG_UP.load(Ordering::SeqCst)
 }
 
 /// Catches `signals`, which are then read from the returned pipe, a byte
@@ -187,14 +216,7 @@ fn catch(signals: &[libc::c_int]) -> io::Result<std::fs::File> {
     }
     SIGNAL_PIPE.store(fds[1], Ordering::Relaxed);
     for &signal in signals {
-        // SAFETY: the handler only writes to the pipe.
-        unsafe {
-            let mut action: libc::sigaction = std::mem::zeroed();
-            action.sa_sigaction = on_signal as *const () as libc::sighandler_t;
-            action.sa_flags = libc::SA_RESTART;
-            libc::sigemptyset(&mut action.sa_mask);
-            check(libc::sigaction(signal, &action, std::ptr::null_mut()))?;
-        }
+        install_handler(signal)?;
     }
     // SAFETY: pipe made it, and only this owns the read end.
     Ok(unsafe { std::fs::File::from_raw_fd(fds[0]) })
@@ -350,6 +372,50 @@ fn stop(by: u8) {
     let _ = STOPPED_BY.compare_exchange(0, by, Ordering::SeqCst, Ordering::SeqCst);
 }
 
+/// How the attachment ended, its stream having stopped.
+fn stopped() -> End {
+    match STOPPED_BY.load(Ordering::SeqCst) {
+        BY_DETACH => End::Detached,
+        BY_HANGUP => End::HungUp,
+        _ => End::Lost,
+    }
+}
+
+/// The terminal has gone, as its setup or a write to it failing says: a
+/// hangup, whether or not `SIGHUP` has got here yet.
+fn terminal_gone() -> End {
+    stop(BY_HANGUP);
+    stopped()
+}
+
+/// Writes `bytes` to the terminal. Some programs leave it non-blocking,
+/// which isn't its end: this waits for room. Any other error is.
+fn to_terminal(mut bytes: &[u8]) -> io::Result<()> {
+    while !bytes.is_empty() {
+        // SAFETY: writes from bytes, within its length.
+        let n = unsafe { libc::write(libc::STDOUT_FILENO, bytes.as_ptr().cast(), bytes.len()) };
+        if n >= 0 {
+            bytes = &bytes[n as usize..];
+            continue;
+        }
+        let e = io::Error::last_os_error();
+        match e.kind() {
+            io::ErrorKind::Interrupted => {}
+            io::ErrorKind::WouldBlock => {
+                let mut pfd = libc::pollfd {
+                    fd: libc::STDOUT_FILENO,
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+                // SAFETY: pfd is valid for the call.
+                unsafe { libc::poll(&mut pfd, 1, -1) };
+            }
+            _ => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn attach(socket: &Path, agent: &str) -> Result<End, AttachError> {
     if !is_tty(libc::STDIN_FILENO) || !is_tty(libc::STDOUT_FILENO) {
         return Err(AttachError::NotATerminal);
@@ -376,6 +442,10 @@ pub(crate) fn attach_to(found: &SessionAttach) -> Result<End, AttachError> {
         libc::SIGINT,
         libc::SIGQUIT,
     ])?;
+    // One that came before the pipe was there.
+    if hung_up() {
+        return Ok(terminal_gone());
+    }
     let hello = Hello {
         protocol: PROTOCOL,
         role: Role::Attach,
@@ -389,11 +459,13 @@ pub(crate) fn attach_to(found: &SessionAttach) -> Result<End, AttachError> {
     stream.set_read_timeout(None)?;
     stream.set_write_timeout(None)?;
     let writer = Arc::new(Mutex::new(stream.try_clone()?));
-    let raw = RawMode::enter()?;
-
-    let mut stdout = io::stdout().lock();
-    write!(stdout, "\x1b]0;{}\x07", found.title)?;
-    stdout.flush()?;
+    // It was a terminal a moment ago, so if this fails, it's gone.
+    let Ok(raw) = RawMode::enter() else {
+        return Ok(terminal_gone());
+    };
+    if to_terminal(format!("\x1b]0;{}\x07", found.title).as_bytes()).is_err() {
+        return Ok(terminal_gone());
+    }
 
     spawn_keys(stream.try_clone()?, writer.clone());
     spawn_signals(signals, stream.try_clone()?, writer);
@@ -404,20 +476,15 @@ pub(crate) fn attach_to(found: &SessionAttach) -> Result<End, AttachError> {
     let end = loop {
         let frame = match shim::read_frame(&mut reading) {
             Ok(Some(f)) => f,
-            Ok(None) | Err(_) => {
-                break match STOPPED_BY.load(Ordering::SeqCst) {
-                    BY_DETACH => End::Detached,
-                    BY_HANGUP => End::HungUp,
-                    _ => End::Lost,
-                };
-            }
+            Ok(None) | Err(_) => break stopped(),
         };
         match frame.kind {
             FrameKind::Output => {
                 out.clear();
                 filter.feed(&frame.payload, &mut out);
-                stdout.write_all(&out)?;
-                stdout.flush()?;
+                if to_terminal(&out).is_err() {
+                    break terminal_gone();
+                }
             }
             FrameKind::Exit => match frame.decode() {
                 Ok(exit) => break End::Exited(exit),
@@ -439,8 +506,7 @@ pub(crate) fn attach_to(found: &SessionAttach) -> Result<End, AttachError> {
         End::Lost => format!("lost the session {agent}"),
     };
     // After a hangup the terminal is gone; saying goodbye is best effort.
-    let _ = write!(stdout, "{RESET}{leave_alternate}\r\n[{said}]\r\n");
-    let _ = stdout.flush();
+    let _ = to_terminal(format!("{RESET}{leave_alternate}\r\n[{said}]\r\n").as_bytes());
     Ok(end)
 }
 

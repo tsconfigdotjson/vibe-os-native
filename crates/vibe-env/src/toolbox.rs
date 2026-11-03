@@ -768,6 +768,9 @@ impl Toolbox {
             return Ok(ran.output);
         }
         let how = match (ran.timed_out, ran.code, ran.signal) {
+            (true, _, _) if timeout.as_secs() < 60 => {
+                format!("didn't finish in {} seconds", timeout.as_secs())
+            }
             (true, _, _) => format!("didn't finish in {} minutes", timeout.as_secs() / 60),
             (_, Some(code), _) => format!("exited with code {code}"),
             (_, None, Some(signal)) => format!("was ended by {signal}"),

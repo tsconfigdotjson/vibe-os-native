@@ -11,10 +11,6 @@ struct ToolboxPane: View {
     @ObservedObject var model: MenuModel
     @State private var logins: ToolboxLogins?
     @State private var error: String?
-    /// While Save & Close runs: from the click until vibed has saved.
-    @State private var closing = false
-    @State private var closeError: String?
-    @State private var confirmingClose = false
 
     private var available: Bool { model.toolbox?.state != .unavailable }
 
@@ -49,7 +45,7 @@ struct ToolboxPane: View {
         let summary = ToolboxSummary(model.toolbox)
         // vibed says it's saving only once the shell has gone; until then,
         // the click is what's known.
-        let saving = closing && !summary.working
+        let saving = model.toolboxClosing && !summary.working
         return Form {
             Section {
                 LabeledContent("Shell") {
@@ -66,7 +62,7 @@ struct ToolboxPane: View {
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
-                ErrorText(error: closeError)
+                ErrorText(error: model.toolboxCloseError)
             } footer: {
                 Text("A Linux shell in Terminal. What you install or log in to there, every new Linux agent "
                     + "starts with. Exit the shell or close its window to save; Control-\\ leaves it open.")
@@ -80,41 +76,28 @@ struct ToolboxPane: View {
                         .disabled(model.toolbox?.state != .closed)
                         .help("Replays toolbox.toml onto the newest base image, in Terminal")
                     Spacer()
-                    if summary.closable || closing {
-                        Button("Save & Close") {
-                            if summary.inTerminal { confirmingClose = true } else { saveAndClose() }
-                        }
-                        .disabled(closing)
-                        .help("Ends the shell and saves the template and Linux home, as exiting does")
+                    if summary.closable || model.toolboxClosing {
+                        Button("Save & Close", action: saveAndClose)
+                            .disabled(model.toolboxClosing)
+                            .help("Ends the shell and saves the template and Linux home, as exiting does")
                     }
                     Button("Open Shell") { Task { await model.openToolbox() } }
                         .buttonStyle(.borderedProminent)
-                        .disabled(!model.toolboxCanOpen || closing)
+                        .disabled(!model.toolboxCanOpen)
                         .help(summary.closable ? "Shows the shell in Terminal" : "Opens the shell in Terminal")
                 }
             }
         }
         .formStyle(.grouped)
-        .confirmationDialog("Save and close the toolbox?", isPresented: $confirmingClose) {
-            Button("Save & Close") { saveAndClose() }
-        } message: {
-            Text("The shell open in Terminal ends, and what you installed and logged in to is saved for new "
-                + "Linux agents.")
-        }
     }
 
+    /// Always asks: a detached shell is how a long install is left running,
+    /// and what it has done so far would become the new template.
     private func saveAndClose() {
-        closing = true
-        closeError = nil
-        Task {
-            do {
-                try await model.closeToolbox()
-            } catch {
-                closeError = describe(error)
-                await model.refreshToolbox()
-            }
-            closing = false
-        }
+        let detail = "The shell ends, and anything still running in it stops. The template and Linux home are "
+            + "saved as they are now, for new Linux agents."
+        guard confirm("Save and close the toolbox?", detail: detail, action: "Save & Close") else { return }
+        Task { await model.closeToolbox() }
     }
 
     @ViewBuilder private var logInsSection: some View {
