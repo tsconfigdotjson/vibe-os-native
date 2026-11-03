@@ -7,7 +7,7 @@ mod common;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -15,12 +15,13 @@ use common::{Conn, Golden, TestServer, serve};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::watch;
-use vibe_core::model::{AgentState, HostLink};
+use vibe_core::model::{AgentState, EventKind, HostLink};
 use vibe_core::paths::Layout;
 use vibe_core::rpc::{
     AgentStartParams, ErrorCode, HostAddParams, HostParams, KeyCreateParams, KeyParams,
-    MAX_MESSAGE_BYTES,
+    MAX_MESSAGE_BYTES, MemoryUse,
 };
+use vibe_core::units::GIB;
 use vibe_mcp::{Daemon, Input, Target};
 use vibed::core::Core;
 use vibed::link::Timing;
@@ -181,6 +182,11 @@ struct World {
 /// A Mac and, at `me@vps.example.com`, a Linux host with the project
 /// `app`, both running agents under the test backend.
 async fn world() -> World {
+    world_with(|_| {}).await
+}
+
+/// [`world`], with the Linux host's config changed by `change`.
+async fn world_with(change: impl FnOnce(&mut vibed::core::Config)) -> World {
     let wires = Wires::new();
     let mac_world = Golden::new();
     let mut config = mac_world.config();
@@ -196,6 +202,7 @@ async fn world() -> World {
     config.label = "vps-1".into();
     config.layout = Layout::new(&host_world.home, "linux");
     config.toolbox = None;
+    change(&mut config);
     let host = Arc::new(Core::open(config).unwrap());
     let server = serve(
         Arc::clone(&host),
@@ -548,6 +555,70 @@ async fn a_pulled_network_shows_the_host_down_and_it_reconnects() {
     w.wait_link(HostLink::Connected).await;
     let back = w.rpc("projects.list", json!({"host": "vps"})).await;
     assert_eq!(back["result"]["projects"][0]["host"], "vps");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_linux_hosts_memory_comes_with_its_pings_and_is_no_link_event() {
+    // The host's own memory, as its kernel would measure it: 12G, with
+    // `used` moving as the test says.
+    let used = Arc::new(AtomicU64::new(5 * GIB));
+    let measured = Arc::clone(&used);
+    let w = world_with(move |c| {
+        c.memory = Arc::new(move || {
+            Some(MemoryUse {
+                total: 12 * GIB,
+                used: measured.load(Ordering::SeqCst),
+                swap_total: 2 * GIB,
+                swap_used: GIB,
+                pressure: None,
+            })
+        });
+        c.pressure = Arc::new(vibed::pressure::NoPressure);
+    })
+    .await;
+    w.add_host().await;
+    // The Mac's hosts.list carries what the host said as its link came up.
+    let listed = w.rpc("hosts.list", json!({})).await;
+    let vps = listed["result"]["hosts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["name"] == "vps")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        vps["memory"],
+        json!({"total": 12 * GIB, "used": 5 * GIB, "swap_total": 2 * GIB, "swap_used": GIB}),
+        "{vps}"
+    );
+
+    // Only its memory changes: the next ping brings it, and it's no change
+    // of the link, so no host.link event.
+    let (_, mut events) = w.mac.subscribe();
+    used.store(7 * GIB, Ordering::SeqCst);
+    let mut seen = None;
+    for _ in 0..250 {
+        seen = w.link().await.memory.map(|m| m.used);
+        if seen == Some(7 * GIB) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        seen,
+        Some(7 * GIB),
+        "the ping never brought the new reading"
+    );
+    // A few more pings, all the same.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    while let Ok(e) = events.try_recv() {
+        assert_ne!(e.kind, EventKind::HostLink, "{e:?}");
+    }
+
+    // Down, its memory isn't known: nothing stale is shown.
+    w.wires.pull();
+    let down = w.wait_link(HostLink::Down).await;
+    assert_eq!(down.memory, None);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

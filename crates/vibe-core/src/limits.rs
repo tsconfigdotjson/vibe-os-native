@@ -24,6 +24,12 @@ const MAX_DURATION: u64 = 365 * 24 * 3600;
 /// in `host.toml` they're written like `"4G"` and `"60s"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostLimits {
+    /// Retired (#47): memory is never kept back from agents now. On the
+    /// socket it's always 0, so a `vibed` from before #47 still reads these
+    /// limits from a newer host; whatever comes in is ignored. Not in
+    /// `host.toml`.
+    #[serde(default)]
+    pub reserve_memory: Retired,
     /// Cores always left for macOS and `vibed`.
     pub reserve_cores: u32,
     pub max_awake_agents: u32,
@@ -57,6 +63,23 @@ pub struct HostLimits {
     pub mcp_tailscale: bool,
 }
 
+/// A setting that no longer means anything: written as 0, and read as
+/// anything at all, or nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Retired;
+
+impl Serialize for Retired {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_u64(0)
+    }
+}
+
+impl<'de> Deserialize<'de> for Retired {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Retired, D::Error> {
+        serde::de::IgnoredAny::deserialize(d).map(|_| Retired)
+    }
+}
+
 fn yes() -> bool {
     true
 }
@@ -86,6 +109,7 @@ const RETIRED: [&str; 1] = ["reserve_memory"];
 impl Default for HostLimits {
     fn default() -> Self {
         HostLimits {
+            reserve_memory: Retired,
             reserve_cores: 2,
             max_awake_agents: 16,
             cpu_cores: 4,
@@ -500,6 +524,25 @@ package_caches   = true    # linux agents share npm, pnpm, cargo and pip caches
         let (_d, path) = file(prd);
         assert_eq!(load(&path).unwrap(), HostLimits::default());
         assert_eq!(HostLimits::keys().count(), 9);
+    }
+
+    #[test]
+    fn a_retired_reserve_memory_is_0_on_the_socket_and_ignored_when_read() {
+        // For a vibed from before #47, which can't read limits without it.
+        let json = serde_json::to_value(HostLimits::default()).unwrap();
+        assert_eq!(json["reserve_memory"], 0);
+        let mut back = json.clone();
+        back["reserve_memory"] = serde_json::json!(4u64 << 30);
+        assert_eq!(
+            serde_json::from_value::<HostLimits>(back).unwrap(),
+            HostLimits::default()
+        );
+        let mut without = json;
+        without.as_object_mut().unwrap().remove("reserve_memory");
+        assert_eq!(
+            serde_json::from_value::<HostLimits>(without).unwrap(),
+            HostLimits::default()
+        );
     }
 
     #[test]

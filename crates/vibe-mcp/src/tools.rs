@@ -631,7 +631,8 @@ impl<D: Daemon> Server<D> {
         let list: Vec<Value> = agents.iter().map(agent_json).collect();
         let memory: Vec<(String, MemoryUse)> = self
             .daemon
-            .memory()
+            .memory(c)
+            .await
             .into_iter()
             .filter(|(h, _)| only.as_ref().is_none_or(|o| o == h))
             .collect();

@@ -322,6 +322,17 @@ async fn open_host(
         config.label = "vps-1".into();
         config.layout = Layout::new(&host_world.home, "linux");
         config.toolbox = None;
+        // Its own memory, unlike the golden Mac's, and nothing short.
+        config.memory = Arc::new(|| {
+            Some(vibe_core::rpc::MemoryUse {
+                total: 16 << 30,
+                used: 4 << 30,
+                swap_total: 0,
+                swap_used: 0,
+                pressure: None,
+            })
+        });
+        config.pressure = Arc::new(vibed::pressure::NoPressure);
         // Its own keys aren't the Mac's.
         config.entropy = Arc::new(vibe_core::keys::random_bytes);
         config.external = external.clone();
@@ -701,6 +712,18 @@ async fn one_url_and_one_key_reach_agents_on_the_host_and_the_mac() {
         "{listed}"
     );
     assert!(!listed.contains("unavailable"), "{listed}");
+    // Each host's memory: the host's own, and the Mac's, down the tunnel.
+    assert!(
+        listed.contains("\nlocal: 4G of 16G memory in use\n"),
+        "{listed}"
+    );
+    assert!(
+        listed.contains(
+            "\nmac: 58G of 64G memory in use, 3G of 4G swap. Short of memory: macOS warns of \
+             memory pressure"
+        ),
+        "{listed}"
+    );
     for agent in ["on-vps", "mac:on-mac"] {
         let waited = c
             .call("vibe_wait", json!({"agents": agent, "timeout": 60}))
@@ -748,6 +771,8 @@ async fn one_url_and_one_key_reach_agents_on_the_host_and_the_mac() {
         .find(|l| l.starts_with("mac:on-mac"))
         .unwrap();
     assert!(mac_line.contains("unavailable"), "{listed}");
+    // The Mac's memory isn't known while it's away.
+    assert!(!listed.contains("\nmac: "), "{listed}");
     let failed = c
         .fails(
             "vibe_send",
@@ -832,6 +857,10 @@ async fn the_mac_checks_every_key_itself() {
         .unwrap()
         .secret;
     let mut c = w.client(&own);
+    // Nor does it tell such a key its memory.
+    let listed = c.call("vibe_list_agents", json!({})).await;
+    assert!(listed.contains("\nlocal: "), "{listed}");
+    assert!(!listed.contains("\nmac: "), "{listed}");
     let projects = c.call("vibe_list_projects", json!({})).await;
     assert!(projects.contains("app (on local)"), "{projects}");
     assert!(!projects.contains("app (on mac)"), "{projects}");
@@ -905,6 +934,16 @@ async fn the_mac_checks_every_key_itself() {
     assert_eq!(r["result"]["agents"], json!([]), "{r}");
     let r = ask(call(&key, "agents.list", json!({"host": "local"}))).await;
     assert!(r["result"].is_object(), "{r}");
+    // hosts.list there is the Mac's own row alone, for its memory: never
+    // the hosts linked to it, or their addresses.
+    let r = ask(call(&key, "hosts.list", json!({}))).await;
+    let hosts = r["result"]["hosts"].as_array().unwrap();
+    assert_eq!(hosts.len(), 1, "{r}");
+    assert_eq!(hosts[0]["name"], "local", "{r}");
+    assert_eq!(hosts[0]["memory"]["total"], 64u64 << 30, "{r}");
+    assert!(!r.to_string().contains("vps.example.com"), "{r}");
+    let r = ask(call(&own, "hosts.list", json!({}))).await;
+    assert_eq!(r["error"]["code"], ErrorCode::Unauthorized.code(), "{r}");
     // Revoked on the Mac, refused by the Mac, even before any host hears.
     w.mac
         .revoke_key(KeyParams {

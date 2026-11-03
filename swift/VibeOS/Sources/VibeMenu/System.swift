@@ -38,13 +38,17 @@ public struct HostMemory: Equatable, Sendable {
         self.total = total
     }
 
+    /// The host port, got once: each `mach_host_self()` adds a reference
+    /// to it that's never given back.
+    private static let hostPort = mach_host_self()
+
     public static func current() -> HostMemory? {
         var stats = vm_statistics64()
         var count = mach_msg_type_number_t(
             MemoryLayout<vm_statistics64_data_t>.size / MemoryLayout<integer_t>.size)
         let result = withUnsafeMutablePointer(to: &stats) {
             $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
-                host_statistics64(mach_host_self(), HOST_VM_INFO64, $0, &count)
+                host_statistics64(hostPort, HOST_VM_INFO64, $0, &count)
             }
         }
         guard result == KERN_SUCCESS else { return nil }

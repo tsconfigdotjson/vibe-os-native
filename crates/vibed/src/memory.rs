@@ -99,6 +99,14 @@ mod platform {
         fn mach_host_self() -> libc::mach_port_t;
     }
 
+    /// The host port, got once: each `mach_host_self` adds a reference to
+    /// it that's never given back.
+    fn host_port() -> libc::mach_port_t {
+        static PORT: std::sync::OnceLock<libc::mach_port_t> = std::sync::OnceLock::new();
+        // SAFETY: mach_host_self has no preconditions.
+        *PORT.get_or_init(|| unsafe { mach_host_self() })
+    }
+
     /// As Activity Monitor counts it, and as the menu did before vibed
     /// reported it: app memory (internal pages, less purgeable ones), wired
     /// and compressed.
@@ -109,7 +117,7 @@ mod platform {
         // SAFETY: a vm_statistics64 to fill, with its size in natural_t's.
         let rc = unsafe {
             libc::host_statistics64(
-                mach_host_self(),
+                host_port(),
                 libc::HOST_VM_INFO64,
                 (&raw mut stats).cast(),
                 &mut count,

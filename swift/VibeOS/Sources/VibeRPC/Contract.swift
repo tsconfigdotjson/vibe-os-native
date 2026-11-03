@@ -1179,6 +1179,9 @@ public struct ProfileParams: Codable, Hashable, Sendable {
 
 /// Host-wide limits. Sizes are bytes; `idleDebounce` is seconds.
 public struct HostLimits: Codable, Hashable, Sendable {
+    /// Retired: memory is never kept back from agents. Always 0, for an
+    /// older vibed; nothing reads it.
+    public var reserveMemory: Int?
     public var reserveCores: Int
     public var maxAwakeAgents: Int
     public var cpuCores: Int
@@ -1190,6 +1193,7 @@ public struct HostLimits: Codable, Hashable, Sendable {
     public var snapshotDisk: Int
 
     public enum CodingKeys: String, CodingKey, CaseIterable {
+        case reserveMemory = "reserve_memory"
         case reserveCores = "reserve_cores"
         case maxAwakeAgents = "max_awake_agents"
         case cpuCores = "cpu_cores"

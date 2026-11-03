@@ -307,7 +307,7 @@ struct ProjectDetail: View {
                 } header: {
                     Text("Profiles")
                 } footer: {
-                    Text("Click a profile to change it. Memory is each agent's ceiling: a Linux VM's RAM, or a macOS agent's hard limit. Nothing is set aside up front.")
+                    Text("Click a profile to change it. Memory is each agent's ceiling: a Linux VM's RAM on the Mac, its cgroup's limit on a Linux host, or a macOS agent's hard limit. Nothing is set aside up front.")
                         .foregroundStyle(.secondary)
                 }
                 Section {
@@ -1262,7 +1262,7 @@ struct LimitsPane: View {
 
     static let groups: [FieldGroup] = [
         FieldGroup(
-            title: "CPU and processes",
+            title: "Agents and CPU",
             fields: [
                 Field(key: "reserve_cores", label: "Cores kept for macOS", kind: .count,
                       value: \.reserveCores, set: \.reserveCores),

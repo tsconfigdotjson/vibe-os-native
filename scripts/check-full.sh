@@ -539,7 +539,7 @@ s_agents() {
   # and waits for the answer until it's hung up.
   export VIBE_TEST_BACKEND="$ROOT/crates/vibe-env/src/stand-in.sh"
   start_vibed "$socket" "$WORK/ag-vibed-1.log"
-  # 1G agents and nothing kept back, so one fits on any machine.
+  # A 1G agent: its memory is only its ceiling, so nothing is set aside.
   out=$(rpc \
     "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"projects.add\",\"params\":{\"path\":\"$repo\"}}" \
     '{"jsonrpc":"2.0","id":2,"method":"profiles.update","params":{"project":"app","profile":"software-eng-linux","memory":1073741824}}' \

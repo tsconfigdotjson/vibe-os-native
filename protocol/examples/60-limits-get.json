@@ -1,10 +1,11 @@
 {
-  "description": "Host limits: ~/.config/vibeos/host.toml over the defaults. Sizes are bytes, idle_debounce is seconds.",
+  "description": "Host limits: ~/.config/vibeos/host.toml over the defaults. Sizes are bytes, idle_debounce is seconds. `reserve_memory` is retired (#47): always 0, for a vibed from before it, and ignored when read; memory is never kept back from agents.",
   "request": {"jsonrpc": "2.0", "id": 60, "method": "limits.get", "params": {"host": "local"}},
   "response": {
     "jsonrpc": "2.0",
     "id": 60,
     "result": {
+      "reserve_memory": 0,
       "reserve_cores": 2,
       "max_awake_agents": 16,
       "cpu_cores": 4,

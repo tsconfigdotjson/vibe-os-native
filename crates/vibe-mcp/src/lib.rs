@@ -175,9 +175,13 @@ pub trait Daemon: Send + Sync + 'static {
     fn hosts(&self) -> impl Future<Output = Result<Vec<String>, Error>> + Send;
 
     /// Each host's memory as its kernel measures it, where it's known
-    /// (`HostInfo.memory`), by host.
-    fn memory(&self) -> Vec<(String, vibe_core::rpc::MemoryUse)> {
-        Vec::new()
+    /// (`HostInfo.memory`), by host: every host [`Daemon::hosts`] names,
+    /// the Mac behind this one included, as `c` may see it.
+    fn memory(
+        &self,
+        _c: &Caller,
+    ) -> impl Future<Output = Vec<(String, vibe_core::rpc::MemoryUse)>> + Send {
+        async { Vec::new() }
     }
 
     fn projects(

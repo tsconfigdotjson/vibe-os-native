@@ -789,7 +789,8 @@ pub struct MemoryUse {
     pub swap_total: u64,
     pub swap_used: u64,
     /// While the host is short of memory, as its kernel says (macOS's
-    /// memory pressure at critical, Linux's pressure stall information),
+    /// memory pressure at warn or critical; Linux's pressure stall
+    /// information past its marks, or under 5% free where it has none),
     /// why. A warning only: no start or wake is refused for it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pressure: Option<String>,
@@ -828,8 +829,11 @@ impl Method for TunnelCall {
     type Result = Value;
 }
 
-/// The calls the tunnel takes, each for this Mac's own agents only.
+/// The calls the tunnel takes, each for this Mac's own agents only; and
+/// `hosts.list`, answered with this Mac's own row alone, for its memory in
+/// `vibe_list_agents`.
 pub const TUNNEL_METHODS: &[&str] = &[
+    "hosts.list",
     "projects.list",
     "agents.list",
     "agents.start",

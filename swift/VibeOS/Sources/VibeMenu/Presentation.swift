@@ -1050,13 +1050,17 @@ public func headerAlerts(gh: GhStatus?, hosts: [HostInfo]) -> [HeaderAlert] {
     return alerts
 }
 
-/// A host's memory in a few words: `58G of 64G`, and its swap while any is
-/// used: `58G of 64G · 3G swap`.
+/// A host's memory in a few words: `58G of 64G`, and its swap once there's
+/// enough of it to matter: `58G of 64G · 3G swap`. A Mac nearly always has
+/// a few MB swapped, which isn't worth the words.
 public func memorySummary(_ memory: MemoryUse) -> String {
     var text = "\(formatBytes(memory.used)) of \(formatBytes(memory.total))"
-    if memory.swapUsed > 0 { text += " · \(formatBytes(memory.swapUsed)) swap" }
+    if memory.swapUsed >= swapWorthShowing { text += " · \(formatBytes(memory.swapUsed)) swap" }
     return text
 }
+
+/// The swap in use past which the header mentions it.
+public let swapWorthShowing = 1 << 30
 
 /// Every steady fact the header can show, in order: memory, `gh`, MCP, then
 /// each Linux host. The Mac's memory is what vibed measures, or the app's

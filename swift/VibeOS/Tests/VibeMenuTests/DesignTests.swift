@@ -780,6 +780,9 @@ typealias StepStatus = SetupProgress.Step.Status
         // No alert while there's no pressure, however full: memory is each
         // agent's ceiling, and the host swaps.
         #expect(headerAlerts(gh: nil, hosts: [mac, vps]).isEmpty)
+        // A little swap, as a Mac nearly always has, isn't worth the words.
+        #expect(memorySummary(MemoryUse(total: 16 << 30, used: 9 << 30, swapTotal: 1 << 30, swapUsed: 12 << 20)) == "9G of 16G")
+        #expect(memorySummary(MemoryUse(total: 16 << 30, used: 9 << 30, swapTotal: 2 << 30, swapUsed: 1 << 30)) == "9G of 16G · 1G swap")
 
         // Short of memory: a warning, never a block, with the kernel's
         // words for a tooltip.
