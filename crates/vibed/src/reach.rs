@@ -23,9 +23,6 @@ pub const LOCAL_NETWORK_SETTINGS: &str =
 /// How long each address has to answer, and the name to resolve.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The most addresses tried.
-const MOST_ADDRESSES: usize = 4;
-
 /// How one of a server's addresses answered a connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Answer {
@@ -109,8 +106,14 @@ pub async fn try_addresses(target: &Target) -> Vec<Tried> {
         Ok(Ok(found)) => found.collect(),
         _ => return Vec::new(),
     };
-    addresses.dedup();
-    addresses.truncate(MOST_ADDRESSES);
+    // One of each family: each try is a connection the server counts, as
+    // one limiting how often a client may connect does.
+    let mut seen = Vec::new();
+    addresses.retain(|a| {
+        let fresh = !seen.contains(&a.is_ipv4());
+        seen.push(a.is_ipv4());
+        fresh
+    });
     // Together, each bounded by its timeout; kept in the resolver's order.
     let mut set = tokio::task::JoinSet::new();
     for (i, address) in addresses.into_iter().enumerate() {
@@ -166,8 +169,20 @@ pub fn explain(address: &str, target: &Target, tried: &[Tried], mac: bool) -> Op
     {
         return Some(local_network_off(address, t.ip));
     }
-    // The address that says what's wrong: one that has a route from here.
-    let telling = tried.iter().find(|t| t.answer != Answer::NoRoute)?;
+    // The address that says most: a refusal (a server there, turning this
+    // Mac away) over no answer, over the rest.
+    let rank = |a: &Answer| match a {
+        Answer::Refused => 0,
+        Answer::Down => 1,
+        Answer::TimedOut => 2,
+        Answer::NotAllowed => 3,
+        Answer::Other(_) => 4,
+        Answer::Connected | Answer::NoRoute => 5,
+    };
+    let telling = tried
+        .iter()
+        .filter(|t| t.answer != Answer::NoRoute)
+        .min_by_key(|t| rank(&t.answer))?;
     let at = at(telling.ip);
     let (what, hint) = match &telling.answer {
         Answer::Refused => (
@@ -213,7 +228,8 @@ pub fn explain(address: &str, target: &Target, tried: &[Tried], mac: bool) -> Op
 pub fn local_network_off(address: &str, ip: IpAddr) -> String {
     format!(
         "Local Network access is off for VibeOS, so it can't connect to {address} ({ip}) on your \
-         local network. Turn it on in {LOCAL_NETWORK_SETTINGS}, then try again."
+         local network. Turn it on in {LOCAL_NETWORK_SETTINGS}, then try again. (If it's on \
+         already, the server may be off or asleep.)"
     )
 }
 
@@ -280,7 +296,10 @@ pub fn local_networks() -> Vec<(IpAddr, IpAddr)> {
             if !wanted || i.ifa_addr.is_null() || i.ifa_netmask.is_null() {
                 continue;
             }
-            if let (Some(addr), Some(mask)) = (ip_of(i.ifa_addr), ip_of(i.ifa_netmask)) {
+            let family = i32::from((*i.ifa_addr).sa_family);
+            if let (Some(addr), Some(mask)) =
+                (ip_of(i.ifa_addr, family), ip_of(i.ifa_netmask, family))
+            {
                 found.push((addr, mask));
             }
         }
@@ -289,27 +308,39 @@ pub fn local_networks() -> Vec<(IpAddr, IpAddr)> {
     found
 }
 
-/// The address in `sa`, an IPv4 or IPv6 one.
+/// The address in `sa`, read as one of `family` (`AF_INET` or `AF_INET6`).
+///
+/// On a Mac a netmask's sockaddr is cut short after its last non-zero byte,
+/// its length (`sa_len`) saying so, and its family may be left out: so the
+/// family is the address's, only the bytes it has are read, and the rest
+/// are zero. Bytes are copied, as such a sockaddr needn't be aligned.
 ///
 /// # Safety
-/// `sa` points to a valid sockaddr of the size its family says.
-unsafe fn ip_of(sa: *const libc::sockaddr) -> Option<IpAddr> {
-    // SAFETY: the caller's; the family says which type to read it as.
+/// `sa` points to a sockaddr from getifaddrs, at least `sa_len` bytes long
+/// on a Mac, and a whole one of its family elsewhere.
+unsafe fn ip_of(sa: *const libc::sockaddr, family: i32) -> Option<IpAddr> {
+    let (offset, len) = match family {
+        libc::AF_INET => (std::mem::offset_of!(libc::sockaddr_in, sin_addr), 4),
+        libc::AF_INET6 => (std::mem::offset_of!(libc::sockaddr_in6, sin6_addr), 16),
+        _ => return None,
+    };
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    // SAFETY: the caller's; sa_len is its first byte.
+    let have = usize::from(unsafe { (*sa).sa_len })
+        .saturating_sub(offset)
+        .min(len);
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    let have = len;
+    let mut bytes = [0u8; 16];
+    // SAFETY: `have` bytes from `offset` are inside the sockaddr.
     unsafe {
-        match i32::from((*sa).sa_family) {
-            libc::AF_INET => {
-                let sin = &*(sa.cast::<libc::sockaddr_in>());
-                Some(IpAddr::V4(Ipv4Addr::from(u32::from_be(
-                    sin.sin_addr.s_addr,
-                ))))
-            }
-            libc::AF_INET6 => {
-                let sin6 = &*(sa.cast::<libc::sockaddr_in6>());
-                Some(IpAddr::V6(Ipv6Addr::from(sin6.sin6_addr.s6_addr)))
-            }
-            _ => None,
-        }
+        std::ptr::copy_nonoverlapping(sa.cast::<u8>().add(offset), bytes.as_mut_ptr(), have);
     }
+    Some(if len == 4 {
+        IpAddr::V4(Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3]))
+    } else {
+        IpAddr::V6(Ipv6Addr::from(bytes))
+    })
 }
 
 #[cfg(test)]
@@ -418,7 +449,8 @@ mod tests {
             m,
             "Local Network access is off for VibeOS, so it can't connect to me@nas \
              (192.168.2.20) on your local network. Turn it on in System Settings > Privacy & \
-             Security > Local Network > VibeOS, then try again."
+             Security > Local Network > VibeOS, then try again. (If it's on already, the server \
+             may be off or asleep.)"
         );
         // Off a Mac there's no such thing; nor for an address out there.
         assert_eq!(
@@ -439,6 +471,47 @@ mod tests {
             ),
             None
         );
+    }
+
+    /// IPv6 dropped by a firewall doesn't hide IPv4's refusal: the sign of
+    /// a server limiting how often a client connects.
+    #[test]
+    fn a_refusal_says_more_than_no_answer() {
+        let m = explain(
+            "me@vps",
+            &vps(),
+            &[
+                tried("2001:db8::1", false, Answer::TimedOut),
+                tried("54.39.97.232", false, Answer::Refused),
+            ],
+            true,
+        )
+        .unwrap();
+        assert!(
+            m.starts_with(
+                "can't reach me@vps over SSH: vps.example.com (54.39.97.232) refused the connection"
+            ),
+            "{m}"
+        );
+    }
+
+    /// A Mac's netmask sockaddr is cut short after its last non-zero byte.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_short_netmask_reads_as_zeros_after_its_end() {
+        // fe80::/64's mask: 8 bytes of address, cut after them.
+        let mut raw = [0xAAu8; std::mem::size_of::<libc::sockaddr_in6>()];
+        let offset = std::mem::offset_of!(libc::sockaddr_in6, sin6_addr);
+        raw[0] = (offset + 8) as u8;
+        raw[offset..offset + 8].fill(0xff);
+        let mask = unsafe { ip_of(raw.as_ptr().cast(), libc::AF_INET6) };
+        assert_eq!(mask, Some(ip("ffff:ffff:ffff:ffff::")));
+        // A /24 cut after three bytes.
+        let mut raw = [0xAAu8; std::mem::size_of::<libc::sockaddr_in>()];
+        raw[0] = 7;
+        raw[4..7].fill(0xff);
+        let mask = unsafe { ip_of(raw.as_ptr().cast(), libc::AF_INET) };
+        assert_eq!(mask, Some(ip("255.255.255.0")));
     }
 
     #[test]

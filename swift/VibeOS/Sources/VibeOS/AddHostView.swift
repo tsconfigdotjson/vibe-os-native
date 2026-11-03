@@ -62,6 +62,8 @@ struct AddHostView: View {
         .frame(width: 480)
         // Escape closes it in either state; Return is Add Host, or Done.
         .onExitCommand { close() }
+        // However it's closed, a wait for Local Network access ends with it.
+        .onDisappear { reset() }
     }
 
     private var form: some View {
@@ -130,12 +132,14 @@ struct AddHostView: View {
         }
     }
 
+    /// Starts adding, once: Return and a click together start one add.
     private func start() {
+        guard canAdd else { return }
+        installing = true
         adding = Task { await add() }
     }
 
     private func add() async {
-        guard canAdd else { return }
         let mine = opening
         installing = true
         do {
@@ -151,13 +155,17 @@ struct AddHostView: View {
     }
 
     private func close() {
-        // Waiting for Local Network access ends; an install under way in
-        // vibed carries on.
+        reset()
+        dismissWindow(id: WindowID.addHost)
+    }
+
+    /// Back to an empty form. Waiting for Local Network access ends; an
+    /// install under way in vibed carries on.
+    private func reset() {
         adding?.cancel()
         adding = nil
         opening += 1
         installing = false
-        dismissWindow(id: WindowID.addHost)
         name = ""
         address = ""
         lastSuggestion = ""

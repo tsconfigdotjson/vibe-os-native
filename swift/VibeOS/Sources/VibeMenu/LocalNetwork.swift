@@ -67,11 +67,13 @@ public enum LocalNetwork {
     }
 
     /// Where `ssh` (at `ssh`) connects for `destination`, from its config.
-    public static func target(destination: String, ssh: String = "/usr/bin/ssh") async -> Target? {
+    public static func target(destination: String, ssh: String = "/usr/bin/ssh", config: String? = nil) async
+        -> Target?
+    {
         await Task.detached {
             let process = Process()
             process.executableURL = URL(fileURLWithPath: ssh)
-            process.arguments = ["-G", "--", destination]
+            process.arguments = (config.map { ["-F", $0] } ?? []) + ["-G", "--", destination]
             let out = Pipe()
             process.standardOutput = out
             process.standardError = FileHandle.nullDevice
@@ -147,7 +149,8 @@ public enum LocalNetwork {
             let flags = Int32(i.pointee.ifa_flags)
             guard flags & IFF_UP != 0, flags & IFF_BROADCAST != 0,
                 flags & (IFF_LOOPBACK | IFF_POINTOPOINT) == 0,
-                let address = bytes(of: i.pointee.ifa_addr), let mask = bytes(of: i.pointee.ifa_netmask),
+                let addr = i.pointee.ifa_addr, let address = bytes(of: addr),
+                let mask = bytes(of: i.pointee.ifa_netmask, family: Int32(addr.pointee.sa_family)),
                 address.count == mask.count
             else { continue }
             found.append((address, mask))
@@ -155,20 +158,27 @@ public enum LocalNetwork {
         return found
     }
 
-    private static func bytes(of sa: UnsafeMutablePointer<sockaddr>?) -> [UInt8]? {
+    /// The address in `sa`, read as one of `family` (its own unless given).
+    /// A netmask's sockaddr is cut short after its last non-zero byte, its
+    /// `sa_len` saying so, and may lack its family: only the bytes it has
+    /// are read, and the rest are zero.
+    static func bytes(of sa: UnsafeMutablePointer<sockaddr>?, family: Int32? = nil) -> [UInt8]? {
         guard let sa else { return nil }
-        switch Int32(sa.pointee.sa_family) {
+        let offset: Int
+        let count: Int
+        switch family ?? Int32(sa.pointee.sa_family) {
         case AF_INET:
-            return sa.withMemoryRebound(to: sockaddr_in.self, capacity: 1) {
-                withUnsafeBytes(of: $0.pointee.sin_addr) { Array($0) }
-            }
+            offset = MemoryLayout<sockaddr_in>.offset(of: \sockaddr_in.sin_addr)!
+            count = 4
         case AF_INET6:
-            return sa.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) {
-                withUnsafeBytes(of: $0.pointee.sin6_addr) { Array($0) }
-            }
+            offset = MemoryLayout<sockaddr_in6>.offset(of: \sockaddr_in6.sin6_addr)!
+            count = 16
         default:
             return nil
         }
+        let have = max(0, min(Int(sa.pointee.sa_len) - offset, count))
+        let raw = UnsafeRawPointer(sa)
+        return (0..<count).map { $0 < have ? raw.load(fromByteOffset: offset + $0, as: UInt8.self) : 0 }
     }
 }
 
@@ -200,19 +210,27 @@ public protocol LocalNetworkGate: Sendable {
 /// connection, which waits for access to be allowed (TN3179).
 public struct SystemLocalNetworkGate: LocalNetworkGate {
     public var ssh: String
+    /// The ssh config to read, if not the user's (for tests).
+    public var config: String?
     /// How long adding waits for access to be turned on.
     public var patience: TimeInterval
     /// How long a host that doesn't answer is given.
     public var answerWithin: TimeInterval
 
-    public init(ssh: String = "/usr/bin/ssh", patience: TimeInterval = 180, answerWithin: TimeInterval = 10) {
+    /// `answerWithin` is long enough for the owner to answer macOS's
+    /// request, should the connection wait for it unrefused.
+    public init(
+        ssh: String = "/usr/bin/ssh", config: String? = nil, patience: TimeInterval = 180,
+        answerWithin: TimeInterval = 20
+    ) {
         self.ssh = ssh
+        self.config = config
         self.patience = patience
         self.answerWithin = answerWithin
     }
 
     public func prepare(_ destination: String, off: @escaping @Sendable () -> Void) async -> LocalNetworkAccess {
-        guard let target = await LocalNetwork.target(destination: destination, ssh: ssh),
+        guard let target = await LocalNetwork.target(destination: destination, ssh: ssh, config: config),
             await Task.detached(operation: { LocalNetwork.isLocal(host: target.host) }).value
         else { return .notNeeded }
         return await connect(to: target, off: off)

@@ -467,6 +467,12 @@ async fn session(core: &Weak<Core>, link: &Arc<Link>, timing: Timing) -> Result<
             }
             // A ping unanswered for `ping_timeout` ends it, then and there.
             () = overdue(waiting.map(|(_, since)| since + timing.ping_timeout)) => {
+                // The connection under it is likely gone, as from a pulled
+                // network: the next dial starts a new one rather than wait
+                // for ssh's keepalives to give up on the shared one.
+                if let Some(c) = core.upgrade() {
+                    c.remote.drop_shared(&link.address);
+                }
                 return Err(format!(
                     "it stopped answering (no answer for {} s)",
                     timing.ping_timeout.as_secs()
@@ -500,14 +506,15 @@ async fn overdue(at: Option<Instant>) {
 /// Dials the host and opens the session: hello, its report, the event
 /// subscription. Then the link is up.
 async fn opening(core: &Arc<Core>, link: &Arc<Link>, timing: Timing) -> Result<Channel, String> {
-    let mut channel = tokio::time::timeout(timing.connect_timeout, core.remote.dial(&link.address))
-        .await
-        .map_err(|_| {
-            format!(
-                "ssh didn't connect in {} s",
-                timing.connect_timeout.as_secs()
-            )
-        })??;
+    let mut channel =
+        tokio::time::timeout(timing.connect_timeout, core.remote.dial_link(&link.address))
+            .await
+            .map_err(|_| {
+                format!(
+                    "ssh didn't connect in {} s",
+                    timing.connect_timeout.as_secs()
+                )
+            })??;
     let opening = async {
         let hello = channel
             .call(
@@ -555,6 +562,8 @@ async fn opening(core: &Arc<Core>, link: &Arc<Link>, timing: Timing) -> Result<C
     let (hello, hosts, _) = tokio::time::timeout(timing.connect_timeout, opening)
         .await
         .map_err(|_| {
+            // A shared connection that hangs would hang the next dial too.
+            core.remote.drop_shared(&link.address);
             channel.why().unwrap_or_else(|| {
                 format!(
                     "its vibed didn't answer in {} s",

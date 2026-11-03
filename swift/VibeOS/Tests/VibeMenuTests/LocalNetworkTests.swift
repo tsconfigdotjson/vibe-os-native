@@ -32,9 +32,23 @@ import VibeRPC
     }
 
     @Test func theRealSshSaysWhereADestinationGoes() async {
-        let target = await LocalNetwork.target(destination: "me@192.0.2.7")
+        // Not this Mac's ~/.ssh/config, whose ProxyJump would hide it.
+        let target = await LocalNetwork.target(destination: "me@192.0.2.7", config: "/dev/null")
         #expect(target?.host == "192.0.2.7")
         #expect(target?.port == 22)
+    }
+
+    /// A netmask's sockaddr is cut short after its last non-zero byte.
+    @Test func aShortNetmaskReadsAsZerosAfterItsEnd() {
+        let size = MemoryLayout<sockaddr_in6>.size
+        let raw = UnsafeMutableRawPointer.allocate(byteCount: size, alignment: 8)
+        defer { raw.deallocate() }
+        raw.initializeMemory(as: UInt8.self, repeating: 0xAA, count: size)
+        let offset = MemoryLayout<sockaddr_in6>.offset(of: \sockaddr_in6.sin6_addr)!
+        raw.storeBytes(of: UInt8(offset + 8), as: UInt8.self)
+        for i in 0..<8 { raw.storeBytes(of: 0xff, toByteOffset: offset + i, as: UInt8.self) }
+        let mask = LocalNetwork.bytes(of: raw.assumingMemoryBound(to: sockaddr.self), family: AF_INET6)
+        #expect(mask == [UInt8](repeating: 0xff, count: 8) + [UInt8](repeating: 0, count: 8))
     }
 
     @Test func localIsOnAnInterfacesNetworkOrLinkLocal() {
@@ -62,7 +76,9 @@ import VibeRPC
     /// the app doesn't connect to it.
     @Test func aHostOutThereNeedsNothing() async {
         let told = Box(false)
-        let access = await SystemLocalNetworkGate().prepare("me@192.0.2.7") { told.value = true }
+        let access = await SystemLocalNetworkGate(config: "/dev/null").prepare("me@192.0.2.7") {
+            told.value = true
+        }
         #expect(access == .notNeeded)
         #expect(!told.value)
     }
