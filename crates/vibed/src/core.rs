@@ -138,8 +138,9 @@ impl std::fmt::Debug for Config {
 }
 
 impl Config {
-    /// The real thing: the system clock, the OS's randomness, the `gh`
-    /// [`find_program`] finds, the `vibe-shim` [`find_shim`] finds, and
+    /// The real thing: the system clock, the OS's randomness, `gh` looked
+    /// up where the doctor looks for tools each time it's run (see
+    /// [`Core::gh_program`]), the `vibe-shim` [`find_shim`] finds, and
     /// admission by this machine's memory and its memory pressure. No
     /// backends: `vibed`'s `main` picks them for the machine it's on.
     pub fn new(info: DaemonInfo, layout: Layout) -> Self {
@@ -149,7 +150,7 @@ impl Config {
         Config {
             label: hostname(),
             layout,
-            gh: find_program("gh", path.as_deref()),
+            gh: "gh".into(),
             shim: find_shim(std::env::current_exe().ok().as_deref(), path.as_deref()),
             clock: Arc::new(vibe_core::time::now),
             entropy: Arc::new(keys::random_bytes),
@@ -174,35 +175,40 @@ impl Config {
     }
 }
 
-/// Where Homebrew puts programs, on Apple Silicon and on Intel. launchd
-/// starts `vibed` with a `PATH` of only the system directories, so these are
-/// searched too.
-const EXTRA_BIN_DIRS: [&str; 2] = ["/opt/homebrew/bin", "/usr/local/bin"];
-
-/// The first executable `name` on `path`, then in [`EXTRA_BIN_DIRS`]; or
-/// just `name` if there's none, so running it fails with a clear error.
-pub fn find_program(name: &str, path: Option<&OsStr>) -> OsString {
-    let dirs = path
+/// The first executable `name` on `path`, then in the usual places
+/// ([`vibe_env::macos::USUAL_BINS`]: `~/.local/bin` under `home`,
+/// `/opt/homebrew/bin`, `/usr/local/bin`). launchd starts `vibed` with a
+/// `PATH` of only the system directories, so those are searched too. The
+/// one lookup for every tool `vibed` runs, `gh` and `claude` among them.
+pub fn find_tool(name: &str, path: Option<&OsStr>, home: Option<&Path>) -> Option<PathBuf> {
+    let on_path = path
         .map(|p| std::env::split_paths(p).collect::<Vec<_>>())
         .unwrap_or_default();
-    dirs.iter()
-        .map(PathBuf::as_path)
-        .chain(EXTRA_BIN_DIRS.iter().map(Path::new))
+    let usual = vibe_env::macos::USUAL_BINS
+        .iter()
+        .map(Path::new)
+        .filter_map(|d| match home {
+            _ if d.is_absolute() => Some(d.to_owned()),
+            Some(h) => Some(h.join(d)),
+            None => None,
+        });
+    on_path
+        .into_iter()
+        .filter(|d| !d.as_os_str().is_empty())
+        .chain(usual)
         .map(|d| d.join(name))
         .find(|p| {
             std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
         })
-        .map(PathBuf::into_os_string)
-        .unwrap_or_else(|| name.into())
 }
 
-/// `program` if it's a path; or else a bare name, as [`find_program`]
-/// finds it now, which may be somewhere it wasn't when `vibed` started.
-pub fn resolve_program(program: &OsStr, path: Option<&OsStr>) -> OsString {
-    if Path::new(program).is_absolute() {
-        return program.to_owned();
-    }
-    find_program(&program.to_string_lossy(), path)
+/// [`find_tool`] in `vibed`'s own `HOME`; or just `name` if there's none,
+/// so running it fails with a clear error.
+pub fn find_program(name: &str, path: Option<&OsStr>) -> OsString {
+    let home = std::env::var_os("HOME").filter(|h| !h.is_empty());
+    find_tool(name, path, home.as_deref().map(Path::new))
+        .map(PathBuf::into_os_string)
+        .unwrap_or_else(|| name.into())
 }
 
 /// `vibe-shim` beside `exe`, as it's installed next to `vibed`; or else
@@ -647,7 +653,7 @@ impl Core {
                 let name = p.name.unwrap_or_else(|| repo.name.clone());
                 _reserved = self.reserve_project(host, &name)?;
                 let dest = self.layout.projects_dir().join(&name);
-                let path = projects::github_clone(&self.gh_program(), &repo, &dest).await?;
+                let path = projects::github_clone(&self.gh_program().await, &repo, &dest).await?;
                 NewProject {
                     host: host.into(),
                     name,
@@ -879,17 +885,29 @@ impl Core {
         }
     }
 
-    /// The `gh` to run: the one configured, or, when none was found at
-    /// startup, the one there is now, so a `gh` installed since (from the
+    /// The `gh` to run: the one configured if it's a path; or else a bare
+    /// name, looked up now where the doctor looks for tools (the login
+    /// shell's `PATH`, then `~/.local/bin` and the other usual places).
+    /// Nothing is kept, so a `gh` installed since `vibed` started (from the
     /// first run's checklist, say) is found without a restart.
-    pub(crate) fn gh_program(&self) -> OsString {
-        resolve_program(&self.gh, std::env::var_os("PATH").as_deref())
+    pub async fn gh_program(&self) -> OsString {
+        if Path::new(&self.gh).is_absolute() {
+            return self.gh.clone();
+        }
+        let (checks, name) = (Arc::clone(&self.checks), self.gh.clone());
+        // Asking the login shell for its PATH, the first time, may block.
+        tokio::task::spawn_blocking(move || checks.find(&name.to_string_lossy()))
+            .await
+            .ok()
+            .flatten()
+            .map_or_else(|| self.gh.clone(), PathBuf::into_os_string)
     }
 
     /// Runs `gh auth status` now, and publishes a `gh.status` event if the
     /// result changed.
     pub async fn check_gh(&self) -> GhStatus {
-        let check = gh::check(&self.gh_program()).await;
+        let program = self.gh_program().await;
+        let check = gh::check(&program).await;
         let status = GhStatus {
             state: check.state,
             account: check.account,
@@ -904,9 +922,10 @@ impl Core {
         };
         if changed {
             crate::log!(
-                "vibed: gh: {} ({})",
+                "vibed: gh: {} ({}; {})",
                 status.state,
-                status.detail.as_deref().unwrap_or("")
+                status.detail.as_deref().unwrap_or(""),
+                program.to_string_lossy()
             );
             let mut e = self.event(EventKind::GhStatus);
             e.state = Some(status.state.to_string());

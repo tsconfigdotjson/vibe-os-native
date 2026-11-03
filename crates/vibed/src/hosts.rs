@@ -183,13 +183,11 @@ impl Core {
         if self.info().os != "linux" {
             return Vec::new();
         }
-        let mut path = std::env::var_os("PATH").unwrap_or_default();
-        let local_bin = self.layout.home().join(".local/bin");
-        path.push(":");
-        path.push(local_bin.as_os_str());
+        let path = std::env::var_os("PATH");
+        let home = self.layout.home();
         TOOLS
             .iter()
-            .filter(|t| crate::core::find_program(t, Some(&path)) == **t)
+            .filter(|t| crate::core::find_tool(t, path.as_deref(), Some(home)).is_none())
             .map(|t| (*t).to_owned())
             .collect()
     }

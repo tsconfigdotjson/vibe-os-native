@@ -292,7 +292,7 @@ public final class FixtureDaemon: DaemonConnection, @unchecked Sendable {
                     hint: "Install Apple's Command Line Tools: run `xcode-select --install` in Terminal."),
                 check(
                     .gh, .fail, "GitHub's gh isn't installed.",
-                    hint: "Install gh from cli.github.com (or `brew install gh`), then run `gh auth login` in Terminal."),
+                    hint: "Install gh from https://cli.github.com, then run `gh auth login` in Terminal."),
                 check(
                     .ghGit, .fail, "git can use gh for GitHub once gh is logged in.",
                     hint: "Log gh in first, with `gh auth login`."),
