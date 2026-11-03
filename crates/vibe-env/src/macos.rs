@@ -67,9 +67,10 @@ const TICK: Duration = Duration::from_millis(100);
 /// How long the owner's login shell may take to say its `PATH`.
 const LOGIN_SHELL_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Where `claude`, Homebrew and the like usually are, added after the login
-/// shell's `PATH` in case its non-interactive start doesn't set them.
-const USUAL_BINS: [&str; 3] = [".local/bin", "/opt/homebrew/bin", "/usr/local/bin"];
+/// Where `claude`, `gh` and the like usually are (relative ones are in the
+/// home folder), added after the login shell's `PATH` in case it doesn't
+/// set them or doesn't answer.
+pub const USUAL_BINS: [&str; 3] = [".local/bin", "/opt/homebrew/bin", "/usr/local/bin"];
 
 /// How often the governor does each of its jobs (PRD: How macos is
 /// governed).

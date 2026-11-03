@@ -1,6 +1,5 @@
 //! `vibed`: serves the JSON-RPC socket until SIGTERM or SIGINT.
 
-use std::ffi::OsString;
 use std::fs::DirBuilder;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::PathBuf;
@@ -330,13 +329,8 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
         macos = Some(Arc::clone(&backend));
         config.backends = config.backends.with(Environment::Macos, backend);
     }
-    let gh: OsString = config.gh.clone();
     let core = Arc::new(Core::open(config)?);
-    vibed::log!(
-        "vibed: state in {}, gh is {}",
-        core.layout().data_dir().display(),
-        gh.to_string_lossy()
-    );
+    vibed::log!("vibed: state in {}", core.layout().data_dir().display());
     core.warn_about_limits();
     // In the background, so a shim that's slow to answer doesn't hold up
     // the socket.

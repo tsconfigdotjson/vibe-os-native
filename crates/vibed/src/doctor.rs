@@ -19,7 +19,7 @@ use vibe_core::rpc::{
 };
 use vibe_env::Run;
 
-use crate::core::{Core, error, find_program, lock};
+use crate::core::{Core, error, find_tool, lock};
 
 /// How long one of the doctor's commands may take.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
@@ -30,6 +30,10 @@ pub const CLAUDE_KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 /// What the doctor asks of the machine. Each answer is `Err` with why,
 /// as a phrase, when the thing isn't there.
 pub trait HostChecks: Send + Sync + fmt::Debug {
+    /// Where the program `name` is, as this host's agents would find it:
+    /// on the login shell's `PATH`, then in `~/.local/bin`,
+    /// `/opt/homebrew/bin` and `/usr/local/bin`. How `vibed` finds `gh`.
+    fn find(&self, name: &str) -> Option<PathBuf>;
     /// `git --version`.
     fn git(&self) -> Result<String, String>;
     /// Whether git asks `gh` for github.com's credentials, as `gh auth
@@ -103,11 +107,11 @@ impl Machine {
         found
     }
 
-    /// The first executable `name` on the agents' `PATH`.
+    /// The first executable `name` on the agents' `PATH`, then in the
+    /// usual places ([`find_tool`]).
     fn which(&self, name: &str) -> Option<PathBuf> {
         let path = self.path();
-        let found = PathBuf::from(find_program(name, Some(OsStr::new(&path))));
-        found.is_absolute().then_some(found)
+        find_tool(name, Some(OsStr::new(&path)), Some(&self.home))
     }
 
     fn run(&self, argv: &[&str]) -> Result<(bool, String), String> {
@@ -155,6 +159,10 @@ impl Machine {
 }
 
 impl HostChecks for Machine {
+    fn find(&self, name: &str) -> Option<PathBuf> {
+        self.which(name)
+    }
+
     fn git(&self) -> Result<String, String> {
         let git = self.git_program()?;
         match self.run(&[&git.to_string_lossy(), "--version"])? {
@@ -253,6 +261,10 @@ pub struct FixedChecks {
 }
 
 impl HostChecks for FixedChecks {
+    /// Nothing: the tools a test runs are given by their paths.
+    fn find(&self, _: &str) -> Option<PathBuf> {
+        None
+    }
     fn git(&self) -> Result<String, String> {
         self.git.clone()
     }
@@ -397,7 +409,7 @@ fn report(
         GhState::NotInstalled => fail(
             CheckId::Gh,
             "GitHub's gh isn't installed",
-            "Install gh from cli.github.com (or `brew install gh`), then run `gh auth login` in Terminal.",
+            "Install gh from https://cli.github.com, then run `gh auth login` in Terminal.",
         ),
         GhState::LoggedOut => fail(
             CheckId::Gh,
@@ -576,7 +588,7 @@ impl Core {
                             .to_owned(),
                     ));
                 }
-                let (checks, gh) = (Arc::clone(&self.checks), self.gh_program());
+                let (checks, gh) = (Arc::clone(&self.checks), self.gh_program().await);
                 tokio::task::spawn_blocking(move || checks.setup_git(&gh))
                     .await
                     .map_err(|e| error(ErrorCode::InternalError, e.to_string()))?
@@ -631,24 +643,26 @@ mod tests {
         assert_eq!(system_sleep_minutes(" sleep  never\n"), None);
     }
 
-    /// A gh installed after vibed started, which found none then, is found
-    /// at the next check: the first run's "Get gh" works without a restart.
+    /// #42: a gh (and a claude) only in `~/.local/bin`, which the `PATH`
+    /// launchd gives `vibed` lacks, are found, by the same lookup.
     #[test]
-    fn a_gh_installed_later_is_found() {
-        use crate::core::resolve_program;
+    fn tools_only_in_local_bin_are_found() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().as_os_str();
-        assert_eq!(resolve_program(OsStr::new("gh"), Some(path)), "gh");
-        let gh = script(tmp.path(), "gh", "exit 0");
-        assert_eq!(
-            resolve_program(OsStr::new("gh"), Some(path)),
-            gh.as_os_str()
-        );
-        // One given by its path stays that one.
-        assert_eq!(
-            resolve_program(OsStr::new("/opt/gh"), Some(path)),
-            "/opt/gh"
-        );
+        let (home, sys) = (tmp.path().join("home"), tmp.path().join("sys"));
+        let local_bin = home.join(".local/bin");
+        std::fs::create_dir_all(&local_bin).unwrap();
+        std::fs::create_dir_all(&sys).unwrap();
+        // As minimal as launchd's, but empty, so a gh the system has
+        // can't be found instead.
+        let m = Machine::new(&home).with_path(sys.to_string_lossy());
+        assert_eq!(m.find("vibe-no-such-tool"), None);
+        let gh = script(&local_bin, "gh", "exit 0");
+        assert_eq!(m.find("gh"), Some(gh));
+        let claude = script(&local_bin, "claude", r#"echo "2.1.314 (Claude Code)""#);
+        assert_eq!(m.claude(), Ok((claude, "2.1.314 (Claude Code)".into())));
+        // The PATH comes first.
+        let first = script(&sys, "gh", "exit 0");
+        assert_eq!(m.find("gh"), Some(first));
     }
 
     #[test]

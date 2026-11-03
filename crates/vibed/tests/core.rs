@@ -627,3 +627,31 @@ async fn gh_logging_out_is_an_event() {
         (EventKind::GhStatus, Some("logged_out"))
     );
 }
+
+/// #42: with no gh to be found when vibed starts, a gh put in
+/// `~/.local/bin` later, which launchd's `PATH` lacks, is found at the next
+/// check, without a restart. A name no system has, so a real gh in
+/// `/usr/local/bin` can't answer instead.
+#[tokio::test]
+async fn a_gh_installed_later_in_local_bin_is_found() {
+    let golden = Golden::new();
+    let empty = golden.dir.path().join("sys");
+    fs::create_dir_all(&empty).unwrap();
+    let mut config = golden.config();
+    config.gh = "vibe-test-gh".into();
+    config.checks =
+        Arc::new(vibed::doctor::Machine::new(&golden.home).with_path(empty.to_string_lossy()));
+    let core = Core::open(config).unwrap();
+    assert_eq!(core.check_gh().await.state, GhState::NotInstalled);
+
+    let local_bin = golden.home.join(".local/bin");
+    fs::create_dir_all(&local_bin).unwrap();
+    let gh = local_bin.join("vibe-test-gh");
+    common::write_script(&gh, &fs::read_to_string(&golden.gh).unwrap());
+    let status = core.check_gh().await;
+    assert_eq!(
+        (status.state, status.account.as_deref()),
+        (GhState::LoggedIn, Some("me"))
+    );
+    assert_eq!(core.gh_program().await, gh.into_os_string());
+}
