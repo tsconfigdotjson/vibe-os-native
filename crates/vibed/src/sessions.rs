@@ -161,8 +161,19 @@ async fn read_frame(stream: &mut UnixStream) -> io::Result<Frame> {
     Ok(Frame { kind, payload })
 }
 
-/// The refs that have a socket in `run/`: every `<ref>.sock` but
-/// `vibed.sock`, sorted.
+/// The sockets `vibed` keeps in `run/` for itself, beside the sessions'.
+/// None is a session, so the scan for sessions never probes one, nor
+/// removes it as stale: sshd makes a host's tunnel end and leaves no lock
+/// beside it, so nothing else would keep it (issue #45). Their names are
+/// in [`vibe_core::model::RESERVED_REFS`], so no session can take them.
+pub const DAEMON_SOCKETS: [&str; 3] = [
+    "vibed.sock",
+    crate::external::TUNNEL_END,
+    crate::tunnel::TUNNEL_SOCKET,
+];
+
+/// The refs that have a socket in `run/`: every `<ref>.sock` but the
+/// [`DAEMON_SOCKETS`], sorted.
 pub fn socket_refs(run_dir: &Path) -> Vec<String> {
     let Ok(entries) = fs::read_dir(run_dir) else {
         return Vec::new();
@@ -172,6 +183,9 @@ pub fn socket_refs(run_dir: &Path) -> Vec<String> {
         .filter(|e| e.file_type().is_ok_and(|t| t.is_socket()))
         .filter_map(|e| {
             let name = e.file_name().into_string().ok()?;
+            if DAEMON_SOCKETS.iter().any(|d| d.eq_ignore_ascii_case(&name)) {
+                return None;
+            }
             let r = name.strip_suffix(".sock")?;
             validate_ref(r).is_ok().then(|| r.to_owned())
         })
@@ -367,6 +381,15 @@ mod tests {
         assert_eq!(socket_refs(&run), ["a-ref", "b-ref"]);
         assert!(socket_refs(&tmp.path().join("none")).is_empty());
 
+        // The daemon's own sockets, with no lock beside them, as sshd
+        // leaves a tunnel's end, are never sessions.
+        for name in DAEMON_SOCKETS {
+            if !run.join(name).exists() {
+                drop(std::os::unix::net::UnixListener::bind(run.join(name)).unwrap());
+            }
+        }
+        assert_eq!(socket_refs(&run), ["a-ref", "b-ref"]);
+
         let agents = tmp.path().join("agents");
         for r in ["x-ref", "y-ref", "no-record"] {
             fs::create_dir_all(agents.join(r)).unwrap();
@@ -374,6 +397,20 @@ mod tests {
         fs::write(agents.join("y-ref").join(shim::RECORD_FILE), "{}").unwrap();
         fs::write(agents.join("x-ref").join(shim::RECORD_FILE), "{}").unwrap();
         assert_eq!(record_refs(&agents), ["x-ref", "y-ref"]);
+    }
+
+    #[test]
+    fn no_session_can_take_a_daemon_socket() {
+        for name in DAEMON_SOCKETS {
+            let stem = name.strip_suffix(".sock").unwrap();
+            let e = validate_ref(stem).unwrap_err();
+            assert!(e.contains("is reserved"), "{name}: {e}");
+        }
+        assert_eq!(
+            DAEMON_SOCKETS,
+            ["vibed.sock", "mac.sock", "tunnel.sock"],
+            "a new socket in run/ needs its name in RESERVED_REFS too"
+        );
     }
 
     #[test]

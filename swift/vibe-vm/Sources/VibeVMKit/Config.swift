@@ -137,10 +137,15 @@ public struct VMConfig: Codable, Equatable, Sendable {
     }
 }
 
+/// The names of `vibed`'s own sockets in `run/`, which no ref may take, in
+/// any case: `vibe_core::model::RESERVED_REFS`.
+let reservedRefs: Set<String> = ["vibed", "mac", "tunnel"]
+
 /// Like `vibe_core::model::validate_ref`: up to 32 letters, digits, `.`, `_`
-/// and `-`, starting with a letter or digit, and not `vibed`.
+/// and `-`, starting with a letter or digit, and none of `reservedRefs`.
 func isRef(_ s: String) -> Bool {
-    guard let first = s.unicodeScalars.first, s != "vibed", s.utf8.count <= 32 else { return false }
+    guard let first = s.unicodeScalars.first, !reservedRefs.contains(s.lowercased()), s.utf8.count <= 32
+    else { return false }
     return isAlnum(first) && isLabel(s, max: 32)
 }
 

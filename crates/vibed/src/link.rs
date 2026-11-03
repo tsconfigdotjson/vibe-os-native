@@ -43,7 +43,8 @@ const IDLE_FOR: Duration = Duration::from_secs(30);
 /// What a channel for calls says it is, in its hello.
 const LINK_CALLS: &str = "vibed link calls from";
 
-/// How the link is timed; tests make it quicker.
+/// How the link is timed, and the tunnel that follows it; tests make it
+/// quicker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Timing {
     pub ping_every: Duration,
@@ -51,6 +52,10 @@ pub struct Timing {
     pub connect_timeout: Duration,
     pub min_backoff: Duration,
     pub max_backoff: Duration,
+    /// How long a tunnel may go without the host coming through it, since
+    /// it began or since the host last did, before it's started anew
+    /// ([`crate::tunnel::QUIET`]).
+    pub tunnel_quiet: Duration,
 }
 
 impl Default for Timing {
@@ -61,6 +66,7 @@ impl Default for Timing {
             connect_timeout: CONNECT_TIMEOUT,
             min_backoff: MIN_BACKOFF,
             max_backoff: MAX_BACKOFF,
+            tunnel_quiet: crate::tunnel::QUIET,
         }
     }
 }

@@ -14,7 +14,8 @@
 //!
 //! The tunnel is supervised like the link: it waits for the host's link,
 //! has the host clear the tunnel's end, starts `ssh`, counts as up once the
-//! host has come through it, and starts over with backoff when it ends.
+//! host has come through it, and starts over with backoff when it ends or
+//! the host stops coming through it.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
@@ -260,9 +261,37 @@ fn usable_remote(path: &str) -> bool {
         && !path.split('/').any(|part| part == "..")
 }
 
-/// How long a tunnel may stay up without the host coming through before
-/// it's started anew.
-const NEVER_CAME: Duration = Duration::from_secs(60);
+/// How long a tunnel may go without the host coming through it before it's
+/// started anew: from when it began, if the host never has, or from when
+/// it last did. That's [`SEEN_WITHIN`], after which it no longer counts as
+/// up, and 40 s more, for a host that's slow or briefly away. A tunnel
+/// whose far end is gone, a socket `run/` lost on the host while `ssh`
+/// still runs, has the host never come through again, so it starts over
+/// instead of waiting for someone to end `ssh` (issue #45).
+pub const QUIET: Duration = SEEN_WITHIN.saturating_add(Duration::from_secs(40));
+
+/// Why a tunnel that began at `began` should start over at `now`, if it
+/// should: the host hasn't come through it for `quiet`, since it began or
+/// since it was last `seen` coming through (any time before it began was
+/// another tunnel's).
+fn gone_quiet(
+    host: &str,
+    began: Instant,
+    seen: Option<Instant>,
+    now: Instant,
+    quiet: Duration,
+) -> Option<String> {
+    let seen = seen.filter(|&at| at >= began);
+    let since = seen.unwrap_or(began);
+    if now.saturating_duration_since(since) < quiet {
+        return None;
+    }
+    let secs = quiet.as_secs().max(1);
+    Some(match seen {
+        None => format!("{host} didn't come through the tunnel in {secs} s"),
+        Some(_) => format!("{host} hasn't come through the tunnel for {secs} s"),
+    })
+}
 
 impl Core {
     /// The tunnel's socket on this Mac.
@@ -427,13 +456,12 @@ async fn supervise(
                     let Some(c) = core.upgrade() else { return };
                     let up = c.host_came_through(began);
                     was_up |= up;
-                    // Up, but the host never came through: start over.
-                    if !was_up && began.elapsed() >= NEVER_CAME {
-                        break format!(
-                            "{} didn't come through the tunnel in {} s",
-                            link.name,
-                            NEVER_CAME.as_secs()
-                        );
+                    // `ssh` runs, but the host hasn't come through, or has
+                    // stopped: start over.
+                    let seen = *lock(&c.tunnel_seen);
+                    let quiet = gone_quiet(&link.name, began, seen, Instant::now(), timing.tunnel_quiet);
+                    if let Some(why) = quiet {
+                        break why;
                     }
                     set(&c, if up { TunnelState::Up } else { TunnelState::Connecting }, None);
                 }
@@ -487,6 +515,49 @@ async fn start(core: &Core, link: &Link) -> Result<crate::remote::TunnelChild, S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tunnel_the_host_stops_coming_through_starts_over() {
+        let quiet = Duration::from_secs(60);
+        let last_tunnel = Instant::now();
+        let began = last_tunnel + Duration::from_secs(10);
+        let at = |s: u64| began + Duration::from_secs(s);
+        // Never came through: given until `quiet` from the start.
+        assert_eq!(gone_quiet("vps", began, None, at(59), quiet), None);
+        assert_eq!(
+            gone_quiet("vps", began, None, at(60), quiet).as_deref(),
+            Some("vps didn't come through the tunnel in 60 s")
+        );
+        // Came through for a while, then stopped (its socket on the host
+        // gone, say): `quiet` from the last time, not from the start.
+        assert_eq!(
+            gone_quiet("vps", began, Some(at(100)), at(159), quiet),
+            None
+        );
+        assert_eq!(
+            gone_quiet("vps", began, Some(at(100)), at(160), quiet).as_deref(),
+            Some("vps hasn't come through the tunnel for 60 s")
+        );
+        // Coming through all along, however long it's been up.
+        assert_eq!(
+            gone_quiet("vps", began, Some(at(3600)), at(3605), quiet),
+            None
+        );
+        // Seen before this tunnel began was the last tunnel: it doesn't count.
+        assert_eq!(
+            gone_quiet("vps", began, Some(last_tunnel), at(59), quiet),
+            None
+        );
+        assert!(
+            gone_quiet("vps", began, Some(last_tunnel), at(60), quiet)
+                .unwrap()
+                .contains("didn't come through")
+        );
+        // By default, a while past when it stops counting as up.
+        assert!(QUIET >= SEEN_WITHIN + Duration::from_secs(30));
+        assert!(QUIET <= SEEN_WITHIN + Duration::from_secs(60));
+        assert_eq!(Timing::default().tunnel_quiet, QUIET);
+    }
 
     #[test]
     fn tunnel_ends_are_plain_absolute_paths() {

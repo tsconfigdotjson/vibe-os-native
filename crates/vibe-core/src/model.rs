@@ -481,12 +481,20 @@ pub fn validate_ssh_destination(dest: &str) -> Result<(), String> {
 /// `/Users/` and a name of up to 19 letters.
 pub const MAX_REF_LEN: usize = 32;
 
-/// Names `run/` uses for itself, so no session may take them.
-const RESERVED_REFS: [&str; 1] = ["vibed"];
+/// Names `vibed` gives its own sockets in `run/`, beside the sessions'
+/// `<ref>.sock`, so no session may take them: a session there would be the
+/// daemon's socket, and the scan for stale sessions would remove the
+/// daemon's (issue #45). Each with what it's for, for the refusal. They're
+/// compared without case, as the Mac's file system does.
+pub const RESERVED_REFS: [(&str, &str); 3] = [
+    ("vibed", "vibed's own socket"),
+    ("mac", "the end of the Mac's tunnel on a Linux host"),
+    ("tunnel", "the Mac's end of its tunnel to a Linux host"),
+];
 
 /// An agent's ref, which also names its worktree, branch and session: like
 /// a name (see [`validate_name`]) but at most [`MAX_REF_LEN`] characters,
-/// and not `vibed`, whose socket is in the same directory.
+/// and none of [`RESERVED_REFS`], whose sockets are in the same directory.
 pub fn validate_ref(r: &str) -> Result<(), String> {
     let ok = !r.is_empty()
         && r.len() <= MAX_REF_LEN
@@ -498,8 +506,13 @@ pub fn validate_ref(r: &str) -> Result<(), String> {
             "`{r}` isn't a valid ref: use up to {MAX_REF_LEN} letters, digits, `.`, `_` and `-`, starting with a letter or digit"
         ));
     }
-    if RESERVED_REFS.contains(&r) {
-        return Err(format!("`{r}` is reserved; pick another ref"));
+    if let Some((_, what)) = RESERVED_REFS
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(r))
+    {
+        return Err(format!(
+            "`{r}` is reserved: it names {what}. Pick another name"
+        ));
     }
     Ok(())
 }
@@ -626,6 +639,23 @@ mod tests {
         assert_eq!(validate_ref(&"a".repeat(MAX_REF_LEN)), Ok(()));
         for bad in ["", "-x", "a/b", "a b", "vibed", "..", ".hidden"] {
             assert!(validate_ref(bad).is_err(), "{bad:?}");
+        }
+        // The names of vibed's own sockets, whatever their case.
+        for reserved in ["vibed", "mac", "tunnel", "Mac", "TUNNEL", "Vibed"] {
+            let e = validate_ref(reserved).unwrap_err();
+            assert!(
+                e.starts_with(&format!("`{reserved}` is reserved: it names ")),
+                "{e}"
+            );
+            assert!(e.ends_with("Pick another name"), "{e}");
+        }
+        assert!(
+            validate_ref("mac")
+                .unwrap_err()
+                .contains("tunnel on a Linux host")
+        );
+        for near in ["macs", "mac-mini", "tunnels", "vibed2"] {
+            assert_eq!(validate_ref(near), Ok(()), "{near}");
         }
         let long = validate_ref(&"a".repeat(MAX_REF_LEN + 1)).unwrap_err();
         assert!(long.contains("up to 32"), "{long}");

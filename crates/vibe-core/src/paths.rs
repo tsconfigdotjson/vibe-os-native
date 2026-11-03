@@ -107,7 +107,9 @@ impl Layout {
         self.data_dir().join("vibe.db")
     }
 
-    /// Sockets: `vibed.sock`, and `<ref>.sock` for each running session.
+    /// Sockets: `vibed.sock`, an external-access tunnel's (`mac.sock` on a
+    /// Linux host, `tunnel.sock` on a Mac), and `<ref>.sock` for each
+    /// running session.
     pub fn run_dir(&self) -> PathBuf {
         self.data_dir().join("run")
     }
