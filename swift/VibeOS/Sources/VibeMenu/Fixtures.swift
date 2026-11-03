@@ -88,7 +88,7 @@ public final class FixtureDaemon: DaemonConnection, @unchecked Sendable {
             ]
         case LimitsGet.name:
             return [
-                "reserve_memory": 4 << 30, "reserve_cores": 2, "max_awake_agents": 16, "cpu_cores": 4,
+                "reserve_cores": 2, "max_awake_agents": 16, "cpu_cores": 4,
                 "max_processes": 512, "disk_soft": 20 << 30, "disk_hard": 30 << 30, "vm_disk": 20 << 30,
                 "idle_debounce": 60, "snapshot_disk": 20 << 30,
             ]
@@ -127,6 +127,7 @@ public final class FixtureDaemon: DaemonConnection, @unchecked Sendable {
         var local: [String: Any] = [
             "name": "local", "os": "macos", "label": "studio", "link": "local", "external": false, "mcp": true,
             "version": "0.1.0", "missing": [String](),
+            "memory": ["total": 64 << 30, "used": 23 << 30, "swap_total": 0, "swap_used": 0],
         ]
         guard populated else {
             local["mcp"] = setUp
@@ -138,6 +139,7 @@ public final class FixtureDaemon: DaemonConnection, @unchecked Sendable {
                 "name": "vps", "os": "linux", "label": "vps-fra-1", "link": "connected", "external": true,
                 "mcp": true, "address": "me@vps.example.com", "version": "0.1.0", "missing": [String](),
                 "url": "https://vps.example.com/mcp", "tunnel": "up",
+                "memory": ["total": 16 << 30, "used": 5 << 30, "swap_total": 4 << 30, "swap_used": 0],
             ],
             [
                 "name": "box", "os": "linux", "label": "box", "link": "down", "external": false, "mcp": false,

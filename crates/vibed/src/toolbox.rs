@@ -335,7 +335,8 @@ impl Core {
             return Ok(attach(sessions::ttys(&status)));
         }
         let was_open = host.is_open();
-        // Open from the boot on, so admission counts its VM's memory.
+        // Open from the boot on, so it counts as awake against
+        // max_awake_agents.
         self.set_toolbox(ToolboxState::Open);
         let end = {
             let host = Arc::clone(&host);

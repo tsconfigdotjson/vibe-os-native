@@ -115,6 +115,7 @@ let swiftTypes: [String: Set<String>] = [
     "NoParams": keys(NoParams.CodingKeys.self),
     "HostParams": keys(HostParams.CodingKeys.self),
     "HostInfo": keys(HostInfo.CodingKeys.self),
+    "MemoryUse": keys(MemoryUse.CodingKeys.self),
     "HostList": keys(HostList.CodingKeys.self),
     "HostAddParams": keys(HostAddParams.CodingKeys.self),
     "HostNameParams": keys(HostNameParams.CodingKeys.self),
@@ -493,7 +494,7 @@ struct LiveDaemonTests {
         #expect(hosts.hosts.first?.os == "macos")
         let limits = try client.call(LimitsGet.self, HostParams())
         #expect(limits.maxAwakeAgents == 16)
-        #expect(limits.reserveMemory == 4 << 30)
+        #expect(limits.snapshotDisk == 20 << 30)
         let mcp = try client.call(McpGet.self, HostParams())
         #expect(mcp.url == "http://127.0.0.1:\(mcp.port)/mcp")
         #expect(!mcp.tailscale)

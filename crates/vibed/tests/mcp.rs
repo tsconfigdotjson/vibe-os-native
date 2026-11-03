@@ -243,8 +243,20 @@ async fn the_orchestrator_round_from_start_to_delete() {
         text(&r),
         format!("deleted {agent}; its branch {agent} is kept")
     );
+    // No agents, and the host's own memory, with the golden Mac's
+    // warning: a report, never a limit (#47).
     let r = c.call("vibe_list_agents", json!({})).await;
-    assert_eq!(text(&r), "no agents");
+    assert_eq!(
+        text(&r),
+        "no agents\nlocal: 58G of 64G memory in use, 3G of 4G swap. Short of memory: macOS warns \
+         of memory pressure. Agents keep running, and it swaps"
+    );
+    assert_eq!(
+        r["structuredContent"]["hosts"],
+        json!([{"host": "local", "memory": 58u64 << 30, "memory_total": 64u64 << 30,
+                "swap": 3u64 << 30, "swap_total": 4u64 << 30,
+                "pressure": "macOS warns of memory pressure"}])
+    );
     let e = c.fails("vibe_read_messages", json!({"agent": agent})).await;
     assert_eq!(
         e,

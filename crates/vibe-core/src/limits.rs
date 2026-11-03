@@ -24,8 +24,6 @@ const MAX_DURATION: u64 = 365 * 24 * 3600;
 /// in `host.toml` they're written like `"4G"` and `"60s"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostLimits {
-    /// Memory always left for macOS and `vibed`.
-    pub reserve_memory: u64,
     /// Cores always left for macOS and `vibed`.
     pub reserve_cores: u32,
     pub max_awake_agents: u32,
@@ -80,10 +78,14 @@ pub const MCP_TAILSCALE: &str = "mcp_tailscale";
 /// The settings that aren't host limits on the socket.
 const FILE_ONLY: [&str; 3] = [PACKAGE_CACHES, MCP_PORT_KEY, MCP_TAILSCALE];
 
+/// Settings that no longer mean anything, left alone where an older file
+/// has them. `reserve_memory` was memory kept from agents for the host:
+/// an agent's memory is a ceiling now, not a reservation (#47).
+const RETIRED: [&str; 1] = ["reserve_memory"];
+
 impl Default for HostLimits {
     fn default() -> Self {
         HostLimits {
-            reserve_memory: 4 * GIB,
             reserve_cores: 2,
             max_awake_agents: 16,
             cpu_cores: 4,
@@ -108,8 +110,7 @@ enum Kind {
 }
 
 /// Every setting, in the order the PRD lists them.
-const SETTINGS: [(&str, Kind); 10] = [
-    ("reserve_memory", Kind::Size),
+const SETTINGS: [(&str, Kind); 9] = [
     ("reserve_cores", Kind::Count),
     ("max_awake_agents", Kind::Count),
     ("cpu_cores", Kind::Count),
@@ -129,7 +130,6 @@ impl HostLimits {
 
     fn slot(&mut self, key: &str) -> Option<Slot<'_>> {
         Some(match key {
-            "reserve_memory" => Slot::Wide(&mut self.reserve_memory),
             "reserve_cores" => Slot::Narrow(&mut self.reserve_cores),
             "max_awake_agents" => Slot::Narrow(&mut self.max_awake_agents),
             "cpu_cores" => Slot::Narrow(&mut self.cpu_cores),
@@ -389,6 +389,9 @@ fn interpret(doc: &DocumentMut) -> Result<HostLimits, String> {
                 .ok_or_else(|| format!("{key} must be a port, from 1 to 65535"))?;
             continue;
         }
+        if RETIRED.contains(&key) {
+            continue;
+        }
         let kind = SETTINGS
             .iter()
             .find(|(k, _)| *k == key)
@@ -483,7 +486,6 @@ mod tests {
     #[test]
     fn defaults_match_the_prd() {
         let prd = r#"
-reserve_memory   = "4G"    # always left for macOS and vibed
 reserve_cores    = 2
 max_awake_agents = 16
 cpu_cores        = 4       # per agent
@@ -497,7 +499,25 @@ package_caches   = true    # linux agents share npm, pnpm, cargo and pip caches
 "#;
         let (_d, path) = file(prd);
         assert_eq!(load(&path).unwrap(), HostLimits::default());
-        assert_eq!(HostLimits::keys().count(), 10);
+        assert_eq!(HostLimits::keys().count(), 9);
+    }
+
+    #[test]
+    fn a_retired_reserve_memory_is_left_alone() {
+        // Files from before #47 may set it: it's read past, whatever its
+        // value, and an edit keeps it where it was.
+        let (_d, path) = file("reserve_memory   = \"4G\"    # mine\ncpu_cores = 8\n");
+        assert_eq!(load(&path).unwrap().cpu_cores, 8);
+        let l = update(&path, &[("cpu_cores", 6)]).unwrap();
+        assert_eq!(l.cpu_cores, 6);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "reserve_memory   = \"4G\"    # mine\ncpu_cores = 6\n"
+        );
+        let (_d, path) = file("reserve_memory = 0\n");
+        assert_eq!(load(&path).unwrap(), HostLimits::default());
+        let err = update(&path, &[("reserve_memory", 0)]).unwrap_err();
+        assert!(err.to_string().contains("unknown setting"), "{err}");
     }
 
     #[test]
@@ -512,10 +532,10 @@ package_caches   = true    # linux agents share npm, pnpm, cargo and pip caches
     #[test]
     fn values_override_defaults() {
         let (_d, path) =
-            file("cpu_cores = 8\nreserve_memory = 6442450944\nidle_debounce = \"5m\"\n");
+            file("cpu_cores = 8\nsnapshot_disk = 6442450944\nidle_debounce = \"5m\"\n");
         let l = load(&path).unwrap();
         assert_eq!(l.cpu_cores, 8);
-        assert_eq!(l.reserve_memory, 6 * GIB);
+        assert_eq!(l.snapshot_disk, 6 * GIB);
         assert_eq!(l.idle_debounce, 300);
         assert_eq!(l.max_awake_agents, 16);
         assert!(l.package_caches);
@@ -647,17 +667,17 @@ package_caches   = true    # linux agents share npm, pnpm, cargo and pip caches
         let path = dir.path().join("vibeos/host.toml");
         update(
             &path,
-            &[("idle_debounce", 0), ("reserve_memory", 1500 * MIB + 1)],
+            &[("idle_debounce", 0), ("snapshot_disk", 1500 * MIB + 1)],
         )
         .unwrap();
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.starts_with("# VibeOS host limits."), "{text}");
         assert!(
-            text.ends_with("idle_debounce = \"0s\"\nreserve_memory = 1572864001\n"),
+            text.ends_with("idle_debounce = \"0s\"\nsnapshot_disk = 1572864001\n"),
             "{text}"
         );
         let l = load(&path).unwrap();
-        assert_eq!((l.idle_debounce, l.reserve_memory), (0, 1500 * MIB + 1));
+        assert_eq!((l.idle_debounce, l.snapshot_disk), (0, 1500 * MIB + 1));
     }
 
     #[test]

@@ -21,7 +21,7 @@ use vibe_core::rpc::Login;
 use vibe_core::units::GIB;
 use vibe_env::images::Images;
 use vibe_env::testing::{STAND_IN, TestBackend, TestToolbox};
-use vibed::agents::{Backends, HostAdmission};
+use vibed::agents::Backends;
 use vibed::core::{Config, Core, DaemonInfo};
 use vibed::remote::{BoxFuture, Channel, Installed, Remote};
 use vibed::server::{self, SocketGuard};
@@ -43,6 +43,29 @@ pub const GOLDEN_HOME: &str = "/Users/me";
 /// What the test backend says every running agent uses: about what a real
 /// Claude Code does (PRD: Spike results).
 pub const AGENT_MEMORY_USED: u64 = 340 * 1024 * 1024;
+
+/// The golden Mac's memory: 64G, 58G of it in use, and 3G of 4G of swap,
+/// with macOS warning of memory pressure. Nothing is refused for it (#47).
+pub fn golden_memory() -> vibe_core::rpc::MemoryUse {
+    vibe_core::rpc::MemoryUse {
+        total: 64 * GIB,
+        used: 58 * GIB,
+        swap_total: 4 * GIB,
+        swap_used: 3 * GIB,
+        pressure: None,
+    }
+}
+
+/// macOS's memory pressure at warn, as the golden Mac has it: worth a
+/// warning, and short of what makes vibed act.
+#[derive(Debug)]
+pub struct Warned;
+
+impl vibed::pressure::MemoryPressure for Warned {
+    fn read(&self) -> Option<vibed::pressure::Reading> {
+        Some(vibed::pressure::Level::Warn.into())
+    }
+}
 
 /// 2026-10-30T12:00:00Z: the time in every example.
 pub const GOLDEN_NOW: i64 = 1_793_361_600;
@@ -339,12 +362,10 @@ impl Golden {
             .with_uncovered(vec!["apt: htop".into()])
             .with_logins(golden_logins(), false),
         ));
-        config.admission = Arc::new(HostAdmission {
-            total_memory: 64 * GIB,
-        });
         // Whatever this machine's memory and disk are doing, and without
         // holding it awake.
-        config.pressure = Arc::new(vibed::pressure::NoPressure);
+        config.memory = Arc::new(|| Some(golden_memory()));
+        config.pressure = Arc::new(Warned);
         config.free_disk = Arc::new(|_: &Path| Some(1 << 40));
         config.power = Arc::new(vibed::power::NoPower);
         config.clock = Arc::new(|| GOLDEN_NOW);

@@ -19,7 +19,7 @@ v1 is one owner, one Mac, any number of Linux hosts, many agents. MCP matters mo
 1. **MCP is the control plane, shaped like VibeOS's.** The round that already drives a working orchestrator stays: start an agent with a prompt, `vibe_wait`, read what it said, answer its questions with `vibe_send`. It's folded to one agent per worktree. Host setup (projects, profiles, the Linux template) lives in Settings.
 2. **One agent, one worktree, one compartment.** Agents never share a checkout, because parallel work no longer needs sequencing inside one worktree.
 3. **Profiles pick the environment.** Each project has a few profiles, such as `software-eng-linux` and `software-eng-mac`. A profile sets the environment, model, reasoning level, permission mode and memory. `linux` is a micro-VM; `macos` runs natively under a resource governor, for Xcode and other Mac toolchains.
-4. **Many agents, responsive hosts.** With 4 GB profiles, about 7 agents can be awake at once on a 32 GB Mac, and 15 on 64 GB. Asleep agents use no RAM, so many more can exist, limited only by disk. No compartment can starve macOS, the daemon or another agent.
+4. **Many agents, responsive hosts.** An agent's memory is a ceiling, not a reservation: start as many as you like, such as ten 4 GB agents on a 12 GB host, and the host swaps if they really use it all. VibeOS never refuses an agent for memory; it holds each to its ceiling and shows what each, and each host, really uses. Asleep agents use no CPU, and asleep `linux` VMs no RAM, so many more can exist, limited only by disk. No single agent can take more than its ceiling.
 5. **Know what every agent is doing without hooks.** agent-tail reads Claude Code's transcripts, and no Claude config is changed.
 6. **Idle agents cost close to nothing and wake exactly where they were.** About a minute after agent-tail says an agent is at rest with nothing attached, a `linux` VM is paused and saved to disk, freeing all its RAM, and a `macos` agent is frozen. A send or an attach brings it back mid-prompt, even mid-question.
 7. **No custom terminal.** Clicking an agent opens Terminal.app attached to the live session. Closing it detaches.
@@ -85,7 +85,7 @@ An agent, its worktree and its compartment are one unit. They're created togethe
 | Linux Claude config | Your Claude setup for `linux` agents (CLAUDE.md, settings, skills, MCP servers), made in the toolbox shell. Copied into each agent's own `~/.claude` when it starts. | `~/VibeOS/linux-claude/` |
 | Managed layer | Tools the daemon keeps current for every `linux` VM. In v1 that's only Claude Code. | Host disk image |
 | Toolbox shell | A Terminal session in a writable Linux VM, for changing the template and the Linux home. | Menu → Linux toolbox, or `vibe toolbox` |
-| Host limits | Everything that isn't per profile: memory and cores kept for macOS, CPU cores per agent, process count, disk. | Settings → Host, or `~/.config/vibeos/host.toml` |
+| Host limits | Everything that isn't per profile: cores kept for macOS, CPU cores per agent, agents awake at once, process count, disk. | Settings → Host, or `~/.config/vibeos/host.toml` |
 | Snapshot | A sleeping `linux` agent's whole VM, RAM included, saved to disk. Restoring it resumes the agent exactly. | `~/VibeOS/snapshots/<ref>` |
 | Session | The PTY the agent runs in. A shim holds it, so it outlives every client. | `…/run/<ref>.sock` |
 | Transcript | The session file Claude Code writes on its own. agent-tail reads it to get status. | `macos` and Linux hosts: `~/.claude/projects/`; `linux` on the Mac: the agent's own Claude home on the Mac |
@@ -108,7 +108,7 @@ An agent's life runs setup → start (worktree and compartment included) → wor
 2. **Add a project.** Settings → Projects → Add takes a GitHub `owner/name`, cloned with the Mac's `gh` login into `~/VibeOS/projects/`, or a local path. The project starts with two profiles, one per environment (see Profiles), which you can edit or add to. Removing a project forgets it and its profiles but leaves its files on disk; adding the same repo again picks up its existing clone. A project with agents can't be removed.
 3. **Start an agent.** `vibe_start_agent {project, profile, prompt}`, or New agent… in the menu. One call does it all:
    - fetch `origin` and cut a worktree on a new branch from the default branch (or from `from`), with `push.autoSetupRemote` set. Agents get their git settings through their environment (`GIT_CONFIG_*`), so the shared `.git/config` is unchanged
-   - check admission against host headroom, using the profile's memory
+   - check there's room: disk to spare, and fewer than `max_awake_agents` awake. Never memory: the profile's memory is the agent's ceiling, not a reservation
    - create the compartment: boot the VM for `linux`, or set up the governed tree for `macos`
    - run the optional `.vibe/setup.sh` inside it
    - pre-fill Claude's state so it opens straight to its prompt: first-run onboarding done (otherwise Claude stops at its theme picker) and the worktree trusted. Then start the shim, and launch `claude --session-id <uuid>` with the profile's model, reasoning level and mode. The prompt is an argument, never pasted, so a startup dialog can't swallow it.
@@ -178,7 +178,7 @@ struct Capabilities { sleep_frees_memory: bool, exact_after_reboot: bool,
 | `linux` on the Mac | Kernel, fixed at VM boot | Snapshot to disk | Yes | Yes | Yes |
 | `linux` on a Linux host | Kernel (cgroups v2) | cgroup freezer | No (may swap) | No, `--resume` | No |
 
-Policy reads only the traits and `Capabilities`. For example, admission sleeps an agent early to free memory only when `sleep_frees_memory` is true. "Freeze a process tree" is one shared building block: the `macos` sleeper, the cgroup freezer and `vibe-guest`'s freeze-before-snapshot all use it. A later backend, such as Firecracker on a Linux host that has KVM, is one new implementation.
+Policy reads only the traits and `Capabilities`. For example, memory pressure ends frozen agents only where `sleep_frees_memory` is false, as their sleep didn't give their memory back. "Freeze a process tree" is one shared building block: the `macos` sleeper, the cgroup freezer and `vibe-guest`'s freeze-before-snapshot all use it. A later backend, such as Firecracker on a Linux host that has KVM, is one new implementation.
 
 One conformance test suite holds every backend to the same contract: start, then its processes are visible; a limit hit pauses it; sleep then wake leaves the session exactly where it was, or reports `--resume` when `exact_after_reboot` says so; delete leaves nothing behind.
 
@@ -230,7 +230,7 @@ A profile is everything you choose when starting an agent, saved under a name. P
 - **Model:** Opus or Sonnet (`--model`).
 - **Reasoning:** Claude's effort level (`--effort`): `low`, `medium`, `high`, `xhigh` or `max`.
 - **Mode:** `auto` by default, or `bypass` (`--dangerously-skip-permissions`), in either environment. Bypass on `macos` is the owner's call.
-- **Memory:** the agent's high-water mark: a `linux` VM's fixed RAM, or a `macos` agent's hard limit. 4 GB by default, and adjustable per profile from 1 GB to 1 TB, in whole MB.
+- **Memory:** the agent's high-water mark: a `linux` VM's fixed RAM, a Linux host's cgroup `memory.max`, or a `macos` agent's hard limit. It's a ceiling the agent is held to, never memory set aside for it, so agents' memory may add up to more than the host has. 4 GB by default, and adjustable per profile from 1 GB to 1 TB, in whole MB.
 
 On a Linux host, a new project starts with one profile, `software-eng-linux`, with the same defaults. MCP clients see each project's profiles in `vibe_list_projects` and pass one by name to `vibe_start_agent`. An agent can't change profile or environment; start a new one `from` the same branch instead.
 
@@ -239,7 +239,6 @@ On a Linux host, a new project starts with one profile, `software-eng-linux`, wi
 Everything that isn't per profile is host-wide, in Settings → Host or `~/.config/vibeos/host.toml`. `vibed` reads the file on every use, so hand edits take effect at once, and edits from Settings keep the file's comments. A setting left out of the file has its default. Every number is a proposed default to check on real hardware:
 
 ```toml
-reserve_memory   = "4G"    # always left for macOS and vibed
 reserve_cores    = 2
 max_awake_agents = 16
 cpu_cores        = 4       # per agent
@@ -256,7 +255,9 @@ mcp_tailscale    = false   # MCP on this host's Tailscale address too
 
 `package_caches` is the opt-out from the shared caches (Mounts, below). It and `mcp_port` are set in this file only, not over the socket. `mcp_tailscale` is also set over the socket, by Settings.
 
-Admission reserves the profile's memory for each awake agent. If host headroom minus the reserve can't cover a new agent, agents still inside their idle debounce go to sleep early, oldest first. If there's still no room, the start is refused with a clear reason. Starts never queue.
+There's no admission by memory. A start or a wake never reserves the profile's memory and is never refused for memory, whatever the other agents' profiles add up to or the host's memory pressure: each agent's memory is only its ceiling, and the host swaps if its agents use more than it has. What's checked is disk (Failures, Low disk) and `max_awake_agents`: past it, agents still inside their idle debounce go to sleep early, oldest first, and if none is idle the start is refused with a clear reason. Starts never queue. `reserve_memory`, from earlier versions, means nothing now; a `host.toml` that still sets it is read as if it didn't.
+
+Instead, `vibed` reports what memory is really used: each agent's against its ceiling (what the guest reports in a `linux` VM, the cgroup's `memory.current` on a Linux host, the governor's `phys_footprint` sum in `macos`), and each host's used and total, with its swap. `agents.list` and `hosts.list` carry them, MCP's `vibe_list_agents` too, and the menu shows them. While the kernel says a host is short of memory (macOS's memory-pressure level; Linux's pressure stall information, or under 5% left where it has none), that's a warning in the menu's header and in `vibe_list_agents`, never a block.
 
 ### How `macos` is governed
 
@@ -398,7 +399,7 @@ MCP is the product. It keeps the shape of VibeOS's MCP, which already drives a w
 | --- | --- | --- |
 | `vibe_list_projects` | Projects on every connected host, each with its host and its profiles: name, environment, model, reasoning, mode, memory | Same tool; profile fields changed |
 | `vibe_start_agent` | `{project, profile, prompt, host?, from?: branch, name?}` → ref. `host` is only needed when the same project exists on more than one host. Creates the worktree, branch, compartment and agent in one call, and submits the prompt | Replaces `vibe_create_workspace` + `vibe_open_window` |
-| `vibe_list_agents` | Agents on every connected host, with their host, state, activity, profile, worktree path, branch, live memory and attach command. Filters: `host`, `project`, `state` | Replaces `vibe_list_workspaces` + `vibe_list_windows` |
+| `vibe_list_agents` | Agents on every connected host, with their host, state, activity, profile, worktree path, branch, live memory against its limit and attach command; and each host's memory used/total, swap, and a warning while it's short of memory. Filters: `host`, `project`, `state` | Replaces `vibe_list_workspaces` + `vibe_list_windows` |
 | `vibe_send` | `text`, submitted unless `submit: false`, or `keys` (`["2"]`, `["Escape"]`, `["Down", "Enter"]`). Wakes a sleeping or exited agent first | Same |
 | `vibe_wait` | Blocks until an agent, or the first of several, answers the last send, not just until it's quiet. `background: true` also waits for commands it left running. Progress every 20 s and on every change; up to 240 s, default 120 | Same |
 | `vibe_read_messages` | The agent's last messages, from its transcript | Same |
@@ -419,7 +420,7 @@ The menu bar lists every agent this app started, across all hosts and projects, 
 
 **The menu** (`MenuBarExtra`, window style, so rows can be rich):
 
-- **Header:** agent count, the Mac's memory used/total, `gh` login state, MCP on/off, and each Linux host's link (connected or down) and external-address state.
+- **Header:** agent count, the Mac's memory used/total (and swap in use), `gh` login state, MCP on/off, and each Linux host's link (connected or down), memory used/total and external-address state. While a host is short of memory, a warning says so; it never stops a start or a wake.
 - **Agent rows,** grouped by host, then project, each tagged with its profile. Each row shows:
   - a state dot: busy (pulsing), question (amber), idle (grey), asleep (hollow), paused or exited (red)
   - the label or ref
@@ -551,12 +552,12 @@ Never put to sleep: `thinking`, `running_tool` or `background_work`.
 | A snapshot won't restore | The snapshot is discarded and the agent resumes with `claude --resume` in a fresh VM. Its state notes that any pending question was lost |
 | Claude exits on its own | `exited`, with its code. Attached clients print the reason and close. A send resumes it |
 | Reboot or logout | Every process ends. At login every agent is `asleep`. `linux` agents wake from their snapshots; `macos` agents wake with `claude --resume` |
-| Critical host memory pressure (`DISPATCH_SOURCE_TYPE_MEMORYPRESSURE`) | Refuse new agents, put idle agents to sleep early, then pause the `macos` agent furthest over 80% of its memory. A paused agent is killed (resumable) after a 5 min grace period if pressure stays critical |
+| Critical host memory pressure (`DISPATCH_SOURCE_TYPE_MEMORYPRESSURE`) | Warn in the menu's header (from macOS's warn level on); new agents still start. Put idle agents to sleep early, then pause the `macos` agent furthest over 80% of its memory. A paused agent is killed (resumable) after a 5 min grace period if pressure stays critical |
 | System sleep | While any agent is awake, `vibed` holds an IOPM no-idle-sleep assertion. Display sleep is still allowed |
 | Low disk | New agents are refused below 10 GB free (proposed). A `linux` agent whose snapshot wouldn't fit stays awake instead of sleeping |
 | The SSH link to a Linux host drops | That host's agents show as unavailable in the menu and MCP. They keep running on the host, and the link reconnects with backoff |
 | A Linux host reboots | systemd starts `vibed` again (the user service has lingering enabled). Every agent there is `asleep` and wakes with `claude --resume` |
-| Memory pressure on a Linux host | Refuse new agents there, then end frozen agents, oldest first (resumable). Each cgroup's own memory limit stops a single agent from taking the server |
+| Memory pressure on a Linux host | Warn in the menu's header, then end frozen agents, oldest first (resumable), as a last resort. New agents still start. Each cgroup's own memory limit stops a single agent from taking the server |
 | The Mac is offline while a host is the external address | The host keeps answering for its own agents; Mac agents show as unavailable until the tunnel is back |
 
 **Where state lives:**
@@ -646,7 +647,7 @@ None. The last one, one-shot cron jobs being cleared by an unrelated fire, was f
 
 *Profiles and projects*
 
-- Profiles belong to projects and set environment, model, reasoning level, mode (`auto` or `bypass`) and memory. Memory is a per-profile high-water mark, 4 GB by default.
+- Profiles belong to projects and set environment, model, reasoning level, mode (`auto` or `bypass`) and memory. Memory is a per-profile high-water mark, 4 GB by default: a ceiling, never a reservation.
 - A new project on the Mac starts with a `linux` and a `macos` profile; on a Linux host, with one `linux` profile. All use Opus, high reasoning, `auto` and 4 GB.
 - Any profile may use `bypass`, including `macos`; that's the owner's call.
 - Projects are added in Settings, or with `vibe project add` on a Linux host, from GitHub `owner/name` or a local path.

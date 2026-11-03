@@ -20,12 +20,9 @@ struct LiveMenuTests {
         let client = VibedClient(socketPath: environment["VIBE_TEST_SOCKET"] ?? "")
         let repo = try #require(environment["VIBE_TEST_REPO"])
         let project = try client.call(ProjectsAdd.self, ProjectAddParams(path: repo))
-        // 1G agents and nothing kept back, so one fits on any Mac.
+        // A 1G agent: its ceiling, which nothing reserves.
         _ = try client.call(
             ProfilesUpdate.self, ProfileUpdateParams(project: project.name, profile: "software-eng-mac", memory: 1 << 30))
-        var limits = LimitsSetParams()
-        limits.reserveMemory = 0
-        _ = try client.call(LimitsSet.self, limits)
 
         // No poll: only vibed's events may move the menu.
         let terminal = FakeTerminal()

@@ -258,6 +258,15 @@ impl Daemon for Core {
         Ok(hosts)
     }
 
+    fn memory(&self) -> Vec<(String, vibe_core::rpc::MemoryUse)> {
+        Core::hosts(self)
+            .map(|l| l.hosts)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|h| Some((h.name, h.memory?)))
+            .collect()
+    }
+
     async fn projects(&self, c: &Caller, host: &str) -> Result<Vec<Project>, ErrorObject> {
         if let Some(mac) = self.mac_for(host) {
             let v = mac

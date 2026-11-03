@@ -24,14 +24,11 @@ use common::{Golden, workspace_bin};
 use vibe_core::claude_token::TOKEN_ENV;
 use vibe_core::model::Environment;
 use vibe_core::paths::Layout;
-use vibe_core::rpc::{
-    AgentDeleteParams, AgentStartParams, HostParams, LimitsSetParams, ProjectAddParams,
-};
+use vibe_core::rpc::{AgentDeleteParams, AgentStartParams, HostParams, ProjectAddParams};
 use vibe_core::shim::{self, Frame, FrameKind, control_hello};
-use vibe_core::units::GIB;
 use vibe_env::linux::{LinuxVm, Real, TokenSource};
 use vibe_env::{Handle, Sleeper, vm};
-use vibed::agents::{Backends, HostAdmission};
+use vibed::agents::Backends;
 use vibed::core::{Config, Core, DaemonInfo};
 
 fn absolute(path: PathBuf) -> PathBuf {
@@ -126,9 +123,6 @@ async fn a_linux_agent_answers_on_opus_and_carries_on_after_sleep() {
     config.gh = golden.gh.clone().into();
     config.shim = workspace_bin("vibe-shim").into_os_string();
     config.backends = Backends::new().with(Environment::Linux, backend.clone());
-    config.admission = Arc::new(HostAdmission {
-        total_memory: 64 * GIB,
-    });
     let core = Arc::new(Core::open(config).unwrap());
     let project = golden.home.join("src/app");
     core.add_project(ProjectAddParams {
@@ -136,11 +130,6 @@ async fn a_linux_agent_answers_on_opus_and_carries_on_after_sleep() {
         ..Default::default()
     })
     .await
-    .unwrap();
-    core.set_limits(LimitsSetParams {
-        reserve_memory: Some(0),
-        ..Default::default()
-    })
     .unwrap();
 
     // The starter profile as it comes: Opus, high, auto, 4 GB.

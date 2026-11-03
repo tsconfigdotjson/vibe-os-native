@@ -1,5 +1,5 @@
-//! Critical memory pressure (PRD: Failures): refuse new agents, put idle
-//! agents to sleep early, and then, while it lasts:
+//! Critical memory pressure (PRD: Failures): put idle agents to sleep
+//! early, and then, while it lasts:
 //!
 //! - on a backend whose limits a supervisor holds (`kernel_limits` false,
 //!   as `macos`'s are), pause the agent furthest over 80% of its memory,
@@ -379,15 +379,6 @@ impl Core {
             }
         }
         self.keep_pressure_pauses(&paused);
-    }
-
-    /// Why a start must be refused now, if memory is short.
-    pub(crate) fn short_of_memory(&self) -> Option<String> {
-        let reading = self.pressure.read().filter(Reading::high)?;
-        Some(format!(
-            "this host is short of memory right now ({reading}). Try again once it eases, or \
-             delete agents you're done with"
-        ))
     }
 
     /// Reads the pressure at `now`, and acts on it: idle agents sleep early

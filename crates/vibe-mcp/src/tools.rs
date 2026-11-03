@@ -19,7 +19,7 @@ use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler};
 use serde_json::{Value, json};
 use vibe_core::model::{AgentState, LOCAL_HOST};
-use vibe_core::rpc::{Agent, AgentDeleteParams, AgentStartParams, ErrorCode};
+use vibe_core::rpc::{Agent, AgentDeleteParams, AgentStartParams, ErrorCode, MemoryUse};
 
 use crate::{
     AgentView, Caller, Check, Daemon, Error, Input, Message, Role, Target, display_ref, keys,
@@ -257,7 +257,7 @@ pub(crate) fn tools() -> Vec<Tool> {
         tool(
             "vibe_list_agents",
             "List agents",
-            "Lists the agents on every connected host, with their ref, host, state (busy, idle, question, asleep, paused or exited), activity, profile, worktree, branch, memory and the command that attaches a terminal.",
+            "Lists the agents on every connected host, with their ref, host, state (busy, idle, question, asleep, paused or exited), activity, profile, worktree, branch, memory (what it uses now, against its profile's limit, the most it may use) and the command that attaches a terminal. Also each host's memory: what's in use of its total, its swap, and why it's short of memory, while it is. Memory never stops an agent from starting: a host swaps if its agents use more than it has.",
             json!({"type": "object", "properties": {
                 "host": {"type": "string", "description": "Only this host's"},
                 "project": {"type": "string", "description": "Only this project's"},
@@ -391,6 +391,42 @@ fn agent_line(v: &AgentView) -> String {
         ));
     }
     parts.join("  ")
+}
+
+/// A host's memory as a line: in use of its total, its swap, and why it's
+/// short, while it is.
+fn memory_line(host: &str, m: &MemoryUse) -> String {
+    let mut line = format!(
+        "{host}: {} of {} memory in use",
+        human(m.used),
+        human(m.total)
+    );
+    if m.swap_total > 0 {
+        line.push_str(&format!(
+            ", {} of {} swap",
+            human(m.swap_used),
+            human(m.swap_total)
+        ));
+    }
+    if let Some(why) = &m.pressure {
+        line.push_str(&format!(
+            ". Short of memory: {why}. Agents keep running, and it swaps"
+        ));
+    }
+    line
+}
+
+/// A host's memory in MCP's names, as an agent's are: `memory` for what's
+/// in use, beside its total and swap.
+fn memory_json(host: &str, m: &MemoryUse) -> Value {
+    json!({
+        "host": host,
+        "memory": m.used,
+        "memory_total": m.total,
+        "swap": m.swap_used,
+        "swap_total": m.swap_total,
+        "pressure": m.pressure,
+    })
 }
 
 fn limited_until(a: &vibe_core::rpc::Agent) -> Option<String> {
@@ -593,7 +629,15 @@ impl<D: Daemon> Server<D> {
         }
         text.extend(unreachable);
         let list: Vec<Value> = agents.iter().map(agent_json).collect();
-        ok(&text.join("\n"), json!({ "agents": list }))
+        let memory: Vec<(String, MemoryUse)> = self
+            .daemon
+            .memory()
+            .into_iter()
+            .filter(|(h, _)| only.as_ref().is_none_or(|o| o == h))
+            .collect();
+        text.extend(memory.iter().map(|(h, m)| memory_line(h, m)));
+        let hosts: Vec<Value> = memory.iter().map(|(h, m)| memory_json(h, m)).collect();
+        ok(&text.join("\n"), json!({ "agents": list, "hosts": hosts }))
     }
 
     async fn send(&self, c: &Caller, args: &JsonObject) -> Outcome {

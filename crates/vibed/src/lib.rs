@@ -14,6 +14,7 @@ pub mod link;
 pub mod linux;
 pub mod logging;
 pub mod mcp;
+pub mod memory;
 pub mod power;
 pub mod pressure;
 pub mod projects;

@@ -5,7 +5,6 @@
     "jsonrpc": "2.0",
     "id": 60,
     "result": {
-      "reserve_memory": 4294967296,
       "reserve_cores": 2,
       "max_awake_agents": 16,
       "cpu_cores": 4,

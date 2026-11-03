@@ -894,10 +894,45 @@ public struct HostInfo: Codable, Hashable, Sendable {
     /// While it's the external address and something keeps it from
     /// working, or holds it up, what, and how to fix it.
     public var externalDetail: String?
+    /// What its memory is doing now: this host's own, and a Linux host's
+    /// from its last ping while its link is up.
+    public var memory: MemoryUse?
 
     public enum CodingKeys: String, CodingKey, CaseIterable {
         case name, os, label, link, external, mcp, address, version, missing, detail, url, tunnel
         case externalDetail = "external_detail"
+        case memory
+    }
+}
+
+/// A host's memory as its kernel measures it. A report, never a limit: each
+/// agent's memory is a ceiling it's held to, and nothing is refused for
+/// memory; the host swaps if its agents use more than it has.
+public struct MemoryUse: Codable, Hashable, Sendable {
+    /// Physical memory, in bytes.
+    public var total: Int
+    /// In use, in bytes: on macOS as Activity Monitor counts it.
+    public var used: Int
+    /// Swap, in bytes: 0 with none.
+    public var swapTotal: Int
+    public var swapUsed: Int
+    /// While the host is short of memory, as its kernel says, why. A
+    /// warning only.
+    public var pressure: String?
+
+    public init(total: Int, used: Int, swapTotal: Int = 0, swapUsed: Int = 0, pressure: String? = nil) {
+        self.total = total
+        self.used = used
+        self.swapTotal = swapTotal
+        self.swapUsed = swapUsed
+        self.pressure = pressure
+    }
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case total, used
+        case swapTotal = "swap_total"
+        case swapUsed = "swap_used"
+        case pressure
     }
 }
 
@@ -1144,7 +1179,6 @@ public struct ProfileParams: Codable, Hashable, Sendable {
 
 /// Host-wide limits. Sizes are bytes; `idleDebounce` is seconds.
 public struct HostLimits: Codable, Hashable, Sendable {
-    public var reserveMemory: Int
     public var reserveCores: Int
     public var maxAwakeAgents: Int
     public var cpuCores: Int
@@ -1156,7 +1190,6 @@ public struct HostLimits: Codable, Hashable, Sendable {
     public var snapshotDisk: Int
 
     public enum CodingKeys: String, CodingKey, CaseIterable {
-        case reserveMemory = "reserve_memory"
         case reserveCores = "reserve_cores"
         case maxAwakeAgents = "max_awake_agents"
         case cpuCores = "cpu_cores"
@@ -1172,7 +1205,6 @@ public struct HostLimits: Codable, Hashable, Sendable {
 /// The settings to change; nil ones keep their values.
 public struct LimitsSetParams: Codable, Hashable, Sendable {
     public var host: String?
-    public var reserveMemory: Int?
     public var reserveCores: Int?
     public var maxAwakeAgents: Int?
     public var cpuCores: Int?
@@ -1189,7 +1221,6 @@ public struct LimitsSetParams: Codable, Hashable, Sendable {
 
     public enum CodingKeys: String, CodingKey, CaseIterable {
         case host
-        case reserveMemory = "reserve_memory"
         case reserveCores = "reserve_cores"
         case maxAwakeAgents = "max_awake_agents"
         case cpuCores = "cpu_cores"

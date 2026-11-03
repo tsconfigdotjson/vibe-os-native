@@ -1,12 +1,12 @@
-//! Sleep, wake and admission (#6), as one scripted scenario run on every
-//! backend, with the stand-in for Claude Code:
+//! Sleep, wake and admission (#6, #47), as one scripted scenario run on
+//! every backend, with the stand-in for Claude Code:
 //!
 //! 1. idle → asleep once the idle debounce has passed, not before, with
 //!    the Mac let go of; reads don't wake it;
 //! 2. a send wakes it, and so does an attach;
-//! 3. a start the host has no room for puts an idle agent to sleep first,
-//!    on a backend where that frees memory; elsewhere it's refused, unless
-//!    it's `max_awake_agents` that's full;
+//! 3. a start past the host's memory goes ahead, with nothing put to sleep
+//!    for it, as memory is a ceiling, not a reservation; one past
+//!    `max_awake_agents` puts an idle agent to sleep first;
 //! 4. a firm `/loop` wakeup fires on time from a sleeping agent.
 //!
 //! On the test backend, both as one whose sleep keeps memory and as one
@@ -39,7 +39,7 @@ use vibe_core::units::{GIB, MIB};
 use vibe_env::testing::{TEST_SNAPSHOT, TestBackend};
 use vibe_env::{Backend, Handle};
 use vibe_mcp::Input;
-use vibed::agents::{Backends, HostAdmission};
+use vibed::agents::Backends;
 use vibed::core::{Config, Core};
 use vibed::power::RecordedPower;
 use vibed::pressure::{
@@ -109,8 +109,8 @@ fn parse_time(s: &str) -> f64 {
 }
 
 /// The golden world, on the backend `make` makes for its home, for
-/// `environment`, with the real clock, a host with room for two 1G agents,
-/// and the sleep watch looking every 200 ms.
+/// `environment`, with the real clock, a host with 2G of memory and 1G
+/// agents, and the sleep watch looking every 200 ms.
 async fn world(
     make: impl FnOnce(&Golden) -> Arc<dyn Backend>,
     environment: Environment,
@@ -123,8 +123,14 @@ async fn world(
     let mut config = golden.config();
     config.clock = Arc::new(vibe_core::time::now);
     config.backends = Backends::new().with(environment, Arc::clone(&backend));
-    config.admission = Arc::new(HostAdmission {
-        total_memory: 2 * GIB,
+    config.memory = Arc::new(|| {
+        Some(vibe_core::rpc::MemoryUse {
+            total: 2 * GIB,
+            used: GIB,
+            swap_total: 0,
+            swap_used: 0,
+            pressure: None,
+        })
     });
     config.power = power.clone();
     config.sleep_timing = Timing {
@@ -150,7 +156,6 @@ async fn world(
         .unwrap();
     }
     core.set_limits(LimitsSetParams {
-        reserve_memory: Some(0),
         idle_debounce: Some(times.debounce),
         ..Default::default()
     })
@@ -422,8 +427,10 @@ async fn scenario(w: &World) {
     assert_ne!(w.state(&r).await, AgentState::Asleep);
     w.wait_screen(&r, "> hello", wait(10)).await;
 
-    // 3. A start the host has no room for: 1.5G more doesn't fit beside
-    // its 1G of 2G. It's still inside its debounce now.
+    // 3. A start past the host's memory: 1.5G beside its 1G, on a 2G
+    // host. Memory is a ceiling, not a reservation (#47), so it goes
+    // ahead, on every backend, and nothing sleeps early to make room for
+    // it, though it's still inside its debounce now.
     w.set(LimitsSetParams {
         idle_debounce: Some(600),
         ..Default::default()
@@ -431,44 +438,33 @@ async fn scenario(w: &World) {
     tokio::time::sleep(vibed::sleep::AFTER_WAKE + Duration::from_secs(1)).await;
     w.wait_state(&r, AgentState::Idle, wait(10)).await;
     w.profile_memory(1536 * MIB);
-    let started = w.core.start_agent(w.start("talk")).await;
+    let b = w
+        .core
+        .start_agent(w.start("talk"))
+        .await
+        .unwrap_or_else(|e| panic!("{}", e.message));
+    assert_eq!(b.memory, 1536 * MIB);
+    assert_eq!(w.state(&r).await, AgentState::Idle);
+    w.wait_screen(&b.agent, "Ready.", wait(60)).await;
+    w.delete(&b.agent).await;
+    // When it's max_awake_agents that's full, an idle agent's sleep makes
+    // room.
+    w.profile_memory(GIB);
+    w.set(LimitsSetParams {
+        max_awake_agents: Some(1),
+        ..Default::default()
+    });
+    let b = w.core.start_agent(w.start("talk")).await.unwrap();
+    assert_eq!(w.state(&r).await, AgentState::Asleep);
     if caps.sleep_frees_memory {
-        // Its sleep gives its memory back, so it sleeps early, first.
-        let b = started.unwrap_or_else(|e| panic!("{}", e.message));
-        assert_eq!(w.state(&r).await, AgentState::Asleep);
         assert!(w.backend.saved(&w.handle(&r)).is_some());
-        w.wait_screen(&b.agent, "Ready.", wait(60)).await;
-        w.delete(&b.agent).await;
-    } else {
-        // Its sleep would free nothing, so it's left awake, and the start
-        // refused with the reason.
-        let err = started.unwrap_err();
-        assert_eq!(err.code, ErrorCode::Conflict.code());
-        assert!(
-            err.message.contains("no room for an agent with 1.5G")
-                && err
-                    .message
-                    .contains("No idle agent would free memory by going to sleep"),
-            "{}",
-            err.message
-        );
-        assert_ne!(w.state(&r).await, AgentState::Asleep);
-        // When it's max_awake_agents that's full, any idle agent's sleep
-        // makes room.
-        w.profile_memory(GIB);
-        w.set(LimitsSetParams {
-            max_awake_agents: Some(1),
-            ..Default::default()
-        });
-        let b = w.core.start_agent(w.start("talk")).await.unwrap();
-        assert_eq!(w.state(&r).await, AgentState::Asleep);
-        w.wait_screen(&b.agent, "Ready.", wait(60)).await;
-        w.delete(&b.agent).await;
-        w.set(LimitsSetParams {
-            max_awake_agents: Some(16),
-            ..Default::default()
-        });
     }
+    w.wait_screen(&b.agent, "Ready.", wait(60)).await;
+    w.delete(&b.agent).await;
+    w.set(LimitsSetParams {
+        max_awake_agents: Some(16),
+        ..Default::default()
+    });
     w.profile_memory(GIB);
 
     // 4. A firm /loop wakeup fires on time from a sleeping agent: it
@@ -685,13 +681,7 @@ async fn three_on_disk(claude: &Path, change: impl FnOnce(&mut Config)) -> (Worl
     let make = |_: &Golden| -> Arc<dyn Backend> {
         Arc::new(TestBackend::new(claude).sleeping_to_disk(64 * MIB))
     };
-    let w = world(make, Environment::Linux, QUICK, |c| {
-        c.admission = Arc::new(HostAdmission {
-            total_memory: 8 * GIB,
-        });
-        change(c);
-    })
-    .await;
+    let w = world(make, Environment::Linux, QUICK, change).await;
     w.set(LimitsSetParams {
         idle_debounce: Some(600),
         ..Default::default()
@@ -845,16 +835,20 @@ async fn critical_pressure_sleeps_idle_agents_then_pauses_and_ends_the_hog() {
     let (_, mut events) = w.core.subscribe();
 
     pressure.set(Some(Level::Critical.into()));
-    // Nothing new starts, and idle agents sleep early, at once.
-    let err = w.core.start_agent(w.start("more")).await.unwrap_err();
-    assert!(
-        err.message.contains("short of memory right now")
-            && err
-                .message
-                .contains("macOS says memory pressure is critical"),
-        "{}",
-        err.message
+    // A start still goes ahead (#47): critical pressure is warned of, and
+    // never refuses one.
+    let more = w
+        .core
+        .start_agent(w.start("more"))
+        .await
+        .unwrap_or_else(|e| panic!("{}", e.message));
+    let local = w.core.hosts().unwrap().hosts.remove(0);
+    assert_eq!(
+        local.memory.and_then(|m| m.pressure).as_deref(),
+        Some("macOS says memory pressure is critical")
     );
+    w.delete(&more.agent).await;
+    // Idle agents sleep early, at once.
     let mut watch = PressureWatch::default();
     let t0 = Instant::now();
     assert_eq!(w.core.check_pressure(&mut watch, t0).await, None);
@@ -1069,9 +1063,6 @@ async fn a_pressure_pause_outlives_a_restart_of_vibed() {
         c.backends = Backends::all(Arc::new(
             TestBackend::new(&claude).reporting_memory(900 * MIB),
         ));
-        c.admission = Arc::new(HostAdmission {
-            total_memory: 8 * GIB,
-        });
         c
     };
     let core = Arc::new(Core::open(config()).unwrap());
@@ -1080,11 +1071,6 @@ async fn a_pressure_pause_outlives_a_restart_of_vibed() {
         ..Default::default()
     })
     .await
-    .unwrap();
-    core.set_limits(LimitsSetParams {
-        reserve_memory: Some(0),
-        ..Default::default()
-    })
     .unwrap();
     core.update_profile(ProfileUpdateParams {
         project: "app".into(),

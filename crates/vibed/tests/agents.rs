@@ -22,7 +22,7 @@ use vibe_core::shim::{self, Frame, FrameKind, control_hello};
 use vibe_core::units::GIB;
 use vibe_env::ClaudeHome;
 use vibe_env::tree::SessionTree;
-use vibed::agents::{Backends, HostAdmission};
+use vibed::agents::Backends;
 use vibed::core::Core;
 
 struct World {
@@ -602,30 +602,102 @@ async fn a_host_without_a_backend_for_the_environment_refuses() {
 }
 
 #[tokio::test]
-async fn admission_refuses_with_a_reason() {
+async fn memory_is_a_ceiling_not_a_reservation() {
+    // A 6G host whose awake agents' profiles already ask for more than it
+    // has (#47): each agent's memory is the most it may use, so a 4G start
+    // still goes ahead, and the host swaps if they use it all.
     let w = world_with(|c| {
-        c.admission = Arc::new(HostAdmission {
-            total_memory: 6 * GIB,
+        c.memory = Arc::new(|| {
+            Some(vibe_core::rpc::MemoryUse {
+                total: 6 * GIB,
+                used: 5 * GIB,
+                swap_total: 0,
+                swap_used: 0,
+                pressure: None,
+            })
+        });
+        c.pressure = Arc::new(vibed::pressure::NoPressure);
+    })
+    .await;
+    w.core
+        .update_profile(ProfileUpdateParams {
+            project: "app".into(),
+            profile: "software-eng-linux".into(),
+            memory: Some(4 * GIB),
+            ..Default::default()
+        })
+        .unwrap();
+    let mut started = Vec::new();
+    for prompt in ["one", "two", "three"] {
+        let a = w.core.start_agent(start(prompt)).await.unwrap();
+        assert_eq!(a.memory, 4 * GIB);
+        started.push(a);
+    }
+    for a in &started {
+        w.wait_screen(&a.agent, "Working on:");
+    }
+    // 12G of ceilings on a 6G host, all awake, and each one's real use
+    // reported against its ceiling.
+    let list = w.list().await;
+    assert_eq!(list.len(), 3);
+    for a in &list {
+        assert_ne!(a.state, AgentState::Asleep, "{a:?}");
+        assert_eq!(
+            (a.memory, a.memory_used),
+            (4 * GIB, Some(common::AGENT_MEMORY_USED))
+        );
+    }
+    // A wake doesn't count memory either.
+    let one = &started[0].agent;
+    w.core.sleep_agent(None, one).await.unwrap();
+    let woke = w.core.resume_agent(None, one).await.unwrap();
+    assert_ne!(woke.state, AgentState::Asleep);
+    // The host's own use, as its kernel measures it, and no warning while
+    // it has room.
+    let local = w.core.hosts().unwrap().hosts.remove(0);
+    let memory = local.memory.expect("the host's memory");
+    assert_eq!((memory.used, memory.total), (5 * GIB, 6 * GIB));
+    assert_eq!(memory.pressure, None);
+    for a in &started {
+        w.core.delete_agent(delete(&a.agent, true)).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn the_host_reports_its_memory_and_warns_when_it_is_short() {
+    let w = world().await;
+    // The golden Mac: macOS warns of pressure, and it's only a warning.
+    let local = w.core.hosts().unwrap().hosts.remove(0);
+    assert_eq!(
+        local.memory,
+        Some(vibe_core::rpc::MemoryUse {
+            pressure: Some("macOS warns of memory pressure".into()),
+            ..common::golden_memory()
+        })
+    );
+    let a = w.core.start_agent(start("hello")).await.unwrap();
+    w.wait_screen(&a.agent, "Working on: hello");
+    w.core.delete_agent(delete(&a.agent, true)).await.unwrap();
+
+    // Where the kernel says nothing of pressure, under 5% free is short.
+    let w = world_with(|c| {
+        c.pressure = Arc::new(vibed::pressure::NoPressure);
+        c.memory = Arc::new(|| {
+            Some(vibe_core::rpc::MemoryUse {
+                total: 16 * GIB,
+                used: 15 * GIB + 900 * 1024 * 1024,
+                swap_total: 0,
+                swap_used: 0,
+                pressure: None,
+            })
         });
     })
     .await;
-    // 6G, less the 4G kept: room for two 1G agents, then none.
-    let a = w.core.start_agent(start("one")).await.unwrap();
-    let b = w.core.start_agent(start("two")).await.unwrap();
-    let err = w.core.start_agent(start("three")).await.unwrap_err();
-    assert_eq!(code(&err), ErrorCode::Conflict);
+    let memory = w.core.hosts().unwrap().hosts.remove(0).memory.unwrap();
     assert_eq!(
-        err.message,
-        "can't start an agent: there's no room for an agent with 1G of memory: this host has \
-         6G, keeps 4G for itself (reserve_memory), and its agents hold 2G. No idle agent would \
-         free memory by going to sleep"
+        memory.pressure.as_deref(),
+        Some("only 124M of its 16G is free")
     );
-    // An agent whose session has gone holds nothing.
-    w.session(&b.agent).end(Duration::from_secs(5));
-    let c = w.core.start_agent(start("three")).await.unwrap();
-    for r in [&a.agent, &b.agent, &c.agent] {
-        w.core.delete_agent(delete(r, true)).await.unwrap();
-    }
 }
 
 #[tokio::test]
@@ -1161,13 +1233,15 @@ async fn untracked_files_count_even_when_the_repo_hides_them() {
 
 #[tokio::test]
 async fn starts_at_once_dont_share_the_last_room() {
-    let w = world_with(|c| {
-        c.admission = Arc::new(HostAdmission {
-            total_memory: 6 * GIB,
-        });
-    })
-    .await;
-    // Room for two 1G agents; three start at once.
+    let w = world().await;
+    w.core
+        .set_limits(vibe_core::rpc::LimitsSetParams {
+            max_awake_agents: Some(2),
+            ..Default::default()
+        })
+        .unwrap();
+    // Room for two awake agents; three start at once, and none is idle to
+    // make room.
     let (a, b, c) = tokio::join!(
         w.core.start_agent(start("one")),
         w.core.start_agent(start("two")),
@@ -1178,7 +1252,11 @@ async fn starts_at_once_dont_share_the_last_room() {
     let refused: Vec<_> = results.iter().filter_map(|r| r.as_ref().err()).collect();
     assert_eq!(started.len(), 2, "{refused:?}");
     assert_eq!(refused.len(), 1);
-    assert!(refused[0].message.contains("no room"), "{:?}", refused[0]);
+    assert!(
+        refused[0].message.contains("(max_awake_agents)"),
+        "{:?}",
+        refused[0]
+    );
     for a in started {
         w.core.delete_agent(delete(&a.agent, true)).await.unwrap();
     }
@@ -1680,7 +1758,7 @@ fn kernel_limited(claude: &Path) -> vibe_env::testing::TestBackend {
 }
 
 #[tokio::test]
-async fn memory_pressure_refuses_starts_then_ends_frozen_agents_oldest_first() {
+async fn memory_pressure_warns_then_ends_frozen_agents_oldest_first() {
     use std::time::Instant;
     use vibe_core::model::Environment;
     use vibed::pressure::{END_AFTER, END_EVERY, PressureWatch};
@@ -1723,16 +1801,14 @@ async fn memory_pressure_refuses_starts_then_ends_frozen_agents_oldest_first() {
     let awake = w.core.start_agent(mac("hello")).await.unwrap();
     w.wait_screen(&awake.agent, "Working on: hello");
 
-    // Short of memory, nothing new starts, and it says why.
+    // Short of memory, a start still goes ahead (#47): the host warns of
+    // it, and says why.
     pressure.set(45.0);
-    let err = w.core.start_agent(mac("more")).await.unwrap_err();
-    assert_eq!(code(&err), ErrorCode::Conflict);
-    assert!(
-        err.message.contains("short of memory right now")
-            && err.message.contains("45% of the last 10 s"),
-        "{}",
-        err.message
-    );
+    let more = w.core.start_agent(mac("more")).await.unwrap();
+    w.wait_screen(&more.agent, "Working on: more");
+    let local = w.core.hosts().unwrap().hosts.remove(0);
+    let warned = local.memory.and_then(|m| m.pressure).unwrap_or_default();
+    assert!(warned.contains("45% of the last 10 s"), "{warned}");
     // Once it has lasted, the frozen agent asleep longest is ended, then
     // one more per interval while it lasts. One whose sleep gave its memory
     // back, and one awake, are left as they are.
@@ -1767,8 +1843,9 @@ async fn memory_pressure_refuses_starts_then_ends_frozen_agents_oldest_first() {
     assert!(!w.runs(&first.agent));
     assert!(w.runs(&saved.agent));
     assert!(w.runs(&awake.agent));
+    assert!(w.runs(&more.agent));
 
-    // Eased, starts go ahead again, and a pressure that comes back waits
+    // Eased, the warning goes, and a pressure that comes back waits
     // its time before anything more is ended.
     *pressure.0.lock().unwrap() = None;
     assert_eq!(
@@ -1786,7 +1863,9 @@ async fn memory_pressure_refuses_starts_then_ends_frozen_agents_oldest_first() {
     let back = w.core.resume_agent(None, &first.agent).await.unwrap();
     assert_eq!(back.session_id, first.session_id);
     w.wait_screen(&first.agent, &format!("Resumed {}.", first.session_id));
-    for a in [&first, &second, &saved, &awake, &later] {
+    let local = w.core.hosts().unwrap().hosts.remove(0);
+    assert_eq!(local.memory.and_then(|m| m.pressure), None);
+    for a in [&first, &second, &saved, &awake, &more, &later] {
         w.core.delete_agent(delete(&a.agent, true)).await.unwrap();
     }
     assert!(w.agent_files().is_empty(), "{:?}", w.agent_files());

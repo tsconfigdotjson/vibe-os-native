@@ -556,11 +556,12 @@ public func agentSummary(_ agents: [Agent]) -> String {
 
 /// A clause from vibed (`can't reach…`), capitalised to stand on its own as
 /// a sentence. One that starts with a command's name (`ssh: connect…`,
-/// `gh auth …`) is left as it is: the name is spelt that way.
+/// `gh auth …`), or a name with capitals of its own (`macOS says…`), is
+/// left as it is: the name is spelt that way.
 public func sentence(_ text: String) -> String {
     guard let first = text.first else { return text }
     let word = text.prefix { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" }
-    if commandNames.contains(String(word)) { return text }
+    if commandNames.contains(String(word)) || word.dropFirst().contains(where: \.isUppercase) { return text }
     return first.uppercased() + text.dropFirst()
 }
 
@@ -1013,6 +1014,18 @@ public func headerAlerts(gh: GhStatus?, hosts: [HostInfo]) -> [HeaderAlert] {
                 detail: "Its agents keep running. VibeOS reconnects on its own.",
                 reason: host.detail.map(sentence), tone: .trouble))
     }
+    // Short of memory: a warning, never a block. Nothing refuses a start
+    // or a wake for memory; each agent's memory is only its ceiling.
+    for host in hosts where host.link != .down {
+        guard let why = host.memory?.pressure else { continue }
+        let isMac = host.link == .local
+        alerts.append(
+            HeaderAlert(
+                id: "memory:\(host.name)", symbol: "memorychip", name: isMac ? nil : host.name,
+                headline: isMac ? "This Mac is short of memory" : "is short of memory",
+                detail: "Agents keep running, and it swaps. Delete agents you're done with to free some.",
+                reason: sentence(why), tone: .attention))
+    }
     for host in hosts where host.link == .connected {
         guard let external = externalStatus(host), external.tone == .trouble else { continue }
         alerts.append(
@@ -1037,15 +1050,25 @@ public func headerAlerts(gh: GhStatus?, hosts: [HostInfo]) -> [HeaderAlert] {
     return alerts
 }
 
+/// A host's memory in a few words: `58G of 64G`, and its swap while any is
+/// used: `58G of 64G · 3G swap`.
+public func memorySummary(_ memory: MemoryUse) -> String {
+    var text = "\(formatBytes(memory.used)) of \(formatBytes(memory.total))"
+    if memory.swapUsed > 0 { text += " · \(formatBytes(memory.swapUsed)) swap" }
+    return text
+}
+
 /// Every steady fact the header can show, in order: memory, `gh`, MCP, then
-/// each Linux host.
+/// each Linux host. The Mac's memory is what vibed measures, or the app's
+/// own reading until vibed says.
 public func headerFacts(memory: HostMemory?, gh: GhStatus?, mcp: Bool, hosts: [HostInfo]) -> [HeaderFact] {
     var facts: [HeaderFact] = []
-    if let memory {
+    let local = hosts.first { $0.link == .local }?.memory
+    if let mac = local ?? memory.map({ MemoryUse(total: $0.total, used: $0.used) }) {
         facts.append(
             HeaderFact(
-                id: "memory", label: "Memory", value: "\(formatBytes(memory.used)) of \(formatBytes(memory.total))",
-                symbol: "memorychip", tone: .normal))
+                id: "memory", label: "Memory", value: memorySummary(mac), symbol: "memorychip",
+                tone: mac.pressure == nil ? .normal : .attention))
     }
     let gitHub: (String, StatusTone)
     switch gh?.state {
@@ -1063,6 +1086,10 @@ public func headerFacts(memory: HostMemory?, gh: GhStatus?, mcp: Bool, hosts: [H
         if let external = externalStatus(host) {
             value += ", \(external.short)"
             if tone == .normal, external.tone == .trouble { tone = .attention }
+        }
+        if host.link == .connected, let memory = host.memory {
+            value += " · \(memorySummary(memory))"
+            if tone == .normal, memory.pressure != nil { tone = .attention }
         }
         facts.append(
             HeaderFact(id: "host:\(host.name)", label: host.name, value: value, symbol: "server.rack", tone: tone))

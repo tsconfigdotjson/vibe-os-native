@@ -16,6 +16,13 @@
           "label": "mac-mini",
           "link": "local",
           "mcp": false,
+          "memory": {
+            "pressure": "macOS warns of memory pressure",
+            "swap_total": 4294967296,
+            "swap_used": 3221225472,
+            "total": 68719476736,
+            "used": 62277025792
+          },
           "missing": [],
           "name": "local",
           "os": "macos",

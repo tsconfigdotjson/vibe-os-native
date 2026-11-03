@@ -32,7 +32,7 @@ use vibe_core::rpc::{
 use vibe_core::store::{NewProject, Store, StoreError};
 use vibe_core::time::rfc3339;
 
-use crate::agents::{Admission, Backends, HostAdmission};
+use crate::agents::Backends;
 use crate::link::{Link, Timing};
 use crate::remote::{Remote, Ssh};
 use crate::sessions::{self, Probe, SessionSpec};
@@ -86,8 +86,9 @@ pub struct Config {
     pub entropy: Entropy,
     /// What runs agents, by environment.
     pub backends: Backends,
-    /// Whether a new agent may start.
-    pub admission: Arc<dyn Admission>,
+    /// What the host's memory is doing, for `hosts.list`: this machine's,
+    /// by default. Nothing is admitted or refused by it (#47).
+    pub memory: crate::memory::MemoryGauge,
     /// How short of memory the host is: the kernel's pressure stall
     /// information on Linux, by default.
     pub pressure: Arc<dyn crate::pressure::MemoryPressure>,
@@ -127,7 +128,6 @@ impl std::fmt::Debug for Config {
             .field("gh", &self.gh)
             .field("shim", &self.shim)
             .field("backends", &self.backends)
-            .field("admission", &self.admission)
             .field("pressure", &self.pressure)
             .field("toolbox", &self.toolbox)
             .field("remote", &self.remote)
@@ -140,8 +140,8 @@ impl std::fmt::Debug for Config {
 impl Config {
     /// The real thing: the system clock, the OS's randomness, `gh` looked
     /// up where the doctor looks for tools each time it's run (see
-    /// [`Core::gh_program`]), the `vibe-shim` [`find_shim`] finds, and
-    /// admission by this machine's memory and its memory pressure. No
+    /// [`Core::gh_program`]), the `vibe-shim` [`find_shim`] finds, and this
+    /// machine's memory and its memory pressure. No
     /// backends: `vibed`'s `main` picks them for the machine it's on.
     pub fn new(info: DaemonInfo, layout: Layout) -> Self {
         let path = std::env::var_os("PATH");
@@ -155,7 +155,7 @@ impl Config {
             clock: Arc::new(vibe_core::time::now),
             entropy: Arc::new(keys::random_bytes),
             backends: Backends::new(),
-            admission: Arc::new(HostAdmission::current()),
+            memory: Arc::new(crate::memory::measure),
             pressure: Arc::new(crate::pressure::HostPressure),
             toolbox: None,
             tailscale: Arc::new(vibe_mcp::net::tailscale_addresses),
@@ -287,7 +287,7 @@ pub struct Core {
     clock: Clock,
     entropy: Entropy,
     pub(crate) backends: Backends,
-    pub(crate) admission: Arc<dyn Admission>,
+    pub(crate) memory_gauge: crate::memory::MemoryGauge,
     pub(crate) pressure: Arc<dyn crate::pressure::MemoryPressure>,
     /// When each agent asleep went to sleep, since this `vibed` started, and
     /// in which order: memory pressure ends the one asleep longest first.
@@ -307,10 +307,11 @@ pub struct Core {
     pub(crate) agents_busy: Mutex<HashSet<String>>,
     /// One edit of Claude's state at a time: agents may share its file.
     pub(crate) claude_lock: Arc<Mutex<()>>,
-    /// One admission at a time, so two starts can't both take the last room.
+    /// One admission at a time, so two starts can't both take the last
+    /// room under `max_awake_agents`.
     pub(crate) admitting: tokio::sync::Mutex<()>,
-    /// The memory of starts admitted but not yet running, by a token each.
-    pub(crate) starting: Mutex<HashMap<u64, u64>>,
+    /// Starts and wakes admitted but not yet running.
+    pub(crate) starting: Mutex<usize>,
     /// Each agent's transcript, as the status engine follows it.
     pub(crate) tails: Mutex<HashMap<String, Arc<Mutex<vibe_status::Tail>>>>,
     /// Where each agent's transcript was at its last send over MCP: what
@@ -482,7 +483,7 @@ impl Core {
             clock: config.clock,
             entropy: config.entropy,
             backends: config.backends,
-            admission: config.admission,
+            memory_gauge: config.memory,
             pressure: config.pressure,
             asleep_since: Mutex::new(crate::pressure::Sleeps::default()),
             pressure_paused: Mutex::new(HashMap::new()),
@@ -494,7 +495,7 @@ impl Core {
             agents_busy: Mutex::new(HashSet::new()),
             claude_lock: Arc::new(Mutex::new(())),
             admitting: tokio::sync::Mutex::new(()),
-            starting: Mutex::new(HashMap::new()),
+            starting: Mutex::new(0),
             fetching: Mutex::new(HashMap::new()),
             tails: Mutex::new(HashMap::new()),
             sends: Mutex::new(HashMap::new()),

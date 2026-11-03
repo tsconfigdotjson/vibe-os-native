@@ -85,8 +85,9 @@ impl From<io::Error> for EnvError {
 pub type Result<T> = std::result::Result<T, EnvError>;
 
 /// What a backend can and can't do. Policy decides from this alone: for
-/// example, admission sleeps an agent early to free memory only when
-/// `sleep_frees_memory` is true.
+/// example, memory pressure ends frozen agents only where
+/// `sleep_frees_memory` is false, as sleeping didn't give their memory
+/// back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Capabilities {
     /// Sleeping gives the agent's memory back to the host.
