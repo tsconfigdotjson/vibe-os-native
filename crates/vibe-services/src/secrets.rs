@@ -14,18 +14,20 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use vibe_core::model::ServiceAuth;
 
 use crate::util::{base64_decode, base64_standard};
 
 /// A login. Nothing but the store and the broker sees it.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Secret {
-    pub auth: ServiceAuth,
-    /// The access token, or the API key.
+    /// The access token.
     pub access: String,
+    /// Only on the host that owns the login.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refresh: Option<String>,
+    /// When `access` was obtained, in seconds since the epoch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub obtained_at: Option<i64>,
     /// When `access` runs out, in seconds since the epoch, if it was said.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<i64>,
@@ -44,7 +46,6 @@ pub struct Secret {
 impl fmt::Debug for Secret {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Secret")
-            .field("auth", &self.auth)
             .field("expires_at", &self.expires_at)
             .field("client_id", &self.client_id)
             .field("scopes", &self.scopes)
@@ -408,7 +409,7 @@ mod tests {
 
     fn secret(access: &str) -> Secret {
         Secret {
-            auth: ServiceAuth::Oauth,
+            obtained_at: Some(1),
             access: access.into(),
             refresh: Some("r".into()),
             expires_at: Some(5),

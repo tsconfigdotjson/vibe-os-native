@@ -155,6 +155,9 @@ names! {
         Connected = "connected",
         /// A refresh is under way.
         Refreshing = "refreshing",
+        /// This host's access token has run out or been refused, and the host
+        /// that owns the login can't be reached to give it another.
+        OwnerUnreachable = "owner_unreachable",
         /// A refresh was refused (`invalid_grant`, `invalid_client`): only
         /// connecting again helps.
         NeedsReconnect = "needs_reconnect",
@@ -165,12 +168,12 @@ names! {
 }
 
 names! {
-    /// How a shared service was connected.
-    ServiceAuth {
-        /// OAuth in the app.
-        Oauth = "oauth",
-        /// A pasted personal API key.
-        ApiKey = "api_key",
+    /// A host's part in a service's one login.
+    ServiceRole {
+        /// It holds the refresh token, and it alone ever refreshes.
+        Owner = "owner",
+        /// It holds only an access token, given to it by way of the Mac.
+        Follower = "follower",
     }
 }
 

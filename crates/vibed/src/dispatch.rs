@@ -12,8 +12,8 @@ use vibe_core::rpc::{
     KeysVerify, LimitsGet, LimitsSet, McpGet, McpSet, Method, PROTOCOL_VERSION, ProfilesCreate,
     ProfilesDelete, ProfilesList, ProfilesUpdate, ProjectsAdd, ProjectsList, ProjectsRemove,
     ProtocolMismatchData, Request, Response, ServicesAudit, ServicesComplete, ServicesConnect,
-    ServicesConnectKey, ServicesDisconnect, ServicesList, ServicesSet, SessionsAttach,
-    SessionsList, Subscribed, ToolboxClose, ToolboxLoginsGet, ToolboxOpen, ToolboxRebuild,
+    ServicesDisconnect, ServicesFollow, ServicesList, ServicesOverview, ServicesSet, ServicesToken,
+    SessionsAttach, SessionsList, Subscribed, ToolboxClose, ToolboxLoginsGet, ToolboxOpen, ToolboxRebuild,
     ToolboxStatusGet, ToolboxUpdate, TunnelPrepare,
 };
 
@@ -280,10 +280,16 @@ async fn call(
             core.services_complete(decode::<ServicesComplete>(params)?)
                 .await,
         ),
-        ServicesConnectKey::NAME => encode_result(
-            core.services_connect_key(decode::<ServicesConnectKey>(params)?)
-                .await,
-        ),
+        ServicesToken::NAME => {
+            encode_result(core.services_token(decode::<ServicesToken>(params)?).await)
+        }
+        ServicesFollow::NAME => {
+            encode_result(core.services_follow(decode::<ServicesFollow>(params)?).await)
+        }
+        ServicesOverview::NAME => {
+            decode::<ServicesOverview>(params)?;
+            encode_result(core.services_overview().await)
+        }
         ServicesDisconnect::NAME => encode_result(
             core.services_disconnect(decode::<ServicesDisconnect>(params)?)
                 .await,

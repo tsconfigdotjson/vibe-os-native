@@ -366,6 +366,10 @@ pub struct Core {
     pub(crate) vibe_cli: OsString,
     /// This host's broker for shared services, which holds its own logins.
     pub(crate) services: Option<Arc<vibe_services::Services>>,
+    /// Wakes the look at what each service's followers have been given.
+    pub(crate) services_wake: Arc<tokio::sync::Notify>,
+    /// What each follower was last given, by (host, service).
+    pub(crate) services_given: tokio::sync::Mutex<crate::services::GivenTokens>,
     pub(crate) gh_status: Mutex<GhStatus>,
     pub(crate) checks: Arc<dyn crate::doctor::HostChecks>,
     pub(crate) linux_images: Option<Arc<crate::linux::Watch>>,
@@ -512,8 +516,10 @@ impl Core {
             tx,
             last: Mutex::new(0),
         });
+        let services_wake = Arc::new(tokio::sync::Notify::new());
         let services = config.services.clone().map(|services| {
             let (bus, clock) = (Arc::clone(&events), Arc::clone(&config.clock));
+            let wake = Arc::clone(&services_wake);
             Core::make_broker(
                 services,
                 config.layout.data_dir().join("services.json"),
@@ -521,6 +527,7 @@ impl Core {
                 Arc::clone(&config.entropy),
                 // `state` is its state, and `message` its name.
                 Arc::new(move |info| {
+                    wake.notify_one();
                     bus.publish(Event {
                         seq: 0,
                         at: rfc3339(clock()),
@@ -570,6 +577,8 @@ impl Core {
             events,
             vibe_cli: config.vibe_cli,
             services,
+            services_wake,
+            services_given: tokio::sync::Mutex::default(),
             gh_status: Mutex::new(GhStatus {
                 state: GhState::Unknown,
                 account: None,

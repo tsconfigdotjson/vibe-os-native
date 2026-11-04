@@ -41,10 +41,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
-use vibe_core::model::{ServiceAuth, ServiceState};
+use vibe_core::model::{ServiceRole, ServiceState};
 use vibe_core::rpc::{
-    ErrorCode, ErrorObject, ServiceAuditEntry, ServiceAuditList, ServiceAuthorization, ServiceInfo,
-    ServiceList, ServiceSetParams,
+    ErrorCode, ErrorObject, ServiceAccess, ServiceAuditEntry, ServiceAuditList,
+    ServiceAuthorization, ServiceFollowParams, ServiceInfo, ServiceList, ServiceSetParams,
 };
 use vibe_core::time::rfc3339;
 use vibe_relay::MAX_MESSAGE;
@@ -71,6 +71,16 @@ const SESSION_IDLE: Duration = Duration::from_secs(30 * 60);
 
 /// How long a sign-in may take.
 const PENDING_FOR: Duration = Duration::from_secs(15 * 60);
+
+/// How long after a follower last waited in vain its calls fail at once, rather
+/// than each waiting again for an owner that's plainly away.
+const ASK_AGAIN_AFTER: Duration = Duration::from_secs(60);
+
+/// How often a waiting follower looks to see if it's been given a token.
+const TOKEN_LOOK: Duration = Duration::from_millis(50);
+
+/// How long a follower's call waits by default to be given a token.
+pub const TOKEN_WAIT: Duration = Duration::from_secs(10);
 
 /// What this client offers a service.
 const PROTOCOL: &str = "2025-06-18";
@@ -104,6 +114,8 @@ pub struct Deps {
     pub audit: Arc<dyn Fn(&str) + Send + Sync>,
     /// Which kind of host this is, for what agents are told to do.
     pub place: Place,
+    /// How long a follower's call waits to be given a token.
+    pub token_wait: Duration,
 }
 
 /// Where this broker runs, which is where its login gets mended.
@@ -148,8 +160,22 @@ struct Saved {
     auto_allow: bool,
     #[serde(default = "disconnected")]
     state: ServiceState,
+    /// This host's part in the login. A host that's never been told is a
+    /// follower of nothing, so disconnected.
+    #[serde(default = "follower")]
+    role: ServiceRole,
+    /// Who owns the login, for people, if it's another host.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    auth: Option<ServiceAuth>,
+    owner: Option<String>,
+    /// A follower whose token was refused or ran out, waiting to be given another.
+    #[serde(default)]
+    wants_token: bool,
+    /// Where the Mac has the login: a host's name. Only the Mac keeps this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    assigned: Option<String>,
+    /// The Mac disconnected it, so no host that still says it owns it is believed.
+    #[serde(default)]
+    released: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     detail: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -172,6 +198,10 @@ fn disconnected() -> ServiceState {
     ServiceState::Disconnected
 }
 
+fn follower() -> ServiceRole {
+    ServiceRole::Follower
+}
+
 impl Default for Saved {
     fn default() -> Self {
         Saved {
@@ -180,7 +210,11 @@ impl Default for Saved {
             denied_tools: Vec::new(),
             auto_allow: false,
             state: ServiceState::Disconnected,
-            auth: None,
+            role: ServiceRole::Follower,
+            owner: None,
+            wants_token: false,
+            assigned: None,
+            released: false,
             detail: None,
             detail_at: None,
             tools: Vec::new(),
@@ -194,8 +228,10 @@ impl Default for Saved {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AuthFailure {
     NotConnected,
-    /// Only the owner can fix it, signing this host in again.
+    /// Only signing in again can fix it.
     NeedsReconnect,
+    /// This host's token is no good, and its owner can't be reached for another.
+    OwnerUnreachable,
     /// It may pass: the service or this host's login store can't be reached.
     Unavailable(String),
 }
@@ -215,6 +251,16 @@ struct Conn {
     catalog_read: Mutex<Option<Instant>>,
     /// Held across reading it.
     catalog_gate: tokio::sync::Mutex<()>,
+    /// As a follower: what it's learned of the token it holds.
+    following: Mutex<Following>,
+}
+
+#[derive(Debug, Default)]
+struct Following {
+    /// The token the service turned down, which is no use until replaced.
+    rejected: Option<String>,
+    /// When a call last waited for a token and none came.
+    gave_up: Option<Instant>,
 }
 
 impl fmt::Debug for Conn {
@@ -234,32 +280,31 @@ impl Conn {
         }
     }
 
+    /// Whichever host owns it, signing in again happens in the app on the Mac.
     fn needs_reconnect_text(&self) -> String {
-        let title = &self.def.title;
-        match self.place {
-            Place::Mac => format!(
-                "{title} needs reconnecting on the Mac (VibeOS → Settings → Services → Reconnect)."
-            ),
-            Place::LinuxHost => format!(
-                "{title} needs reconnecting on this host (VibeOS → Settings → Services → Reconnect \
-                 on the Mac, or `vibe service set-key {}` here).",
-                self.def.name
-            ),
-        }
+        format!(
+            "{} needs reconnecting on the Mac (VibeOS → Settings → Services → Reconnect).",
+            self.def.title
+        )
     }
 
     fn not_connected_text(&self) -> String {
-        let title = &self.def.title;
-        match self.place {
-            Place::Mac => format!(
-                "{title} isn't connected on the Mac (VibeOS → Settings → Services → Connect)."
-            ),
-            Place::LinuxHost => format!(
-                "{title} isn't connected on this host (VibeOS → Settings → Services → Connect on \
-                 the Mac, or `vibe service set-key {}` here).",
-                self.def.name
-            ),
-        }
+        format!(
+            "{} isn't connected on the Mac (VibeOS → Settings → Services → Connect).",
+            self.def.title
+        )
+    }
+
+    fn owner_unreachable_text(&self) -> String {
+        let owner = lock(&self.saved)
+            .owner
+            .clone()
+            .unwrap_or_else(|| "the host that owns it".to_owned());
+        format!(
+            "{} has no current access token here: its login is on {owner}, which can't be reached \
+             from here right now. Calls work again once it's back.",
+            self.def.title
+        )
     }
 
     fn off_text(&self) -> String {
@@ -293,6 +338,7 @@ impl Conn {
         match failure {
             AuthFailure::NotConnected => self.not_connected_text(),
             AuthFailure::NeedsReconnect => self.needs_reconnect_text(),
+            AuthFailure::OwnerUnreachable => self.owner_unreachable_text(),
             AuthFailure::Unavailable(why) => self.unavailable_text(why),
         }
     }
@@ -422,6 +468,7 @@ impl Services {
                     saved: Mutex::new(saved),
                     catalog_read: Mutex::new(None),
                     catalog_gate: tokio::sync::Mutex::new(()),
+                    following: Mutex::default(),
                 })
             })
             .collect();
@@ -509,7 +556,13 @@ impl Services {
             name: conn.def.name.clone(),
             title: conn.def.title.clone(),
             state: saved.state,
-            auth: saved.auth,
+            role: saved.role,
+            owner: saved.owner.clone(),
+            access_until: lock(&conn.secret)
+                .as_ref()
+                .and_then(|s| s.expires_at)
+                .map(rfc3339),
+            wants_token: saved.wants_token,
             enabled: saved.enabled,
             read_only: saved.read_only,
             denied_tools: saved.denied_tools.clone(),
@@ -796,9 +849,9 @@ impl Services {
         };
         let now = (self.deps.clock)();
         let secret = Secret {
-            auth: ServiceAuth::Oauth,
             access: tokens.access,
             refresh: tokens.refresh,
+            obtained_at: Some(now),
             expires_at: tokens.expires_in.map(|s| now + s),
             client_id: Some(pending.client_id),
             token_endpoint: Some(pending.md.token_endpoint),
@@ -811,42 +864,8 @@ impl Services {
         Ok(self.info(conn))
     }
 
-    /// Connects with a personal API key, once the service has taken it.
-    pub async fn connect_key(
-        self: &Arc<Self>,
-        service: &str,
-        key: &str,
-    ) -> Result<ServiceInfo, ErrorObject> {
-        let conn = self.require(service)?;
-        let key = key.trim();
-        if key.is_empty() {
-            return Err(invalid("that key is empty"));
-        }
-        let title = &conn.def.title;
-        match self.initialize(conn, key).await {
-            Ok(_) => {}
-            Err(Rejected::Token) => {
-                return Err(failed(format!("{title} refused that key")));
-            }
-            Err(Rejected::Other(why)) => {
-                return Err(failed(format!("Can't check that key with {title}: {why}")));
-            }
-        }
-        let secret = Secret {
-            auth: ServiceAuth::ApiKey,
-            access: key.to_owned(),
-            refresh: None,
-            expires_at: None,
-            client_id: None,
-            token_endpoint: None,
-            revocation_endpoint: None,
-            scopes: Vec::new(),
-        };
-        self.connected(conn, secret).await?;
-        Ok(self.info(conn))
-    }
-
-    /// A new login: kept whole, replacing the old one, then in use.
+    /// A new login: kept whole, replacing the old one, then in use. Signing in
+    /// here is what makes this host its owner.
     async fn connected(
         self: &Arc<Self>,
         conn: &Arc<Conn>,
@@ -865,11 +884,14 @@ impl Services {
         *lock(&conn.catalog_read) = None;
         self.update(conn, |s| {
             s.state = ServiceState::Connected;
-            s.auth = Some(secret.auth);
+            s.role = ServiceRole::Owner;
+            s.owner = None;
+            s.wants_token = false;
             s.detail = None;
             s.detail_at = None;
             s.client_stale = false;
         });
+        *lock(&conn.following) = Following::default();
         // Agents see its tools soon: they ask every few minutes.
         let services = self.clone();
         let conn = conn.clone();
@@ -884,6 +906,20 @@ impl Services {
         let conn = self.require(service)?;
         let store = self.store.clone();
         let name = conn.def.name.clone();
+        let (role, owner) = {
+            let saved = lock(&conn.saved);
+            (saved.role, saved.owner.clone())
+        };
+        if role == ServiceRole::Follower && owner.is_some() {
+            return Err(ErrorObject::new(
+                ErrorCode::Conflict,
+                format!(
+                    "{}'s login is on {}: disconnect it in VibeOS → Settings → Services on the Mac",
+                    conn.def.title,
+                    owner.unwrap_or_default()
+                ),
+            ));
+        }
         // As in `connected`: a refresh in flight mustn't write it back after.
         let refreshing = conn.refreshing.lock().await;
         tokio::task::spawn_blocking(move || store.delete(&name))
@@ -897,7 +933,9 @@ impl Services {
         *lock(&conn.catalog_read) = None;
         self.update(conn, |s| {
             s.state = ServiceState::Disconnected;
-            s.auth = None;
+            s.role = ServiceRole::Follower;
+            s.owner = None;
+            s.wants_token = false;
             s.detail = None;
             s.detail_at = None;
             s.tools.clear();
@@ -993,10 +1031,12 @@ impl Services {
         self.update(conn, |saved| match &*lock(&conn.secret) {
             None => {
                 saved.state = ServiceState::Disconnected;
-                saved.auth = None;
             }
             Some(s) => {
-                saved.auth = Some(s.auth);
+                // Only the owner ever has one of these.
+                if s.refresh.is_some() {
+                    saved.role = ServiceRole::Owner;
+                }
                 if saved.state == ServiceState::Disconnected {
                     saved.state = ServiceState::Connected;
                 }
@@ -1045,6 +1085,13 @@ impl Services {
     }
 
     async fn access_now(&self, conn: &Conn, rejected: Option<&str>) -> Result<String, AuthFailure> {
+        // Loaded first, as what's in the store can make this host the owner.
+        self.load_secret(conn).await.map_err(|e| {
+            AuthFailure::Unavailable(format!("{} can't be read ({e})", conn.place.store()))
+        })?;
+        if lock(&conn.saved).role == ServiceRole::Follower {
+            return self.access_as_follower(conn, rejected).await;
+        }
         let _one = conn.refreshing.lock().await;
         let secret = self
             .load_secret(conn)
@@ -1058,18 +1105,6 @@ impl Services {
             return Err(AuthFailure::NeedsReconnect);
         }
         let turned_down = rejected == Some(secret.access.as_str());
-        if secret.auth == ServiceAuth::ApiKey {
-            // There's no refreshing a key.
-            if turned_down {
-                self.note(
-                    conn,
-                    ServiceState::Revoked,
-                    Some(format!("{} refused the API key", conn.def.title)),
-                );
-                return Err(AuthFailure::NeedsReconnect);
-            }
-            return Ok(secret.access);
-        }
         let running_out = secret
             .expires_at
             .is_some_and(|at| at - REFRESH_EARLY <= (self.deps.clock)());
@@ -1078,6 +1113,273 @@ impl Services {
             return Ok(secret.access);
         }
         self.refresh(conn, secret).await
+    }
+
+    /// A token as a follower: the one it was given if that's still good, or else
+    /// it says it wants another and waits a moment to be given it, by way of the
+    /// Mac. It never refreshes: it has nothing to do so with.
+    async fn access_as_follower(
+        &self,
+        conn: &Conn,
+        rejected: Option<&str>,
+    ) -> Result<String, AuthFailure> {
+        if let Some(token) = rejected {
+            lock(&conn.following).rejected = Some(token.to_owned());
+        }
+        if let Some(answer) = self.follower_answer(conn) {
+            return answer;
+        }
+        self.update(conn, |s| s.wants_token = true);
+        let waited_lately = lock(&conn.following)
+            .gave_up
+            .is_some_and(|at| at.elapsed() < ASK_AGAIN_AFTER);
+        if !waited_lately {
+            let deadline = Instant::now() + self.deps.token_wait;
+            while Instant::now() < deadline {
+                tokio::time::sleep(TOKEN_LOOK).await;
+                if let Some(answer) = self.follower_answer(conn) {
+                    return answer;
+                }
+            }
+            lock(&conn.following).gave_up = Some(Instant::now());
+        }
+        self.note(
+            conn,
+            ServiceState::OwnerUnreachable,
+            Some(format!(
+                "The access token here is no good and {} didn't give another",
+                lock(&conn.saved)
+                    .owner
+                    .clone()
+                    .unwrap_or_else(|| "the host that owns it".to_owned())
+            )),
+        );
+        Err(AuthFailure::OwnerUnreachable)
+    }
+
+    /// What a follower can say now, if it needn't wait: `None` if it's to ask.
+    fn follower_answer(&self, conn: &Conn) -> Option<Result<String, AuthFailure>> {
+        let (state, owner) = {
+            let saved = lock(&conn.saved);
+            (saved.state, saved.owner.clone())
+        };
+        if matches!(
+            state,
+            ServiceState::NeedsReconnect | ServiceState::Revoked
+        ) {
+            return Some(Err(AuthFailure::NeedsReconnect));
+        }
+        let held = lock(&conn.secret).clone();
+        let Some(held) = held else {
+            return owner.is_none().then_some(Err(AuthFailure::NotConnected));
+        };
+        let refused = lock(&conn.following).rejected.as_deref() == Some(held.access.as_str());
+        let run_out = held.expires_at.is_some_and(|at| at <= (self.deps.clock)());
+        (!refused && !run_out).then_some(Ok(held.access))
+    }
+
+    /// Refreshes any login this host owns that's past half its life, so followers
+    /// are handed a token with the most time on it, to carry them through the
+    /// owner or the Mac being away. Failing is fine: the next pass tries again,
+    /// with the current token good for hours yet.
+    pub async fn refresh_due(&self) {
+        for conn in &self.conns {
+            if self.load_secret(conn).await.is_err() {
+                continue;
+            }
+            let _one = conn.refreshing.lock().await;
+            let (role, state) = {
+                let saved = lock(&conn.saved);
+                (saved.role, saved.state)
+            };
+            if role != ServiceRole::Owner
+                || matches!(state, ServiceState::NeedsReconnect | ServiceState::Revoked)
+            {
+                continue;
+            }
+            // As it is now that the lock's held: a call may just have refreshed it.
+            let Some(secret) = lock(&conn.secret).clone() else {
+                continue;
+            };
+            let (Some(from), Some(to)) = (secret.obtained_at, secret.expires_at) else {
+                continue;
+            };
+            if (self.deps.clock)() >= from + (to - from) / 2 {
+                let _ = self.refresh(conn, secret).await;
+            }
+        }
+    }
+
+    /// The owner's current access token, for its followers. Never the refresh
+    /// token. `rejected` is a token a follower had turned down: if it's still the
+    /// current one, this refreshes first.
+    pub async fn token(
+        &self,
+        service: &str,
+        rejected: Option<&str>,
+    ) -> Result<ServiceAccess, ErrorObject> {
+        let conn = self.require(service)?;
+        let held = self.load_secret(conn).await.ok().flatten();
+        let answer = |state, access: Option<String>, expires_at| ServiceAccess {
+            service: service.to_owned(),
+            state,
+            access,
+            expires_at,
+            detail: lock(&conn.saved).detail.clone(),
+        };
+        if lock(&conn.saved).role != ServiceRole::Owner {
+            return if held.is_none() {
+                Ok(answer(ServiceState::Disconnected, None, None))
+            } else {
+                Err(ErrorObject::new(
+                    ErrorCode::Conflict,
+                    format!("This host doesn't own {}'s login", conn.def.title),
+                ))
+            };
+        }
+        match self.access(conn, rejected).await {
+            Ok(access) => {
+                let expires_at = lock(&conn.secret).as_ref().and_then(|s| s.expires_at);
+                Ok(answer(ServiceState::Connected, Some(access), expires_at))
+            }
+            Err(AuthFailure::NotConnected) => Ok(answer(ServiceState::Disconnected, None, None)),
+            Err(AuthFailure::NeedsReconnect | AuthFailure::OwnerUnreachable) => {
+                Ok(answer(lock(&conn.saved).state, None, None))
+            }
+            Err(AuthFailure::Unavailable(why)) => Err(failed(why)),
+        }
+    }
+
+    /// Makes this host a follower of a login another host owns, using the token
+    /// given. If it held a login of its own, that's forgotten first, here and at
+    /// the service, so there's never a second host with a refresh token.
+    pub async fn follow(
+        self: &Arc<Self>,
+        p: ServiceFollowParams,
+    ) -> Result<ServiceInfo, ErrorObject> {
+        let conn = self.require(&p.service)?.clone();
+        let refreshing = conn.refreshing.lock().await;
+        let _ = self.load_secret(&conn).await;
+        let old = lock(&conn.secret).clone();
+        let now = (self.deps.clock)();
+        let next = p.access.clone().map(|access| Secret {
+            access,
+            refresh: None,
+            obtained_at: Some(now),
+            expires_at: p.expires_at,
+            client_id: None,
+            token_endpoint: None,
+            revocation_endpoint: None,
+            scopes: Vec::new(),
+        });
+        let store = self.store.clone();
+        let name = conn.def.name.clone();
+        let written = {
+            let next = next.clone();
+            tokio::task::spawn_blocking(move || match &next {
+                Some(secret) => store.store(&name, secret),
+                None => store.delete(&name),
+            })
+            .await
+            .map_err(io::Error::other)
+            .and_then(|r| r)
+        };
+        // Used whether or not it could be kept: this only saves asking again
+        // after a restart.
+        self.hold_login(&conn, next);
+        drop(refreshing);
+        let new_owner = lock(&conn.saved).owner != p.owner;
+        let was_owner = old.as_ref().is_some_and(|s| s.refresh.is_some());
+        if new_owner || was_owner || p.access.is_none() {
+            self.forget_sessions(&p.service);
+            *lock(&conn.catalog_read) = None;
+        }
+        let refused_again = {
+            let mut following = lock(&conn.following);
+            following.gave_up = None;
+            let refused_again = p.access.is_some() && following.rejected == p.access;
+            if !refused_again {
+                following.rejected = None;
+            }
+            refused_again
+        };
+        let state = match p.state {
+            // Which is only how the owner happens to be just now.
+            ServiceState::Refreshing | ServiceState::OwnerUnreachable => ServiceState::Connected,
+            other => other,
+        };
+        let at = p.detail.as_ref().map(|_| now);
+        self.update(&conn, |s| {
+            s.role = ServiceRole::Follower;
+            s.owner = p.owner.clone();
+            s.state = state;
+            s.wants_token = refused_again;
+            s.detail = p.detail.clone();
+            s.detail_at = at;
+            if state == ServiceState::Disconnected {
+                s.tools.clear();
+                s.instructions = None;
+            }
+        });
+        if let Some(old) = old.filter(|s| s.refresh.is_some())
+            && let Some(endpoint) = &old.revocation_endpoint
+        {
+            let token = old.refresh.as_deref().unwrap_or(&old.access);
+            oauth::revoke(&self.http, endpoint, token, old.client_id.as_deref()).await;
+        }
+        written.map_err(|e| {
+            failed(format!(
+                "Can't keep the access token for {}: {e}",
+                conn.def.title
+            ))
+        })?;
+        // Agents see its tools soon: they ask every few minutes.
+        if state == ServiceState::Connected && lock(&conn.saved).tools.is_empty() {
+            let (services, reading) = (self.clone(), conn.clone());
+            tokio::spawn(async move {
+                let _ = services.catalog(&reading).await;
+            });
+        }
+        Ok(self.info(&conn))
+    }
+
+    /// The services this broker knows, by name.
+    pub fn names(&self) -> Vec<String> {
+        self.conns.iter().map(|c| c.def.name.clone()).collect()
+    }
+
+    /// How `service` stands on this host.
+    pub fn info_of(&self, service: &str) -> Option<ServiceInfo> {
+        self.conn(service).map(|c| self.info(c))
+    }
+
+    /// Where the Mac has `service`'s login, and whether it disconnected it.
+    pub fn assignment(&self, service: &str) -> Option<(Option<String>, bool)> {
+        self.conn(service).map(|c| {
+            let saved = lock(&c.saved);
+            (saved.assigned.clone(), saved.released)
+        })
+    }
+
+    /// The Mac records that `host` holds `service`'s login now.
+    pub fn assign(&self, service: &str, host: &str) {
+        if let Some(conn) = self.conn(service) {
+            self.update(conn, |s| {
+                s.assigned = Some(host.to_owned());
+                s.released = false;
+            });
+        }
+    }
+
+    /// The Mac records that `service` was disconnected. Any host still saying it
+    /// owns it is then told otherwise, and not believed.
+    pub fn release(&self, service: &str) {
+        if let Some(conn) = self.conn(service) {
+            self.update(conn, |s| {
+                s.assigned = None;
+                s.released = true;
+            });
+        }
     }
 
     async fn refresh(&self, conn: &Conn, secret: Secret) -> Result<String, AuthFailure> {
@@ -1135,6 +1437,7 @@ impl Services {
             access: tokens.access.clone(),
             // A service that doesn't rotate keeps the one it has.
             refresh: tokens.refresh.or_else(|| secret.refresh.clone()),
+            obtained_at: Some(now),
             expires_at: tokens.expires_in.map(|s| now + s),
             ..secret
         };
@@ -1371,6 +1674,13 @@ impl Services {
             .is_some_and(|s| s.access == token);
         if !current {
             return None;
+        }
+        // Only the owner can tell a revoked login from a token that's merely
+        // old. This host goes on asking, and the next call may have a good one.
+        if lock(&conn.saved).role == ServiceRole::Follower {
+            lock(&conn.following).rejected = Some(token.to_owned());
+            self.update(conn, |s| s.wants_token = true);
+            return Some(CallError::Auth(AuthFailure::OwnerUnreachable));
         }
         self.note(
             conn,
@@ -1639,6 +1949,7 @@ impl Services {
                 audit.finish(match failure {
                     AuthFailure::NotConnected => "not_connected",
                     AuthFailure::NeedsReconnect => "needs_reconnect",
+                    AuthFailure::OwnerUnreachable => "owner_unreachable",
                     AuthFailure::Unavailable(_) => "unavailable",
                 });
                 Some(tool_error(id, &conn.failure_text(&failure)))

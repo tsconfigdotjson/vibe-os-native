@@ -18,7 +18,7 @@ use serde_json::Value;
 pub use crate::limits::HostLimits;
 pub use crate::model::{
     Activity, AgentState, Certainty, CheckId, CheckState, Environment, EventKind, GhState,
-    HostLink, LoginTool, MessageRole, Mode, Model, Profile, ProjectSource, Reasoning, ServiceAuth,
+    HostLink, LoginTool, MessageRole, Mode, Model, Profile, ProjectSource, Reasoning, ServiceRole,
     ServiceState, SessionState, StopReason, ToolboxAction, ToolboxState, TunnelState, WakeupKind,
 };
 
@@ -383,7 +383,9 @@ pub const METHODS: &[&str] = &[
     ServicesList::NAME,
     ServicesConnect::NAME,
     ServicesComplete::NAME,
-    ServicesConnectKey::NAME,
+    ServicesToken::NAME,
+    ServicesFollow::NAME,
+    ServicesOverview::NAME,
     ServicesDisconnect::NAME,
     ServicesSet::NAME,
     ServicesAudit::NAME,
@@ -1670,13 +1672,6 @@ method! {
 }
 
 method! {
-    /// `services.connect_key`: connects this host with a personal API key
-    /// instead, which is how a host mends itself with the Mac away. It takes no
-    /// `host`, so a key never crosses a link.
-    ServicesConnectKey = "services.connect_key", ServiceKeyParams => ServiceInfo
-}
-
-method! {
     /// `services.disconnect`: forgets the login, here and, where it can, at
     /// the service.
     ServicesDisconnect = "services.disconnect", ServiceParams => ServiceInfo
@@ -1689,13 +1684,32 @@ method! {
 }
 
 method! {
+    /// `services.token`: the owner's current access token, refreshed first if
+    /// `rejected` is what's current. The Mac asks it, for the other hosts.
+    ServicesToken = "services.token", ServiceTokenParams => ServiceAccess
+}
+
+method! {
+    /// `services.follow`: makes this host a follower of a login, with the access
+    /// token it's to use. The Mac sends it. There's no way to send a refresh
+    /// token this way.
+    ServicesFollow = "services.follow", ServiceFollowParams => ServiceInfo
+}
+
+method! {
+    /// `services.overview`: each service's one connection: who owns it, and how
+    /// every host stands with it, those that don't answer in a few seconds
+    /// marked so.
+    ServicesOverview = "services.overview", NoParams => ServiceOverviewList
+}
+
+method! {
     /// `services.audit`: the last calls agents on that host made to its services,
     /// oldest first. Never arguments or tokens.
     ServicesAudit = "services.audit", HostParams => ServiceAuditList
 }
 
-/// One shared service, on one host. Nothing here is secret: a token never leaves
-/// the host that holds it.
+/// One shared service, on one host. Nothing here is secret.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServiceInfo {
     /// Its name: `linear`. Its MCP server in an agent is `vibe-<name>`.
@@ -1703,9 +1717,17 @@ pub struct ServiceInfo {
     /// Its name for people: `Linear`.
     pub title: String,
     pub state: ServiceState,
-    /// How it was connected, while there's a login.
+    /// This host's part in the login.
+    pub role: ServiceRole,
+    /// Who owns the login, for people, if it's another host.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auth: Option<ServiceAuth>,
+    pub owner: Option<String>,
+    /// When this host's access token runs out, if it has one and that's known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_until: Option<String>,
+    /// A follower whose token was refused or ran out, waiting to be given another.
+    #[serde(default)]
+    pub wants_token: bool,
     /// Off, every agent's calls are refused: the kill switch.
     pub enabled: bool,
     /// Agents reach its read-only endpoint.
@@ -1768,21 +1790,116 @@ impl fmt::Debug for ServiceCompleteParams {
     }
 }
 
-// By hand, below: it holds a personal key.
+// By hand, below: it can hold an access token.
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ServiceKeyParams {
+pub struct ServiceTokenParams {
     pub service: String,
-    /// The key, which goes to this host's store and nowhere else.
-    pub key: String,
+    /// The access token a follower had turned down, so that the owner refreshes
+    /// if it's still the current one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rejected: Option<String>,
 }
 
-impl fmt::Debug for ServiceKeyParams {
+impl fmt::Debug for ServiceTokenParams {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ServiceKeyParams")
+        f.debug_struct("ServiceTokenParams")
             .field("service", &self.service)
             .finish_non_exhaustive()
     }
+}
+
+/// What the owner of a login gives out: an access token and how the login stands.
+/// Never its refresh token.
+// By hand, below: it holds an access token.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceAccess {
+    pub service: String,
+    pub state: ServiceState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<String>,
+    /// When it runs out, in seconds since the epoch, if the service said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
+    /// What's wrong with the login, for people.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+impl fmt::Debug for ServiceAccess {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ServiceAccess")
+            .field("service", &self.service)
+            .field("state", &self.state)
+            .field("expires_at", &self.expires_at)
+            .finish_non_exhaustive()
+    }
+}
+
+/// What the Mac tells a host that doesn't own a login. Any login of its own that
+/// it held is forgotten, as another host has it now.
+// By hand, below: it holds an access token.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceFollowParams {
+    pub service: String,
+    /// Who owns it, for people: a host's name, or `the Mac`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    /// How the login stands at its owner.
+    pub state: ServiceState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+impl fmt::Debug for ServiceFollowParams {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ServiceFollowParams")
+            .field("service", &self.service)
+            .field("owner", &self.owner)
+            .field("state", &self.state)
+            .field("expires_at", &self.expires_at)
+            .finish_non_exhaustive()
+    }
+}
+
+/// How one host stands with a service.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceHost {
+    /// The host's name; `local` is the one asked.
+    pub host: String,
+    /// Whether it answered just now.
+    pub reachable: bool,
+    /// What it says, if it answered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<ServiceInfo>,
+}
+
+/// A service's one connection, as this install sees it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceOverview {
+    pub name: String,
+    pub title: String,
+    /// How the login stands, as its owner last said.
+    pub state: ServiceState,
+    /// The host that holds the login, or would at the next sign-in.
+    pub owner: String,
+    /// Whether it holds it yet.
+    pub signed_in: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail_at: Option<String>,
+    pub hosts: Vec<ServiceHost>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceOverviewList {
+    pub services: Vec<ServiceOverview>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

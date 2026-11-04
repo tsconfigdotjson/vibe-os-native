@@ -464,6 +464,7 @@ fn services_config(layout: &Layout) -> ServicesConfig {
         services,
         store,
         place,
+        token_wait: vibe_services::broker::TOKEN_WAIT,
     }
 }
 

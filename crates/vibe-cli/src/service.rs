@@ -1,23 +1,19 @@
-//! `vibe service`: this host's shared MCP services, from its own shell. Their
-//! logins are this host's own, so this needs no Mac, which is how a host mends
-//! itself while the Mac is away. A personal API key is read here and goes to
-//! this host's `vibed` alone: never on a command line, where `ps` would show it,
-//! and never over a link.
+//! `vibe service`: how this host stands with its shared MCP services, and its own
+//! switch for each, from its own shell, with no Mac needed. Signing in happens in
+//! the app on the Mac: a browser sign-in is the only way to connect a service.
 
-use std::io::{self, BufRead};
 use std::path::Path;
 use std::time::Duration;
 
+use vibe_core::model::ServiceRole;
 use vibe_core::rpc::{
-    HostParams, ServiceInfo, ServiceKeyParams, ServiceParams, ServiceSetParams, ServicesAudit,
-    ServicesConnectKey, ServicesDisconnect, ServicesList, ServicesSet,
+    HostParams, ServiceInfo, ServiceParams, ServiceSetParams, ServicesAudit, ServicesDisconnect,
+    ServicesList, ServicesSet,
 };
 
-use crate::attach::is_tty;
 use crate::client;
-use crate::setup_token::read_hidden;
 
-/// How long a call may take: a key is checked with the service first.
+/// How long a call may take.
 const TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Which `vibe service`.
@@ -25,7 +21,6 @@ const TIMEOUT: Duration = Duration::from_secs(90);
 pub(crate) enum Command {
     List,
     Audit,
-    SetKey(String),
     Disconnect(String),
     Turn { service: String, on: bool },
 }
@@ -37,25 +32,18 @@ impl Command {
             [] => Ok(Command::List),
             [w] if w == "list" || w == "ls" || w == "status" => Ok(Command::List),
             [w] if w == "audit" => Ok(Command::Audit),
-            [w, name] if w == "set-key" => Ok(Command::SetKey(name.clone())),
             [w, name] if w == "disconnect" => Ok(Command::Disconnect(name.clone())),
             [w, name] if w == "on" || w == "off" => Ok(Command::Turn {
                 service: name.clone(),
                 on: w == "on",
             }),
-            [w] if w == "set-key" || w == "disconnect" || w == "on" || w == "off" => {
+            [w] if w == "disconnect" || w == "on" || w == "off" => {
                 Err(format!("service {w} needs a service, such as linear"))
             }
-            [w, _, ..] if w == "set-key" => Err(
-                "service set-key takes only the service: give it the key on the terminal or \
-                 stdin, so it stays off command lines"
-                    .into(),
-            ),
-            _ => Err(
-                "service takes list, audit, on SERVICE, off SERVICE, set-key SERVICE or \
-                 disconnect SERVICE"
-                    .into(),
-            ),
+            _ => {
+                Err("service takes list, audit, on SERVICE, off SERVICE or disconnect SERVICE"
+                    .into())
+            }
         }
     }
 }
@@ -63,8 +51,13 @@ impl Command {
 /// One line for a service, for people.
 pub(crate) fn describe(s: &ServiceInfo) -> String {
     let mut line = format!("{}  {}", s.name, s.state);
-    if let Some(auth) = s.auth {
-        line.push_str(&format!("  by {auth}"));
+    match (&s.owner, s.role) {
+        (Some(owner), _) => line.push_str(&format!("  login on {owner}")),
+        (None, ServiceRole::Owner) => line.push_str("  login here"),
+        (None, ServiceRole::Follower) => {}
+    }
+    if let Some(until) = &s.access_until {
+        line.push_str(&format!("  access until {until}"));
     }
     line.push_str(&format!(
         "  {} tool{}",
@@ -86,24 +79,6 @@ pub(crate) fn describe(s: &ServiceInfo) -> String {
     line
 }
 
-/// One line from stdin, with no echo if that's a terminal.
-fn read_key() -> Result<String, String> {
-    let key = if is_tty(libc::STDIN_FILENO) {
-        read_hidden("vibe: paste the personal API key, then press Return: ")
-    } else {
-        let mut line = String::new();
-        io::stdin()
-            .lock()
-            .read_line(&mut line)
-            .map(|_| line.trim().to_owned())
-    }
-    .map_err(|e| format!("can't read the key: {e}"))?;
-    if key.is_empty() {
-        return Err("no key was given".into());
-    }
-    Ok(key)
-}
-
 pub(crate) fn run(socket: &Path, command: Command) -> Result<(), String> {
     match command {
         Command::List => {
@@ -122,13 +97,6 @@ pub(crate) fn run(socket: &Path, command: Command) -> Result<(), String> {
                     e.at, e.agent, e.service, e.tool, e.outcome, e.ms
                 );
             }
-        }
-        Command::SetKey(service) => {
-            let key = read_key()?;
-            let params = ServiceKeyParams { service, key };
-            let info = client::call::<ServicesConnectKey>(socket, &params, TIMEOUT)
-                .map_err(|e| e.to_string())?;
-            println!("{}", describe(&info));
         }
         Command::Disconnect(service) => {
             let params = ServiceParams {
@@ -156,7 +124,7 @@ pub(crate) fn run(socket: &Path, command: Command) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vibe_core::model::{ServiceAuth, ServiceState};
+    use vibe_core::model::ServiceState;
 
     fn parse(words: &[&str]) -> Result<Command, String> {
         Command::parse(&words.iter().map(|s| s.to_string()).collect::<Vec<_>>())
@@ -167,10 +135,6 @@ mod tests {
         assert_eq!(parse(&[]), Ok(Command::List));
         assert_eq!(parse(&["status"]), Ok(Command::List));
         assert_eq!(parse(&["audit"]), Ok(Command::Audit));
-        assert_eq!(
-            parse(&["set-key", "linear"]),
-            Ok(Command::SetKey("linear".into()))
-        );
         assert_eq!(
             parse(&["disconnect", "linear"]),
             Ok(Command::Disconnect("linear".into()))
@@ -190,15 +154,8 @@ mod tests {
             })
         );
         assert!(parse(&["on"]).is_err());
-        assert!(parse(&["set-key"]).is_err());
+        assert!(parse(&["set-key", "linear"]).is_err(), "there are no keys");
         assert!(parse(&["nonsense"]).is_err());
-    }
-
-    #[test]
-    fn a_key_is_never_taken_from_the_command_line() {
-        let err = parse(&["set-key", "linear", "lin_api_secret"]).unwrap_err();
-        assert!(err.contains("off command lines"), "{err}");
-        assert!(!err.contains("lin_api_secret"), "{err}");
     }
 
     #[test]
@@ -207,7 +164,10 @@ mod tests {
             name: "linear".into(),
             title: "Linear".into(),
             state: ServiceState::NeedsReconnect,
-            auth: Some(ServiceAuth::Oauth),
+            role: ServiceRole::Owner,
+            owner: None,
+            access_until: Some("2026-11-05T00:00:00Z".into()),
+            wants_token: false,
             enabled: true,
             read_only: true,
             denied_tools: Vec::new(),
@@ -218,16 +178,19 @@ mod tests {
         };
         assert_eq!(
             describe(&s),
-            "linear  needs_reconnect  by oauth  1 tool  read-only\n  Linear refused the refresh \
-             (invalid_grant) (2026-11-04T00:00:00Z)"
+            "linear  needs_reconnect  login here  access until 2026-11-05T00:00:00Z  1 tool  \
+             read-only\n  Linear refused the refresh (invalid_grant) (2026-11-04T00:00:00Z)"
         );
         s.detail = None;
         s.read_only = false;
         s.enabled = false;
         s.tools = 3;
+        s.role = ServiceRole::Follower;
+        s.owner = Some("vps-1".into());
+        s.access_until = None;
         assert_eq!(
             describe(&s),
-            "linear  needs_reconnect  by oauth  3 tools  turned off"
+            "linear  needs_reconnect  login on vps-1  3 tools  turned off"
         );
     }
 }

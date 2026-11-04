@@ -59,14 +59,11 @@ commands:
               start it (vibe-linear, say). It goes through this host's vibed,
               which holds this host's own login
   service     how this host's shared services stand. Connect them in VibeOS on
-              the Mac, or with:
-  service set-key SERVICE
-              connect this host with a personal API key, read from the terminal
-              or stdin; how a host mends itself with the Mac away
+              the Mac, by signing in with a browser there
   service on SERVICE, service off SERVICE
               turn a shared service on or off on this host, with no Mac needed
   service disconnect SERVICE
-              forget this host's login to a service
+              forget a service's login, if it's on this host
   service audit
               the last calls this host's agents made to its services
   key         list this host's API keys for MCP

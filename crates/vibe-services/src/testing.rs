@@ -30,9 +30,6 @@ use crate::util::{form, parse_form, query_of};
 /// What every secret this hands out holds.
 pub const SECRET_MARK: &str = "FAKESECRET";
 
-/// The personal API key it takes.
-pub const API_KEY: &str = "FAKESECRET-api-key";
-
 /// One request to its MCP endpoints, as it saw it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Seen {
@@ -633,7 +630,7 @@ async fn mcp(
     let authorized = !state.reject_all
         && bearer
             .as_deref()
-            .is_some_and(|b| b == API_KEY || (!state.reject_oauth && state.access.contains(b)));
+            .is_some_and(|b| !state.reject_oauth && state.access.contains(b));
     let known_session = session.as_ref().is_some_and(|s| state.sessions.contains(s));
     let status = if !authorized {
         401
