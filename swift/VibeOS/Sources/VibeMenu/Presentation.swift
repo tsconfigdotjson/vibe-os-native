@@ -850,8 +850,11 @@ public struct SetupProgress: Equatable, Sendable {
         var steps: [Step] = []
         if let command = commandStep { steps.append(command) }
         // Pi is optional and nothing starts without asking for it, so the
-        // welcome doesn't bring it up: Settings → Agents has it.
-        let machine = doctor.filter { $0.id != .linux && $0.id != .pi }
+        // welcome doesn't bring it up: Settings → Agents has it. Nor git using gh
+        // while gh isn't logged in: vibed sets that up itself once it is.
+        let machine = doctor.filter {
+            $0.id != .linux && $0.id != .pi && !($0.id == .ghGit && $0.state == .optional)
+        }
         for check in machine {
             steps.append(step(for: check))
             // Terminal goes with the tools agents need, before the Mac's
@@ -967,7 +970,7 @@ public struct SetupProgress: Equatable, Sendable {
         case .ghGit:
             if check.fixable {
                 step.action = .fix(.ghGit)
-                step.actionTitle = "Set Up"
+                step.actionTitle = "Try Again"
             }
         case .claude:
             step.action = .open("https://claude.com/claude-code")
@@ -1006,7 +1009,7 @@ public struct SetupProgress: Equatable, Sendable {
                 ? "Log in once, in Terminal, so agents can clone, push and open pull requests."
                 : "GitHub's command line tool, for cloning, pushing and pull requests."
         case .ghGit:
-            return check.fixable ? "So git pushes with gh's login. One click sets it up." : "Once gh is logged in."
+            return check.fixable ? check.detail : "Once gh is logged in."
         case .claude: return "macos agents run your own Claude Code."
         case .claudeLogin: return claudeReady ? "Sign in once, in Terminal, with /login." : "Once Claude Code is installed."
         case .power: return "Agents can't answer while this Mac sleeps. Turning it off asks for your password."

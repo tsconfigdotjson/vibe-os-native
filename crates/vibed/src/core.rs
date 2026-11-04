@@ -761,7 +761,7 @@ impl Core {
                 let name = p.name.unwrap_or_else(|| repo.name.clone());
                 _reserved = self.reserve_project(host, &name)?;
                 let dest = self.layout.projects_dir().join(&name);
-                let path = projects::github_clone(&self.gh_program().await, &repo, &dest).await?;
+                let path = self.clone_github(&repo, &dest).await?;
                 NewProject {
                     host: host.into(),
                     name,
@@ -1206,11 +1206,72 @@ impl Core {
             .map_or_else(|| self.gh.clone(), PathBuf::into_os_string)
     }
 
+    /// Clones `repo` to `dest`, having set up first whatever VibeOS can for it. What's
+    /// left that only the owner can do is said in as many words.
+    async fn clone_github(&self, repo: &GithubRepo, dest: &Path) -> Result<String, ErrorObject> {
+        self.prepare_github(true).await;
+        let cloned = projects::github_clone(&self.gh_program().await, repo, dest).await;
+        let Err(e) = cloned else {
+            return cloned;
+        };
+        if e.code != ErrorCode::CommandFailed.code() {
+            return Err(e);
+        }
+        // gh says this of every way of being signed out, and not of a network that's
+        // down, whatever `gh auth status` makes of that.
+        let said = e
+            .message
+            .split_once(" failed: ")
+            .map_or("", |(_, said)| said);
+        if !said.contains("gh auth login") {
+            return Err(e);
+        }
+        // So the app knows too.
+        self.check_gh().await;
+        Err(error(
+            ErrorCode::CommandFailed,
+            format!(
+                "GitHub isn't signed in on {}, so {repo} can't be cloned yet. Sign in to GitHub \
+                 there with `gh auth login`, then add the project again. What gh said: \
+                 {said}",
+                self.label
+            ),
+        ))
+    }
+
+    /// Sets up what git and `gh` need of this host for GitHub, as nobody should have
+    /// to (PRD: Key user flows, Add a project): GitHub's own host keys in
+    /// `known_hosts`, and, with `gh` logged in, git asking it for credentials. Quiet,
+    /// and quick when it's all there. What can't be done now is logged: a clone
+    /// still has HTTPS, and `gh` logged out gets said when it matters.
+    pub(crate) async fn prepare_github(&self, logged_in: bool) {
+        let home = self.layout.home().to_owned();
+        let checks = Arc::clone(&self.checks);
+        let gh = self.gh_program().await;
+        let set_up = tokio::task::spawn_blocking(move || {
+            match gh::pin_host_keys(&home) {
+                Ok(true) => crate::log!("vibed: GitHub's host keys are in known_hosts now"),
+                Ok(false) => {}
+                Err(e) => crate::log!("vibed: can't add GitHub's host keys to known_hosts: {e}"),
+            }
+            logged_in.then(|| crate::doctor::git_through_gh(&*checks, &gh))
+        })
+        .await;
+        match set_up {
+            Ok(Some(Err(why))) => crate::log!("vibed: {why}"),
+            // What the doctor last found may just have been put right.
+            Ok(Some(Ok(_))) => *lock(&self.doctor_found) = None,
+            Ok(None) => {}
+            Err(e) => crate::log!("vibed: setting up for GitHub failed: {e}"),
+        }
+    }
+
     /// Runs `gh auth status` now, and publishes a `gh.status` event if the
     /// result changed.
     pub async fn check_gh(&self) -> GhStatus {
         let program = self.gh_program().await;
         let check = gh::check(&program).await;
+        self.prepare_github(check.state == GhState::LoggedIn).await;
         let status = GhStatus {
             state: check.state,
             account: check.account,

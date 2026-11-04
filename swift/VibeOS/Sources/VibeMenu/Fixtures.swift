@@ -293,11 +293,7 @@ public final class FixtureDaemon: DaemonConnection, @unchecked Sendable {
             var downloading = check(.linux, .working, "Downloading the Linux base image.")
             downloading["progress"] = 40
             return [
-                git, gh,
-                check(
-                    .ghGit, .fail, "git doesn't ask gh for GitHub's credentials yet.",
-                    hint: "Run `gh auth setup-git` in Terminal.", fixable: true),
-                claude, login,
+                git, gh, check(.ghGit, .pass, "git asks gh for GitHub's credentials."), claude, login,
                 check(
                     .power, .fail, "This Mac sleeps after 10 minutes idle, and agents stop answering while it sleeps.",
                     hint: "In System Settings → Energy, turn on Prevent automatic sleeping when the display is off."),
@@ -313,9 +309,7 @@ public final class FixtureDaemon: DaemonConnection, @unchecked Sendable {
                 check(
                     .gh, .fail, "GitHub's gh isn't installed.",
                     hint: "Install gh from https://cli.github.com, then run `gh auth login` in Terminal."),
-                check(
-                    .ghGit, .fail, "git can use gh for GitHub once gh is logged in.",
-                    hint: "Log gh in first, with `gh auth login`."),
+                check(.ghGit, .optional, "VibeOS has git use gh for GitHub as soon as gh is logged in."),
                 check(
                     .claude, .fail, "claude isn't on your login shell's PATH.",
                     hint: "Install Claude Code (claude.com/claude-code), then check `claude` runs in Terminal."),

@@ -1,7 +1,7 @@
 //! `vibe doctor` and the first run's checklist (PRD: Key user flows,
 //! Install and setup): what this host needs for agents to work, as `vibed`
 //! sees it. git; `gh`'s login, and git using `gh` for GitHub (`gh auth
-//! setup-git`); the `claude` macos agents run, and its login; system sleep
+//! setup-git`, which `vibed` runs itself); the `claude` macos agents run, and its login; system sleep
 //! off; Tailscale, which is optional; on a Mac, the Linux images; and Pi,
 //! optional too. The
 //! checks that look at the machine go through [`HostChecks`], so tests can
@@ -38,7 +38,7 @@ pub trait HostChecks: Send + Sync + fmt::Debug {
     /// `git --version`.
     fn git(&self) -> Result<String, String>;
     /// Whether git asks `gh` for github.com's credentials, as `gh auth
-    /// setup-git` sets it up.
+    /// setup-git` sets it up, or has a helper of the owner's own for it.
     fn git_uses_gh(&self) -> Result<bool, String>;
     /// Runs `<gh> auth setup-git`.
     fn setup_git(&self, gh: &OsStr) -> Result<(), String>;
@@ -186,6 +186,11 @@ impl HostChecks for Machine {
         for key in ["credential.https://github.com.helper", "credential.helper"] {
             // Exit 1 is "not set", which is an answer too.
             let (_, text) = self.run(&[&git, "config", "--global", "--get-all", key])?;
+            // A way of its own for GitHub alone is the owner's, and `gh auth setup-git`
+            // would replace it, so it counts.
+            if key.contains("github.com") && !text.trim().is_empty() && !uses_gh(&text) {
+                return Ok(true);
+            }
             helpers.push_str(&text);
             helpers.push('\n');
         }
@@ -392,6 +397,17 @@ fn fail(id: CheckId, detail: impl AsRef<str>, hint: &str) -> DoctorCheck {
 /// otherwise run git, claude, security and pmset again.
 pub const FOUND_FOR: Duration = Duration::from_secs(15);
 
+/// Whether git asks `gh` for GitHub's credentials, having set that up if not:
+/// nobody's asked to, once `gh` is logged in.
+pub(crate) fn git_through_gh(checks: &dyn HostChecks, gh: &OsStr) -> Result<bool, String> {
+    if checks.git_uses_gh()? {
+        return Ok(true);
+    }
+    checks.setup_git(gh)?;
+    crate::log!("vibed: git now asks gh for GitHub's credentials (gh auth setup-git)");
+    checks.git_uses_gh()
+}
+
 /// What the machine said, before any of it is put into checks.
 #[derive(Debug, Clone)]
 pub(crate) struct Found {
@@ -452,22 +468,35 @@ fn report(
             "Run `gh auth status` in Terminal to see why.",
         ),
     });
+    // VibeOS's to set up, so it only needs the owner if that fails. The doctor has
+    // tried by now, and tries again next time.
+    let retry = "VibeOS sets this up itself, and tries again each time it checks.";
     checks.push(match (&found.git_uses_gh, gh_ok) {
         (Ok(true), _) => pass(CheckId::GhGit, "git asks gh for GitHub's credentials"),
-        (_, false) => fail(
-            CheckId::GhGit,
-            "git can use gh for GitHub once gh is logged in",
-            "Log gh in first, with `gh auth login`.",
-        ),
+        (_, false) => DoctorCheck {
+            state: CheckState::Optional,
+            hint: None,
+            ..fail(
+                CheckId::GhGit,
+                "VibeOS has git use gh for GitHub as soon as gh is logged in",
+                "",
+            )
+        },
         (Ok(false), true) => DoctorCheck {
             fixable: true,
             ..fail(
                 CheckId::GhGit,
                 "git doesn't ask gh for GitHub's credentials yet",
-                "Run `gh auth setup-git` in Terminal.",
+                retry,
             )
         },
-        (Err(why), true) => fail(CheckId::GhGit, why, install_git),
+        (Err(why), true) => match found.git {
+            Ok(_) => DoctorCheck {
+                fixable: true,
+                ..fail(CheckId::GhGit, why, retry)
+            },
+            Err(_) => fail(CheckId::GhGit, why, install_git),
+        },
     });
     checks.push(match &found.claude {
         Ok((path, version)) => pass(
@@ -580,6 +609,8 @@ impl Core {
             .map(|(_, f)| f.clone());
         let checks = Arc::clone(&self.checks);
         let linux = self.linux_images.clone();
+        let logged_in = gh.state == GhState::LoggedIn;
+        let program = self.gh_program().await;
         let found = tokio::task::spawn_blocking(move || {
             let found = cached.unwrap_or_else(|| {
                 let git = checks.git();
@@ -587,6 +618,7 @@ impl Core {
                 // without the Command Line Tools, asking opens their
                 // installer again.
                 let git_uses_gh = match &git {
+                    Ok(_) if logged_in => git_through_gh(&*checks, &program),
                     Ok(_) => checks.git_uses_gh(),
                     Err(why) => Err(why.clone()),
                 };
@@ -807,7 +839,7 @@ mod tests {
             checked_at: None,
         };
         let r = report(fresh, &gh, &[], None, true);
-        for c in &r.checks[..6] {
+        for c in r.checks[..6].iter().filter(|c| c.id != CheckId::GhGit) {
             assert_eq!(c.state, CheckState::Fail, "{c:?}");
             assert!(c.hint.as_deref().is_some_and(|h| h.ends_with('.')), "{c:?}");
             assert!(c.detail.ends_with('.'), "{c:?}");
@@ -819,16 +851,56 @@ mod tests {
                 .unwrap()
                 .contains("xcode-select --install")
         );
-        // git can't use gh until gh is logged in, so that isn't fixable yet.
-        assert!(!r.checks[2].fixable);
         assert!(r.checks[5].detail.contains("10 minutes"));
 
-        // Logged in, git not set up: VibeOS can fix that one.
+        // Logged in, and it's not set up, which the doctor would have just tried.
         let mut half = found();
         half.git_uses_gh = Ok(false);
         let r = report(half, &logged_in(), &[], None, true);
         assert_eq!(r.checks[2].state, CheckState::Fail);
         assert!(r.checks[2].fixable);
+
+        // Logged in, and setting git up didn't take: VibeOS is still on it, and it
+        // says what's in the way.
+        let mut half = found();
+        half.git_uses_gh = Err("gh auth setup-git failed: no space left".into());
+        let r = report(half, &logged_in(), &[], None, true);
+        assert_eq!(r.checks[2].state, CheckState::Fail);
+        assert!(r.checks[2].detail.contains("no space left"));
+        assert!(r.checks[2].hint.as_deref().unwrap().contains("itself"));
+        assert!(r.checks[2].fixable);
+    }
+
+    #[test]
+    fn git_through_gh_asks_nothing_of_the_owner() {
+        // gh's not logged in, or not there: that's one thing to do, not two.
+        let mut f = found();
+        f.git_uses_gh = Ok(false);
+        for state in [GhState::LoggedOut, GhState::NotInstalled] {
+            let gh = GhStatus {
+                state,
+                account: None,
+                detail: None,
+                checked_at: None,
+            };
+            let r = report(f.clone(), &gh, &[], None, false);
+            let c = &r.checks[2];
+            assert_eq!((c.id, c.state), (CheckId::GhGit, CheckState::Optional));
+            assert_eq!(c.hint, None);
+            assert!(!c.fixable);
+            assert_eq!(r.checks[1].state, CheckState::Fail);
+        }
+        // Nothing's found failing that it can put right.
+        let tmp = tempfile::tempdir().unwrap();
+        let checks = FixedChecks {
+            git: Ok("git version 2.50.1".into()),
+            git_uses_gh: Mutex::new(Ok(false)),
+            claude: Err(String::new()),
+            claude_login: Err(String::new()),
+            pi: Err(String::new()),
+            system_sleep: Ok(None),
+        };
+        assert_eq!(git_through_gh(&checks, tmp.path().as_os_str()), Ok(true));
     }
 
     #[test]
@@ -937,6 +1009,10 @@ printf '\n!%s auth git-credential\n' "$0" > "{c}""#,
             assert_eq!(m.git(), Ok("git version 2.50.1".into()));
         }
         assert_eq!(m.git_uses_gh(), Ok(false));
+        // A helper of the owner's own, just for GitHub, is theirs, and counts.
+        std::fs::write(&config, "/opt/custom-helper\n").unwrap();
+        assert_eq!(m.git_uses_gh(), Ok(true));
+        std::fs::remove_file(&config).unwrap();
         m.setup_git(gh.as_os_str()).unwrap();
         assert_eq!(m.git_uses_gh(), Ok(true));
         assert_eq!(

@@ -19,6 +19,9 @@ pub const CLONE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// How long a quick git query may take.
 const GIT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How many of the last lines of what a failed clone said are kept.
+const WORDS_KEPT: usize = 8;
+
 fn invalid(message: String) -> ErrorObject {
     ErrorObject::new(ErrorCode::InvalidParams, message)
 }
@@ -81,6 +84,39 @@ fn last_words(out: &Output) -> String {
         .unwrap_or_else(|| format!("exit status {}", out.status))
 }
 
+/// All a failed `gh` said, git's words with its own, in a few lines of what matters:
+/// "failed to run git: exit status 128" alone tells nobody anything. Its progress
+/// isn't kept, and nor is a line with a token in it.
+fn what_it_said(out: &Output) -> String {
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stderr
+        .lines()
+        .chain(stdout.lines())
+        .map(str::trim)
+        .filter(|l| {
+            !l.is_empty()
+                && !l.starts_with("Cloning into ")
+                && ![
+                    "gho_",
+                    "ghp_",
+                    "ghs_",
+                    "ghu_",
+                    "ghr_",
+                    "github_pat_",
+                    "x-access-token:",
+                ]
+                .iter()
+                .any(|token| l.contains(token))
+        })
+        .collect();
+    if lines.is_empty() {
+        return format!("exit status {}", out.status);
+    }
+    let last = &lines[lines.len().saturating_sub(WORDS_KEPT)..];
+    vibe_core::model::clean_alert(&last.join(" "))
+}
+
 /// `git -C <dir> <args>`, its trimmed stdout if it succeeds, its last words
 /// if not.
 pub(crate) async fn git(dir: &Path, args: &[&str]) -> Result<Result<String, String>, ErrorObject> {
@@ -135,6 +171,32 @@ pub async fn local_repo(path: &str) -> Result<String, ErrorObject> {
     utf8(canonical)
 }
 
+/// How a clone went wrong.
+enum Failed {
+    NoGh,
+    /// `gh` wouldn't run, or didn't finish.
+    Ran(io::Error),
+    /// What it said as it failed.
+    Said(String),
+}
+
+/// One `gh repo clone` of `repo`, by name or URL, which leaves `partial` a directory
+/// if it worked.
+async fn clone_into(gh: &OsStr, repo: &str, partial: &Path) -> Result<(), Failed> {
+    let args = [
+        OsStr::new("repo"),
+        OsStr::new("clone"),
+        OsStr::new(repo),
+        partial.as_os_str(),
+    ];
+    match run(gh, &args, CLONE_TIMEOUT).await {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Err(Failed::NoGh),
+        Err(e) => Err(Failed::Ran(e)),
+        Ok(o) if o.status.success() && partial.is_dir() => Ok(()),
+        Ok(o) => Err(Failed::Said(what_it_said(&o))),
+    }
+}
+
 /// Puts `repo` at `dest`, cloning it with `gh` unless a clone of it is
 /// already there (from a project that was removed and is being added
 /// again). Anything else at `dest` is left alone and refused.
@@ -172,22 +234,30 @@ pub async fn github_clone(
             .map_err(|e| failed(format!("can't clear {}: {e}", partial.display())))?;
     }
     let name = repo.to_string();
-    let args = [
-        OsStr::new("repo"),
-        OsStr::new("clone"),
-        OsStr::new(&name),
-        partial.as_os_str(),
-    ];
-    let out = run(gh, &args, CLONE_TIMEOUT).await;
-    let ok = matches!(&out, Ok(o) if o.status.success()) && partial.is_dir();
-    if !ok {
+    let mut out = clone_into(gh, &name, &partial).await;
+    // SSH in the way, whatever was done about it beforehand: this clone goes over
+    // HTTPS, with `gh`'s login, which a URL asks for. `gh`'s own setting is the owner's
+    // and stays as it is, so nothing here can race, or last beyond this clone.
+    if let Err(Failed::Said(said)) = &out
+        && crate::gh::ssh_in_the_way(said)
+    {
+        let said = said.clone();
         let _ = fs::remove_dir_all(&partial);
-        return Err(match out {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                failed("can't run gh: it isn't installed".into())
-            }
-            Err(e) => failed(format!("gh repo clone {repo} failed: {e}")),
-            Ok(o) => failed(format!("gh repo clone {repo} failed: {}", last_words(&o))),
+        out = clone_into(gh, &format!("https://github.com/{repo}"), &partial).await;
+        if out.is_ok() {
+            crate::log!("vibed: {repo} wouldn't clone over SSH, so it came over HTTPS: {said}");
+        }
+    }
+    if let Err(failure) = out {
+        let _ = fs::remove_dir_all(&partial);
+        return Err(match failure {
+            Failed::NoGh => failed(
+                "can't run gh: it isn't installed on this host. Install it from \
+                 https://cli.github.com, then add the project again"
+                    .into(),
+            ),
+            Failed::Ran(e) => failed(format!("gh repo clone {repo} failed: {e}")),
+            Failed::Said(said) => failed(format!("gh repo clone {repo} failed: {said}")),
         });
     }
     if let Err(e) = fs::rename(&partial, dest) {
@@ -370,6 +440,41 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    fn failed_with(stderr: &str) -> Output {
+        use std::os::unix::process::ExitStatusExt;
+        Output {
+            status: std::process::ExitStatus::from_raw(256),
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn what_a_failed_clone_said_is_kept_but_for_a_token_or_what_moves_a_cursor() {
+        let said = what_it_said(&failed_with(
+            "Cloning into 'x'...\nHost key verification failed.\n\
+             fatal: Could not read from remote repository.\n\n\
+             failed to run git: exit status 128\n",
+        ));
+        assert_eq!(
+            said,
+            "Host key verification failed. fatal: Could not read from remote repository. \
+             failed to run git: exit status 128"
+        );
+        for token in [
+            "gho_abc",
+            "ghp_abc",
+            "github_pat_abc",
+            "https://x-access-token:v1.abc@github.com/o/n",
+        ] {
+            let said = what_it_said(&failed_with(&format!("fatal: {token}\nthe end\n")));
+            assert_eq!(said, "the end", "{token}");
+        }
+        let said = what_it_said(&failed_with("a\u{1b}[2Jb\u{202e}c\n"));
+        assert_eq!(said, "a[2Jbc");
+        assert!(what_it_said(&failed_with("")).contains("exit status"));
     }
 
     #[tokio::test]

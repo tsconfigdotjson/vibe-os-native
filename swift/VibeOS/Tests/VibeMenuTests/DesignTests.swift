@@ -681,7 +681,12 @@ typealias StepStatus = SetupProgress.Step.Status
         #expect(pi.fixable == false)
         let fresh = try FixtureDaemon(.freshMac).call(DoctorCheckGet.self, NoParams()).checks
         let failing: Int = fresh.filter { (c: DoctorCheck) -> Bool in c.state == CheckState.fail }.count
-        #expect(failing == 6)
+        #expect(failing == 5)
+        // git using gh waits on gh's login with nothing to ask of the owner, so
+        // it's no step in the welcome.
+        let waiting = SetupProgress(hasProject: false, hasKey: false, doctor: fresh)
+        let ghGitStep: SetupProgress.Step? = SetupTests.step(waiting, StepID.check(CheckId.ghGit))
+        #expect(ghGitStep == nil)
         #expect(fresh.last?.id == CheckId.pi)
         #expect(fresh.last?.state == CheckState.optional)
         // What Settings shows of Pi agrees with the doctor, either way.

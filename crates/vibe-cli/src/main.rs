@@ -36,8 +36,9 @@ commands:
   doctor      check what agents here need: git, gh's login and git using it,
               claude and its login, system sleep off, Tailscale (optional),
               and on a Mac the Linux images; exits 1 if one needs you.
-              --fix has vibed do what it can (gh auth setup-git, the
-              download). VibeOS.app checks its own Terminal permission
+              vibed sets git up to use gh itself. --fix has it try now what
+              it can, such as the download. VibeOS.app checks its own Terminal
+              permission
   rpc         the vibed socket API on stdin and stdout, one JSON-RPC message per line
   setup-token log linux agents in to Claude: runs `claude setup-token` and keeps
               its long-lived token in the Keychain, for vibed to hand each VM

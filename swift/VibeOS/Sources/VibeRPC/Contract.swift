@@ -917,8 +917,8 @@ public enum DoctorCheckGet: RPCMethod {
     public static let name = "doctor.check"
 }
 
-/// `doctor.fix`: does what VibeOS can about one check (`gh_git` runs `gh
-/// auth setup-git`; `linux` downloads now), then checks again. Any other is
+/// `doctor.fix`: tries now what VibeOS does itself about one check (`gh_git` runs
+/// `gh auth setup-git`; `linux` downloads now), then checks again. Any other is
 /// refused, with what to do.
 public enum DoctorFix: RPCMethod {
     public typealias Params = DoctorFixParams
