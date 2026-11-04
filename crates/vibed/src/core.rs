@@ -356,7 +356,7 @@ pub struct Core {
     /// What's wrong with a copy of Pi's login, or with the store, by what it's
     /// about (PRD: Who gets which credentials).
     pub(crate) pi_alerts: Mutex<std::collections::BTreeMap<String, String>>,
-    /// Sends made with a send id, by that id: see [`Core::send_once`].
+    /// Sends made with a request id, by agent and id: see [`Core::send_once`].
     pub(crate) sends_kept: Mutex<HashMap<String, crate::talk::KeptSend>>,
     /// Held while a send types into an agent, so two can't interleave.
     pub(crate) typing: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,

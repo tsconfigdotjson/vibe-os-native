@@ -269,7 +269,7 @@ async fn the_orchestrator_round_from_start_to_delete() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_send_id_types_once_and_one_refused_can_be_made_again() {
+async fn a_request_id_types_once_and_one_refused_can_be_made_again() {
     let w = world().await;
     let mut c = w.client().await;
     let r = c
@@ -283,7 +283,7 @@ async fn a_send_id_types_once_and_one_refused_can_be_made_again() {
         .await;
 
     // On a question nothing is typed, so the id isn't used up.
-    let blue = json!({"agent": agent, "text": "blue", "send_id": "first"});
+    let blue = json!({"agent": agent, "text": "blue", "request_id": "first"});
     let e = c.fails("vibe_send", blue.clone()).await;
     assert!(e.contains("is waiting on a question"), "{e}");
     c.call(
@@ -321,7 +321,7 @@ async fn a_send_id_types_once_and_one_refused_can_be_made_again() {
     let e = c
         .fails(
             "vibe_send",
-            json!({"agent": agent, "text": "red", "send_id": "first"}),
+            json!({"agent": agent, "text": "red", "request_id": "first"}),
         )
         .await;
     assert!(e.contains("different send"), "{e}");
@@ -331,7 +331,7 @@ async fn a_send_id_types_once_and_one_refused_can_be_made_again() {
     let green = AgentSendParams {
         agent: agent.clone(),
         text: Some("green".into()),
-        send_id: Some("second".into()),
+        request_id: Some("second".into()),
         ..Default::default()
     };
     let (one, two) = tokio::join!(
@@ -350,11 +350,11 @@ async fn a_send_id_types_once_and_one_refused_can_be_made_again() {
 
     // The socket's door checks an id too.
     let bad = AgentSendParams {
-        send_id: Some("has space".into()),
+        request_id: Some("has space".into()),
         ..green
     };
     let e = w.core.send_call(bad).await.unwrap_err();
-    assert!(e.message.contains("send_id must be"), "{}", e.message);
+    assert!(e.message.contains("request_id must be"), "{}", e.message);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

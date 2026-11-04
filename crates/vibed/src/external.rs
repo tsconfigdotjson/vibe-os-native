@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -27,7 +27,7 @@ use tokio::net::{TcpListener, UnixStream};
 use tokio::task::JoinHandle;
 use vibe_core::model::{EventKind, LOCAL_HOST, MAC_HOST, TunnelState, validate_domain};
 use vibe_core::rpc::{
-    Agent, ErrorCode, ErrorObject, HostExternalParams, HostInfo, HostsExternal, Method,
+    Agent, ErrorCode, ErrorObject, HostExternalParams, HostInfo, HostsExternal, Method, Project,
     TunnelPrepared,
 };
 use vibe_mcp::public::{Limiter, Limits};
@@ -109,8 +109,11 @@ impl Drop for AbortOnDrop {
 #[derive(Debug)]
 pub(crate) struct MacPeer {
     socket: PathBuf,
-    /// Whether the Mac answered through the tunnel when last looked.
+    /// Whether the Mac answered through the tunnel when last looked. Only
+    /// looks clear it: one failed call says nothing of the others.
     up: AtomicBool,
+    /// Looks that have failed in a row.
+    misses: AtomicU32,
     idle: Mutex<Vec<(Channel, Instant)>>,
     /// Calls to the Mac at once, fewer than its tunnel socket serves, so
     /// one is always left for the look that says it's there.
@@ -119,6 +122,9 @@ pub(crate) struct MacPeer {
     /// show unavailable while the tunnel is down. Only to that key: one the
     /// Mac doesn't take never sees them.
     seen: Mutex<HashMap<String, (i64, Vec<Agent>)>>,
+    /// The Mac's projects as each key last listed them, likewise: a project
+    /// there is still there while the Mac is away.
+    projects_seen: Mutex<HashMap<String, Vec<String>>>,
 }
 
 /// How long a call waits its turn at the Mac, as stuck calls mustn't queue new
@@ -128,9 +134,10 @@ const TURN_WITHIN: Duration = Duration::from_secs(3);
 /// How often a call under way looks at whether the Mac's been found gone.
 const STILL_THERE_EVERY: Duration = Duration::from_millis(250);
 
-/// Calls whose work may well carry on at the Mac whether or not anyone's listening,
-/// so a look that fails, as on a host stalling for a moment, isn't their answer.
-const SEES_ITSELF_THROUGH: &[&str] = &["agents.start", "agents.delete"];
+/// Looks that fail in a row before calls under way stop waiting. One can be a host
+/// stalling for a moment, and giving up on a call that's fine costs its caller a
+/// guess at whether it happened.
+const GONE_AFTER: u32 = 2;
 
 /// Channels to the Mac kept between calls, and for how long.
 const MAX_IDLE: usize = 4;
@@ -141,6 +148,37 @@ const MAX_SEEN: usize = 64;
 
 /// Calls to the Mac at once: the Mac's tunnel socket serves 16.
 const MAX_CALLS: usize = 8;
+
+/// What to do about a call that changes something, once it's gone out and nobody
+/// has heard how it ended. Nothing, for one that doesn't.
+pub(crate) fn check_after(method: &str) -> Option<&'static str> {
+    match method {
+        "agents.send" => Some("check vibe_read_messages before resending"),
+        "agents.start" | "agents.delete" => Some("check vibe_list_agents before trying again"),
+        _ => None,
+    }
+}
+
+/// What a call gets that never went out.
+fn not_sent(method: &str, why: &str) -> ErrorObject {
+    if check_after(method).is_some() {
+        mac_unavailable(&format!("{why}, so nothing was sent"))
+    } else {
+        mac_unavailable(why)
+    }
+}
+
+/// What a call gets that went out and hasn't been heard of since.
+fn lost(method: &str, why: &str) -> ErrorObject {
+    match check_after(method) {
+        Some(check) => error(
+            ErrorCode::HostUnavailable,
+            format!("{MAC_HOST} is unavailable: {why}. Outcome unknown: {check}"),
+        )
+        .outcome_unknown(),
+        None => mac_unavailable(why),
+    }
+}
 
 /// What a call for the Mac gets while the tunnel is down.
 fn mac_unavailable(why: &str) -> ErrorObject {
@@ -171,9 +209,11 @@ impl MacPeer {
         MacPeer {
             socket,
             up: AtomicBool::new(false),
+            misses: AtomicU32::new(0),
             idle: Mutex::new(Vec::new()),
             calls: tokio::sync::Semaphore::new(MAX_CALLS),
             seen: Mutex::new(HashMap::new()),
+            projects_seen: Mutex::new(HashMap::new()),
         }
     }
 
@@ -186,7 +226,22 @@ impl MacPeer {
     pub(crate) fn reset(&self) {
         lock(&self.idle).clear();
         lock(&self.seen).clear();
+        lock(&self.projects_seen).clear();
         self.up.store(false, Ordering::SeqCst);
+        self.misses.store(GONE_AFTER, Ordering::SeqCst);
+    }
+
+    /// What a look at the tunnel found. A miss stops new calls at once; only
+    /// [`GONE_AFTER`] of them stop those under way.
+    fn note_look(&self, up: bool) {
+        if up {
+            self.misses.store(0, Ordering::SeqCst);
+        } else {
+            self.misses.fetch_add(1, Ordering::SeqCst);
+            // Whatever's kept leads to something that isn't answering.
+            lock(&self.idle).clear();
+        }
+        self.up.store(up, Ordering::SeqCst);
     }
 
     async fn dial(&self) -> std::io::Result<Channel> {
@@ -217,7 +272,7 @@ impl MacPeer {
             .ok()
             .flatten()
             .is_some();
-        self.up.store(up, Ordering::SeqCst);
+        self.note_look(up);
         up
     }
 
@@ -228,8 +283,21 @@ impl MacPeer {
         &self,
         key: &str,
         method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, ErrorObject> {
+        self.call_at(key, method, params, timeout, None).await
+    }
+
+    /// [`MacPeer::call`], saying when it was sent, as the Mac refuses a send
+    /// that took too long to arrive.
+    pub(crate) async fn call_at(
+        &self,
+        key: &str,
+        method: &str,
         mut params: Value,
         timeout: Duration,
+        sent_at: Option<i64>,
     ) -> Result<Value, ErrorObject> {
         if let Some(map) = params.as_object_mut() {
             map.remove("host");
@@ -237,18 +305,26 @@ impl MacPeer {
         // Asleep, the end of its tunnel may accept and then say nothing: once the
         // look at it has found that, nothing more is sent there to wait for.
         if !self.is_up() {
-            return Err(mac_unavailable(
+            return Err(not_sent(
+                method,
                 "it didn't answer the last look at its tunnel",
             ));
         }
-        let message = json!({"key": key, "method": method, "params": params});
+        let mut message = json!({"key": key, "method": method, "params": params});
+        if let Some(at) = sent_at {
+            message["sent_at"] = json!(at);
+        }
         let _turn = tokio::time::timeout(TURN_WITHIN, self.calls.acquire())
             .await
-            .map_err(|_| mac_unavailable("too many calls to it are stuck"))?
-            .map_err(|_| mac_unavailable("its tunnel is closing"))?;
-        // A channel kept from before may lead to a tunnel since replaced:
-        // one that fails is followed by a fresh one, once.
-        let kept = {
+            .map_err(|_| not_sent(method, "too many calls to it are stuck"))?
+            .map_err(|_| not_sent(method, "its tunnel is closing"))?;
+        // A channel kept from before may lead to a tunnel since replaced: one
+        // that fails is followed by a fresh one, once. Not for a call that
+        // changes something, which may have got there before the channel failed
+        // and mustn't go twice: that always goes on a fresh one.
+        let kept = if check_after(method).is_some() {
+            None
+        } else {
             let mut idle = lock(&self.idle);
             idle.retain(|(_, since)| since.elapsed() < IDLE_FOR);
             idle.pop().map(|(c, _)| c)
@@ -256,46 +332,34 @@ impl MacPeer {
         let mut attempts = kept.into_iter().map(Some).chain([None]);
         loop {
             let Some(next) = attempts.next() else {
-                return Err(mac_unavailable("its tunnel is down"));
+                return Err(not_sent(method, "its tunnel is down"));
             };
             let fresh = next.is_none();
             let mut channel = match next {
                 Some(c) => c,
                 None => match self.dial().await {
                     Ok(c) => c,
-                    Err(_) => {
-                        self.up.store(false, Ordering::SeqCst);
-                        return Err(mac_unavailable("its tunnel is down"));
-                    }
+                    Err(_) => return Err(not_sent(method, "its tunnel is down")),
                 },
             };
             let waiting =
                 tokio::time::timeout(timeout, channel.call("tunnel.call", message.clone()));
-            let answer = if SEES_ITSELF_THROUGH.contains(&method) {
-                waiting.await
-            } else {
-                tokio::select! {
-                    answer = waiting => answer,
-                    () = self.found_gone() => {
-                        return Err(mac_unavailable("it stopped answering"));
-                    }
-                }
+            let answer = tokio::select! {
+                answer = waiting => answer,
+                () = self.found_gone() => return Err(lost(method, "it stopped answering")),
             };
             let outcome = match answer {
                 Err(_) => {
-                    return Err(mac_unavailable(&format!(
-                        "it didn't answer {method} in {} s",
-                        timeout.as_secs()
-                    )));
+                    return Err(lost(
+                        method,
+                        &format!("it didn't answer {method} in {} s", timeout.as_secs()),
+                    ));
                 }
                 Ok(Err(_)) if !fresh => continue,
-                Ok(Err(e)) => {
-                    self.up.store(false, Ordering::SeqCst);
-                    return Err(mac_unavailable(&format!("its tunnel failed: {e}")));
-                }
+                Ok(Err(e)) => return Err(lost(method, &format!("its tunnel failed: {e}"))),
                 Ok(Ok(outcome)) => outcome,
             };
-            self.up.store(true, Ordering::SeqCst);
+            self.note_look(true);
             {
                 let mut idle = lock(&self.idle);
                 if idle.len() < MAX_IDLE {
@@ -317,11 +381,28 @@ impl MacPeer {
         }
     }
 
-    /// Ends once the look at the tunnel finds the Mac gone.
+    /// Ends once looks at the tunnel have found the Mac gone.
     async fn found_gone(&self) {
-        while self.is_up() {
+        while self.misses.load(Ordering::SeqCst) < GONE_AFTER {
             tokio::time::sleep(STILL_THERE_EVERY).await;
         }
+    }
+
+    /// Keeps which projects `key` last listed on the Mac.
+    pub(crate) fn saw_projects(&self, key: &str, projects: &[Project]) {
+        let mut seen = lock(&self.projects_seen);
+        let k = vibe_core::keys::hash(key);
+        if !seen.contains_key(&k) && seen.len() >= MAX_SEEN {
+            seen.clear();
+        }
+        seen.insert(k, projects.iter().map(|p| p.name.clone()).collect());
+    }
+
+    /// Whether `key` last listed `project` on the Mac.
+    pub(crate) fn saw_project(&self, key: &str, project: &str) -> bool {
+        lock(&self.projects_seen)
+            .get(&vibe_core::keys::hash(key))
+            .is_some_and(|names| names.iter().any(|n| n == project))
     }
 
     /// Keeps what `key` last listed of the Mac's agents.
@@ -336,12 +417,15 @@ impl MacPeer {
 
     /// Forgets what `key` listed, as when the Mac no longer takes it.
     pub(crate) fn forget(&self, key: &str) {
-        lock(&self.seen).remove(&vibe_core::keys::hash(key));
+        let k = vibe_core::keys::hash(key);
+        lock(&self.seen).remove(&k);
+        lock(&self.projects_seen).remove(&k);
     }
 
     /// Forgets what every key listed, as when the keys change.
     pub(crate) fn forget_all(&self) {
         lock(&self.seen).clear();
+        lock(&self.projects_seen).clear();
     }
 
     /// What `key` last listed of the Mac's agents, if it listed them.
@@ -547,6 +631,7 @@ async fn probe_mac(core: Weak<Core>, every: Duration) {
     loop {
         let Some(c) = core.upgrade() else { return };
         let up = c.peer.probe().await;
+        let look_again = !up && c.peer.misses.load(Ordering::SeqCst) < GONE_AFTER;
         if was != Some(up) {
             if was.is_some() || up {
                 crate::log!(
@@ -568,7 +653,10 @@ async fn probe_mac(core: Weak<Core>, every: Duration) {
             was = Some(up);
         }
         drop(c);
-        tokio::time::sleep(every).await;
+        // A first miss is looked into at once: calls under way are waiting on it.
+        if !look_again {
+            tokio::time::sleep(every).await;
+        }
     }
 }
 
@@ -866,6 +954,224 @@ mod tests {
                 {"host": "mac", "ref": "x"},
             ], "host": "mac"})
         );
+    }
+
+    /// A tunnel's end that takes connections and says nothing, as a sleeping Mac's does.
+    fn silent_end(dir: &std::path::Path) -> PathBuf {
+        let path = dir.join("silent.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        path
+    }
+
+    const LONG: Duration = Duration::from_secs(3600);
+
+    /// `method` on `peer`, under way, ending only when the peer gives up on it.
+    fn under_way(
+        peer: &Arc<MacPeer>,
+        method: &'static str,
+    ) -> tokio::task::JoinHandle<ErrorObject> {
+        let peer = Arc::clone(peer);
+        tokio::spawn(async move {
+            peer.call("vk_x", method, json!({}), LONG)
+                .await
+                .unwrap_err()
+        })
+    }
+
+    #[tokio::test]
+    async fn one_miss_stops_new_calls_and_two_stop_those_under_way() {
+        let dir = tempfile::tempdir().unwrap();
+        let peer = Arc::new(MacPeer::new(silent_end(dir.path())));
+        peer.note_look(true);
+        let send = under_way(&peer, "agents.send");
+        let start = under_way(&peer, "agents.start");
+        let delete = under_way(&peer, "agents.delete");
+        let read = under_way(&peer, "agents.list");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // One miss: anything new fails at once, and it's known not to have gone.
+        peer.note_look(false);
+        let e = peer
+            .call("vk_x", "agents.send", json!({}), LONG)
+            .await
+            .unwrap_err();
+        assert!(e.message.contains("nothing was sent"), "{}", e.message);
+        assert!(!e.is_outcome_unknown());
+        // Those under way carry on: it may have been a host stalling for a moment.
+        tokio::time::sleep(STILL_THERE_EVERY * 3).await;
+        for call in [&send, &start, &delete, &read] {
+            assert!(!call.is_finished());
+        }
+
+        // Two: they stop, nobody knowing how the changes ended, and their turns are free.
+        peer.note_look(false);
+        for (call, check) in [
+            (send, "check vibe_read_messages before resending"),
+            (start, "check vibe_list_agents before trying again"),
+            (delete, "check vibe_list_agents before trying again"),
+        ] {
+            let e = tokio::time::timeout(Duration::from_secs(5), call)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(e.code, ErrorCode::HostUnavailable.code());
+            assert!(e.is_outcome_unknown(), "{}", e.message);
+            assert!(e.message.contains("Outcome unknown"), "{}", e.message);
+            assert!(e.message.contains(check), "{}", e.message);
+        }
+        let e = read.await.unwrap();
+        assert!(!e.is_outcome_unknown(), "nothing to know of a read");
+        assert!(e.message.contains("stopped answering"), "{}", e.message);
+        assert_eq!(peer.calls.available_permits(), MAX_CALLS);
+
+        // An answer to a look puts it all right.
+        peer.note_look(true);
+        let e = peer
+            .call("vk_x", "agents.list", json!({}), Duration::from_millis(100))
+            .await
+            .unwrap_err();
+        assert!(e.message.contains("didn't answer"), "{}", e.message);
+    }
+
+    #[tokio::test]
+    async fn stuck_calls_dont_hold_up_a_ninth_for_long_or_outlast_the_looks() {
+        let dir = tempfile::tempdir().unwrap();
+        let peer = Arc::new(MacPeer::new(silent_end(dir.path())));
+        peer.note_look(true);
+        let stuck: Vec<_> = (0..MAX_CALLS)
+            .map(|_| under_way(&peer, "agents.start"))
+            .collect();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(peer.calls.available_permits(), 0);
+
+        let begun = Instant::now();
+        let e = peer
+            .call("vk_x", "agents.send", json!({}), LONG)
+            .await
+            .unwrap_err();
+        assert!(begun.elapsed() < TURN_WITHIN + Duration::from_secs(2));
+        assert!(e.message.contains("too many calls"), "{}", e.message);
+        assert!(e.message.contains("nothing was sent"), "{}", e.message);
+        assert!(!e.is_outcome_unknown());
+
+        // The Mac's found gone: each stuck call ends, and gives its turn back.
+        peer.note_look(false);
+        peer.note_look(false);
+        for call in stuck {
+            let e = tokio::time::timeout(Duration::from_secs(5), call)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                e.message.contains("check vibe_list_agents"),
+                "{}",
+                e.message
+            );
+        }
+        peer.note_look(true);
+        let e = peer
+            .call("vk_x", "agents.list", json!({}), Duration::from_millis(100))
+            .await
+            .unwrap_err();
+        assert!(!e.message.contains("too many calls"), "{}", e.message);
+    }
+
+    /// A tunnel's end that answers reads and closes each connection after one, and
+    /// closes on a send without a word: it may have happened, and who's to say.
+    fn closing_end(dir: &std::path::Path) -> (PathBuf, Arc<Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let path = dir.join("closing.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&heard);
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let log = Arc::clone(&log);
+                tokio::spawn(async move {
+                    let mut stream = BufReader::new(stream);
+                    let mut line = String::new();
+                    if stream.read_line(&mut line).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let call: Value = serde_json::from_str(&line).unwrap();
+                    let method = call["params"]["method"].as_str().unwrap().to_owned();
+                    lock(&log).push(method.clone());
+                    if method != "agents.send" {
+                        let reply = json!({"jsonrpc": "2.0", "id": call["id"], "result": {}});
+                        let _ = stream
+                            .get_mut()
+                            .write_all(format!("{reply}\n").as_bytes())
+                            .await;
+                    }
+                });
+            }
+        });
+        (path, heard)
+    }
+
+    #[tokio::test]
+    async fn a_send_that_went_out_isnt_sent_again_and_only_a_look_says_the_mac_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (end, heard) = closing_end(dir.path());
+        let peer = MacPeer::new(end);
+        peer.note_look(true);
+        let quick = Duration::from_secs(5);
+
+        // A read on a channel kept from before, now closed, just goes again.
+        for _ in 0..2 {
+            peer.call("vk_x", "agents.list", json!({}), quick)
+                .await
+                .unwrap();
+        }
+        assert_eq!(*lock(&heard), ["agents.list", "agents.list"]);
+
+        // A send isn't risked on the kept one, and once out it's never repeated.
+        let e = peer
+            .call("vk_x", "agents.send", json!({}), quick)
+            .await
+            .unwrap_err();
+        assert!(e.is_outcome_unknown(), "{}", e.message);
+        assert!(
+            e.message.contains("check vibe_read_messages"),
+            "{}",
+            e.message
+        );
+        assert_eq!(
+            lock(&heard).iter().filter(|m| *m == "agents.send").count(),
+            1
+        );
+        assert!(peer.is_up(), "one failed call says nothing of the others");
+
+        // Its tunnel's end gone: that didn't go out, and nothing's unknown of it.
+        let peer = MacPeer::new(dir.path().join("nothing-here.sock"));
+        peer.note_look(true);
+        let e = peer
+            .call("vk_x", "agents.send", json!({}), quick)
+            .await
+            .unwrap_err();
+        assert!(e.message.contains("nothing was sent"), "{}", e.message);
+        assert!(!e.is_outcome_unknown());
+        assert!(peer.is_up());
+    }
+
+    #[tokio::test]
+    async fn a_look_that_fails_lets_go_of_kept_channels() {
+        let dir = tempfile::tempdir().unwrap();
+        let (end, _heard) = closing_end(dir.path());
+        let peer = MacPeer::new(end);
+        peer.note_look(true);
+        peer.call("vk_x", "agents.list", json!({}), Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(lock(&peer.idle).len(), 1);
+        peer.note_look(false);
+        assert!(lock(&peer.idle).is_empty());
     }
 
     #[tokio::test]

@@ -19,9 +19,9 @@ use vibe_core::model::EventKind;
 use vibe_core::model::{LOCAL_HOST, MAC_HOST};
 use vibe_core::rpc::{
     Agent, AgentCheckParams, AgentDeleteParams, AgentList, AgentMessagesParams, AgentOutputParams,
-    AgentStartParams, AgentsCheck, AgentsDelete, AgentsList, AgentsMessages, AgentsOutput,
-    AgentsSend, AgentsStart, ErrorCode, ErrorObject, HostList, HostParams, HostsList, McpSetParams,
-    McpSettings, Method, Project, ProjectList, ProjectsList,
+    AgentSent, AgentStartParams, AgentsCheck, AgentsDelete, AgentsList, AgentsMessages,
+    AgentsOutput, AgentsSend, AgentsStart, ErrorCode, ErrorObject, HostList, HostParams, HostsList,
+    McpSetParams, McpSettings, Method, Project, ProjectList, ProjectsList,
 };
 use vibe_mcp::http::Settings;
 use vibe_mcp::{AgentView, Caller, Check, Daemon, Input, Message, Screen, Sent, Target};
@@ -29,9 +29,6 @@ use vibe_mcp::{AgentView, Caller, Check, Daemon, Input, Message, Screen, Sent, T
 use crate::core::{Core, error, invalid, limits_error, lock};
 use crate::external::MacPeer;
 
-/// How long another host gets to answer a listing or a lookup: nothing local waits
-/// on one for longer than this, whatever state it's in.
-const PEER_READ: Duration = Duration::from_secs(3);
 use crate::hosts::call_timeout;
 
 /// A value the Mac answered with, as `T`.
@@ -180,7 +177,7 @@ impl Core {
         if let Some(link) = self.link(host) {
             // A link that's up but stuck is let go, with what it last listed.
             let (agents, available) =
-                match tokio::time::timeout(PEER_READ, self.remote_agents(&link)).await {
+                match tokio::time::timeout(self.peer_read(), self.remote_agents(&link)).await {
                     Ok(agents) => (agents, link.connected()),
                     Err(_) => (self.kept_agents(&link), false),
                 };
@@ -222,6 +219,30 @@ impl Core {
     }
 }
 
+impl Core {
+    /// `asked`, for as long as another host gets to answer a read, all of it: its
+    /// turn at that host as well as the answer. Whatever falls back on what the host
+    /// last said then has time to, inside the deadline of whoever's waiting on it.
+    async fn within_peer_read<T>(
+        &self,
+        host: &str,
+        asked: impl Future<Output = Result<T, ErrorObject>>,
+    ) -> Result<T, ErrorObject> {
+        let limit = self.peer_read();
+        tokio::time::timeout(limit, asked)
+            .await
+            .unwrap_or_else(|_| {
+                Err(error(
+                    ErrorCode::HostUnavailable,
+                    format!(
+                        "{host} is unavailable: it didn't answer in {} s",
+                        limit.as_secs()
+                    ),
+                ))
+            })
+    }
+}
+
 impl Daemon for Core {
     fn serving(&self, on: bool) {
         if self.mcp_serving.swap(on, Ordering::SeqCst) != on {
@@ -254,18 +275,45 @@ impl Daemon for Core {
         }
     }
 
-    fn known_host(&self, c: &Caller, agent: &str) -> Option<String> {
+    fn known_hosts(&self, c: &Caller, agent: &str) -> Vec<String> {
+        let mut on = Vec::new();
         if let Some(seen) = self.mac().and_then(|mac| mac.last_seen(c.key()))
             && seen.iter().any(|a| a.agent == agent)
         {
-            return Some(MAC_HOST.to_owned());
+            on.push(MAC_HOST.to_owned());
         }
         let links: Vec<Arc<crate::link::Link>> =
             crate::core::lock(&self.links).values().cloned().collect();
-        links
-            .iter()
-            .find(|l| self.kept_agents(l).iter().any(|a| a.agent == agent))
-            .map(|l| l.name.clone())
+        on.extend(
+            links
+                .iter()
+                .filter(|l| self.kept_agents(l).iter().any(|a| a.agent == agent))
+                .map(|l| l.name.clone()),
+        );
+        on.sort();
+        on
+    }
+
+    fn known_project_hosts(&self, c: &Caller, project: &str) -> Vec<String> {
+        let mut on = Vec::new();
+        if self
+            .mac()
+            .is_some_and(|mac| mac.saw_project(c.key(), project))
+        {
+            on.push(MAC_HOST.to_owned());
+        }
+        on.extend(
+            crate::core::lock(&self.links)
+                .values()
+                .filter(|l| lock(&l.projects_seen).iter().any(|p| p == project))
+                .map(|l| l.name.clone()),
+        );
+        on.sort();
+        on
+    }
+
+    fn peer_deadline(&self) -> Duration {
+        self.peer_read()
     }
 
     async fn hosts(&self) -> Result<Vec<String>, ErrorObject> {
@@ -294,8 +342,11 @@ impl Daemon for Core {
         if let Some(mac) = self.mac()
             && !all.iter().any(|(h, _)| h == MAC_HOST)
         {
-            let own = mac
-                .call(c.key(), HostsList::NAME, json!({}), PEER_READ)
+            let own = self
+                .within_peer_read(
+                    MAC_HOST,
+                    mac.call(c.key(), HostsList::NAME, json!({}), self.peer_read()),
+                )
                 .await
                 .and_then(typed::<HostList>)
                 .ok()
@@ -310,24 +361,32 @@ impl Daemon for Core {
 
     async fn projects(&self, c: &Caller, host: &str) -> Result<Vec<Project>, ErrorObject> {
         if let Some(mac) = self.mac_for(host) {
-            let v = mac
-                .call(c.key(), ProjectsList::NAME, json!({}), PEER_READ)
-                .await?;
-            return Ok(typed::<ProjectList>(v)?.projects);
+            let listed = self
+                .within_peer_read(
+                    host,
+                    mac.call(c.key(), ProjectsList::NAME, json!({}), self.peer_read()),
+                )
+                .await
+                .and_then(typed::<ProjectList>);
+            return match listed {
+                Ok(list) => {
+                    mac.saw_projects(c.key(), &list.projects);
+                    Ok(list.projects)
+                }
+                Err(e) => {
+                    if e.code == ErrorCode::Unauthorized.code() {
+                        mac.forget(c.key());
+                    }
+                    Err(e)
+                }
+            };
         }
         if let Some(link) = self.link(host) {
             let params = HostParams::default();
             let asked = self.forward_typed::<ProjectsList>(&link, &params);
-            return match tokio::time::timeout(PEER_READ, asked).await {
-                Ok(list) => Ok(list?.projects),
-                Err(_) => Err(error(
-                    ErrorCode::HostUnavailable,
-                    format!(
-                        "{host} is unavailable: it didn't answer in {} s",
-                        PEER_READ.as_secs()
-                    ),
-                )),
-            };
+            let projects = self.within_peer_read(host, asked).await?.projects;
+            *lock(&link.projects_seen) = projects.iter().map(|p| p.name.clone()).collect();
+            return Ok(projects);
         }
         Ok(Core::projects(
             self,
@@ -340,8 +399,11 @@ impl Daemon for Core {
 
     async fn agents(&self, c: &Caller, host: &str) -> Result<Vec<AgentView>, ErrorObject> {
         if let Some(mac) = self.mac_for(host) {
-            let listed = mac
-                .call(c.key(), AgentsList::NAME, json!({}), PEER_READ)
+            let listed = self
+                .within_peer_read(
+                    host,
+                    mac.call(c.key(), AgentsList::NAME, json!({}), self.peer_read()),
+                )
                 .await
                 .and_then(typed::<AgentList>);
             let (agents, available) = match listed {
@@ -405,14 +467,31 @@ impl Daemon for Core {
         c: &Caller,
         t: &Target,
         input: Input,
-        send_id: &str,
+        request_id: &str,
     ) -> Result<Sent, ErrorObject> {
+        // It's this key's id: another key's the same one is another send.
+        let request_id = vibe_core::keys::hash(&format!("{}\n{request_id}", c.key()));
+        let request_id = request_id.as_str();
         let mac = self.mac_for(&t.host);
         let link = self.link(&t.host);
         if mac.is_some() || link.is_some() {
-            let params = crate::talk::send_params(&t.host, &t.agent, &input, send_id);
+            let params = crate::talk::send_params(&t.host, &t.agent, &input, request_id);
             let sent = match mac {
-                Some(mac) => mac_call::<AgentsSend>(mac, c, &params).await?,
+                Some(mac) => {
+                    let params = serde_json::to_value(&params).map_err(|e| {
+                        error(ErrorCode::InternalError, format!("Internal error: {e}"))
+                    })?;
+                    let answer = mac
+                        .call_at(
+                            c.key(),
+                            AgentsSend::NAME,
+                            params,
+                            call_timeout(AgentsSend::NAME),
+                            Some(self.now()),
+                        )
+                        .await?;
+                    typed::<AgentSent>(answer)?
+                }
                 None => {
                     let link = link.expect("one of them");
                     self.forward_typed::<AgentsSend>(&link, &params).await?
@@ -423,7 +502,7 @@ impl Daemon for Core {
                 state: sent.state,
             });
         }
-        self.send_once(Some(&t.host), &t.agent, input, send_id)
+        self.send_once(Some(&t.host), &t.agent, input, request_id)
             .await
     }
 

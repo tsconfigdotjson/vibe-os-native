@@ -29,12 +29,16 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::task::JoinHandle;
 use vibe_core::model::{LOCAL_HOST, TunnelState};
 use vibe_core::rpc::{
-    ErrorCode, ErrorObject, Hello, HelloParams, HostsList, Id, Method, NoParams, Request, Response,
-    TUNNEL_METHODS, TunnelCall, TunnelCallParams, TunnelPrepare,
+    AgentsSend, ErrorCode, ErrorObject, Hello, HelloParams, HostsList, Id, Method, NoParams,
+    Request, Response, TUNNEL_METHODS, TunnelCall, TunnelCallParams, TunnelPrepare,
 };
 
 use crate::core::{Core, error, lock};
 use crate::link::{Link, Timing};
+
+/// The oldest a send can be on arriving, in seconds. Older, it sat in the tunnel while
+/// this Mac slept, and whoever sent it has long been told it may not have arrived.
+const SEND_TOO_OLD: i64 = 60;
 
 /// The tunnel's socket, in `run/`.
 pub const TUNNEL_SOCKET: &str = "tunnel.sock";
@@ -178,6 +182,17 @@ async fn tunnel_call(core: &Core, params: Option<Value>) -> Result<Value, ErrorO
         Err(e) => return Err(e),
     };
     crate::log!("vibed: tunnel: key {:?} called {}", key.name, p.method);
+    if p.method == AgentsSend::NAME
+        && let Some(age) = p.sent_at.map(|at| core.now().saturating_sub(at))
+        && age > SEND_TOO_OLD
+    {
+        return Err(error(
+            ErrorCode::Conflict,
+            format!(
+                "this send took {age} s to reach the Mac, so it wasn't typed. Send it again if it's still wanted"
+            ),
+        ));
+    }
     let mut answer = crate::dispatch::call_here(core, &p.method, Value::Object(params)).await?;
     // This Mac's own row only: the hosts linked to it aren't the tunnel's
     // to see.

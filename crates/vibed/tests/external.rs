@@ -904,7 +904,7 @@ async fn a_send_delivered_with_its_reply_lost_arrives_once_when_retried() {
         .await;
     assert!(failed.contains("mac is unavailable"), "{failed}");
     let id = failed
-        .split("send_id \"")
+        .split("request_id \"")
         .nth(1)
         .and_then(|rest| rest.split('"').next())
         .unwrap_or_else(|| panic!("no id to retry with: {failed}"))
@@ -932,7 +932,7 @@ async fn a_send_delivered_with_its_reply_lost_arrives_once_when_retried() {
     let again = c
         .call(
             "vibe_send",
-            json!({"agent": agent, "text": "only once", "send_id": id}),
+            json!({"agent": agent, "text": "only once", "request_id": id}),
         )
         .await;
     assert!(again.contains("sent to mac:on-mac"), "{again}");
@@ -942,7 +942,7 @@ async fn a_send_delivered_with_its_reply_lost_arrives_once_when_retried() {
     let other = c
         .fails(
             "vibe_send",
-            json!({"agent": agent, "text": "something else", "send_id": id}),
+            json!({"agent": agent, "text": "something else", "request_id": id}),
         )
         .await;
     assert!(other.contains("different send"), "{other}");
@@ -951,6 +951,123 @@ async fn a_send_delivered_with_its_reply_lost_arrives_once_when_retried() {
     c.call("vibe_send", json!({"agent": agent, "text": "only once"}))
         .await;
     assert_eq!(times(&mut c, "only once").await, 2, "a new send");
+}
+
+/// The Mac sleeps with a send on its way: the caller is told nobody knows, and when
+/// the Mac wakes it lands. A retry with the id it was given types nothing more.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_send_held_up_by_a_sleeping_mac_lands_once_when_retried() {
+    let w = world(limits()).await;
+    w.turn_on().await;
+    let key = w.key("laptop");
+    w.pushed(&key).await;
+    let mut c = w.client(&key);
+    let agent = "mac:on-mac";
+    c.call(
+        "vibe_start_agent",
+        json!({"project": "app", "profile": "software-eng-mac", "prompt": "talk",
+               "host": "mac", "name": "on-mac"}),
+    )
+    .await;
+    c.call("vibe_wait", json!({"agents": agent, "timeout": 60}))
+        .await;
+
+    // Before any look has failed: the send goes out, into the frozen tunnel.
+    w.wires.freeze(true);
+    let failed = c
+        .fails(
+            "vibe_send",
+            json!({"agent": agent, "text": "held up", "request_id": "mine"}),
+        )
+        .await;
+    assert!(failed.contains("Outcome unknown"), "{failed}");
+    assert!(failed.contains("check vibe_read_messages"), "{failed}");
+    assert!(failed.contains("request_id \"mine\""), "{failed}");
+
+    // Now the look has failed, a new one is known not to have gone.
+    let refused = c
+        .fails("vibe_send", json!({"agent": agent, "text": "not this"}))
+        .await;
+    assert!(refused.contains("nothing was sent"), "{refused}");
+    assert!(!refused.contains("request_id"), "{refused}");
+
+    w.wires.freeze(false);
+    for _ in 0..1000 {
+        if w.host.hosts().unwrap().hosts[0].tunnel == Some(TunnelState::Up) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let times = async |c: &mut Client, text: &str| {
+        c.call("vibe_wait", json!({"agents": agent, "timeout": 60}))
+            .await;
+        c.call("vibe_read_messages", json!({"agent": agent, "last": 50}))
+            .await
+            .matches(&format!("> {text}"))
+            .count()
+    };
+    let again = c
+        .call(
+            "vibe_send",
+            json!({"agent": agent, "text": "held up", "request_id": "mine"}),
+        )
+        .await;
+    assert!(again.contains("sent to mac:on-mac"), "{again}");
+    // Whichever got there first, the one held up or its retry, that's the one.
+    for _ in 0..3 {
+        assert_eq!(times(&mut c, "held up").await, 1, "delivered once");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    assert_eq!(times(&mut c, "not this").await, 0);
+}
+
+/// A send a day late, as the bytes of one might be after a long sleep: not typed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_send_too_old_when_it_reaches_the_mac_isnt_typed() {
+    let w = world(limits()).await;
+    w.turn_on().await;
+    let key = w.key("laptop");
+    w.pushed(&key).await;
+    let mut c = w.client(&key);
+    let agent = "mac:on-mac";
+    c.call(
+        "vibe_start_agent",
+        json!({"project": "app", "profile": "software-eng-mac", "prompt": "talk",
+               "host": "mac", "name": "on-mac"}),
+    )
+    .await;
+    c.call("vibe_wait", json!({"agents": agent, "timeout": 60}))
+        .await;
+
+    let socket = w.host_world.home.join(".local/share/vibeos/run/mac.sock");
+    let send = async |text: &str, age: i64| {
+        let line = json!({"jsonrpc": "2.0", "id": 1, "method": "tunnel.call", "params": {
+            "key": key, "method": "agents.send", "sent_at": common::GOLDEN_NOW - age,
+            "params": {"ref": "on-mac", "text": text},
+        }});
+        let mut s = UnixStream::connect(&socket).await.unwrap();
+        s.write_all(format!("{line}\n").as_bytes()).await.unwrap();
+        let mut r = BufReader::new(s);
+        let mut out = String::new();
+        tokio::io::AsyncBufReadExt::read_line(&mut r, &mut out)
+            .await
+            .unwrap();
+        serde_json::from_str::<Value>(&out).unwrap()
+    };
+    let r = send("too late", 61).await;
+    assert_eq!(r["error"]["code"], ErrorCode::Conflict.code(), "{r}");
+    let why = r["error"]["message"].as_str().unwrap();
+    assert!(why.contains("wasn't typed"), "{why}");
+    let r = send("in time", 30).await;
+    assert!(r["result"].is_object(), "{r}");
+
+    c.call("vibe_wait", json!({"agents": agent, "timeout": 60}))
+        .await;
+    let read = c
+        .call("vibe_read_messages", json!({"agent": agent, "last": 50}))
+        .await;
+    assert!(read.contains("> in time"), "{read}");
+    assert!(!read.contains("> too late"), "{read}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1007,13 +1124,16 @@ async fn a_sleeping_mac_holds_up_nothing_on_the_host() {
         .await;
     assert!(read.contains("> hello mac"), "{read}");
 
+    // Which projects are where is known from here on.
+    c.call("vibe_list_projects", json!({})).await;
+
     // The Mac sleeps. Its tunnel's end goes on accepting, with nothing behind it,
-    // and before anything's noticed that costs a listing a few seconds at most.
+    // and before anything's noticed that costs a listing the peer deadline at most.
     w.wires.freeze(true);
     let started = Instant::now();
     let listed = c.call("vibe_list_agents", json!({})).await;
     assert!(
-        started.elapsed() < Duration::from_secs(10),
+        started.elapsed() < Duration::from_millis(vibe_core::limits::PEER_READ * 1000 + 500),
         "{:?}",
         started.elapsed()
     );
@@ -1061,20 +1181,29 @@ async fn a_sleeping_mac_holds_up_nothing_on_the_host() {
         )
         .await;
     assert!(failed.contains("mac is unavailable"), "{failed}");
-    // A project on both goes to the only host answering.
+    // A project on both is still on both, however long the Mac takes to answer.
+    let ambiguous = c
+        .fails(
+            "vibe_start_agent",
+            json!({"project": "app", "profile": "software-eng-linux", "prompt": "talk",
+                   "name": "while-away"}),
+        )
+        .await;
+    assert!(ambiguous.contains("app is a project on"), "{ambiguous}");
     let started_here = c
         .call(
             "vibe_start_agent",
             json!({"project": "app", "profile": "software-eng-linux", "prompt": "talk",
-                   "name": "while-away"}),
+                   "host": "local", "name": "while-away"}),
         )
         .await;
     assert!(
         started_here.contains("started while-away"),
         "{started_here}"
     );
+    // A call already on its way when the Mac went waits for two looks to fail.
     assert!(
-        started.elapsed() < Duration::from_secs(8),
+        started.elapsed() < Duration::from_secs(25),
         "all of that together: {:?}",
         started.elapsed()
     );

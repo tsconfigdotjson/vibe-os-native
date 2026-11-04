@@ -154,16 +154,16 @@ pub use vibe_status::{Message, Role};
 /// An error a core handler gave: its JSON-RPC code says what kind.
 pub type Error = ErrorObject;
 
-/// The longest send id, in characters.
-const MAX_SEND_ID: usize = 128;
+/// The longest request id, in characters.
+const MAX_REQUEST_ID: usize = 128;
 
-/// Whether `id` can name a send (`vibe_send`'s `send_id`).
-pub fn check_send_id(id: &str) -> Result<(), String> {
-    if (1..=MAX_SEND_ID).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_graphic()) {
+/// Whether `id` can name a send (`vibe_send`'s `request_id`).
+pub fn check_request_id(id: &str) -> Result<(), String> {
+    if (1..=MAX_REQUEST_ID).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_graphic()) {
         Ok(())
     } else {
         Err(format!(
-            "send_id must be 1 to {MAX_SEND_ID} printable ASCII characters, with no spaces"
+            "request_id must be 1 to {MAX_REQUEST_ID} printable ASCII characters, with no spaces"
         ))
     }
 }
@@ -187,10 +187,22 @@ pub trait Daemon: Send + Sync + 'static {
     /// records that it was used.
     fn verify_key(&self, secret: &str) -> Option<String>;
 
-    /// The host `agent` was last seen on, as `c` may know it, with no asking: so
-    /// that a bare ref needn't go looking on every host.
-    fn known_host(&self, _c: &Caller, _agent: &str) -> Option<String> {
-        None
+    /// The hosts `agent` was last seen on, as `c` may know them, so that a bare
+    /// ref needn't go looking on every host.
+    fn known_hosts(&self, _c: &Caller, _agent: &str) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// The hosts `project` was last seen on, as `c` may know them: a host that
+    /// doesn't answer now still has what it had.
+    fn known_project_hosts(&self, _c: &Caller, _project: &str) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// How long another host gets to answer a listing or a lookup. Nothing local
+    /// waits on one for much longer, whatever state it's in.
+    fn peer_deadline(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(vibe_core::limits::PEER_READ)
     }
 
     /// Every host this one can reach now, itself (`local`) first.
@@ -233,13 +245,13 @@ pub trait Daemon: Send + Sync + 'static {
     /// Types `input` into the agent's terminal, waking it first if it's
     /// asleep, paused or exited. Whatever answers afterwards is what
     /// [`Daemon::check`] waits for. The host that types it does so at most
-    /// once for `send_id`, and answers a repeat with how the first went.
+    /// once for `request_id`, and answers a repeat with how the first went.
     fn send(
         &self,
         c: &Caller,
         t: &Target,
         input: Input,
-        send_id: &str,
+        request_id: &str,
     ) -> impl Future<Output = Result<Sent, Error>> + Send;
 
     /// Never wakes it.

@@ -1710,11 +1710,11 @@ public struct AgentSendParams: Codable, Hashable, Sendable {
     /// Keys by name: "2", "Enter", "Down", "Ctrl+C".
     public var keys: [String]?
     /// Types it at most once: a repeat of this id gets how the first went.
-    public var sendId: String?
+    public var requestId: String?
 
     public init(
         host: String? = nil, ref: String, text: String? = nil, submit: Bool? = nil,
-        force: Bool? = nil, keys: [String]? = nil, sendId: String? = nil
+        force: Bool? = nil, keys: [String]? = nil, requestId: String? = nil
     ) {
         self.host = host
         self.ref = ref
@@ -1722,12 +1722,12 @@ public struct AgentSendParams: Codable, Hashable, Sendable {
         self.submit = submit
         self.force = force
         self.keys = keys
-        self.sendId = sendId
+        self.requestId = requestId
     }
 
     public enum CodingKeys: String, CodingKey, CaseIterable {
         case host, ref, text, submit, force, keys
-        case sendId = "send_id"
+        case requestId = "request_id"
     }
 }
 

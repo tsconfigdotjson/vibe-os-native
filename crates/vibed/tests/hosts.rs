@@ -440,7 +440,7 @@ async fn a_linux_hosts_agents_join_the_macs_view_over_the_link() {
     )
     .await
     .unwrap();
-    // A send id gets over the link to the host that types: there, it knows this
+    // A request id gets over the link to the host that types: there, it knows this
     // one was for something else, and nothing more is typed.
     let reused = Daemon::send(
         &*w.mac,

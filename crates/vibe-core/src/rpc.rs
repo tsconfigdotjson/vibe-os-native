@@ -294,6 +294,21 @@ impl ErrorObject {
         }
     }
 
+    /// Says this call went out and nobody heard how it ended: what it asked
+    /// for may have happened, or may yet.
+    pub fn outcome_unknown(self) -> Self {
+        self.with_data(serde_json::json!({"outcome": "unknown"}))
+    }
+
+    /// Whether [`ErrorObject::outcome_unknown`] said so.
+    pub fn is_outcome_unknown(&self) -> bool {
+        self.data
+            .as_ref()
+            .and_then(|d| d.get("outcome"))
+            .and_then(Value::as_str)
+            == Some("unknown")
+    }
+
     pub fn with_data(mut self, data: impl Serialize) -> Self {
         self.data = Some(serde_json::to_value(data).expect("error data serializes to JSON"));
         self
@@ -904,6 +919,10 @@ pub struct TunnelCallParams {
     pub method: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<Value>,
+    /// When the host sent it, in Unix seconds. A send that arrives long after,
+    /// as one held in the tunnel while a Mac slept does, isn't typed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sent_at: Option<i64>,
 }
 
 impl fmt::Debug for TunnelCallParams {
@@ -1682,9 +1701,10 @@ pub struct AgentSendParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keys: Option<Vec<String>>,
     /// Types it at most once: the host that types answers a repeat of this id
-    /// with how the first went. 1 to 128 printable ASCII characters, no spaces.
+    /// for this agent with how the first went, for about 10 minutes. 1 to 128
+    /// printable ASCII characters, no spaces.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub send_id: Option<String>,
+    pub request_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

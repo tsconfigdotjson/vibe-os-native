@@ -1502,6 +1502,39 @@ fn real_external_access() {
     );
     assert!(started.contains("started mac:external-mac"), "{started}");
     c.talk("mac:external-mac");
+    // The Mac's real `ssh -R` stops passing anything with its ends still open, as
+    // with a Mac asleep: the server goes on answering, with the Mac's agents as last
+    // seen, and has them back when it resumes.
+    c.call("vibe_list_agents", json!({}));
+    let pgrep = Command::new("pgrep")
+        .args(["-f", "ssh .*-R .*mac\\.sock"])
+        .output()
+        .unwrap();
+    let tunnel = String::from_utf8_lossy(&pgrep.stdout).trim().to_owned();
+    assert!(!tunnel.is_empty(), "the Mac's ssh -R isn't running");
+    let signal = |which: &str| {
+        for pid in tunnel.lines() {
+            assert!(
+                Command::new("kill")
+                    .args([which, pid])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+    };
+    signal("-STOP");
+    let begun = Instant::now();
+    let listed = c.call("vibe_list_agents", json!({}));
+    let took = begun.elapsed();
+    signal("-CONT");
+    assert!(took < Duration::from_secs(10), "{took:?}");
+    assert!(listed.contains("mac:external-mac"), "{listed}");
+    assert!(listed.contains("unavailable"), "{listed}");
+    wait_for("the Mac back", Duration::from_secs(60), || {
+        !c.call("vibe_list_agents", json!({}))
+            .contains("unavailable")
+    });
     if let Ok(project) = std::env::var("VIBE_TEST_LINUX_PROJECT") {
         let started = c.call(
             "vibe_start_agent",

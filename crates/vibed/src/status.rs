@@ -67,9 +67,16 @@ impl Core {
         Timestamp::from_secs_f64(self.now() as f64)
     }
 
-    /// The idle debounce, which is agent-tail's idle window. `host.toml` is
-    /// read on every use; one that can't be read gives the default, as
+    /// How long another host gets to answer a listing or a lookup. `host.toml`
+    /// is read on every use; one that can't be read gives the default, as
     /// admission says why it can't be.
+    pub(crate) fn peer_read(&self) -> Duration {
+        let secs =
+            limits::load(&self.layout.host_config()).map_or(limits::PEER_READ, |l| l.peer_read);
+        Duration::from_secs(secs)
+    }
+
+    /// The idle debounce, as above.
     pub(crate) fn idle_debounce(&self) -> Duration {
         let secs = limits::load(&self.layout.host_config())
             .map_or(HostLimits::default().idle_debounce, |l| l.idle_debounce);

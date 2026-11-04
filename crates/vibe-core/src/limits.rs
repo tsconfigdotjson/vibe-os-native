@@ -61,6 +61,10 @@ pub struct HostLimits {
     /// (Settings), not with `limits.set`.
     #[serde(skip)]
     pub mcp_tailscale: bool,
+    /// Seconds another host gets to answer a listing or a lookup before this
+    /// one goes on without it. Set in `host.toml` only, not over the socket.
+    #[serde(skip, default = "peer_read")]
+    pub peer_read: u64,
 }
 
 /// A setting that no longer means anything: written as 0, and read as
@@ -91,15 +95,26 @@ fn mcp_port() -> u16 {
     MCP_PORT
 }
 
+/// The default [`HostLimits::peer_read`], in seconds.
+pub const PEER_READ: u64 = 3;
+
+fn peer_read() -> u64 {
+    PEER_READ
+}
+
+/// The longest [`HostLimits::peer_read`]: longer, and a listing isn't prompt.
+const MAX_PEER_READ: i64 = 60;
+
 /// A setting that's true or false, and only in `host.toml`.
 pub const PACKAGE_CACHES: &str = "package_caches";
 
 /// The MCP settings, which are in `host.toml` only.
 pub const MCP_PORT_KEY: &str = "mcp_port";
 pub const MCP_TAILSCALE: &str = "mcp_tailscale";
+pub const PEER_READ_KEY: &str = "peer_read";
 
 /// The settings that aren't host limits on the socket.
-const FILE_ONLY: [&str; 3] = [PACKAGE_CACHES, MCP_PORT_KEY, MCP_TAILSCALE];
+const FILE_ONLY: [&str; 4] = [PACKAGE_CACHES, MCP_PORT_KEY, MCP_TAILSCALE, PEER_READ_KEY];
 
 /// Settings that no longer mean anything, left alone where an older file
 /// has them. `reserve_memory` was memory kept from agents for the host:
@@ -122,6 +137,7 @@ impl Default for HostLimits {
             package_caches: true,
             mcp_port: MCP_PORT,
             mcp_tailscale: false,
+            peer_read: PEER_READ,
         }
     }
 }
@@ -404,6 +420,17 @@ fn interpret(doc: &DocumentMut) -> Result<HostLimits, String> {
                 .ok_or_else(|| format!("{key} must be true or false"))?;
             continue;
         }
+        if key == PEER_READ_KEY {
+            limits.peer_read = item
+                .as_value()
+                .and_then(Value::as_integer)
+                .filter(|s| (1..=MAX_PEER_READ).contains(s))
+                .and_then(|s| u64::try_from(s).ok())
+                .ok_or_else(|| {
+                    format!("{key} must be a number of seconds, from 1 to {MAX_PEER_READ}")
+                })?;
+            continue;
+        }
         if key == MCP_PORT_KEY {
             limits.mcp_port = item
                 .as_value()
@@ -520,6 +547,7 @@ vm_disk          = "20G"   # a linux agent's own writable layer
 idle_debounce    = "60s"
 snapshot_disk    = "20G"   # total for all sleeping linux agents
 package_caches   = true    # linux agents share npm, pnpm, cargo and pip caches
+peer_read        = 3       # seconds another host gets to answer a listing or lookup
 "#;
         let (_d, path) = file(prd);
         assert_eq!(load(&path).unwrap(), HostLimits::default());
@@ -629,6 +657,20 @@ package_caches   = true    # linux agents share npm, pnpm, cargo and pip caches
             let e = load(&path).unwrap_err().to_string();
             assert!(e.contains(expect), "{text}: {e}");
         }
+        for (text, why) in [
+            ("peer_read = 0", "peer_read must be a number of seconds"),
+            ("peer_read = 61", "peer_read must be a number of seconds"),
+            (
+                "peer_read = \"3s\"",
+                "peer_read must be a number of seconds",
+            ),
+        ] {
+            let (_d, path) = file(text);
+            assert!(load(&path).unwrap_err().to_string().contains(why), "{text}");
+        }
+        let (_d, path) = file("peer_read = 10");
+        assert_eq!(load(&path).unwrap().peer_read, 10);
+        assert_eq!(HostLimits::default().peer_read, PEER_READ);
         let (_d, path) = file("mcp_ports = 1");
         let e = load(&path).unwrap_err().to_string();
         assert!(e.contains("mcp_port, mcp_tailscale"), "{e}");

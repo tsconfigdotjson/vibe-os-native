@@ -100,6 +100,8 @@ pub struct Link {
     /// The last push of this host's keys there failed: the next ping tries
     /// again.
     pub(crate) keys_stale: AtomicBool,
+    /// The projects it last listed, as it still has them while it's away.
+    pub(crate) projects_seen: Mutex<Vec<String>>,
 }
 
 impl std::fmt::Debug for Link {
@@ -131,6 +133,19 @@ pub fn unavailable(name: &str, why: Option<&str>) -> ErrorObject {
     )
 }
 
+/// What a call gets that went out over a link and hasn't been heard of since.
+fn lost(name: &str, method: &str, why: Option<&str>) -> ErrorObject {
+    let e = unavailable(name, why);
+    match crate::external::check_after(method) {
+        Some(check) => ErrorObject {
+            message: format!("{}. Outcome unknown: {check}", e.message),
+            ..e
+        }
+        .outcome_unknown(),
+        None => e,
+    }
+}
+
 impl Link {
     pub fn new(name: &str, address: &str) -> Link {
         Link {
@@ -148,6 +163,7 @@ impl Link {
             upgrade_tried: AtomicBool::new(false),
             refresh_wanted: AtomicBool::new(false),
             keys_stale: AtomicBool::new(false),
+            projects_seen: Mutex::new(Vec::new()),
         }
     }
 
@@ -303,7 +319,7 @@ impl Link {
         };
         let answer = tokio::select! {
             a = tokio::time::timeout(timeout, exchange) => a,
-            () = went_down => return Err(unavailable(&self.name, None)),
+            () = went_down => return Err(lost(&self.name, method, None)),
         };
         match answer {
             Ok(Ok(outcome)) => {
@@ -313,9 +329,10 @@ impl Link {
                 }
                 outcome
             }
-            Ok(Err(e)) => Err(unavailable(&self.name, Some(&e.to_string()))),
-            Err(_) => Err(unavailable(
+            Ok(Err(e)) => Err(lost(&self.name, method, Some(&e.to_string()))),
+            Err(_) => Err(lost(
                 &self.name,
+                method,
                 Some(&format!(
                     "it didn't answer {method} in {} s",
                     timeout.as_secs()
