@@ -66,6 +66,7 @@ pub const FORWARDED: &[&str] = &[
     "agents.messages",
     "pi.status",
     "pi.install",
+    "pi.forget",
 ];
 
 /// How long a forwarded call may take. Starting an agent fetches, cuts a

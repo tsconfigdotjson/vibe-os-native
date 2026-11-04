@@ -35,6 +35,9 @@ pub struct PiSeen {
 
 use crate::core::{Core, error, lock};
 
+/// What one look at the copies found: each copy's, and what's wrong with the store.
+type Look = (Vec<(Copy, std::io::Result<Synced>)>, Option<std::io::Error>);
+
 /// How many alerts there can be at once, whatever agents try.
 const MAX_ALERTS: usize = 32;
 
@@ -99,6 +102,7 @@ impl Core {
         synced: std::io::Result<Synced>,
     ) {
         let mut trouble = None;
+        let mut odd_name = false;
         match synced {
             Err(e) => {
                 Core::pi_note_store(alerts, Some(&e));
@@ -108,6 +112,7 @@ impl Core {
             Ok(Synced::Gone) => {}
             Ok(Synced::Quarantined(why)) => trouble = Some(why),
             Ok(Synced::Done(report)) => {
+                odd_name = report.odd_name;
                 if !report.bad.is_empty() {
                     let bad: std::collections::BTreeSet<&String> = report.bad.values().collect();
                     let bad: Vec<&str> = bad.into_iter().map(String::as_str).collect();
@@ -140,20 +145,26 @@ impl Core {
                 }
             }
         }
-        match trouble {
-            None => {
-                alerts.remove(&copy.name);
-            }
-            Some(why) => {
-                let alert = format!(
-                    "{}: {why}, so that isn't shared with any other agent. Something in it may \
-                     be hostile.",
-                    copy.name
-                );
-                if alerts.get(&copy.name) != Some(&alert) {
-                    crate::log!("vibed: Pi's login: {alert}");
-                    alerts.insert(copy.name.clone(), alert);
-                }
+        // What may be an attack says so; a custom provider's odd name needn't.
+        let mut said = Vec::new();
+        if let Some(why) = trouble {
+            said.push(format!(
+                "{why}, so that isn't shared with any other agent. Something in it may be hostile."
+            ));
+        }
+        if odd_name {
+            said.push(format!(
+                "{}. It works there, and reaches no other agent.",
+                pi_logins::ODD_NAME
+            ));
+        }
+        if said.is_empty() {
+            alerts.remove(&copy.name);
+        } else {
+            let alert = format!("{}: {}", copy.name, said.join(" "));
+            if alerts.get(&copy.name) != Some(&alert) {
+                crate::log!("vibed: Pi's login: {alert}");
+                alerts.insert(copy.name.clone(), alert);
             }
         }
     }
@@ -194,15 +205,29 @@ impl Core {
             (done, broker.read_store().err())
         })
         .await;
-        let Ok((done, store)) = done else {
-            return;
+        Core::pi_note_look(&mut lock(&self.pi_alerts), &known, done);
+    }
+
+    /// Keeps the alerts as one look at the copies left them. If the look itself
+    /// fell over, that's said, or logins would quietly stop being kept in step.
+    fn pi_note_look(
+        alerts: &mut BTreeMap<String, String>,
+        known: &[String],
+        look: Result<Look, tokio::task::JoinError>,
+    ) {
+        let (done, store) = match look {
+            Ok(look) => look,
+            Err(e) => {
+                let why = std::io::Error::other(format!("the look at them failed: {e}"));
+                Core::pi_note_store(alerts, Some(&why));
+                return;
+            }
         };
-        let mut alerts = lock(&self.pi_alerts);
         alerts.retain(|name, _| name == STORE_ALERT || known.contains(name));
         for (copy, synced) in done {
-            Core::pi_note_synced(&mut alerts, &copy, synced);
+            Core::pi_note_synced(alerts, &copy, synced);
         }
-        Core::pi_note_store(&mut alerts, store.as_ref());
+        Core::pi_note_store(alerts, store.as_ref());
     }
 
     /// Looks at one agent's copy as it starts, wakes or resumes, so what a backend
@@ -487,6 +512,46 @@ fn install(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F6: a look that falls over is told of, and a good one after it clears that.
+    #[tokio::test]
+    async fn a_look_that_falls_over_is_told_of() {
+        let panicked = tokio::spawn(async { panic!("the look") })
+            .await
+            .unwrap_err();
+        let mut alerts = BTreeMap::new();
+        Core::pi_note_look(&mut alerts, &[], Err(panicked));
+        let said = alerts.values().cloned().collect::<Vec<_>>().join(" ");
+        assert!(said.contains("the look at them failed"), "{said}");
+        Core::pi_note_look(&mut alerts, &[], Ok((Vec::new(), None)));
+        assert!(alerts.is_empty(), "{alerts:?}");
+    }
+
+    /// F4: an odd name is told of without the alarm, and what may be hostile with.
+    #[test]
+    fn only_what_may_be_hostile_is_called_that() {
+        let tmp = tempfile::tempdir().unwrap();
+        let copy = pi_logins::vm_copy("quiet-otter", tmp.path());
+        let mut alerts = BTreeMap::new();
+        let odd = pi_logins::Report {
+            odd_name: true,
+            ..Default::default()
+        };
+        Core::pi_note_synced(&mut alerts, &copy, Ok(Synced::Done(odd)));
+        let said = &alerts["quiet-otter"];
+        assert!(said.contains("can't pass on"), "{said}");
+        assert!(!said.contains("hostile"), "{said}");
+        let mut bad = pi_logins::Report::default();
+        bad.bad.insert(
+            "openai".into(),
+            "its login for openai would run a command".into(),
+        );
+        Core::pi_note_synced(&mut alerts, &copy, Ok(Synced::Done(bad)));
+        assert!(alerts["quiet-otter"].contains("hostile"));
+        // Put right, it's over.
+        Core::pi_note_synced(&mut alerts, &copy, Ok(Synced::Done(Default::default())));
+        assert!(alerts.is_empty());
+    }
 
     #[test]
     fn a_copy_is_looked_at_only_while_its_agent_is_up_and_settled() {

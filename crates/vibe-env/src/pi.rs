@@ -583,6 +583,13 @@ pub fn logins_in(dir: &Path) -> Vec<String> {
         .collect()
 }
 
+/// Whether all of `name` is text a terminal would only show: not a name a provider
+/// here can have, perhaps, but no attempt on whoever reads it.
+pub fn name_means_only_itself(name: &str) -> bool {
+    let bidi = |c: char| matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
+    !name.chars().any(|c| c.is_control() || bidi(c))
+}
+
 /// Whether `name` could be a provider's: what Pi's are, in characters that mean
 /// nothing to a terminal and few enough to read.
 pub fn provider_name_ok(name: &str) -> bool {

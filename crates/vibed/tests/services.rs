@@ -1101,6 +1101,39 @@ async fn a_pi_agent_on_an_older_guest_is_offered_nothing() {
     assert_eq!(*n.relays.lock().unwrap(), 0);
 }
 
+/// F1: `vibe pi forget --host vps` is about that host, which keeps no such login.
+/// It must never quietly edit the Mac's own.
+#[tokio::test(flavor = "multi_thread")]
+async fn forgetting_a_pi_login_on_a_host_goes_to_that_host_and_leaves_the_macs() {
+    let fake = FakeService::start().await;
+    let p = pair(&fake).await;
+    assert!(vibed::hosts::FORWARDED.contains(&"pi.forget"));
+    let store = p.mac.layout.linux_pi_logins_dir();
+    std::fs::create_dir_all(&store).unwrap();
+    let login = r#"{"xai":{"type":"api_key","key":"k"}}"#;
+    std::fs::write(store.join("auth.json"), login).unwrap();
+    let answer = rpc(
+        &p.mac.core,
+        "pi.forget",
+        json!({"host": "vps", "providers": ["xai"]}),
+    )
+    .await;
+    let message = answer["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("only a Mac keeps a login"), "{answer}");
+    assert_eq!(
+        std::fs::read_to_string(store.join("auth.json")).unwrap(),
+        login
+    );
+    // Asked of the Mac, it's the Mac's.
+    let answer = rpc(&p.mac.core, "pi.forget", json!({"providers": ["xai"]})).await;
+    assert_eq!(answer["result"]["vms"]["logins"], Value::Null, "{answer}");
+    assert!(
+        !std::fs::read_to_string(store.join("auth.json"))
+            .unwrap()
+            .contains("xai")
+    );
+}
+
 // ---- A Linux host's own login, driven from the Mac.
 
 /// `ssh`, in process, keeping everything that crosses the link either way.

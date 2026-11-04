@@ -167,6 +167,9 @@ pub struct Report {
     /// What this copy holds that isn't plain, which goes nowhere, and why. It
     /// stands for as long as the copy holds it.
     pub bad: BTreeMap<String, String>,
+    /// Whether it holds a login under a name that's only odd. It stands for as long
+    /// as the copy holds it, and is nothing to be alarmed by.
+    pub odd_name: bool,
     /// What this copy offered and was refused, and why: said once.
     pub refused: BTreeMap<String, String>,
     /// The store couldn't be read, and the owner's sign-in replaced it. What was
@@ -214,6 +217,12 @@ pub fn parse_copy(text: &str) -> Result<Map<String, Value>, String> {
     }
 }
 
+/// What's said of a name that's merely odd, as an owner's custom provider's might
+/// be, with a space, a `:` or a `/`, or long. It's still not repeated, and doesn't
+/// go further: only what's said of it differs.
+pub const ODD_NAME: &str = "it has a login under a name VibeOS can't pass on, as a provider's name \
+    here has to be letters, digits, '-', '_' or '.', up to 64 of them";
+
 /// The entries of `text`, if every one is plain, as the store has to be.
 pub fn parse_plain(text: &str) -> Result<Map<String, Value>, String> {
     let entries = parse_copy(text)?;
@@ -228,7 +237,11 @@ pub fn parse_plain(text: &str) -> Result<Map<String, Value>, String> {
 /// on its way to the owner's terminal and Settings.
 fn plain_login(name: &str, entry: &Value) -> Result<(), String> {
     if !pi::provider_name_ok(name) {
-        return Err("its auth.json has a login under a name no provider has".to_owned());
+        return Err(if pi::name_means_only_itself(name) {
+            ODD_NAME.to_owned()
+        } else {
+            "its auth.json has a login under a name no provider has".to_owned()
+        });
     }
     plain_entry(entry).map_err(|why| format!("its login for {name} {why}"))
 }
@@ -376,15 +389,16 @@ fn strings_of(value: &Value, out: &mut Vec<String>) {
 /// Copilot token's `proxy-ep` for where to send every request, finding it with
 /// the unanchored `/proxy-ep=([^;]+)/` (`github-copilot.ts`). So everything that
 /// expression could find, in any string of the login, has to be a host of
-/// Copilot's, whole.
-fn leads_elsewhere(entry: &Value) -> bool {
+/// Copilot's, whole, or of the enterprise the owner's own login says it's with,
+/// `enterprise`, which a refresh can't change.
+fn leads_elsewhere(entry: &Value, enterprise: Option<&str>) -> bool {
     let mut texts = Vec::new();
     strings_of(entry, &mut texts);
     texts.iter().any(|text| {
         text.match_indices("proxy-ep=").any(|(at, needle)| {
             let rest = &text[at + needle.len()..];
             let host = rest.split(';').next().unwrap_or_default();
-            !host.is_empty() && !copilot_host(host)
+            !host.is_empty() && !copilot_host(host) && !enterprise_host(host, enterprise)
         })
     })
 }
@@ -397,6 +411,23 @@ fn copilot_host(host: &str) -> bool {
                 .chars()
                 .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '-')
     })
+}
+
+/// Whether `host` is the enterprise's, as a GitHub Enterprise login's proxy is, in
+/// the same plain characters.
+fn enterprise_host(host: &str, enterprise: Option<&str>) -> bool {
+    enterprise
+        .filter(|domain| !domain.is_empty())
+        .is_some_and(|domain| {
+            host.strip_suffix(domain)
+                .and_then(|name| name.strip_suffix('.'))
+                .is_some_and(|name| {
+                    !name.is_empty()
+                        && name.chars().all(|c| {
+                            c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '-'
+                        })
+                })
+        })
 }
 
 /// How a new login from an agent's VM goes.
@@ -557,7 +588,10 @@ impl Broker {
         now_ms: u64,
     ) -> Verdict {
         let refuse = |why: &str| Verdict::Refuse(why.to_owned());
-        if leads_elsewhere(new) {
+        let enterprise = store
+            .get(name)
+            .and_then(|have| have["enterpriseUrl"].as_str());
+        if leads_elsewhere(new, enterprise) {
             return refuse("it would send requests somewhere of its own");
         }
         if serde_json::to_string(new).map_or(usize::MAX, |t| t.len()) > MAX_AGENT_ENTRY {
@@ -659,6 +693,9 @@ impl Broker {
             match plain_login(name, entry) {
                 Ok(()) => {
                     entries.insert(name.clone(), entry.clone());
+                }
+                Err(_) if pi::name_means_only_itself(name) && !pi::provider_name_ok(name) => {
+                    report.odd_name = true;
                 }
                 Err(why) => {
                     report.bad.insert(name.clone(), why);

@@ -916,6 +916,83 @@ fn nothing_agents_can_do_makes_a_copy_unreadable() {
     assert_eq!(w.done(&toolbox).taken, ["mine"]);
 }
 
+/// N4: the proxy of the enterprise the owner's own login is with is no false alarm.
+/// An agent can't bring that enterprise with it.
+#[test]
+fn a_refresh_of_an_enterprises_login_stays_with_that_enterprise() {
+    let login = |host: &str, enterprise: &str, expires: u64| {
+        format!(
+            r#"{{"github-copilot":{{"type":"oauth","access":"tid=1;proxy-ep={host}","refresh":"r","expires":{expires},"enterpriseUrl":"{enterprise}"}}}}"#
+        )
+    };
+    let w = world();
+    w.owner_signs_in(&login(
+        "copilot-proxy.corp.ghe.com",
+        "corp.ghe.com",
+        NOW + 1,
+    ));
+    let a = w.copy("a");
+    w.done(&a);
+    write(
+        &a,
+        &login("copilot-proxy.corp.ghe.com", "corp.ghe.com", NOW + 2),
+    );
+    assert_eq!(w.done(&a).taken, ["github-copilot"]);
+    // Anywhere else is what it always was.
+    for host in [
+        "evil.example",
+        "corp.ghe.com.evil.example",
+        "evilcorp.ghe.com",
+        "corp.ghe.com",
+    ] {
+        write(&a, &login(host, "corp.ghe.com", NOW + 3));
+        let report = w.done(&a);
+        assert!(
+            report.refused.contains_key("github-copilot"),
+            "{host}: {report:?}"
+        );
+    }
+    // Nor can a login say so for itself.
+    let w = world();
+    let a = w.copy("a");
+    write(&a, &login("x.evil.example", "evil.example", NOW + 1));
+    assert!(w.done(&a).refused.contains_key("github-copilot"));
+}
+
+/// F4: a name that's only odd isn't passed on either, and isn't an alarm.
+#[test]
+fn an_odd_name_is_told_of_calmly_and_goes_no_further() {
+    for name in [
+        "my provider",
+        "corp:gateway",
+        "team/model",
+        &"long".repeat(40),
+    ] {
+        let w = world();
+        let a = w.copy("a");
+        write(
+            &a,
+            &format!(
+                r#"{{"{name}":{{"type":"api_key","key":"k"}},"groq":{{"type":"api_key","key":"g"}}}}"#
+            ),
+        );
+        let report = w.done(&a);
+        assert!(report.odd_name, "{name}: {report:?}");
+        assert!(report.bad.is_empty(), "{name}: {report:?}");
+        assert_eq!(report.taken, ["groq"], "the rest go on");
+        assert_eq!(w.stored().keys().collect::<Vec<_>>(), ["groq"]);
+        // It's the agent's still.
+        assert!(
+            fs::read_to_string(a.dir.join("auth.json"))
+                .unwrap()
+                .contains(name)
+        );
+    }
+    assert!(pi::name_means_only_itself("corp:gateway"));
+    assert!(!pi::name_means_only_itself("a\u{1b}[2J"));
+    assert!(!pi::name_means_only_itself("a\u{202e}b"));
+}
+
 /// R3: a guest's text doesn't reach the owner's terminal as a provider's name.
 #[test]
 fn a_rejected_name_is_never_repeated() {
