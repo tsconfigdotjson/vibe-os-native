@@ -9,13 +9,13 @@ use vibe_core::rpc::{
     AgentsSend, AgentsStart, DoctorCheckGet, DoctorFix, ErrorCode, ErrorObject, Event,
     EventsSubscribe, GhStatusGet, Hello, HelloParams, HelloResult, HostsAdd, HostsExternal,
     HostsList, HostsRemove, HostsUpgrade, Id, KeysCreate, KeysList, KeysRevoke, KeysSync,
-    KeysVerify, LimitsGet, LimitsSet, McpGet, McpSet, Method, PROTOCOL_VERSION, PiInstall,
-    PiStatusGet, ProfilesCreate, ProfilesDelete, ProfilesList, ProfilesUpdate, ProjectsAdd,
-    ProjectsList, ProjectsRemove, ProtocolMismatchData, Request, Response, ServicesAudit,
-    ServicesComplete, ServicesConnect, ServicesDisconnect, ServicesFollow, ServicesList,
-    ServicesOverview, ServicesSet, ServicesToken, SessionsAttach, SessionsList, Subscribed,
-    ToolboxClose, ToolboxLoginsGet, ToolboxOpen, ToolboxRebuild, ToolboxStatusGet, ToolboxUpdate,
-    TunnelPrepare,
+    KeysVerify, LimitsGet, LimitsSet, McpGet, McpSet, Method, PROTOCOL_VERSION, PiForget,
+    PiInstall, PiStatusGet, ProfilesCreate, ProfilesDelete, ProfilesList, ProfilesUpdate,
+    ProjectsAdd, ProjectsList, ProjectsRemove, ProtocolMismatchData, Request, Response,
+    ServicesAudit, ServicesComplete, ServicesConnect, ServicesDisconnect, ServicesFollow,
+    ServicesList, ServicesOverview, ServicesSet, ServicesToken, SessionsAttach, SessionsList,
+    Subscribed, ToolboxClose, ToolboxLoginsGet, ToolboxOpen, ToolboxRebuild, ToolboxStatusGet,
+    ToolboxUpdate, TunnelPrepare,
 };
 
 use crate::core::Core;
@@ -280,6 +280,7 @@ async fn call(
                 .await,
         ),
         PiStatusGet::NAME => encode_result(core.pi_status(decode::<PiStatusGet>(params)?).await),
+        PiForget::NAME => encode_result(core.pi_forget(decode::<PiForget>(params)?).await),
         PiInstall::NAME => encode_result(core.pi_install(decode::<PiInstall>(params)?).await),
         DoctorCheckGet::NAME => {
             decode::<DoctorCheckGet>(params)?;

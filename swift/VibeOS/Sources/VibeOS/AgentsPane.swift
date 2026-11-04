@@ -90,10 +90,26 @@ struct AgentsPane: View {
                 Text(error).font(.callout).foregroundStyle(.secondary)
             }
             ForEach(vms.alerts ?? [], id: \.self) { alert in
-                Label(alert, systemImage: "exclamationmark.triangle.fill")
+                Label(cleanAlert(alert), systemImage: "exclamationmark.triangle.fill")
                     .font(.callout)
                     .foregroundStyle(.orange)
                     .textSelection(.enabled)
+            }
+            if let offered = vms.offered, !offered.isEmpty {
+                ForEach(offered, id: \.provider) { login in
+                    LabeledContent {
+                        Button("Forget") { Task { await forget([login.provider]) } }
+                            .help("Takes this login from every Linux Pi agent. If that agent offers another, stop it too.")
+                    } label: {
+                        Text(cleanAlert(login.provider))
+                        Text("From \(cleanAlert(login.agent)), not you")
+                    }
+                }
+                if offered.count > 1 {
+                    Button("Forget All from Agents") {
+                        Task { await forget(offered.map(\.provider)) }
+                    }
+                }
             }
             HStack {
                 if installing == .vm {
@@ -162,6 +178,15 @@ struct AgentsPane: View {
             error = nil
         } catch {
             status = nil
+            self.error = describe(error)
+        }
+    }
+
+    private func forget(_ providers: [String]) async {
+        do {
+            status = try await model.call(PiForget.self, PiForgetParams(host: host, providers: providers))
+            error = nil
+        } catch {
             self.error = describe(error)
         }
     }

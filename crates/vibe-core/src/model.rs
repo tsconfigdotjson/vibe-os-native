@@ -5,6 +5,25 @@
 use std::fmt;
 use std::str::FromStr;
 
+/// How much of an alert about Pi's logins is shown, in characters.
+const MAX_ALERT_CHARS: usize = 400;
+
+/// An alert about Pi's logins, as it's safe to print or show: part of it can have
+/// come from a guest, and it ends up on the owner's terminal. Nothing that moves a
+/// cursor, clears a screen or reverses text, and no more than a few lines of it.
+pub fn clean_alert(alert: &str) -> String {
+    let bidi = |c: char| matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
+    let clean: String = alert
+        .chars()
+        .map(|c| if c == '\n' || c == '\t' { ' ' } else { c })
+        .filter(|c| !c.is_control() && !bidi(*c))
+        .collect();
+    match clean.char_indices().nth(MAX_ALERT_CHARS) {
+        Some((at, _)) => format!("{}…", &clean[..at]),
+        None => clean,
+    }
+}
+
 /// How to sign in to Pi in the toolbox, which has no browser, and where a browser
 /// login's localhost callback can't be reached from the Mac's. Each option named
 /// is what Pi 1.5 calls it (`auth/oauth/`, in its source): check them when the pin moves.
@@ -817,6 +836,17 @@ impl fmt::Display for GithubRepo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_alert_cant_reach_a_terminal_as_anything_but_text() {
+        assert_eq!(clean_alert("plain"), "plain");
+        assert_eq!(clean_alert("a\x1b[2Jb\x07c\u{9b}d\ne"), "a[2Jbcd e");
+        assert_eq!(clean_alert("a\u{202e}b\u{2066}c"), "abc");
+        let long = "é".repeat(MAX_ALERT_CHARS * 2);
+        let cut = clean_alert(&long);
+        assert_eq!(cut.chars().count(), MAX_ALERT_CHARS + 1);
+        assert!(cut.ends_with('…'));
+    }
 
     #[test]
     fn refs() {

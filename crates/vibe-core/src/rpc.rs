@@ -381,6 +381,7 @@ pub const METHODS: &[&str] = &[
     ToolboxClose::NAME,
     PiStatusGet::NAME,
     PiInstall::NAME,
+    PiForget::NAME,
     DoctorCheckGet::NAME,
     DoctorFix::NAME,
     ServicesList::NAME,
@@ -705,6 +706,15 @@ method! {
     /// boot. It takes as long as the download does, and one runs at a time. A
     /// `pi.changed` event tells other clients, with `message` if it failed.
     PiInstall = "pi.install", PiInstallParams => PiStatus
+}
+
+method! {
+    /// `pi.forget`: takes these providers' logins out of the store `linux` agents
+    /// get theirs from, and so out of each agent's copy within seconds, and gives
+    /// the status after. A way to clear what agents offered, or sign out, without
+    /// the toolbox. Offered again as it was, a login stays out; anything new is a
+    /// new offer, so an agent offering junk has to be stopped too. On a Mac only.
+    PiForget = "pi.forget", PiForgetParams => PiStatus
 }
 
 method! {
@@ -1415,6 +1425,17 @@ pub struct PiVms {
     /// agent's copy, and what agents have done with a login.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub alerts: Vec<String>,
+    /// The logins here that came from an agent and not from the owner.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub offered: Vec<PiOffered>,
+}
+
+/// A login an agent signed in to, and every agent now uses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PiOffered {
+    pub provider: String,
+    /// The agent's ref.
+    pub agent: String,
 }
 
 /// Pi on one host.
@@ -1439,6 +1460,15 @@ pub struct PiInstallParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
     pub target: PiTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PiForgetParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    /// The providers, by name.
+    pub providers: Vec<String>,
 }
 
 /// What an agent's transcript says it's doing, from agent-tail (PRD:

@@ -966,6 +966,202 @@ async fn a_send_pi_takes_itself_is_no_failed_turn() {
     w.delete(&r).await;
 }
 
+/// N1: the send before it was answered long ago, and a `/model` after it owes none.
+#[tokio::test]
+async fn a_send_pi_takes_itself_after_a_tracked_one_is_no_failed_turn() {
+    let w = world().await;
+    w.sign_in();
+    let r = w.start("hello").await.agent;
+    w.wait_for(&r, Activity::Done).await;
+    let send = |text: &'static str| {
+        let (core, r) = (Arc::clone(&w.core), r.clone());
+        async move {
+            core.send_input(
+                None,
+                &r,
+                vibe_mcp::Input::Text {
+                    text: text.into(),
+                    submit: true,
+                    force: false,
+                },
+            )
+            .await
+            .unwrap();
+        }
+    };
+    send("sayerror").await;
+    w.wait_screen(&r, "No API key found for stripe").await;
+    w.wait_for(&r, Activity::Done).await;
+    send("/model").await;
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    let (_, activity, _) = w.state(&r).await;
+    assert_eq!(activity, Activity::Done);
+    w.delete(&r).await;
+}
+
+/// S5, through the daemon: what an agent offered is listed, and forgotten on the
+/// owner's word, from every copy.
+#[tokio::test]
+async fn the_owner_forgets_what_an_agent_offered_and_it_goes_from_every_copy() {
+    let w = world().await;
+    w.sign_in();
+    let (hostile, other) = (w.start("one").await.agent, w.start("two").await.agent);
+    let mut seen = None;
+    w.core.pi_watch(&mut seen).await;
+    let copy = |r: &str| w.layout.agent_dir(r).join(vibe_env::pi::VM_AGENT_DIR);
+    fs::write(
+        copy(&hostile).join("auth.json"),
+        r#"{"mock":{"type":"api_key","key":"fake"},
+            "junk-a":{"type":"api_key","key":"a"},
+            "junk-b":{"type":"api_key","key":"b"}}"#,
+    )
+    .unwrap();
+    w.core.pi_watch(&mut seen).await;
+    w.core.pi_watch(&mut seen).await;
+    assert_eq!(
+        vibe_env::pi::logins_in(&copy(&other)),
+        ["junk-a", "junk-b", "mock"]
+    );
+    let vms = w
+        .core
+        .pi_status(HostParams { host: None })
+        .await
+        .unwrap()
+        .vms
+        .unwrap();
+    assert_eq!(vms.offered.len(), 2);
+    assert_eq!(vms.offered[0].provider, "junk-a");
+    assert_eq!(vms.offered[0].agent, hostile);
+    let (_, mut events) = w.core.subscribe();
+    let after = w
+        .core
+        .pi_forget(vibe_core::rpc::PiForgetParams {
+            host: None,
+            providers: vec!["junk-a".into(), "junk-b".into()],
+        })
+        .await
+        .unwrap();
+    let vms = after.vms.unwrap();
+    assert_eq!(vms.logins, ["mock"]);
+    assert!(vms.offered.is_empty());
+    assert!(vms.alerts.is_empty(), "{:?}", vms.alerts);
+    assert_eq!(
+        events.try_recv().unwrap().kind,
+        vibe_core::model::EventKind::PiChanged
+    );
+    w.core.pi_watch(&mut seen).await;
+    assert_eq!(vibe_env::pi::logins_in(&copy(&other)), ["mock"]);
+    assert_eq!(vibe_env::pi::logins_in(&copy(&hostile)), ["mock"]);
+    let e = w
+        .core
+        .pi_forget(vibe_core::rpc::PiForgetParams {
+            host: None,
+            providers: vec!["\u{1b}[2J".into()],
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, ErrorCode::InvalidParams.code());
+    w.delete(&hostile).await;
+    w.delete(&other).await;
+}
+
+/// R3, through the daemon: however it got there, an alert is only text.
+#[tokio::test]
+async fn an_alert_a_guest_wrote_reaches_no_terminal() {
+    let w = world().await;
+    w.sign_in();
+    let r = w.start("hello").await.agent;
+    let mut seen = None;
+    w.core.pi_watch(&mut seen).await;
+    let copy = w.layout.agent_dir(&r).join(vibe_env::pi::VM_AGENT_DIR);
+    let phish = format!("\\u001b[2JYour Mac is at risk {}", "x".repeat(100_000));
+    fs::write(
+        copy.join("auth.json"),
+        format!(r#"{{"{phish}":{{"type":"api_key","key":"k"}}}}"#),
+    )
+    .unwrap();
+    let (_, mut events) = w.core.subscribe();
+    w.core.pi_watch(&mut seen).await;
+    let vms = w
+        .core
+        .pi_status(HostParams { host: None })
+        .await
+        .unwrap()
+        .vms
+        .unwrap();
+    assert_eq!(vms.alerts.len(), 1, "{:?}", vms.alerts);
+    let event = events.try_recv().unwrap().message.unwrap();
+    for said in [&vms.alerts[0], &event] {
+        assert!(!said.contains("at risk"), "{said}");
+        assert!(!said.contains('\u{1b}'), "{said}");
+        assert!(said.len() < 1000, "{}", said.len());
+        assert!(said.contains(&r), "{said}");
+    }
+    w.delete(&r).await;
+}
+
+/// N2: one copy looking fine after another found the store bad doesn't hide it.
+#[tokio::test]
+async fn a_bad_store_stays_told_of_whichever_copy_looks_last() {
+    let w = world().await;
+    w.sign_in();
+    let (a, b) = (w.start("one").await.agent, w.start("two").await.agent);
+    let mut seen = None;
+    w.core.pi_watch(&mut seen).await;
+    let store = w.layout.linux_pi_logins_dir().join("auth.json");
+    let good = fs::read_to_string(&store).unwrap();
+    fs::write(&store, "not json").unwrap();
+    // One of them quarantined all the same, so a look at it isn't about the store.
+    let copy = w.layout.agent_dir(&b).join(vibe_env::pi::VM_AGENT_DIR);
+    fs::write(copy.join("auth.json"), "not json").unwrap();
+    w.core.pi_watch(&mut seen).await;
+    let alerts = w
+        .core
+        .pi_status(HostParams { host: None })
+        .await
+        .unwrap()
+        .vms
+        .unwrap()
+        .alerts;
+    assert!(
+        alerts.iter().any(|a| a.contains("can't be kept in step")),
+        "{alerts:?}"
+    );
+    fs::write(&store, good).unwrap();
+    fs::write(copy.join("auth.json"), "{}").unwrap();
+    w.core.pi_watch(&mut seen).await;
+    let alerts = w
+        .core
+        .pi_status(HostParams { host: None })
+        .await
+        .unwrap()
+        .vms
+        .unwrap()
+        .alerts;
+    assert!(alerts.is_empty(), "{alerts:?}");
+    w.delete(&a).await;
+    w.delete(&b).await;
+}
+
+/// N5: what the broker keeps going bad reaches Settings, not silence.
+#[tokio::test]
+async fn what_the_broker_keeps_going_bad_is_told_of() {
+    let w = world().await;
+    w.sign_in();
+    let dir = w.layout.linux_pi_logins_dir();
+    fs::write(dir.join(vibe_env::pi_logins::NOTICES_FILE), "not json").unwrap();
+    let alerts = w
+        .core
+        .pi_status(HostParams { host: None })
+        .await
+        .unwrap()
+        .vms
+        .unwrap()
+        .alerts;
+    assert_eq!(alerts.len(), 1, "{alerts:?}");
+    assert!(alerts[0].contains("notices.json"), "{alerts:?}");
+}
+
 /// Delete takes its sessions and its copy, and nothing of the store.
 #[tokio::test]
 async fn a_delete_keeps_the_login_every_agent_shares() {

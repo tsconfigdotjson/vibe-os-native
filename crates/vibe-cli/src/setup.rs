@@ -9,11 +9,11 @@ use std::time::Duration;
 use vibe_core::model::{AgentKind, Environment, Mode, Model, PiTarget, Reasoning};
 use vibe_core::rpc::{
     HostAddParams, HostExternalParams, HostInfo, HostInstall, HostLink, HostNameParams, HostParams,
-    HostsAdd, HostsExternal, HostsList, HostsRemove, HostsUpgrade, NoParams, PiInstall,
-    PiInstallParams, PiStatus, PiStatusGet, Profile, ProfileCreateParams, ProfileParams,
-    ProfileUpdateParams, ProfilesCreate, ProfilesDelete, ProfilesList, ProfilesUpdate, Project,
-    ProjectAddParams, ProjectParams, ProjectRemoveParams, ProjectsAdd, ProjectsList,
-    ProjectsRemove,
+    HostsAdd, HostsExternal, HostsList, HostsRemove, HostsUpgrade, NoParams, PiForget,
+    PiForgetParams, PiInstall, PiInstallParams, PiStatus, PiStatusGet, Profile,
+    ProfileCreateParams, ProfileParams, ProfileUpdateParams, ProfilesCreate, ProfilesDelete,
+    ProfilesList, ProfilesUpdate, Project, ProjectAddParams, ProjectParams, ProjectRemoveParams,
+    ProjectsAdd, ProjectsList, ProjectsRemove,
 };
 use vibe_core::units::{format_size, parse_size};
 
@@ -42,6 +42,10 @@ pub(crate) struct Settings {
 pub(crate) enum Command {
     Pi {
         host: Option<String>,
+    },
+    ForgetPi {
+        host: Option<String>,
+        providers: Vec<String>,
     },
     InstallPi {
         host: Option<String>,
@@ -285,11 +289,15 @@ impl Command {
         let host = value(&found, "host").map(str::to_owned);
         match plain.as_slice() {
             [] | ["status"] if !vm => Ok(Command::Pi { host }),
+            ["forget", providers @ ..] if !providers.is_empty() => Ok(Command::ForgetPi {
+                host,
+                providers: providers.iter().map(|p| (*p).to_owned()).collect(),
+            }),
             ["install"] => Ok(Command::InstallPi {
                 host,
                 target: if vm { PiTarget::Vm } else { PiTarget::Native },
             }),
-            _ => Err("pi takes status, or install [--vm]".into()),
+            _ => Err("pi takes status, install [--vm], or forget PROVIDER...".into()),
         }
     }
 
@@ -375,8 +383,20 @@ pub(crate) fn describe_pi(p: &PiStatus) -> String {
                 l => l,
             }
         ));
+        // What a daemon of any version says goes to this terminal only as text.
         for alert in &vms.alerts {
+            let alert = vibe_core::model::clean_alert(alert);
             out.push_str(&format!("\n! {alert}"));
+        }
+        for o in &vms.offered {
+            let (provider, agent) = (
+                vibe_core::model::clean_alert(&o.provider),
+                vibe_core::model::clean_alert(&o.agent),
+            );
+            out.push_str(&format!(
+                "\n{provider}'s login came from {agent}, not you: `vibe pi forget {provider}`, \
+                 and stop that agent if it wasn't you"
+            ));
         }
     }
     out
@@ -566,6 +586,12 @@ pub(crate) fn run(socket: &Path, command: Command) -> Result<(), String> {
         Command::Pi { host } => {
             let status =
                 client::call::<PiStatusGet>(socket, &HostParams { host }, TIMEOUT).map_err(e)?;
+            println!("{}", describe_pi(&status));
+        }
+        Command::ForgetPi { host, providers } => {
+            let status =
+                client::call::<PiForget>(socket, &PiForgetParams { host, providers }, TIMEOUT)
+                    .map_err(e)?;
             println!("{}", describe_pi(&status));
         }
         Command::InstallPi { host, target } => {
@@ -913,6 +939,14 @@ mod tests {
     #[test]
     fn pi_commands() {
         assert_eq!(
+            Command::parse_pi(&words(&["forget", "junk-a", "junk-b"])),
+            Ok(Command::ForgetPi {
+                host: None,
+                providers: vec!["junk-a".into(), "junk-b".into()]
+            })
+        );
+        assert!(Command::parse_pi(&words(&["forget"])).is_err());
+        assert_eq!(
             Command::parse_pi(&words(&[])),
             Ok(Command::Pi { host: None })
         );
@@ -981,6 +1015,20 @@ mod tests {
             describe_pi(&status).contains("\n! quiet-otter signed in to xai"),
             "the owner hears here too"
         );
+        // R3: nothing of what a daemon sends reaches this terminal as more than
+        // text, nor much of it.
+        status.vms = Some(vibe_core::rpc::PiVms {
+            alerts: vec![format!("\x1b[2Jphish{}", "x".repeat(100_000))],
+            offered: vec![vibe_core::rpc::PiOffered {
+                provider: "\x1b]0;evil\x07xai".into(),
+                agent: "quiet-otter".into(),
+            }],
+            ..Default::default()
+        });
+        let said = describe_pi(&status);
+        assert!(!said.chars().any(|c| c == '\x1b' || c == '\x07'), "{said}");
+        assert!(said.len() < 2000, "{}", said.len());
+        assert!(said.contains("vibe pi forget"), "{said}");
         status.native = Some(vibe_core::rpc::PiBinary {
             managed: false,
             path: "/bin/pi".into(),

@@ -71,7 +71,7 @@ public final class FixtureDaemon: DaemonConnection, @unchecked Sendable {
             return ["checks": doctor]
         case ToolboxStatusGet.name, ToolboxClose.name:
             return ["state": "closed", "template": 3, "home": 2, "base": 1, "newest_base": 2]
-        case PiStatusGet.name, PiInstall.name:
+        case PiStatusGet.name, PiInstall.name, PiForget.name:
             // As the doctor's Pi check says of this Mac.
             if scenario == .firstRun || scenario == .freshMac {
                 return ["host": host, "vms": [String: Any]()]

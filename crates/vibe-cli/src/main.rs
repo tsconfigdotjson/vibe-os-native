@@ -89,6 +89,9 @@ commands:
               is linked to
   pi          Pi on this host: what's installed and which providers it's
               signed in to
+  pi forget PROVIDER...
+              on a Mac, take these providers' logins from what linux agents
+              share, such as one an agent offered; stop that agent as well
   pi install [--vm]
               download Pi, checksummed, and link it at ~/.local/bin/pi; on a
               Mac, --vm for the layer linux agents boot instead. Signing in

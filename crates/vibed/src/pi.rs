@@ -11,7 +11,8 @@ use vibe_core::model::{
     AgentKind, AgentState, Environment, EventKind, LOCAL_HOST, PiTarget, Profile,
 };
 use vibe_core::rpc::{
-    ErrorCode, ErrorObject, HostParams, PiBinary, PiInstallParams, PiStatus, PiVms,
+    ErrorCode, ErrorObject, HostParams, PiBinary, PiForgetParams, PiInstallParams, PiOffered,
+    PiStatus, PiVms,
 };
 use vibe_core::store::AgentRecord;
 use vibe_env::images::Images;
@@ -33,6 +34,9 @@ pub struct PiSeen {
 }
 
 use crate::core::{Core, error, lock};
+
+/// How many alerts there can be at once, whatever agents try.
+const MAX_ALERTS: usize = 32;
 
 /// Where an alert about the store itself is kept, among those about each copy.
 const STORE_ALERT: &str = "the store";
@@ -80,7 +84,10 @@ impl Core {
                 && let AgentHome::Pi(home) = &handle.home
                 && home.config.is_some()
             {
-                let running = !matches!(a.state, AgentState::Exited | AgentState::Asleep);
+                // Being deleted, slept or woken, it's looked at when that's done:
+                // a delete mustn't race with something writing beside it.
+                let running = !matches!(a.state, AgentState::Exited | AgentState::Asleep)
+                    && !self.is_busy(&a.agent_ref);
                 copies.push((pi_logins::vm_copy(&a.agent_ref, &handle.agent_dir), running));
             }
         }
@@ -97,11 +104,7 @@ impl Core {
         let mut trouble = None;
         match synced {
             Err(e) => {
-                let alert = format!("Pi's logins can't be kept in step: {e}");
-                if alerts.get(STORE_ALERT) != Some(&alert) {
-                    crate::log!("vibed: {alert}");
-                    alerts.insert(STORE_ALERT.to_owned(), alert);
-                }
+                Core::pi_note_store(alerts, Some(&e));
                 return;
             }
             Ok(Synced::Busy) => return,
@@ -109,7 +112,8 @@ impl Core {
             Ok(Synced::Quarantined(why)) => trouble = Some(why),
             Ok(Synced::Done(report)) => {
                 if !report.bad.is_empty() {
-                    let bad: Vec<String> = report.bad.values().cloned().collect();
+                    let bad: std::collections::BTreeSet<&String> = report.bad.values().collect();
+                    let bad: Vec<&str> = bad.into_iter().map(String::as_str).collect();
                     trouble = Some(bad.join("; "));
                 }
                 if !report.taken.is_empty() {
@@ -139,7 +143,6 @@ impl Core {
                 }
             }
         }
-        alerts.remove(STORE_ALERT);
         match trouble {
             None => {
                 alerts.remove(&copy.name);
@@ -158,6 +161,22 @@ impl Core {
         }
     }
 
+    /// Keeps the alert about the store as it stands: `trouble` if there is any.
+    fn pi_note_store(alerts: &mut BTreeMap<String, String>, trouble: Option<&std::io::Error>) {
+        match trouble {
+            Some(e) => {
+                let alert = format!("Pi's logins can't be kept in step: {e}");
+                if alerts.get(STORE_ALERT) != Some(&alert) {
+                    crate::log!("vibed: {alert}");
+                    alerts.insert(STORE_ALERT.to_owned(), alert);
+                }
+            }
+            None => {
+                alerts.remove(STORE_ALERT);
+            }
+        }
+    }
+
     /// Looks at every copy of Pi's login in use, keeping each in step with the
     /// store. An alert goes only when the agent does: one asleep keeps its own.
     async fn pi_sync_logins(&self) {
@@ -165,21 +184,28 @@ impl Core {
         let broker = Broker::of(&self.layout);
         let known: Vec<String> = copies.iter().map(|(c, _)| c.name.clone()).collect();
         let done = tokio::task::spawn_blocking(move || {
-            copies
+            let done = copies
                 .into_iter()
                 .filter(|(_, in_use)| *in_use)
                 .map(|(copy, _)| {
                     let synced = broker.sync(&copy, pi_logins::now_ms());
                     (copy, synced)
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            // As it stands after all of them, whichever copy looked last, with
+            // or without any copy to look.
+            (done, broker.read_store().err())
         })
         .await;
+        let Ok((done, store)) = done else {
+            return;
+        };
         let mut alerts = lock(&self.pi_alerts);
         alerts.retain(|name, _| name == STORE_ALERT || known.contains(name));
-        for (copy, synced) in done.unwrap_or_default() {
+        for (copy, synced) in done {
             Core::pi_note_synced(&mut alerts, &copy, synced);
         }
+        Core::pi_note_store(&mut alerts, store.as_ref());
     }
 
     /// Looks at one agent's copy as it starts, wakes or resumes, so what a backend
@@ -202,18 +228,64 @@ impl Core {
         Core::pi_note_synced(&mut lock(&self.pi_alerts), &copy, done);
     }
 
-    /// All that needs the owner's eye about Pi's logins: what's wrong now, and
-    /// what agents have done with one.
+    /// All that needs the owner's eye about Pi's logins: what's wrong now, what's
+    /// wrong with what the broker keeps, and what agents have done with one. Part
+    /// of it can have come from a guest, so it's made safe to print here, for
+    /// every client, and there's a limit to how much of it there is.
     async fn pi_alerts_now(&self) -> Vec<String> {
         let broker = Broker::of(&self.layout);
-        let notices = tokio::task::spawn_blocking(move || broker.notices(pi_logins::now_ms()))
-            .await
-            .unwrap_or_default();
-        lock(&self.pi_alerts)
-            .values()
-            .cloned()
-            .chain(notices)
+        let (problems, notices) = tokio::task::spawn_blocking(move || {
+            (broker.problems(), broker.notices(pi_logins::now_ms()))
+        })
+        .await
+        .unwrap_or_default();
+        let wrong: Vec<String> = lock(&self.pi_alerts).values().cloned().collect();
+        wrong
+            .into_iter()
+            .chain(problems)
+            .chain(notices.into_iter().rev())
+            .take(MAX_ALERTS)
+            .map(|alert| vibe_core::model::clean_alert(&alert))
             .collect()
+    }
+
+    /// The logins agents offered, from what the broker kept.
+    async fn pi_offered_now(&self) -> Vec<PiOffered> {
+        let broker = Broker::of(&self.layout);
+        tokio::task::spawn_blocking(move || broker.offered())
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(provider, agent)| PiOffered { provider, agent })
+            .collect()
+    }
+
+    /// `pi.forget`.
+    pub async fn pi_forget(&self, p: PiForgetParams) -> Result<PiStatus, ErrorObject> {
+        self.host(p.host.as_deref())?;
+        if self.info().os != "macos" {
+            return Err(error(
+                ErrorCode::Conflict,
+                "only a Mac keeps a login for linux agents; run `pi` here and use /logout",
+            ));
+        }
+        if p.providers.is_empty() || !p.providers.iter().all(|n| pi::provider_name_ok(n)) {
+            return Err(error(
+                ErrorCode::InvalidParams,
+                "give the providers to forget",
+            ));
+        }
+        let broker = Broker::of(&self.layout);
+        let names = p.providers.clone();
+        let gone = tokio::task::spawn_blocking(move || broker.forget(&names, pi_logins::now_ms()))
+            .await
+            .map_err(|e| error(ErrorCode::InternalError, e.to_string()))?
+            .map_err(|e| error(ErrorCode::CommandFailed, e.to_string()))?;
+        if !gone.is_empty() {
+            crate::log!("vibed: forgot Pi's login for {}", gone.join(", "));
+        }
+        self.publish(self.event(EventKind::PiChanged));
+        self.pi_status(HostParams { host: None }).await
     }
 
     /// The looks at Pi's logins this host makes every [`PI_WATCH_EVERY`], and
@@ -291,11 +363,13 @@ impl Core {
             });
         let (logins, vm_logins) = self.pi_logins_now().await;
         let alerts = self.pi_alerts_now().await;
+        let offered = self.pi_offered_now().await;
         let vms = (self.info().os == "macos").then(|| PiVms {
             version: Images::new(self.layout.linux_dir()).pi().map(|(v, _)| v),
             logins: vm_logins,
             error: self.linux_images.as_ref().and_then(|w| w.pi_error()),
-            alerts: alerts.clone(),
+            alerts,
+            offered,
         });
         Ok(PiStatus {
             host,

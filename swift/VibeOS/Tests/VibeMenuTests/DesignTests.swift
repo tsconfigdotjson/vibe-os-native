@@ -849,6 +849,9 @@ typealias StepStatus = SetupProgress.Step.Status
             ["name": "reviewer", "environment": "linux", "model": "sonnet", "reasoning": "xhigh", "mode": "bypass",
              "memory": 4 << 30] as [String: Any])
         #expect(profileSummary(profile) == "Linux · Sonnet · Extra High · Bypass · 4G")
+        // Part of an alert can come from a guest: it's shown as text, and short.
+        #expect(cleanAlert("a\u{1b}[2Jb\u{07}c\u{202e}d") == "a[2Jbcd")
+        #expect(cleanAlert(String(repeating: "x", count: 1000)).count == 401)
         // Pi says what it runs, has a model of its own, and no modes.
         var pi = profile
         pi.agent = .pi

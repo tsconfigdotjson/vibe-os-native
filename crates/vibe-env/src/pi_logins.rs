@@ -66,8 +66,12 @@ const MAX_AGENT_ENTRY: usize = 32 * 1024;
 /// Pi 1.5 knows about 50.
 const MAX_AGENT_PROVIDERS: usize = 64;
 
-/// How big the store may grow by an agent's VM. The owner's sign-ins go past this
-/// up to [`pi::MAX_AUTH_FILE`], which is what keeps a copy of it readable.
+/// How big the store may grow by a new provider from an agent's VM. A refresh of
+/// a login already there isn't held to this, or a store filled by a hostile VM
+/// would stop rotated tokens reaching the rest. The owner's sign-ins go past it too,
+/// up to [`pi::MAX_AUTH_FILE`], which is what keeps a copy of it readable, and which
+/// these limits together can't reach from agents alone: [`MAX_AGENT_ENTRY`] by
+/// [`MAX_AGENT_PROVIDERS`] is 2 MiB.
 const MAX_AGENT_STORE: usize = 256 * 1024;
 
 /// How many old logins are remembered per provider, to know a stale one by.
@@ -83,6 +87,13 @@ const MAX_NOTICES: usize = 2 * MAX_AGENT_PROVIDERS;
 /// A share's names on its way to a VM aren't these, whatever the case on a Mac's
 /// disk: the first two are the copy's own, and sessions go elsewhere.
 const NEVER_LINKED: &[&str] = &["auth.json", "auth.json.lock", "sessions"];
+
+/// Where it's kept who offered a login that's now in the store, so the owner can
+/// find it and forget it, however long ago that was.
+const OFFERED_FILE: &str = "offered.json";
+
+/// Where the store remembers logins it has moved on from, by digest.
+const HISTORY_FILE: &str = "history.json";
 
 /// What doesn't say who a login is or where it goes: a provider's list of models
 /// or scopes, which a refresh may change. Any other field of a login has to stay
@@ -207,28 +218,28 @@ pub fn parse_copy(text: &str) -> Result<Map<String, Value>, String> {
 pub fn parse_plain(text: &str) -> Result<Map<String, Value>, String> {
     let entries = parse_copy(text)?;
     for (name, entry) in &entries {
-        if let Err(why) = plain_login(name, entry) {
-            return Err(format!("its login for {name} {why}"));
-        }
+        plain_login(name, entry)?;
     }
     Ok(entries)
 }
 
-/// Whether `entry` is a login for a provider of this name.
-fn plain_login(name: &str, entry: &Value) -> Result<(), &'static str> {
-    let name_ok =
-        !name.is_empty() && name.len() <= 128 && name.chars().all(|c| c.is_ascii_graphic());
-    if !name_ok {
-        return Err("names a provider strangely");
+/// Whether `entry` is a login for a provider of this name, and if not, what to
+/// tell the owner. A name that isn't one is never repeated: it's a guest's text,
+/// on its way to the owner's terminal and Settings.
+fn plain_login(name: &str, entry: &Value) -> Result<(), String> {
+    if !pi::provider_name_ok(name) {
+        return Err("its auth.json has a login under a name no provider has".to_owned());
     }
-    plain_entry(entry)
+    plain_entry(entry).map_err(|why| format!("its login for {name} {why}"))
 }
 
 /// Whether `entry` is only what Pi's logins are (`auth/types.ts`), each value
 /// taken for what it says. An API key may have a flat map beside it, as
-/// Cloudflare's has its account's id (`cloudflare-auth.ts`). An OAuth login may
-/// have a provider's own fields: plain values, a list of strings, as Copilot's
-/// models and ChatGPT's scopes are, or a flat map.
+/// Cloudflare's has its account's id (`cloudflare-auth.ts`), and may have no key
+/// at all, as Bedrock's and Vertex's don't, which sign in from a profile, a
+/// credential chain or a file (`amazon-bedrock.ts`, `google-vertex.ts`). An OAuth
+/// login may have a provider's own fields: plain values, a list of strings, as
+/// Copilot's models and ChatGPT's scopes are, or a flat map.
 fn plain_entry(entry: &Value) -> Result<(), &'static str> {
     let Value::Object(fields) = entry else {
         return Err("isn't an object");
@@ -242,9 +253,6 @@ fn plain_entry(entry: &Value) -> Result<(), &'static str> {
                     "env" => plain_map(value)?,
                     _ => return Err("has more than a key"),
                 }
-            }
-            if !fields.contains_key("key") {
-                return Err("has no key");
             }
             Ok(())
         }
@@ -555,17 +563,18 @@ impl Broker {
         if serde_json::to_string(new).map_or(usize::MAX, |t| t.len()) > MAX_AGENT_ENTRY {
             return refuse("it's far bigger than a login is");
         }
-        let mut after = store.clone();
-        after.insert(name.to_owned(), new.clone());
-        if serde_json::to_string(&after).map_or(usize::MAX, |t| t.len()) > MAX_AGENT_STORE {
-            return refuse("the store has no more room for what agents offer");
-        }
         let oauth = new["type"] == "oauth";
         let ahead = (now_ms + MAX_EXPIRES_AHEAD_MS) as f64;
         if oauth && expires(new) > ahead {
             return refuse("its expiry is implausibly far off");
         }
+        let mut after = store.clone();
+        after.insert(name.to_owned(), new.clone());
         let Some(have) = store.get(name) else {
+            // Only a new provider can fill the store.
+            if serde_json::to_string(&after).map_or(usize::MAX, |t| t.len()) > MAX_AGENT_STORE {
+                return refuse("the store has no more room for what agents offer");
+            }
             if store.len() >= MAX_AGENT_PROVIDERS {
                 return refuse("the store has no more room for what agents offer");
             }
@@ -575,6 +584,11 @@ impl Broker {
                 }
                 None => return refuse("pi.env can't be read, to tell if you've given it a key"),
                 Some(_) => {}
+            }
+            // With no key, it signs in from whatever's around it. That's the
+            // owner's to choose for every agent, and an agent's offer isn't.
+            if !oauth && !new.as_object().is_some_and(|f| f.contains_key("key")) {
+                return refuse("it has no key, and would use what's around each agent");
             }
             // What a first sign-in says of where it goes could send others
             // anywhere: Cloudflare's account and gateway, Copilot's enterprise.
@@ -587,6 +601,11 @@ impl Broker {
                 Verdict::Take
             };
         };
+        // What keeps every copy readable, whoever's growing it. Agents alone can't
+        // get here.
+        if pretty(&after).len() as u64 > pi::MAX_AUTH_FILE {
+            return refuse("the store is as big as a copy of it can be");
+        }
         if oauth
             && have["type"] == "oauth"
             && identity(have) == identity(new)
@@ -642,9 +661,7 @@ impl Broker {
                     entries.insert(name.clone(), entry.clone());
                 }
                 Err(why) => {
-                    report
-                        .bad
-                        .insert(name.clone(), format!("its login for {name} {why}"));
+                    report.bad.insert(name.clone(), why);
                 }
             }
         }
@@ -662,11 +679,16 @@ impl Broker {
         let mut history = self.read_history();
         let own_keys = self.own_keys();
         let mut notices = self.read_notices(now_ms);
+        let notices_before = notices.clone();
+        let mut offered = self.read_offered();
+        let offered_before = offered.clone();
         let mut store_changed = false;
         // A new entry that's one the store once held is a stale read being written
-        // back. Tokens never come round again, so that's no sign-in; a key may.
+        // back, or something the owner forgot being offered again. Tokens never
+        // come round again, so that's no sign-in; the owner's key may.
+        let owner = copy.owner;
         let stale_read = |name: &str, entry: &Value, history: &BTreeMap<String, Vec<String>>| {
-            entry["type"] == "oauth"
+            (entry["type"] == "oauth" || !owner)
                 && history
                     .get(name)
                     .is_some_and(|old| old.contains(&digest(entry)))
@@ -701,7 +723,9 @@ impl Broker {
                     store_changed = true;
                     if copy.owner {
                         notices.retain(|n| n.provider != *name);
+                        offered.remove(name);
                     } else if first {
+                        offered.insert(name.clone(), copy.name.clone());
                         notices.push(Notice {
                             provider: name.clone(),
                             text: format!(
@@ -751,6 +775,7 @@ impl Broker {
                 if let Some(old) = store.remove(&name) {
                     remember(&mut history, &name, &old);
                     notices.retain(|n| n.provider != name);
+                    offered.remove(&name);
                     report.removed.push(name);
                     store_changed = true;
                 }
@@ -779,7 +804,13 @@ impl Broker {
             write_auth(&self.store, &store)?;
             self.write_history(&history)?;
         }
-        self.write_notices(&mut notices)?;
+        trim_notices(&mut notices);
+        if notices != notices_before {
+            self.write_json(NOTICES_FILE, &notices)?;
+        }
+        if offered != offered_before {
+            self.write_json(OFFERED_FILE, &offered)?;
+        }
 
         // What the store has that this copy hasn't been given.
         let given = digests(&store);
@@ -832,45 +863,97 @@ impl Broker {
         Ok(name)
     }
 
-    fn history_path(&self) -> PathBuf {
-        self.store.join("history.json")
-    }
-
-    fn read_history(&self) -> BTreeMap<String, Vec<String>> {
-        fs::read(self.history_path())
+    fn read_json<T: serde::de::DeserializeOwned + Default>(&self, name: &str) -> T {
+        fs::read(self.store.join(name))
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or_default()
     }
 
-    fn write_history(&self, history: &BTreeMap<String, Vec<String>>) -> io::Result<()> {
-        let bytes = serde_json::to_vec(history).map_err(io::Error::other)?;
-        write_file(&self.store, "history.json", &bytes)
+    fn write_json<T: Serialize>(&self, name: &str, value: &T) -> io::Result<()> {
+        let bytes = serde_json::to_vec(value).map_err(io::Error::other)?;
+        write_file(&self.store, name, &bytes)
     }
 
-    fn notices_path(&self) -> PathBuf {
-        self.store.join(NOTICES_FILE)
+    fn read_history(&self) -> BTreeMap<String, Vec<String>> {
+        self.read_json(HISTORY_FILE)
+    }
+
+    fn write_history(&self, history: &BTreeMap<String, Vec<String>>) -> io::Result<()> {
+        self.write_json(HISTORY_FILE, history)
+    }
+
+    fn read_offered(&self) -> BTreeMap<String, String> {
+        self.read_json(OFFERED_FILE)
     }
 
     fn read_notices(&self, now_ms: u64) -> Vec<Notice> {
-        let mut notices: Vec<Notice> = fs::read(self.notices_path())
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default();
+        let mut notices: Vec<Notice> = self.read_json(NOTICES_FILE);
         notices.retain(|n| now_ms.saturating_sub(n.at_ms) < NOTICE_FOR_MS);
         notices
     }
 
-    fn write_notices(&self, notices: &mut Vec<Notice>) -> io::Result<()> {
-        while notices.len() > MAX_NOTICES {
-            let oldest = notices.iter().position(|n| !n.first).unwrap_or(0);
-            notices.remove(oldest);
+    /// The logins in the store that came from an agent and not the owner, by
+    /// provider, with the agent. They stay listed until the owner signs in to
+    /// that provider from the toolbox, or forgets it.
+    pub fn offered(&self) -> BTreeMap<String, String> {
+        let _one_at_a_time = BROKER.lock().unwrap_or_else(PoisonError::into_inner);
+        self.read_offered()
+    }
+
+    /// Takes these providers' logins out of the store, and so out of every copy at
+    /// its next look, whoever they came from, and says which there were. Offered
+    /// again as they were, they're refused; anything new is a new offer, so an
+    /// agent that's offering junk has to be stopped too.
+    pub fn forget(&self, providers: &[String], now_ms: u64) -> io::Result<Vec<String>> {
+        let _one_at_a_time = BROKER.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut store = self.read_store()?;
+        let mut history = self.read_history();
+        let mut notices = self.read_notices(now_ms);
+        let mut offered = self.read_offered();
+        let mut gone = Vec::new();
+        for name in providers {
+            if let Some(old) = store.remove(name) {
+                remember(&mut history, name, &old);
+                gone.push(name.clone());
+            }
+            notices.retain(|n| n.provider != *name);
+            offered.remove(name);
         }
-        if notices.is_empty() && !self.notices_path().exists() {
-            return Ok(());
+        if !gone.is_empty() {
+            write_auth(&self.store, &store)?;
+            self.write_history(&history)?;
         }
-        let bytes = serde_json::to_vec(notices).map_err(io::Error::other)?;
-        write_file(&self.store, NOTICES_FILE, &bytes)
+        self.write_json(NOTICES_FILE, &notices)?;
+        self.write_json(OFFERED_FILE, &offered)?;
+        Ok(gone)
+    }
+
+    /// What's wrong with what the broker keeps beside the store, which it goes on
+    /// without rather than stopping: each of these only makes it know less.
+    pub fn problems(&self) -> Vec<String> {
+        let _one_at_a_time = BROKER.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut problems = Vec::new();
+        let unreadable = |name: &str| {
+            fs::read(self.store.join(name))
+                .is_ok_and(|bytes| serde_json::from_slice::<Value>(&bytes).is_err())
+        };
+        for (name, what) in [
+            (NOTICES_FILE, "what agents did with a login may be missing"),
+            (
+                HISTORY_FILE,
+                "an old login written back may be taken for a new one",
+            ),
+            (OFFERED_FILE, "which logins came from agents may be missing"),
+        ] {
+            if unreadable(name) {
+                problems.push(format!(
+                    "{} can't be read, so {what}. Remove it if this stays.",
+                    self.store.join(name).display()
+                ));
+            }
+        }
+        problems
     }
 
     /// What the owner should hear of what agents did with a login: a first
@@ -906,6 +989,17 @@ impl Broker {
 
 /// Where what the owner should hear is kept, in the store's directory.
 pub const NOTICES_FILE: &str = "notices.json";
+
+/// Where a golden's offered login is noted, in the store's directory.
+pub const OFFERED_FILE_NAME: &str = OFFERED_FILE;
+
+/// Oldest first, what's refused making way for what's in use.
+fn trim_notices(notices: &mut Vec<Notice>) {
+    while notices.len() > MAX_NOTICES {
+        let oldest = notices.iter().position(|n| !n.first).unwrap_or(0);
+        notices.remove(oldest);
+    }
+}
 
 fn remember(history: &mut BTreeMap<String, Vec<String>>, name: &str, old: &Value) {
     let list = history.entry(name.to_owned()).or_default();

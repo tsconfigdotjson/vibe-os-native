@@ -63,6 +63,7 @@ public enum VibeRPC {
         ToolboxClose.name,
         PiStatusGet.name,
         PiInstall.name,
+        PiForget.name,
         DoctorCheckGet.name,
         DoctorFix.name,
         ServicesList.name,
@@ -883,6 +884,15 @@ public enum PiInstall: RPCMethod {
     public typealias Params = PiInstallParams
     public typealias Result = PiStatus
     public static let name = "pi.install"
+}
+
+/// `pi.forget`: takes these providers' logins out of what `linux` agents share,
+/// and gives the status after. Anything new an agent offers is a new offer, so one
+/// offering junk has to be stopped too.
+public enum PiForget: RPCMethod {
+    public typealias Params = PiForgetParams
+    public typealias Result = PiStatus
+    public static let name = "pi.forget"
 }
 
 /// `doctor.check`: `vibe doctor`, and the first run's checklist. Runs every
@@ -1888,9 +1898,11 @@ public struct PiVms: Codable, Hashable, Sendable {
     /// What needs the owner's eye about those logins: what's wrong with an
     /// agent's copy, and what agents have done with a login.
     public var alerts: [String]?
+    /// The logins here that came from an agent and not from the owner.
+    public var offered: [PiOffered]?
 
     public enum CodingKeys: String, CodingKey, CaseIterable {
-        case version, logins, error, alerts
+        case version, logins, error, alerts, offered
     }
 }
 
@@ -1908,6 +1920,31 @@ public struct PiStatus: Codable, Hashable, Sendable {
 
     public enum CodingKeys: String, CodingKey, CaseIterable {
         case host, native, logins, vms
+    }
+}
+
+public struct PiForgetParams: Codable, Hashable, Sendable {
+    public var host: String?
+    public var providers: [String]
+
+    public init(host: String? = nil, providers: [String]) {
+        self.host = host
+        self.providers = providers
+    }
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case host, providers
+    }
+}
+
+/// A login an agent signed in to, and every agent now uses.
+public struct PiOffered: Codable, Hashable, Sendable {
+    public var provider: String
+    /// The agent's ref.
+    public var agent: String
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case provider, agent
     }
 }
 

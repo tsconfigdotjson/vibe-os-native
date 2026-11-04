@@ -410,10 +410,17 @@ impl Golden {
         fs::create_dir_all(&vms).unwrap();
         fs::write(
             vms.join("auth.json"),
-            r#"{"anthropic":{"type":"oauth","access":"a","refresh":"r","expires":1}}"#,
+            r#"{"anthropic":{"type":"oauth","access":"a","refresh":"r","expires":1},
+                "xai":{"type":"api_key","key":"fake"}}"#,
         )
         .unwrap();
-        // What the owner is told of what an agent did with a login, not a week old.
+        // What the owner is told of what an agent did with a login, not a week old,
+        // and that it did.
+        fs::write(
+            vms.join(vibe_env::pi_logins::OFFERED_FILE_NAME),
+            r#"{"xai":"brave-copper-lynx"}"#,
+        )
+        .unwrap();
         fs::write(
             vms.join(vibe_env::pi_logins::NOTICES_FILE),
             serde_json::json!([{
@@ -422,6 +429,7 @@ impl Golden {
                          that login. If that wasn't you, sign in to it from the toolbox to \
                          replace it.",
                 "at_ms": vibe_env::pi_logins::now_ms(),
+                "first": true,
             }])
             .to_string(),
         )

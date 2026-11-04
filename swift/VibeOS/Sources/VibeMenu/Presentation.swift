@@ -589,6 +589,17 @@ extension PermissionMode {
     }
 }
 
+/// An alert as it's safe and short enough to show, as `vibed` says it already:
+/// part of one can have come from a guest, whichever `vibed` this is.
+public func cleanAlert(_ alert: String) -> String {
+    let clean = String.UnicodeScalarView(
+        alert.unicodeScalars.filter { scalar in
+            !scalar.properties.isBidiControl && !CharacterSet.controlCharacters.contains(scalar)
+        })
+    let text = String(clean)
+    return text.count > 400 ? String(text.prefix(400)) + "…" : text
+}
+
 /// A profile's settings in a line, in the app's voice: `Linux · Opus · High
 /// · Auto · 4G`.
 public func profileSummary(_ profile: Profile) -> String {

@@ -65,9 +65,11 @@ pub const GUEST_CONFIG_DIR: &str = "/home/vibe/.pi/config";
 /// That share's tag.
 pub const CONFIG_TAG: &str = "pi-config";
 
-/// The largest `auth.json` looked at. Far past any real one, and all a guest
-/// could make `vibed` read every few seconds.
-pub const MAX_AUTH_FILE: u64 = 1 << 20;
+/// The largest `auth.json` looked at, far past any real one, and all a guest can
+/// make `vibed` read every few seconds. A copy has to hold the whole store, so this
+/// is past what the limits on agents' offers can add up to
+/// (`pi_logins::MAX_AGENT_ENTRY` by `MAX_AGENT_PROVIDERS`).
+pub const MAX_AUTH_FILE: u64 = 4 << 20;
 
 /// Where a VM's sessions are mounted, beside its agent dir.
 pub const GUEST_SESSION_DIR: &str = "/home/vibe/.pi/sessions";
@@ -376,7 +378,6 @@ impl PiHome {
                 !logins.is_empty()
                     || !own.is_empty()
                     || PROVIDER_ENV.iter().any(|(_, names)| has_key(names))
-                    || AMBIENT_ENV.iter().any(|name| set(name))
             }
         };
         (!enough).then(|| match provider {
@@ -475,6 +476,27 @@ const PROVIDER_ENV: &[(&str, &[&str])] = &[
     ("xiaomi-token-plan-cn", &["XIAOMI_TOKEN_PLAN_CN_API_KEY"]),
     ("xiaomi-token-plan-ams", &["XIAOMI_TOKEN_PLAN_AMS_API_KEY"]),
     ("xiaomi-token-plan-sgp", &["XIAOMI_TOKEN_PLAN_SGP_API_KEY"]),
+    // These two can also sign in from what's around them: `AMBIENT_PROVIDERS`.
+    (
+        "google-vertex",
+        &[
+            "GOOGLE_CLOUD_API_KEY",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "GOOGLE_CLOUD_PROJECT",
+            "GCLOUD_PROJECT",
+        ],
+    ),
+    (
+        "amazon-bedrock",
+        &[
+            "AWS_BEARER_TOKEN_BEDROCK",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_PROFILE",
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+            "AWS_WEB_IDENTITY_TOKEN_FILE",
+        ],
+    ),
 ];
 
 /// The providers `env`, what `pi.env` sets, gives a key for.
@@ -493,20 +515,6 @@ pub fn providers_with_keys(env: &[(String, String)]) -> Vec<String> {
 /// Providers that can sign in from what's around them, which can't be told from
 /// here: Vertex from a file of `gcloud`'s, Bedrock from a role or a profile.
 const AMBIENT_PROVIDERS: &[&str] = &["google-vertex", "amazon-bedrock"];
-
-/// What says one of those is meant to be used, for a profile that names no model.
-const AMBIENT_ENV: &[&str] = &[
-    "GOOGLE_CLOUD_API_KEY",
-    "GOOGLE_APPLICATION_CREDENTIALS",
-    "GOOGLE_CLOUD_PROJECT",
-    "GCLOUD_PROJECT",
-    "AWS_BEARER_TOKEN_BEDROCK",
-    "AWS_ACCESS_KEY_ID",
-    "AWS_PROFILE",
-    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
-    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
-    "AWS_WEB_IDENTITY_TOKEN_FILE",
-];
 
 /// The owner's own agent dir: `~/.pi/agent`, unless `PI_CODING_AGENT_DIR` moves
 /// it in `vibed`'s environment, as it moves it for the owner's own `pi`.
@@ -565,9 +573,24 @@ fn auth_entries(dir: &Path) -> serde_json::Map<String, Value> {
     }
 }
 
-/// The providers `auth.json` in `dir` has entries for.
+/// The providers `auth.json` in `dir` has entries for. A name that can't be a
+/// provider's isn't one, and isn't repeated: it's on its way to a terminal.
 pub fn logins_in(dir: &Path) -> Vec<String> {
-    auth_entries(dir).keys().cloned().collect()
+    auth_entries(dir)
+        .keys()
+        .filter(|name| provider_name_ok(name))
+        .cloned()
+        .collect()
+}
+
+/// Whether `name` could be a provider's: what Pi's are, in characters that mean
+/// nothing to a terminal and few enough to read.
+pub fn provider_name_ok(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
 /// Makes `dir`, and what's above it, for this user alone.
@@ -761,6 +784,13 @@ mod tests {
         .unwrap();
         assert_eq!(home.logins(), ["anthropic", "openai"]);
         assert!(!format!("{:?}", home.logins()).contains("sk-"));
+        // A name that can't be a provider's isn't repeated.
+        fs::write(
+            tmp.path().join("auth.json"),
+            "{\"\\u001b[2Jx\":{\"type\":\"oauth\"},\"openai\":{\"type\":\"oauth\"}}",
+        )
+        .unwrap();
+        assert_eq!(home.logins(), ["openai"]);
         fs::write(tmp.path().join("auth.json"), "not json").unwrap();
         assert!(home.logins().is_empty());
     }
@@ -883,6 +913,20 @@ mod tests {
         // As may those that sign in from what's around them.
         assert_eq!(home.login_missing(Some("google-vertex/m"), &[]), None);
         assert_eq!(home.login_missing(Some("amazon-bedrock/m"), &[]), None);
+        // R4: and their own keys are the owner's, as anyone else's are.
+        for (provider, name) in [
+            ("amazon-bedrock", "AWS_PROFILE"),
+            ("amazon-bedrock", "AWS_BEARER_TOKEN_BEDROCK"),
+            ("amazon-bedrock", "AWS_WEB_IDENTITY_TOKEN_FILE"),
+            ("google-vertex", "GOOGLE_CLOUD_API_KEY"),
+            ("google-vertex", "GOOGLE_APPLICATION_CREDENTIALS"),
+        ] {
+            assert_eq!(
+                providers_with_keys(&pairs(&[(name, "x")])),
+                [provider],
+                "{name}"
+            );
+        }
         // With no model named, what says one of them is meant counts too.
         assert!(home.login_missing(None, &[]).is_some());
         let role = pairs(&[("AWS_WEB_IDENTITY_TOKEN_FILE", "/t")]);
