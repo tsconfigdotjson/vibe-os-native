@@ -84,10 +84,7 @@ impl Core {
                 && let AgentHome::Pi(home) = &handle.home
                 && home.config.is_some()
             {
-                // Being deleted, slept or woken, it's looked at when that's done:
-                // a delete mustn't race with something writing beside it.
-                let running = !matches!(a.state, AgentState::Exited | AgentState::Asleep)
-                    && !self.is_busy(&a.agent_ref);
+                let running = pi_copy_in_use(a.state, self.is_busy(&a.agent_ref));
                 copies.push((pi_logins::vm_copy(&a.agent_ref, &handle.agent_dir), running));
             }
         }
@@ -441,6 +438,14 @@ impl Core {
     }
 }
 
+/// Whether an agent's copy of Pi's login is one to look at now. One whose VM can't
+/// be running has nothing new to say. One being deleted, slept or woken (`busy`) is
+/// looked at when that's done: a delete mustn't race with something writing beside
+/// it.
+fn pi_copy_in_use(state: AgentState, busy: bool) -> bool {
+    !busy && !matches!(state, AgentState::Exited | AgentState::Asleep)
+}
+
 /// Installs `target`, and says what it did.
 fn install(
     target: PiTarget,
@@ -475,6 +480,28 @@ fn install(
                 )),
                 None => Ok("the Pi layer for linux agents is up to date".to_owned()),
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_copy_is_looked_at_only_while_its_agent_is_up_and_settled() {
+        for state in [
+            AgentState::Busy,
+            AgentState::Idle,
+            AgentState::Question,
+            AgentState::Paused,
+        ] {
+            assert!(pi_copy_in_use(state, false), "{state}");
+            // Being deleted, among other things.
+            assert!(!pi_copy_in_use(state, true), "{state}");
+        }
+        for state in [AgentState::Asleep, AgentState::Exited] {
+            assert!(!pi_copy_in_use(state, false), "{state}");
         }
     }
 }
