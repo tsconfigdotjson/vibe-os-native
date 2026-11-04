@@ -5,6 +5,7 @@
 //! base-<n>/                 Image, initrd and base.img: base release <n>,
 //!                           downloaded once per app release
 //! managed-<version>.img     the managed layer: Claude Code <version>
+//! pi-<version>.img          the Pi layer: Pi <version>, for Pi agents only
 //! template-<n>.img          the Linux template, from the toolbox
 //! template-<n>.base         the base release template <n> was built on
 //! home-<n>.img              the Linux home, from the toolbox
@@ -39,6 +40,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::ext4;
+use crate::pi_release;
 use crate::vm::VmConfig;
 
 /// Where Claude Code's releases are published, as its own installer
@@ -52,6 +54,10 @@ pub const CLAUDE_PLATFORM: &str = "linux-arm64";
 /// Where the managed layer puts Claude Code: `vibe-guest` puts this
 /// directory first on `PATH`.
 pub const MANAGED_BIN: &str = "opt/vibeos/bin";
+
+/// Where the Pi layer puts Pi's directory: the binary and its assets, and the
+/// shared services' extension.
+pub const PI_DIR: &str = "opt/vibeos/pi";
 
 /// The base release this build of VibeOS boots: a new app release may ship
 /// a new one (PRD: Base image updates). 2 has the `vibe-guest` the toolbox
@@ -128,6 +134,8 @@ pub struct Layers {
     pub template: Option<PathBuf>,
     /// Claude Code's version, and its layer.
     pub managed: Option<(String, PathBuf)>,
+    /// Pi's version, and its layer.
+    pub pi: Option<(String, PathBuf)>,
     pub home: Option<PathBuf>,
 }
 
@@ -207,6 +215,26 @@ impl Images {
             .into_iter()
             .filter_map(|name| {
                 let v = name.strip_prefix("managed-")?.strip_suffix(".img")?;
+                let parsed = Version::parse(v)?;
+                Some((parsed, v.to_owned(), self.dir.join(&name)))
+            })
+            .collect();
+        found.sort();
+        found.into_iter().map(|(_, v, p)| (v, p)).collect()
+    }
+
+    /// The newest Pi layer: Pi's version and the image.
+    pub fn pi(&self) -> Option<(String, PathBuf)> {
+        self.pi_all().pop()
+    }
+
+    /// Every Pi layer, oldest first.
+    fn pi_all(&self) -> Vec<(String, PathBuf)> {
+        let mut found: Vec<(Version, String, PathBuf)> = self
+            .names()
+            .into_iter()
+            .filter_map(|name| {
+                let v = name.strip_prefix("pi-")?.strip_suffix(".img")?;
                 let parsed = Version::parse(v)?;
                 Some((parsed, v.to_owned(), self.dir.join(&name)))
             })
@@ -346,6 +374,7 @@ impl Images {
             base,
             template,
             managed: self.managed(),
+            pi: self.pi(),
             home: self.newest("home"),
         })
     }
@@ -611,7 +640,67 @@ impl Images {
         built.map(|()| dest)
     }
 
-    /// Removes every managed layer, template and home but the newest of
+    /// Makes `version` a Pi layer, if the newest isn't that or newer: downloads
+    /// its [`pi_release::VM_PLATFORM`] build, checks it against the release's
+    /// `SHA256SUMS`, and `fd` likewise. Returns the new version, or `None` if
+    /// there's nothing to do. Its own directory, not the scratch one Claude's
+    /// download empties, as both may run at once.
+    pub fn update_pi(&self, releases: &str, version: &str) -> Result<Option<String>> {
+        // A daily round and an owner's install share the scratch directory.
+        static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _one_at_a_time = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((newest, _)) = self.pi()
+            && Version::parse(&newest) >= Version::parse(version)
+        {
+            return Ok(None);
+        }
+        self.make_dir()?;
+        let scratch = self.dir.join("downloads-pi");
+        let _ = fs::remove_dir_all(&scratch);
+        fs::create_dir_all(&scratch).map_err(io_err(format!("create {}", scratch.display())))?;
+        let result = (|| {
+            let mut build =
+                pi_release::download(releases, version, pi_release::VM_PLATFORM, &scratch)?;
+            build.fd = Some(pi_release::download_fd(releases, &scratch)?);
+            self.add_pi(&build)?;
+            Ok(Some(version.to_owned()))
+        })();
+        let _ = fs::remove_dir_all(&scratch);
+        result
+    }
+
+    /// Makes `build`, already checked, a Pi layer ([`pi_tree`]). Returns it.
+    pub fn add_pi(&self, build: &pi_release::Build) -> Result<PathBuf> {
+        let version = &build.version;
+        if Version::parse(version).is_none() {
+            return Err(err(format!("`{version}` isn't a Pi version")));
+        }
+        self.make_dir()?;
+        let dest = self.dir.join(format!("pi-{version}.img"));
+        if dest.exists() {
+            return Ok(dest);
+        }
+        let partial = self
+            .dir
+            .join(format!(".pi-{version}.img.{}.partial", std::process::id()));
+        let _ = fs::remove_file(&partial);
+        let tree = pi_tree(build).map_err(io_err(format!("read {}", build.dir.display())))?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs().min(u64::from(u32::MAX)) as u32);
+        let built = ext4::write(&tree, &partial, "pi", now)
+            .map_err(io_err(format!("build the layer for Pi {version}")))
+            .and_then(|_| readonly(&partial))
+            .and_then(|()| {
+                fs::rename(&partial, &dest).map_err(io_err(format!("keep {}", dest.display())))
+            });
+        if built.is_err() {
+            let _ = fs::remove_file(&partial);
+        }
+        built.map(|()| dest)
+    }
+
+    /// Removes every managed layer, Pi layer, template and home but the newest of
     /// each that no path in `in_use` names, and anything a stopped build
     /// left. Returns what went. A template or home is kept while its newest
     /// version is younger than [`PRUNE_GRACE`]: an agent being made, or
@@ -623,12 +712,13 @@ impl Images {
 
     /// [`Images::prune_managed`] with `grace` in place of [`PRUNE_GRACE`].
     pub fn prune_managed_after(&self, in_use: &HashSet<PathBuf>, grace: Duration) -> Vec<PathBuf> {
-        let mut all = self.managed_all();
-        all.pop();
         let mut gone = Vec::new();
-        for (_, path) in all {
-            if !in_use.contains(&path) && fs::remove_file(&path).is_ok() {
-                gone.push(path);
+        for mut all in [self.managed_all(), self.pi_all()] {
+            all.pop();
+            for (_, path) in all {
+                if !in_use.contains(&path) && fs::remove_file(&path).is_ok() {
+                    gone.push(path);
+                }
             }
         }
         for kind in [Kind::Template, Kind::Home] {
@@ -661,7 +751,9 @@ impl Images {
                     gone.push(path);
                 }
             }
-            if name.starts_with(".managed-") && name.ends_with(".partial") {
+            if (name.starts_with(".managed-") || name.starts_with(".pi-"))
+                && name.ends_with(".partial")
+            {
                 let path = self.dir.join(&name);
                 // Only one left by a vibed that's gone: its pid is in the name.
                 let pid = name
@@ -778,7 +870,7 @@ struct ClaudeFile {
 /// A Claude Code version, `1.2.3` or `1.2.3-tag`, ordered as releases are.
 /// Nothing else is ever a file name here.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct Version {
+pub(crate) struct Version {
     numbers: [u64; 3],
     /// A release without a tag sorts after its pre-releases.
     release: bool,
@@ -787,13 +879,13 @@ struct Version {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-enum TagPart {
+pub(crate) enum TagPart {
     Number(u64),
     Word(String),
 }
 
 impl Version {
-    fn parse(s: &str) -> Option<Version> {
+    pub(crate) fn parse(s: &str) -> Option<Version> {
         let (core, tag) = match s.split_once('-') {
             Some((core, tag)) => (core, Some(tag)),
             None => (s, None),
@@ -834,7 +926,7 @@ impl Version {
 }
 
 /// Downloads `url` to `dest` with `curl`, over HTTPS or from a local file.
-fn fetch(url: &str, dest: &Path) -> Result<()> {
+pub(crate) fn fetch(url: &str, dest: &Path) -> Result<()> {
     let out = Command::new("curl")
         .args(["-fsSL", "--retry", "3", "--proto", "=https,file"])
         // A download that stalls gives up, so the next check can run.
@@ -860,6 +952,72 @@ fn fetch(url: &str, dest: &Path) -> Result<()> {
         "can't download {url}: {}",
         String::from_utf8_lossy(&out.stderr).trim()
     )))
+}
+
+/// Adds the directory `from` to `tree` at `at`: its files with their modes,
+/// and its symlinks as they are.
+/// What's in a Pi layer: `build`'s directory at `/opt/vibeos/pi/` with the shared
+/// services' extension beside it, and in `/opt/vibeos/bin`, which `vibe-guest`
+/// puts first on `PATH` and which the layer shares with the managed one, the
+/// wrapper that's `pi` ([`crate::pi::WRAPPER`]) and `fd`.
+fn pi_tree(build: &pi_release::Build) -> io::Result<ext4::Tree> {
+    let note = serde_json::json!({
+        "pi": build.version,
+        "platform": pi_release::VM_PLATFORM,
+        "sha256": build.sha256,
+    });
+    let mut tree = ext4::Tree::new();
+    add_dir(&mut tree, &build.dir, PI_DIR)?;
+    tree.file(
+        &format!("{MANAGED_BIN}/pi"),
+        ext4::Source::Bytes(crate::pi::WRAPPER.as_bytes().to_vec()),
+        0o755,
+    )
+    .file(
+        &format!("{PI_DIR}/{}", crate::pi::EXTENSION_NAME),
+        ext4::Source::Bytes(crate::pi::EXTENSION.as_bytes().to_vec()),
+        0o644,
+    )
+    .file(
+        "opt/vibeos/pi.json",
+        ext4::Source::Bytes(format!("{note}\n").into_bytes()),
+        0o644,
+    );
+    if let Some(fd) = &build.fd {
+        tree.file(
+            &format!("{MANAGED_BIN}/fd"),
+            ext4::Source::Path(fd.clone()),
+            0o755,
+        );
+    }
+    Ok(tree)
+}
+
+fn add_dir(tree: &mut ext4::Tree, from: &Path, at: &str) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    tree.dir(at, 0o755);
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            return Err(io::Error::other(format!(
+                "{} has a name that isn't UTF-8",
+                entry.path().display()
+            )));
+        };
+        let path = format!("{at}/{name}");
+        let meta = fs::symlink_metadata(entry.path())?;
+        if meta.is_dir() {
+            add_dir(tree, &entry.path(), &path)?;
+        } else if meta.file_type().is_symlink() {
+            let target = fs::read_link(entry.path())?;
+            tree.symlink(&path, &target.to_string_lossy());
+        } else if meta.is_file() {
+            let mode = (meta.permissions().mode() & 0o777) as u16;
+            tree.file(&path, ext4::Source::Path(entry.path()), mode);
+        }
+    }
+    Ok(())
 }
 
 pub fn sha256_file(path: &Path) -> io::Result<String> {
@@ -1423,5 +1581,122 @@ mod tests {
         fs::write(tmp.path().join("bad.gz"), "not gzip").unwrap();
         assert!(gunzip_sparse(&tmp.path().join("bad.gz"), &tmp.path().join("bad")).is_err());
         assert!(!tmp.path().join("bad").exists());
+    }
+
+    fn pi_build(tmp: &Path, version: &str) -> pi_release::Build {
+        let dir = tmp.join(format!("build-{version}"));
+        fs::create_dir_all(dir.join("theme")).unwrap();
+        fs::write(dir.join("pi"), format!("pi {version}")).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir.join("pi"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(dir.join("theme/dark.json"), "{}").unwrap();
+        pi_release::Build {
+            version: version.into(),
+            dir,
+            sha256: "ab".into(),
+            fd: None,
+        }
+    }
+
+    /// What the layer holds, file by file: its modes and what's in it, as an
+    /// image could only be read back with `debugfs`, which not every host has.
+    #[test]
+    fn the_pi_layer_holds_a_wrapper_for_pi_and_fd() {
+        use ext4::Entry;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut build = pi_build(tmp.path(), "1.5.0");
+        let fd = tmp.path().join("fd");
+        fs::write(&fd, "fd").unwrap();
+        build.fd = Some(fd.clone());
+        let tree = pi_tree(&build).unwrap();
+        let file = |path: &str| match tree.entry(path) {
+            Some(Entry::File { source, mode }) => (source.clone(), *mode),
+            other => panic!("{path}: {other:?}"),
+        };
+        let (wrapper, mode) = file("opt/vibeos/bin/pi");
+        assert_eq!(mode, 0o755, "`pi` runs");
+        assert_eq!(
+            wrapper,
+            ext4::Source::Bytes(crate::pi::WRAPPER.as_bytes().to_vec())
+        );
+        assert!(crate::pi::WRAPPER.contains("-u CLAUDE_CODE_OAUTH_TOKEN"));
+        assert!(crate::pi::WRAPPER.contains("-u ANTHROPIC_OAUTH_TOKEN"));
+        assert!(crate::pi::WRAPPER.contains(&format!("/{PI_DIR}/pi ")));
+        assert_eq!(file("opt/vibeos/bin/fd"), (ext4::Source::Path(fd), 0o755));
+        assert_eq!(file("opt/vibeos/pi/pi").1, 0o755, "the binary runs");
+        assert_eq!(file("opt/vibeos/pi/theme/dark.json").1, 0o644);
+        let (extension, mode) = file("opt/vibeos/pi/vibe-services.ts");
+        assert_eq!(mode, 0o644);
+        assert_eq!(
+            extension,
+            ext4::Source::Bytes(crate::pi::EXTENSION.as_bytes().to_vec())
+        );
+        assert!(matches!(
+            tree.entry("opt/vibeos/pi"),
+            Some(Entry::Dir { mode: 0o755 })
+        ));
+        // And it's an image: on a build without an `fd`, `fd` isn't made up.
+        build.fd = None;
+        assert!(
+            pi_tree(&build)
+                .unwrap()
+                .entry("opt/vibeos/bin/fd")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn the_pi_layer_stands_apart_from_claudes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let images = Images::new(tmp.path().join("linux"));
+        assert_eq!(images.pi(), None);
+        let layer = images.add_pi(&pi_build(tmp.path(), "1.5.0")).unwrap();
+        assert!(layer.ends_with("pi-1.5.0.img"));
+        let mut head = vec![0u8; 2048];
+        File::open(&layer).unwrap().read_exact(&mut head).unwrap();
+        assert!(ext4::is_ext4(&head), "an ext4 image");
+        // A Pi layer isn't a managed one, nor the other way about.
+        assert_eq!(images.managed(), None);
+        assert_eq!(images.pi().unwrap().0, "1.5.0");
+        // Versions sort as versions, and an image is never changed in place.
+        images.add_pi(&pi_build(tmp.path(), "1.10.0")).unwrap();
+        images.add_pi(&pi_build(tmp.path(), "1.9.0")).unwrap();
+        assert_eq!(images.pi().unwrap().0, "1.10.0");
+        let same = images.add_pi(&pi_build(tmp.path(), "1.5.0")).unwrap();
+        assert_eq!(same, layer);
+        // What no agent names goes, but the newest and what one does.
+        let in_use: HashSet<PathBuf> = [layer.clone()].into();
+        let gone = images.prune_managed_after(&in_use, Duration::ZERO);
+        assert_eq!(gone, [images.dir().join("pi-1.9.0.img")]);
+        assert!(layer.exists());
+        assert_eq!(images.pi().unwrap().0, "1.10.0");
+    }
+
+    #[test]
+    fn a_new_pi_release_becomes_a_layer_and_a_tampered_one_does_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let images = Images::new(tmp.path().join("linux"));
+        let root = tmp.path().join("releases");
+        let releases =
+            pi_release::tests::publish(&root, "1.5.0", pi_release::VM_PLATFORM, "#!/bin/sh\n");
+        assert_eq!(
+            images.update_pi(&releases, "1.5.0").unwrap().as_deref(),
+            Some("1.5.0")
+        );
+        assert_eq!(
+            images.update_pi(&releases, "1.5.0").unwrap(),
+            None,
+            "already there"
+        );
+        assert!(!images.dir().join("downloads-pi").exists());
+        pi_release::tests::publish(&root, "1.6.0", pi_release::VM_PLATFORM, "#!/bin/sh\n");
+        fs::write(
+            root.join("download/v1.6.0/pi-linux-arm64.tar.gz"),
+            "tampered",
+        )
+        .unwrap();
+        let e = images.update_pi(&releases, "1.6.0").unwrap_err();
+        assert!(e.0.contains("SHA-256"), "{e}");
+        assert_eq!(images.pi().unwrap().0, "1.5.0");
     }
 }

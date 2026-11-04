@@ -9,9 +9,10 @@ use serde::de::{self, DeserializeOwned, Deserializer, Visitor};
 use serde::{Serialize, forward_to_deserialize_any};
 use serde_json::Value;
 use vibe_core::model::{
-    Activity, AgentState, Certainty, CheckId, CheckState, Environment, EventKind, GhState,
-    HostLink, LoginTool, MessageRole, Mode, Model, ProjectSource, Reasoning, ServiceRole,
-    ServiceState, SessionState, StopReason, ToolboxAction, ToolboxState, TunnelState, WakeupKind,
+    Activity, AgentKind, AgentState, Certainty, CheckId, CheckState, Environment, EventKind,
+    GhState, HostLink, LoginTool, MessageRole, Mode, Model, PiTarget, ProjectSource, Reasoning,
+    ServiceRole, ServiceState, SessionState, StopReason, ToolboxAction, ToolboxState, TunnelState,
+    WakeupKind,
 };
 use vibe_core::paths;
 use vibe_core::rpc::*;
@@ -216,6 +217,10 @@ fn rust_types() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
         entry::<ToolboxRun>(),
         entry::<ToolboxLogins>(),
         entry::<Login>(),
+        entry::<PiBinary>(),
+        entry::<PiVms>(),
+        entry::<PiStatus>(),
+        entry::<PiInstallParams>(),
         entry::<DoctorReport>(),
         entry::<DoctorCheck>(),
         entry::<DoctorFixParams>(),
@@ -311,6 +316,8 @@ fn rust_methods() -> BTreeMap<&'static str, MethodTypes> {
         method::<ToolboxRebuild>(),
         method::<ToolboxLoginsGet>(),
         method::<ToolboxClose>(),
+        method::<PiStatusGet>(),
+        method::<PiInstall>(),
         method::<DoctorCheckGet>(),
         method::<DoctorFix>(),
         method::<ServicesList>(),
@@ -341,6 +348,8 @@ fn rust_enums() -> BTreeMap<&'static str, Vec<&'static str>> {
     }
     BTreeMap::from([
         ("Environment", names(Environment::ALL, Environment::as_str)),
+        ("AgentKind", names(AgentKind::ALL, AgentKind::as_str)),
+        ("PiTarget", names(PiTarget::ALL, PiTarget::as_str)),
         ("Model", names(Model::ALL, Model::as_str)),
         ("Reasoning", names(Reasoning::ALL, Reasoning::as_str)),
         ("Mode", names(Mode::ALL, Mode::as_str)),
@@ -749,6 +758,15 @@ fn examples_cover_the_contract() {
         // examples' world is a Mac; vibed's own tests cover it.
         if ty == "Project" {
             seen_keys.insert("deleted");
+        }
+        // The examples' `pi` is the owner's own, and their world never tried
+        // to download its layer in the background; vibe-env's and vibed's
+        // own tests cover those.
+        if ty == "PiBinary" {
+            seen_keys.insert("managed");
+        }
+        if ty == "PiVms" {
+            seen_keys.insert("error");
         }
         assert_eq!(
             seen_keys, fields,

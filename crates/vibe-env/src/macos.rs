@@ -42,11 +42,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use vibe_core::model::AgentKind;
+
 use crate::governor::Governor;
 use crate::tree::{self, SessionTree};
 use crate::{
-    AgentSpec, Backend, Capabilities, ClaudeHome, Compartment, EnvError, Handle, Launch, Limit,
-    Limiter, Limits, Proc, Result, Run, RunOutput, Sleeper, TerminalEnd, Usage, Woke, native,
+    AgentHome, AgentSpec, Backend, Capabilities, ClaudeHome, Compartment, EnvError, Handle, Launch,
+    Limit, Limiter, Limits, Proc, Result, Run, RunOutput, Sleeper, TerminalEnd, Usage, Woke,
+    native,
 };
 
 /// What keeps a paused or sleeping agent's state across a restart of
@@ -101,6 +104,8 @@ pub struct Macos {
     home: PathBuf,
     /// The `claude` to run; by default the one on the agent's `PATH`.
     claude: Option<PathBuf>,
+    /// The `pi` to run; by default the one on the agent's `PATH`.
+    pi: Option<PathBuf>,
     /// The agent's `PATH`, once the owner's login shell has said it. One it
     /// couldn't say isn't kept, so the next launch asks again.
     path: Mutex<Option<String>>,
@@ -211,6 +216,7 @@ impl Macos {
         Macos {
             home: home.into(),
             claude: None,
+            pi: None,
             path: Mutex::new(None),
             intervals: Intervals::default(),
             agents: Mutex::new(HashMap::new()),
@@ -220,6 +226,12 @@ impl Macos {
     /// Runs `claude` as Claude Code, rather than the one on `PATH`.
     pub fn with_claude(mut self, claude: impl Into<PathBuf>) -> Macos {
         self.claude = Some(claude.into());
+        self
+    }
+
+    /// Runs `pi` as Pi, rather than the one on `PATH`.
+    pub fn with_pi(mut self, pi: impl Into<PathBuf>) -> Macos {
+        self.pi = Some(pi.into());
         self
     }
 
@@ -266,6 +278,23 @@ impl Macos {
                 EnvError::new(format!(
                     "can't find claude for macos agents: it isn't on your login shell's PATH \
                      ({path}). Install Claude Code, or check `claude` runs in Terminal"
+                ))
+            })
+    }
+
+    /// The `pi` agents run: the Mac's own, like `claude`.
+    pub fn pi(&self) -> Result<PathBuf> {
+        if let Some(p) = &self.pi {
+            return Ok(p.clone());
+        }
+        let path = self.path();
+        std::env::split_paths(&path)
+            .map(|d| d.join("pi"))
+            .find(|c| is_executable(c))
+            .ok_or_else(|| {
+                EnvError::new(format!(
+                    "can't find pi for macos agents: it isn't on your login shell's PATH \
+                     ({path}). Install it from Settings, or check `pi` runs in Terminal"
                 ))
             })
     }
@@ -434,7 +463,13 @@ impl Compartment for Macos {
             agent_ref: spec.agent_ref.clone(),
             agent_dir: spec.agent_dir.clone(),
             worktree: spec.worktree.clone(),
-            claude: ClaudeHome::user(&self.home),
+            home: match spec.agent {
+                AgentKind::Claude => AgentHome::Claude(ClaudeHome::user(&self.home)),
+                AgentKind::Pi => AgentHome::Pi(crate::PiHome::user(
+                    crate::pi::own_dir(&self.home),
+                    &spec.worktree,
+                )),
+            },
             session: None,
         })
     }
@@ -445,14 +480,28 @@ impl Compartment for Macos {
         fs::create_dir_all(&tmp)?;
         let mut env = self.env();
         env.push(("TMPDIR".into(), tmp.to_string_lossy().into_owned()));
-        native::run(r, &env)
+        native::run_for(h, r, &env)
+    }
+
+    fn pi_auth_check(
+        &self,
+        h: &Handle,
+        env: &[(String, String)],
+        model: &str,
+    ) -> Option<crate::pi::AuthCheck> {
+        native::pi_auth_check(&self.pi().ok()?, h, env, self.env(), model)
     }
 
     fn launch(&self, h: &Handle, launch: &Launch) -> Result<TerminalEnd> {
-        let mut command = vec![self.claude()?.to_string_lossy().into_owned()];
-        command.extend(launch.args.iter().cloned());
-        let mut env = self.env();
-        env.extend(launch.env.iter().cloned());
+        let program = match launch.agent {
+            AgentKind::Claude => self.claude()?,
+            AgentKind::Pi => self.pi()?,
+        };
+        let native::AgentCommand {
+            command,
+            env,
+            clean_env,
+        } = native::agent_command(&program, h, launch, self.env())?;
         // A new launch runs: nothing of an old pause, sleep or stop holds.
         let agent = self.agent(h);
         let mut st = lock(&agent.state);
@@ -463,6 +512,7 @@ impl Compartment for Macos {
             command,
             cwd: launch.cwd.clone(),
             env,
+            clean_env,
         })
     }
 
@@ -506,9 +556,9 @@ impl Compartment for Macos {
     /// of its worktree. What it installed elsewhere stays (PRD: Non-goals).
     fn delete(&self, h: &Handle) -> Result<()> {
         self.stop(h)?;
-        h.claude
+        h.home
             .forget(&h.worktree)
-            .map_err(|e| EnvError::new(format!("can't remove Claude's state: {e}")))?;
+            .map_err(|e| EnvError::new(format!("can't remove its agent's state: {e}")))?;
         let tmp = h.agent_dir.join(vibe_core::paths::TMP_DIR);
         let gone = |r: io::Result<()>, what: &Path| match r {
             Err(e) if e.kind() != io::ErrorKind::NotFound => Err(EnvError::new(format!(
@@ -1094,7 +1144,7 @@ mod tests {
             agent_ref: "a".into(),
             agent_dir: dir.path().to_owned(),
             worktree: dir.path().join("w"),
-            claude: ClaudeHome::user(dir.path()),
+            home: AgentHome::Claude(ClaudeHome::user(dir.path())),
             session: None,
         };
         let agent = Agent::new(&h);
@@ -1141,7 +1191,7 @@ mod tests {
             agent_ref: "a".into(),
             agent_dir: dir.path().to_owned(),
             worktree: dir.path().join("w"),
-            claude: ClaudeHome::user(dir.path()),
+            home: AgentHome::Claude(ClaudeHome::user(dir.path())),
             session: Some(u32::MAX - 1),
         };
         fs::write(dir.path().join(STATE_FILE), r#"{"mode":"asleep"}"#).unwrap();

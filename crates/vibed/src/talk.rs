@@ -289,6 +289,15 @@ impl Core {
         let state = match self.store().agent(&host, agent_ref) {
             Ok(r) => {
                 lock(&self.sends).insert(agent_ref.to_owned(), mark);
+                // Pi takes `/model` or `!ls` itself, and writes nothing for them: no
+                // answer is owed, and nothing on its screen is about them.
+                if r.agent == vibe_core::model::AgentKind::Pi
+                    && matches!(&input, Input::Text { submit: true, text, .. }
+                        if !text.trim_start().starts_with(['/', '!']))
+                {
+                    lock(&self.pi_sent_at)
+                        .insert(agent_ref.to_owned(), crate::status::wall_clock());
+                }
                 r.state
             }
             Err(_) => AgentState::Exited,
@@ -316,6 +325,13 @@ impl Core {
             })
             .await
             .unwrap_or_else(|| (vibe_status::Status::unknown(), false));
+        // A Pi that failed where only its screen shows has answered all it will.
+        let (status, answered) = if record.agent == vibe_core::model::AgentKind::Pi {
+            let (status, failed) = self.pi_read_status(&mut record, debounce, status).await;
+            (status, answered || failed)
+        } else {
+            (status, answered)
+        };
         let state = if record.starting || self.is_busy(agent_ref) {
             record.state
         } else {

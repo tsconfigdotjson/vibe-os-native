@@ -58,6 +58,7 @@ impl Setup {
         let agent_dir = self.layout.agent_dir(r);
         fs::create_dir_all(&agent_dir).unwrap();
         AgentSpec {
+            agent: Default::default(),
             agent_ref: r.into(),
             project: "app".into(),
             worktree,
@@ -79,6 +80,7 @@ impl Setup {
         self.backend.launch(
             h,
             &Launch {
+                agent: Default::default(),
                 args: vec!["--session-id".into(), "s".into(), "--".into(), "hi".into()],
                 env: vec![("GIT_CONFIG_COUNT".into(), "1".into())],
                 cwd: h.worktree.clone(),
@@ -96,10 +98,13 @@ fn create_writes_the_vm_as_the_contract_says() {
     fs::write(config.join("CLAUDE.md"), "Be brief.").unwrap();
     let spec = s.spec("quiet-amber-otter");
     let h = s.backend.create(&spec).unwrap();
-    assert_eq!(h.claude, ClaudeHome::own(spec.agent_dir.join("claude")));
-    assert!(h.claude.own);
     assert_eq!(
-        fs::read_to_string(h.claude.dir.join("CLAUDE.md")).unwrap(),
+        h.claude().unwrap(),
+        &ClaudeHome::own(spec.agent_dir.join("claude"))
+    );
+    assert!(h.claude().unwrap().own);
+    assert_eq!(
+        fs::read_to_string(h.claude().unwrap().dir.join("CLAUDE.md")).unwrap(),
         "Be brief."
     );
     let c = s.config(&h);
@@ -242,7 +247,7 @@ fn launch_boots_and_starts_claude_with_the_token() {
         }
     }
     let state: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(&h.claude.state).unwrap()).unwrap();
+        serde_json::from_str(&fs::read_to_string(&h.claude().unwrap().state).unwrap()).unwrap();
     assert_eq!(state["installMethod"], "native");
     assert_eq!(state["autoUpdates"], false);
 
@@ -474,7 +479,7 @@ fn the_dirs_it_makes_are_private_whatever_the_umask() {
     }
     let h = s.backend.create(&s.spec("quiet-amber-otter")).unwrap();
     assert_eq!(mode(&s.layout.snapshots_dir()), 0o700);
-    assert_eq!(mode(&h.claude.dir), 0o700);
+    assert_eq!(mode(&h.claude().unwrap().dir), 0o700);
     for (_, name, _) in CACHES {
         assert_eq!(mode(&s.layout.cache_dir().join(name)), 0o700, "{name}");
     }
@@ -597,7 +602,7 @@ fn delete_leaves_nothing_of_the_vm() {
     let spec = s.spec("quiet-amber-otter");
     let h = s.backend.create(&spec).unwrap();
     s.launch(&h).unwrap();
-    let transcript = h.claude.transcript(&h.worktree, "s");
+    let transcript = h.claude().unwrap().transcript(&h.worktree, "s");
     fs::create_dir_all(transcript.parent().unwrap()).unwrap();
     fs::write(&transcript, "{}\n").unwrap();
     fs::write(spec.agent_dir.join("console.log"), "boot").unwrap();
@@ -688,4 +693,387 @@ fn shared_services_go_by_what_the_running_guest_says() {
     let why = s.backend.services_unsupported(&h).unwrap().unwrap();
     assert!(why.contains("Rebuild Template"), "{why}");
     assert!(s.backend.services_relay(&h).unwrap().is_none());
+}
+
+impl Setup {
+    /// The Pi layer, as vibed fetches it, with a build of `pi` in it.
+    fn add_pi_layer(&self, version: &str) {
+        let dir = self.tmp.path().join(format!("pi-build-{version}"));
+        fs::create_dir_all(dir.join("theme")).unwrap();
+        fs::write(dir.join("pi"), "pi").unwrap();
+        fs::write(dir.join("theme/dark.json"), "{}").unwrap();
+        Images::new(self.layout.linux_dir())
+            .add_pi(&crate::pi_release::Build {
+                version: version.into(),
+                dir,
+                sha256: "x".into(),
+                fd: None,
+            })
+            .unwrap();
+    }
+
+    fn pi_spec(&self, r: &str) -> AgentSpec {
+        AgentSpec {
+            agent: AgentKind::Pi,
+            ..self.spec(r)
+        }
+    }
+
+    fn launch_pi(&self, h: &Handle, services: Option<&str>) -> Result<TerminalEnd> {
+        let mut env = vec![("GIT_CONFIG_COUNT".to_owned(), "1".to_owned())];
+        env.extend(services.map(|s| (crate::pi::SERVICES_ENV.to_owned(), s.to_owned())));
+        self.backend.launch(
+            h,
+            &Launch {
+                agent: AgentKind::Pi,
+                args: crate::pi::args("s", Some("openai/gpt-5"), "high", Some("hi")),
+                env,
+                cwd: h.worktree.clone(),
+            },
+        )
+    }
+}
+
+#[test]
+fn a_pi_vm_needs_the_pi_layer_and_says_so() {
+    let s = Setup::new();
+    let e = s
+        .backend
+        .create(&s.pi_spec("quiet-amber-otter"))
+        .unwrap_err();
+    assert!(e.message().contains("Pi for linux agents"), "{e}");
+    s.add_pi_layer("1.5.0");
+    s.backend.create(&s.pi_spec("quiet-amber-otter")).unwrap();
+}
+
+#[test]
+fn each_pi_vm_has_its_own_agent_dir_and_sessions() {
+    let s = Setup::new();
+    s.add_pi_layer("1.5.0");
+    let (a, b) = (
+        s.backend.create(&s.pi_spec("quiet-amber-otter")).unwrap(),
+        s.backend.create(&s.pi_spec("brave-copper-lynx")).unwrap(),
+    );
+    let (ca, cb) = (s.config(&a), s.config(&b));
+    let share = |c: &VmConfig, tag: &str| {
+        c.shares
+            .iter()
+            .find(|x| x.tag == tag)
+            .map(|x| (x.path.clone(), x.read_only))
+    };
+    // A private agent dir each, writable, inside the agent's own directory.
+    assert_eq!(
+        share(&ca, "pi"),
+        Some((a.agent_dir.join(crate::pi::VM_AGENT_DIR), false))
+    );
+    assert_eq!(
+        share(&cb, "pi"),
+        Some((b.agent_dir.join(crate::pi::VM_AGENT_DIR), false))
+    );
+    // Their sessions are their own.
+    assert_ne!(share(&ca, "pi-sessions"), share(&cb, "pi-sessions"));
+    assert_eq!(
+        share(&ca, "pi-sessions").unwrap().0,
+        a.agent_dir.join(crate::pi::VM_SESSIONS)
+    );
+    // No Claude home.
+    assert_eq!(share(&ca, "claude"), None);
+    assert!(a.claude().is_none());
+    assert!(!a.agent_dir.join("claude").exists());
+    // And mounted where Pi looks.
+    let (boot, _) = boot::Boot::parse(&ca.cmdline);
+    let at = |tag: &str| {
+        boot.shares
+            .iter()
+            .find(|m| m.tag == tag)
+            .map(|m| m.path.clone())
+    };
+    assert_eq!(at("pi").as_deref(), Some(crate::pi::GUEST_AGENT_DIR));
+    assert_eq!(
+        at("pi-sessions").as_deref(),
+        Some(crate::pi::GUEST_SESSION_DIR)
+    );
+    // The Pi layer stacks on top with the managed one.
+    assert!(ca.disks.iter().any(|d| d.id == "pi" && d.read_only));
+    assert_eq!(boot.layers[..2], ["managed", "pi"]);
+}
+
+#[test]
+fn a_claude_vm_never_gets_the_pi_layer() {
+    let s = Setup::new();
+    s.add_pi_layer("1.5.0");
+    let h = s.backend.create(&s.spec("quiet-amber-otter")).unwrap();
+    let c = s.config(&h);
+    assert!(!c.disks.iter().any(|d| d.id == "pi"));
+    assert!(!c.shares.iter().any(|x| x.tag.starts_with("pi")));
+    // Nor on a fresh boot, so a VM saved before Pi restores on its own disks.
+    s.launch(&h).unwrap();
+    let c = s.config(&h);
+    assert!(!c.disks.iter().any(|d| d.id == "pi"));
+}
+
+/// The Claude setup-token never reaches a Pi process: it isn't even asked for,
+/// so Pi starts without one, and the guest starts it from an empty environment
+/// (`vibe-guest`'s `env_clear`) with only what's here.
+#[test]
+fn the_claude_token_never_reaches_a_pi_vm() {
+    // No token to be had at all, and the launch doesn't mind.
+    let s = Setup::with_token(None);
+    s.add_pi_layer("1.5.0");
+    let h = s.backend.create(&s.pi_spec("quiet-amber-otter")).unwrap();
+    s.launch_pi(&h, None).unwrap();
+    let launch = s.fake.last_launch();
+    assert!(
+        !launch.env.contains_key(TOKEN_ENV),
+        "{:?}",
+        launch.env.keys()
+    );
+    assert_eq!(launch.command[0], "pi");
+    assert!(!launch.command.iter().any(|w| w == "-e"));
+    assert_eq!(
+        launch.env[crate::pi::AGENT_DIR_ENV],
+        crate::pi::GUEST_AGENT_DIR
+    );
+    assert_eq!(
+        launch.env[crate::pi::SESSION_DIR_ENV],
+        crate::pi::GUEST_SESSION_DIR
+    );
+    assert_eq!(launch.env["PI_SKIP_VERSION_CHECK"], "1");
+    assert_eq!(launch.env["PI_TELEMETRY"], "0");
+    assert_eq!(launch.env["GIT_CONFIG_COUNT"], "1");
+
+    // With a token to be had, the same: it isn't Pi's.
+    let s = Setup::new();
+    s.add_pi_layer("1.5.0");
+    let h = s.backend.create(&s.pi_spec("quiet-amber-otter")).unwrap();
+    s.launch_pi(&h, None).unwrap();
+    let launch = s.fake.last_launch();
+    assert!(!launch.env.contains_key(TOKEN_ENV));
+    assert!(!launch.env.values().any(|v| v == TOKEN));
+    assert!(!launch.command.iter().any(|w| w == TOKEN));
+    // Claude still gets its own.
+    let h = s.backend.create(&s.spec("brave-copper-lynx")).unwrap();
+    s.launch(&h).unwrap();
+    assert_eq!(s.fake.last_launch().env[TOKEN_ENV], TOKEN);
+}
+
+/// D1: what isolates one VM from another. Pi runs a `!command` from `auth.json`,
+/// loads extensions and runs `bin/`, so anything two VMs could both write would
+/// let one run code in the other. None of Pi's writable shares are shared, and
+/// the one Pi share they have in common is read-only at the share, which no
+/// guest can undo, whatever the disk does with the case of a name.
+#[test]
+fn nothing_a_guest_can_write_is_shared_between_pi_vms() {
+    let s = Setup::new();
+    s.add_pi_layer("1.5.0");
+    let (a, b) = (
+        s.backend.create(&s.pi_spec("quiet-amber-otter")).unwrap(),
+        s.backend.create(&s.pi_spec("brave-copper-lynx")).unwrap(),
+    );
+    let (ca, cb) = (s.config(&a), s.config(&b));
+    let caches: Vec<_> = CACHES.iter().map(|(tag, ..)| *tag).collect();
+    for x in &ca.shares {
+        // Not Pi's, and every `linux` agent's already: the project's `.git`, and
+        // the package caches. They're how one agent can reach another with no
+        // login involved (PRD: Exceptions).
+        if x.tag == "git" || caches.contains(&x.tag.as_str()) || x.read_only {
+            continue;
+        }
+        assert!(
+            cb.shares.iter().all(|y| y.path != x.path),
+            "{} is writable and shared",
+            x.tag
+        );
+    }
+    let config = s.layout.linux_pi_dir();
+    for c in [&ca, &cb] {
+        let share = c.shares.iter().find(|x| x.path == config).unwrap();
+        assert_eq!(share.tag, crate::pi::CONFIG_TAG);
+        assert!(share.read_only, "read-only at the share itself");
+        let store = s.layout.linux_pi_logins_dir();
+        assert!(c.shares.iter().all(|x| !x.path.starts_with(&store)));
+        let (boot, problems) = boot::Boot::parse(&c.cmdline);
+        assert!(problems.is_empty(), "{problems:?}");
+        let mount = boot.shares.iter().find(|m| m.tag == share.tag).unwrap();
+        assert_eq!(mount.path, crate::pi::GUEST_CONFIG_DIR);
+    }
+
+    // What the owner keeps reaches each through links in its own directory.
+    fs::write(config.join("settings.json"), "{}").unwrap();
+    s.launch_pi(&a, None).unwrap();
+    let link = a
+        .agent_dir
+        .join(crate::pi::VM_AGENT_DIR)
+        .join("settings.json");
+    assert_eq!(
+        fs::read_link(link).unwrap(),
+        Path::new(crate::pi::GUEST_CONFIG_DIR).join("settings.json")
+    );
+    // And no Claude VM has any of it.
+    let claude = s.backend.create(&s.spec("calm-brown-heron")).unwrap();
+    assert!(
+        s.config(&claude)
+            .shares
+            .iter()
+            .all(|x| x.path != config && !x.tag.starts_with("pi"))
+    );
+}
+
+/// D1: one login per user, kept by a copy per VM.
+#[test]
+fn a_pi_vm_starts_with_the_owners_login_in_its_own_copy() {
+    let s = Setup::new();
+    s.add_pi_layer("1.5.0");
+    let store = s.layout.linux_pi_logins_dir();
+    fs::create_dir_all(&store).unwrap();
+    fs::write(
+        store.join("auth.json"),
+        r#"{"groq":{"type":"api_key","key":"gsk"}}"#,
+    )
+    .unwrap();
+    let h = s.backend.create(&s.pi_spec("quiet-amber-otter")).unwrap();
+    let AgentHome::Pi(home) = &h.home else {
+        panic!("a Pi agent has a Pi home");
+    };
+    // At creation, so a start can tell if it's signed in.
+    assert_eq!(home.logins(), ["groq"]);
+    assert_ne!(home.dir, store);
+    // And at each launch, with a lock left from before boot cleared.
+    fs::write(
+        store.join("auth.json"),
+        r#"{"xai":{"type":"api_key","key":"x"}}"#,
+    )
+    .unwrap();
+    fs::create_dir(home.dir.join("auth.json.lock")).unwrap();
+    s.launch_pi(&h, None).unwrap();
+    assert_eq!(home.logins(), ["xai"]);
+    assert!(!home.dir.join("auth.json.lock").exists());
+    // A copy that's gone bad doesn't stop its agent, or touch the store.
+    s.backend.stop(&h).unwrap();
+    fs::write(home.dir.join("auth.json"), "not json").unwrap();
+    s.launch_pi(&h, None).unwrap();
+    assert_eq!(
+        fs::read_to_string(home.dir.join("auth.json")).unwrap(),
+        "not json"
+    );
+    assert!(
+        fs::read_to_string(store.join("auth.json"))
+            .unwrap()
+            .contains("xai")
+    );
+}
+
+/// B3: logins aren't kept in step for a VM asleep, so it's given what's current
+/// before anything of it runs again, whichever way it wakes.
+#[test]
+fn a_pi_vm_wakes_on_the_login_of_now() {
+    let s = Setup::new();
+    s.add_pi_layer("1.5.0");
+    let store = s.layout.linux_pi_logins_dir();
+    fs::create_dir_all(&store).unwrap();
+    let login = |key: &str| format!(r#"{{"xai":{{"type":"api_key","key":"{key}"}}}}"#);
+    fs::write(store.join("auth.json"), login("before")).unwrap();
+    let h = s.backend.create(&s.pi_spec("quiet-amber-otter")).unwrap();
+    s.launch_pi(&h, None).unwrap();
+    let copy = h.agent_dir.join(crate::pi::VM_AGENT_DIR).join("auth.json");
+    assert!(fs::read_to_string(&copy).unwrap().contains("before"));
+    s.backend.sleep(&h).unwrap();
+
+    // Restored from its snapshot. Before the restore: one that fails has it too.
+    fs::write(store.join("auth.json"), login("while-asleep")).unwrap();
+    lock(&s.fake.state).restore_fails = true;
+    assert_eq!(s.backend.wake(&h).unwrap(), Woke::Resume);
+    assert!(fs::read_to_string(&copy).unwrap().contains("while-asleep"));
+
+    // A lock its saved Pi may hold isn't cleared, and doesn't stop the wake.
+    s.launch_pi(&h, None).unwrap();
+    s.backend.sleep(&h).unwrap();
+    fs::write(store.join("auth.json"), login("held")).unwrap();
+    fs::create_dir(
+        h.agent_dir
+            .join(crate::pi::VM_AGENT_DIR)
+            .join("auth.json.lock"),
+    )
+    .unwrap();
+    s.backend.wake(&h).unwrap();
+    assert!(
+        h.agent_dir
+            .join(crate::pi::VM_AGENT_DIR)
+            .join("auth.json.lock")
+            .is_dir()
+    );
+}
+
+#[test]
+fn pi_env_written_for_the_mac_leaves_the_guests_path_alone() {
+    let s = Setup::new();
+    s.add_pi_layer("1.5.0");
+    let h = s.backend.create(&s.pi_spec("quiet-amber-otter")).unwrap();
+    s.backend
+        .launch(
+            &h,
+            &Launch {
+                agent: AgentKind::Pi,
+                args: Vec::new(),
+                env: vec![
+                    ("PATH".to_owned(), "/opt/homebrew/bin".to_owned()),
+                    ("PI_TELEMETRY".to_owned(), "1".to_owned()),
+                    ("OPENAI_API_KEY".to_owned(), "k".to_owned()),
+                ],
+                cwd: h.worktree.clone(),
+            },
+        )
+        .unwrap();
+    let launch = s.fake.last_launch();
+    assert!(!launch.env.contains_key("PATH"), "the guest's own stands");
+    assert_eq!(launch.env["OPENAI_API_KEY"], "k");
+    assert_eq!(
+        launch.env["PI_TELEMETRY"], "0",
+        "VibeOS's own win, as natively"
+    );
+}
+
+#[test]
+fn shared_services_reach_a_pi_vm_through_the_layers_extension() {
+    let s = Setup::new();
+    s.add_pi_layer("1.5.0");
+    let h = s.backend.create(&s.pi_spec("quiet-amber-otter")).unwrap();
+    let fake = r#"{"mcpServers":{"vibe-fake":{"type":"stdio","command":"vibe","args":["mcp-proxy","fake"]}}}"#;
+    s.launch_pi(&h, Some(fake)).unwrap();
+    let launch = s.fake.last_launch();
+    assert_eq!(launch.command[..3], ["pi", "-e", GUEST_PI_EXTENSION]);
+    assert_eq!(launch.env[crate::pi::SERVICES_ENV], fake);
+}
+
+#[test]
+fn deleting_a_pi_vm_takes_its_copy_and_keeps_the_owners_login() {
+    let s = Setup::new();
+    s.add_pi_layer("1.5.0");
+    let h = s.backend.create(&s.pi_spec("quiet-amber-otter")).unwrap();
+    let store = s.layout.linux_pi_logins_dir();
+    fs::create_dir_all(&store).unwrap();
+    let login = store.join("auth.json");
+    fs::write(&login, "{}").unwrap();
+    let AgentHome::Pi(home) = &h.home else {
+        panic!("a Pi agent has a Pi home");
+    };
+    fs::create_dir_all(&home.sessions).unwrap();
+    fs::write(home.sessions.join("t_s.jsonl"), "{}\n").unwrap();
+    s.backend.delete(&h).unwrap();
+    assert!(!home.sessions.exists());
+    assert!(!home.dir.exists());
+    assert!(login.is_file());
+}
+
+#[test]
+fn a_new_pi_release_is_a_new_layer_for_the_next_fresh_boot() {
+    let s = Setup::new();
+    s.add_pi_layer("1.5.0");
+    let h = s.backend.create(&s.pi_spec("quiet-amber-otter")).unwrap();
+    let disk = |c: &VmConfig| c.disks.iter().find(|d| d.id == "pi").unwrap().path.clone();
+    let first = disk(&s.config(&h));
+    assert!(first.ends_with("pi-1.5.0.img"));
+    s.add_pi_layer("1.6.0");
+    s.launch_pi(&h, None).unwrap();
+    assert!(disk(&s.config(&h)).ends_with("pi-1.6.0.img"));
 }

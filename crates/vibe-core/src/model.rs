@@ -5,6 +5,15 @@
 use std::fmt;
 use std::str::FromStr;
 
+/// How to sign in to Pi in the toolbox, which has no browser, and where a browser
+/// login's localhost callback can't be reached from the Mac's. Each option named
+/// is what Pi 1.5 calls it (`auth/oauth/`, in its source): check them when the pin moves.
+pub const PI_TOOLBOX_SIGN_IN: &str = "In the Linux toolbox (`vibe toolbox`), run `pi`, then /login. \
+    Don't choose Browser login: the toolbox has no browser, and that login can't call back to \
+    it. Choose an API key, or for a subscription Anthropic's \"Copy code login (headless)\" or \
+    OpenAI's \"Device code login (headless)\". Open the link Pi shows in your Mac's browser, and \
+    give Pi the code, or paste back the address you end up on if it asks for a redirect URL";
+
 use serde::{Deserialize, Serialize};
 
 use crate::units::{GIB, MIB, TIB};
@@ -64,18 +73,41 @@ names! {
 }
 
 names! {
-    /// Claude's `--model`.
+    /// Which coding agent a profile runs (PRD: Profiles): Claude Code, or
+    /// Pi. Missing from a profile or an agent that predates Pi, which is
+    /// then Claude's.
+    #[derive(Default)]
+    AgentKind { #[default] Claude = "claude", Pi = "pi" }
+}
+
+impl AgentKind {
+    /// Whether it's the default, which the socket leaves out.
+    pub fn is_claude(&self) -> bool {
+        *self == AgentKind::Claude
+    }
+}
+
+names! {
+    /// Which Pi `pi.install` installs: the `pi` this host's native agents run,
+    /// or the layer `linux` agents boot in their VMs on a Mac.
+    PiTarget { Native = "native", Vm = "vm" }
+}
+
+names! {
+    /// Claude's `--model`. A Pi profile names its model in `pi_model`.
     Model { Opus = "opus", Sonnet = "sonnet" }
 }
 
 names! {
-    /// Claude's `--effort`.
+    /// Claude's `--effort`, and Pi's `--thinking`, which takes the same
+    /// names.
     Reasoning { Low = "low", Medium = "medium", High = "high", Xhigh = "xhigh", Max = "max" }
 }
 
 names! {
     /// Claude's permission mode: `auto`, or `bypass`
-    /// (`--dangerously-skip-permissions`).
+    /// (`--dangerously-skip-permissions`). Pi never asks before a tool
+    /// runs, so a Pi profile is always `bypass`.
     Mode { Auto = "auto", Bypass = "bypass" }
 }
 
@@ -144,6 +176,9 @@ names! {
         HostLink = "host.link",
         /// A shared service changed: its state, settings or tools.
         ServiceChanged = "service.changed",
+        /// Pi's install on this host changed, or an install ended; `message`
+        /// says why one failed.
+        PiChanged = "pi.changed",
     }
 }
 
@@ -174,15 +209,6 @@ names! {
         Owner = "owner",
         /// It holds only an access token, given to it by way of the Mac.
         Follower = "follower",
-    }
-}
-
-names! {
-    /// Which coding agent an agent runs. The shared services don't care; only
-    /// how they're offered to it differs by kind.
-    AgentKind {
-        Claude = "claude",
-        Pi = "pi",
     }
 }
 
@@ -321,8 +347,9 @@ names! {
     /// What `vibe doctor` checks (PRD: Key user flows, Install and setup),
     /// in the order it reports them: git; `gh`'s login, and git using `gh`
     /// for GitHub (`gh auth setup-git`); the `claude` macos agents run, and
-    /// its login; system sleep off; Tailscale, which is optional; and on a
-    /// Mac, the Linux base image and Claude Code for linux agents.
+    /// its login; system sleep off; Tailscale, which is optional; on a
+    /// Mac, the Linux base image and Claude Code for linux agents; and Pi,
+    /// which is optional too.
     CheckId {
         Git = "git",
         Gh = "gh",
@@ -332,6 +359,7 @@ names! {
         Power = "power",
         Tailscale = "tailscale",
         Linux = "linux",
+        Pi = "pi",
     }
 }
 
@@ -364,6 +392,14 @@ pub struct Profile {
     /// as on.
     #[serde(default = "shared_services_on", skip_serializing_if = "is_on")]
     pub shared_services: bool,
+    /// Which coding agent it runs. Claude's unless it says otherwise, so
+    /// what was saved before Pi still reads the same.
+    #[serde(default, skip_serializing_if = "AgentKind::is_claude")]
+    pub agent: AgentKind,
+    /// A Pi profile's model, as `provider/id`. Without one, Pi uses what its
+    /// own settings and logins give: VibeOS doesn't pick a provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pi_model: Option<String>,
 }
 
 fn shared_services_on() -> bool {
@@ -385,6 +421,8 @@ impl Profile {
             mode: Mode::Auto,
             memory: DEFAULT_PROFILE_MEMORY,
             shared_services: true,
+            agent: AgentKind::Claude,
+            pi_model: None,
         }
     }
 
@@ -397,7 +435,85 @@ impl Profile {
                 self.name
             ));
         }
+        match self.agent {
+            AgentKind::Claude => {
+                if self.pi_model.is_some() {
+                    return Err(format!(
+                        "`{}` runs Claude, so it can't have a Pi model",
+                        self.name
+                    ));
+                }
+            }
+            AgentKind::Pi => {
+                if let Some(model) = &self.pi_model {
+                    validate_pi_model(model)?;
+                }
+                // The same opt-in as Claude's bypass on the Mac: Pi never
+                // asks, and `macos` has no file sandbox.
+                if self.environment == Environment::Macos && self.mode != Mode::Bypass {
+                    return Err(format!(
+                        "`{}` would run Pi on this Mac, unsandboxed, and Pi never asks before \
+                         running a tool. Use the linux environment, or set its mode to bypass \
+                         to say that's what you want",
+                        self.name
+                    ));
+                }
+                if self.environment == Environment::Linux && self.mode != Mode::Bypass {
+                    return Err(format!(
+                        "`{}` runs Pi, which has no permission modes: leave its mode out",
+                        self.name
+                    ));
+                }
+            }
+        }
         validate_memory(self.memory)
+    }
+}
+
+impl Profile {
+    /// Keeps the mode true to the agent, after a change of agent or
+    /// environment from `was`, or on a new profile, with `asked` the mode this
+    /// call named. Pi has no modes, so in `linux` it's simply `bypass`. On the
+    /// Mac that's the owner's opt-in, which has to be said in the call that
+    /// puts Pi there: a `bypass` left from `linux` doesn't count, nor does it
+    /// carry over to Claude, which goes back to `auto`.
+    pub fn settle_mode(&mut self, was: Option<(AgentKind, Environment)>, asked: Option<Mode>) {
+        self.mode = match (self.agent, self.environment) {
+            (AgentKind::Pi, Environment::Linux) => Mode::Bypass,
+            (AgentKind::Pi, Environment::Macos) => {
+                if was == Some((AgentKind::Pi, Environment::Macos)) {
+                    asked.unwrap_or(self.mode)
+                } else {
+                    asked.unwrap_or(Mode::Auto)
+                }
+            }
+            (AgentKind::Claude, _) => match was {
+                Some((AgentKind::Pi, _)) => asked.unwrap_or(Mode::Auto),
+                _ => asked.unwrap_or(self.mode),
+            },
+        };
+    }
+}
+
+/// A Pi model as `--model` takes it: `provider/id`, such as
+/// `anthropic/claude-sonnet-4` or `openrouter/moonshotai/kimi-k2`. Never read
+/// as an option or split by a shell.
+pub fn validate_pi_model(model: &str) -> Result<(), String> {
+    let ok = !model.is_empty()
+        && model.len() <= 200
+        && !model.starts_with('-')
+        && model.split_once('/').is_some_and(|(provider, id)| {
+            !provider.is_empty() && !id.is_empty() && !id.starts_with('/')
+        })
+        && model
+            .chars()
+            .all(|c| c.is_ascii_graphic() && !matches!(c, '\'' | '"' | '`' | '$' | '\\'));
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "`{model}` isn't a Pi model: write it as provider/id, as `pi --list-models` shows it"
+        ))
     }
 }
 
@@ -853,6 +969,151 @@ mod tests {
         let linux = starter_profiles("linux");
         assert_eq!(linux.len(), 1);
         assert_eq!(linux[0].environment, Environment::Linux);
+    }
+
+    #[test]
+    fn profiles_from_before_pi_are_claudes() {
+        let old = r#"{"name":"p","environment":"linux","model":"opus","reasoning":"high","mode":"auto","memory":4294967296}"#;
+        let p: Profile = serde_json::from_str(old).unwrap();
+        assert_eq!(p.agent, AgentKind::Claude);
+        assert_eq!(p.pi_model, None);
+        // And they say what they always said, so nothing older misreads them.
+        assert_eq!(
+            serde_json::to_value(&p).unwrap(),
+            serde_json::from_str::<serde_json::Value>(old).unwrap()
+        );
+    }
+
+    #[test]
+    fn pi_profiles() {
+        let pi = |environment, mode, model: Option<&str>| Profile {
+            agent: AgentKind::Pi,
+            mode,
+            pi_model: model.map(str::to_owned),
+            ..Profile::with_defaults("pi-linux", environment)
+        };
+        let on_linux = pi(Environment::Linux, Mode::Bypass, Some("openai/gpt-5"));
+        assert_eq!(on_linux.validate("macos"), Ok(()));
+        assert_eq!(on_linux.validate("linux"), Ok(()));
+        let wire = serde_json::to_value(&on_linux).unwrap();
+        assert_eq!(wire["agent"], "pi");
+        assert_eq!(wire["pi_model"], "openai/gpt-5");
+        // No model is fine: VibeOS doesn't pick one.
+        assert_eq!(
+            pi(Environment::Linux, Mode::Bypass, None).validate("linux"),
+            Ok(())
+        );
+        // On the Mac it takes the owner's opt-in.
+        let refused = pi(Environment::Macos, Mode::Auto, None)
+            .validate("macos")
+            .unwrap_err();
+        assert!(refused.contains("never asks"), "{refused}");
+        assert_eq!(
+            pi(Environment::Macos, Mode::Bypass, None).validate("macos"),
+            Ok(())
+        );
+        assert!(
+            pi(Environment::Linux, Mode::Auto, None)
+                .validate("linux")
+                .is_err()
+        );
+        // A Pi model on a Claude profile means nothing, so it's refused.
+        let claude = Profile {
+            pi_model: Some("openai/gpt-5".into()),
+            ..Profile::with_defaults("c", Environment::Linux)
+        };
+        assert!(claude.validate("linux").unwrap_err().contains("Pi model"));
+    }
+
+    #[test]
+    fn the_mode_stays_true_to_the_agent() {
+        use AgentKind::{Claude, Pi};
+        use Environment::{Linux, Macos};
+        let settled = |agent, environment, mode, was, asked| {
+            let mut p = Profile {
+                agent,
+                mode,
+                ..Profile::with_defaults("p", environment)
+            };
+            p.settle_mode(was, asked);
+            p.mode
+        };
+        // A new Pi profile in linux needs no mode.
+        assert_eq!(settled(Pi, Linux, Mode::Auto, None, None), Mode::Bypass);
+        // A bypass left from linux isn't the owner's opt-in for the Mac.
+        assert_eq!(
+            settled(Pi, Macos, Mode::Bypass, Some((Pi, Linux)), None),
+            Mode::Auto
+        );
+        assert_eq!(
+            settled(
+                Pi,
+                Macos,
+                Mode::Bypass,
+                Some((Pi, Linux)),
+                Some(Mode::Bypass)
+            ),
+            Mode::Bypass
+        );
+        assert_eq!(
+            settled(Pi, Macos, Mode::Auto, Some((Claude, Macos)), None),
+            Mode::Auto
+        );
+        // Once opted in it stays, through an edit of something else.
+        assert_eq!(
+            settled(Pi, Macos, Mode::Bypass, Some((Pi, Macos)), None),
+            Mode::Bypass
+        );
+        // Pi's bypass doesn't follow it back to Claude.
+        assert_eq!(
+            settled(Claude, Linux, Mode::Bypass, Some((Pi, Linux)), None),
+            Mode::Auto
+        );
+        assert_eq!(
+            settled(
+                Claude,
+                Linux,
+                Mode::Bypass,
+                Some((Pi, Linux)),
+                Some(Mode::Bypass)
+            ),
+            Mode::Bypass
+        );
+        // Claude's own bypass is left as it is.
+        assert_eq!(
+            settled(Claude, Macos, Mode::Bypass, Some((Claude, Macos)), None),
+            Mode::Bypass
+        );
+    }
+
+    #[test]
+    fn pi_models() {
+        for good in [
+            "anthropic/claude-sonnet-4",
+            "openrouter/moonshotai/kimi-k2.6",
+            "openai/gpt-5:high",
+            "ollama/qwen3:30b",
+        ] {
+            assert_eq!(validate_pi_model(good), Ok(()), "{good}");
+        }
+        for bad in [
+            "",
+            "gpt-5",
+            "/gpt-5",
+            "openai/",
+            "openai//x",
+            "-x/y",
+            "--help/y",
+            "a b/c",
+            "a/b c",
+            "a/b\nc",
+            "a/$(x)",
+            "a/`x`",
+            "a/'x",
+            &format!("a/{}", "x".repeat(200)),
+        ] {
+            assert!(validate_pi_model(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

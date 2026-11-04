@@ -71,6 +71,7 @@ fn agent(host: &str, r: &str, project: &str, state: AgentState) -> Agent {
         agent: r.into(),
         project: project.into(),
         profile: "software-eng-linux".into(),
+        kind: Default::default(),
         environment: Environment::Linux,
         state,
         worktree: format!("/w/{project}/{r}"),

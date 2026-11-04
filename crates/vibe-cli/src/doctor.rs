@@ -29,6 +29,7 @@ pub(crate) fn title(id: CheckId) -> &'static str {
         CheckId::Power => "system sleep",
         CheckId::Tailscale => "Tailscale",
         CheckId::Linux => "Linux images",
+        CheckId::Pi => "Pi",
     }
 }
 

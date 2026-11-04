@@ -1,4 +1,4 @@
-//! Agents: one Claude Code in its own worktree and compartment, made and
+//! Agents: one Claude Code or Pi in its own worktree and compartment, made and
 //! deleted as a unit (PRD: Core concepts; Key user flows, Start an agent and
 //! Delete). One ref names all three, and the branch too.
 //!
@@ -6,8 +6,8 @@
 //! under `max_awake_agents` (never memory: an agent's memory is a ceiling,
 //! not a reservation, #47); a fetch of `origin` and a worktree on a new
 //! branch; the compartment, through the environment's backend; the
-//! worktree's `.vibe/setup.sh`, run inside it; Claude's state pre-filled;
-//! then Claude on the prompt, in a session of its own, held to its limits.
+//! worktree's `.vibe/setup.sh`, run inside it; its state pre-filled; then the
+//! agent on the prompt, in a session of its own, held to its limits.
 //! If any step fails, the ones before are undone. A delete refuses while the
 //! worktree has uncommitted changes or unpushed commits, unless forced, and
 //! otherwise removes everything VibeOS made for the agent but its branch.
@@ -59,7 +59,7 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// Draws of randomness for a free ref before giving up.
 const REF_TRIES: usize = 8;
 
-/// What Interrupt presses: Escape, which stops Claude's turn.
+/// What Interrupt presses: Escape, which stops the turn in Claude and in Pi.
 const ESCAPE: &[u8] = b"\x1b";
 
 /// The script a repo can have run in every new agent's compartment.
@@ -193,6 +193,25 @@ pub fn claude_args(
         args.extend(["--".into(), prompt.to_owned()]);
     }
     args
+}
+
+/// An agent's arguments, whichever it runs: a new session on `prompt`, or with
+/// `resume`, the session it had. Pi's one `--session-id` does both.
+pub fn agent_args(
+    a: &AgentRecord,
+    prompt: Option<&str>,
+    resume: bool,
+    offered: &[String],
+) -> Vec<String> {
+    match a.agent {
+        AgentKind::Claude => claude_args(a, prompt, resume, offered),
+        AgentKind::Pi => vibe_env::pi::args(
+            &a.session_id,
+            a.pi_model.as_deref(),
+            a.reasoning.as_str(),
+            prompt,
+        ),
+    }
 }
 
 /// The environment every agent's commands get on top of the
@@ -487,6 +506,7 @@ impl Core {
             agent: a.agent_ref.clone(),
             project: a.project.clone(),
             profile: a.profile.clone(),
+            kind: a.agent,
             environment: a.environment,
             state: a.state,
             worktree: a.worktree.clone(),
@@ -789,6 +809,8 @@ impl Core {
             compartment: "{}".into(),
             starting: true,
             shared_services: profile.shared_services,
+            agent: profile.agent,
+            pi_model: profile.pi_model.clone(),
         };
         self.store().add_agent(&record).map_err(store_error)?;
         undo.record = Some(agent_ref.to_owned());
@@ -836,6 +858,7 @@ impl Core {
             git_dir: PathBuf::from(git_dir),
             agent_dir: agent_dir.clone(),
             limits,
+            agent: profile.agent,
         };
         let mut handle = {
             let (b, spec) = (Arc::clone(backend), spec.clone());
@@ -847,24 +870,31 @@ impl Core {
             .set_agent_compartment(host, agent_ref, &record.compartment)
             .map_err(store_error)?;
 
+        // Pi with nothing to answer with would only sit there: said now,
+        // before the repo's setup. What this can't tell, the screen says later
+        // (`vibe_status::pi_error_on_screen`).
+        if let vibe_env::AgentHome::Pi(home) = &handle.home {
+            self.check_pi_can_answer(home, backend, &handle, &record)
+                .await?;
+        }
+
         // 3. The repo's own setup, inside the compartment.
         if worktree.join(SETUP_SCRIPT).is_file() {
             self.run_setup(backend, &handle, &worktree).await?;
         }
 
-        // 4. Claude opens straight to its prompt.
-        let claude = handle.claude.clone();
+        // 4. It opens straight to its prompt.
+        let home = handle.home.clone();
         let (trust, bypass) = (worktree.clone(), profile.mode == Mode::Bypass);
         let claude_lock = Arc::clone(&self.claude_lock);
         blocking(move || {
             let _one_at_a_time = lock(&claude_lock);
-            claude
-                .prefill(&trust, bypass)
-                .map_err(|e| vibe_env::EnvError::new(format!("can't pre-fill Claude's state: {e}")))
+            home.prefill(&trust, bypass)
+                .map_err(|e| vibe_env::EnvError::new(format!("can't pre-fill its state: {e}")))
         })
         .await?;
 
-        // 5. Claude, on the prompt, held by a shim and to its limits. If a
+        // 5. The agent, on the prompt, held by a shim and to its limits. If a
         // shim started and a later step failed, the undo must end its
         // session, so it gets the handle as the launch left it.
         let launched = self
@@ -932,8 +962,65 @@ impl Core {
         Err(failed(format!("{SETUP_SCRIPT} {how}{last}")))
     }
 
-    /// Launches Claude in the agent's compartment and starts a shim on its
-    /// terminal, then holds it to its limits. Records the session.
+    /// Refuses a Pi agent that couldn't answer, and says how to sign in: VibeOS
+    /// holds no key and picks no provider (PRD: Who gets which credentials).
+    /// With a model named, Pi says itself, where it can be run; otherwise, and
+    /// in a VM, it's what can be told from its files.
+    async fn check_pi_can_answer(
+        &self,
+        home: &vibe_env::PiHome,
+        backend: &Arc<dyn Backend>,
+        handle: &Handle,
+        record: &AgentRecord,
+    ) -> Result<(), ErrorObject> {
+        let env_file = vibe_env::pi::read_env_file(&self.layout.pi_env_file()).map_err(failed)?;
+        let model = record.pi_model.as_deref();
+        let mut said = None;
+        if let Some(model) = model {
+            let env = self.launch_env(record)?;
+            let (b, h, m) = (Arc::clone(backend), handle.clone(), model.to_owned());
+            said = blocking(move || Ok(b.pi_auth_check(&h, &env, &m))).await?;
+        }
+        let missing = match said {
+            Some(vibe_env::pi::AuthCheck::Ready) => None,
+            Some(vibe_env::pi::AuthCheck::NotReady(why)) => Some(why),
+            None => {
+                let (home, model) = (home.clone(), model.map(str::to_owned));
+                blocking(move || Ok(home.login_missing(model.as_deref(), &env_file))).await?
+            }
+        };
+        let Some(missing) = missing else {
+            return Ok(());
+        };
+        let how = if backend.capabilities().file_containment {
+            format!(
+                "{}. Every linux Pi agent gets that one login",
+                vibe_core::model::PI_TOOLBOX_SIGN_IN
+            )
+        } else {
+            "Run `pi` on this host and sign in with /login. Every Pi agent here shares that one \
+             login"
+                .to_owned()
+        };
+        Err(error(
+            ErrorCode::Conflict,
+            format!("{missing}, so it couldn't answer. {how}"),
+        ))
+    }
+
+    /// What a Pi agent gets in its environment on top of the compartment's:
+    /// git's settings, and what the owner set on purpose in `pi.env`. Claude
+    /// gets git's settings alone.
+    fn launch_env(&self, record: &AgentRecord) -> Result<Vec<(String, String)>, ErrorObject> {
+        let mut env = agent_env();
+        if record.agent == AgentKind::Pi {
+            env.extend(vibe_env::pi::read_env_file(&self.layout.pi_env_file()).map_err(failed)?);
+        }
+        Ok(env)
+    }
+
+    /// Launches its coding agent in the agent's compartment and starts a shim
+    /// on its terminal, then holds it to its limits. Records the session.
     async fn launch(
         &self,
         backend: &Arc<dyn Backend>,
@@ -957,22 +1044,31 @@ impl Core {
             }
         }
         let auto_allowed = self.services_auto_allowed();
-        let offered = injection(AgentKind::Claude, services.as_deref(), &auto_allowed);
-        let mut env = agent_env();
+        let offered = injection(record.agent, services.as_deref(), &auto_allowed);
+        // VibeOS's own last, so a line of `pi.env` can't turn them on, off or
+        // somewhere else.
+        let mut env = self.launch_env(record)?;
         env.push((local::AGENT_ENV.to_owned(), record.agent_ref.clone()));
         if services.is_some() {
             env.extend(self.services_socket_env(backend));
         }
         env.extend(offered.env);
         let launch = Launch {
-            args: claude_args(record, prompt, resume, &offered.args),
+            agent: record.agent,
+            args: agent_args(record, prompt, resume, &offered.args),
             env,
             cwd: PathBuf::from(&record.worktree),
         };
+        // A Pi with nothing to do reads as at rest from here until it writes
+        // again, whatever its transcript left open.
+        if record.agent == AgentKind::Pi {
+            crate::status::note_pi_at_rest(handle, prompt.is_none());
+        }
         let end = {
             let (b, h) = (Arc::clone(backend), handle.clone());
             blocking(move || b.launch(&h, &launch)).await?
         };
+        self.pi_sync_copy(record, handle).await;
         self.hold_terminal(backend, handle, record, &end).await
     }
 
@@ -986,11 +1082,17 @@ impl Core {
         end: &TerminalEnd,
     ) -> Result<(), ErrorObject> {
         let spec = match end {
-            TerminalEnd::Pty { command, cwd, env } => SessionSpec {
+            TerminalEnd::Pty {
+                command,
+                cwd,
+                env,
+                clean_env,
+            } => SessionSpec {
                 agent: record.agent_ref.clone(),
                 command: command.iter().map(Into::into).collect(),
                 cwd: cwd.clone(),
                 env: env.iter().map(|(k, v)| (k.into(), v.into())).collect(),
+                clean_env: *clean_env,
                 size: None,
                 vm: None,
             },
@@ -999,6 +1101,7 @@ impl Core {
                 command: Vec::new(),
                 cwd: PathBuf::from(&record.worktree),
                 env: Vec::new(),
+                clean_env: false,
                 size: None,
                 vm: Some(socket.clone()),
             },
@@ -1271,8 +1374,9 @@ impl Core {
                 let limits = Limits::new(record.memory, &host_limits);
                 let (b, h) = (Arc::clone(&backend), handle.clone());
                 blocking(move || b.apply(&h, &limits)).await?;
-                let (b, h) = (Arc::clone(&backend), handle);
+                let (b, h) = (Arc::clone(&backend), handle.clone());
                 blocking(move || b.wake(&h)).await?;
+                self.pi_sync_copy(&record, &handle).await;
                 crate::log!("vibed: {agent_ref} resumed from being {}", record.state);
                 let status = self.agent_status(&mut record, self.idle_debounce()).await;
                 let state = self.running_state(agent_ref, &status).await;
@@ -1312,12 +1416,10 @@ impl Core {
         }
         let _ = remove_session_files(&self.layout.session_socket(agent_ref));
         let worktree = PathBuf::from(&record.worktree);
-        // A session that never wrote a transcript has nothing to resume, so
-        // it starts again under the same id.
-        let resume = handle
-            .claude
-            .transcript(&worktree, &record.session_id)
-            .is_file();
+        // A session with no transcript has nothing to resume, so it starts
+        // again under the same id: Claude's before its first answer, Pi's
+        // before its first message.
+        let resume = handle.home.has_transcript(&worktree, &record.session_id);
         self.launch(&backend, &mut handle, &record, None, resume)
             .await?;
         crate::log!(
@@ -1839,6 +1941,8 @@ mod tests {
             compartment: "{}".into(),
             starting: false,
             shared_services: true,
+            agent: AgentKind::Claude,
+            pi_model: None,
         }
     }
 
@@ -1875,6 +1979,47 @@ mod tests {
             ]
         );
         assert_eq!(args[4], "--model");
+    }
+
+    #[test]
+    fn pi_gets_its_own_arguments_and_one_flag_for_start_and_resume() {
+        let a = AgentRecord {
+            agent: AgentKind::Pi,
+            pi_model: Some("openai/gpt-5".into()),
+            ..record(Mode::Bypass)
+        };
+        let id = "0b5c3f6e-0000-4000-8000-000000000000";
+        assert_eq!(
+            agent_args(&a, Some("-fix the build"), false, &[]),
+            [
+                "--session-id",
+                id,
+                "--model",
+                "openai/gpt-5",
+                "--thinking",
+                "xhigh",
+                "--approve",
+                "--",
+                "-fix the build"
+            ]
+        );
+        assert_eq!(
+            agent_args(&a, None, true, &[]),
+            [
+                "--session-id",
+                id,
+                "--model",
+                "openai/gpt-5",
+                "--thinking",
+                "xhigh",
+                "--approve"
+            ]
+        );
+        // Claude's are as they were.
+        assert_eq!(
+            agent_args(&record(Mode::Auto), None, true, &[]),
+            claude_args(&record(Mode::Auto), None, true, &[])
+        );
     }
 
     #[test]

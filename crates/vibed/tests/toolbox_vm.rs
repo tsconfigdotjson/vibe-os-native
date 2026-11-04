@@ -160,6 +160,7 @@ impl World {
         let agent_dir = self.layout.agent_dir(r);
         fs::create_dir_all(&agent_dir).unwrap();
         AgentSpec {
+            agent: Default::default(),
             agent_ref: r.into(),
             project: "app".into(),
             worktree,
@@ -176,6 +177,7 @@ impl World {
             .launch(
                 &h,
                 &Launch {
+                    agent: Default::default(),
                     args: vec!["-c".into(), "sleep 100000".into()],
                     env: vec![],
                     cwd: h.worktree.clone(),
@@ -235,7 +237,7 @@ async fn new_agents_get_what_the_toolbox_installed_and_sleeping_ones_keep_theirs
         ..vibed::linux::Sources::from_env()
     };
     let images = Images::new(layout.linux_dir());
-    vibed::linux::refresh(&images, &layout.agents_dir(), &sources);
+    vibed::linux::refresh(&images, &layout.agents_dir(), &sources, false);
     images.layers().expect("the base image installs");
 
     let token: TokenSource = Arc::new(|| Ok("sk-ant-oat01-unused-by-the-stand-in".into()));

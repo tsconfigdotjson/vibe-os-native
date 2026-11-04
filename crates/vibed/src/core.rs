@@ -18,7 +18,7 @@ use tokio::sync::broadcast;
 use vibe_core::keys;
 use vibe_core::limits::{self, LimitsError};
 use vibe_core::model::{
-    Environment, EventKind, GhState, GithubRepo, LOCAL_HOST, Profile, ProjectSource,
+    AgentKind, Environment, EventKind, GhState, GithubRepo, LOCAL_HOST, Profile, ProjectSource,
     starter_profiles, validate_key_name, validate_name, validate_ref,
 };
 use vibe_core::paths::Layout;
@@ -114,6 +114,8 @@ pub struct Config {
     /// What `vibe doctor` asks of the machine: the machine itself, by
     /// default.
     pub checks: Arc<dyn crate::doctor::HostChecks>,
+    /// Where Pi's releases are, for `pi.install`.
+    pub pi_releases: String,
     /// The Linux images kept current in the background, on a Mac that
     /// runs `linux` agents in VMs: the doctor's `linux` check.
     pub linux_images: Option<Arc<crate::linux::Watch>>,
@@ -174,6 +176,7 @@ impl Config {
                 ..crate::external::ExternalConfig::default()
             },
             checks,
+            pi_releases: crate::pi::releases_from_env(),
             linux_images: None,
             vibe_cli: find_vibe(std::env::current_exe().ok().as_deref()),
             services: None,
@@ -334,6 +337,9 @@ pub struct Core {
     pub(crate) agents_busy: Mutex<HashSet<String>>,
     /// One edit of Claude's state at a time: agents may share its file.
     pub(crate) claude_lock: Arc<Mutex<()>>,
+    pub(crate) pi_releases: String,
+    /// Held while Pi is being installed.
+    pub(crate) pi_installing: tokio::sync::Mutex<()>,
     /// One admission at a time, so two starts can't both take the last
     /// room under `max_awake_agents`.
     pub(crate) admitting: tokio::sync::Mutex<()>,
@@ -345,6 +351,11 @@ pub struct Core {
     /// `vibe_wait` waits for an answer after. None yet means its start's
     /// prompt was the last.
     pub(crate) sends: Mutex<HashMap<String, vibe_status::Mark>>,
+    /// When a Pi agent was last sent a line to answer.
+    pub(crate) pi_sent_at: Mutex<HashMap<String, vibe_status::Timestamp>>,
+    /// What's wrong with a copy of Pi's login, or with the store, by what it's
+    /// about (PRD: Who gets which credentials).
+    pub(crate) pi_alerts: Mutex<std::collections::BTreeMap<String, String>>,
     /// Held while a send types into an agent, so two can't interleave.
     pub(crate) typing: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// One fetch at a time per project, as concurrent fetches of the same
@@ -511,6 +522,19 @@ impl Core {
         store
             .ensure_host(LOCAL_HOST, &config.info.os, &config.label, (config.clock)())
             .map_err(OpenError::Store)?;
+        // A profile that runs Pi in a VM keeps its layer current, and asks for
+        // one that a failed download left it without.
+        if let Some(watch) = &config.linux_images
+            && store.has_linux_pi_profile().unwrap_or(false)
+        {
+            watch.want_pi();
+            if vibe_env::images::Images::new(config.layout.linux_dir())
+                .pi()
+                .is_none()
+            {
+                watch.kick();
+            }
+        }
         let (tx, _) = broadcast::channel(EVENT_BACKLOG);
         let events = Arc::new(EventBus {
             tx,
@@ -564,12 +588,16 @@ impl Core {
             free_disk: config.free_disk,
             agents_busy: Mutex::new(HashSet::new()),
             claude_lock: Arc::new(Mutex::new(())),
+            pi_releases: config.pi_releases,
+            pi_installing: tokio::sync::Mutex::new(()),
             admitting: tokio::sync::Mutex::new(()),
             starting: Mutex::new(0),
             fetching: Mutex::new(HashMap::new()),
             project_use: Mutex::new(HashMap::new()),
             tails: Mutex::new(HashMap::new()),
             sends: Mutex::new(HashMap::new()),
+            pi_sent_at: Mutex::new(HashMap::new()),
+            pi_alerts: Mutex::new(std::collections::BTreeMap::new()),
             typing: Mutex::new(HashMap::new()),
             store: Mutex::new(store),
             limits_lock: Mutex::new(()),
@@ -990,15 +1018,18 @@ impl Core {
             Profile::with_defaults(p.name, p.environment.unwrap_or(Environment::Linux));
         profile.model = p.model.unwrap_or(profile.model);
         profile.reasoning = p.reasoning.unwrap_or(profile.reasoning);
-        profile.mode = p.mode.unwrap_or(profile.mode);
         profile.memory = p.memory.unwrap_or(profile.memory);
         profile.shared_services = p.shared_services.unwrap_or(profile.shared_services);
+        profile.agent = p.agent.unwrap_or(profile.agent);
+        profile.pi_model = p.pi_model.filter(|m| !m.is_empty());
+        profile.settle_mode(None, p.mode);
         profile.validate(&self.info.os).map_err(invalid)?;
         let profile = self
             .store()
             .create_profile(host, &p.project, &profile)
             .map_err(store_error)?;
         self.profiles_changed(&p.project);
+        self.pi_profile_saved(&profile);
         Ok(profile)
     }
 
@@ -1008,19 +1039,29 @@ impl Core {
         let mut profile = store
             .profile(host, &p.project, &p.profile)
             .map_err(store_error)?;
+        let was = (profile.agent, profile.environment);
         profile.name = p.name.unwrap_or(profile.name);
         profile.environment = p.environment.unwrap_or(profile.environment);
         profile.model = p.model.unwrap_or(profile.model);
         profile.reasoning = p.reasoning.unwrap_or(profile.reasoning);
-        profile.mode = p.mode.unwrap_or(profile.mode);
         profile.memory = p.memory.unwrap_or(profile.memory);
         profile.shared_services = p.shared_services.unwrap_or(profile.shared_services);
+        profile.agent = p.agent.unwrap_or(profile.agent);
+        // Back to Claude, a model only Pi could use goes with it.
+        if was.0 == AgentKind::Pi && profile.agent == AgentKind::Claude {
+            profile.pi_model = None;
+        }
+        if let Some(model) = p.pi_model {
+            profile.pi_model = Some(model).filter(|m| !m.is_empty());
+        }
+        profile.settle_mode(Some(was), p.mode);
         profile.validate(&self.info.os).map_err(invalid)?;
         let profile = store
             .replace_profile(host, &p.project, &p.profile, &profile)
             .map_err(store_error)?;
         drop(store);
         self.profiles_changed(&p.project);
+        self.pi_profile_saved(&profile);
         Ok(profile)
     }
 

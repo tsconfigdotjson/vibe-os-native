@@ -1651,6 +1651,7 @@ impl vibe_env::Sleeper for Reattaches {
                 "-c".into(),
                 "echo 'Where it was.'; exec cat".into(),
             ],
+            clean_env: false,
             cwd: h.worktree.clone(),
             env: vec![],
         }))
@@ -2136,6 +2137,7 @@ fn tiny(l: &vibe_env::Limits) -> vibe_env::Limits {
 impl vibe_env::Compartment for Tiny {
     fn create(&self, spec: &vibe_env::AgentSpec) -> vibe_env::Result<vibe_env::Handle> {
         self.0.create(&vibe_env::AgentSpec {
+            agent: Default::default(),
             limits: tiny(&spec.limits),
             ..spec.clone()
         })

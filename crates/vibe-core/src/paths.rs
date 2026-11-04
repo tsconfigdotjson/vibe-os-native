@@ -216,6 +216,31 @@ impl Layout {
         self.home.join("VibeOS/linux-claude")
     }
 
+    /// What the owner keeps for Pi in `linux` agents on the Mac: settings,
+    /// models, extensions. Every Pi VM has it as a read-only share, so nothing it
+    /// does can reach another through it (PRD: Exceptions).
+    pub fn linux_pi_dir(&self) -> PathBuf {
+        self.home.join("VibeOS/linux-pi")
+    }
+
+    /// The owner's one Pi login for `linux` agents: `auth.json`, which no guest
+    /// mounts and only `vibed` writes, from which each gets a private copy.
+    pub fn linux_pi_logins_dir(&self) -> PathBuf {
+        self.home.join("VibeOS/linux-pi-logins")
+    }
+
+    /// The toolbox's own agent dir for Pi: a private copy of the login like a
+    /// VM's, and the owner's, so a `/login` there always wins.
+    pub fn linux_pi_signin_dir(&self) -> PathBuf {
+        self.home.join("VibeOS/linux-pi-signin")
+    }
+
+    /// Where the owner names what Pi agents get in their environment, on
+    /// purpose.
+    pub fn pi_env_file(&self) -> PathBuf {
+        self.config_dir().join("pi.env")
+    }
+
     /// The package caches `linux` agents share, one directory per tool.
     pub fn cache_dir(&self) -> PathBuf {
         self.home.join("VibeOS/cache")

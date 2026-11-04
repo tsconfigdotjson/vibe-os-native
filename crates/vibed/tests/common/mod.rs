@@ -20,7 +20,7 @@ use vibe_core::paths::Layout;
 use vibe_core::rpc::Login;
 use vibe_core::units::GIB;
 use vibe_env::images::Images;
-use vibe_env::testing::{STAND_IN, TestBackend, TestToolbox};
+use vibe_env::testing::{PI_STAND_IN, STAND_IN, TestBackend, TestToolbox};
 use vibe_services::secrets::MemoryStore;
 use vibe_services::testing::FakeService;
 use vibe_services::{Secret, SecretStore};
@@ -187,6 +187,7 @@ pub fn stand_in(bin: &Path) -> PathBuf {
     fs::create_dir_all(bin).unwrap();
     let claude = bin.join("claude");
     write_script(&claude, STAND_IN);
+    write_script(&bin.join("pi"), PI_STAND_IN);
     claude
 }
 
@@ -255,8 +256,64 @@ pub fn golden_checks() -> vibed::doctor::FixedChecks {
             "2.1.314 (Claude Code)".into(),
         )),
         claude_login: Ok("Claude Code is signed in, with its login in your Keychain".into()),
+        pi: Ok(("/usr/local/bin/pi".into(), "1.5.0".into())),
         system_sleep: Ok(Some(10)),
     }
+}
+
+/// Publishes a build of Pi as its releases do, under `root`, as the latest: a
+/// `file://` directory `vibe_env::pi_release` reads. Its `pi` is a script.
+pub fn publish_pi(root: &Path, version: &str, platform: &str) {
+    let release = root.join(format!("download/v{version}"));
+    let staging = root.join(format!("staging-{version}"));
+    fs::create_dir_all(staging.join("pi/theme")).unwrap();
+    fs::create_dir_all(&release).unwrap();
+    let binary = staging.join("pi/pi");
+    fs::write(&binary, format!("#!/bin/sh\necho {version}\n")).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(staging.join("pi/theme/dark.json"), "{}").unwrap();
+    let name = format!("pi-{platform}.tar.gz");
+    let tarball = release.join(&name);
+    let ok = std::process::Command::new("tar")
+        .arg("-czf")
+        .arg(&tarball)
+        .arg("-C")
+        .arg(&staging)
+        .arg("pi")
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok);
+    let sum = vibe_env::images::sha256_file(&tarball).unwrap();
+    fs::write(release.join("SHA256SUMS"), format!("{sum}  {name}\n")).unwrap();
+    // And the `fd` that goes in a layer.
+    let target = format!(
+        "fd-v{}-aarch64-unknown-linux-gnu",
+        vibe_env::pi_release::FD_VERSION
+    );
+    let staging = root.join("staging-fd");
+    fs::create_dir_all(staging.join(&target)).unwrap();
+    fs::write(staging.join(&target).join("fd"), "#!/bin/sh\n").unwrap();
+    fs::set_permissions(
+        staging.join(&target).join("fd"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("fd")).unwrap();
+    let tarball = root.join("fd").join(format!("{target}.tar.gz"));
+    let ok = std::process::Command::new("tar")
+        .arg("-czf")
+        .arg(&tarball)
+        .arg("-C")
+        .arg(&staging)
+        .arg(&target)
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok);
+    let sum = vibe_env::images::sha256_file(&tarball).unwrap();
+    fs::write(root.join("fd").join(format!("{target}.tar.gz.sha256")), sum).unwrap();
 }
 
 pub struct Golden {
@@ -340,6 +397,36 @@ impl Golden {
             fs::write(base.join(f), f).unwrap();
         }
         fs::write(layout.linux_dir().join("home-1.img"), "").unwrap();
+        // Pi: the owner's own login, the store for linux agents, and a release to
+        // install the layer they boot from. Never a provider's real login.
+        let own = self.home.join(".pi/agent");
+        fs::create_dir_all(&own).unwrap();
+        fs::write(
+            own.join("auth.json"),
+            r#"{"openai":{"type":"api_key","key":"sk-fake"}}"#,
+        )
+        .unwrap();
+        let vms = layout.linux_pi_logins_dir();
+        fs::create_dir_all(&vms).unwrap();
+        fs::write(
+            vms.join("auth.json"),
+            r#"{"anthropic":{"type":"oauth","access":"a","refresh":"r","expires":1}}"#,
+        )
+        .unwrap();
+        // What the owner is told of what an agent did with a login, not a week old.
+        fs::write(
+            vms.join(vibe_env::pi_logins::NOTICES_FILE),
+            serde_json::json!([{
+                "provider": "xai",
+                "text": "brave-copper-lynx signed in to xai, and every Pi agent here now uses \
+                         that login. If that wasn't you, sign in to it from the toolbox to \
+                         replace it.",
+                "at_ms": vibe_env::pi_logins::now_ms(),
+            }])
+            .to_string(),
+        )
+        .unwrap();
+        publish_pi(&self.home.join("pi-releases"), "1.5.0", "linux-arm64");
         // And for the doctor's linux check: Claude Code's managed layer, and
         // base release 2 being downloaded, 400 bytes of 1000 in so far.
         fs::write(layout.linux_dir().join("managed-2.1.314.img"), "").unwrap();
@@ -381,7 +468,12 @@ impl Golden {
         config.gh = self.gh.clone().into();
         config.shim = workspace_bin("vibe-shim").into_os_string();
         config.backends = Backends::all(Arc::new(Seeding {
-            backend: TestBackend::new(&self.claude).reporting_memory(AGENT_MEMORY_USED),
+            backend: TestBackend::new(&self.claude)
+                .with_pi_copies(
+                    self.claude.with_file_name("pi"),
+                    &Layout::new(&self.home, "macos"),
+                )
+                .reporting_memory(AGENT_MEMORY_USED),
             run: Layout::new(&self.home, "macos").run_dir(),
             settled: std::sync::atomic::AtomicBool::new(false),
         }));
@@ -407,12 +499,14 @@ impl Golden {
         // Mac that sleeps after 10 minutes; and the Linux images, with base
         // release 2 on its way (for_examples has it 40% downloaded).
         config.checks = Arc::new(golden_checks());
+        config.pi_releases = format!("file://{}", self.home.join("pi-releases").display());
         config.linux_images = Some(vibed::linux::Watch::new(
             &Layout::new(&self.home, "macos"),
             vibed::linux::Sources {
                 base_releases: "file:///nowhere".into(),
                 base_release: 2,
                 claude_releases: "file:///nowhere".into(),
+                pi_releases: "file:///nowhere".into(),
             },
         ));
         // Bytes 0, 1, 2, … for the first key, 32, 33, … for the next.
@@ -576,7 +670,10 @@ impl vibe_env::Compartment for Seeding {
     fn create(&self, spec: &vibe_env::AgentSpec) -> vibe_env::Result<vibe_env::Handle> {
         let h = self.backend.create(spec)?;
         if spec.agent_ref == "dark-mode-review" {
-            let path = h.claude.transcript(&spec.worktree, SEEDED_SESSION);
+            let path = h
+                .claude()
+                .unwrap()
+                .transcript(&spec.worktree, SEEDED_SESSION);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             let cwd = spec.worktree.to_string_lossy();
             let entry = |kind: &str, at: &str, uuid: &str, message: &str| {
@@ -879,7 +976,7 @@ impl Conn {
     }
 }
 
-pub const HELLO: &str = r#"{"jsonrpc":"2.0","id":"probe","method":"daemon.hello","params":{"client":"test","protocol":1}}"#;
+pub const HELLO: &str = r#"{"jsonrpc":"2.0","id":"probe","method":"daemon.hello","params":{"client":"test","protocol":2}}"#;
 
 /// The logins the examples' Linux home holds.
 pub fn golden_logins() -> Vec<Login> {

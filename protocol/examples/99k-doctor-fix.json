@@ -55,6 +55,12 @@
           "detail": "Downloading the Linux base image.",
           "fixable": false,
           "progress": 40
+        },
+        {
+          "id": "pi",
+          "state": "pass",
+          "detail": "Pi 1.5.0 is at /usr/local/bin/pi.",
+          "fixable": false
         }
       ]
     }

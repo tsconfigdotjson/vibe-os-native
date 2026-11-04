@@ -24,8 +24,12 @@
 //!   is measured on the host, and past `disk_hard` the agent is frozen
 //!   until a wake (PRD: How `macos` is governed, Disk, applied here too).
 //!
-//! Everything that talks to `vibe-vm` and `vibe-guest` goes through
-//! [`Machine`], so the policy here is tested without a Mac.
+//! A Pi agent's VM differs in three ways (PRD: What's inside `linux`). It
+//! stacks the Pi layer. Instead of a Claude home it has a private agent dir of
+//! its own at `~/.pi/agent`, which `vibed` keeps in step with the owner's one
+//! login ([`crate::pi_logins`]), `~/VibeOS/linux-pi/` read-only at the share for
+//! what the owner keeps there, and its own sessions. And its launch gets no Claude
+//! token.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -38,6 +42,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use vibe_core::claude_token::{TOKEN_ENV, TokenStore};
 use vibe_core::limits::{self, HostLimits};
+use vibe_core::model::AgentKind;
 use vibe_core::paths::{Layout, private_dir};
 use vibe_core::units::MIB;
 
@@ -47,15 +52,19 @@ use crate::images::{Images, Layers};
 use crate::tree::SessionTree;
 use crate::vm::{self, Disk, Share, VmConfig, VmError};
 use crate::{
-    AgentSpec, Backend, Capabilities, Compartment, EnvError, Handle, Launch, Limit, Limiter,
-    Limits, Proc, Result, Run, RunOutput, Sleeper, TerminalEnd, Usage, Woke,
+    AgentHome, AgentSpec, Backend, Capabilities, Compartment, EnvError, Handle, Launch, Limit,
+    Limiter, Limits, PiHome, Proc, Result, Run, RunOutput, Sleeper, TerminalEnd, Usage, Woke,
 };
+use crate::{pi, pi_logins};
 
 /// The kernel command line before `vibe-guest`'s words.
 pub const CMDLINE: &str = "console=hvc0 quiet";
 
 /// Where the agent's Claude home is mounted in the guest.
 pub const GUEST_CLAUDE_HOME: &str = "/home/vibe/.claude";
+
+/// Where the Pi layer's extension for the shared services is in the guest.
+pub const GUEST_PI_EXTENSION: &str = "/opt/vibeos/pi/vibe-services.ts";
 
 /// The package caches every `linux` agent shares, by tag: the host
 /// directory under `~/VibeOS/cache/`, and where the tool looks in the guest.
@@ -290,6 +299,8 @@ pub struct LinuxVm {
     token: TokenSource,
     /// What's run as Claude Code in the guest: the managed layer's.
     claude: String,
+    /// What's run as Pi in the guest: the Pi layer's.
+    pi: String,
     host_cpus: usize,
     disk_every: Duration,
     supervisors: Mutex<HashMap<String, Supervisor>>,
@@ -338,6 +349,7 @@ impl LinuxVm {
             machine,
             token,
             claude: "claude".into(),
+            pi: "pi".into(),
             host_cpus: std::thread::available_parallelism().map_or(1, |n| n.get()),
             disk_every: DISK_EVERY,
             supervisors: Mutex::new(HashMap::new()),
@@ -349,6 +361,12 @@ impl LinuxVm {
     /// `claude`, as the conformance suite runs its stand-in.
     pub fn with_claude(mut self, command: impl Into<String>) -> LinuxVm {
         self.claude = command.into();
+        self
+    }
+
+    /// Runs `command` as Pi instead of the Pi layer's `pi`.
+    pub fn with_pi(mut self, command: impl Into<String>) -> LinuxVm {
+        self.pi = command.into();
         self
     }
 
@@ -382,14 +400,23 @@ impl LinuxVm {
         limits::load(&self.layout.host_config()).map_err(|e| EnvError::new(e.to_string()))
     }
 
+    /// Readies a Pi VM's private agent dir, and gives it the store's logins. Trouble
+    /// with this copy or the store doesn't stop the agent, which may have a key of
+    /// its own: `vibed` looks at the same copy right after, and tells the owner
+    /// (`Core::pi_sync_copy`). Not being able to make the directory does.
+    fn prepare_pi(&self, agent: &str, agent_dir: &Path, running: bool) -> Result<()> {
+        let broker = pi_logins::Broker::of(&self.layout);
+        let copy = pi_logins::vm_copy(agent, agent_dir);
+        broker
+            .prepare_dir(&copy, running)
+            .map_err(|e| EnvError::new(format!("can't set up Pi's agent dir for {agent}: {e}")))?;
+        let _ = broker.sync(&copy, pi_logins::now_ms());
+        Ok(())
+    }
+
     /// The VM's configuration for `spec`, on `layers`.
     fn config(&self, spec: &AgentSpec, layers: &Layers, host: &HostLimits) -> Result<VmConfig> {
-        let (_, managed) = layers.managed.clone().ok_or_else(|| {
-            EnvError::new(
-                "Claude Code for linux agents isn't downloaded yet: vibed fetches it when it \
-                 starts, and daily",
-            )
-        })?;
+        LinuxVm::layers_for(spec.agent, layers)?;
         let dir = &spec.agent_dir;
         let path = |p: &Path| p.to_string_lossy().into_owned();
         let mut shares = vec![
@@ -399,12 +426,33 @@ impl LinuxVm {
                 path(&spec.worktree),
             ),
             ("git".to_owned(), spec.git_dir.clone(), path(&spec.git_dir)),
-            (
+        ];
+        match spec.agent {
+            AgentKind::Claude => shares.push((
                 "claude".to_owned(),
                 dir.join("claude"),
                 GUEST_CLAUDE_HOME.to_owned(),
-            ),
-        ];
+            )),
+            AgentKind::Pi => {
+                shares.push((
+                    "pi".to_owned(),
+                    dir.join(pi::VM_AGENT_DIR),
+                    pi::GUEST_AGENT_DIR.to_owned(),
+                ));
+                // Read-only at the share itself: the owner's, for every Pi VM,
+                // and the one thing here more than one of them can see.
+                shares.push((
+                    pi::CONFIG_TAG.to_owned(),
+                    self.layout.linux_pi_dir(),
+                    pi::GUEST_CONFIG_DIR.to_owned(),
+                ));
+                shares.push((
+                    "pi-sessions".to_owned(),
+                    dir.join(pi::VM_SESSIONS),
+                    pi::GUEST_SESSION_DIR.to_owned(),
+                ));
+            }
+        }
         if host.package_caches {
             for (tag, name, at) in CACHES {
                 shares.push((tag.into(), self.layout.cache_dir().join(name), at.into()));
@@ -426,7 +474,7 @@ impl LinuxVm {
                 .map(|(tag, host, _)| Share {
                     tag: tag.clone(),
                     path: host.clone(),
-                    read_only: false,
+                    read_only: tag == pi::CONFIG_TAG,
                 })
                 .collect(),
             console_log: Some(dir.join("console.log")),
@@ -448,8 +496,24 @@ impl LinuxVm {
             uid: Some(unsafe { libc::getuid() }),
             gid: Some(unsafe { libc::getgid() }),
         };
-        set_layers(&mut config, boot, layers, &managed, &dir.join("disk.img"))?;
+        set_layers(&mut config, boot, layers, spec.agent, &dir.join("disk.img"))?;
         Ok(config)
+    }
+
+    /// Says what's missing if `layers` doesn't have what `agent` needs: Claude
+    /// the managed layer, Pi its own.
+    fn layers_for(agent: AgentKind, layers: &Layers) -> Result<()> {
+        match agent {
+            AgentKind::Claude if layers.managed.is_none() => Err(EnvError::new(
+                "Claude Code for linux agents isn't downloaded yet: vibed fetches it when it \
+                 starts, and daily",
+            )),
+            AgentKind::Pi if layers.pi.is_none() => Err(EnvError::new(
+                "Pi for linux agents isn't downloaded yet: download it from Settings, or wait \
+                 for vibed's next check, as a Pi profile asks for it",
+            )),
+            _ => Ok(()),
+        }
     }
 
     /// Before a fresh boot: the newest layers into `vm.json`, keeping the
@@ -460,11 +524,12 @@ impl LinuxVm {
         let mut config = VmConfig::load(&path)
             .map_err(|e| EnvError::new(format!("{}'s VM: {e}", h.agent_ref)))?;
         let layers = self.images.layers()?;
-        let Some((_, managed)) = layers.managed.clone() else {
+        let agent = h.home.kind();
+        if LinuxVm::layers_for(agent, &layers).is_err() {
             return Ok(());
-        };
+        }
         let (boot, _) = boot::Boot::parse(&config.cmdline);
-        let agent = config
+        let agent_disk = config
             .disks
             .iter()
             .find(|d| !d.read_only)
@@ -472,7 +537,7 @@ impl LinuxVm {
             .unwrap_or_else(|| h.agent_dir.join("disk.img"));
         config.kernel = layers.base.kernel.clone();
         config.initrd = Some(layers.base.initrd.clone());
-        set_layers(&mut config, boot, &layers, &managed, &agent)?;
+        set_layers(&mut config, boot, &layers, agent, &agent_disk)?;
         config
             .save(&path)
             .map_err(|e| EnvError::new(format!("can't update {}: {e}", path.display())))
@@ -571,24 +636,33 @@ impl LinuxVm {
 }
 
 /// Puts `layers` into `config`: the read-only disks, then the agent's own,
-/// and the command line that stacks them, managed layer on top.
+/// and the command line that stacks them, the layers VibeOS keeps on top. A
+/// Claude agent's VM never gets the Pi layer, so one saved before Pi restores
+/// with the disks it was saved with.
 fn set_layers(
     config: &mut VmConfig,
     mut boot: boot::Boot,
     layers: &Layers,
-    managed: &Path,
+    agent: AgentKind,
     agent_disk: &Path,
 ) -> Result<()> {
     let mut disks = vec![("base", layers.base.disk.clone())];
     if let Some(t) = &layers.template {
         disks.push(("template", t.clone()));
     }
-    disks.push(("managed", managed.to_owned()));
+    if let Some((_, managed)) = &layers.managed {
+        disks.push(("managed", managed.clone()));
+    }
+    if agent == AgentKind::Pi
+        && let Some((_, pi)) = &layers.pi
+    {
+        disks.push(("pi", pi.clone()));
+    }
     if let Some(home) = &layers.home {
         disks.push(("home", home.clone()));
     }
-    // Top first: the managed layer, the home, the template, the base.
-    let order = ["managed", "home", "template", "base"];
+    // Top first: the layers VibeOS keeps, the home, the template, the base.
+    let order = ["managed", "pi", "home", "template", "base"];
     boot.layers = order
         .iter()
         .filter(|id| disks.iter().any(|(d, _)| d == *id))
@@ -660,12 +734,31 @@ impl Compartment for LinuxVm {
         let host = self.host_limits()?;
         let layers = self.images.layers()?;
         let config = self.config(spec, &layers, &host)?;
-        let home = ClaudeHome::own(spec.agent_dir.join("claude"));
-        private_dir(&home.dir)
-            .map_err(|e| EnvError::new(format!("can't create {}: {e}", home.dir.display())))?;
-        home.seed(&self.layout.linux_claude_dir())
-            .and_then(|()| home.mark_managed())
-            .map_err(|e| EnvError::new(format!("can't set up the agent's Claude home: {e}")))?;
+        let home = match spec.agent {
+            AgentKind::Claude => {
+                let home = ClaudeHome::own(spec.agent_dir.join("claude"));
+                private_dir(&home.dir).map_err(|e| {
+                    EnvError::new(format!("can't create {}: {e}", home.dir.display()))
+                })?;
+                home.seed(&self.layout.linux_claude_dir())
+                    .and_then(|()| home.mark_managed())
+                    .map_err(|e| {
+                        EnvError::new(format!("can't set up the agent's Claude home: {e}"))
+                    })?;
+                AgentHome::Claude(home)
+            }
+            AgentKind::Pi => {
+                let home = PiHome::at(
+                    spec.agent_dir.join(pi::VM_AGENT_DIR),
+                    spec.agent_dir.join(pi::VM_SESSIONS),
+                )
+                .with_config(self.layout.linux_pi_dir());
+                home.prefill()
+                    .map_err(|e| EnvError::new(format!("can't set up Pi for the agent: {e}")))?;
+                self.prepare_pi(&spec.agent_ref, &spec.agent_dir, false)?;
+                AgentHome::Pi(home)
+            }
+        };
         // The caches, like the agent's own directories, are this user's
         // alone, whatever the umask; the worktree and `.git` are as they are.
         for share in &config.shares {
@@ -693,7 +786,7 @@ impl Compartment for LinuxVm {
             agent_ref: spec.agent_ref.clone(),
             agent_dir: spec.agent_dir.clone(),
             worktree: spec.worktree.clone(),
-            claude: home,
+            home,
             session: None,
         })
     }
@@ -722,23 +815,44 @@ impl Compartment for LinuxVm {
     }
 
     fn launch(&self, h: &Handle, launch: &Launch) -> Result<TerminalEnd> {
-        let token = (self.token)()?;
-        h.claude
-            .mark_managed()
-            .map_err(|e| EnvError::new(format!("can't set up Claude's state: {e}")))?;
-        self.ensure_running(h)?;
-        let socket = self.socket(h);
-        let mut command = vec![self.claude.clone()];
-        command.extend(launch.args.iter().cloned());
         let mut env: std::collections::BTreeMap<String, String> =
             launch.env.iter().cloned().collect();
-        env.insert(CONFIG_DIR_ENV.into(), GUEST_CLAUDE_HOME.into());
-        // The managed layer keeps Claude current (PRD: Exceptions).
-        env.insert("DISABLE_AUTOUPDATER".into(), "1".into());
-        // Nor is it where Claude's own installer would put it, which Claude
-        // otherwise warns about (PRD: Spike results).
-        env.insert("DISABLE_INSTALLATION_CHECKS".into(), "1".into());
-        env.insert(TOKEN_ENV.into(), token);
+        let mut command;
+        match &h.home {
+            AgentHome::Claude(claude) => {
+                let token = (self.token)()?;
+                claude
+                    .mark_managed()
+                    .map_err(|e| EnvError::new(format!("can't set up Claude's state: {e}")))?;
+                command = vec![self.claude.clone()];
+                env.insert(CONFIG_DIR_ENV.into(), GUEST_CLAUDE_HOME.into());
+                // The managed layer keeps Claude current (PRD: Exceptions).
+                env.insert("DISABLE_AUTOUPDATER".into(), "1".into());
+                // Nor is it where Claude's own installer would put it, which
+                // Claude otherwise warns about (PRD: Spike results).
+                env.insert("DISABLE_INSTALLATION_CHECKS".into(), "1".into());
+                env.insert(TOKEN_ENV.into(), token);
+            }
+            // Never the Claude token (PRD: Who gets which credentials). The
+            // guest starts it from an empty environment, so what's here is
+            // all it gets.
+            AgentHome::Pi(home) => {
+                home.prefill()
+                    .map_err(|e| EnvError::new(format!("can't set up Pi for the agent: {e}")))?;
+                let running = self.machine.running(&self.socket(h));
+                self.prepare_pi(&h.agent_ref, &h.agent_dir, running)?;
+                command = vec![self.pi.clone()];
+                command.extend(pi::service_args(&launch.env, GUEST_PI_EXTENSION));
+                // A line of `pi.env` written for the Mac stays out of its way.
+                env = pi::for_guest(launch.env.clone()).into_iter().collect();
+                env.extend(pi::quiet_env());
+                env.insert(pi::AGENT_DIR_ENV.into(), pi::GUEST_AGENT_DIR.into());
+                env.insert(pi::SESSION_DIR_ENV.into(), pi::GUEST_SESSION_DIR.into());
+            }
+        }
+        command.extend(launch.args.iter().cloned());
+        self.ensure_running(h)?;
+        let socket = self.socket(h);
         self.machine.launch(
             &socket,
             &guest::Launch {
@@ -847,9 +961,9 @@ impl Compartment for LinuxVm {
             remove_file(&h.agent_dir.join(name))?;
         }
         remove_file(&h.agent_dir.join("vm.json.tmp"))?;
-        h.claude
+        h.home
             .forget(&h.worktree)
-            .map_err(|e| EnvError::new(format!("can't remove Claude's state: {e}")))?;
+            .map_err(|e| EnvError::new(format!("can't remove its agent's state: {e}")))?;
         self.remove_lock(h);
         Ok(())
     }
@@ -950,6 +1064,15 @@ impl Sleeper for LinuxVm {
         let end = TerminalEnd::Vm {
             socket: socket.clone(),
         };
+        // Agents sleep within a minute, and logins aren't kept in step for one
+        // asleep: it mustn't wake to a token spent meanwhile. Its Pi may be holding
+        // a lock as it was saved, so that isn't cleared.
+        if matches!(h.home, AgentHome::Pi(_)) {
+            let _ = pi_logins::Broker::of(&self.layout).sync(
+                &pi_logins::vm_copy(&h.agent_ref, &h.agent_dir),
+                pi_logins::now_ms(),
+            );
+        }
         if self.machine.running(&socket) {
             let status = self.machine.status(&socket)?;
             if status.frozen {

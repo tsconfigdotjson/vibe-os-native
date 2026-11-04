@@ -66,7 +66,7 @@ fn hello(socket: &Path) -> Value {
     call(
         socket,
         "daemon.hello",
-        serde_json::json!({"client": "daemon-test", "protocol": 1}),
+        serde_json::json!({"client": "daemon-test", "protocol": 2}),
     )
 }
 
@@ -101,7 +101,7 @@ fn serves_hello_and_stops_cleanly_on_sigterm() {
     let result = &r["result"];
     assert_eq!(result["daemon"], "vibed");
     assert_eq!(result["version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(result["protocol"], 1);
+    assert_eq!(result["protocol"], 2);
     assert_eq!(result["os"], std::env::consts::OS);
     assert_eq!(result["arch"], std::env::consts::ARCH);
     assert_eq!(result["pid"], d.child.id());

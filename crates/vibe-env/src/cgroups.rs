@@ -63,10 +63,13 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use vibe_core::limits::HostLimits;
 
+use vibe_core::model::AgentKind;
+
 use crate::tree::{self, SHIM_NAME, SessionTree};
 use crate::{
-    AgentSpec, Backend, Capabilities, ClaudeHome, Compartment, EnvError, Handle, Launch, Limit,
-    Limiter, Limits, Proc, Result, Run, RunOutput, Sleeper, TerminalEnd, Usage, Woke, native,
+    AgentHome, AgentSpec, Backend, Capabilities, ClaudeHome, Compartment, EnvError, Handle, Launch,
+    Limit, Limiter, Limits, Proc, Result, Run, RunOutput, Sleeper, TerminalEnd, Usage, Woke,
+    native,
 };
 
 /// Where an agent's mode (running, asleep or paused, and why) and the
@@ -497,6 +500,8 @@ pub struct Cgroups {
     home: PathBuf,
     /// The `claude` to run; by default the one on the agents' `PATH`.
     claude: Option<PathBuf>,
+    /// The `pi` to run; by default the one on the agents' `PATH`.
+    pi: Option<PathBuf>,
     /// The agents' `PATH`.
     path: String,
     systemctl: PathBuf,
@@ -525,6 +530,7 @@ impl Cgroups {
             systemd_run: find(&path, "systemd-run"),
             home,
             claude: None,
+            pi: None,
             path,
             slice: SLICE.into(),
             root: PathBuf::from(CGROUP_ROOT),
@@ -538,6 +544,12 @@ impl Cgroups {
     /// Runs `claude` as Claude Code, rather than the one on `PATH`.
     pub fn with_claude(mut self, claude: impl Into<PathBuf>) -> Cgroups {
         self.claude = Some(claude.into());
+        self
+    }
+
+    /// Runs `pi` as Pi, rather than the one on `PATH`.
+    pub fn with_pi(mut self, pi: impl Into<PathBuf>) -> Cgroups {
+        self.pi = Some(pi.into());
         self
     }
 
@@ -776,6 +788,23 @@ impl Cgroups {
             })
     }
 
+    /// The `pi` agents run: the server's own, like `claude`.
+    pub fn pi(&self) -> Result<PathBuf> {
+        if let Some(p) = &self.pi {
+            return Ok(p.clone());
+        }
+        std::env::split_paths(&self.path)
+            .map(|d| d.join("pi"))
+            .find(|c| is_executable(c))
+            .ok_or_else(|| {
+                EnvError::new(format!(
+                    "can't find pi on this server's PATH ({}). Install it from the Mac's Settings \
+                     or with `vibe pi install`, then run `pi` and `/login` once",
+                    self.path
+                ))
+            })
+    }
+
     fn env(&self) -> Vec<(String, String)> {
         vec![
             ("HOME".into(), self.home.to_string_lossy().into_owned()),
@@ -891,7 +920,13 @@ impl Compartment for Cgroups {
             agent_ref: spec.agent_ref.clone(),
             agent_dir: spec.agent_dir.clone(),
             worktree: spec.worktree.clone(),
-            claude: ClaudeHome::user(&self.home),
+            home: match spec.agent {
+                AgentKind::Claude => AgentHome::Claude(ClaudeHome::user(&self.home)),
+                AgentKind::Pi => AgentHome::Pi(crate::PiHome::user(
+                    crate::pi::own_dir(&self.home),
+                    &spec.worktree,
+                )),
+            },
             session: None,
         };
         let agent = self.agent(&h);
@@ -922,7 +957,8 @@ impl Compartment for Cgroups {
             self.runs.fetch_add(1, Ordering::SeqCst)
         );
         let argv = self.scope_command(&sd, &unit, &limits, &r.argv);
-        let out = native::run(
+        let out = native::run_for(
+            h,
             &Run {
                 argv,
                 env: r.env.clone(),
@@ -937,9 +973,21 @@ impl Compartment for Cgroups {
         Ok(out)
     }
 
+    fn pi_auth_check(
+        &self,
+        h: &Handle,
+        env: &[(String, String)],
+        model: &str,
+    ) -> Option<crate::pi::AuthCheck> {
+        native::pi_auth_check(&self.pi().ok()?, h, env, self.env(), model)
+    }
+
     fn launch(&self, h: &Handle, launch: &Launch) -> Result<TerminalEnd> {
         let sd = self.systemd()?;
-        let claude = self.claude()?;
+        let program = match launch.agent {
+            AgentKind::Claude => self.claude()?,
+            AgentKind::Pi => self.pi()?,
+        };
         let unit = self.unit(&h.agent_ref);
         let cg = self.cgroup_of(&sd, &unit);
         let agent = self.agent(h);
@@ -956,11 +1004,12 @@ impl Compartment for Cgroups {
             }
         }
         let limits = Cgroups::limits_of(&st);
-        let mut command = vec![claude.to_string_lossy().into_owned()];
-        command.extend(launch.args.iter().cloned());
+        let native::AgentCommand {
+            command,
+            env,
+            clean_env,
+        } = native::agent_command(&program, h, launch, self.env())?;
         let command = self.scope_command(&sd, &unit, &limits, &command);
-        let mut env = self.env();
-        env.extend(launch.env.iter().cloned());
         // A new launch runs: nothing of an old pause or sleep holds.
         agent.set_mode(&mut st, Mode::Running);
         st.warnings.clear();
@@ -970,6 +1019,7 @@ impl Compartment for Cgroups {
             command,
             cwd: launch.cwd.clone(),
             env,
+            clean_env,
         })
     }
 
@@ -1020,9 +1070,9 @@ impl Compartment for Cgroups {
     /// of its worktree.
     fn delete(&self, h: &Handle) -> Result<()> {
         self.stop(h)?;
-        h.claude
+        h.home
             .forget(&h.worktree)
-            .map_err(|e| EnvError::new(format!("can't remove Claude's state: {e}")))?;
+            .map_err(|e| EnvError::new(format!("can't remove its agent's state: {e}")))?;
         let gone = |r: io::Result<()>, what: &Path| match r {
             Err(e) if e.kind() != io::ErrorKind::NotFound => Err(EnvError::new(format!(
                 "can't remove {}: {e}",
@@ -1553,7 +1603,7 @@ mod tests {
             agent_ref: "a".into(),
             agent_dir: dir.path().to_owned(),
             worktree: dir.path().to_owned(),
-            claude: ClaudeHome::user(dir.path()),
+            home: AgentHome::Claude(ClaudeHome::user(dir.path())),
             session: None,
         };
         let agent = Agent::new(&h);

@@ -121,7 +121,7 @@ mod tests {
     fn hello(path: &Path) -> Result<vibe_core::rpc::HelloResult, ClientError> {
         let params = HelloParams {
             client: "t".into(),
-            protocol: 1,
+            protocol: vibe_core::rpc::PROTOCOL_VERSION,
         };
         call::<Hello>(path, &params, Duration::from_secs(10))
     }
@@ -129,7 +129,7 @@ mod tests {
     #[test]
     fn decodes_a_result() {
         let (_d, p) = fake(
-            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"daemon\":\"vibed\",\"version\":\"1\",\"protocol\":1,\"os\":\"linux\",\"arch\":\"x86_64\",\"pid\":5}}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"daemon\":\"vibed\",\"version\":\"1\",\"protocol\":2,\"os\":\"linux\",\"arch\":\"x86_64\",\"pid\":5}}\n",
         );
         assert_eq!(hello(&p).unwrap().pid, 5);
     }

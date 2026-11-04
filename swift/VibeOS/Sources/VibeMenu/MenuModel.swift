@@ -524,7 +524,7 @@ public final class MenuModel: ObservableObject {
         case .lagged:
             settingsRevision += 1
             await refresh()
-        case .projectAdded, .projectRemoved, .profilesChanged, .limitsChanged, .keysChanged:
+        case .projectAdded, .projectRemoved, .profilesChanged, .limitsChanged, .keysChanged, .piChanged:
             settingsRevision += 1
         case .toolboxChanged:
             set(\.toolbox, (try? await call(ToolboxStatusGet.self, NoParams())) ?? toolbox)

@@ -1,0 +1,39 @@
+{
+  "description": "Back to Claude: the mode goes back to auto rather than keeping Pi's bypass, and its Pi model goes. And so to Pi again. On the Mac a Pi profile needs mode bypass said in the same call: Pi never asks, and macos has no file sandbox.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 153,
+    "method": "profiles.update",
+    "params": {
+      "project": "app",
+      "profile": "pi-linux",
+      "agent": "claude",
+      "environment": "macos"
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 153,
+    "result": {
+      "environment": "macos",
+      "memory": 4294967296,
+      "mode": "auto",
+      "model": "opus",
+      "name": "pi-linux",
+      "reasoning": "high"
+    }
+  },
+  "events": [
+    {
+      "jsonrpc": "2.0",
+      "method": "events.event",
+      "params": {
+        "at": "2026-10-30T12:00:00Z",
+        "host": "local",
+        "kind": "profiles.changed",
+        "project": "app",
+        "seq": 32
+      }
+    }
+  ]
+}

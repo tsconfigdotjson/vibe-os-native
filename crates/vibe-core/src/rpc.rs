@@ -17,14 +17,15 @@ use serde_json::Value;
 
 pub use crate::limits::HostLimits;
 pub use crate::model::{
-    Activity, AgentState, Certainty, CheckId, CheckState, Environment, EventKind, GhState,
-    HostLink, LoginTool, MessageRole, Mode, Model, Profile, ProjectSource, Reasoning, ServiceRole,
-    ServiceState, SessionState, StopReason, ToolboxAction, ToolboxState, TunnelState, WakeupKind,
+    Activity, AgentKind, AgentState, Certainty, CheckId, CheckState, Environment, EventKind,
+    GhState, HostLink, LoginTool, MessageRole, Mode, Model, PiTarget, Profile, ProjectSource,
+    Reasoning, ServiceRole, ServiceState, SessionState, StopReason, ToolboxAction, ToolboxState,
+    TunnelState, WakeupKind,
 };
 
 /// Bumped on any incompatible change to the contract. Clients send theirs in
 /// `daemon.hello`, and the daemon refuses a mismatch.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// The longest message, newline excluded, either side accepts.
 pub const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
@@ -378,6 +379,8 @@ pub const METHODS: &[&str] = &[
     ToolboxRebuild::NAME,
     ToolboxLoginsGet::NAME,
     ToolboxClose::NAME,
+    PiStatusGet::NAME,
+    PiInstall::NAME,
     DoctorCheckGet::NAME,
     DoctorFix::NAME,
     ServicesList::NAME,
@@ -613,8 +616,8 @@ method! {
     /// disk to spare and room under `max_awake_agents` (never memory: an
     /// agent's memory is its ceiling, not a reservation); creates the
     /// compartment; runs `.vibe/setup.sh` there if the
-    /// worktree has one; pre-fills Claude's state; and starts Claude on the
-    /// prompt in a session of its own.
+    /// worktree has one; pre-fills its coding agent's state; and starts that on
+    /// the prompt in a session of its own.
     AgentsStart = "agents.start", AgentStartParams => Agent
 }
 
@@ -684,6 +687,24 @@ method! {
     /// already closed is left as it is, so calling it twice is harmless; one
     /// busy updating or rebuilding is refused.
     ToolboxClose = "toolbox.close", NoParams => ToolboxStatus
+}
+
+method! {
+    /// `pi.status`: Pi's install on a host and the providers it's signed in
+    /// to, by name: never what they hold (PRD: Who gets which credentials).
+    /// Reads only what's on disk, and asks `pi` its version. Never changes
+    /// anything.
+    PiStatusGet = "pi.status", HostParams => PiStatus
+}
+
+method! {
+    /// `pi.install`: downloads the newest Pi, checked against its release's
+    /// checksums, and gives the status after: `native` for the `pi` this
+    /// host's native agents run (linked at `~/.local/bin/pi`, never over one
+    /// that isn't VibeOS's), or on a Mac `vm` for the layer `linux` agents
+    /// boot. It takes as long as the download does, and one runs at a time. A
+    /// `pi.changed` event tells other clients, with `message` if it failed.
+    PiInstall = "pi.install", PiInstallParams => PiStatus
 }
 
 method! {
@@ -1008,6 +1029,12 @@ pub struct ProfileCreateParams {
     /// `false`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shared_services: Option<bool>,
+    /// Which coding agent it runs; Claude unless it says.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<AgentKind>,
+    /// A Pi profile's model, as `provider/id`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pi_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1036,6 +1063,15 @@ pub struct ProfileUpdateParams {
     /// here on.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shared_services: Option<bool>,
+    /// Another coding agent for it. Pi's mode is always `bypass`; going back
+    /// to Claude goes back to `auto` unless `mode` says otherwise, and forgets
+    /// its Pi model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<AgentKind>,
+    /// A Pi profile's model, as `provider/id`; empty clears it, for Pi's own
+    /// default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pi_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1279,7 +1315,7 @@ pub struct AgentStartParams {
     pub project: String,
     /// The project's profile to start it from.
     pub profile: String,
-    /// What Claude starts on, given as an argument.
+    /// What the agent starts on, given as an argument.
     pub prompt: String,
     /// The branch (or any commit) to cut the agent's branch from; by
     /// default `origin`'s default branch, or the project's `HEAD` when it
@@ -1314,7 +1350,7 @@ pub struct AgentParams {
     pub agent: String,
 }
 
-/// An agent: one Claude Code in its own worktree and compartment.
+/// An agent: one Claude Code or Pi in its own worktree and compartment.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Agent {
     pub host: String,
@@ -1324,12 +1360,19 @@ pub struct Agent {
     /// The profile it was started from. Its settings were copied at the
     /// start, so editing the profile changes only later agents.
     pub profile: String,
+    /// Which coding agent it runs; left out for Claude.
+    #[serde(
+        rename = "agent",
+        default,
+        skip_serializing_if = "AgentKind::is_claude"
+    )]
+    pub kind: AgentKind,
     pub environment: Environment,
     pub state: AgentState,
     /// The worktree's absolute path, the same in every environment.
     pub worktree: String,
     pub branch: String,
-    /// Claude Code's `--session-id`, which names its transcript.
+    /// The `--session-id` it was started with, which names its transcript.
     pub session_id: String,
     pub created_at: String,
     /// The command that attaches a terminal to it.
@@ -1342,6 +1385,60 @@ pub struct Agent {
     pub memory_used: Option<u64>,
     /// What its transcript says it's doing.
     pub status: AgentStatus,
+}
+
+/// A `pi` a host's agents can run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PiBinary {
+    pub path: String,
+    pub version: String,
+    /// Whether it's the one `pi.install` put there, which it can update. One
+    /// that isn't is the owner's own, which it leaves alone.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub managed: bool,
+}
+
+/// The Pi layer `linux` agents boot on a Mac, and the login they share.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PiVms {
+    /// Pi's version in the newest layer, once there is one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// The providers `linux` agents are signed in to, by name: the store each
+    /// VM's private copy is kept in step with.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub logins: Vec<String>,
+    /// Why the layer couldn't be had when it was last tried in the background.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// What needs the owner's eye about those logins: what's wrong with an
+    /// agent's copy, and what agents have done with a login.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub alerts: Vec<String>,
+}
+
+/// Pi on one host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PiStatus {
+    pub host: String,
+    /// The `pi` this host's native agents run: `macos` agents on a Mac, every
+    /// agent on a Linux host. None if it has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native: Option<PiBinary>,
+    /// The providers the owner's own `~/.pi/agent` is signed in to, by name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub logins: Vec<String>,
+    /// On a Mac: what `linux` agents, in their VMs, have.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vms: Option<PiVms>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PiInstallParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    pub target: PiTarget,
 }
 
 /// What an agent's transcript says it's doing, from agent-tail (PRD:

@@ -9,12 +9,13 @@ use vibe_core::rpc::{
     AgentsSend, AgentsStart, DoctorCheckGet, DoctorFix, ErrorCode, ErrorObject, Event,
     EventsSubscribe, GhStatusGet, Hello, HelloParams, HelloResult, HostsAdd, HostsExternal,
     HostsList, HostsRemove, HostsUpgrade, Id, KeysCreate, KeysList, KeysRevoke, KeysSync,
-    KeysVerify, LimitsGet, LimitsSet, McpGet, McpSet, Method, PROTOCOL_VERSION, ProfilesCreate,
-    ProfilesDelete, ProfilesList, ProfilesUpdate, ProjectsAdd, ProjectsList, ProjectsRemove,
-    ProtocolMismatchData, Request, Response, ServicesAudit, ServicesComplete, ServicesConnect,
-    ServicesDisconnect, ServicesFollow, ServicesList, ServicesOverview, ServicesSet, ServicesToken,
-    SessionsAttach, SessionsList, Subscribed, ToolboxClose, ToolboxLoginsGet, ToolboxOpen,
-    ToolboxRebuild, ToolboxStatusGet, ToolboxUpdate, TunnelPrepare,
+    KeysVerify, LimitsGet, LimitsSet, McpGet, McpSet, Method, PROTOCOL_VERSION, PiInstall,
+    PiStatusGet, ProfilesCreate, ProfilesDelete, ProfilesList, ProfilesUpdate, ProjectsAdd,
+    ProjectsList, ProjectsRemove, ProtocolMismatchData, Request, Response, ServicesAudit,
+    ServicesComplete, ServicesConnect, ServicesDisconnect, ServicesFollow, ServicesList,
+    ServicesOverview, ServicesSet, ServicesToken, SessionsAttach, SessionsList, Subscribed,
+    ToolboxClose, ToolboxLoginsGet, ToolboxOpen, ToolboxRebuild, ToolboxStatusGet, ToolboxUpdate,
+    TunnelPrepare,
 };
 
 use crate::core::Core;
@@ -278,6 +279,8 @@ async fn call(
             core.toolbox_logins(decode::<ToolboxLoginsGet>(params)?)
                 .await,
         ),
+        PiStatusGet::NAME => encode_result(core.pi_status(decode::<PiStatusGet>(params)?).await),
+        PiInstall::NAME => encode_result(core.pi_install(decode::<PiInstall>(params)?).await),
         DoctorCheckGet::NAME => {
             decode::<DoctorCheckGet>(params)?;
             encode_result(Ok(core.doctor().await))
@@ -428,12 +431,12 @@ mod tests {
     #[test]
     fn hello_reports_the_daemon() {
         let r = reply(
-            r#"{"jsonrpc":"2.0","id":1,"method":"daemon.hello","params":{"client":"t","protocol":1}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"daemon.hello","params":{"client":"t","protocol":2}}"#,
         );
         assert_eq!(
             r,
             Some(json!({"jsonrpc": "2.0", "id": 1, "result": {
-                "daemon": "vibed", "version": "9.9.9", "protocol": 1,
+                "daemon": "vibed", "version": "9.9.9", "protocol": 2,
                 "os": "linux", "arch": "x86_64", "pid": 1}}))
         );
     }
@@ -456,7 +459,7 @@ mod tests {
 
     #[test]
     fn unknown_param_fields_are_invalid_params() {
-        let r = reply(r#"{"jsonrpc":"2.0","id":1,"method":"daemon.hello","params":{"client":"t","protocol":1,"x":0}}"#)
+        let r = reply(r#"{"jsonrpc":"2.0","id":1,"method":"daemon.hello","params":{"client":"t","protocol":2,"x":0}}"#)
             .unwrap();
         assert_eq!(r["error"]["code"], -32602);
     }
@@ -532,7 +535,7 @@ mod tests {
             .unwrap();
         let hello = |client: &str| {
             format!(
-                r#"{{"jsonrpc":"2.0","id":1,"method":"daemon.hello","params":{{"client":"{client}","protocol":1}}}}"#
+                r#"{{"jsonrpc":"2.0","id":1,"method":"daemon.hello","params":{{"client":"{client}","protocol":2}}}}"#
             )
         };
         for (client, limit) in [

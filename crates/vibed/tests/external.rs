@@ -1105,6 +1105,8 @@ fn legacy_agent(home: &Path, os: &str, agent_ref: &str) {
             compartment: "{}".into(),
             starting: false,
             shared_services: true,
+            agent: Default::default(),
+            pi_model: None,
         })
         .unwrap();
 }

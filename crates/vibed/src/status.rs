@@ -1,5 +1,5 @@
 //! The status engine in `vibed`: one [`Tail`] per agent, on the transcript
-//! Claude writes in the agent's Claude home (PRD: State and lifecycle,
+//! its coding agent writes, in its Claude home or Pi's sessions (PRD: State and lifecycle,
 //! Matching an agent to its transcript). Only those transcripts are read,
 //! never a scan of the whole home.
 //!
@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use tokio::io::unix::AsyncFd;
 use vibe_core::limits::{self, HostLimits};
-use vibe_core::model::{AgentState, EventKind, LOCAL_HOST};
+use vibe_core::model::{AgentKind, AgentState, EventKind, LOCAL_HOST};
 use vibe_core::rpc::{self, ErrorObject};
 use vibe_core::store::AgentRecord;
 use vibe_status::{Mark, POLL_EVERY, Status, Tail, Timestamp, Watcher};
@@ -27,6 +27,40 @@ use crate::core::{Core, lock, store_error};
 /// How long after a file-system event the transcripts are read, so a burst
 /// of writes is read once.
 const SETTLE: Duration = Duration::from_millis(50);
+
+/// How long a Pi with nothing to show for itself has written nothing before its
+/// screen is read for why.
+const PI_SCREEN_AFTER: Duration = Duration::from_secs(3);
+
+/// Beside a Pi agent's other files: when it was launched with nothing to do.
+const PI_AT_REST: &str = "pi-at-rest";
+
+/// This machine's clock, which is what a transcript's file time is by.
+pub(crate) fn wall_clock() -> Timestamp {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    Timestamp::from_secs_f64(now.as_secs_f64())
+}
+
+/// Notes that a Pi agent was just launched `at_rest` with nothing to do, or not.
+/// Pi writes nothing on a resume, so a turn the transcript left open stays open
+/// there; this says it's over ([`Status::at_rest_since`]). In a file, for a
+/// `vibed` that restarts and reads the transcript afresh.
+pub(crate) fn note_pi_at_rest(handle: &vibe_env::Handle, at_rest: bool) {
+    let path = handle.agent_dir.join(PI_AT_REST);
+    let done = if at_rest {
+        std::fs::write(&path, wall_clock().as_secs_f64().to_string())
+    } else {
+        match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
+    };
+    if let Err(e) = done {
+        crate::log!("vibed: can't note {}: {e}", path.display());
+    }
+}
 
 impl Core {
     fn now_ts(&self) -> Timestamp {
@@ -46,15 +80,82 @@ impl Core {
     /// it was last read is read first. If a `/clear` moved it to another
     /// session, the agent's record follows, so a resume continues that one.
     pub(crate) async fn agent_status(&self, a: &mut AgentRecord, debounce: Duration) -> Status {
-        self.with_tail(a, debounce, |t, now| t.status(now))
+        let status = self
+            .with_tail(a, debounce, |t, now| t.status(now))
             .await
-            .unwrap_or_else(Status::unknown)
+            .unwrap_or_else(Status::unknown);
+        if a.agent == AgentKind::Pi {
+            self.pi_read_status(a, debounce, status).await.0
+        } else {
+            status
+        }
+    }
+
+    /// When the last thing typed to `a` was, if its transcript has shown nothing
+    /// of it since. Any later turn fails as a first one does: an answered agent
+    /// reads as done, and goes on reading so.
+    async fn pi_unanswered_send(
+        &self,
+        a: &mut AgentRecord,
+        debounce: Duration,
+    ) -> Option<Timestamp> {
+        let at = *lock(&self.pi_sent_at).get(&a.agent_ref)?;
+        let mark = lock(&self.sends).get(&a.agent_ref).cloned()?;
+        let moved = self
+            .with_tail(a, debounce, move |t, _| t.moved_since(&mark))
+            .await?;
+        (!moved).then_some(at)
+    }
+
+    /// What a Pi's transcript can't say, and whether the screen had to say it.
+    /// It writes nothing on a resume, so a turn left open from before stays open
+    /// there. And a turn that fails before it starts, for want of a login, writes
+    /// nothing and shows only on its screen. Either would read as it did before:
+    /// busy for ever, or a send that never got an answer.
+    pub(crate) async fn pi_read_status(
+        &self,
+        a: &mut AgentRecord,
+        debounce: Duration,
+        status: Status,
+    ) -> (Status, bool) {
+        let sent = self.pi_unanswered_send(a, debounce).await;
+        if !status.open_turn() && sent.is_none() {
+            return (status, false);
+        }
+        let Ok(handle) = Core::handle_of(a) else {
+            return (status, false);
+        };
+        let at_rest = std::fs::read_to_string(handle.agent_dir.join(PI_AT_REST))
+            .ok()
+            .and_then(|t| t.trim().parse::<f64>().ok())
+            .map(Timestamp::from_secs_f64);
+        let status = match at_rest {
+            Some(at) => status.at_rest_since(at),
+            None => status,
+        };
+        let now = wall_clock();
+        let look = match sent {
+            Some(at) => now.as_secs_f64() - at.as_secs_f64() >= PI_SCREEN_AFTER.as_secs_f64(),
+            None => status.pi_may_have_failed(now, PI_SCREEN_AFTER),
+        };
+        if !look {
+            return (status, false);
+        }
+        let socket = self.layout.session_socket(&a.agent_ref);
+        let screen = tokio::task::spawn_blocking(move || crate::talk::screen_now(&socket))
+            .await
+            .ok()
+            .and_then(Result::ok);
+        match screen.and_then(|o| vibe_status::pi_error_on_screen(&o.screen)) {
+            Some(error) => (status.failed_on_screen(error), true),
+            None => (status, false),
+        }
     }
 
     /// Reads `a`'s transcript up to now, then runs `f` on its tail. Each
     /// agent's tail has a lock of its own, and is read on the blocking
     /// pool: the first read after a restart is the whole transcript. None
-    /// until its compartment's handle, which says where its Claude home is,
+    /// until its compartment's handle, which says where its transcripts are,
     /// is written.
     pub(crate) async fn with_tail<T: Send + 'static>(
         &self,
@@ -62,14 +163,15 @@ impl Core {
         debounce: Duration,
         f: impl FnOnce(&Tail, Timestamp) -> T + Send + 'static,
     ) -> Option<T> {
-        let claude = Core::handle_of(a).ok()?.claude;
+        let home = Core::handle_of(a).ok()?.home;
         let worktree = PathBuf::from(&a.worktree);
         let tail = Arc::clone(
             lock(&self.tails)
                 .entry(a.agent_ref.clone())
                 .or_insert_with(|| {
-                    Arc::new(Mutex::new(Tail::new(
-                        claude.project_dir(&worktree),
+                    Arc::new(Mutex::new(Tail::of(
+                        a.agent,
+                        home.transcripts_dir(&worktree),
                         &worktree,
                         &a.session_id,
                         debounce,
@@ -81,7 +183,7 @@ impl Core {
             let mut t = lock(&tail);
             if t.transcript().is_none() {
                 // Claude's directory for a long path is known once it's made.
-                t.set_project_dir(claude.project_dir(&worktree));
+                t.set_project_dir(home.transcripts_dir(&worktree));
             }
             t.set_idle_debounce(debounce);
             t.poll();
@@ -206,6 +308,7 @@ impl Core {
         let refs: HashSet<&str> = records.iter().map(|a| a.agent_ref.as_str()).collect();
         lock(&self.tails).retain(|r, _| refs.contains(r.as_str()));
         lock(&self.sends).retain(|r, _| refs.contains(r.as_str()));
+        lock(&self.pi_sent_at).retain(|r, _| refs.contains(r.as_str()));
         published.retain(|r, _| refs.contains(r.as_str()));
         let debounce = self.idle_debounce();
         let mut paths = Vec::new();

@@ -1,0 +1,42 @@
+{
+  "description": "A profile that runs Pi. In linux it needs no mode, since Pi never asks before a tool runs: it's always bypass. Without pi_model, Pi uses what its own settings and logins give.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 152,
+    "method": "profiles.create",
+    "params": {
+      "project": "app",
+      "name": "pi-linux",
+      "agent": "pi",
+      "pi_model": "openai/gpt-5",
+      "reasoning": "high"
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 152,
+    "result": {
+      "agent": "pi",
+      "environment": "linux",
+      "memory": 4294967296,
+      "mode": "bypass",
+      "model": "opus",
+      "name": "pi-linux",
+      "pi_model": "openai/gpt-5",
+      "reasoning": "high"
+    }
+  },
+  "events": [
+    {
+      "jsonrpc": "2.0",
+      "method": "events.event",
+      "params": {
+        "at": "2026-10-30T12:00:00Z",
+        "host": "local",
+        "kind": "profiles.changed",
+        "project": "app",
+        "seq": 31
+      }
+    }
+  ]
+}

@@ -104,7 +104,7 @@ struct NewAgentView: View {
 
             HStack {
                 if starting {
-                    Working(text: "Cutting a worktree, then starting Claude…")
+                    Working(text: "Cutting a worktree, then starting \(chosen?.kind.title ?? "the agent")…")
                 }
                 Spacer()
                 Button("Cancel") { dismissWindow(id: WindowID.newAgent) }
@@ -209,7 +209,10 @@ struct ProfileSummary: View {
                 Label("acts as you", systemImage: "exclamationmark.shield")
                     .font(.subheadline)
                     .foregroundStyle(Palette.attention)
-                    .help("Bypass skips every permission prompt, and a macOS agent acts as you.")
+                    .help(
+                        profile.kind == .pi
+                            ? "Pi never asks before running a tool, and a macOS agent acts as you."
+                            : "Bypass skips every permission prompt, and a macOS agent acts as you.")
             }
         }
         .accessibilityElement(children: .combine)

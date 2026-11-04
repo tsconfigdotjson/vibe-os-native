@@ -19,3 +19,17 @@ where they were captured and redacted. agent-tail is MIT licensed, copyright
 To keep them small, strings longer than 4 KB are cut to their first 4 KB,
 as agent-tail's lean parse does before reading them anyway; nothing else is
 changed. `tests/fixtures.rs` replays each one a few lines at a time.
+
+# Recorded Pi sessions
+
+`pi/*.jsonl` are real Pi 1.4.0 sessions, copied from agent-tail's fixture
+corpus at the same commit (`fixtures/pi/1.4/linux/<scenario>/input/session.jsonl`),
+where they were captured and redacted.
+
+| File | agent-tail scenario | What it is |
+| --- | --- | --- |
+| `plain-qa.jsonl` | `plain-qa` | A prompt and its answer |
+| `tool-call.jsonl` | `tool-call` | A tool call, its result and the answer |
+| `api-error.jsonl` | `api-error` | A turn that stopped at an API error |
+| `interrupted.jsonl` | `interrupted` | A turn the owner interrupted |
+| `usage-limit.jsonl` | `ci-pi_usage_limit` | A 429 usage-limit stop |

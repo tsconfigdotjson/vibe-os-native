@@ -14,7 +14,7 @@ import Testing
         #expect(
             try EventConnection.message(
                 from: line(
-                    #"{"jsonrpc":"2.0","id":"hello","result":{"daemon":"vibed","version":"0.1.0","protocol":1,"os":"macos","arch":"aarch64","pid":1}}"#
+                    #"{"jsonrpc":"2.0","id":"hello","result":{"daemon":"vibed","version":"0.1.0","protocol":2,"os":"macos","arch":"aarch64","pid":1}}"#
                 )) == nil)
         let event = try EventConnection.message(
             from: line(
