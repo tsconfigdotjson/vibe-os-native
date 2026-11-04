@@ -78,6 +78,23 @@ pub fn lock_path(socket: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// Whether a process holds the lock beside `socket`, as whatever's serving it
+/// does. If that can't be told, it's taken as held, so nothing is removed or
+/// replaced on a guess.
+pub fn lock_held(socket: &Path) -> bool {
+    let lock = match OpenOptions::new().write(true).open(lock_path(socket)) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return false,
+        Err(_) => return true,
+    };
+    match lock.try_lock() {
+        // Released as `lock` drops.
+        Ok(()) => false,
+        Err(TryLockError::WouldBlock) => true,
+        Err(TryLockError::Error(_)) => true,
+    }
+}
+
 /// Binds the socket at `path`, readable and writable only by this user.
 ///
 /// The directory is created `0700` if missing, and refused if it's open to

@@ -57,30 +57,10 @@ pub async fn probe(socket: &Path) -> Probe {
         Ok(Err(e)) => e.to_string(),
         Err(_) => format!("no answer in {}s", PROBE_TIMEOUT.as_secs()),
     };
-    if !socket.exists() || !lock_held(socket) {
+    if !socket.exists() || !socket::lock_held(socket) {
         Probe::Gone
     } else {
         Probe::Broken(why)
-    }
-}
-
-/// Whether a process holds the lock beside `socket`, as a running shim
-/// does. If that can't be told, it's taken as held, so nothing is removed
-/// on a guess.
-fn lock_held(socket: &Path) -> bool {
-    let lock = match OpenOptions::new()
-        .write(true)
-        .open(socket::lock_path(socket))
-    {
-        Ok(f) => f,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return false,
-        Err(_) => return true,
-    };
-    match lock.try_lock() {
-        // Released as `lock` drops.
-        Ok(()) => false,
-        Err(TryLockError::WouldBlock) => true,
-        Err(TryLockError::Error(_)) => true,
     }
 }
 
@@ -521,7 +501,7 @@ mod tests {
         // assumed the moment `held` drops.
         drop(held);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        while lock_held(&other) {
+        while socket::lock_held(&other) {
             assert!(
                 tokio::time::Instant::now() < deadline,
                 "the lock stayed held after it was let go"
@@ -532,7 +512,7 @@ mod tests {
         assert!(
             matches!(after, Probe::Gone),
             "{after:?} with its lock let go; lock_held says {}",
-            lock_held(&other)
+            socket::lock_held(&other)
         );
 
         // A stale socket whose lock a shim holds as it starts is left be.

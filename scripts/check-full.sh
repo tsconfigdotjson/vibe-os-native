@@ -324,6 +324,23 @@ stop_vibed() {
   [ ! -e "$VIBED_SOCKET" ] || { echo "vibed left $VIBED_SOCKET behind"; return 1; }
 }
 
+# left_behind <run> <dir>...: what's in these folders, and in <run> if it's a
+# run/. The shared services' socket isn't an agent's: it's vibed's own, there for
+# as long as vibed is, for agents yet to start. So it's the one thing a running
+# vibed may have there, and has to.
+left_behind() {
+  local run=$1
+  shift
+  [ -S "$run/.services.sock" ] || echo "no $run/.services.sock while vibed is up"
+  find "$@" "$run" -mindepth 1 \
+    ! -path "$run/.services.sock" ! -path "$run/.services.sock.lock" 2>/dev/null
+}
+
+# services_socket_gone <run>: vibed takes it with it, and only its lock stays.
+services_socket_gone() {
+  [ ! -e "$1/.services.sock" ] || { echo "vibed left $1/.services.sock behind"; return 1; }
+}
+
 # wait_for <file> <text>: up to 20 s for <text> to appear in <file>.
 wait_for() {
   local i
@@ -412,11 +429,15 @@ STUB
 }
 
 s_smoke() {
-  local log="$WORK/smoke-vibed.log" out
+  local log="$WORK/smoke-vibed.log" out protocol
   start_vibed "$WORK/smoke/run/vibed.sock" "$log"
-  target/debug/vibe --socket "$VIBED_SOCKET" hello
+  out=$(target/debug/vibe --socket "$VIBED_SOCKET" hello)
+  echo "$out"
+  # What this build speaks, so a protocol bump can't leave this behind.
+  protocol=$(printf '%s\n' "$out" | sed -n 's/.* protocol \([0-9][0-9]*\) .*/\1/p')
+  [ -n "$protocol" ] || { echo "vibe hello gave no protocol"; return 1; }
   out=$(printf '%s\n' \
-    '{"jsonrpc":"2.0","id":1,"method":"daemon.hello","params":{"client":"check-full","protocol":1}}' \
+    '{"jsonrpc":"2.0","id":1,"method":"daemon.hello","params":{"client":"check-full","protocol":'"$protocol"'}}' \
     | target/debug/vibe --socket "$VIBED_SOCKET" rpc)
   echo "vibe rpc: $out"
   case $out in *'"daemon":"vibed"'*) ;; *) echo "vibe rpc gave no hello result"; return 1 ;; esac
@@ -621,11 +642,12 @@ s_agents() {
   [ ! -e "$worktree" ] || { echo "the worktree is left"; return 1; }
   [ ! -e "$home/VibeOS/agents/$ref" ] || { echo "its directory is left"; return 1; }
   # Nothing of it in VibeOS's folders, nor a socket or lock in run/.
-  left=$(find "$home/VibeOS/worktrees" "$home/VibeOS/agents" "$run" -mindepth 1 2>/dev/null)
+  left=$(left_behind "$run" "$home/VibeOS/worktrees" "$home/VibeOS/agents")
   [ -z "$left" ] || { echo "left behind: $left"; return 1; }
   git -C "$repo" rev-parse --verify --quiet "refs/heads/$ref" >/dev/null || { echo "the branch went"; return 1; }
   git -C "$origin" rev-parse --verify --quiet "refs/heads/$ref" >/dev/null || { echo "the push didn't land"; return 1; }
   stop_vibed
+  services_socket_gone "$run"
 }
 
 # mcp_call <id> <json> <text>: sends a request down the bridge, waits for
@@ -846,10 +868,11 @@ s_macos_agents() {
   [ ! -e "$worktree" ] || { echo "the worktree is left"; return 1; }
   [ ! -e "$(dirname "$transcript")" ] || { echo "its transcripts are left"; return 1; }
   if grep -q "$worktree" "$home/.claude.json"; then echo "Claude still trusts its worktree"; return 1; fi
-  left=$(find "$home/VibeOS/worktrees" "$home/VibeOS/agents" "$run" "$home/.claude/projects" -mindepth 1 2>/dev/null)
+  left=$(left_behind "$run" "$home/VibeOS/worktrees" "$home/VibeOS/agents" "$home/.claude/projects")
   [ -z "$left" ] || { echo "left behind: $left"; return 1; }
   git -C "$repo" rev-parse --verify --quiet "refs/heads/$ref" >/dev/null || { echo "the branch went"; return 1; }
   stop_vibed
+  services_socket_gone "$run"
 }
 
 s_swift_app_build() { swift build --package-path swift/VibeOS; }

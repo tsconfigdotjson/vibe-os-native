@@ -7,7 +7,7 @@ mod common;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -70,6 +70,16 @@ fn hello(socket: &Path) -> Value {
     )
 }
 
+/// `hello`, once the socket's there.
+fn hello_when_up(socket: &Path) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while UnixStream::connect(socket).is_err() {
+        assert!(Instant::now() < deadline, "vibed didn't start");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    hello(socket)
+}
+
 fn stop(mut d: Daemon) -> String {
     sigterm(&d.child);
     let out = d.child.wait().unwrap();
@@ -113,12 +123,36 @@ fn serves_hello_and_stops_cleanly_on_sigterm() {
     assert!(stderr.contains("vibed: stopped"), "{stderr}");
 }
 
+/// How `cmd` ends, in time: a `vibed` that was meant to be refused and wasn't
+/// serves forever, which would hang `output()` and the whole run.
+fn refused_in_time(cmd: &mut Command) -> Output {
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let out = child.wait_with_output().unwrap();
+            panic!(
+                "a second vibed wasn't refused; it was still serving: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    child.wait_with_output().unwrap()
+}
+
 #[test]
 fn a_second_daemon_on_the_same_socket_is_refused() {
     let tmp = tempfile::tempdir().unwrap();
     let socket = socket_in(&tmp);
     let _first = spawn(&mut vibed(&tmp, &socket), &socket);
-    let out = vibed(&tmp, &socket).output().unwrap();
+    let out = refused_in_time(&mut vibed(&tmp, &socket));
     assert_eq!(out.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("already serving"), "{stderr}");
@@ -166,9 +200,8 @@ fn a_second_daemon_on_the_same_state_is_refused() {
     let socket = socket_in(&tmp);
     let _first = spawn(&mut vibed(&tmp, &socket), &socket);
     // Another socket, but the same $HOME.
-    let out = vibed(&tmp, &tmp.path().join("run2/vibed.sock"))
-        .output()
-        .unwrap();
+    let second = tmp.path().join("run2/vibed.sock");
+    let out = refused_in_time(&mut vibed(&tmp, &second));
     assert_eq!(out.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -176,6 +209,78 @@ fn a_second_daemon_on_the_same_state_is_refused() {
         "{stderr}"
     );
     assert_eq!(hello(&socket)["result"]["daemon"], "vibed");
+    // Refused before it bound anything, with nothing to connect to, ever.
+    assert!(
+        !second.parent().unwrap().exists(),
+        "it made {}",
+        second.parent().unwrap().display()
+    );
+}
+
+/// The shared services' socket is `vibed`'s own, not any agent's: it's there for
+/// as long as `vibed` is, for agents yet to start, and goes when it stops. Only
+/// its lock stays, as `vibed.sock`'s does.
+#[test]
+fn the_services_socket_lasts_as_long_as_vibed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = socket_in(&tmp);
+    let d = spawn(&mut vibed(&tmp, &socket), &socket);
+    let run = Layout::new(&tmp.path().join("home"), std::env::consts::OS).run_dir();
+    let services = run.join(".services.sock");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while UnixStream::connect(&services).is_err() {
+        assert!(Instant::now() < deadline, "it never served {services:?}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    stop(d);
+    assert!(!services.exists(), "{services:?} outlived vibed");
+    let left: Vec<_> = std::fs::read_dir(&run)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name != ".services.sock.lock")
+        .collect();
+    assert_eq!(left, Vec::<String>::new());
+}
+
+/// As soon as its socket answers, a `vibed` holds the state: two started at once
+/// can't each find the other's socket and go on to serve.
+#[test]
+fn two_daemons_started_together_leave_one() {
+    for _ in 0..3 {
+        let tmp = tempfile::tempdir().unwrap();
+        let (one, two) = (
+            tmp.path().join("one/vibed.sock"),
+            tmp.path().join("two/vibed.sock"),
+        );
+        let mut a = vibed(&tmp, &one).stderr(Stdio::piped()).spawn().unwrap();
+        let mut b = vibed(&tmp, &two).stderr(Stdio::piped()).spawn().unwrap();
+        // The refused one exits, once the lock has had its moment.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let (winner, mut alive, socket) = loop {
+            if a.try_wait().unwrap().is_some() {
+                break (&two, b, &one);
+            }
+            if b.try_wait().unwrap().is_some() {
+                break (&one, a, &two);
+            }
+            if Instant::now() >= deadline {
+                let _ = a.kill();
+                let _ = b.kill();
+                let _ = a.wait();
+                let _ = b.wait();
+                panic!("both are still serving");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(hello_when_up(winner)["result"]["daemon"], "vibed");
+        assert!(
+            !socket.exists(),
+            "the refused one left {}",
+            socket.display()
+        );
+        let _ = alive.kill();
+        let _ = alive.wait();
+    }
 }
 
 /// The ticket's "done when", through the real binary: add a project, list
