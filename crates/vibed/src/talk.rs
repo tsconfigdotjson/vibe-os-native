@@ -99,6 +99,10 @@ fn make_room_for_a_send(kept: &mut HashMap<String, KeptSend>) {
 const SETTLE: Duration = Duration::from_secs(1);
 const READY_WITHIN: Duration = Duration::from_secs(30);
 
+/// How long a Pi that's just started may hand a send back. Fetching its tools is
+/// the slowest it does: two downloads, each given up on after 10 s.
+const PI_STARTUP_WITHIN: Duration = Duration::from_secs(60);
+
 const PASTE_START: &str = "\x1b[200~";
 const PASTE_END: &str = "\x1b[201~";
 
@@ -366,9 +370,10 @@ impl Core {
             state,
             AgentState::Asleep | AgentState::Paused | AgentState::Exited
         );
+        let mut just_started = false;
         if woke {
             self.resume_agent(Some(&host), agent_ref).await?;
-            self.wait_started(agent_ref, &socket).await;
+            just_started = self.wait_started(agent_ref, &socket).await;
             crate::log!("vibed: {agent_ref} was {state}, and a send woke it");
             // Asleep or paused, it read as that; woken where it was, it may
             // be on a question. One resumed with `--resume` has lost any
@@ -384,7 +389,7 @@ impl Core {
             }
         }
         // Started moments ago, by a resume or a start that came before this.
-        self.wait_started(agent_ref, &socket).await;
+        just_started |= self.wait_started(agent_ref, &socket).await;
         // Where its transcript is now: the answer to this send is what
         // comes after. It's kept only once the send is in, so a send that
         // failed leaves the wait on the one before.
@@ -401,7 +406,8 @@ impl Core {
             })?;
         let chunks = chunks_of(&input, screen.bracketed_paste);
         typing_began.store(true, Ordering::SeqCst);
-        tokio::task::spawn_blocking(move || type_into(&socket, &chunks))
+        let s = socket.clone();
+        tokio::task::spawn_blocking(move || type_into(&s, &chunks))
             .await
             .map_err(|e| error(ErrorCode::InternalError, format!("Internal error: {e}")))?
             .map_err(|e| {
@@ -410,6 +416,14 @@ impl Core {
                     format!("{agent_ref} didn't take the send: {e}"),
                 )
             })?;
+        if just_started
+            && record.agent == vibe_core::model::AgentKind::Pi
+            && let Input::Text {
+                text, submit: true, ..
+            } = &input
+        {
+            see_pi_take(agent_ref, &socket, text).await?;
+        }
         // A delete may have run meanwhile: then there's nothing to wait on,
         // and a new agent by the same name mustn't inherit this mark.
         // Its debounce starts again from the send: Claude may not have
@@ -442,10 +456,14 @@ impl Core {
     /// until it's up: typed to before that, what's typed waits in a terminal that
     /// isn't raw yet, so its Enter arrives as a newline in the text and nothing is
     /// submitted. A frozen program thawed is where it was, and isn't waited for.
-    async fn wait_started(&self, agent_ref: &str, socket: &Path) {
+    async fn wait_started(&self, agent_ref: &str, socket: &Path) -> bool {
         let started = lock(&self.started_at).remove(agent_ref);
-        if let Some(left) = started.and_then(|at| READY_WITHIN.checked_sub(at.elapsed())) {
-            wait_ready(socket, left).await;
+        match started.and_then(|at| READY_WITHIN.checked_sub(at.elapsed())) {
+            Some(left) => {
+                wait_ready(socket, left).await;
+                true
+            }
+            None => false,
         }
     }
 
@@ -712,6 +730,46 @@ async fn wait_ready(socket: &Path, within: Duration) {
             _ => last = Some((out.screen, Instant::now())),
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Sees a Pi that's just started take what was sent. It can look ready, with its
+/// editor up, while its startup goes on, which can take a while if it's fetching
+/// its tools: until then it hands back whatever's submitted. So while the text's
+/// still in its editor, Enter is pressed again. Nothing's typed twice. If it never
+/// takes it, the send says so.
+async fn see_pi_take(agent_ref: &str, socket: &Path, text: &str) -> Result<(), ErrorObject> {
+    let begun = Instant::now();
+    loop {
+        tokio::time::sleep(SUBMIT_DELAY).await;
+        let s = socket.to_owned();
+        let Ok(Ok(out)) = tokio::task::spawn_blocking(move || screen_now(&s)).await else {
+            return Ok(());
+        };
+        if !vibe_status::pi_editor_holds(&out.screen, text) {
+            return Ok(());
+        }
+        if begun.elapsed() >= PI_STARTUP_WITHIN {
+            return Err(error(
+                ErrorCode::Conflict,
+                format!(
+                    "{agent_ref} is still starting after {}s, and hasn't taken that: it's in \
+                     its editor, to be submitted with [\"Enter\"]",
+                    PI_STARTUP_WITHIN.as_secs()
+                ),
+            ));
+        }
+        let s = socket.to_owned();
+        let enter = vec![(b"\r".to_vec(), Duration::ZERO)];
+        tokio::task::spawn_blocking(move || type_into(&s, &enter))
+            .await
+            .map_err(|e| error(ErrorCode::InternalError, format!("Internal error: {e}")))?
+            .map_err(|e| {
+                error(
+                    ErrorCode::CommandFailed,
+                    format!("{agent_ref} didn't take the send: {e}"),
+                )
+            })?;
     }
 }
 

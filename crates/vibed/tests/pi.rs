@@ -812,6 +812,64 @@ async fn a_first_sign_in_in_an_agent_is_told_to_the_owner() {
     w.delete(&a).await;
 }
 
+/// A real Pi can have its editor up and bracketed paste on while its startup goes
+/// on, and until then hands back what's submitted, saying so. This does that as
+/// the pinned Pi does, for its first 2 s.
+const PI_STILL_STARTING: &str = r#"#!/usr/bin/env python3
+import os, sys, time, tty
+got = sys.argv[0] + ".got"
+tty.setraw(0)
+rule = "\u2500" * 40
+begun = time.time()
+buf = ""
+def draw(note):
+    sys.stdout.write("\r\n%s\r\n\r\n%s\r\n%s\r\n\r\n%s\r\n" % (note, rule, buf, rule))
+    sys.stdout.flush()
+sys.stdout.write("\x1b[?2004h")
+draw("")
+while True:
+    data = os.read(0, 4096).decode().replace("\x1b[200~", "").replace("\x1b[201~", "")
+    for c in data:
+        if c != "\r":
+            buf += c
+        elif time.time() - begun < 2:
+            draw("Startup is still in progress")
+        elif buf:
+            with open(got, "a") as f:
+                f.write(buf + "\n")
+            buf = ""
+            draw("")
+"#;
+
+/// A send just after a start reaches a Pi still starting: it's pressed again until
+/// it's taken, once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_send_to_a_pi_still_starting_is_taken_in_the_end() {
+    let w = world().await;
+    w.sign_in();
+    let pi = w.golden.claude.with_file_name("pi");
+    common::write_script(&pi, PI_STILL_STARTING);
+    let got = pi.with_file_name("pi.got");
+    let a = w.start("hello").await;
+    let begun = std::time::Instant::now();
+    w.core
+        .send_input(
+            None,
+            &a.agent,
+            vibe_mcp::Input::Text {
+                text: "after a start".into(),
+                submit: true,
+                force: false,
+            },
+        )
+        .await
+        .unwrap();
+    let got_it = begun.elapsed();
+    assert_eq!(fs::read_to_string(&got).unwrap(), "after a start\n");
+    assert!(got_it < std::time::Duration::from_secs(30), "{got_it:?}");
+    w.delete(&a.agent).await;
+}
+
 /// B1: a login Pi really writes, beside a bad one, in the same file: the good one
 /// goes on, the bad one doesn't, and the owner hears which.
 #[tokio::test]
