@@ -48,6 +48,9 @@ struct Wires {
     /// Nothing gets through, but nothing ends either, and new connections are
     /// still accepted: a Mac asleep, with sshd none the wiser.
     frozen: watch::Sender<bool>,
+    /// What a Mac says back through a tunnel goes nowhere, while what's sent to
+    /// it arrives: a call that's done there, with the host never hearing so.
+    replies_lost: Arc<AtomicBool>,
     /// Bumped to end every dial, as stopping the host's `vibed` ends each
     /// `vibe rpc`, while tunnels stay: sshd holds those.
     hang_up: watch::Sender<u64>,
@@ -62,6 +65,7 @@ impl Wires {
             sockets: Mutex::new(HashMap::new()),
             up: watch::channel(true).0,
             frozen: watch::channel(false).0,
+            replies_lost: Arc::new(AtomicBool::new(false)),
             hang_up: watch::channel(0).0,
             tunnels: Mutex::new(0),
             forwarding: AtomicBool::new(true),
@@ -91,6 +95,7 @@ async fn pump(
     b: UnixStream,
     mut up: watch::Receiver<bool>,
     mut frozen: watch::Receiver<bool>,
+    b_lost: Arc<AtomicBool>,
 ) {
     let (mut ar, mut aw) = a.into_split();
     let (mut br, mut bw) = b.into_split();
@@ -116,6 +121,7 @@ async fn pump(
             },
             n = br.read(&mut y) => match n {
                 Ok(0) | Err(_) => return,
+                Ok(_) if b_lost.load(Ordering::SeqCst) => {}
                 Ok(n) => if aw.write_all(&y[..n]).await.is_err() { return },
             },
         }
@@ -142,7 +148,7 @@ impl Remote for Wires {
             let mut hang_up = self.hang_up.subscribe();
             tokio::spawn(async move {
                 tokio::select! {
-                    () = pump(host, theirs, up, frozen) => {}
+                    () = pump(host, theirs, up, frozen, Arc::new(AtomicBool::new(false))) => {}
                     _ = hang_up.changed() => {}
                 }
             });
@@ -193,6 +199,7 @@ impl Remote for Wires {
             let mut up = self.up.subscribe();
             let pumps = self.up.clone();
             let frozen = self.frozen.clone();
+            let replies_lost = Arc::clone(&self.replies_lost);
             Ok(TunnelChild {
                 ended: Box::pin(async move {
                     loop {
@@ -205,6 +212,7 @@ impl Remote for Wires {
                                     here,
                                     pumps.subscribe(),
                                     frozen.subscribe(),
+                                    Arc::clone(&replies_lost),
                                 ));
                             }
                             _ = up.changed() => {
@@ -869,6 +877,80 @@ async fn one_url_and_one_key_reach_agents_on_the_host_and_the_mac() {
     assert!(!socket.exists(), "{} is left", socket.display());
     assert!(!vibe_core::socket::lock_path(&socket).exists());
     assert!(!w.host.hosts().unwrap().hosts[0].external);
+}
+
+/// The send a caller can't know the fate of: the Mac types it, its answer never
+/// reaches the host, and the caller is told to try again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_send_delivered_with_its_reply_lost_arrives_once_when_retried() {
+    let w = world(limits()).await;
+    w.turn_on().await;
+    let key = w.key("laptop");
+    w.pushed(&key).await;
+    let mut c = w.client(&key);
+    let agent = "mac:on-mac";
+    c.call(
+        "vibe_start_agent",
+        json!({"project": "app", "profile": "software-eng-mac", "prompt": "talk",
+               "host": "mac", "name": "on-mac"}),
+    )
+    .await;
+    c.call("vibe_wait", json!({"agents": agent, "timeout": 60}))
+        .await;
+
+    w.wires.replies_lost.store(true, Ordering::SeqCst);
+    let failed = c
+        .fails("vibe_send", json!({"agent": agent, "text": "only once"}))
+        .await;
+    assert!(failed.contains("mac is unavailable"), "{failed}");
+    let id = failed
+        .split("send_id \"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .unwrap_or_else(|| panic!("no id to retry with: {failed}"))
+        .to_owned();
+
+    w.wires.replies_lost.store(false, Ordering::SeqCst);
+    for _ in 0..1000 {
+        if w.host.hosts().unwrap().hosts[0].tunnel == Some(TunnelState::Up) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // What came of it, as the caller can read it.
+    let times = async |c: &mut Client, text: &str| {
+        c.call("vibe_wait", json!({"agents": agent, "timeout": 60}))
+            .await;
+        c.call("vibe_read_messages", json!({"agent": agent, "last": 50}))
+            .await
+            .matches(&format!("> {text}"))
+            .count()
+    };
+    assert_eq!(times(&mut c, "only once").await, 1, "it did arrive");
+
+    // The retry is told it went, and nothing more is typed.
+    let again = c
+        .call(
+            "vibe_send",
+            json!({"agent": agent, "text": "only once", "send_id": id}),
+        )
+        .await;
+    assert!(again.contains("sent to mac:on-mac"), "{again}");
+    assert_eq!(times(&mut c, "only once").await, 1, "delivered once");
+
+    // The id is for that send and no other.
+    let other = c
+        .fails(
+            "vibe_send",
+            json!({"agent": agent, "text": "something else", "send_id": id}),
+        )
+        .await;
+    assert!(other.contains("different send"), "{other}");
+
+    // Saying the same thing again on purpose is still two sends.
+    c.call("vibe_send", json!({"agent": agent, "text": "only once"}))
+        .await;
+    assert_eq!(times(&mut c, "only once").await, 2, "a new send");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

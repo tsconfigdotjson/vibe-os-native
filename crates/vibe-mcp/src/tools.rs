@@ -122,6 +122,13 @@ fn fail(text: String) -> CallToolResult {
 
 /// A core error, as a model reads it, with what to do next where that
 /// helps.
+/// A send id for a caller who didn't give one.
+fn new_send_id() -> Result<String, String> {
+    let bytes =
+        vibe_core::keys::random_bytes().map_err(|e| format!("can't make a send id: {e}"))?;
+    Ok(bytes[..16].iter().map(|b| format!("{b:02x}")).collect())
+}
+
 fn explain(e: &Error, what: Option<&str>) -> String {
     let not_found = e.code == ErrorCode::NotFound.code();
     match what {
@@ -277,7 +284,8 @@ pub(crate) fn tools() -> Vec<Tool> {
                 "text": {"type": "string", "description": "Text to paste"},
                 "submit": {"type": "boolean", "description": "Press Enter after the text. Default true"},
                 "keys": {"type": "array", "items": {"type": "string"}, "description": "Instead of text: keys to press, like [\"2\"] or [\"Enter\"]"},
-                "force": {"type": "boolean", "description": "Paste the text even when the agent is on a question"}
+                "force": {"type": "boolean", "description": "Paste the text even when the agent is on a question"},
+                "send_id": {"type": "string", "description": "Makes a retry safe: a send with the same send_id and the same input is delivered once, for about an hour. A send that fails with a host unavailable gives you one to use"}
             }, "required": ["agent"]}),
         ),
         tool(
@@ -737,6 +745,13 @@ impl<D: Daemon> Server<D> {
         let text = string(args, "text")?;
         let submit = boolean(args, "submit")?;
         let force = boolean(args, "force")?.unwrap_or(false);
+        let send_id = match string(args, "send_id")? {
+            Some(id) => {
+                crate::check_send_id(&id)?;
+                id
+            }
+            None => new_send_id()?,
+        };
         let keys = match args.get("keys").filter(|v| !v.is_null()) {
             None => None,
             Some(Value::Array(items)) if !items.is_empty() => Some(
@@ -782,9 +797,19 @@ impl<D: Daemon> Server<D> {
         };
         let sent = self
             .daemon
-            .send(c, &t, input)
+            .send(c, &t, input, &send_id)
             .await
-            .map_err(|e| explain(&e, Some(&t.agent)))?;
+            .map_err(|e| {
+                let why = explain(&e, Some(&t.agent));
+                // Its host may have typed it and only the answer been lost.
+                if e.code == ErrorCode::HostUnavailable.code() {
+                    format!(
+                        "{why} The send may or may not have arrived. To try again without it arriving twice, call vibe_send with the same input and send_id \"{send_id}\"."
+                    )
+                } else {
+                    why
+                }
+            })?;
         ok(
             &format!(
                 "{what}{}. Call vibe_wait to know when it has answered",

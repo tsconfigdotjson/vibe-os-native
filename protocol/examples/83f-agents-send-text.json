@@ -1,5 +1,5 @@
 {
-  "description": "Pastes text into an agent's terminal and presses Enter, as `vibe_send` does; `submit: false` pastes without it. Text is refused while the agent is on a question unless `force`. An agent asleep, paused or exited is woken or resumed first, and `woke` says so. A Mac sends a Linux host's agents theirs this way, over the link.",
+  "description": "Pastes text into an agent's terminal and presses Enter, as `vibe_send` does; `submit: false` pastes without it. Text is refused while the agent is on a question unless `force`. An agent asleep, paused or exited is woken or resumed first, and `woke` says so. A Mac sends a Linux host's agents theirs this way, over the link. With `send_id`, the host that types it does so once for that id, for about an hour or until its vibed restarts: a repeat gets how the first went, and a different send with the same id is refused.",
   "request": {
     "jsonrpc": "2.0",
     "id": 834,
@@ -8,7 +8,8 @@
       "ref": "dark-mode-review",
       "text": "Localize the label too",
       "submit": true,
-      "force": true
+      "force": true,
+      "send_id": "4f1c9e2ab7d03856"
     }
   },
   "response": {

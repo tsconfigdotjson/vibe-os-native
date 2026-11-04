@@ -400,11 +400,17 @@ impl Daemon for Core {
         Core::delete_agent(self, p).await
     }
 
-    async fn send(&self, c: &Caller, t: &Target, input: Input) -> Result<Sent, ErrorObject> {
+    async fn send(
+        &self,
+        c: &Caller,
+        t: &Target,
+        input: Input,
+        send_id: &str,
+    ) -> Result<Sent, ErrorObject> {
         let mac = self.mac_for(&t.host);
         let link = self.link(&t.host);
         if mac.is_some() || link.is_some() {
-            let params = crate::talk::send_params(&t.host, &t.agent, &input);
+            let params = crate::talk::send_params(&t.host, &t.agent, &input, send_id);
             let sent = match mac {
                 Some(mac) => mac_call::<AgentsSend>(mac, c, &params).await?,
                 None => {
@@ -417,7 +423,8 @@ impl Daemon for Core {
                 state: sent.state,
             });
         }
-        self.send_input(Some(&t.host), &t.agent, input).await
+        self.send_once(Some(&t.host), &t.agent, input, send_id)
+            .await
     }
 
     async fn check(&self, c: &Caller, t: &Target, background: bool) -> Result<Check, ErrorObject> {

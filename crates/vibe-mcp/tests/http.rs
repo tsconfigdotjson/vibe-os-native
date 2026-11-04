@@ -26,6 +26,9 @@ const KEY: &str = "vk_aaaqeayeaudaocajbifqydiob4ibceqtcqkrmfyydenbwha5dypq";
 struct Fake {
     log: Mutex<Vec<String>>,
     sends: Mutex<Vec<(Target, Input)>>,
+    send_ids: Mutex<Vec<String>>,
+    /// Sends find their host unavailable, as when a reply is lost.
+    sends_lost: AtomicBool,
     starts: Mutex<Vec<AgentStartParams>>,
     deletes: Mutex<Vec<AgentDeleteParams>>,
     /// How many checks each agent stays busy for before it has answered;
@@ -192,8 +195,21 @@ impl Daemon for Fake {
         Ok(a)
     }
 
-    async fn send(&self, _c: &Caller, t: &Target, input: Input) -> Result<Sent, ErrorObject> {
+    async fn send(
+        &self,
+        _c: &Caller,
+        t: &Target,
+        input: Input,
+        send_id: &str,
+    ) -> Result<Sent, ErrorObject> {
         let a = self.find(t)?;
+        self.send_ids.lock().unwrap().push(send_id.to_owned());
+        if self.sends_lost.load(Ordering::SeqCst) {
+            return Err(ErrorObject::new(
+                ErrorCode::HostUnavailable,
+                "vps is unavailable: its link is down",
+            ));
+        }
         self.sends.lock().unwrap().push((t.clone(), input));
         Ok(Sent {
             woke: a.state == AgentState::Asleep,
@@ -638,6 +654,63 @@ async fn a_host_that_doesnt_answer_holds_up_nothing_of_this_ones() {
         )
         .await;
     assert!(text(&r).contains("on local"), "{r}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_send_that_may_have_arrived_says_how_to_retry_it_safely() {
+    let (fake, mut c) = client().await;
+    // Every send carries an id, each its own unless the caller gives one.
+    for args in [
+        json!({"agent": "slow", "text": "one"}),
+        json!({"agent": "slow", "text": "one"}),
+        json!({"agent": "slow", "text": "two", "send_id": "mine-1"}),
+    ] {
+        c.call("vibe_send", args).await;
+    }
+    {
+        let ids = fake.send_ids.lock().unwrap();
+        assert_eq!(ids.len(), 3);
+        assert_ne!(ids[0], ids[1]);
+        assert_eq!(ids[2], "mine-1");
+    }
+
+    // A host unavailable names the id to retry with.
+    fake.sends_lost.store(true, Ordering::SeqCst);
+    let e = c
+        .fails("vibe_send", json!({"agent": "slow", "text": "three"}))
+        .await;
+    let id = fake.send_ids.lock().unwrap().last().unwrap().clone();
+    assert!(e.contains("vps is unavailable"), "{e}");
+    assert!(e.contains(&format!("send_id \"{id}\"")), "{e}");
+
+    // Yours is the one it names, if you gave one.
+    let e = c
+        .fails(
+            "vibe_send",
+            json!({"agent": "slow", "text": "three", "send_id": "mine-2"}),
+        )
+        .await;
+    assert!(e.contains("send_id \"mine-2\""), "{e}");
+    fake.sends_lost.store(false, Ordering::SeqCst);
+
+    // Anything else isn't in doubt, and doesn't mention it.
+    let e = c
+        .fails("vibe_send", json!({"agent": "nobody", "text": "four"}))
+        .await;
+    assert!(!e.contains("send_id"), "{e}");
+
+    // A bad id goes nowhere.
+    let before = fake.send_ids.lock().unwrap().len();
+    for bad in ["", "has space", &"x".repeat(129)] {
+        let e = c
+            .fails(
+                "vibe_send",
+                json!({"agent": "slow", "text": "five", "send_id": bad}),
+            )
+            .await;
+        assert!(e.contains("send_id must be"), "{e}");
+    }
+    assert_eq!(fake.send_ids.lock().unwrap().len(), before);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

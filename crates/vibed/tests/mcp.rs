@@ -15,7 +15,7 @@ use client::{Client, post_raw, text};
 use common::Golden;
 use serde_json::{Value, json};
 use vibe_core::paths::Layout;
-use vibe_core::rpc::{KeyCreateParams, ProfileUpdateParams, ProjectAddParams};
+use vibe_core::rpc::{AgentSendParams, KeyCreateParams, ProfileUpdateParams, ProjectAddParams};
 use vibe_core::shim::{self, control_hello};
 use vibe_core::units::GIB;
 use vibe_env::tree::SessionTree;
@@ -266,6 +266,95 @@ async fn the_orchestrator_round_from_start_to_delete() {
     );
     // The key says when it was last used.
     assert!(w.core.keys().unwrap().keys[0].last_used_at.is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_send_id_types_once_and_one_refused_can_be_made_again() {
+    let w = world().await;
+    let mut c = w.client().await;
+    let r = c
+        .call(
+            "vibe_start_agent",
+            json!({"project": "app", "profile": "software-eng-mac", "prompt": "question"}),
+        )
+        .await;
+    let agent = r["structuredContent"]["ref"].as_str().unwrap().to_owned();
+    c.call("vibe_wait", json!({"agents": agent, "timeout": 30}))
+        .await;
+
+    // On a question nothing is typed, so the id isn't used up.
+    let blue = json!({"agent": agent, "text": "blue", "send_id": "first"});
+    let e = c.fails("vibe_send", blue.clone()).await;
+    assert!(e.contains("is waiting on a question"), "{e}");
+    c.call(
+        "vibe_send",
+        json!({"agent": agent, "keys": ["B", "l", "u", "e", "Enter"]}),
+    )
+    .await;
+    c.call("vibe_wait", json!({"agents": agent, "timeout": 30}))
+        .await;
+
+    // How many times `what` reached it, as the conversation has it.
+    let agent_ref = agent.clone();
+    let times = async |c: &mut client::Client, what: &str| {
+        c.call("vibe_wait", json!({"agents": agent_ref, "timeout": 30}))
+            .await;
+        let r = c
+            .call(
+                "vibe_read_messages",
+                json!({"agent": agent_ref, "last": 50}),
+            )
+            .await;
+        messages(&r)
+            .iter()
+            .filter(|(role, text)| role == "user" && text == what)
+            .count()
+    };
+
+    c.call("vibe_send", blue.clone()).await;
+    assert_eq!(times(&mut c, "blue").await, 1);
+    let r = c.call("vibe_send", blue.clone()).await;
+    assert_eq!(r["structuredContent"]["delivered"], true, "{}", text(&r));
+    assert_eq!(times(&mut c, "blue").await, 1, "the repeat typed nothing");
+
+    // Used for something else, it's refused, and nothing is typed.
+    let e = c
+        .fails(
+            "vibe_send",
+            json!({"agent": agent, "text": "red", "send_id": "first"}),
+        )
+        .await;
+    assert!(e.contains("different send"), "{e}");
+    assert_eq!(times(&mut c, "red").await, 0);
+
+    // Two at once: one types, and the other waits to hear how it went.
+    let green = AgentSendParams {
+        agent: agent.clone(),
+        text: Some("green".into()),
+        send_id: Some("second".into()),
+        ..Default::default()
+    };
+    let (one, two) = tokio::join!(
+        w.core.send_call(green.clone()),
+        w.core.send_call(green.clone()),
+    );
+    assert_eq!(one.unwrap(), two.unwrap());
+    assert_eq!(times(&mut c, "green").await, 1);
+
+    // With no id, each send is its own.
+    for count in [2, 3] {
+        c.call("vibe_send", json!({"agent": agent, "text": "green"}))
+            .await;
+        assert_eq!(times(&mut c, "green").await, count);
+    }
+
+    // The socket's door checks an id too.
+    let bad = AgentSendParams {
+        send_id: Some("has space".into()),
+        ..green
+    };
+    let e = w.core.send_call(bad).await.unwrap_err();
+    assert!(e.message.contains("send_id must be"), "{}", e.message);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

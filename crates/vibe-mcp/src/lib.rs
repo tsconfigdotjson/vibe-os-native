@@ -154,6 +154,20 @@ pub use vibe_status::{Message, Role};
 /// An error a core handler gave: its JSON-RPC code says what kind.
 pub type Error = ErrorObject;
 
+/// The longest send id, in characters.
+const MAX_SEND_ID: usize = 128;
+
+/// Whether `id` can name a send (`vibe_send`'s `send_id`).
+pub fn check_send_id(id: &str) -> Result<(), String> {
+    if (1..=MAX_SEND_ID).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_graphic()) {
+        Ok(())
+    } else {
+        Err(format!(
+            "send_id must be 1 to {MAX_SEND_ID} printable ASCII characters, with no spaces"
+        ))
+    }
+}
+
 /// What the MCP server needs from `vibed`: the core handlers, by host.
 /// Hosts other than `local` are Linux hosts this one is linked to, reached
 /// over their links, or, on the Linux host that's the external address,
@@ -218,12 +232,14 @@ pub trait Daemon: Send + Sync + 'static {
 
     /// Types `input` into the agent's terminal, waking it first if it's
     /// asleep, paused or exited. Whatever answers afterwards is what
-    /// [`Daemon::check`] waits for.
+    /// [`Daemon::check`] waits for. The host that types it does so at most
+    /// once for `send_id`, and answers a repeat with how the first went.
     fn send(
         &self,
         c: &Caller,
         t: &Target,
         input: Input,
+        send_id: &str,
     ) -> impl Future<Output = Result<Sent, Error>> + Send;
 
     /// Never wakes it.

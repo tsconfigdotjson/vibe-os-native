@@ -1681,6 +1681,10 @@ pub struct AgentSendParams {
     /// `"Ctrl+C"`, as `vibe_send` takes them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keys: Option<Vec<String>>,
+    /// Types it at most once: the host that types answers a repeat of this id
+    /// with how the first went. 1 to 128 printable ASCII characters, no spaces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

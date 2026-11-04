@@ -414,6 +414,7 @@ async fn a_linux_hosts_agents_join_the_macs_view_over_the_link() {
             submit: true,
             force: false,
         },
+        "ping-1",
     )
     .await
     .unwrap();
@@ -435,9 +436,23 @@ async fn a_linux_hosts_agents_join_the_macs_view_over_the_link() {
         &caller(),
         &t,
         Input::Keys(vec!["y".into(), "Enter".into()]),
+        "keys-1",
     )
     .await
     .unwrap();
+    // A send id gets over the link to the host that types: there, it knows this
+    // one was for something else, and nothing more is typed.
+    let reused = Daemon::send(
+        &*w.mac,
+        &caller(),
+        &t,
+        Input::Keys(vec!["n".into()]),
+        "keys-1",
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(reused.code, ErrorCode::Conflict.code(), "{reused:?}");
+    assert!(reused.message.contains("different send"), "{reused:?}");
     let check = Daemon::check(&*w.mac, &caller(), &t, false).await.unwrap();
     assert_ne!(check.state, AgentState::Exited);
     assert!(
@@ -476,7 +491,19 @@ async fn a_linux_hosts_agents_join_the_macs_view_over_the_link() {
     let used_there = laptop(on_host).last_used_at;
     assert!(used_there.is_some(), "the host recorded the use");
     assert_eq!(laptop(w.mac.keys().unwrap().keys).last_used_at, None);
-    let listed = w.rpc("keys.list", json!({})).await;
+    // Each listing gives the host a few seconds and then goes without it, as it
+    // should, and a busy machine can use them up. So it's asked again here; a
+    // host that never says fails, and so does a listing that doesn't end.
+    let mut listed = Value::Null;
+    for _ in 0..10 {
+        listed = tokio::time::timeout(Duration::from_secs(20), w.rpc("keys.list", json!({})))
+            .await
+            .expect("a listing doesn't wait on a host for long");
+        if listed["result"]["keys"][0]["last_used_at"].as_str() == used_there.as_deref() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     assert_eq!(
         listed["result"]["keys"][0]["last_used_at"].as_str(),
         used_there.as_deref(),
