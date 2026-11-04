@@ -15,6 +15,9 @@
 //! - [`claude`], Claude Code's state in a compartment: where its
 //!   transcripts go, the pre-fill that opens it straight to its prompt, and
 //!   forgetting a worktree;
+//! - [`pi`], the same for Pi, and how it's started: its args, the allowlist
+//!   its environment is built from, and the one login every agent shares;
+//!   [`pi_release`] downloads it, checksummed;
 //! - [`native`], what backends whose agents run natively share;
 //! - [`macos`], the `macos` backend: native agents under a resource
 //!   governor, whose decisions are [`governor`]'s;
@@ -38,6 +41,9 @@ pub mod images;
 pub mod linux;
 pub mod macos;
 pub mod native;
+pub mod pi;
+pub mod pi_logins;
+pub mod pi_release;
 pub mod sparse;
 pub mod testing;
 pub mod toolbox;
@@ -51,8 +57,10 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use vibe_core::limits::HostLimits;
+use vibe_core::model::AgentKind;
 
 pub use claude::ClaudeHome;
+pub use pi::PiHome;
 
 /// Why a backend couldn't do something, in a sentence for the owner.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -164,6 +172,60 @@ pub struct AgentSpec {
     pub agent_dir: PathBuf,
     /// The limits it starts with; a VM's are fixed at boot.
     pub limits: Limits,
+    /// Which coding agent runs in it, for life.
+    pub agent: AgentKind,
+}
+
+/// Where the agent's coding agent keeps its state. It's flattened into
+/// [`Handle`] under the kind's name, so a handle saved before Pi, with its
+/// `claude` key, reads as it always did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentHome {
+    Claude(ClaudeHome),
+    Pi(PiHome),
+}
+
+impl AgentHome {
+    pub fn kind(&self) -> AgentKind {
+        match self {
+            AgentHome::Claude(_) => AgentKind::Claude,
+            AgentHome::Pi(_) => AgentKind::Pi,
+        }
+    }
+
+    /// The directory of the transcripts of sessions run in `worktree`.
+    pub fn transcripts_dir(&self, worktree: &std::path::Path) -> PathBuf {
+        match self {
+            AgentHome::Claude(c) => c.project_dir(worktree),
+            AgentHome::Pi(p) => p.sessions.clone(),
+        }
+    }
+
+    /// Whether session `session_id`, run in `worktree`, has a transcript to
+    /// resume from.
+    pub fn has_transcript(&self, worktree: &std::path::Path, session_id: &str) -> bool {
+        match self {
+            AgentHome::Claude(c) => c.transcript(worktree, session_id).is_file(),
+            AgentHome::Pi(p) => p.transcript(session_id).is_some(),
+        }
+    }
+
+    /// Pre-fills its state so it opens straight to its prompt in `worktree`.
+    pub fn prefill(&self, worktree: &std::path::Path, bypass: bool) -> io::Result<()> {
+        match self {
+            AgentHome::Claude(c) => c.prefill(worktree, bypass),
+            AgentHome::Pi(p) => p.prefill(),
+        }
+    }
+
+    /// Forgets `worktree`, and what's the agent's alone.
+    pub fn forget(&self, worktree: &std::path::Path) -> io::Result<()> {
+        match self {
+            AgentHome::Claude(c) => c.forget(worktree),
+            AgentHome::Pi(p) => p.forget(),
+        }
+    }
 }
 
 /// An agent's compartment, as its backend made it. It's plain data, kept in
@@ -174,8 +236,9 @@ pub struct Handle {
     pub agent_ref: String,
     pub agent_dir: PathBuf,
     pub worktree: PathBuf,
-    /// Where Claude keeps its state for this agent.
-    pub claude: ClaudeHome,
+    /// Where its coding agent keeps its state.
+    #[serde(flatten)]
+    pub home: AgentHome,
     /// The session the agent's terminal leads: its shim's pid, which is the
     /// session ID of everything a native agent starts. Set once a shim
     /// holds the terminal; it stays after the shim is gone, so stragglers
@@ -186,13 +249,28 @@ pub struct Handle {
     pub session: Option<u32>,
 }
 
-/// How to start Claude Code in a compartment. The backend knows which
-/// `claude` to run there; this is what to run it with.
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl Handle {
+    /// Its Claude home, for an agent that runs Claude.
+    pub fn claude(&self) -> Option<&ClaudeHome> {
+        match &self.home {
+            AgentHome::Claude(c) => Some(c),
+            AgentHome::Pi(_) => None,
+        }
+    }
+}
+
+/// How to start the agent's coding agent in a compartment. The backend knows
+/// which `claude` or `pi` to run there; this is what to run it with.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Launch {
-    /// Claude's arguments, the prompt included.
+    /// Which to run.
+    pub agent: AgentKind,
+    /// Its arguments, the prompt included.
     pub args: Vec<String>,
-    /// Set on top of the compartment's own environment.
+    /// Set on top of the compartment's own environment. For Pi, on top of
+    /// only what [`pi::allowed_env`] keeps of it; `VIBE_SERVICES` here also
+    /// has its backend add the `-e` for the services' extension
+    /// ([`pi::service_args`]), as only the backend knows where that is.
     pub env: Vec<(String, String)>,
     pub cwd: PathBuf,
 }
@@ -235,6 +313,9 @@ pub enum TerminalEnd {
         command: Vec<String>,
         cwd: PathBuf,
         env: Vec<(String, String)>,
+        /// Start from an empty environment rather than `vibed`'s, so `env`
+        /// is everything it gets: Pi's way ([`pi::allowed_env`]).
+        clean_env: bool,
     },
     /// The command already runs in a VM: the shim attaches to
     /// `vibe-guest`'s terminal through the `vibe-vm` serving this socket.
@@ -301,7 +382,19 @@ pub trait Compartment {
     /// Runs a command to completion inside the compartment.
     fn run(&self, h: &Handle, run: &Run) -> Result<RunOutput>;
 
-    /// Starts Claude, and returns the end of its terminal for the shim:
+    /// What Pi itself says of `model` for this agent, given the environment it
+    /// would start with, where Pi can be run before the agent is: not in a VM,
+    /// whose Pi only the guest can run. None there, or if Pi doesn't say.
+    fn pi_auth_check(
+        &self,
+        _h: &Handle,
+        _env: &[(String, String)],
+        _model: &str,
+    ) -> Option<pi::AuthCheck> {
+        None
+    }
+
+    /// Starts its coding agent, and returns the end of its terminal for the shim:
     /// a command for the shim's PTY, or a VM's stream.
     fn launch(&self, h: &Handle, launch: &Launch) -> Result<TerminalEnd>;
 
@@ -333,7 +426,7 @@ pub trait Compartment {
     fn stop(&self, h: &Handle) -> Result<()>;
 
     /// Stops the agent and removes everything the backend made for it,
-    /// Claude's state included. Leaves nothing behind.
+    /// its coding agent's state included. Leaves nothing behind.
     fn delete(&self, h: &Handle) -> Result<()>;
 }
 
@@ -383,4 +476,42 @@ pub trait Sleeper {
 /// A way of running agents: the three traits and what it can do.
 pub trait Backend: Compartment + Limiter + Sleeper + Send + Sync + fmt::Debug {
     fn capabilities(&self) -> Capabilities;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn handles_saved_before_pi_still_read() {
+        let old = serde_json::json!({
+            "agent_ref": "q",
+            "agent_dir": "/a/q",
+            "worktree": "/w/q",
+            "claude": {"dir": "/h/.claude", "state": "/h/.claude.json", "own": false},
+            "session": 7,
+        });
+        let h: Handle = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(h.home.kind(), AgentKind::Claude);
+        assert_eq!(h.session, Some(7));
+        assert_eq!(h.claude().unwrap().dir, std::path::Path::new("/h/.claude"));
+        // And what's written reads the same to an older vibed.
+        assert_eq!(serde_json::to_value(&h).unwrap(), old);
+    }
+
+    #[test]
+    fn a_pi_handle_round_trips_under_its_own_key() {
+        let h = Handle {
+            agent_ref: "q".into(),
+            agent_dir: "/a/q".into(),
+            worktree: "/w/q".into(),
+            home: AgentHome::Pi(PiHome::at("/h/agent".into(), "/a/q/pi-sessions".into())),
+            session: None,
+        };
+        let v = serde_json::to_value(&h).unwrap();
+        assert_eq!(v["pi"]["sessions"], "/a/q/pi-sessions");
+        assert!(v.get("claude").is_none());
+        assert_eq!(serde_json::from_value::<Handle>(v).unwrap(), h);
+        assert_eq!(h.claude(), None);
+    }
 }

@@ -63,6 +63,7 @@ impl Harness for TestHarness {
             fs::create_dir_all(d).unwrap();
         }
         AgentSpec {
+            agent: Default::default(),
             agent_ref: agent_ref.into(),
             project: "web".into(),
             worktree,

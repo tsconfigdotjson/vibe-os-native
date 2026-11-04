@@ -1,5 +1,5 @@
 {
   "description": "A request without an id is a notification and gets no response.",
-  "request": { "jsonrpc": "2.0", "method": "daemon.hello", "params": { "client": "vibe-cli", "protocol": 1 } },
+  "request": { "jsonrpc": "2.0", "method": "daemon.hello", "params": { "client": "vibe-cli", "protocol": 2 } },
   "response": null
 }

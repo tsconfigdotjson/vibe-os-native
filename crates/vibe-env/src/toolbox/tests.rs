@@ -160,9 +160,26 @@ fn the_shell_boots_the_template_and_home_writable() {
     assert_eq!(boot.home.as_deref(), Some("home"));
     assert!(boot.sudo, "the toolbox shell may use sudo");
     // The Linux Claude config is edited there too.
-    assert_eq!(c.shares.len(), 1);
+    assert_eq!(c.shares.len(), 2);
     assert_eq!(c.shares[0].path, s.layout.linux_claude_dir());
     assert_eq!(boot.shares[0].path, "/home/vibe/.claude");
+    // And a private agent dir for Pi, which `vibed` keeps in step with the store,
+    // with nothing of the owner's extensions and settings, with `sudo` and the
+    // Claude token here, and nothing of it lands in the Linux home.
+    assert_eq!(c.shares[1].path, s.layout.linux_pi_signin_dir());
+    assert!(!c.shares[1].read_only);
+    assert_eq!(boot.shares[1].path, "/home/vibe/.pi/agent");
+    assert!(
+        c.shares.iter().all(|x| x.path != s.layout.linux_pi_dir()),
+        "the toolbox runs nothing of the owner's Pi settings"
+    );
+    assert!(
+        c.shares
+            .iter()
+            .all(|x| x.path != s.layout.linux_pi_logins_dir()),
+        "nor does it mount the store"
+    );
+    assert!(!s.layout.linux_pi_dir().exists(), "nor does it make them");
     let state: serde_json::Value = serde_json::from_slice(
         &fs::read(s.layout.linux_claude_dir().join(".claude.json")).unwrap(),
     )
@@ -355,6 +372,7 @@ fn new_agents_boot_the_new_versions_and_a_sleeping_agent_keeps_its_own() {
         let agent_dir = s.layout.agent_dir(r);
         fs::create_dir_all(&agent_dir).unwrap();
         AgentSpec {
+            agent: Default::default(),
             agent_ref: r.into(),
             project: "app".into(),
             worktree,
@@ -376,6 +394,7 @@ fn new_agents_boot_the_new_versions_and_a_sleeping_agent_keeps_its_own() {
             .launch(
                 h,
                 &Launch {
+                    agent: Default::default(),
                     args: vec![],
                     env: vec![],
                     cwd: h.worktree.clone(),
@@ -1023,4 +1042,32 @@ fn hanging_up_signals_the_shells_group_in_the_guest() {
     s.fake.exit(&s.socket(), 129);
     let saved = s.toolbox.close().unwrap();
     assert_eq!((saved.template, saved.home), (Some(1), Some(1)));
+}
+
+#[test]
+fn the_toolboxs_shell_has_the_token_and_its_pi_never_does() {
+    let s = Setup::new();
+    let dir = s.tmp.path().join("pi-build");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("pi"), "pi").unwrap();
+    Images::new(s.layout.linux_dir())
+        .add_pi(&crate::pi_release::Build {
+            version: "1.5.0".into(),
+            dir,
+            sha256: "x".into(),
+            fd: None,
+        })
+        .unwrap();
+    s.toolbox.open().unwrap();
+    // It stacks the Pi layer, and its shell holds the Claude token.
+    let c = VmConfig::load(&s.toolbox.dir().join("vm.json")).unwrap();
+    let (boot, _) = boot::Boot::parse(&c.cmdline);
+    assert!(boot.layers.iter().any(|l| l == "pi"), "{:?}", boot.layers);
+    assert!(s.fake.last_launch().env.contains_key(TOKEN_ENV));
+    // So what `pi` finds on PATH there takes it away, which
+    // `the_wrapper_keeps_a_claude_token_from_pi` runs for real and the layer's
+    // own test finds at /opt/vibeos/bin/pi.
+    assert!(crate::pi::WRAPPER.contains(&format!("-u {TOKEN_ENV}")));
+    // And its Pi loads nothing an agent could have left for it.
+    assert!(c.shares.iter().all(|x| x.path != s.layout.linux_pi_dir()));
 }

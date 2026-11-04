@@ -18,7 +18,7 @@ use rmcp::model::{
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler};
 use serde_json::{Value, json};
-use vibe_core::model::{AgentState, LOCAL_HOST};
+use vibe_core::model::{AgentKind, AgentState, LOCAL_HOST};
 use vibe_core::rpc::{Agent, AgentDeleteParams, AgentStartParams, ErrorCode, MemoryUse};
 
 use crate::{
@@ -244,7 +244,7 @@ pub(crate) fn tools() -> Vec<Tool> {
         tool(
             "vibe_start_agent",
             "Start an agent",
-            "Starts an agent: cuts a new git worktree and branch of a project, creates its compartment, and starts Claude Code on it with the prompt, submitted. Returns its ref. Then call vibe_wait, and vibe_read_messages for its answer.",
+            "Starts an agent: cuts a new git worktree and branch of a project, creates its compartment, and starts its profile's coding agent (Claude Code or Pi) on it with the prompt, submitted. Returns its ref. Then call vibe_wait, and vibe_read_messages for its answer.",
             json!({"type": "object", "properties": {
                 "project": {"type": "string", "description": "The project, by name"},
                 "profile": {"type": "string", "description": "The project's profile to start it from, by name, like software-eng-linux"},
@@ -371,7 +371,11 @@ fn agent_line(v: &AgentView) -> String {
     let mut parts = vec![
         display_ref(&a.host, &a.agent),
         format!("{} ({})", a.state, a.status.activity),
-        a.profile.clone(),
+        if a.kind == AgentKind::Claude {
+            a.profile.clone()
+        } else {
+            format!("{} ({})", a.profile, a.kind)
+        },
         format!("{} · branch {}", a.project, a.branch),
     ];
     if let Some(m) = a.memory_used {
@@ -518,8 +522,8 @@ impl<D: Daemon> Server<D> {
             .iter()
             .map(|p| {
                 let mut lines = vec![format!("{} (on {}) {}", p.name, p.host, p.path)];
-                lines.extend(p.profiles.iter().map(|r| {
-                    format!(
+                lines.extend(p.profiles.iter().map(|r| match r.agent {
+                    AgentKind::Claude => format!(
                         "  {}: {}, {}, {} reasoning, {} mode, {}",
                         r.name,
                         r.environment,
@@ -527,7 +531,16 @@ impl<D: Daemon> Server<D> {
                         r.reasoning,
                         r.mode,
                         human(r.memory)
-                    )
+                    ),
+                    // Pi has no modes: it never asks before running a tool.
+                    AgentKind::Pi => format!(
+                        "  {}: pi, {}, {}, {} thinking, no approvals, {}",
+                        r.name,
+                        r.environment,
+                        r.pi_model.as_deref().unwrap_or("Pi's default model"),
+                        r.reasoning,
+                        human(r.memory)
+                    ),
                 }));
                 lines.join("\n")
             })

@@ -6,7 +6,7 @@ import Foundation
 
 public enum VibeRPC {
     /// Sent in `daemon.hello`; vibed refuses any other.
-    public static let protocolVersion = 1
+    public static let protocolVersion = 2
     public static let jsonrpc = "2.0"
     /// The first Linux base image whose guest serves shared MCP services
     /// (`vibe_env::images::SERVICES_BASE`). A template built on an older one
@@ -61,6 +61,9 @@ public enum VibeRPC {
         ToolboxRebuild.name,
         ToolboxLoginsGet.name,
         ToolboxClose.name,
+        PiStatusGet.name,
+        PiInstall.name,
+        PiForget.name,
         DoctorCheckGet.name,
         DoctorFix.name,
         ServicesList.name,
@@ -379,12 +382,24 @@ public enum AgentEnvironment: String, Codable, CaseIterable, Hashable, Sendable 
     case linux, macos
 }
 
-/// Claude's `--model` (index: Model).
+/// Which coding agent a profile runs (index: AgentKind). Left out of what
+/// was saved before Pi, which is Claude's.
+public enum AgentKind: String, Codable, CaseIterable, Hashable, Sendable {
+    case claude, pi
+}
+
+/// What `pi.install` installs: the `pi` a host's native agents run, or the
+/// layer `linux` agents boot in their VMs on a Mac (index: PiTarget).
+public enum PiTarget: String, Codable, CaseIterable, Hashable, Sendable {
+    case native, vm
+}
+
+/// Claude's `--model` (index: Model). A Pi profile names its own, in `piModel`.
 public enum ClaudeModel: String, Codable, CaseIterable, Hashable, Sendable {
     case opus, sonnet
 }
 
-/// Claude's `--effort` (index: Reasoning).
+/// Claude's `--effort`, and Pi's `--thinking` (index: Reasoning).
 public enum ReasoningLevel: String, Codable, CaseIterable, Hashable, Sendable {
     case low, medium, high, xhigh, max
 }
@@ -437,6 +452,9 @@ public enum EventKind: String, Codable, CaseIterable, Hashable, Sendable {
     /// A shared service changed on `host`: `state` is its `ServiceState`,
     /// `message` its name.
     case serviceChanged = "service.changed"
+    /// Pi's install on this host changed, or an install ended; `message`
+    /// says why one failed.
+    case piChanged = "pi.changed"
 }
 
 /// Where a shared service stands.
@@ -530,14 +548,14 @@ public enum LoginTool: String, Codable, CaseIterable, Hashable, Sendable {
 
 /// What `vibe doctor` checks, in the order it reports them: git; `gh`'s
 /// login, and git using `gh` for GitHub; the `claude` macos agents run, and
-/// its login; system sleep off; Tailscale (optional); and on a Mac, the
-/// Linux images.
+/// its login; system sleep off; Tailscale (optional); on a Mac, the Linux
+/// images; and Pi (optional).
 public enum CheckId: String, Codable, CaseIterable, Hashable, Sendable {
     case git, gh
     case ghGit = "gh_git"
     case claude
     case claudeLogin = "claude_login"
-    case power, tailscale, linux
+    case power, tailscale, linux, pi
 }
 
 /// How a doctor check went: `pass`; `fail`, which needs the owner;
@@ -852,6 +870,31 @@ public enum ToolboxClose: RPCMethod {
     public static let name = "toolbox.close"
 }
 
+/// `pi.status`: Pi's install on a host, and the providers it's signed in to,
+/// by name. Changes nothing.
+public enum PiStatusGet: RPCMethod {
+    public typealias Params = HostParams
+    public typealias Result = PiStatus
+    public static let name = "pi.status"
+}
+
+/// `pi.install`: downloads the newest Pi, checked against its release's
+/// checksums, and gives the status after. It takes as long as the download.
+public enum PiInstall: RPCMethod {
+    public typealias Params = PiInstallParams
+    public typealias Result = PiStatus
+    public static let name = "pi.install"
+}
+
+/// `pi.forget`: takes these providers' logins out of what `linux` agents share,
+/// and gives the status after. Anything new an agent offers is a new offer, so one
+/// offering junk has to be stopped too.
+public enum PiForget: RPCMethod {
+    public typealias Params = PiForgetParams
+    public typealias Result = PiStatus
+    public static let name = "pi.forget"
+}
+
 /// `doctor.check`: `vibe doctor`, and the first run's checklist. Runs every
 /// check now, as this host's vibed sees it. Changes nothing.
 public enum DoctorCheckGet: RPCMethod {
@@ -1078,9 +1121,18 @@ public struct Profile: Codable, Hashable, Sendable {
 
     public var sharedServicesOn: Bool { sharedServices ?? true }
 
+    /// Which coding agent it runs; none means Claude.
+    public var agent: AgentKind?
+    /// A Pi profile's model, as `provider/id`; none uses Pi's own default.
+    public var piModel: String?
+
+    /// Which coding agent it runs.
+    public var kind: AgentKind { agent ?? .claude }
+
     public enum CodingKeys: String, CodingKey, CaseIterable {
-        case name, environment, model, reasoning, mode, memory
+        case name, environment, model, reasoning, mode, memory, agent
         case sharedServices = "shared_services"
+        case piModel = "pi_model"
     }
 }
 
@@ -1181,12 +1233,16 @@ public struct ProfileCreateParams: Codable, Hashable, Sendable {
     public var mode: PermissionMode?
     public var memory: Int?
     public var sharedServices: Bool?
+    public var agent: AgentKind?
+    public var piModel: String?
 
     public init(
         host: String? = nil, project: String, name: String, environment: AgentEnvironment? = nil,
         model: ClaudeModel? = nil, reasoning: ReasoningLevel? = nil, mode: PermissionMode? = nil,
-        memory: Int? = nil, sharedServices: Bool? = nil
+        memory: Int? = nil, sharedServices: Bool? = nil, agent: AgentKind? = nil, piModel: String? = nil
     ) {
+        self.agent = agent
+        self.piModel = piModel
         self.host = host
         self.project = project
         self.name = name
@@ -1199,8 +1255,9 @@ public struct ProfileCreateParams: Codable, Hashable, Sendable {
     }
 
     public enum CodingKeys: String, CodingKey, CaseIterable {
-        case host, project, name, environment, model, reasoning, mode, memory
+        case host, project, name, environment, model, reasoning, mode, memory, agent
         case sharedServices = "shared_services"
+        case piModel = "pi_model"
     }
 }
 
@@ -1216,12 +1273,20 @@ public struct ProfileUpdateParams: Codable, Hashable, Sendable {
     public var mode: PermissionMode?
     public var memory: Int?
     public var sharedServices: Bool?
+    /// Pi's mode is always `bypass`; going back to Claude goes back to
+    /// `auto` unless `mode` says otherwise, and forgets the Pi model.
+    public var agent: AgentKind?
+    /// Empty clears it, for Pi's own default.
+    public var piModel: String?
 
     public init(
         host: String? = nil, project: String, profile: String, name: String? = nil,
         environment: AgentEnvironment? = nil, model: ClaudeModel? = nil,
-        reasoning: ReasoningLevel? = nil, mode: PermissionMode? = nil, memory: Int? = nil, sharedServices: Bool? = nil
+        reasoning: ReasoningLevel? = nil, mode: PermissionMode? = nil, memory: Int? = nil,
+        sharedServices: Bool? = nil, agent: AgentKind? = nil, piModel: String? = nil
     ) {
+        self.agent = agent
+        self.piModel = piModel
         self.host = host
         self.project = project
         self.profile = profile
@@ -1237,6 +1302,8 @@ public struct ProfileUpdateParams: Codable, Hashable, Sendable {
     public enum CodingKeys: String, CodingKey, CaseIterable {
         case host, project, profile, name, environment, model, reasoning, mode, memory
         case sharedServices = "shared_services"
+        case agent
+        case piModel = "pi_model"
     }
 }
 
@@ -1772,11 +1839,13 @@ public struct Agent: Codable, Hashable, Sendable {
     public var ref: String
     public var project: String
     public var profile: String
+    /// Which coding agent it runs; none means Claude.
+    public var agent: AgentKind?
     public var environment: AgentEnvironment
     public var state: AgentState
     public var worktree: String
     public var branch: String
-    /// Claude Code's `--session-id`.
+    /// The `--session-id` it was started with.
     public var sessionId: String
     public var createdAt: String
     /// The command that attaches a terminal, such as `vibe attach <ref>`.
@@ -1790,12 +1859,106 @@ public struct Agent: Codable, Hashable, Sendable {
     public var status: AgentStatus
 
     public enum CodingKeys: String, CodingKey, CaseIterable {
-        case host, ref, project, profile, environment, state, worktree, branch
+        case host, ref, project, profile, agent, environment, state, worktree, branch
         case sessionId = "session_id"
         case createdAt = "created_at"
         case attach, memory
         case memoryUsed = "memory_used"
         case status
+    }
+}
+
+extension Agent {
+    /// Which coding agent it runs.
+    public var kind: AgentKind { agent ?? .claude }
+}
+
+/// A `pi` a host's agents can run.
+public struct PiBinary: Codable, Hashable, Sendable {
+    public var path: String
+    public var version: String
+    /// Whether it's the one `pi.install` put there, which it can update. One
+    /// that isn't is the owner's own, which it leaves alone.
+    public var managed: Bool?
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case path, version, managed
+    }
+}
+
+/// The Pi layer `linux` agents boot on a Mac, and the login they share.
+public struct PiVms: Codable, Hashable, Sendable {
+    /// Pi's version in the newest layer, once there is one.
+    public var version: String?
+    /// The providers `linux` agents are signed in to, by name: the store each
+    /// VM's private copy is kept in step with.
+    public var logins: [String]?
+    /// Why the layer couldn't be had when it was last tried in the background.
+    public var error: String?
+    /// What needs the owner's eye about those logins: what's wrong with an
+    /// agent's copy, and what agents have done with a login.
+    public var alerts: [String]?
+    /// The logins here that came from an agent and not from the owner.
+    public var offered: [PiOffered]?
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case version, logins, error, alerts, offered
+    }
+}
+
+/// Pi on one host.
+public struct PiStatus: Codable, Hashable, Sendable {
+    public var host: String
+    /// The `pi` this host's native agents run: `macos` agents on a Mac, every
+    /// agent on a Linux host.
+    public var native: PiBinary?
+    /// The providers the owner's own `~/.pi/agent` is signed in to, by name.
+    /// Never what their logins hold.
+    public var logins: [String]?
+    /// On a Mac: what `linux` agents, in their VMs, have.
+    public var vms: PiVms?
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case host, native, logins, vms
+    }
+}
+
+public struct PiForgetParams: Codable, Hashable, Sendable {
+    public var host: String?
+    public var providers: [String]
+
+    public init(host: String? = nil, providers: [String]) {
+        self.host = host
+        self.providers = providers
+    }
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case host, providers
+    }
+}
+
+/// A login an agent signed in to, and every agent now uses.
+public struct PiOffered: Codable, Hashable, Sendable {
+    public var provider: String
+    /// The agent's ref.
+    public var agent: String
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case provider, agent
+    }
+}
+
+public struct PiInstallParams: Codable, Hashable, Sendable {
+    public var host: String?
+    public var target: PiTarget
+
+    public init(host: String? = nil, target: PiTarget) {
+        self.host = host
+        self.target = target
+    }
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case host, target
     }
 }
 

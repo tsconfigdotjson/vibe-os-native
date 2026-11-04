@@ -71,6 +71,17 @@ public final class FixtureDaemon: DaemonConnection, @unchecked Sendable {
             return ["checks": doctor]
         case ToolboxStatusGet.name, ToolboxClose.name:
             return ["state": "closed", "template": 3, "home": 2, "base": 1, "newest_base": 2]
+        case PiStatusGet.name, PiInstall.name, PiForget.name:
+            // As the doctor's Pi check says of this Mac.
+            if scenario == .firstRun || scenario == .freshMac {
+                return ["host": host, "vms": [String: Any]()]
+            }
+            return [
+                "host": host,
+                "native": ["path": "/Users/me/.local/bin/pi", "version": "1.5.0"],
+                "logins": ["openai"],
+                "vms": ["version": "1.5.0", "logins": ["anthropic"]],
+            ]
         case McpGet.name:
             return [
                 "port": 7878, "tailscale": populated, "url": "http://127.0.0.1:7878/mcp",
@@ -266,11 +277,17 @@ public final class FixtureDaemon: DaemonConnection, @unchecked Sendable {
         let login = check(.claudeLogin, .pass, "Claude Code is signed in, with its login in your Keychain.")
         let tailscale = check(.tailscale, .pass, "Tailscale is up, at 100.101.102.103; Settings can serve MCP there too.")
         let linux = check(.linux, .pass, "Linux base image 2 and Claude Code 2.1.314 are ready for linux agents.")
+        // The doctor's last check, as `vibed` says it. Only agents whose profile
+        // runs Pi need it, so a Mac without it has nothing to do about it.
+        let piInstalled = check(.pi, .pass, "Pi 1.5.0 is at /Users/me/.local/bin/pi.")
+        let noPi = check(
+            .pi, .optional, "Pi isn't on your login shell's PATH.",
+            hint: "Only agents whose profile runs Pi need it: install it in Settings → Agents.")
         switch scenario {
         case .busy, .quiet, .offline:
             return [
                 git, gh, check(.ghGit, .pass, "git asks gh for GitHub's credentials."), claude, login,
-                check(.power, .pass, "This Mac never sleeps on its own."), tailscale, linux,
+                check(.power, .pass, "This Mac never sleeps on its own."), tailscale, linux, piInstalled,
             ]
         case .firstRun:
             var downloading = check(.linux, .working, "Downloading the Linux base image.")
@@ -286,6 +303,7 @@ public final class FixtureDaemon: DaemonConnection, @unchecked Sendable {
                     hint: "In System Settings → Energy, turn on Prevent automatic sleeping when the display is off."),
                 tailscale,
                 downloading,
+                noPi,
             ]
         case .freshMac:
             return [
@@ -312,6 +330,7 @@ public final class FixtureDaemon: DaemonConnection, @unchecked Sendable {
                 check(
                     .linux, .fail, "Can't download the Linux base image: the network is unreachable.",
                     hint: "Check this Mac is online, then try again.", fixable: true),
+                noPi,
             ]
         }
     }

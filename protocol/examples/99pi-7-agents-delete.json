@@ -1,0 +1,20 @@
+{
+  "description": "Deleting it removes its own sessions, and nothing of the login every Pi agent shares.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 156,
+    "method": "agents.delete",
+    "params": {
+      "agent": "able-aqua-bison",
+      "force": true
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 156,
+    "error": {
+      "code": -32602,
+      "message": "Invalid params: unknown field `agent`, expected one of `host`, `ref`, `force`"
+    }
+  }
+}

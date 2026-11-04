@@ -75,6 +75,10 @@ async fn socket_answers_every_example_exactly() {
             link.send(line).await;
             link.send(b"\n").await;
             assert_eq!(link.reply().await, ex.response, "{}", ex.name);
+            // What it set off goes to whoever's subscribed, on the other connection.
+            for (i, event) in ex.events.iter().enumerate() {
+                assert_eq!(&conn.reply().await, event, "{}: event {i}", ex.name);
+            }
             continue;
         }
         conn.send(line).await;

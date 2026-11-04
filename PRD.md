@@ -8,7 +8,7 @@ VibeOS Native (repo: `vibe-os-native`) turns an always-on Apple Silicon Mac on t
 
 The MCP server is the main interface. The menu bar lists the agents this app started on every host, with live status, so a Linux server feels like part of the Mac. Clicking one opens Terminal.app attached to its session. Closing the window detaches; the agent keeps running.
 
-Status comes from agent-tail, which reads Claude Code's own transcripts, so no hooks are needed. That's what lets the daemon put idle agents to sleep and give their resources back. VibeOS inspired the product, but there is no shared code and no compatibility promise.
+Status comes from agent-tail, which reads the coding agents' own transcripts, Claude Code's or Pi's, so no hooks are needed. That's what lets the daemon put idle agents to sleep and give their resources back. VibeOS inspired the product, but there is no shared code and no compatibility promise.
 
 ## Goals and non-goals
 
@@ -18,9 +18,9 @@ v1 is one owner, one Mac, any number of Linux hosts, many agents. MCP matters mo
 
 1. **MCP is the control plane, shaped like VibeOS's.** The round that already drives a working orchestrator stays: start an agent with a prompt, `vibe_wait`, read what it said, answer its questions with `vibe_send`. It's folded to one agent per worktree. Host setup (projects, profiles, the Linux template) lives in Settings.
 2. **One agent, one worktree, one compartment.** Agents never share a checkout, because parallel work no longer needs sequencing inside one worktree.
-3. **Profiles pick the environment.** Each project has a few profiles, such as `software-eng-linux` and `software-eng-mac`. A profile sets the environment, model, reasoning level, permission mode and memory. `linux` is a micro-VM; `macos` runs natively under a resource governor, for Xcode and other Mac toolchains.
+3. **Profiles pick the agent and the environment.** Each project has a few profiles, such as `software-eng-linux` and `software-eng-mac`. A profile sets the agent (Claude Code or Pi), the environment, model, reasoning level, permission mode and memory. `linux` is a micro-VM; `macos` runs natively under a resource governor, for Xcode and other Mac toolchains.
 4. **Many agents, responsive hosts.** An agent's memory is a ceiling, not a reservation: start as many as you like, such as ten 4 GB agents on a 12 GB host, and the host swaps if they really use it all. VibeOS never refuses an agent for memory; it holds each to its ceiling and shows what each, and each host, really uses. Asleep agents use no CPU, and asleep `linux` VMs no RAM, so many more can exist, limited only by disk. No agent can starve macOS, the daemon or another agent of CPU (`reserve_cores`, `cpu_cores`) or processes (`max_processes`), and none can take more memory than its ceiling.
-5. **Know what every agent is doing without hooks.** agent-tail reads Claude Code's transcripts, and no Claude config is changed. (A per-launch flag such as `--mcp-config` writes nothing, so it's allowed: see Shared MCP services.)
+5. **Know what every agent is doing without hooks.** agent-tail reads Claude Code's and Pi's transcripts, and no agent's config is changed: per-launch flags and extensions only. (A per-launch flag such as Claude's `--mcp-config` or Pi's `-e` writes nothing, so it's allowed: see Shared MCP services.)
 6. **Idle agents cost close to nothing and wake exactly where they were.** About a minute after agent-tail says an agent is at rest with nothing attached, a `linux` VM is paused and saved to disk, freeing all its RAM, and a `macos` agent is frozen. A send or an attach brings it back mid-prompt, even mid-question.
 7. **No custom terminal.** Clicking an agent opens Terminal.app attached to the live session. Closing it detaches.
 8. **Nothing is lost by accident.** Agents survive the menu bar app quitting, the daemon restarting or upgrading, and clients disconnecting. After a reboot they come back asleep. Deleting an agent with unsaved work is refused.
@@ -31,7 +31,7 @@ v1 is one owner, one Mac, any number of Linux hosts, many agents. MCP matters mo
 
 **Non-goals for v1**
 
-- Harnesses other than Claude Code. Pi comes next, added as a profile field; agent-tail already reads it, CI-verified.
+- Harnesses other than Claude Code and Pi.
 - Several agents in one worktree.
 - Reaching ports inside `linux` VMs (dev servers, previews). Agents test from inside their VM.
 - A menu bar on a Linux host. Linux hosts are driven from the Mac's menu bar, over MCP, or with the `vibe` CLI.
@@ -77,20 +77,23 @@ An agent, its worktree and its compartment are one unit. They're created togethe
 | Host | A machine running `vibed`: the Mac, or a Linux host. Each host keeps its own projects, profiles and agents; the Mac's menu and MCP show all of them. One owner for all. | — |
 | Linux host | A Linux server (a VPS, say) added by its SSH address. `vibed` runs there as a systemd user service, and agents run natively under cgroups v2. | The server |
 | Project | A GitHub repo cloned onto a host by `owner/name`, or a local repo registered by path. Added in Settings, where its profiles live too. | `~/VibeOS/projects/<name>` |
-| Profile | A per-project preset for starting agents: environment, model, reasoning level, mode (`auto` or `bypass`) and memory. A new project starts with one per environment. | Settings → Projects (SQLite) |
-| Agent | One Claude Code process and all its children, started from a profile, working in its own worktree inside its own compartment. | Process tree under a shim |
+| Profile | A per-project preset for starting agents: agent (Claude Code or Pi), environment, model, reasoning level, mode (`auto` or `bypass`) and memory. A new project starts with one per environment. | Settings → Projects (SQLite) |
+| Agent | One Claude Code or Pi process and all its children, started from a profile, working in its own worktree inside its own compartment. | Process tree under a shim |
 | Worktree | The agent's git worktree, on its own branch. Deleted with the agent; the branch is kept. | `~/VibeOS/worktrees/<project>/<ref>` |
 | Compartment | The agent's isolation boundary: a micro-VM for `linux` on the Mac, a cgroup on a Linux host, a governed process tree for `macos`. | — |
 | Environment | `linux` or `macos` (`macos` only on the Mac). Set by the profile, and fixed for the agent's life. The host decides how `linux` runs: a VM on the Mac, a cgroup on a Linux host. | The profile |
 | Linux template | The Linux machine every `linux` agent boots a copy of: whatever you install in the toolbox shell (`apt`, `curl … \| sh`, `npm -g`). Versioned. | Host disk image |
 | Linux home | Logins and dotfiles every `linux` agent starts with (`gh`, `gcloud`, `~/.gitconfig`), set up in the toolbox shell. Kept apart from the template so a rebuild doesn't lose them. | Host disk image |
 | Linux Claude config | Your Claude setup for `linux` agents (CLAUDE.md, settings, skills, MCP servers), made in the toolbox shell. Copied into each agent's own `~/.claude` when it starts. | `~/VibeOS/linux-claude/` |
-| Managed layer | Tools the daemon keeps current for every `linux` VM. In v1 that's only Claude Code. | Host disk image |
+| Linux Pi directory | What you keep for Pi in `linux` agents: settings, models, extensions. Every Pi VM has it as a share read-only at virtio-fs, so only you on the Mac can change it. | `~/VibeOS/linux-pi/` |
+| Linux Pi logins | Your one Pi login for `linux` agents. No guest mounts it, and only the daemon writes it. | `~/VibeOS/linux-pi-logins/` |
+| Linux Pi toolbox agent dir | The toolbox's own private copy of that login, where `/login` there writes. Each Pi VM has one like it in its own directory. | `~/VibeOS/linux-pi-signin/` |
+| Managed layers | Tools the daemon keeps for `linux` VMs: Claude Code, kept current, for every agent that runs it, and in a layer of its own the Pi version this build pins, for those that run Pi. | Host disk images |
 | Toolbox shell | A Terminal session in a writable Linux VM, for changing the template and the Linux home. | Settings → Linux Toolbox, or `vibe toolbox` |
 | Host limits | Everything that isn't per profile: cores kept for macOS, CPU cores per agent, agents awake at once, process count, disk. | Settings → Host, or `~/.config/vibeos/host.toml` |
 | Snapshot | A sleeping `linux` agent's whole VM, RAM included, saved to disk. Restoring it resumes the agent exactly. | `~/VibeOS/snapshots/<ref>` |
 | Session | The PTY the agent runs in. A shim holds it, so it outlives every client. | `…/run/<ref>.sock` |
-| Transcript | The session file Claude Code writes on its own. agent-tail reads it to get status. | `macos` and Linux hosts: `~/.claude/projects/`; `linux` on the Mac: the agent's own Claude home on the Mac |
+| Transcript | The session file the agent writes on its own. agent-tail reads it to get status. | Claude: `macos` and Linux hosts, `~/.claude/projects/`; `linux` on the Mac, the agent's own Claude home on the Mac. Pi: `macos` and Linux hosts, `~/.pi/agent/sessions/`; `linux` on the Mac, the agent's own `pi-sessions/` on the Mac |
 | Client | Anything attached to an agent or calling `vibed`: Terminal via `vibe attach`, an MCP client, or the menu bar app. | — |
 
 ## Key user flows
@@ -113,7 +116,7 @@ An agent's life runs setup → start (worktree and compartment included) → wor
    - check there's room: disk to spare, and fewer than `max_awake_agents` awake. Never memory: the profile's memory is the agent's ceiling, not a reservation
    - create the compartment: boot the VM for `linux`, or set up the governed tree for `macos`
    - run the optional `.vibe/setup.sh` inside it
-   - pre-fill Claude's state so it opens straight to its prompt: first-run onboarding done (otherwise Claude stops at its theme picker) and the worktree trusted. Then start the shim, and launch `claude --session-id <uuid>` with the profile's model, reasoning level and mode. The prompt is an argument, never pasted, so a startup dialog can't swallow it.
+   - pre-fill Claude's state so it opens straight to its prompt: first-run onboarding done (otherwise Claude stops at its theme picker) and the worktree trusted. Then start the shim, and launch `claude --session-id <uuid>` with the profile's model, reasoning level and mode. The prompt is an argument, never pasted, so a startup dialog can't swallow it. A Pi profile starts the same way, with nothing to pre-fill: first, Pi's own `pi auth check` where it can be run, or a look at its login files in a VM, so a profile whose model it has no login for is refused. Then `pi --session-id <uuid>` with its model and thinking level, `--approve` for the worktree, and the prompt after `--`, with a space before a leading `@`, which Pi would otherwise read as a file to attach.
    - agent-tail starts tailing the transcript
 
    If a step fails, the steps before it are undone, the new branch included, and the call says why (for `.vibe/setup.sh`, its last line of output). The agent's record is written first, so a start cut short by a crash of `vibed` is undone the same way when `vibed` starts again.
@@ -135,7 +138,7 @@ A Rust daemon owns all state and logic. Every other part is a thin client of it.
 | `vibe-shim` | Rust | One per awake agent, on the host, detached (its own session) | Owns the agent's terminal end: PTY (`macos`) or a vsock stream to `vibe-guest` (`linux`), a scrollback ring buffer, and a screen model (`vt100` crate) for `read_output` and redraw on attach. Serves `run/<ref>.sock`. |
 | `vibe-vm` | Swift (Virtualization.framework) | One per awake `linux` agent, detached | Boots the agent's VM, or restores it from its snapshot. Serves `run/<ref>.vm`, which carries vsock streams into the guest for the shim. To sleep, it pauses the VM, saves its state to disk and exits. Holds the `com.apple.security.virtualization` entitlement. |
 | `vibe-guest` | Rust, static Linux binary | PID 1 inside each VM | Starts Claude as the unprivileged user `vibe` on a PTY. Reports the process tree for the idle rules. Freezes Claude's tree before a save. After a restore, sets the clock from the host, waits for the shared folders to answer, then thaws Claude. If the vsock link drops, Claude keeps running until the shim reconnects. Serves the shared services' socket to the agent, and carries it to the Mac over a relay the Mac dials. Its contract, the kernel command line it boots with and its vsock ports, is in `protocol/vibe-guest/`. |
-| `vibe` CLI | Rust | On demand; linked into `/usr/local/bin` at setup | `vibe attach <ref>`, `vibe ls`, `vibe doctor`, `vibe toolbox`, `vibe setup-token` (the Claude login for `linux` agents), `vibe mcp` (a stdio bridge for clients that can only start a command), `vibe rpc` (the socket API over stdio, which the Mac uses through SSH), `vibe mcp-proxy` (a shared service over stdio, as agents' MCP clients start it), and `vibe key`, `vibe project`, `vibe profile` and `vibe service` for setting up a Linux host without the menu bar. |
+| `vibe` CLI | Rust | On demand; linked into `/usr/local/bin` at setup | `vibe attach <ref>`, `vibe ls`, `vibe doctor`, `vibe toolbox`, `vibe setup-token` (the Claude login for `linux` agents), `vibe mcp` (a stdio bridge for clients that can only start a command), `vibe rpc` (the socket API over stdio, which the Mac uses through SSH), `vibe mcp-proxy` (a shared service over stdio, as agents' MCP clients start it), and `vibe key`, `vibe project`, `vibe profile`, `vibe service` and `vibe pi` for setting up a Linux host without the menu bar. |
 
 **Restarts.** Shims and `vibe-vm` processes are detached from `vibed`. A daemon crash or upgrade leaves every agent running, and on start `vibed` re-adopts them by scanning `run/`: a shim serves `<ref>.sock` there and a `vibe-vm` `<ref>.vm`. Each shim leads its own session and process group, so launchd ending `vibed`'s job leaves them alone; on a Linux host the systemd unit (#16) must use `KillMode=process`, or restarting `vibed` would kill the shims in its cgroup.
 
@@ -224,17 +227,20 @@ Every agent runs in its own compartment, in the environment its profile names. `
 
 A profile is everything you choose when starting an agent, saved under a name. Profiles belong to a project and are edited in Settings → Projects. A new project starts with these two:
 
-| Profile | Environment | Model | Reasoning | Mode | Memory |
-| --- | --- | --- | --- | --- | --- |
-| `software-eng-linux` | `linux` | Opus | high | auto | 4 GB |
-| `software-eng-mac` | `macos` | Opus | high | auto | 4 GB |
+| Profile | Agent | Environment | Model | Reasoning | Mode | Memory |
+| --- | --- | --- | --- | --- | --- | --- |
+| `software-eng-linux` | Claude | `linux` | Opus | high | auto | 4 GB |
+| `software-eng-mac` | Claude | `macos` | Opus | high | auto | 4 GB |
 
-- **Model:** Opus or Sonnet (`--model`).
-- **Reasoning:** Claude's effort level (`--effort`): `low`, `medium`, `high`, `xhigh` or `max`.
-- **Mode:** `auto` by default, or `bypass` (`--dangerously-skip-permissions`), in either environment. Bypass on `macos` is the owner's call.
+- **Agent:** Claude Code by default, or Pi. Starter profiles are Claude's; a Pi profile, `pi-linux`, is one click in Settings → Projects. What's saved without an agent is Claude's.
+- **Model:** for Claude, Opus or Sonnet (`--model`). For Pi, `provider/id` as `pi --list-models` shows it (`--model`), or none for what Pi's own settings and logins give. VibeOS doesn't pick a provider. A profile's model is checked for its form when saved, and for a login when an agent starts; that the provider has such a model only Pi can say, once it runs.
+- **Reasoning:** Claude's effort level (`--effort`) or Pi's thinking level (`--thinking`): `low`, `medium`, `high`, `xhigh` or `max`.
+- **Mode:** for Claude, `auto` by default, or `bypass` (`--dangerously-skip-permissions`), in either environment. Bypass on `macos` is the owner's call. Pi has no permission modes: it never asks before running a tool, so it's always the equivalent of `bypass`. In `linux` that needs no choice. On `macos`, with no file sandbox, it takes the same opt-in as Claude's bypass, said in the call that puts Pi there.
 - **Memory:** the agent's high-water mark: a `linux` VM's fixed RAM, a Linux host's cgroup `memory.max`, or a `macos` agent's hard limit. It's a ceiling the agent is held to, never memory set aside for it, so agents' memory may add up to more than the host has. 4 GB by default, and adjustable per profile from 1 GB to 1 TB, in whole MB.
 
-On a Linux host, a new project starts with one profile, `software-eng-linux`, with the same defaults. MCP clients see each project's profiles in `vibe_list_projects` and pass one by name to `vibe_start_agent`. An agent can't change profile or environment; start a new one `from` the same branch instead.
+**Shared MCP services** are the same for either agent, and only their injection differs, per launch and written nowhere: Claude takes them as `--mcp-config`, and Pi as `-e vibe-services.ts`, an extension shipped with VibeOS (in the Pi layer for a VM, and beside a native agent) that registers each `vibe-<service>` from `VIBE_SERVICES` as `vibe mcp-proxy <service>`. A profile with them off gets neither. Pi never asks, so what a shared service allows, it does unprompted.
+
+On a Linux host, a new project starts with one profile, `software-eng-linux`, with the same defaults. MCP clients see each project's profiles, with their agents, in `vibe_list_projects` and pass one by name to `vibe_start_agent`. An agent can't change profile or environment; start a new one `from` the same branch instead.
 
 ### Host limits
 
@@ -280,7 +286,8 @@ A `linux` agent boots a stack of layers. You build the middle once, the daemon k
 agent VM = base image      ships with the app: Debian slim, git, gh, curl,
                            ripgrep, jq, build-essential, Python 3, Node LTS, mise
          + Linux template  what you installed in the toolbox shell   read-only
-         + managed layer   Claude Code, updated daily by the daemon  read-only, first on PATH
+         + managed layers  Claude Code, updated daily by the daemon, read-only, first on PATH
+                           and for a Pi agent, Pi, the same way
          + Linux home      your logins and dotfiles                  read-only
          + agent's copy    everything this agent writes              discarded on delete
 ```
@@ -311,17 +318,20 @@ Repos don't customize the VM themselves. Project dependencies go in `.vibe/setup
 | What | Why the frozen template doesn't fit | How it works instead |
 | --- | --- | --- |
 | Claude Code | It must stay current | The managed layer: the daemon downloads each new release into a new layer version. Claude's own auto-updater is off inside VMs |
+| Pi | Most agents don't need it, and what its agent dir holds, its transcripts and its screen are all read here, so a new version is checked first | A layer of its own, `pi-<version>.img`: the version this build of VibeOS pins, not the newest, from GitHub's standalone release, checked against its `SHA256SUMS`, once a profile runs Pi in a VM or the owner asks in Settings. A new one comes with a new VibeOS, and moving the pin means looking again at what Pi reads, runs and writes, at the broker's rules for a login, and at the screen messages and provider keys read here (decided by EM, Nov 4, under Lee's delegation: per the issue's Risk 3, a new version mustn't change any of that unchecked; and a layer of its own, as Pi isn't Claude's to update). `/opt/vibeos/pi/` holds the binary, its assets and `vibe-services.ts`; `/opt/vibeos/bin/pi` is a small wrapper for it that takes any Claude token out of its environment, and `/opt/vibeos/bin/fd` is the `fd` Pi would otherwise download into its agent dir, pinned by hash. Only Pi agents' VMs and the toolbox stack it, so a Claude agent's snapshot still restores on the disks it was saved with. Pi's version check and telemetry are off |
 | Claude's login and config | A login that refreshes itself can't be copied per agent: a refresh in one copy leaves the others dead. Sharing one Claude home across VMs failed the spike | Login: a long-lived `claude setup-token` token, kept in Keychain and injected as `CLAUDE_CODE_OAUTH_TOKEN`, so nothing refreshes. Config: copied per agent (Mounts, below) |
+| Pi's login | The owner signs in to Pi themselves, as to Claude: VibeOS picks no provider and supplies no key. Pi's OAuth refresh tokens rotate, and there's no long-lived token to use instead. But Pi runs a `!command` it finds in `auth.json` and has to write that file, so no two VMs can share it | One login per user, kept by a copy per VM (decided by EM, Nov 4, under Lee's delegation: VM isolation is a core guarantee, and a hostile repo must not reach other agents). Each Pi VM and the toolbox has a private agent dir with its own `auth.json`. The daemon is the only writer of the store, `~/VibeOS/linux-pi-logins/auth.json`, which no guest mounts. Every few seconds it merges each copy in use with the store, per provider, under that copy's lock. An agent asleep isn't looked at, so its copy is brought up to date before its VM is restored or thawed; if something still holds its lock then, that's left to the next look, a few seconds on. **What it passes on:** only logins parsed as plain, field by field, written out afresh, from a file of at most 4 MiB, never through a link. Plain means what Pi 1.5's own types allow, as far as they mean only themselves: an API key, with or without a flat map beside it, or none at all, as Bedrock's and Vertex's aren't always (a profile, a credential chain, a file), and an OAuth login with a provider's own plain values. A key that's a `!command`, a `$VARIABLE` or anything else not plain goes nowhere: the owner is told, and only that provider in that VM is affected. A file that can't be read as an object of logins, or a stuck lock, quarantines that VM's copy: nothing is read from it or written to it until it's put right, and every other copy carries on. **Who wins:** a change in the toolbox is the owner's and goes through whatever it replaces, up to what a copy can hold, what agents offered making way for it, and one sign-out there is everyone's. From an agent's VM only a sign-in to a provider with no login yet, which the owner is told of, or the same OAuth login with a later expiry, goes through. No login of 32 KiB or more does. A new provider is held to 64 providers and 256 KiB in all, so an agent can't fill the store, and a refresh isn't, so one filled by a hostile VM never stops a rotated token reaching the rest. It can use up that room, though: other agents' first sign-ins are then refused and the owner told, until the owner forgets what's there, in Settings or with `vibe pi forget`. That agent can offer more, so it has to be stopped too. A forget also isn't final against a login still in use: an agent's refresh of it right after is a new login to the store, offered like any other, so it comes back, listed as offered, and the owner sees that. A login with no key isn't an agent's to offer, as it would sign every agent in from what's around it, nor is a first sign-in let through over a key of the owner's in `pi.env`, Bedrock's and Vertex's own variables among them, or in `models.json`. What doesn't go through stays in that VM. **An OAuth login the store has already moved on from** is a stale read being written back, from the toolbox too, and is put right rather than taken. So is every login going at once, which is what Pi's `{}` looks like after a read that missed the file: forgetting several at once is what `vibe pi forget` and Settings are for. **What's left** (decided by EM, Nov 4, under Lee's delegation): two VMs refreshing a rotating token at once. Their tokens expire together, and until the daemon passes on the first refresh, up to its few seconds, another can spend the same refresh token, which the provider may refuse or answer by ending the login. Whichever has the later expiry is kept and given to the other, which recovers at its next request unless the provider ended the login: then the owner signs in again. A read in a guest just after the daemon's write can also return the old file for about a second, as the spike found across VMs, with the same result. And with a single provider signed in, a toolbox `{}` from a missed read can't be told from a sign-out. Keys in `pi.env` are out of reach of all of this. None of it has been measured on real tokens |
 | Other self-updating CLIs (`gcloud`, `gh`) | An update inside an agent lands in that agent's throwaway copy | The `[update]` commands in `toolbox.toml`, or updating by hand in the toolbox shell |
 | Shared, writable state | Can't be a read-only layer | Read-write mounts (below) |
 
 #### Mounts
 
-Mounts are the same for every agent:
+Every agent has these mounts, its coding agent's state being the one difference:
 
 - **The worktree**, read-write, at the same absolute path as on the host.
 - **The project's `.git` directory**, read-write, at its host path. A worktree's `.git` file points into it. Git's lock files handle concurrent ref updates from several VMs: they use O_EXCL, which the spike showed holds across VMs, unlike `flock` and `mkdir` locks. Agents run with `gc.auto=0`, and the daemon runs `git maintenance` on the host during quiet periods: hourly, on each project none of whose agents is awake. It runs the `gc` task when `gc.auto` or `gc.autoPackLimit` says there's work to do, and the `commit-graph` task when `maintenance.commit-graph.auto` does, the same on every git version, rather than whatever that version's default strategy is.
-- **The agent's Claude home**, a per-agent host directory mounted as `~/.claude`. Shared MCP services don't use its seeded `mcpServers`: they're offered per launch. When the agent starts, it's seeded with a copy of the Linux Claude config (CLAUDE.md, settings, skills, MCP servers) made in the toolbox shell. agent-tail reads the transcripts from it on the host, and `claude --resume` finds them after a crash or reboot. It isn't shared between agents: VibeOS shares one `~/.claude` on a single disk, but across VMs the spike lost appended lines and served stale files under a lock.
+- **Pi's directories and sessions**, for a Pi agent, in place of a Claude home. Its private agent dir, `pi-agent/` in its host directory, at `~/.pi/agent`, read-write and seen by no other VM. `~/VibeOS/linux-pi/` at `~/.pi/config`, read-only at the virtio-fs share itself, which no guest can undo and which doesn't depend on the case of a name, or on a list of the names Pi reads, as the bind mounts it replaced did (decided by EM, Nov 4, under Lee's delegation: a share can't be got around by a name nobody listed). Each thing in that share gets a link in the private agent dir when the VM launches, so Pi finds the owner's settings, models and extensions, and saving over one fails with a warning, as `/model`'s default does. What Pi writes under any other name stays in that VM, and what a VM does to its own links reaches nothing else. And a per-agent host directory, `pi-sessions/`, at `~/.pi/sessions`, which `PI_CODING_AGENT_SESSION_DIR` points at, so agent-tail reads the transcripts on the host and a resume finds them after a crash or reboot. The toolbox has its private agent dir and not the share (decided by EM, Nov 4, under Lee's delegation: it's one more copy the daemon keeps in step, and it has `sudo` and the Claude token, so nothing the owner's settings load runs there).
+- **The agent's Claude home**, a per-agent host directory mounted as `~/.claude`, for a Claude agent. Shared MCP services don't use its seeded `mcpServers`: they're offered per launch. When the agent starts, it's seeded with a copy of the Linux Claude config (CLAUDE.md, settings, skills, MCP servers) made in the toolbox shell. agent-tail reads the transcripts from it on the host, and `claude --resume` finds them after a crash or reboot. It isn't shared between agents: VibeOS shares one `~/.claude` on a single disk, but across VMs the spike lost appended lines and served stale files under a lock.
 - **Shared package caches** (npm, pnpm, cargo, pip), read-write.
 
 #### Sleep and wake
@@ -345,7 +355,8 @@ A Linux server runs the same `vibed`, so it joins the Mac as another host. Its a
 ### Adding a Linux host
 
 - **Settings → Hosts → Add Linux Host…** takes an SSH destination, such as `me@vps.example.com` or a Tailscale name. The app installs or upgrades `vibed` over SSH (static builds of `vibed`, `vibe` and `vibe-shim` in `~/.local/lib/vibeos`, plus a systemd user service with lingering on), checks `git`, `gh` and `claude` there, and lists what's missing.
-- The server has its own logins, set up on the server itself: `gh auth login`, and `claude` with `/login`. A shared MCP service is signed in to once, from the app on the Mac; a linked Linux host is where that login lives by default (see Shared MCP services). It's one machine with one `~/.claude`, like a VibeOS box, so plain `/login` works; the cross-VM problem that forced `setup-token` doesn't apply.
+- The server has its own logins, set up on the server itself: `gh auth login`, `claude` with `/login`, and if it'll run Pi, `pi` with `/login`. A shared MCP service is signed in to once, from the app on the Mac; a linked Linux host is where that login lives by default (see Shared MCP services). It's one machine with one `~/.claude` and one `~/.pi/agent`, like a VibeOS box, so plain `/login` works; the cross-VM problem that forced `setup-token` doesn't apply.
+- Pi is optional. Settings → Agents, or `vibe pi install`, downloads the standalone build of the version this VibeOS pins, checked against the release's `SHA256SUMS`, into VibeOS's data directory and links `~/.local/bin/pi`, never over one that isn't VibeOS's. `vibe doctor` reports it. A `pi` already on the server's `PATH` is used as it is, as `claude` is. The same goes for `macos` agents on the Mac: no Homebrew and no Node.
 - Projects are cloned on the host that runs their agents. The same GitHub repo can be a project on the Mac and on a server.
 - There's no toolbox or Linux template on a server: install tools on it directly, as you would on any server.
 - A server on the Mac's local network needs VibeOS's Local Network access (macOS counts `vibed` and its `ssh` as the app's, but only the app can ask). Before the install, the app asks for it when the destination is on the local network, and while it's off says so and how to turn it on (System Settings > Privacy & Security > Local Network > VibeOS). A server out on the internet needs nothing.
@@ -354,7 +365,7 @@ A Linux server runs the same `vibed`, so it joins the Mac as another host. Its a
 ### How agents run on a Linux host
 
 - Each agent gets its own cgroup v2 (through systemd, as the user, no root). Memory, CPU and process count are hard kernel limits from the profile and host limits.
-- Sleep uses the cgroup freezer: exact, like `SIGSTOP`, but memory stays allocated. Under memory pressure a frozen agent is ended and later resumes with `claude --resume`.
+- Sleep uses the cgroup freezer: exact, like `SIGSTOP`, but memory stays allocated. Under memory pressure a frozen agent is ended and later resumes with the agent's resume.
 - The worktree, `.git`, transcripts and the `vibe-shim` session work exactly as on the Mac; it's the same code.
 - File containment is not in v1. `bubblewrap` could add it later, and a server with KVM could later get a micro-VM backend.
 
@@ -463,7 +474,7 @@ What's connected stays until step 3 succeeds, so a sign-in given up on loses not
 **Offering them.** On by default for every profile, with a per-profile off switch (`shared_services`; absent means on; `vibe profile set … --shared-services off`). The switch is read at each launch, a `--resume` included, so switching it off takes the `vibe-*` servers from its agents' next launches, and refuses a shim that's already there the next time it connects. A VM's relay goes at once. A profile that's off gets nothing offered and no relay. Each launch offers every supported service, connected or not, so a service connected later reaches agents already running. The proxy doesn't know which kind of agent is calling; only how it's offered differs, and neither way writes a file:
 
 - **Claude Code:** `--mcp-config '{"mcpServers":{"vibe-linear":{"type":"stdio","command":"…/vibe","args":["mcp-proxy","linear"]}}}'`. It adds to the owner's own servers, which keep working; there's no `--strict-mcp-config`. Tools are `mcp__vibe-linear__*`. The `vibe-` prefix is reserved, so nothing is clobbered. By default no allow rule is added, so Claude's permission prompts still govern writes. Each service has a per-host opt-in, **Run tools without asking**, which adds `--allowedTools mcp__vibe-linear__*` to launches from then on.
-- **Pi**, once #52 is in: the same JSON in `VIBE_SERVICES`, read by an extension (`pi -e …/vibe-services.ts`) that registers each server for the session. Pi has no prompts, so it needs no opt-in.
+- **Pi:** the same JSON in `VIBE_SERVICES`, on the launch of every Pi agent, native or in a VM, with `pi -e <its vibe-services.ts>` added on finding it: beside a native agent, and in the Pi layer for a VM. The extension registers each server for that session, with `pi.registerMcpServer`, writing nothing. They're registered `direct`, not Pi's default of `codemode`, so the model has the tools from its first prompt, as Claude does, under Pi's name for them, `mcp__vibe_linear__<tool>`. Pi hands its environment on to what it starts, so `vibe mcp-proxy` finds its socket and agent as it does under Claude. Pi has no prompts, so it needs no opt-in. A line of `pi.env` can't set any of these, so only the profile turns them on or off.
 
 **The shim never dies.** `vibe mcp-proxy` answers `initialize` and `tools/list` itself, from a catalog cached on disk (tools only, nothing secret), because a server that fails its handshake stays failed for the whole session. Each call connects if it has to. If its broker can't be reached it returns a tool error saying so, and the next call after it's back just works. When the live catalog differs from the cache it sends `notifications/tools/list_changed`. It asks every few minutes, and every 30 s while its broker's away.
 
@@ -510,7 +521,7 @@ The menu bar lists every agent this app started, across all hosts and projects, 
 
 ## Auth, security and trust
 
-An API key is a shell on the Mac, so keys are mandatory and the server listens on loopback by default. Logins follow one rule: a `macos` agent uses the Mac's own logins, and a `linux` agent uses the Linux home, which the owner sets up once.
+An API key is a shell on the Mac, so keys are mandatory and the server listens on loopback by default. Logins follow one rule: a `macos` agent uses the Mac's own logins, and a `linux` agent uses the Linux home and logins the owner sets up once.
 
 - **No root.** `vibed` runs as the logged-in user. v1 has no privileged helper.
 - **Distribution.** Open source under MIT, in a public repo. Releases are a DMG signed with the owner's existing Developer ID and notarized, with Sparkle for updates. Not the Mac App Store, whose sandbox blocks most of this. `vibe-vm` carries the `com.apple.security.virtualization` entitlement.
@@ -519,25 +530,31 @@ An API key is a shell on the Mac, so keys are mandatory and the server listens o
 
 **Who gets which credentials:**
 
-| Environment | GitHub, gcloud and other logins | Claude | Set up by |
-| --- | --- | --- | --- |
-| `macos` | The Mac's own: `gh` as git's credential helper, `~/.config/gcloud` and so on | The Mac's Claude login in Keychain | Logging in on the Mac as yourself, as you already do |
-| `linux` | The Linux home: read-only in every VM, with a per-agent copy on top | A long-lived `claude setup-token` token, kept in Keychain and injected as `CLAUDE_CODE_OAUTH_TOKEN` | One toolbox-shell session, plus one Claude sign-in through `setup-token` |
-| Linux host | The server's own: `gh` and the rest, logged in on the server | The server's `~/.claude`, from `/login` on the server | Logging in on the server once |
+| Environment | GitHub, gcloud and other logins | Claude | Pi | Set up by |
+| --- | --- | --- | --- | --- |
+| `macos` | The Mac's own: `gh` as git's credential helper, `~/.config/gcloud` and so on | The Mac's Claude login in Keychain | The Mac's own `~/.pi/agent`, from `pi` and `/login` | Logging in on the Mac as yourself, as you already do |
+| `linux` | The Linux home: read-only in every VM, with a per-agent copy on top | A long-lived `claude setup-token` token, kept in Keychain and injected as `CLAUDE_CODE_OAUTH_TOKEN` | One login per user, from `pi` and `/login` in the toolbox shell with an API key or a headless option (below). It's kept in `~/VibeOS/linux-pi-logins/`, which no guest mounts, and each Pi VM has a private copy the daemon keeps in step | One toolbox-shell session, plus one Claude sign-in through `setup-token` and, for Pi, one `/login` |
+| Linux host | The server's own: `gh` and the rest, logged in on the server | The server's `~/.claude`, from `/login` on the server | The server's `~/.pi/agent`, from `pi` and `/login` on the server | Logging in on the server once |
+
+Pi's login is the owner's own, with whichever provider they choose: a subscription or an API key, through Pi's `/login`, persisted per user and available to every agent, as Claude's sign-in is. VibeOS picks no provider and supplies no key. A Pi agent is refused at the start, saying how to sign in, only where it's known it can't answer: with a model named, when Pi's own `pi auth check` says `not_ready` where Pi can be run. Otherwise, in a VM or when Pi doesn't say, when the model's provider is one Pi names a key for and there's no login, key in `pi.env` or key in `models.json` for it; or with no model named, when there's none for any. A provider Pi names no key for, an extension's say, or one that can sign in from what's around it, Vertex or Bedrock, is left to try. So this catches little else: not a login that's expired or a key that's wrong. A turn that fails before it starts writes nothing and shows only on Pi's screen. So while a Pi agent's turn has shown nothing, at its start or after a send its transcript hasn't moved on from, the daemon reads its screen after a few seconds, and calls it `errored` with what Pi said, which also ends a `vibe_wait` on it. It takes one of Pi's own messages, with nothing but Pi's help between it and the editor, and no spinner: a message Pi words differently, or an extension's widget below it, reads as before, busy or done, until the transcript moves or the agent is looked at. The toolbox's Pi has the owner's login like any other copy. **Signing in there:** run `pi`, then `/login`. The toolbox has no browser, and a browser login's localhost callback is inside the VM, so Browser login is a dead end there. Choose an API key, or for a subscription Anthropic's "Copy code login (headless)" or OpenAI's "Device code login (headless)". Open the link Pi shows in the Mac's browser, then give Pi the code, or paste back the address you end up on if it asks for a redirect URL, even if that page won't load. Settings and `vibe pi` say the same.
+
+**`vibed` never gives Pi the Claude setup-token**, and refuses `CLAUDE_CODE_OAUTH_TOKEN` and `ANTHROPIC_OAUTH_TOKEN` in `pi.env`. Anthropic's terms keep subscription OAuth to Claude Code. The one place the two meet is the toolbox shell, which holds the token for Claude and stacks the Pi layer. Its `pi` is the wrapper that removes both, so Pi can't pick them up. That's no wall: Pi runs there as the same user as the shell, so a command it runs could read them from that shell. A Pi process also starts from an empty environment plus an allowlist, not `vibed`'s environment, as Pi uses any provider key it finds there: a stray `OPENROUTER_API_KEY` would silently bill that account. A Pi agent's `.vibe/setup.sh` starts from the same allowlist. A key the owner does want Pi to use, on purpose, goes in `~/.config/vibeos/pi.env` (`NAME=value`, private to the owner): that's the one way VibeOS passes one on, on every host. In a VM its `PATH`, `HOME` and the like are left out, as those are the guest's own.
 
 Shared MCP services (Linear, say) have one login, held by one owning host, whichever environment an agent runs in: on a Mac in its Keychain, for its `macos` and `linux` agents alike, and on a Linux host in a `0600` file in `vibed`'s private directory there. Other hosts hold only an access token it gave them, kept the same way. The login itself is never copied (see Shared MCP services).
 
 **Threat model, plainly:**
 
 - `macos` protects the machine's resources: runaway builds, fork bombs, memory leaks. It does not protect your files. A `macos` agent can do anything you can.
-- `linux` protects the host and other agents from a misbehaving agent. It does not protect the Linux home's logins or the Claude token: any agent can use them, and a compromised agent could copy them. For tighter scope, log the Linux home's `gh` into a fine-grained token rather than your full account. Network egress is open.
-- Every agent can write to the project's shared `.git`, so a misbehaving agent could rewrite other branches' refs. Pushed branches on GitHub are the backstop.
+- `linux` protects the host and other agents from a misbehaving agent, with the exceptions below. It does not protect the Linux home's logins, the Claude token or Pi's login: any agent that has them can use them, and a compromised agent could copy them, every Pi VM holding a plain copy of the owner's Pi logins. A Claude agent has no way to Pi's login, and a Pi VM has no Claude token to find.
+- **Between Pi VMs, nothing of Pi's that a guest can write is shared, and nothing in a login runs.** A compromised Pi agent, and any repo's own `.pi/extensions` runs unasked, can do what it likes in its own private agent dir. It can't change what the owner keeps, which is read-only at the share, or put a `!command` in another VM: the daemon passes on only plain logins, reading them without following links and running nothing. **It can still offer a login.** A login's content can't be checked from here, so a refresh or a first sign-in in a VM reaches the others, and other agents' work can then go to an account the attacker holds, at the same provider. Where requests go is held as far as Pi 1.5 is known to take that from a login. A token whose `proxy-ep` isn't a `githubcopilot.com` host stays in that VM, with one exception: a refresh of a login the owner signed in to from the toolbox may use a host under that login's own `enterpriseUrl`, as GitHub Enterprise's does, if that's a domain with a dot in it. A login an agent offered gets no such trust. A first sign-in from an agent that names an enterprise or any other place, with or without a dot, or a Cloudflare account, stays in that VM too, and a refresh can't change those. That's what's known from Pi's source, not a guarantee about what a login can do. Settings and `vibe pi` show a first sign-in, and what was refused, for a week or until the owner signs in to that provider from the toolbox, which replaces that login everywhere, and go on listing a login that came from an agent for as long as it's there. The owner can forget any of them at once, from both. Neither ends what's running in the hostile agent, which can offer another, so stop that agent as well. What's shown is made safe to print first, with nothing of what a guest wrote under a name that isn't a provider's. **A key in `pi.env` isn't protection against a login that's already there.** In Pi a stored login owns its provider, and a key is only looked at when there's none, so an agent's first sign-in isn't let through for a provider the owner has a key for, by any of the variables Pi 1.5 reads for it, Bedrock's and Vertex's included. But one made before the key was set stands until the owner forgets it.
+- **The project's `.git` and the package caches are shared read-write across VMs, for every kind of agent, and that's a way from one agent to another.** Every agent can write to the project's shared `.git`, so a misbehaving agent could rewrite other branches' refs, and it can leave a hook or a `core.fsmonitor` there that runs as `vibe` in another agent of that project when its git next runs. Pushed branches on GitHub are the backstop for refs, and nothing is for that. The caches reach further, across projects: what one agent leaves in them another may build and run. `package_caches = false` turns those off. This predates Pi, and isn't changed by it.
+- For tighter scope, log the Linux home's `gh` into a fine-grained token rather than your full account. Network egress is open.
 - Nothing protects against a stolen API key except revoking it. With external access on, a key works from the internet, so treat it like a password; the public endpoint rate-limits and logs every call.
 - A Linux host's agents can do anything the server's user can. The host protects its resources, not its files.
 - A compromised Linux host can use the tunnel but can't drive the Mac without a valid key, because the Mac checks every forwarded call itself.
 - Shared MCP services are on for every agent by default, so any agent, one running untrusted code in bypass mode included, can act in Linear as the owner through its host's broker. Agents that don't prompt, as Pi's don't, make that sharper. The mitigations are per host: the read-only option, the denylist, the kill switch and the audit log, plus the per-profile off switch. The off switch isn't a wall on a host whose agents run as its user, where a process can reach what the user can: it keeps them from getting the services by accident. In a VM it is one, as no relay is dialed. A compromised owning host exposes the login itself. A compromised follower exposes an access token until it runs out, and can't renew it. Either way one compromised host can act as the owner at the service, as it could with a login of its own; what's shared is that revoking the login cuts off every host.
 
-**Permissions.** Each profile sets Claude's mode: `auto` (the default), or `bypass` (`--dangerously-skip-permissions`). Bypass is safest in `linux`, where the VM is the sandbox. A `macos` profile can use it too; that agent then acts as you without asking, which is the owner's call.
+**Permissions.** Each profile sets Claude's mode: `auto` (the default), or `bypass` (`--dangerously-skip-permissions`). Bypass is safest in `linux`, where the VM is the sandbox. A `macos` profile can use it too; that agent then acts as you without asking, which is the owner's call. Pi never asks, in any environment, so everything said of bypass is true of it. It also trusts the worktree's `.pi/` for each run (`--approve`), as Claude's pre-fill trusts the worktree: a repo's `.pi/extensions` run as code.
 
 Transcripts, scrollback and logs stay on the host that runs the agent; the Mac reads remote ones over SSH and doesn't copy them. Logs redact keys and tokens.
 
@@ -559,7 +576,7 @@ stateDiagram-v2
   AtRest: At rest (done · idle · awaiting_* · errored · interrupted)
   Working: Working (thinking · running_tool · background_work)
   Asleep: Asleep (linux on the Mac — VM saved to disk · macos — SIGSTOP · Linux host — cgroup freezer)
-  Exited: Exited (Claude quit, VM died, or killed — a send resumes it)
+  Exited: Exited (the agent quit, VM died, or killed — a send resumes it)
 ```
 
 Working and At rest come straight from agent-tail's `activity`. Sleeping, pausing and waking are `vibed`'s decisions, made from that activity plus who is attached. MCP clients see the same lifecycle as the states `busy`, `idle`, `question`, `asleep`, `paused` and `exited`.
@@ -568,9 +585,10 @@ Working and At rest come straight from agent-tail's `activity`. Sleeping, pausin
 
 Only transcripts of agents this app spawned are read. agent-tail is fed specific files, never a scan of the whole home folder.
 
-- **By id.** Claude Code is launched with `--session-id <uuid>` generated by `vibed`, so the transcript path is known exactly. `--resume` keeps the same id.
-- **By worktree.** If `/clear` changes the id, `vibed` takes the newest session whose recorded cwd is the agent's worktree. Each worktree has exactly one agent, so this is always exact.
-- **Where.** `macos` transcripts are in the Mac's normal `~/.claude/projects/`, and a Linux host's in its own `~/.claude/projects/`. `linux` transcripts on the Mac are in the agent's own Claude home, which is a directory on the Mac, so tailing works the same way. Each host tails its own agents; the Mac gets their status over the SSH link.
+- **By id.** The agent is launched with `--session-id <uuid>` generated by `vibed`, so its transcript is known exactly: Claude's by its path, Pi's by the `_<uuid>.jsonl` its file name ends in, after the time it began. Pi writes its file at the first user message, and is `busy` until something says otherwise. For Claude, `--resume` keeps the same id; for Pi, `--session-id` is one flag for both start and resume.
+- **By worktree.** If `/clear`, or Pi's `/new`, changes the id, `vibed` takes the newest session whose recorded cwd is the agent's worktree. Each worktree has exactly one agent, so this is always exact.
+- **Where.** `macos` transcripts are in the Mac's normal `~/.claude/projects/` or `~/.pi/agent/sessions/`, and a Linux host's in its own. `linux` transcripts on the Mac are in the agent's own Claude home or `pi-sessions/`, which are directories on the Mac, so tailing works the same way. VibeOS always tells Pi where (`PI_CODING_AGENT_SESSION_DIR`), natively the path Pi would use itself, so a `sessionDir` setting can't lose them and the owner's own `pi --resume` still finds them. Each host tails its own agents; the Mac gets their status over the SSH link.
+- **Pi's states.** agent-tail reads Pi with its own adapter. A Pi agent goes busy → idle, and never `question`: it has no approvals and no ask-user tool, and a long tool is firmly `running_tool`, so it never raises a false hand. It stops as `errored`, with `usage_limit` for a 429, as Claude's do, or when its screen shows a turn failed before it started (Auth).
 - **Polling.** Each agent's reducer gets appended bytes on every file-system event, plus a 1 s poll as a backstop. `vibed` passes `now` in, as the library expects, and sets agent-tail's idle window to the idle debounce. Past that window agent-tail reports only `idle`; the status engine keeps the activity the agent had as the window closed, so a pending question still shows as `question`.
 
 ### Going to sleep
@@ -601,7 +619,7 @@ Wake triggers are `vibe_send`, attach, and a due `/loop` wakeup. Reading doesn't
 
 Never put to sleep: `thinking`, `running_tool` or `background_work`.
 
-`claude --resume` is used only when an agent's processes are gone: after a crash, after a reboot in `macos` or on a Linux host, or when an agent is ended under critical memory pressure. Resuming that way loses a pending question. It re-arms a still-future `/loop` wakeup, but session-only cron jobs are lost; a durable one (`durable: true`, kept in the worktree's `.claude/scheduled_tasks.json`) survives.
+`claude --resume`, or Pi's `--session-id` with no prompt, is used only when an agent's processes are gone: after a crash, after a reboot in `macos` or on a Linux host, or when an agent is ended under critical memory pressure. Resuming that way loses a pending question. Pi writes nothing on a resume, so a turn its transcript left open is taken as interrupted, and the agent as idle, until it writes again. It re-arms a still-future `/loop` wakeup, but session-only cron jobs are lost; a durable one (`durable: true`, kept in the worktree's `.claude/scheduled_tasks.json`) survives.
 
 ### Failures
 
@@ -618,7 +636,7 @@ Never put to sleep: `thinking`, `running_tool` or `background_work`.
 | System sleep | While any agent is awake, `vibed` holds an IOPM no-idle-sleep assertion. Display sleep is still allowed |
 | Low disk | New agents are refused below 10 GB free (proposed). A `linux` agent whose snapshot wouldn't fit stays awake instead of sleeping |
 | The SSH link to a Linux host drops | That host's agents show as unavailable in the menu and MCP. They keep running on the host, and the link reconnects with backoff |
-| A Linux host reboots | systemd starts `vibed` again (the user service has lingering enabled). Every agent there is `asleep` and wakes with `claude --resume` |
+| A Linux host reboots | systemd starts `vibed` again (the user service has lingering enabled). Every agent there is `asleep` and wakes with the agent's resume |
 | Memory pressure on a Linux host | Warn in the menu's header, then end frozen agents, oldest first (resumable), as a last resort. New agents still start. Each cgroup's own memory limit stops a single agent from taking the server |
 | The Mac is offline while a host is the external address | The host keeps answering for its own agents; Mac agents show as unavailable until the tunnel is back |
 | The Mac is off or away while a Linux host's agents use shared services | If that host owns the login, nothing changes for them: it refreshes by itself. A follower goes on with the access token it has until that runs out, then gets a clear tool error saying which host has the login. Signing in again waits for the Mac |
@@ -636,6 +654,7 @@ Never put to sleep: `thinking`, `running_tool` or `background_work`.
 - shared MCP services: the owning host's login, and a follower's access token, in the Keychain on a Mac, and in `services/<service>.login` (`0600`) in the state directory on a Linux host; their settings, states and last-seen tools, nothing secret, in `services.json` beside it, and the last calls to them, with no arguments or tokens, in `services-audit.log` beside that
 - sockets in `…/VibeOS/run/`
 - host limits in `~/.config/vibeos/host.toml`
+- what Pi agents get in their environment on purpose, in `~/.config/vibeos/pi.env`
 - on a Linux host: the same layout under `~/.local/share/vibeos/` (logs in its `logs/`), with projects and worktrees in `~/VibeOS/` and host limits in `~/.config/vibeos/host.toml`
 
 ## Spike results: VM snapshots (2026-10-29)
@@ -668,7 +687,7 @@ A second spike the same day ran several VMs at once, all sharing one folder, the
 | `mkdir` as a lock | Exclusive, but whoever takes it next can read a stale file: a locked counter reached 6 to 40 of 200 |
 | O_EXCL lock files, as git uses for `index.lock` and ref locks | Correct: the locked counter reached 200 of 200 in four runs out of four |
 
-So linux agents don't share a Claude home. Its append-only logs and its login refresh are exactly what failed, and they now use `setup-token` instead. The shared `.git` is safe because git locks with O_EXCL, which a third spike confirmed with real git (below). Nothing else should be shared read-write across VMs.
+So linux agents don't share a Claude home. Its append-only logs and its login refresh are exactly what failed, and they now use `setup-token` instead. The shared `.git` is safe from this because git locks with O_EXCL, which a third spike confirmed with real git (below). Nothing else should be shared read-write across VMs but the package caches, so Pi's login isn't: each VM has a copy, and the daemon alone passes logins between them (Exceptions).
 
 A third spike the same day covered real git, layered disks, the `macos` governor and Claude's real memory use:
 
@@ -702,7 +721,7 @@ Two fixes for the base image came out of it. Claude warns when it runs from outs
 
 None. The last one, one-shot cron jobs being cleared by an unrelated fire, was fixed upstream in agent-tail#130.
 
-**Decided (2026-10-29 and 2026-10-30):**
+**Decided (2026-10-29 and 2026-10-30, and 2026-11-04 where marked):**
 
 *Shape*
 
@@ -711,7 +730,7 @@ None. The last one, one-shot cron jobs being cleared by an unrelated fire, was f
 - One agent per worktree, each with its own compartment.
 - "Host" is in the core from day one: every agent records its host, MCP calls take an optional `host`, and the menu groups by host.
 - Environment backends sit behind three small traits (`Compartment`, `Limiter`, `Sleeper`) and a `Capabilities` record, with one conformance suite every backend must pass.
-- v1 supports Claude Code only. Pi is the next harness.
+- VibeOS runs Claude Code and Pi. Users sign in to Pi themselves, as to Claude: VibeOS picks no provider and supplies no key, and one login per user reaches every agent.
 - Open source under MIT. Releases are signed and notarized with the owner's existing Apple Developer account.
 
 *Profiles and projects*
@@ -725,13 +744,13 @@ None. The last one, one-shot cron jobs being cleared by an unrelated fire, was f
 *Environments*
 
 - `linux` on the Mac runs in a micro-VM on Apple's Virtualization.framework. It sleeps by saving the VM to disk, and wakes exactly where it was, even after a reboot.
-- `linux` disks are read-only ext4 images (base, template, managed layer, Linux home) plus a writable image per agent, stacked with overlayfs inside the guest. Images are never changed in place.
-- `linux` agents on the Mac use the Linux template and home set up in the toolbox shell. Claude Code comes from a daemon-managed layer updated daily, and authenticates with one `setup-token` token. Each agent gets its own Claude home seeded from the Linux Claude config; sharing one across VMs failed the spike.
+- `linux` disks are read-only ext4 images (base, template, managed layers, Linux home) plus a writable image per agent, stacked with overlayfs inside the guest. Images are never changed in place.
+- `linux` agents on the Mac use the Linux template and home set up in the toolbox shell. Claude Code comes from a daemon-managed layer updated daily, and authenticates with one `setup-token` token. Each agent gets its own Claude home seeded from the Linux Claude config; sharing one across VMs failed the spike. Pi comes from a layer of its own at a pinned version. Each Pi VM and the toolbox has a private agent dir, with a copy of the owner's one login that the daemon, the only writer of the store, keeps in step, passing on only plain logins, and the owner's settings come through a read-only share (decided by EM, Nov 4, under Lee's delegation: VM isolation is a core guarantee, and a hostile repo must not reach other agents through Pi). Exceptions and the threat model say what's left: two VMs refreshing a rotating token at once, and a hostile VM offering a login.
 - Sleeping `linux` agents share one snapshot budget, 20 GB by default and adjustable; past it, the oldest snapshot is dropped.
 - `macos` agents use the Mac's own binaries and logins. They are resource-governed only, with no file sandbox and no cleanup outside what VibeOS made. The governor finds their processes by tree walk and session ID.
 - Linux hosts run agents natively under cgroups v2, sleep with the cgroup freezer, and use the server's own logins (`/login` on the server). No micro-VMs or file containment there in v1.
 - npm, pnpm, cargo and pip caches are shared across `linux` VMs by default, with an opt-out.
-- Agents share the project's `.git`, with auto-gc off and maintenance run by the daemon. Git's O_EXCL locks hold across VMs; nothing else is shared read-write across VMs.
+- Agents share the project's `.git`, with auto-gc off and maintenance run by the daemon. Git's O_EXCL locks hold across VMs. Nothing else is shared read-write across VMs but the package caches: no directory of Pi's (decided by EM, Nov 4, under Lee's delegation, which also settles the shared `linux-pi` directory this replaces). The threat model says what those two shares leave open.
 
 *Status and sleep*
 

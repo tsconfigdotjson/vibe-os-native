@@ -37,6 +37,8 @@ The checks:
 To change the contract, edit this directory first, then both sides, and bump
 `protocol_version` for anything a running peer would misread.
 
+**Pi.** The last examples, `99pi-*`, are Pi's: the golden home has a login each for the owner and for `linux` agents (fakes), and a release to install from, and its backend runs the stand-in for Pi.
+
 **Framing.** One JSON value per line, UTF-8, `\n`-terminated, in both
 directions: on the Unix socket, and through `vibe rpc` (stdin/stdout) over
 SSH. A line longer than `max_message_bytes` gets an error and the connection

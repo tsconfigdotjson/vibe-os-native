@@ -1,0 +1,54 @@
+{
+  "description": "Downloads the Pi this build of VibeOS pins for linux agents, checks it against its release's SHA256SUMS and makes it a new layer, which their next fresh boot takes. It takes as long as the download does, and a pi.changed event tells other clients.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 151,
+    "method": "pi.install",
+    "params": {
+      "host": "local",
+      "target": "vm"
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 151,
+    "result": {
+      "host": "local",
+      "logins": [
+        "openai"
+      ],
+      "native": {
+        "path": "/usr/local/bin/pi",
+        "version": "1.5.0"
+      },
+      "vms": {
+        "alerts": [
+          "brave-copper-lynx signed in to xai, and every Pi agent here now uses that login. If that wasn't you, sign in to it from the toolbox to replace it."
+        ],
+        "logins": [
+          "anthropic",
+          "xai"
+        ],
+        "version": "1.5.0",
+        "offered": [
+          {
+            "provider": "xai",
+            "agent": "brave-copper-lynx"
+          }
+        ]
+      }
+    }
+  },
+  "events": [
+    {
+      "jsonrpc": "2.0",
+      "method": "events.event",
+      "params": {
+        "at": "2026-10-30T12:00:00Z",
+        "host": "local",
+        "kind": "pi.changed",
+        "seq": 38
+      }
+    }
+  ]
+}

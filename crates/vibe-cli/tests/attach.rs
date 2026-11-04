@@ -36,6 +36,21 @@ struct World {
     _dir: tempfile::TempDir,
 }
 
+/// A toolbox test that fails leaves its shim behind otherwise, with its shell
+/// still at whatever it was running, spinning for as long as the machine is up.
+/// Found by its command line, as a shim whose output nobody reads may not answer
+/// on its socket, whose path is this world's alone. The shell goes with its
+/// terminal.
+impl Drop for World {
+    fn drop(&mut self) {
+        let socket = self.layout.session_socket("toolbox");
+        let _ = Command::new("pkill")
+            .args(["-KILL", "-f"])
+            .arg(format!("socket {}", socket.display()))
+            .status();
+    }
+}
+
 fn world() -> World {
     let dir = short_tempdir();
     let home = dir.path().canonicalize().unwrap().join("home");

@@ -17,11 +17,11 @@ use std::time::Duration;
 use common::{Golden, TestServer, serve, workspace_bin};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader as TokioBufReader};
-use vibe_core::model::{LOCAL_HOST, ServiceRole, ServiceState};
+use vibe_core::model::{AgentKind, LOCAL_HOST, ServiceRole, ServiceState};
 use vibe_core::paths::Layout;
 use vibe_core::rpc::{
-    AgentStartParams, ErrorCode, HostAddParams, MAX_MESSAGE_BYTES, ProfileUpdateParams,
-    ProjectAddParams,
+    AgentStartParams, ErrorCode, HostAddParams, MAX_MESSAGE_BYTES, ProfileCreateParams,
+    ProfileUpdateParams, ProjectAddParams,
 };
 use vibe_env::testing::TestBackend;
 use vibe_relay::proxy;
@@ -168,8 +168,16 @@ async fn node_with(
     let launches: Arc<Mutex<Vec<vibe_env::Launch>>> = Arc::default();
     let relays: Arc<Mutex<usize>> = Arc::default();
     let check_fails: Arc<AtomicBool> = Arc::default();
+    let os = if place == Place::LinuxHost {
+        "linux"
+    } else {
+        "macos"
+    };
     config.backends = Backends::all(Arc::new(Seen {
-        backend: TestBackend::new(&golden.claude),
+        backend: TestBackend::new(&golden.claude).with_pi_copies(
+            golden.claude.with_file_name("pi"),
+            &Layout::new(&golden.home, os),
+        ),
         launches: launches.clone(),
         vm,
         relays: relays.clone(),
@@ -809,6 +817,321 @@ async fn an_agent_with_the_services_off_gets_no_relay() {
     assert!(text(&answer).contains("Mac unreachable"), "{answer}");
     let _ = child.kill();
     let _ = child.wait();
+}
+
+// ---- Pi: the same services, by another way in.
+
+impl Node {
+    /// A Pi profile, as the owner makes one, on or off for the services.
+    fn pi_profile(&self, name: &str, on: bool) {
+        self.core
+            .create_profile(ProfileCreateParams {
+                project: "app".into(),
+                name: name.into(),
+                agent: Some(AgentKind::Pi),
+                pi_model: Some("mock/mock-model".into()),
+                shared_services: (!on).then_some(false),
+                ..Default::default()
+            })
+            .unwrap();
+    }
+
+    /// The real environment of the agent's Pi as it started, past its allowlist:
+    /// the stand-in notes all it got.
+    fn pi_env(&self, agent: &str) -> HashMap<String, String> {
+        let path = self
+            .layout
+            .agent_dir(agent)
+            .join(format!("{}.env", vibe_env::pi::VM_SESSIONS));
+        common::wait_until("Pi to start", || path.is_file());
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .filter_map(|l| l.split_once('='))
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect()
+    }
+
+    fn pi_args(&self, agent: &str) -> Vec<String> {
+        let path = self
+            .layout
+            .agent_dir(agent)
+            .join(format!("{}.args", vibe_env::pi::VM_SESSIONS));
+        common::wait_until("Pi to start", || path.is_file());
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+}
+
+/// What `vibe-services.ts` registers, started as Pi starts it: the command and
+/// arguments from `VIBE_SERVICES`, with Pi's own environment and nothing else
+/// (`pi-mcp`'s `StdioTransport` hands on `process.env`). Real Pi's loading of the
+/// extension itself is in `pi_e2e`.
+fn start_as_pi_does(env: &HashMap<String, String>, cache: &Path) -> (Shim, Child) {
+    let offered: Value = serde_json::from_str(&env[vibe_env::pi::SERVICES_ENV]).unwrap();
+    let server = &offered["mcpServers"]["vibe-linear"];
+    let args: Vec<String> = server["args"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a.as_str().unwrap().to_owned())
+        .collect();
+    let mut child = Command::new(server["command"].as_str().unwrap())
+        .args(args)
+        .env_clear()
+        .envs(env)
+        // Not the home of whoever's running the tests.
+        .env(vibe_relay::local::CACHE_ENV, cache)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    (Shim::over(Box::new(stdin), stdout), child)
+}
+
+/// A Pi agent on this host, through the whole launch, its real environment, the
+/// real `vibe mcp-proxy` and the real broker, to a stand-in for the service.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pi_agent_reaches_the_broker_by_what_its_launch_gives_it() {
+    let fake = FakeService::start().await;
+    let store = Arc::new(MemoryStore::default());
+    let n = node(&fake, Place::Mac, store.clone(), None, |c| {
+        c.vibe_cli = workspace_bin("vibe").into_os_string();
+    })
+    .await;
+    n.sign_in_here().await;
+    n.pi_profile("pi", true);
+    let a = n.core.start_agent(start("hello", "pi")).await.unwrap();
+
+    // The same JSON Claude's handed, for the extension to read, with `-e` for it.
+    let launch = n.launches.lock().unwrap().last().unwrap().clone();
+    assert!(!launch.args.iter().any(|a| a == "--mcp-config"));
+    let env = n.pi_env(&a.agent);
+    let vibe = workspace_bin("vibe");
+    assert_eq!(
+        serde_json::from_str::<Value>(&env[vibe_env::pi::SERVICES_ENV]).unwrap(),
+        json!({"mcpServers": {"vibe-linear": {
+            "type": "stdio",
+            "command": vibe.to_str().unwrap(),
+            "args": ["mcp-proxy", "linear"],
+        }}})
+    );
+    let args = n.pi_args(&a.agent);
+    let extension = n
+        .layout
+        .agent_dir(&a.agent)
+        .join(vibe_env::pi::EXTENSION_NAME);
+    assert_eq!(args[..2], ["-e", extension.to_str().unwrap()]);
+    assert_eq!(
+        std::fs::read_to_string(&extension).unwrap(),
+        vibe_env::pi::EXTENSION
+    );
+    assert_eq!(env["VIBE_AGENT"], a.agent);
+    assert_eq!(
+        env["VIBE_SERVICES_SOCKET"],
+        n.core.services_socket().to_str().unwrap()
+    );
+
+    // So the shim Pi starts gets there.
+    let dir = tempfile::tempdir().unwrap();
+    let (mut shim, mut child) = start_as_pi_does(&env, dir.path());
+    let answer = blocking(move || {
+        assert!(shim.tools().contains(&"list_issues".to_owned()));
+        shim.call("list_issues")
+    })
+    .await;
+    assert_eq!(text(&answer), "issues on /mcp", "{answer}");
+    let _ = child.kill();
+    let _ = child.wait();
+    let login = SecretStore::load(&*store, "linear")
+        .unwrap()
+        .expect("a login");
+    let calls = fake.calls();
+    let call = calls.last().expect("the tool was called");
+    assert_eq!(call.tool.as_deref(), Some("list_issues"));
+    assert_eq!(call.bearer.as_deref(), Some(login.access.as_str()));
+
+    // Nothing of the login reached Pi, by any way in, and nothing was written.
+    assert!(!answer.to_string().contains(SECRET_MARK));
+    for (name, value) in &env {
+        assert!(!value.contains(SECRET_MARK), "{name}");
+    }
+    let copy = n
+        .layout
+        .agent_dir(&a.agent)
+        .join(vibe_env::pi::VM_AGENT_DIR);
+    assert!(!copy.join("mcp.json").exists());
+    assert!(!launch.cwd.join(".mcp.json").exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pi_profile_with_them_off_is_offered_nothing_and_refused() {
+    let fake = FakeService::start().await;
+    let n = node(
+        &fake,
+        Place::Mac,
+        Arc::new(MemoryStore::default()),
+        None,
+        |c| c.vibe_cli = workspace_bin("vibe").into_os_string(),
+    )
+    .await;
+    n.sign_in_here().await;
+    n.pi_profile("pi-off", false);
+    let a = n.core.start_agent(start("hello", "pi-off")).await.unwrap();
+    let env = n.pi_env(&a.agent);
+    assert!(!env.contains_key(vibe_env::pi::SERVICES_ENV), "{env:?}");
+    assert!(!env.contains_key("VIBE_SERVICES_SOCKET"), "{env:?}");
+    assert!(!n.pi_args(&a.agent).iter().any(|w| w == "-e"));
+
+    // And a shim in that agent all the same is told no.
+    let socket = n.core.services_socket();
+    let dir = tempfile::tempdir().unwrap();
+    let (cache, agent) = (dir.path().to_owned(), a.agent.clone());
+    let refused =
+        blocking(move || Shim::start(&socket, &cache, Some(&agent)).call("list_issues")).await;
+    assert_eq!(refused["result"]["isError"], true, "{refused}");
+    assert!(
+        text(&refused).contains("off for this agent's profile"),
+        "{refused}"
+    );
+    assert!(fake.calls().is_empty());
+}
+
+/// Off or on, it goes by what the profile says at each launch, as for Claude.
+#[tokio::test(flavor = "multi_thread")]
+async fn switching_a_pi_profile_takes_effect_at_its_agents_next_launch() {
+    let fake = FakeService::start().await;
+    let n = node(
+        &fake,
+        Place::Mac,
+        Arc::new(MemoryStore::default()),
+        None,
+        |_| {},
+    )
+    .await;
+    n.pi_profile("pi", true);
+    let a = n.core.start_agent(start("hello", "pi")).await.unwrap();
+    assert!(n.pi_env(&a.agent).contains_key(vibe_env::pi::SERVICES_ENV));
+    n.core
+        .update_profile(ProfileUpdateParams {
+            project: "app".into(),
+            profile: "pi".into(),
+            shared_services: Some(false),
+            ..Default::default()
+        })
+        .unwrap();
+    end_session(&n, &a.agent);
+    let noted = n
+        .layout
+        .agent_dir(&a.agent)
+        .join(format!("{}.env", vibe_env::pi::VM_SESSIONS));
+    std::fs::remove_file(&noted).unwrap();
+    n.core.resume_agent(None, &a.agent).await.unwrap();
+    assert!(!n.pi_env(&a.agent).contains_key(vibe_env::pi::SERVICES_ENV));
+    assert!(!n.pi_args(&a.agent).iter().any(|w| w == "-e"));
+}
+
+/// A Pi agent in a VM: the guest's own shim, and the relay the Mac dials.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pi_agent_in_a_vm_reaches_the_macs_broker_over_the_relay() {
+    let fake = FakeService::start().await;
+    let guest = Guest::start();
+    let n = node(
+        &fake,
+        Place::Mac,
+        Arc::new(MemoryStore::default()),
+        Some(guest.dir.path().to_owned()),
+        |_| {},
+    )
+    .await;
+    n.sign_in_here().await;
+    n.pi_profile("pi", true);
+    n.core.start_agent(start("in a vm", "pi")).await.unwrap();
+
+    // Offered as the guest's own program, with no host socket to find.
+    let launch = n.launches.lock().unwrap().last().unwrap().clone();
+    let offered: Value =
+        serde_json::from_str(env_of(&launch, vibe_env::pi::SERVICES_ENV).unwrap()).unwrap();
+    assert_eq!(
+        offered["mcpServers"]["vibe-linear"]["command"],
+        vibe_relay::local::GUEST_PROGRAM
+    );
+    assert_eq!(env_of(&launch, "VIBE_SERVICES_SOCKET"), None);
+
+    // The Mac dials, for a Pi agent as for any.
+    let relays = n.relays.clone();
+    wait_for("the Mac to dial the VM", || *relays.lock().unwrap() >= 1).await;
+    let (mut shim, mut child) = guest.shim("pi-in-a-vm");
+    let answer = blocking(move || {
+        assert!(shim.tools().contains(&"list_issues".to_owned()));
+        shim.call("list_issues")
+    })
+    .await;
+    assert_eq!(text(&answer), "issues on /mcp", "{answer}");
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(!answer.to_string().contains(SECRET_MARK));
+}
+
+/// A template on an older base has a guest with no socket: the agent still runs,
+/// and is offered nothing it can't reach.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pi_agent_on_an_older_guest_is_offered_nothing() {
+    let fake = FakeService::start().await;
+    let guest = Guest::start();
+    let n = node_with(
+        &fake,
+        Place::Mac,
+        Arc::new(MemoryStore::default()),
+        Some(guest.dir.path().to_owned()),
+        true,
+        |_| {},
+    )
+    .await;
+    n.pi_profile("pi", true);
+    let a = n.core.start_agent(start("hello", "pi")).await.unwrap();
+    assert!(!n.pi_env(&a.agent).contains_key(vibe_env::pi::SERVICES_ENV));
+    assert!(!n.pi_args(&a.agent).iter().any(|w| w == "-e"));
+    assert_eq!(*n.relays.lock().unwrap(), 0);
+}
+
+/// F1: `vibe pi forget --host vps` is about that host, which keeps no such login.
+/// It must never quietly edit the Mac's own.
+#[tokio::test(flavor = "multi_thread")]
+async fn forgetting_a_pi_login_on_a_host_goes_to_that_host_and_leaves_the_macs() {
+    let fake = FakeService::start().await;
+    let p = pair(&fake).await;
+    assert!(vibed::hosts::FORWARDED.contains(&"pi.forget"));
+    let store = p.mac.layout.linux_pi_logins_dir();
+    std::fs::create_dir_all(&store).unwrap();
+    let login = r#"{"xai":{"type":"api_key","key":"k"}}"#;
+    std::fs::write(store.join("auth.json"), login).unwrap();
+    let answer = rpc(
+        &p.mac.core,
+        "pi.forget",
+        json!({"host": "vps", "providers": ["xai"]}),
+    )
+    .await;
+    let message = answer["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("only a Mac keeps a login"), "{answer}");
+    assert_eq!(
+        std::fs::read_to_string(store.join("auth.json")).unwrap(),
+        login
+    );
+    // Asked of the Mac, it's the Mac's.
+    let answer = rpc(&p.mac.core, "pi.forget", json!({"providers": ["xai"]})).await;
+    assert_eq!(answer["result"]["vms"]["logins"], Value::Null, "{answer}");
+    assert!(
+        !std::fs::read_to_string(store.join("auth.json"))
+            .unwrap()
+            .contains("xai")
+    );
 }
 
 // ---- A Linux host's own login, driven from the Mac.

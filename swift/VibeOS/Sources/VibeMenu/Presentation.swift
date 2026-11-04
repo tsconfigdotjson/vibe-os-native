@@ -549,6 +549,16 @@ extension AgentEnvironment {
     }
 }
 
+extension AgentKind {
+    /// `Claude`, `Pi`.
+    public var title: String {
+        switch self {
+        case .claude: "Claude"
+        case .pi: "Pi"
+        }
+    }
+}
+
 extension ClaudeModel {
     public var title: String {
         switch self {
@@ -579,9 +589,28 @@ extension PermissionMode {
     }
 }
 
+/// An alert as it's safe and short enough to show, as `vibed` says it already:
+/// part of one can have come from a guest, whichever `vibed` this is.
+public func cleanAlert(_ alert: String) -> String {
+    let clean = String.UnicodeScalarView(
+        alert.unicodeScalars.filter { scalar in
+            !scalar.properties.isBidiControl && !CharacterSet.controlCharacters.contains(scalar)
+        })
+    let text = String(clean)
+    return text.count > 400 ? String(text.prefix(400)) + "…" : text
+}
+
 /// A profile's settings in a line, in the app's voice: `Linux · Opus · High
 /// · Auto · 4G`.
 public func profileSummary(_ profile: Profile) -> String {
+    if profile.kind == .pi {
+        var parts = [
+            "Pi", profile.environment.title, profile.piModel ?? "Pi's default model",
+            profile.reasoning.title, "No approvals", formatBytes(profile.memory),
+        ]
+        if !profile.sharedServicesOn { parts.append("No shared services") }
+        return parts.joined(separator: " · ")
+    }
     var parts = [
         profile.environment.title, profile.model.title, profile.reasoning.title, profile.mode.title,
         formatBytes(profile.memory),
@@ -619,6 +648,7 @@ public func rowAccessibilityLabel(_ agent: Agent, now: Date, unavailable: Bool =
     if let title = lines.title { parts.append(title) }
     if let line = lines.line { parts.append(line) }
     parts.append(agent.profile)
+    if agent.kind == .pi { parts.append("runs Pi") }
     if let started = parseTime(agent.createdAt) {
         parts.append("started \(spokenElapsed(now.timeIntervalSince(started))) ago")
     }
@@ -648,7 +678,7 @@ public func sentence(_ text: String) -> String {
 
 /// Commands whose names a sentence may start with, in lowercase.
 let commandNames: Set<String> = [
-    "ssh", "scp", "gh", "git", "gcloud", "claude", "vibe", "vibed", "vibe-shim", "vibe-vm", "systemctl", "sudo",
+    "ssh", "scp", "gh", "git", "gcloud", "claude", "pi", "vibe", "vibed", "vibe-shim", "vibe-vm", "systemctl", "sudo",
     "apt", "npm",
 ]
 
@@ -810,7 +840,9 @@ public struct SetupProgress: Equatable, Sendable {
     public var steps: [Step] {
         var steps: [Step] = []
         if let command = commandStep { steps.append(command) }
-        let machine = doctor.filter { $0.id != .linux }
+        // Pi is optional and nothing starts without asking for it, so the
+        // welcome doesn't bring it up: Settings → Agents has it.
+        let machine = doctor.filter { $0.id != .linux && $0.id != .pi }
         for check in machine {
             steps.append(step(for: check))
             // Terminal goes with the tools agents need, before the Mac's
@@ -947,6 +979,8 @@ public struct SetupProgress: Equatable, Sendable {
                 step.action = .fix(.linux)
                 step.actionTitle = "Try Again"
             }
+        case .pi:
+            break
         }
         return step
     }
@@ -968,7 +1002,7 @@ public struct SetupProgress: Equatable, Sendable {
         case .claudeLogin: return claudeReady ? "Sign in once, in Terminal, with /login." : "Once Claude Code is installed."
         case .power: return "Agents can't answer while this Mac sleeps. Turning it off asks for your password."
         case .tailscale: return "Lets your other machines reach MCP here."
-        case .linux: return check.detail
+        case .linux, .pi: return check.detail
         }
     }
 
@@ -1027,6 +1061,8 @@ public func checkTitle(_ id: CheckId, passed: Bool) -> String {
     case (.tailscale, false): "Tailscale"
     case (.linux, true): "Linux"
     case (.linux, false): "Download Linux"
+    case (.pi, true): "Pi"
+    case (.pi, false): "Install Pi"
     }
 }
 

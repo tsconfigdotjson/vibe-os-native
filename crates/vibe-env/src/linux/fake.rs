@@ -41,6 +41,7 @@ pub(crate) struct State {
     pub(crate) run_output: Option<(String, i32)>,
     /// A share the guest fails to mount.
     pub(crate) unmounted: Option<String>,
+    /// A guest from before read-only mounts, which doesn't report any.
     pub(crate) runs: Vec<proto::Run>,
     /// Says how each run went, in place of `run_output`.
     pub(crate) run_handler: Option<RunHandler>,
@@ -368,5 +369,13 @@ impl Machine for Fake {
                 output: String::new(),
             },
         })
+    }
+}
+
+impl Fake {
+    /// What was last launched in any VM.
+    pub(crate) fn last_launch(&self) -> guest::Launch {
+        let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        s.launches.last().expect("something was launched").clone()
     }
 }

@@ -758,7 +758,7 @@ pub fn servers_json(program: &str, services: &[String]) -> String {
 }
 
 /// What Pi's extension reads the servers from.
-pub const SERVICES_ENV: &str = "VIBE_SERVICES";
+pub use vibe_env::pi::SERVICES_ENV;
 
 /// How an agent's offered the shared services: what's added to its arguments
 /// and its environment. Neither writes a file, and neither holds a secret.
@@ -775,9 +775,10 @@ pub struct Injection {
 ///   owner's own servers rather than replacing them. No `--strict-mcp-config`,
 ///   and no allow rule unless the owner opted in, per service, so by default
 ///   Claude's permission prompts still govern writes.
-/// - Pi, once #52 wires it, takes them through an extension that registers each
-///   for the session: its backend adds `-e <that extension>`, and the extension
-///   reads [`SERVICES_ENV`].
+/// - Pi takes them through an extension that registers each for the session:
+///   its backend adds `-e <that extension>` on finding [`SERVICES_ENV`], and the
+///   extension reads that. Pi hands its environment on to what it starts, so the
+///   shim finds its socket and agent as it does under Claude.
 ///
 /// `auto_allowed` are the services the owner chose to run unasked. It's for
 /// Claude Code alone: a Pi agent is never asked anyway.

@@ -18,7 +18,7 @@ use rusqlite::types::Type;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use crate::model::{
-    AgentState, Environment, HostLink, Mode, Model, Profile, ProjectSource, Reasoning,
+    AgentKind, AgentState, Environment, HostLink, Mode, Model, Profile, ProjectSource, Reasoning,
 };
 use crate::rpc::{ApiKey, HostInfo, KeyHash, Project};
 use crate::time::rfc3339;
@@ -136,6 +136,15 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE profiles ADD COLUMN shared_services INTEGER NOT NULL DEFAULT 1;
     ALTER TABLE agents ADD COLUMN shared_services INTEGER NOT NULL DEFAULT 1;
     ",
+    // 6: Pi (#52). Which coding agent a profile runs and an agent was started
+    // with, and Pi's model as `provider/id`. Everything before this is
+    // Claude's.
+    "
+    ALTER TABLE profiles ADD COLUMN agent TEXT NOT NULL DEFAULT 'claude';
+    ALTER TABLE profiles ADD COLUMN pi_model TEXT;
+    ALTER TABLE agents ADD COLUMN agent TEXT NOT NULL DEFAULT 'claude';
+    ALTER TABLE agents ADD COLUMN pi_model TEXT;
+    ",
 ];
 
 /// The schema version this build reads and writes.
@@ -223,11 +232,15 @@ pub struct AgentRecord {
     /// Whether it got the shared MCP services as it started. Each launch goes by
     /// what its profile says then: this is for when that profile has gone.
     pub shared_services: bool,
+    /// Which coding agent it runs, for life.
+    pub agent: AgentKind,
+    /// Pi's model, for one that runs Pi and whose profile named one.
+    pub pi_model: Option<String>,
 }
 
 const AGENT_COLUMNS: &str = "a.host, a.ref, p.name, a.profile, a.environment, a.model, \
      a.reasoning, a.mode, a.memory, a.worktree, a.branch, a.session_id, a.shim_socket, a.state, \
-     a.created_at, a.compartment, a.starting, a.shared_services";
+     a.created_at, a.compartment, a.starting, a.shared_services, a.agent, a.pi_model";
 
 fn agent_row(r: &Row<'_>) -> rusqlite::Result<AgentRecord> {
     let memory: i64 = r.get(8)?;
@@ -252,6 +265,8 @@ fn agent_row(r: &Row<'_>) -> rusqlite::Result<AgentRecord> {
         compartment: r.get(15)?,
         starting: r.get(16)?,
         shared_services: r.get(17)?,
+        agent: parse(r, 18)?,
+        pi_model: r.get(19)?,
     })
 }
 
@@ -679,7 +694,7 @@ impl Store {
         }
         tx.execute(
             "UPDATE profiles SET name = ?3, environment = ?4, model = ?5, reasoning = ?6,
-                 mode = ?7, memory = ?8, shared_services = ?9
+                 mode = ?7, memory = ?8, shared_services = ?9, agent = ?10, pi_model = ?11
              WHERE project_id = ?1 AND name = ?2",
             params![
                 id,
@@ -691,6 +706,8 @@ impl Store {
                 profile.mode.as_str(),
                 memory_column(profile.memory)?,
                 profile.shared_services,
+                profile.agent.as_str(),
+                profile.pi_model,
             ],
         )?;
         // Its agents are still its agents, and go by its settings at each launch.
@@ -700,6 +717,19 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(profile.clone())
+    }
+
+    /// Whether any profile runs Pi in the `linux` environment.
+    pub fn has_linux_pi_profile(&self) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM profiles WHERE agent = 'pi' AND environment = 'linux' LIMIT 1",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
     }
 
     pub fn delete_profile(&mut self, host: &str, project: &str, name: &str) -> Result<Profile> {
@@ -739,9 +769,9 @@ impl Store {
         tx.execute(
             "INSERT INTO agents (host, ref, project_id, profile, environment, model, reasoning,
                  mode, memory, worktree, branch, session_id, shim_socket, state, created_at,
-                 compartment, starting, shared_services)
+                 compartment, starting, shared_services, agent, pi_model)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                 ?17, ?18)",
+                 ?17, ?18, ?19, ?20)",
             params![
                 a.host,
                 a.agent_ref,
@@ -761,6 +791,8 @@ impl Store {
                 a.compartment,
                 a.starting,
                 a.shared_services,
+                a.agent.as_str(),
+                a.pi_model,
             ],
         )?;
         tx.commit()?;
@@ -1065,7 +1097,8 @@ impl Store {
     }
 }
 
-const PROFILE_COLUMNS: &str = "name, environment, model, reasoning, mode, memory, shared_services";
+const PROFILE_COLUMNS: &str =
+    "name, environment, model, reasoning, mode, memory, shared_services, agent, pi_model";
 const KEY_COLUMNS: &str = "name, prefix, created_at, last_used_at";
 const PUSHED_KEY_COLUMNS: &str = "name, prefix, created_at, last_used_at";
 
@@ -1117,8 +1150,8 @@ fn profile_exists(conn: &Connection, project_id: i64, name: &str) -> Result<bool
 fn insert_profile(conn: &Connection, project_id: i64, p: &Profile) -> Result<()> {
     conn.execute(
         "INSERT INTO profiles (project_id, name, environment, model, reasoning, mode, memory,
-             shared_services)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             shared_services, agent, pi_model)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             project_id,
             p.name,
@@ -1128,6 +1161,8 @@ fn insert_profile(conn: &Connection, project_id: i64, p: &Profile) -> Result<()>
             p.mode.as_str(),
             memory_column(p.memory)?,
             p.shared_services,
+            p.agent.as_str(),
+            p.pi_model,
         ],
     )?;
     Ok(())
@@ -1160,6 +1195,8 @@ fn profile_row(r: &Row<'_>) -> rusqlite::Result<Profile> {
             rusqlite::Error::FromSqlConversionFailure(5, Type::Integer, Box::new(e))
         })?,
         shared_services: r.get(6)?,
+        agent: parse(r, 7)?,
+        pi_model: r.get(8)?,
     })
 }
 
@@ -1212,6 +1249,56 @@ mod tests {
         }
     }
 
+    /// What was saved before Pi reads as Claude's, and Pi's settings persist.
+    #[test]
+    fn profiles_and_agents_know_their_agent() {
+        let mut s = Store::open_in_memory().unwrap();
+        s.ensure_host(LOCAL_HOST, "macos", "mac", 1).unwrap();
+        let project = NewProject {
+            host: LOCAL_HOST.into(),
+            name: "web".into(),
+            source: ProjectSource::Path,
+            repo: None,
+            path: "/w/web".into(),
+        };
+        s.add_project(&project, &[], 1).unwrap();
+        let id = project_id(&s.conn, LOCAL_HOST, "web").unwrap().unwrap();
+        // A row from before the migration: nothing says which agent.
+        s.conn
+            .execute(
+                "INSERT INTO profiles (project_id, name, environment, model, reasoning, mode, memory)
+                 VALUES (?1, 'old', 'linux', 'opus', 'high', 'auto', 4294967296)",
+                [id],
+            )
+            .unwrap();
+        let old = s.profile(LOCAL_HOST, "web", "old").unwrap();
+        assert_eq!((old.agent, old.pi_model), (AgentKind::Claude, None));
+        assert!(!s.has_linux_pi_profile().unwrap());
+
+        let pi = Profile {
+            agent: AgentKind::Pi,
+            pi_model: Some("openai/gpt-5".into()),
+            mode: Mode::Bypass,
+            ..Profile::with_defaults("pi-linux", Environment::Linux)
+        };
+        s.create_profile(LOCAL_HOST, "web", &pi).unwrap();
+        assert_eq!(s.profile(LOCAL_HOST, "web", "pi-linux").unwrap(), pi);
+        assert!(s.has_linux_pi_profile().unwrap());
+        let changed = Profile {
+            pi_model: None,
+            ..pi.clone()
+        };
+        s.replace_profile(LOCAL_HOST, "web", "pi-linux", &changed)
+            .unwrap();
+        assert_eq!(s.profile(LOCAL_HOST, "web", "pi-linux").unwrap(), changed);
+
+        let mut a = agent("web", "quiet-amber-otter");
+        a.agent = AgentKind::Pi;
+        a.pi_model = Some("openai/gpt-5".into());
+        s.add_agent(&a).unwrap();
+        assert_eq!(s.agent(LOCAL_HOST, "quiet-amber-otter").unwrap(), a);
+    }
+
     fn agent(project: &str, r: &str) -> AgentRecord {
         AgentRecord {
             host: LOCAL_HOST.into(),
@@ -1232,6 +1319,8 @@ mod tests {
             compartment: r#"{"x":1}"#.into(),
             starting: true,
             shared_services: true,
+            agent: AgentKind::Claude,
+            pi_model: None,
         }
     }
 

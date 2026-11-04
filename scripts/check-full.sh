@@ -1023,9 +1023,36 @@ s_linux_vm() {
     cargo test -p vibed --locked --test linux_vm -- --test-threads=1 --nocapture
   cargo test -p vibed --locked --test toolbox_vm -- --test-threads=1 --nocapture
   cargo test -p vibed --locked --test sleep -- --test-threads=1 --nocapture on_real_vms
-  for t in linux_conformance linux_agent toolbox_vm sleep_scenario; do
+  for t in linux_conformance linux_agent linux_pi_agent toolbox_vm sleep_scenario; do
     [ -f "$marker/$t" ] || { echo "$t was skipped, not run"; return 1; }
   done
+}
+
+# Real Pi, on a mock model, with no provider and no login: its own standalone
+# build, checked against its release's SHA256SUMS as vibed checks it. Without
+# VIBE_TEST_PI_BIN it fetches the version this build pins. To try a new one
+# before pinning it, set PI_E2E_VERSION.
+s_pi_e2e() {
+  local marker="$WORK/pi-marker" bin="${VIBE_TEST_PI_BIN:-}"
+  if [ -z "$bin" ]; then
+    local version="${PI_E2E_VERSION:-$(sed -n 's/^pub const PINNED: &str = "\(.*\)";$/\1/p' crates/vibe-env/src/pi_release.rs)}"
+    local arch os platform dir="$WORK/pi-build" releases="https://github.com/earendil-works/pi/releases/download/v$version"
+    case "$(uname -s)" in Darwin) os=darwin ;; *) os=linux ;; esac
+    case "$(uname -m)" in arm64|aarch64) arch=arm64 ;; *) arch=x64 ;; esac
+    platform="pi-$os-$arch.tar.gz"
+    rm -rf "$dir"; mkdir -p "$dir"
+    curl -fsSL --retry 3 -o "$dir/$platform" "$releases/$platform"
+    curl -fsSL --retry 3 -o "$dir/SHA256SUMS" "$releases/SHA256SUMS"
+    local check="shasum -a 256 -c -"
+    command -v sha256sum >/dev/null && check="sha256sum -c -"
+    (cd "$dir" && grep " $platform\$" SHA256SUMS | $check)
+    tar -xzf "$dir/$platform" -C "$dir"
+    bin="$dir/pi/pi"
+  fi
+  rm -rf "$marker"
+  VIBE_TEST_PI_BIN="$bin" VIBE_TEST_PI_MARKER="$marker" \
+    cargo test -p vibed --locked --test pi_e2e -- --nocapture
+  [ -f "$marker/pi_e2e" ] || { echo "pi_e2e was skipped, not run"; return 1; }
 }
 
 s_live_contract() {
@@ -1441,6 +1468,7 @@ step sessions "a session outlives a killed vibed and is re-adopted" s_sessions b
 step agents "agents start, outlive vibed, and delete to nothing but the branch" s_agents build
 step mcp "MCP: no key refused; VibeOS's round over vibe mcp, start to delete" s_mcp build
 step services-claude "shared MCP services: real Claude Code through the shim, to a stand-in" s_services_claude build
+step pi-e2e "real Pi on a mock model: first prompt, a shared service, send, interrupt, sleep, resume" s_pi_e2e build
 step linux-host "a Linux host over SSH: install, link, an agent via MCP, a pulled network" s_linux_host build
 step real-host "a real Linux server over SSH (VIBE_TEST_LINUX_HOST), its cgroups too" s_real_host build
 step external "external access via a real server, Let's Encrypt and ssh -R (VIBE_TEST_EXTERNAL_DOMAIN)" s_real_external build

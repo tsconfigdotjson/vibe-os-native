@@ -121,6 +121,7 @@ impl CgHarness {
         let bin = root.join("bin");
         fs::create_dir_all(&bin).unwrap();
         install(&bin.join("claude"), claude);
+        install(&bin.join("pi"), vibe_env::testing::PI_STAND_IN);
         // The owner's home: Claude's state is there before any agent, and
         // is the server's own, not the agent's.
         let home = root.join("home");
@@ -135,6 +136,7 @@ impl CgHarness {
         );
         let backend = Cgroups::new(&home)
             .with_claude(bin.join("claude"))
+            .with_pi(bin.join("pi"))
             .with_path(std::env::var("PATH").unwrap_or_default())
             .with_slice(slice)
             .with_intervals(intervals);
@@ -160,6 +162,7 @@ impl CgHarness {
             fs::create_dir_all(d).unwrap();
         }
         AgentSpec {
+            agent: Default::default(),
             agent_ref: agent_ref.into(),
             project: "web".into(),
             worktree,
@@ -340,6 +343,7 @@ fn a_server_that_cant_limit_agents_says_how_to_fix_it() {
         .with_path(&path)
         .with_cgroup_root(&root);
     let h = |r: &str| AgentSpec {
+        agent: Default::default(),
         agent_ref: r.into(),
         project: "web".into(),
         worktree: dir.path().join("w"),
@@ -426,13 +430,17 @@ impl<'a> Agent<'a> {
             .launch(
                 &self.handle,
                 &Launch {
+                    agent: Default::default(),
                     args: vec!["--".into(), prompt.into()],
                     env: Vec::new(),
                     cwd: self.handle.worktree.clone(),
                 },
             )
             .unwrap();
-        let TerminalEnd::Pty { command, cwd, env } = end else {
+        let TerminalEnd::Pty {
+            command, cwd, env, ..
+        } = end
+        else {
             panic!("a Linux host's agent runs on a PTY");
         };
         let out = Command::new(h.shim())
@@ -977,4 +985,110 @@ fn without_swap_a_hog_is_paused_before_the_oom_killer_picks_anything() {
     );
     assert!(b.event("memory.events", "high") >= 1);
     a.answers("unbothered");
+}
+
+/// A Pi agent on a Linux host: asked for its scope from a clean environment,
+/// so what `systemd-run` needs has to be on the allowlist, in the owner's own
+/// `~/.pi/agent`, and without a stray key or the Claude token. (`vibed` does
+/// what this does with `clean_env`: `crates/vibed/src/sessions.rs`.)
+#[test]
+fn a_pi_agent_runs_in_a_scope_on_an_allowlisted_environment() {
+    let Some(h) = CgHarness::new() else {
+        return;
+    };
+    let spec = AgentSpec {
+        agent: vibe_core::model::AgentKind::Pi,
+        ..h.spec("pi-scope")
+    };
+    let handle = h.backend.create(&spec).unwrap();
+    let vibe_env::AgentHome::Pi(home) = &handle.home else {
+        panic!("a Pi agent has a Pi home");
+    };
+    assert_eq!(
+        home.dir,
+        h.root().join("home/.pi/agent"),
+        "the server's own"
+    );
+    home.prefill().unwrap();
+    let end = h
+        .backend
+        .launch(
+            &handle,
+            &Launch {
+                agent: vibe_core::model::AgentKind::Pi,
+                args: vibe_env::pi::args("s-1", None, "high", Some("hello")),
+                env: vec![("OPENROUTER_API_KEY_ON_PURPOSE".into(), "yes".into())],
+                cwd: handle.worktree.clone(),
+            },
+        )
+        .unwrap();
+    let TerminalEnd::Pty {
+        command,
+        cwd,
+        env,
+        clean_env,
+    } = end
+    else {
+        panic!("a Linux host's agent runs on a PTY");
+    };
+    assert!(clean_env);
+    let names: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
+    for stray in [
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "OPENROUTER_API_KEY",
+        "ANTHROPIC_API_KEY",
+    ] {
+        assert!(!names.contains(&stray), "{stray}: {names:?}");
+    }
+    let r = &handle.agent_ref;
+    let out = Command::new(h.shim())
+        .env_clear()
+        .envs(env.iter().map(|(k, v)| (k, v)))
+        .args(["--ref", r, "--socket"])
+        .arg(h.scratch().join(format!("{r}.sock")))
+        .arg("--state")
+        .arg(h.scratch().join(r))
+        .args(["--size", "100x30", "--cwd"])
+        .arg(cwd)
+        .arg("--")
+        .args(&command)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "vibe-shim: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let sid: u32 = String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .expect("the shim prints its pid");
+    let session = home.sessions.clone();
+    wait("Pi's first answer", Duration::from_secs(30), || {
+        fs::read_dir(&session).is_ok_and(|mut d| d.next().is_some())
+    });
+    assert!(home.transcript("s-1").is_some());
+    let mut env_file = home.sessions.clone().into_os_string();
+    env_file.push(".env");
+    let env = fs::read_to_string(env_file).unwrap();
+    assert!(env.contains("OPENROUTER_API_KEY_ON_PURPOSE=yes"), "{env}");
+    assert!(!env.contains("CLAUDE_CODE_OAUTH_TOKEN"), "{env}");
+    // In its scope, under its limits, like any other agent.
+    assert!(
+        !h.backend
+            .processes(&Handle {
+                session: Some(sid),
+                ..handle.clone()
+            })
+            .unwrap()
+            .is_empty()
+    );
+    h.backend
+        .delete(&Handle {
+            session: Some(sid),
+            ..handle.clone()
+        })
+        .unwrap();
+    assert!(!home.sessions.exists());
+    assert!(home.dir.is_dir(), "the owner's stays");
 }

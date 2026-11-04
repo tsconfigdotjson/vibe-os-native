@@ -718,7 +718,7 @@ impl Core {
                     total -= s.bytes;
                     crate::log!(
                         "vibed: dropped {other}'s snapshot ({}) to make room for {r}'s within \
-                         snapshot_disk ({}); {other} wakes with claude --resume",
+                         snapshot_disk ({}); {other} wakes by resuming its session",
                         size(s.bytes),
                         size(budget)
                     );

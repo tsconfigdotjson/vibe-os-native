@@ -81,11 +81,23 @@ commands:
   profile list PROJECT  a project's profiles
   profile create PROJECT NAME [--environment linux|macos] [--model opus|sonnet]
               [--reasoning low|medium|high|xhigh|max] [--mode auto|bypass]
-              [--memory 4G] [--shared-services on|off]
+              [--memory 4G] [--shared-services on|off] [--agent claude|pi]
+              [--pi-model PROVIDER/ID]
   profile set PROJECT PROFILE [--name NEW] [the same settings]
   profile delete PROJECT PROFILE
               project and profile take --host NAME for a Linux host this one
               is linked to
+  pi          Pi on this host: what's installed and which providers it's
+              signed in to
+  pi forget PROVIDER...
+              on a Mac, take these providers' logins from what linux agents
+              share, such as one an agent offered; stop that agent as well
+  pi install [--vm]
+              download Pi, checksummed, and link it at ~/.local/bin/pi; on a
+              Mac, --vm for the layer linux agents boot instead. Signing in
+              is Pi's own: run `pi`, then /login (for linux agents on a Mac,
+              in `vibe toolbox`, with a headless option: `vibe pi` says which)
+              pi takes --host NAME for a Linux host this one is linked to
   host        the hosts this one knows, and their links
   host add NAME SSH-DESTINATION
               install vibed on a Linux host over SSH (as Add Linux Host…
@@ -210,7 +222,7 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
                 }
                 Command::Mcp { url, key }
             }
-            word @ ("project" | "profile" | "host") => {
+            word @ ("project" | "profile" | "host" | "pi") => {
                 // Everything after it is its, but --socket.
                 let mut words = Vec::new();
                 while let Some(w) = iter.next() {
@@ -227,6 +239,7 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
                 Command::Setup(match word {
                     "project" => setup::Command::parse_project(&words)?,
                     "profile" => setup::Command::parse_profile(&words)?,
+                    "pi" => setup::Command::parse_pi(&words)?,
                     _ => setup::Command::parse_host(&words)?,
                 })
             }

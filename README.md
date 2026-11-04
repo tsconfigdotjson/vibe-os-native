@@ -76,8 +76,15 @@ release is published, build one and point `vibed` at it:
 ```sh
 scripts/base-image.sh           # build/base-image/base-3: kernel, initrd, Debian image
 target/debug/vibe setup-token   # the Claude login for linux agents
+target/debug/vibe pi            # Pi: what's installed, and who it's signed in to
 VIBE_BASE_RELEASES=file://$PWD/build/base-image target/debug/vibed
 ```
+
+Pi is pinned (`vibe_env::pi_release::PINNED`). Moving the pin means looking again
+at what the new version reads, runs and writes in its agent dir, at what the login
+broker accepts (`vibe_env::pi_logins`), and at the provider keys and screen
+messages read in `vibe_env::pi` and `vibe_status::screen`, then running
+`scripts/check-full.sh`'s `pi-e2e` with `PI_E2E_VERSION`.
 
 Add Linux Host installs the Linux builds of `vibed`, `vibe` and `vibe-shim`
 over SSH. A release carries them in the app; for a build of your own, make

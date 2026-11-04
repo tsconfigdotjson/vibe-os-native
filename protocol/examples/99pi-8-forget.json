@@ -1,0 +1,46 @@
+{
+  "description": "Takes a login out of the store linux agents get theirs from, and so out of each agent's copy within seconds: how the owner clears what an agent offered, or signs out, without the toolbox.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 157,
+    "method": "pi.forget",
+    "params": {
+      "host": "local",
+      "providers": [
+        "xai"
+      ]
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 157,
+    "result": {
+      "host": "local",
+      "logins": [
+        "openai"
+      ],
+      "native": {
+        "path": "/usr/local/bin/pi",
+        "version": "1.5.0"
+      },
+      "vms": {
+        "logins": [
+          "anthropic"
+        ],
+        "version": "1.5.0"
+      }
+    }
+  },
+  "events": [
+    {
+      "jsonrpc": "2.0",
+      "method": "events.event",
+      "params": {
+        "at": "2026-10-30T12:00:00Z",
+        "host": "local",
+        "kind": "pi.changed",
+        "seq": 43
+      }
+    }
+  ]
+}

@@ -2,7 +2,8 @@
 //! Install and setup; Exceptions to "set up once, then frozen"): the base
 //! release this `vibed` ships with, downloaded once, and the managed layer,
 //! which takes each new Claude Code release, checked when `vibed` starts and
-//! then daily. The work is `vibe_env::images`; this is when it runs.
+//! then daily, and the Pi layer, the same way, once a profile runs Pi in a VM.
+//! The work is `vibe_env::images`; this is when it runs.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -26,6 +27,8 @@ pub struct Sources {
     pub base_release: u32,
     /// Claude Code's releases.
     pub claude_releases: String,
+    /// Pi's releases.
+    pub pi_releases: String,
 }
 
 impl Sources {
@@ -43,6 +46,7 @@ impl Sources {
             base_releases: var("VIBE_BASE_RELEASES", images::BASE_RELEASES),
             base_release: images::BASE_RELEASE,
             claude_releases: var("VIBE_CLAUDE_RELEASES", images::CLAUDE_RELEASES),
+            pi_releases: crate::pi::releases_from_env(),
         }
     }
 }
@@ -53,14 +57,16 @@ impl Sources {
 pub struct Refreshed {
     pub base_error: Option<String>,
     pub claude_error: Option<String>,
+    pub pi_error: Option<String>,
 }
 
 /// One round, in this order: the base release if it isn't installed; the
 /// managed layers no agent's `vm.json` names any more, but the newest; and
-/// a newer Claude Code, as a new layer. Pruning goes before the update, so
-/// a start that just took the newest layer never loses it. Each step is
-/// logged, and one failing doesn't stop the next.
-pub fn refresh(images: &Images, agents_dir: &Path, sources: &Sources) -> Refreshed {
+/// a newer Claude Code, as a new layer; and with `pi`, the Pi this build pins,
+/// the same way. Pruning goes before the update, so a start that just took the newest
+/// layer never loses it. Each step is logged, and one failing doesn't stop
+/// the next.
+pub fn refresh(images: &Images, agents_dir: &Path, sources: &Sources, pi: bool) -> Refreshed {
     let mut out = Refreshed::default();
     let url = images::base_url(&sources.base_releases, sources.base_release);
     let had_base = images
@@ -91,6 +97,18 @@ pub fn refresh(images: &Images, agents_dir: &Path, sources: &Sources) -> Refresh
             out.claude_error = Some(e.to_string());
         }
     }
+    if pi {
+        match images.update_pi(&sources.pi_releases, vibe_env::pi_release::PINNED) {
+            Ok(Some(version)) => {
+                crate::log!("vibed: Pi {version} is the layer for linux Pi agents' next boot");
+            }
+            Ok(None) => {}
+            Err(e) => {
+                crate::log!("vibed: can't update Pi for linux agents: {e}");
+                out.pi_error = Some(e.to_string());
+            }
+        }
+    }
     out
 }
 
@@ -104,6 +122,9 @@ pub struct Watch {
     sources: Sources,
     state: Mutex<WatchState>,
     kick: tokio::sync::Notify,
+    /// A profile runs Pi in a VM, so its layer is kept current. A layer that's
+    /// there says so too.
+    want_pi: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Debug, Default)]
@@ -125,7 +146,19 @@ impl Watch {
             sources,
             state: Mutex::new(WatchState::default()),
             kick: tokio::sync::Notify::new(),
+            want_pi: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// From now on, keeps the Pi layer current.
+    /// Why the Pi layer couldn't be had the last time it was tried.
+    pub fn pi_error(&self) -> Option<String> {
+        lock(&self.state).last.pi_error.clone()
+    }
+
+    pub fn want_pi(&self) {
+        self.want_pi
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// One [`refresh`], noted for [`Watch::check`].
@@ -135,7 +168,9 @@ impl Watch {
             st.running = true;
             st.pending = false;
         }
-        let done = refresh(&self.images, &self.agents_dir, &self.sources);
+        let pi =
+            self.want_pi.load(std::sync::atomic::Ordering::SeqCst) || self.images.pi().is_some();
+        let done = refresh(&self.images, &self.agents_dir, &self.sources, pi);
         let mut st = lock(&self.state);
         st.running = false;
         st.rounds += 1;
@@ -357,6 +392,7 @@ mod tests {
             base_releases: "file:///nowhere".into(),
             base_release: vibe_env::images::SERVICES_BASE,
             claude_releases: "file:///nowhere".into(),
+            pi_releases: "file:///nowhere".into(),
         };
 
         // No template yet: new agents boot the newest base, and all's well.
@@ -393,9 +429,10 @@ mod tests {
             base_releases: format!("file://{}", published.join("base").display()),
             base_release: 1,
             claude_releases: format!("file://{}", published.join("claude").display()),
+            pi_releases: "file:///nowhere".into(),
         };
         let images = Images::new(layout.linux_dir());
-        refresh(&images, &layout.agents_dir(), &sources);
+        refresh(&images, &layout.agents_dir(), &sources, false);
         let layers = images.layers().unwrap();
         assert_eq!(layers.base.version, 1);
         assert_eq!(layers.managed.as_ref().unwrap().0, "2.1.308");
@@ -403,11 +440,11 @@ mod tests {
         // The next day: a new release, the next boot's layer. The old one,
         // which no agent uses, goes the round after.
         publish_claude(&published.join("claude"), "2.1.314", b"second");
-        refresh(&images, &layout.agents_dir(), &sources);
+        refresh(&images, &layout.agents_dir(), &sources, false);
         assert_eq!(images.managed().unwrap().0, "2.1.314");
         let old = layout.linux_dir().join("managed-2.1.308.img");
         assert!(old.exists());
-        refresh(&images, &layout.agents_dir(), &sources);
+        refresh(&images, &layout.agents_dir(), &sources, false);
         assert!(!old.exists());
         assert_eq!(images.managed().unwrap().0, "2.1.314");
 
@@ -416,8 +453,9 @@ mod tests {
             base_releases: "file:///nowhere".into(),
             base_release: 2,
             claude_releases: "file:///nowhere".into(),
+            pi_releases: "file:///nowhere".into(),
         };
-        refresh(&images, &layout.agents_dir(), &gone);
+        refresh(&images, &layout.agents_dir(), &gone, false);
         assert_eq!(images.base().unwrap().version, 1);
         assert_eq!(images.managed().unwrap().0, "2.1.314");
     }
@@ -431,6 +469,7 @@ mod tests {
             base_releases: format!("file://{}", published.join("base").display()),
             base_release: 1,
             claude_releases: format!("file://{}", published.join("claude").display()),
+            pi_releases: "file:///nowhere".into(),
         };
         let watch = Watch::new(&layout, sources);
         // Before the first round: working, with no progress yet, and
@@ -505,5 +544,24 @@ mod tests {
         assert_eq!(percent(2000, 1000), 100);
         assert_eq!(percent(u64::MAX - 1, u64::MAX), 99);
         assert_eq!(sentence("can't download x"), "Can't download x.");
+    }
+
+    #[test]
+    fn only_a_mac_that_runs_pi_downloads_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("pi");
+        std::fs::create_dir_all(&root).unwrap();
+        let sources = Sources {
+            base_releases: "file:///nowhere".into(),
+            base_release: 1,
+            claude_releases: "file:///nowhere".into(),
+            pi_releases: format!("file://{}", root.display()),
+        };
+        let layout = Layout::new(tmp.path(), "macos");
+        let watch = Watch::new(&layout, sources);
+        // Pi publishes nothing here, so a round that asks would say so.
+        assert_eq!(watch.refresh().pi_error, None, "not asked for");
+        watch.want_pi();
+        assert!(watch.refresh().pi_error.is_some());
     }
 }

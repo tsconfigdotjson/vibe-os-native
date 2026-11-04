@@ -169,6 +169,7 @@ impl<'a, H: Harness> Agent<'a, H> {
             .launch(
                 &self.handle,
                 &Launch {
+                    agent: Default::default(),
                     args: args(prompt),
                     env: vec![("VIBE_CONFORMANCE".into(), "1".into())],
                     cwd: self.handle.worktree.clone(),
@@ -188,7 +189,9 @@ impl<'a, H: Harness> Agent<'a, H> {
             .arg(self.h.scratch().join(r))
             .args(["--size", "100x30"]);
         match end {
-            TerminalEnd::Pty { command, cwd, env } => {
+            TerminalEnd::Pty {
+                command, cwd, env, ..
+            } => {
                 cmd.arg("--cwd")
                     .arg(cwd)
                     .arg("--")
@@ -438,10 +441,15 @@ pub fn delete_leaves_nothing<H: Harness>(h: &H) {
     a.wait_screen("Red or blue?");
     let transcript = a
         .handle
-        .claude
+        .claude()
+        .unwrap()
         .transcript(&a.handle.worktree, "0b5c3f6e-c0f0-4000-8000-000000000001");
     wait("the transcript", || transcript.is_file());
-    a.handle.claude.prefill(&a.handle.worktree, false).unwrap();
+    a.handle
+        .claude()
+        .unwrap()
+        .prefill(&a.handle.worktree, false)
+        .unwrap();
     h.backend()
         .run(
             &a.handle,

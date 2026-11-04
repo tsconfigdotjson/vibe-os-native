@@ -406,6 +406,13 @@ struct AgentRow: View {
                         Image(systemName: environmentSymbol(agent.environment))
                             .imageScale(.small)
                             .foregroundStyle(.secondary)
+                        // Claude is the usual: only Pi says so.
+                        if agent.kind == .pi {
+                            Text("π")
+                                .font(.callout.weight(.medium))
+                                .foregroundStyle(.secondary)
+                                .accessibilityHidden(true)
+                        }
                         Spacer(minLength: 6)
                         if model.attaching.contains(agent.key) {
                             ProgressView().controlSize(.mini)
@@ -460,7 +467,7 @@ struct AgentRow: View {
         .opacity(unavailable ? 0.45 : 1)
         .disabled(unavailable)
         .help(
-            "\(agent.profile) · \(agent.environment.title)\n"
+            "\(agent.profile) · \(agent.kind.title) · \(agent.environment.title)\n"
                 + (unavailable ? "\(agent.host) can't be reached. Its agents keep running there." : "Click to open it in Terminal."))
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(rowAccessibilityLabel(agent, now: Date(), unavailable: unavailable))

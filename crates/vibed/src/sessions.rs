@@ -297,6 +297,9 @@ pub struct SessionSpec {
     pub cwd: PathBuf,
     /// Set for the command on top of `vibed`'s own environment.
     pub env: Vec<(OsString, OsString)>,
+    /// `env` is all it gets: the shim and the command start from nothing of
+    /// `vibed`'s.
+    pub clean_env: bool,
     /// The terminal's size until a client attaches.
     pub size: Option<Size>,
     /// For a `linux` agent on the Mac: the `vibe-vm` socket of its VM,
@@ -331,8 +334,11 @@ pub async fn spawn_shim(
             cmd.arg("--cwd")
                 .arg(&spec.cwd)
                 .arg("--")
-                .args(&spec.command)
-                .envs(spec.env.iter().map(|(k, v)| (k, v)));
+                .args(&spec.command);
+            if spec.clean_env {
+                cmd.env_clear();
+            }
+            cmd.envs(spec.env.iter().map(|(k, v)| (k, v)));
         }
     }
     cmd.stdin(std::process::Stdio::null()).kill_on_drop(true);

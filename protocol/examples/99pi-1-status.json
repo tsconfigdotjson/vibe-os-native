@@ -1,0 +1,38 @@
+{
+  "description": "Pi on this host: on a Mac, the `pi` macos agents run (none here) with the providers the owner's own `~/.pi/agent` is signed in to, and what linux agents have in their VMs. Only the providers' names, never what their logins hold. Here linux agents are signed in, and the Pi layer hasn't been downloaded yet. `alerts` is what the owner should see about those logins: here, an agent's first sign-in, which reaches every agent and can't be checked, and which `offered` lists until the owner replaces or forgets it. `managed` would say the `pi` is one `pi.install` put there; this one is the owner's own.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 150,
+    "method": "pi.status",
+    "params": {}
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 150,
+    "result": {
+      "host": "local",
+      "logins": [
+        "openai"
+      ],
+      "native": {
+        "path": "/usr/local/bin/pi",
+        "version": "1.5.0"
+      },
+      "vms": {
+        "alerts": [
+          "brave-copper-lynx signed in to xai, and every Pi agent here now uses that login. If that wasn't you, sign in to it from the toolbox to replace it."
+        ],
+        "logins": [
+          "anthropic",
+          "xai"
+        ],
+        "offered": [
+          {
+            "provider": "xai",
+            "agent": "brave-copper-lynx"
+          }
+        ]
+      }
+    }
+  }
+}

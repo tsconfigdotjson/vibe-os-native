@@ -49,6 +49,74 @@ pub fn last_messages(path: &Path, last: usize) -> io::Result<Vec<Message>> {
     }
 }
 
+/// One of Pi's `message` entries: user text, assistant text and each tool
+/// call, as Claude's are. An assistant entry is the whole response, so nothing
+/// needs joining. System prompts, tool results, thinking and a failed turn's
+/// empty message are left out; a failed turn says why, as Pi's screen does.
+fn parse_pi_entry(entry: &Value, out: &mut Vec<Message>) {
+    let Some(message) = entry.get("message") else {
+        return;
+    };
+    let at = entry
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let blocks: Vec<Value> = match message.get("content") {
+        Some(Value::String(s)) => vec![serde_json::json!({"type": "text", "text": s})],
+        Some(Value::Array(a)) => a.clone(),
+        _ => Vec::new(),
+    };
+    let mut push = |role: Role, text: String| {
+        out.push(Message {
+            role,
+            text,
+            at: at.clone(),
+        });
+    };
+    match message.get("role").and_then(Value::as_str) {
+        Some("user") => {
+            let said = blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|b| b.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let said = said.trim();
+            if !said.is_empty() {
+                push(Role::User, said.to_owned());
+            }
+        }
+        Some("assistant") => {
+            for block in &blocks {
+                match block.get("type").and_then(Value::as_str) {
+                    Some("text") => {
+                        let text = block.get("text").and_then(Value::as_str).unwrap_or("");
+                        if !text.trim().is_empty() {
+                            push(Role::Assistant, text.trim().to_owned());
+                        }
+                    }
+                    Some("toolCall") => push(Role::Tool, pi_tool_line(block)),
+                    _ => {}
+                }
+            }
+            if let Some(why) = message.get("errorMessage").and_then(Value::as_str) {
+                push(Role::Assistant, format!("Error: {why}"));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A tool call of Pi's as one short line: its name and a short form of its
+/// arguments, as Claude's are shown.
+fn pi_tool_line(block: &Value) -> String {
+    let as_claude = serde_json::json!({
+        "name": block.get("name"),
+        "input": block.get("arguments"),
+    });
+    tool_line(&as_claude)
+}
+
 /// The messages in a stretch of transcript, oldest first.
 ///
 /// User text and assistant text become one message each, and each tool
@@ -56,6 +124,9 @@ pub fn last_messages(path: &Path, last: usize) -> io::Result<Vec<Message>> {
 /// and the entries Claude marks as meta are left out. Claude writes one
 /// reply as several lines sharing a message id, one per block, so those are
 /// joined.
+///
+/// Pi's entries are a `message` holding the role, and are told apart here so
+/// a caller needn't know whose transcript it has ([`parse_pi_entry`]).
 pub fn parse(text: &str) -> Vec<Message> {
     let mut out: Vec<Message> = Vec::new();
     let mut last_assistant: Option<String> = None;
@@ -72,6 +143,10 @@ pub fn parse(text: &str) -> Vec<Message> {
             continue;
         }
         let kind = entry.get("type").and_then(Value::as_str);
+        if kind == Some("message") {
+            parse_pi_entry(&entry, &mut out);
+            continue;
+        }
         if kind != Some("user") && kind != Some("assistant") {
             continue;
         }

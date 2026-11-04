@@ -108,6 +108,7 @@ impl Harness for MacHarness {
             fs::create_dir_all(d).unwrap();
         }
         AgentSpec {
+            agent: Default::default(),
             agent_ref: agent_ref.into(),
             project: "web".into(),
             worktree,
@@ -241,13 +242,17 @@ fn start_on(backend: &Macos, h: &MacHarness, agent_ref: &str, script: &str) -> H
         .launch(
             &handle,
             &Launch {
+                agent: Default::default(),
                 args: vec!["--".into(), script.into()],
                 env: Vec::new(),
                 cwd: spec.worktree.clone(),
             },
         )
         .unwrap();
-    let TerminalEnd::Pty { command, cwd, env } = end else {
+    let TerminalEnd::Pty {
+        command, cwd, env, ..
+    } = end
+    else {
         panic!("a macos agent runs on a PTY");
     };
     let out = Command::new(h.shim())
@@ -794,8 +799,8 @@ fn agents_use_the_owners_home_and_path() {
     let spec = h.spec("env");
     let handle = h.backend.create(&spec).unwrap();
     // Claude's state is the owner's own.
-    assert_eq!(handle.claude.dir, h.root().join("home/.claude"));
-    assert!(!handle.claude.own);
+    assert_eq!(handle.claude().unwrap().dir, h.root().join("home/.claude"));
+    assert!(!handle.claude().unwrap().own);
     let out = h
         .backend
         .run(
@@ -829,13 +834,17 @@ fn agents_use_the_owners_home_and_path() {
         .launch(
             &handle,
             &Launch {
+                agent: Default::default(),
                 args: vec!["--model".into(), "opus".into()],
                 env: vec![("GIT_CONFIG_COUNT".into(), "0".into())],
                 cwd: spec.worktree.clone(),
             },
         )
         .unwrap();
-    let TerminalEnd::Pty { command, cwd, env } = end else {
+    let TerminalEnd::Pty {
+        command, cwd, env, ..
+    } = end
+    else {
         panic!("a PTY");
     };
     assert_eq!(command[0], h.root().join("bin/claude").to_string_lossy());

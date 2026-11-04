@@ -1,9 +1,9 @@
 {
   "description": "Ids may be strings; the response echoes the id exactly.",
-  "request": { "jsonrpc": "2.0", "id": "menu-1", "method": "daemon.hello", "params": { "client": "VibeOS.app", "protocol": 1 } },
+  "request": { "jsonrpc": "2.0", "id": "menu-1", "method": "daemon.hello", "params": { "client": "VibeOS.app", "protocol": 2 } },
   "response": {
     "jsonrpc": "2.0",
     "id": "menu-1",
-    "result": { "daemon": "vibed", "version": "0.1.0", "protocol": 1, "os": "macos", "arch": "aarch64", "pid": 4242 }
+    "result": { "daemon": "vibed", "version": "0.1.0", "protocol": 2, "os": "macos", "arch": "aarch64", "pid": 4242 }
   }
 }

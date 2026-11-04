@@ -328,11 +328,17 @@ impl Core {
         let _ = crate::agents::remove_session_files(&socket);
         let _ = fs::remove_file(self.toolbox_dir().join(shim::RECORD_FILE));
         let spec = match end {
-            TerminalEnd::Pty { command, cwd, env } => SessionSpec {
+            TerminalEnd::Pty {
+                command,
+                cwd,
+                env,
+                clean_env,
+            } => SessionSpec {
                 agent: TOOLBOX_REF.into(),
                 command: command.iter().map(Into::into).collect(),
                 cwd: cwd.clone(),
                 env: env.iter().map(|(k, v)| (k.into(), v.into())).collect(),
+                clean_env: *clean_env,
                 size: None,
                 vm: None,
             },
@@ -341,6 +347,7 @@ impl Core {
                 command: Vec::new(),
                 cwd: self.toolbox_dir(),
                 env: Vec::new(),
+                clean_env: false,
                 size: None,
                 vm: Some(socket.clone()),
             },

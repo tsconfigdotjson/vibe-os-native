@@ -1,6 +1,6 @@
 [package]
 name = "vibe-status"
-description = "The VibeOS status engine: agent-tail reading Claude Code's transcripts"
+description = "The VibeOS status engine: agent-tail reading Claude Code's and Pi's transcripts"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

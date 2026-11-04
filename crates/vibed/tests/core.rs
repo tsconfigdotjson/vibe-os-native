@@ -393,6 +393,8 @@ async fn projects_with_agents_cannot_be_removed() {
                 compartment: "{}".into(),
                 starting: false,
                 shared_services: true,
+                agent: Default::default(),
+                pi_model: None,
             })
             .unwrap();
     }

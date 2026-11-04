@@ -6,10 +6,11 @@
 use std::path::Path;
 use std::time::Duration;
 
-use vibe_core::model::{Environment, Mode, Model, Reasoning};
+use vibe_core::model::{AgentKind, Environment, Mode, Model, PiTarget, Reasoning};
 use vibe_core::rpc::{
     HostAddParams, HostExternalParams, HostInfo, HostInstall, HostLink, HostNameParams, HostParams,
-    HostsAdd, HostsExternal, HostsList, HostsRemove, HostsUpgrade, NoParams, Profile,
+    HostsAdd, HostsExternal, HostsList, HostsRemove, HostsUpgrade, NoParams, PiForget,
+    PiForgetParams, PiInstall, PiInstallParams, PiStatus, PiStatusGet, Profile,
     ProfileCreateParams, ProfileParams, ProfileUpdateParams, ProfilesCreate, ProfilesDelete,
     ProfilesList, ProfilesUpdate, Project, ProjectAddParams, ProjectParams, ProjectRemoveParams,
     ProjectsAdd, ProjectsList, ProjectsRemove,
@@ -33,10 +34,23 @@ pub(crate) struct Settings {
     pub(crate) mode: Option<Mode>,
     pub(crate) memory: Option<u64>,
     pub(crate) shared_services: Option<bool>,
+    pub(crate) agent: Option<AgentKind>,
+    pub(crate) pi_model: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Command {
+    Pi {
+        host: Option<String>,
+    },
+    ForgetPi {
+        host: Option<String>,
+        providers: Vec<String>,
+    },
+    InstallPi {
+        host: Option<String>,
+        target: PiTarget,
+    },
     Projects {
         host: Option<String>,
     },
@@ -141,6 +155,8 @@ fn settings(found: &[(&str, &str)]) -> Result<Settings, String> {
                 other => Err(format!("--shared-services is on or off, not {other}")),
             })
             .transpose()?,
+        agent: parse("agent").map(|v| v.parse()).transpose()?,
+        pi_model: parse("pi-model"),
     })
 }
 
@@ -149,7 +165,7 @@ const SUBCOMMANDS: [&str; 8] = [
     "list", "ls", "create", "add", "set", "update", "delete", "rm",
 ];
 
-const PROFILE_FLAGS: [&str; 7] = [
+const PROFILE_FLAGS: [&str; 9] = [
     "host",
     "environment",
     "model",
@@ -157,6 +173,8 @@ const PROFILE_FLAGS: [&str; 7] = [
     "mode",
     "memory",
     "shared-services",
+    "agent",
+    "pi-model",
 ];
 
 impl Command {
@@ -262,6 +280,27 @@ impl Command {
         }
     }
 
+    /// From the words after `pi`.
+    pub(crate) fn parse_pi(words: &[String]) -> Result<Command, String> {
+        // `--vm` takes no value.
+        let vm = words.iter().any(|w| w == "--vm");
+        let words: Vec<String> = words.iter().filter(|w| *w != "--vm").cloned().collect();
+        let (plain, found) = flags(&words, &["host"])?;
+        let host = value(&found, "host").map(str::to_owned);
+        match plain.as_slice() {
+            [] | ["status"] if !vm => Ok(Command::Pi { host }),
+            ["forget", providers @ ..] if !providers.is_empty() => Ok(Command::ForgetPi {
+                host,
+                providers: providers.iter().map(|p| (*p).to_owned()).collect(),
+            }),
+            ["install"] => Ok(Command::InstallPi {
+                host,
+                target: if vm { PiTarget::Vm } else { PiTarget::Native },
+            }),
+            _ => Err("pi takes status, install [--vm], or forget PROVIDER...".into()),
+        }
+    }
+
     /// From the words after `host`.
     pub(crate) fn parse_host(words: &[String]) -> Result<Command, String> {
         let (plain, _) = flags(words, &[])?;
@@ -315,7 +354,69 @@ pub(crate) fn describe_project(p: &Project) -> String {
     out
 }
 
+/// What's installed and signed in to, a line each. Only providers' names: a
+/// login's contents are Pi's own.
+pub(crate) fn describe_pi(p: &PiStatus) -> String {
+    let logins = |l: &[String]| {
+        if l.is_empty() {
+            "not signed in".to_owned()
+        } else {
+            format!("signed in to {}", l.join(", "))
+        }
+    };
+    let native = match &p.native {
+        Some(n) => format!("Pi {} at {}", n.version, n.path),
+        None => "Pi isn't installed (vibe pi install)".to_owned(),
+    };
+    let mut out = format!("{native}, {}", logins(&p.logins));
+    if let Some(vms) = &p.vms {
+        let layer = match &vms.version {
+            Some(v) => format!("Pi {v}"),
+            None => "Pi isn't downloaded (vibe pi install --vm)".to_owned(),
+        };
+        out.push_str(&format!(
+            "\nlinux agents: {layer}, {}",
+            match logins(&vms.logins) {
+                l if vms.logins.is_empty() => {
+                    format!("{l}. {}", vibe_core::model::PI_TOOLBOX_SIGN_IN)
+                }
+                l => l,
+            }
+        ));
+        // What a daemon of any version says goes to this terminal only as text.
+        for alert in &vms.alerts {
+            let alert = vibe_core::model::clean_alert(alert);
+            out.push_str(&format!("\n! {alert}"));
+        }
+        for o in &vms.offered {
+            let (provider, agent) = (
+                vibe_core::model::clean_alert(&o.provider),
+                vibe_core::model::clean_alert(&o.agent),
+            );
+            out.push_str(&format!(
+                "\n{provider}'s login came from {agent}, not you: `vibe pi forget {provider}`, \
+                 and stop that agent if it wasn't you"
+            ));
+        }
+    }
+    out
+}
+
 pub(crate) fn describe_profile(p: &Profile) -> String {
+    if p.agent == AgentKind::Pi {
+        return format!(
+            "{}  pi, {}, {}, {} thinking, no approvals, {}",
+            p.name,
+            p.environment,
+            p.pi_model.as_deref().unwrap_or("Pi's default model"),
+            p.reasoning,
+            format_size(p.memory).unwrap_or_else(|| format!("{} bytes", p.memory))
+        ) + if p.shared_services {
+            ""
+        } else {
+            ", shared services off"
+        };
+    }
     format!(
         "{}  {}, {}, {} reasoning, {} mode, {}",
         p.name,
@@ -482,6 +583,24 @@ pub(crate) fn run(socket: &Path, command: Command) -> Result<(), String> {
                 println!("{}", describe_profile(p));
             }
         }
+        Command::Pi { host } => {
+            let status =
+                client::call::<PiStatusGet>(socket, &HostParams { host }, TIMEOUT).map_err(e)?;
+            println!("{}", describe_pi(&status));
+        }
+        Command::ForgetPi { host, providers } => {
+            let status =
+                client::call::<PiForget>(socket, &PiForgetParams { host, providers }, TIMEOUT)
+                    .map_err(e)?;
+            println!("{}", describe_pi(&status));
+        }
+        Command::InstallPi { host, target } => {
+            println!("Downloading Pi…");
+            let status =
+                client::call::<PiInstall>(socket, &PiInstallParams { host, target }, LONG_TIMEOUT)
+                    .map_err(e)?;
+            println!("{}", describe_pi(&status));
+        }
         Command::CreateProfile {
             host,
             project,
@@ -498,6 +617,8 @@ pub(crate) fn run(socket: &Path, command: Command) -> Result<(), String> {
                 mode: s.mode,
                 memory: s.memory,
                 shared_services: s.shared_services,
+                agent: s.agent,
+                pi_model: s.pi_model,
             };
             let p = client::call::<ProfilesCreate>(socket, &params, TIMEOUT).map_err(e)?;
             println!("created {}", describe_profile(&p));
@@ -520,6 +641,8 @@ pub(crate) fn run(socket: &Path, command: Command) -> Result<(), String> {
                 mode: s.mode,
                 memory: s.memory,
                 shared_services: s.shared_services,
+                agent: s.agent,
+                pi_model: s.pi_model,
             };
             let p = client::call::<ProfilesUpdate>(socket, &params, TIMEOUT).map_err(e)?;
             println!("{}", describe_profile(&p));
@@ -811,5 +934,111 @@ mod tests {
             })
         );
         assert!(Command::parse_host(&words(&["external", "vps"])).is_err());
+    }
+
+    #[test]
+    fn pi_commands() {
+        assert_eq!(
+            Command::parse_pi(&words(&["forget", "junk-a", "junk-b"])),
+            Ok(Command::ForgetPi {
+                host: None,
+                providers: vec!["junk-a".into(), "junk-b".into()]
+            })
+        );
+        assert!(Command::parse_pi(&words(&["forget"])).is_err());
+        assert_eq!(
+            Command::parse_pi(&words(&[])),
+            Ok(Command::Pi { host: None })
+        );
+        assert_eq!(
+            Command::parse_pi(&words(&["status", "--host", "vps"])),
+            Ok(Command::Pi {
+                host: Some("vps".into())
+            })
+        );
+        assert_eq!(
+            Command::parse_pi(&words(&["install"])),
+            Ok(Command::InstallPi {
+                host: None,
+                target: PiTarget::Native
+            })
+        );
+        assert_eq!(
+            Command::parse_pi(&words(&["install", "--vm"])),
+            Ok(Command::InstallPi {
+                host: None,
+                target: PiTarget::Vm
+            })
+        );
+        assert!(Command::parse_pi(&words(&["--vm"])).is_err());
+        assert!(Command::parse_pi(&words(&["login"])).is_err());
+    }
+
+    #[test]
+    fn pi_profiles_from_flags() {
+        let c = Command::parse_profile(&words(&[
+            "create",
+            "web",
+            "pi-linux",
+            "--agent",
+            "pi",
+            "--pi-model",
+            "openai/gpt-5",
+        ]))
+        .unwrap();
+        let Command::CreateProfile { settings, .. } = c else {
+            panic!("{c:?}");
+        };
+        assert_eq!(settings.agent, Some(AgentKind::Pi));
+        assert_eq!(settings.pi_model.as_deref(), Some("openai/gpt-5"));
+        assert!(Command::parse_profile(&words(&["create", "web", "x", "--agent", "gpt"])).is_err());
+    }
+
+    #[test]
+    fn what_pi_status_says() {
+        let mut status = PiStatus {
+            host: "local".into(),
+            native: None,
+            logins: Vec::new(),
+            vms: Some(vibe_core::rpc::PiVms::default()),
+        };
+        let none = describe_pi(&status);
+        assert!(none.contains("vibe pi install\x29"), "{none}");
+        assert!(none.contains("vibe pi install --vm"), "{none}");
+        assert!(none.contains("Copy code login (headless)"), "{none}");
+        assert!(none.contains("Don't choose Browser login"), "{none}");
+        status.vms = Some(vibe_core::rpc::PiVms {
+            alerts: vec!["quiet-otter signed in to xai".into()],
+            ..Default::default()
+        });
+        assert!(
+            describe_pi(&status).contains("\n! quiet-otter signed in to xai"),
+            "the owner hears here too"
+        );
+        // R3: nothing of what a daemon sends reaches this terminal as more than
+        // text, nor much of it.
+        status.vms = Some(vibe_core::rpc::PiVms {
+            alerts: vec![format!("\x1b[2Jphish{}", "x".repeat(100_000))],
+            offered: vec![vibe_core::rpc::PiOffered {
+                provider: "\x1b]0;evil\x07xai".into(),
+                agent: "quiet-otter".into(),
+            }],
+            ..Default::default()
+        });
+        let said = describe_pi(&status);
+        assert!(!said.chars().any(|c| c == '\x1b' || c == '\x07'), "{said}");
+        assert!(said.len() < 2000, "{}", said.len());
+        assert!(said.contains("vibe pi forget"), "{said}");
+        status.native = Some(vibe_core::rpc::PiBinary {
+            managed: false,
+            path: "/bin/pi".into(),
+            version: "1.5.0".into(),
+        });
+        status.logins = vec!["openai".into()];
+        status.vms = None;
+        assert_eq!(
+            describe_pi(&status),
+            "Pi 1.5.0 at /bin/pi, signed in to openai"
+        );
     }
 }

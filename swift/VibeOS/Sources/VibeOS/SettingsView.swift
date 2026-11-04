@@ -9,7 +9,7 @@ import VibeRPC
 /// is vibed's; nothing is kept here but the menu's own preferences. Fields
 /// save themselves.
 enum SettingsPane: String, CaseIterable, Identifiable {
-    case projects, keys, hosts, services, toolbox, limits, general
+    case projects, keys, hosts, agents, services, toolbox, limits, general
 
     /// Where the last pane shown is kept, so Settings opens where it was
     /// and the menu can open it on a pane.
@@ -22,6 +22,7 @@ enum SettingsPane: String, CaseIterable, Identifiable {
         case .projects: "Projects"
         case .keys: "API Keys"
         case .hosts: "Hosts"
+        case .agents: "Agents"
         case .services: "Services"
         case .toolbox: "Linux Toolbox"
         case .limits: "Host Limits"
@@ -34,6 +35,7 @@ enum SettingsPane: String, CaseIterable, Identifiable {
         case .projects: "folder.fill"
         case .keys: "key.fill"
         case .hosts: "server.rack"
+        case .agents: "terminal.fill"
         case .services: "puzzlepiece.extension.fill"
         case .toolbox: "shippingbox.fill"
         case .limits: "gauge.with.dots.needle.67percent"
@@ -46,6 +48,7 @@ enum SettingsPane: String, CaseIterable, Identifiable {
         case .projects: .blue
         case .keys: .orange
         case .hosts: .indigo
+        case .agents: .purple
         case .services: .purple
         case .toolbox: .brown
         case .limits: .green
@@ -92,6 +95,7 @@ struct SettingsView: View {
                 }
             case .keys: KeysPane(model: model)
             case .hosts: HostsPane(model: model)
+            case .agents: AgentsPane(model: model)
             case .services: ServicesPane(model: model)
             case .toolbox: ToolboxPane(model: model)
             case .limits: LimitsPane(model: model, host: $place.limitsHost)
@@ -371,11 +375,16 @@ struct ProjectDetail: View {
                             .onSubmit { Task { await create() } }
                         Button("Add Profile") { Task { await create() } }
                             .disabled(newProfile.trimmingCharacters(in: .whitespaces).isEmpty)
+                        // One click, in a VM: Pi never asks, so that's its
+                        // home unless the owner moves it.
+                        Button("Add Pi Profile") { Task { await create(agent: .pi) } }
+                            .disabled(profileNameTaken("pi-linux") && newProfile.trimmingCharacters(in: .whitespaces).isEmpty)
+                            .help("Runs Pi in a Linux environment, named pi-linux unless you name it. Its model and login are Pi's own.")
                     }
                 } header: {
                     Text("Add a Profile")
                 } footer: {
-                    Text("It starts as Linux, Opus, High, Auto and 4G. Change any of it above.")
+                    Text("It starts as Claude, Linux, Opus, High, Auto and 4G. Change any of it above.")
                         .foregroundStyle(.secondary)
                 }
                 Section {
@@ -405,11 +414,18 @@ struct ProjectDetail: View {
         }
     }
 
-    private func create() async {
-        let profile = newProfile.trimmingCharacters(in: .whitespaces)
+    private func profileNameTaken(_ profile: String) -> Bool {
+        project?.profiles.contains { $0.name == profile } ?? false
+    }
+
+    /// A new profile, of `agent` if it's named: Pi's has a usual name.
+    private func create(agent: AgentKind? = nil) async {
+        var profile = newProfile.trimmingCharacters(in: .whitespaces)
+        if profile.isEmpty && agent == .pi { profile = "pi-linux" }
         guard !profile.isEmpty else { return }
         do {
-            _ = try await model.call(ProfilesCreate.self, ProfileCreateParams(host: host, project: name, name: profile))
+            _ = try await model.call(
+                ProfilesCreate.self, ProfileCreateParams(host: host, project: name, name: profile, agent: agent))
             newProfile = ""
             error = nil
             await load()
@@ -452,8 +468,10 @@ struct ProjectDetail: View {
     }
 }
 
-/// One profile: environment, model, reasoning, mode and memory (PRD:
-/// Profiles). Each change is sent as it's made.
+/// One profile: its agent, environment, model, reasoning, mode and memory
+/// (PRD: Profiles). Each change is sent as it's made. Claude has a model of two
+/// and permission modes; Pi takes its model as `provider/id`, thinks at the
+/// same levels and never asks, which says so here.
 struct ProfileRow: View {
     @ObservedObject var model: MenuModel
     let host: String
@@ -493,28 +511,47 @@ struct ProfileRow: View {
                         return await update { $0.name = name }
                     }
                 }
-                Picker("Environment", selection: binding(\.environment, \.environment)) {
+                Picker("Agent", selection: agentBinding) {
+                    ForEach(AgentKind.allCases, id: \.self) { Text($0.title).tag($0) }
+                }
+                .pickerStyle(.segmented)
+                Picker("Environment", selection: environmentBinding) {
                     ForEach(environments, id: \.self) { Text($0.title).tag($0) }
                 }
                 .pickerStyle(.segmented)
-                Picker("Model", selection: binding(\.model, \.model)) {
-                    ForEach(ClaudeModel.allCases, id: \.self) { Text($0.title).tag($0) }
+                if shown.kind == .claude {
+                    Picker("Model", selection: binding(\.model, \.model)) {
+                        ForEach(ClaudeModel.allCases, id: \.self) { Text($0.title).tag($0) }
+                    }
+                    .pickerStyle(.segmented)
+                } else {
+                    LabeledContent("Model") {
+                        CommitField(
+                            title: "Model", value: profile.piModel ?? "", prompt: "Pi's default", width: 240,
+                            help: "As provider/id, as pi --list-models shows it. Empty uses Pi's own default.",
+                            trailing: false, isValid: validPiModel
+                        ) { text in
+                            let model = text.trimmingCharacters(in: .whitespaces)
+                            return await update { $0.piModel = model }
+                        }
+                    }
                 }
-                .pickerStyle(.segmented)
                 // Five levels don't fit a segmented control here, so a
                 // bordered pop-up, as New Agent's are.
-                LabeledContent("Reasoning") {
+                LabeledContent(shown.kind == .claude ? "Reasoning" : "Thinking") {
                     PopUp(
-                        label: "Reasoning",
+                        label: shown.kind == .claude ? "Reasoning" : "Thinking",
                         items: ReasoningLevel.allCases.map { PopUp<ReasoningLevel>.Item(title: $0.title, value: $0) },
                         selection: binding(\.reasoning, \.reasoning)
                     )
                     .frame(width: 140)
                 }
-                Picker("Mode", selection: binding(\.mode, \.mode)) {
-                    ForEach(PermissionMode.allCases, id: \.self) { Text($0.title).tag($0) }
+                if shown.kind == .claude {
+                    Picker("Mode", selection: binding(\.mode, \.mode)) {
+                        ForEach(PermissionMode.allCases, id: \.self) { Text($0.title).tag($0) }
+                    }
+                    .pickerStyle(.segmented)
                 }
-                .pickerStyle(.segmented)
                 // A compact field, as Host Limits' are, beside its stepper.
                 LabeledContent("Memory") {
                     HStack(spacing: 6) {
@@ -546,7 +583,16 @@ struct ProfileRow: View {
                         })
                 )
                 .help("Whether agents started from this profile get the services in Settings → Services")
-                if shown.mode == .bypass {
+                if shown.kind == .pi {
+                    Label(
+                        shown.environment == .macos
+                            ? "Approvals: none. Pi never asks before running a tool, and a macOS agent acts as you."
+                            : "Approvals: none. Pi never asks before running a tool; its compartment is its limit.",
+                        systemImage: "exclamationmark.shield"
+                    )
+                    .font(.callout)
+                    .foregroundStyle(shown.environment == .macos ? Palette.attention : Color.secondary)
+                } else if shown.mode == .bypass {
                     Label(
                         shown.environment == .macos
                             ? "Bypass skips every permission prompt, and a macOS agent acts as you."
@@ -590,7 +636,10 @@ struct ProfileRow: View {
             if shown.mode == .bypass && shown.environment == .macos {
                 Image(systemName: "exclamationmark.shield")
                     .foregroundStyle(Palette.attention)
-                    .help("Bypass on macOS: this agent acts as you")
+                    .help(
+                        shown.kind == .pi
+                            ? "Pi on macOS: it never asks, and this agent acts as you"
+                            : "Bypass on macOS: this agent acts as you")
                     .accessibilityLabel("Bypass on macOS")
             }
         }
@@ -621,6 +670,65 @@ struct ProfileRow: View {
         stepping = false
         stepTarget = nil
         pending = nil
+    }
+
+    /// Empty for Pi's own default, or `provider/id` with no spaces; vibed has
+    /// the last word.
+    private func validPiModel(_ text: String) -> Bool {
+        let model = text.trimmingCharacters(in: .whitespaces)
+        if model.isEmpty { return true }
+        let parts = model.split(separator: "/", omittingEmptySubsequences: false)
+        return parts.count >= 2 && parts.allSatisfy { !$0.isEmpty } && !model.hasPrefix("-")
+            && !model.contains(where: \.isWhitespace)
+    }
+
+    /// Pi on this Mac is the owner's call, as Claude's bypass is, and is said
+    /// in the call that puts it there: vibed refuses it otherwise.
+    private func confirmPiOnMac() -> Bool {
+        confirm(
+            "Run Pi on this Mac, unsandboxed?",
+            detail: "Pi never asks before running a tool, and a macOS agent can do anything you can. A "
+                + "Linux environment keeps it in a VM.",
+            action: "Run on macOS")
+    }
+
+    private var agentBinding: Binding<AgentKind> {
+        Binding(
+            get: { shown.kind },
+            set: { kind in
+                guard kind != shown.kind else { return }
+                let onMac = kind == .pi && shown.environment == .macos
+                if onMac && !confirmPiOnMac() { return }
+                var next = shown
+                next.agent = kind
+                if kind == .claude { next.mode = .auto; next.piModel = nil } else { next.mode = .bypass }
+                pending = next
+                Task {
+                    await update {
+                        $0.agent = kind
+                        if onMac { $0.mode = .bypass }
+                    }
+                }
+            })
+    }
+
+    private var environmentBinding: Binding<AgentEnvironment> {
+        Binding(
+            get: { shown.environment },
+            set: { environment in
+                guard environment != shown.environment else { return }
+                let onMac = shown.kind == .pi && environment == .macos
+                if onMac && !confirmPiOnMac() { return }
+                var next = shown
+                next.environment = environment
+                pending = next
+                Task {
+                    await update {
+                        $0.environment = environment
+                        if onMac { $0.mode = .bypass }
+                    }
+                }
+            })
     }
 
     private func validMemory(_ text: String) -> Bool {
@@ -1188,7 +1296,7 @@ struct HostRow: View {
                     Label("Still needs \(host.missing.joined(separator: ", ")) on the server", systemImage: "wrench.and.screwdriver")
                         .font(.caption)
                         .foregroundStyle(Palette.attention)
-                        .help("Install it on \(host.name), then log in there: gh auth login, and claude with /login")
+                        .help("Install it on \(host.name), then log in there: gh auth login, and claude with /login. Pi, if you'll run it, signs in the same way: pi, then /login")
                 }
             }
             Spacer()

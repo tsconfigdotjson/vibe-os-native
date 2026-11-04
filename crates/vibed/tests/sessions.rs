@@ -156,6 +156,8 @@ async fn an_agents_session_is_titled_with_its_profile() {
             compartment: "{}".into(),
             starting: false,
             shared_services: true,
+            agent: Default::default(),
+            pi_model: None,
         })
         .unwrap();
     let _shim = start_shim(&w.layout, "quiet-amber-otter", &["sleep", "600"]);
@@ -256,6 +258,7 @@ async fn a_started_session_is_detached_and_outlives_vibed() {
             .to_vec(),
         cwd: w.layout.home().to_owned(),
         env: vec![("GREETING".into(), "world".into())],
+        clean_env: false,
         size: Some(Size { rows: 10, cols: 50 }),
         vm: None,
     };
@@ -342,6 +345,7 @@ async fn starting_reports_what_went_wrong() {
         command: vec![command.into()],
         cwd: "/".into(),
         env: Vec::new(),
+        clean_env: false,
         size: None,
         vm: None,
     };

@@ -49,7 +49,7 @@ pub enum Source {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Entry {
+pub(crate) enum Entry {
     Dir { mode: u16 },
     File { source: Source, mode: u16 },
     Symlink { target: String },
@@ -83,6 +83,12 @@ impl Tree {
                 target: target.to_owned(),
             },
         )
+    }
+
+    /// What's at `path`, for a test to look at.
+    #[cfg(test)]
+    pub(crate) fn entry(&self, path: &str) -> Option<&Entry> {
+        self.entries.get(path)
     }
 
     fn add(&mut self, path: &str, entry: Entry) -> &mut Tree {

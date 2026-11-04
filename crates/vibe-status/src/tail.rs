@@ -11,12 +11,13 @@ use agent_tail::{
     ChunkCtx, EventKind as TailEvent, Harness, ParseMode, READ_CHUNK, ReducerOptions,
     SessionReducer, SessionState, Timestamp,
 };
-use vibe_core::model::{Activity, AgentState, Certainty, StopReason, WakeupKind};
+use vibe_core::model::{Activity, AgentKind, AgentState, Certainty, StopReason, WakeupKind};
 use vibe_core::rpc;
 use vibe_core::time::rfc3339;
 
 /// How much of a transcript is read to find the working directory it
-/// records, and when it began. Claude writes both on its first entries.
+/// records, and when it began. Claude and Pi both write them on their first
+/// entries.
 const CWD_PROBE: u64 = 256 * 1024;
 
 /// How long a pending tool call goes without a result before agent-tail
@@ -32,9 +33,10 @@ pub const INFERRED_QUIET: Duration = Duration::from_secs(5 * 60);
 
 /// One agent's transcript, read as it's appended to.
 ///
-/// Claude Code is launched with `--session-id`, so the transcript is known
-/// exactly: `<project dir>/<session id>.jsonl`. A `/clear` starts a new
-/// session, in a new file beside it; the tail then follows the newest
+/// The agent is launched with `--session-id`, so the transcript is known
+/// exactly: Claude's is `<project dir>/<session id>.jsonl`, and Pi's
+/// `<sessions dir>/<time>_<session id>.jsonl`. A `/clear`, or Pi's `/new`,
+/// starts a new session, in a new file beside it; the tail then follows the newest
 /// session whose recorded working directory is the agent's worktree. Each
 /// worktree has exactly one agent, so that's always this agent's. It moves
 /// only forward, to a session that began later, and only once something in
@@ -43,6 +45,8 @@ pub const INFERRED_QUIET: Duration = Duration::from_secs(5 * 60);
 /// its helpers.
 #[derive(Debug)]
 pub struct Tail {
+    /// Whose transcripts these are.
+    harness: Harness,
     project_dir: PathBuf,
     worktree: String,
     /// The session the agent was launched with.
@@ -69,6 +73,7 @@ struct Probe {
 
 #[derive(Debug)]
 struct Followed {
+    harness: Harness,
     path: PathBuf,
     session_id: String,
     reducer: SessionReducer,
@@ -102,7 +107,7 @@ pub struct Mark {
 }
 
 impl Tail {
-    /// A tail on the transcripts in `project_dir`, Claude's directory for
+    /// A tail on the Claude transcripts in `project_dir`, its directory for
     /// sessions run in `worktree`, of an agent launched as `session_id`.
     /// agent-tail's idle window is `idle_debounce`, the host's.
     pub fn new(
@@ -111,7 +116,25 @@ impl Tail {
         session_id: &str,
         idle_debounce: Duration,
     ) -> Tail {
+        Tail::of(
+            AgentKind::Claude,
+            project_dir,
+            worktree,
+            session_id,
+            idle_debounce,
+        )
+    }
+
+    /// [`Tail::new`] for the transcripts of `kind`, read with its own adapter.
+    pub fn of(
+        kind: AgentKind,
+        project_dir: PathBuf,
+        worktree: &Path,
+        session_id: &str,
+        idle_debounce: Duration,
+    ) -> Tail {
         Tail {
+            harness: harness_of(kind),
             project_dir,
             worktree: worktree.to_string_lossy().into_owned(),
             launched: session_id.to_owned(),
@@ -287,7 +310,7 @@ impl Tail {
     /// at work when the mark was taken, by a prompt or interrupt of the
     /// user's, as the end of the turn it was in is no answer to a send it
     /// hasn't read yet.
-    fn moved_since(&self, mark: &Mark) -> bool {
+    pub fn moved_since(&self, mark: &Mark) -> bool {
         let Some(f) = &self.followed else {
             return false;
         };
@@ -303,7 +326,9 @@ impl Tail {
     /// Picks the transcript to follow, and says whether it changed.
     fn choose(&mut self) -> bool {
         let current_id = self.session_id().to_owned();
-        let current = self.project_dir.join(format!("{current_id}.jsonl"));
+        let harness = self.harness;
+        let current = transcript_path(harness, &self.project_dir, &current_id)
+            .unwrap_or_else(|| self.project_dir.join(format!("{current_id}.jsonl")));
         let current_mtime = file_mtime(&current);
         let current_began = current_mtime
             .and_then(|_| self.probe(&current))
@@ -319,7 +344,7 @@ impl Tail {
                 let Some(id) = path
                     .file_name()
                     .and_then(|n| n.to_str())
-                    .and_then(|n| n.strip_suffix(".jsonl"))
+                    .and_then(|n| session_of_file(harness, n))
                     .map(str::to_owned)
                 else {
                     continue;
@@ -357,14 +382,14 @@ impl Tail {
         let Some((_, _, path, session_id)) = newer else {
             self.candidate = None;
             if self.followed.is_none() && current_mtime.is_some() {
-                self.follow(Followed::new(current, current_id, self.window()));
+                self.follow(Followed::new(harness, current, current_id, self.window()));
                 return true;
             }
             return false;
         };
         let window = self.window();
         if self.candidate.as_ref().is_none_or(|c| c.path != path) {
-            self.candidate = Some(Followed::new(path, session_id, window));
+            self.candidate = Some(Followed::new(harness, path, session_id, window));
         }
         let candidate = self.candidate.as_mut().expect("just set");
         candidate.read(window);
@@ -378,7 +403,7 @@ impl Tail {
             return true;
         }
         if self.followed.is_none() && current_mtime.is_some() {
-            self.follow(Followed::new(current, current_id, window));
+            self.follow(Followed::new(harness, current, current_id, window));
             return true;
         }
         false
@@ -401,7 +426,7 @@ impl Tail {
             .ok()?;
         let mut cwd = None;
         let mut began = None;
-        for e in agent_tail::parse_lines(Harness::ClaudeCode, &bytes, ParseMode::Lean) {
+        for e in agent_tail::parse_lines(self.harness, &bytes, ParseMode::Lean) {
             if e.sidechain {
                 continue;
             }
@@ -429,9 +454,10 @@ enum Fed {
 }
 
 impl Followed {
-    fn new(path: PathBuf, session_id: String, window: Duration) -> Followed {
+    fn new(harness: Harness, path: PathBuf, session_id: String, window: Duration) -> Followed {
         Followed {
-            reducer: reducer(&path, window),
+            harness,
+            reducer: reducer(harness, &path, window),
             path,
             session_id,
             seen: None,
@@ -442,7 +468,7 @@ impl Followed {
 
     /// Starts over, to be read again from the start.
     fn reset(&mut self, window: Duration) {
-        self.reducer = reducer(&self.path, window);
+        self.reducer = reducer(self.harness, &self.path, window);
         self.seen = None;
         self.helpers.clear();
     }
@@ -486,7 +512,7 @@ impl Followed {
                 .seek(SeekFrom::Start(before))
                 .and_then(|_| (&mut file).take(after - before).read_to_end(&mut bytes));
             if taken.is_ok() {
-                self.inputs += agent_tail::parse_lines(Harness::ClaudeCode, &bytes, ParseMode::Lean)
+                self.inputs += agent_tail::parse_lines(self.harness, &bytes, ParseMode::Lean)
                     .filter(|e| !e.sidechain && is_input(&e.kind))
                     .count() as u64;
             }
@@ -568,12 +594,50 @@ fn is_input(kind: &TailEvent) -> bool {
     }
 }
 
-fn reducer(path: &Path, window: Duration) -> SessionReducer {
+fn harness_of(kind: AgentKind) -> Harness {
+    match kind {
+        AgentKind::Claude => Harness::ClaudeCode,
+        AgentKind::Pi => Harness::Pi,
+    }
+}
+
+/// The session a transcript's file name says it holds.
+fn session_of_file(harness: Harness, name: &str) -> Option<&str> {
+    let stem = name.strip_suffix(".jsonl")?;
+    match harness {
+        // `<ISO time>_<session id>`; the time has no `_` in it.
+        Harness::Pi => stem
+            .split_once('_')
+            .map(|(_, id)| id)
+            .filter(|id| !id.is_empty()),
+        _ => Some(stem),
+    }
+}
+
+/// The transcript of session `id` in `dir`, where its name doesn't say it
+/// exactly: Pi's starts with the time it began. None until it's written.
+fn transcript_path(harness: Harness, dir: &Path, id: &str) -> Option<PathBuf> {
+    if !matches!(harness, Harness::Pi) {
+        return None;
+    }
+    fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .find(|e| {
+            e.file_name()
+                .to_str()
+                .and_then(|n| session_of_file(harness, n))
+                .is_some_and(|s| s == id)
+        })
+        .map(|e| e.path())
+}
+
+fn reducer(harness: Harness, path: &Path, window: Duration) -> SessionReducer {
     let options = ReducerOptions {
         idle_after: window,
         ..ReducerOptions::default()
     };
-    let mut r = SessionReducer::new(Harness::ClaudeCode, options);
+    let mut r = SessionReducer::new(harness, options);
     r.set_path(path);
     r
 }
@@ -727,6 +791,54 @@ impl Status {
             return AgentState::Busy;
         }
         state_of(self.activity)
+    }
+
+    /// Whether it reads as in the middle of a turn, or as not having started.
+    pub fn open_turn(&self) -> bool {
+        matches!(
+            self.activity,
+            Activity::Unknown
+                | Activity::Thinking
+                | Activity::RunningTool
+                | Activity::BackgroundWork
+        )
+    }
+
+    /// An open turn from before `at` is over: the agent was launched then with
+    /// nothing to do. Written since, it's a turn of this launch and stands. By
+    /// the file's own time where there is one, which is this machine's clock
+    /// and not a VM's.
+    pub fn at_rest_since(mut self, at: Timestamp) -> Status {
+        let last = self.last_write.or(self.quiet_since);
+        if self.open_turn() && last.is_none_or(|t| t <= at) {
+            self.activity = if self.transcript.is_some() {
+                Activity::Interrupted
+            } else {
+                Activity::Done
+            };
+            self.certainty = Certainty::Firm;
+            self.since = Some(at);
+        }
+        self
+    }
+
+    /// Whether a turn may have failed before it started, which only the screen
+    /// can say: no transcript or nothing past the prompt, and nothing written
+    /// for `after`. A tool that's running has started.
+    pub fn pi_may_have_failed(&self, now: Timestamp, after: Duration) -> bool {
+        matches!(self.activity, Activity::Unknown | Activity::Thinking)
+            && self
+                .last_write
+                .or(self.quiet_since)
+                .is_none_or(|t| now.as_secs_f64() - t.as_secs_f64() >= after.as_secs_f64())
+    }
+
+    /// The screen shows that the turn failed with `error`.
+    pub fn failed_on_screen(mut self, error: String) -> Status {
+        self.activity = Activity::Errored;
+        self.certainty = Certainty::Firm;
+        self.error = Some(error);
+        self
     }
 
     /// Whether it's surely waiting on a permission prompt: agent-tail says

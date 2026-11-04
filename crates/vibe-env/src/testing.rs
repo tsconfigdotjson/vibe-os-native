@@ -13,16 +13,18 @@
 use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::DirBuilderExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+use vibe_core::model::AgentKind;
+
 use crate::claude::{CONFIG_DIR_ENV, ClaudeHome};
 use crate::tree::SessionTree;
 use crate::{
-    AgentSpec, Backend, Capabilities, Compartment, EnvError, Handle, Launch, Limit, Limiter,
-    Limits, Result, Run, RunOutput, Sleeper, TerminalEnd, Usage, Woke, native,
+    AgentHome, AgentSpec, Backend, Capabilities, Compartment, EnvError, Handle, Launch, Limit,
+    Limiter, Limits, PiHome, Result, Run, RunOutput, Sleeper, TerminalEnd, Usage, Woke, native, pi,
 };
 
 /// A stand-in for Claude Code, as a POSIX shell script. It reads Claude's
@@ -52,6 +54,14 @@ use crate::{
 /// `stand-in.sh` beside this file, which `scripts/check-full.sh` uses too.
 pub const STAND_IN: &str = include_str!("stand-in.sh");
 
+/// A stand-in for Pi, as a POSIX shell script: it takes Pi's arguments, starts
+/// or resumes the session its `--session-id` names, as Pi's session files are
+/// written, with a real session's entries for what the prompt's words say. So
+/// the status engine reads what Pi writes, through agent-tail's own Pi
+/// adapter, with no model behind it. See `pi-stand-in.sh`, which says what it
+/// does for each word, beside this file.
+pub const PI_STAND_IN: &str = include_str!("pi-stand-in.sh");
+
 /// How often a supervisor checks its agent.
 const TICK: Duration = Duration::from_millis(50);
 
@@ -61,6 +71,12 @@ const STOP_GRACE: Duration = Duration::from_secs(5);
 #[derive(Debug)]
 pub struct TestBackend {
     claude: PathBuf,
+    /// What runs as Pi, if anything does, and the one agent dir its agents
+    /// share.
+    pi: Option<(PathBuf, PathBuf)>,
+    /// With [`TestBackend::with_pi_copies`], the store.
+    pi_copies: Option<crate::pi_logins::Broker>,
+    pi_config: Option<PathBuf>,
     supervisors: Mutex<HashMap<String, Supervisor>>,
     /// Held to pause, to replace a supervisor and to wake, so a supervisor
     /// that was just replaced can't pause the agent a wake has continued.
@@ -99,6 +115,9 @@ impl TestBackend {
     pub fn new(claude: impl Into<PathBuf>) -> TestBackend {
         TestBackend {
             claude: claude.into(),
+            pi: None,
+            pi_copies: None,
+            pi_config: None,
             supervisors: Mutex::new(HashMap::new()),
             gate: Arc::new(Mutex::new(())),
             memory: None,
@@ -111,6 +130,25 @@ impl TestBackend {
                 wake_cost: Duration::from_millis(10),
             },
         }
+    }
+
+    /// Keeps each Pi agent a private agent dir as a `linux` VM has, in step with
+    /// the store in `layout` by the real code.
+    pub fn with_pi_copies(
+        mut self,
+        pi: impl Into<PathBuf>,
+        layout: &vibe_core::paths::Layout,
+    ) -> TestBackend {
+        self.pi = Some((pi.into(), layout.linux_pi_logins_dir()));
+        self.pi_copies = Some(crate::pi_logins::Broker::of(layout));
+        self.pi_config = Some(layout.linux_pi_dir());
+        self
+    }
+
+    /// Runs `pi` as Pi, with `dir` as the agent dir all its agents share.
+    pub fn with_pi(mut self, pi: impl Into<PathBuf>, dir: impl Into<PathBuf>) -> TestBackend {
+        self.pi = Some((pi.into(), dir.into()));
+        self
     }
 
     /// Says it has `capabilities`, so policy that reads them can be tested
@@ -143,6 +181,19 @@ impl TestBackend {
         self
     }
 
+    /// As the `linux` backend readies a VM's private agent dir, with
+    /// [`TestBackend::with_pi_copies`].
+    fn prepare_pi_copy(&self, agent: &str, agent_dir: &Path, running: bool) -> Result<()> {
+        if let Some(broker) = &self.pi_copies {
+            let _ = broker.prepare_vm(
+                &crate::pi_logins::vm_copy(agent, agent_dir),
+                running,
+                crate::pi_logins::now_ms(),
+            );
+        }
+        Ok(())
+    }
+
     /// The agent's session, unless its pid now names someone else's.
     fn tree(h: &Handle) -> Option<SessionTree> {
         h.session
@@ -151,10 +202,16 @@ impl TestBackend {
     }
 
     fn env(h: &Handle) -> Vec<(String, String)> {
-        vec![(
-            CONFIG_DIR_ENV.to_owned(),
-            h.claude.dir.to_string_lossy().into_owned(),
-        )]
+        match &h.home {
+            AgentHome::Claude(c) => vec![(
+                CONFIG_DIR_ENV.to_owned(),
+                c.dir.to_string_lossy().into_owned(),
+            )],
+            AgentHome::Pi(p) => vec![(
+                pi::AGENT_DIR_ENV.to_owned(),
+                p.dir.to_string_lossy().into_owned(),
+            )],
+        }
     }
 
     fn unsupervise(&self, h: &Handle) {
@@ -165,17 +222,41 @@ impl TestBackend {
 
 impl Compartment for TestBackend {
     fn create(&self, spec: &AgentSpec) -> Result<Handle> {
-        let dir = spec.agent_dir.join("claude");
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&dir)
-            .map_err(|e| EnvError::new(format!("can't create {}: {e}", dir.display())))?;
+        let home = match spec.agent {
+            AgentKind::Claude => {
+                let dir = spec.agent_dir.join("claude");
+                fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(&dir)
+                    .map_err(|e| EnvError::new(format!("can't create {}: {e}", dir.display())))?;
+                AgentHome::Claude(ClaudeHome::own(dir))
+            }
+            AgentKind::Pi => {
+                let (_, dir) = self
+                    .pi
+                    .clone()
+                    .ok_or_else(|| EnvError::new("this test backend has no Pi"))?;
+                match &self.pi_config {
+                    None => AgentHome::Pi(PiHome::at(dir, spec.agent_dir.join(pi::VM_SESSIONS))),
+                    Some(config) => {
+                        self.prepare_pi_copy(&spec.agent_ref, &spec.agent_dir, false)?;
+                        AgentHome::Pi(
+                            PiHome::at(
+                                spec.agent_dir.join(pi::VM_AGENT_DIR),
+                                spec.agent_dir.join(pi::VM_SESSIONS),
+                            )
+                            .with_config(config.clone()),
+                        )
+                    }
+                }
+            }
+        };
         Ok(Handle {
             agent_ref: spec.agent_ref.clone(),
             agent_dir: spec.agent_dir.clone(),
             worktree: spec.worktree.clone(),
-            claude: ClaudeHome::own(dir),
+            home,
             session: None,
         })
     }
@@ -186,18 +267,30 @@ impl Compartment for TestBackend {
         fs::create_dir_all(&tmp)?;
         let mut env = TestBackend::env(h);
         env.push(("TMPDIR".into(), tmp.to_string_lossy().into_owned()));
-        native::run(r, &env)
+        native::run_for(h, r, &env)
     }
 
     fn launch(&self, h: &Handle, launch: &Launch) -> Result<TerminalEnd> {
-        let mut command = vec![self.claude.to_string_lossy().into_owned()];
-        command.extend(launch.args.iter().cloned());
-        let mut env = TestBackend::env(h);
-        env.extend(launch.env.iter().cloned());
+        let program = match launch.agent {
+            AgentKind::Claude => self.claude.clone(),
+            AgentKind::Pi => {
+                self.prepare_pi_copy(&h.agent_ref, &h.agent_dir, true)?;
+                self.pi
+                    .clone()
+                    .ok_or_else(|| EnvError::new("this test backend has no Pi"))?
+                    .0
+            }
+        };
+        let native::AgentCommand {
+            command,
+            env,
+            clean_env,
+        } = native::agent_command(&program, h, launch, TestBackend::env(h))?;
         Ok(TerminalEnd::Pty {
             command,
             cwd: launch.cwd.clone(),
             env,
+            clean_env,
         })
     }
 
@@ -226,9 +319,9 @@ impl Compartment for TestBackend {
 
     fn delete(&self, h: &Handle) -> Result<()> {
         self.stop(h)?;
-        h.claude
+        h.home
             .forget(&h.worktree)
-            .map_err(|e| EnvError::new(format!("can't remove Claude's state: {e}")))?;
+            .map_err(|e| EnvError::new(format!("can't remove its agent's state: {e}")))?;
         let tmp = h.agent_dir.join(vibe_core::paths::TMP_DIR);
         match fs::remove_dir_all(&tmp) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(EnvError::new(format!(
@@ -329,6 +422,13 @@ impl Sleeper for TestBackend {
     }
 
     fn wake(&self, h: &Handle) -> Result<Woke> {
+        // As the `linux` backend does, before anything of it runs again.
+        if let (Some(broker), AgentHome::Pi(_)) = (&self.pi_copies, &h.home) {
+            let _ = broker.sync(
+                &crate::pi_logins::vm_copy(&h.agent_ref, &h.agent_dir),
+                crate::pi_logins::now_ms(),
+            );
+        }
         let Some(tree) = TestBackend::tree(h) else {
             return Ok(Woke::Resume);
         };
@@ -529,6 +629,7 @@ impl crate::toolbox::ToolboxHost for TestToolbox {
             command: self.shell.clone(),
             cwd: dir,
             env: Vec::new(),
+            clean_env: false,
         })
     }
 

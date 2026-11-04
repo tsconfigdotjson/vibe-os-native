@@ -243,12 +243,15 @@ typealias StepStatus = SetupProgress.Step.Status
             check(CheckId.ghGit, CheckState.fail, fixable: true), check(CheckId.claude, CheckState.pass),
             check(CheckId.claudeLogin, CheckState.pass), check(CheckId.power, CheckState.fail),
             check(CheckId.tailscale, CheckState.optional), check(CheckId.linux, CheckState.working, progress: 40),
+            check(CheckId.pi, CheckState.optional),
         ],
         install: InstallStatus.justInstalled)
 
     /// The first launch and the first run in one list, in order: the vibe
     /// command, the doctor's checks with Terminal among them, then the
-    /// Linux download, GitHub for linux agents, a project, a key.
+    /// Linux download, GitHub for linux agents, a project, a key. The doctor's
+    /// Pi check, which `fiveMinute` has as `vibed` sends it, is no step: nothing
+    /// needs it until a profile runs Pi.
     @Test func doctorChecksAreStepsInTheSameList() {
         let setup = Self.fiveMinute
         let order: [StepID] = [
@@ -668,12 +671,24 @@ typealias StepStatus = SetupProgress.Step.Status
         let doctor = try d.call(DoctorCheckGet.self, NoParams()).checks
         let doctorIDs: [CheckId] = doctor.map { (c: DoctorCheck) -> CheckId in c.id }
         #expect(doctorIDs == CheckId.allCases)
-        let last = try #require(doctor.last)
-        #expect(last.state == CheckState.working)
-        #expect(last.progress == 40)
+        let linux = try #require(doctor.first { (c: DoctorCheck) -> Bool in c.id == CheckId.linux })
+        #expect(linux.state == CheckState.working)
+        #expect(linux.progress == 40)
+        // Pi comes after it, as `vibed` says them: optional, with nothing to do.
+        let pi = try #require(doctor.last)
+        #expect(pi.id == CheckId.pi)
+        #expect(pi.state == CheckState.optional)
+        #expect(pi.fixable == false)
         let fresh = try FixtureDaemon(.freshMac).call(DoctorCheckGet.self, NoParams()).checks
         let failing: Int = fresh.filter { (c: DoctorCheck) -> Bool in c.state == CheckState.fail }.count
         #expect(failing == 6)
+        #expect(fresh.last?.id == CheckId.pi)
+        #expect(fresh.last?.state == CheckState.optional)
+        // What Settings shows of Pi agrees with the doctor, either way.
+        for scenario in [FixtureDaemon.Scenario.firstRun, FixtureDaemon.Scenario.freshMac] {
+            #expect(try FixtureDaemon(scenario).call(PiStatusGet.self, HostParams()).native == nil)
+        }
+        #expect(try FixtureDaemon(.quiet).call(PiStatusGet.self, HostParams()).native != nil)
         let freshGh: GhState = try FixtureDaemon(.freshMac).call(GhStatusGet.self, GhStatusParams()).state
         #expect(freshGh == GhState.notInstalled)
         let quiet = FixtureDaemon(.quiet)
@@ -834,6 +849,16 @@ typealias StepStatus = SetupProgress.Step.Status
             ["name": "reviewer", "environment": "linux", "model": "sonnet", "reasoning": "xhigh", "mode": "bypass",
              "memory": 4 << 30] as [String: Any])
         #expect(profileSummary(profile) == "Linux · Sonnet · Extra High · Bypass · 4G")
+        // Part of an alert can come from a guest: it's shown as text, and short.
+        #expect(cleanAlert("a\u{1b}[2Jb\u{07}c\u{202e}d") == "a[2Jbcd")
+        #expect(cleanAlert(String(repeating: "x", count: 1000)).count == 401)
+        // Pi says what it runs, has a model of its own, and no modes.
+        var pi = profile
+        pi.agent = .pi
+        pi.piModel = "openai/gpt-5"
+        #expect(profileSummary(pi) == "Pi · Linux · openai/gpt-5 · Extra High · No approvals · 4G")
+        pi.piModel = nil
+        #expect(profileSummary(pi) == "Pi · Linux · Pi's default model · Extra High · No approvals · 4G")
         // The step's words, wherever it sits in the list (SetupTests has
         // the order).
         let setup = SetupProgress(hasProject: false, hasKey: false, linuxGitHub: false)

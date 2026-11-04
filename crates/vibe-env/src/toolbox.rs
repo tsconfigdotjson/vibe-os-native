@@ -7,7 +7,10 @@
 //! the root's writable layer, and a clone of the newest Linux home for
 //! `/home/vibe` (`vibe.home`). `vibe` may use `sudo` there (`vibe.sudo`),
 //! and the Linux Claude config is shared at `~/.claude`, so it's edited
-//! there too. Cloning is an APFS clone on the Mac, so nothing is copied.
+//! there too. Pi has a private agent dir at `~/.pi/agent`, which `vibed` keeps in
+//! step with the store, so `/login` there signs in every Pi agent at once and
+//! nothing of it lands in the Linux home.
+//! Cloning is an APFS clone on the Mac, so nothing is copied.
 //!
 //! When the work is done, the guest seals the disks (ends everything,
 //! flushes, and leaves each filesystem clean), the VM powers off, and each
@@ -59,6 +62,7 @@ use crate::claude::{CONFIG_DIR_ENV, ClaudeHome};
 use crate::guest::{self, GuestState, boot, proto};
 use crate::images::{Base, Images, Kind};
 use crate::linux::{CMDLINE, GUEST_CLAUDE_HOME, Machine, TokenSource};
+use crate::pi;
 use crate::vm::{self, Disk, Share, VmConfig};
 use crate::{EnvError, Result, TerminalEnd};
 
@@ -318,7 +322,8 @@ struct Plan {
     layers: Vec<(&'static str, PathBuf)>,
     template: Option<Source>,
     home: Option<Source>,
-    /// Share the Linux Claude config at `~/.claude`.
+    /// Share the Linux Claude config at `~/.claude`, and Pi's agent dir at
+    /// `~/.pi/agent`.
     claude: bool,
 }
 
@@ -525,10 +530,14 @@ impl Toolbox {
     }
 
     fn managed_layer(&self) -> Vec<(&'static str, PathBuf)> {
-        self.images
-            .managed()
-            .map(|(_, p)| vec![("managed", p)])
-            .unwrap_or_default()
+        let mut layers: Vec<(&'static str, PathBuf)> = Vec::new();
+        if let Some((_, p)) = self.images.managed() {
+            layers.push(("managed", p));
+        }
+        if let Some((_, p)) = self.images.pi() {
+            layers.push(("pi", p));
+        }
+        layers
     }
 
     /// Makes a writable disk from `source` at `path`.
@@ -610,6 +619,21 @@ impl Toolbox {
             mounts.push(boot::Share {
                 tag: "claude".into(),
                 path: GUEST_CLAUDE_HOME.into(),
+            });
+            // A private agent dir for Pi here, the owner's, which `vibed` keeps
+            // in step with the store as it does a VM's. Not the owner's share of
+            // settings and extensions, which would run with `sudo` and the Claude
+            // token here.
+            let dir = self.layout.linux_pi_signin_dir();
+            private_dir(&dir).map_err(|e| err(format!("can't create {}: {e}", dir.display())))?;
+            shares.push(Share {
+                tag: "pi".into(),
+                path: dir,
+                read_only: false,
+            });
+            mounts.push(boot::Share {
+                tag: "pi".into(),
+                path: pi::GUEST_AGENT_DIR.into(),
             });
         }
         let mut layers: Vec<String> = plan.layers.iter().map(|(id, _)| (*id).to_owned()).collect();
@@ -931,6 +955,7 @@ impl ToolboxHost for Toolbox {
             env.insert(CONFIG_DIR_ENV.into(), GUEST_CLAUDE_HOME.into());
             env.insert("DISABLE_AUTOUPDATER".into(), "1".into());
             env.insert("DISABLE_INSTALLATION_CHECKS".into(), "1".into());
+            env.extend(pi::quiet_env());
             // Claude works in the toolbox once it has a login; the shell
             // works without one.
             if let Ok(token) = (self.token)() {

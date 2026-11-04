@@ -118,6 +118,7 @@ impl Harness for VmHarness {
         // As vibed makes it: this user's alone.
         private_dir(&agent_dir).unwrap();
         AgentSpec {
+            agent: Default::default(),
             agent_ref: agent_ref.into(),
             project: "web".into(),
             worktree,

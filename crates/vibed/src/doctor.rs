@@ -2,7 +2,8 @@
 //! Install and setup): what this host needs for agents to work, as `vibed`
 //! sees it. git; `gh`'s login, and git using `gh` for GitHub (`gh auth
 //! setup-git`); the `claude` macos agents run, and its login; system sleep
-//! off; Tailscale, which is optional; and on a Mac, the Linux images. The
+//! off; Tailscale, which is optional; on a Mac, the Linux images; and Pi,
+//! optional too. The
 //! checks that look at the machine go through [`HostChecks`], so tests can
 //! give fixed answers. VibeOS.app adds its own permission to control
 //! Terminal, which only the app can see.
@@ -45,6 +46,8 @@ pub trait HostChecks: Send + Sync + fmt::Debug {
     fn claude(&self) -> Result<(PathBuf, String), String>;
     /// How that `claude` is logged in.
     fn claude_login(&self) -> Result<String, String>;
+    /// The `pi` this host's native agents run, and its version.
+    fn pi(&self) -> Result<(PathBuf, String), String>;
     /// Minutes of idleness before the system sleeps, `Some(0)` for never;
     /// `None` where there's nothing to check, as on a Linux host.
     fn system_sleep(&self) -> Result<Option<u32>, String>;
@@ -57,6 +60,8 @@ pub struct Machine {
     home: PathBuf,
     /// `VIBE_CLAUDE`, if it names the `claude` agents run.
     claude: Option<PathBuf>,
+    /// `VIBE_PI`, if it names the `pi` agents run.
+    pi: Option<PathBuf>,
     path: Mutex<Option<String>>,
 }
 
@@ -65,6 +70,9 @@ impl Machine {
         Machine {
             home: home.into(),
             claude: std::env::var_os("VIBE_CLAUDE")
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from),
+            pi: std::env::var_os("VIBE_PI")
                 .filter(|v| !v.is_empty())
                 .map(PathBuf::from),
             path: Mutex::new(None),
@@ -218,6 +226,23 @@ impl HostChecks for Machine {
         }
     }
 
+    fn pi(&self) -> Result<(PathBuf, String), String> {
+        let pi = match &self.pi {
+            Some(p) => p.clone(),
+            None => self
+                .which("pi")
+                .ok_or("Pi isn't on your login shell's PATH")?,
+        };
+        match self.run(&[&pi.to_string_lossy(), "--version"])? {
+            (true, text) => Ok((pi, first_line(&text))),
+            (false, text) => Err(format!(
+                "{} --version failed: {}",
+                pi.display(),
+                first_line(&text)
+            )),
+        }
+    }
+
     fn claude_login(&self) -> Result<String, String> {
         if cfg!(target_os = "macos") {
             let (ok, _) = self.run(&[
@@ -257,6 +282,7 @@ pub struct FixedChecks {
     pub git_uses_gh: Mutex<Result<bool, String>>,
     pub claude: Result<(PathBuf, String), String>,
     pub claude_login: Result<String, String>,
+    pub pi: Result<(PathBuf, String), String>,
     pub system_sleep: Result<Option<u32>, String>,
 }
 
@@ -280,6 +306,9 @@ impl HostChecks for FixedChecks {
     }
     fn claude_login(&self) -> Result<String, String> {
         self.claude_login.clone()
+    }
+    fn pi(&self) -> Result<(PathBuf, String), String> {
+        self.pi.clone()
     }
     fn system_sleep(&self) -> Result<Option<u32>, String> {
         self.system_sleep.clone()
@@ -315,7 +344,7 @@ fn first_line(text: &str) -> String {
 
 /// Commands a sentence may start with, kept in lowercase, as the menu
 /// keeps them (swift/VibeOS's `commandNames`).
-const COMMANDS: [&str; 6] = ["git", "gh", "claude", "vibe", "pmset", "curl"];
+const COMMANDS: [&str; 7] = ["git", "gh", "claude", "pi", "vibe", "pmset", "curl"];
 
 /// `s` as a sentence: capitalized unless it starts with a command's name,
 /// with a full stop.
@@ -370,6 +399,7 @@ pub(crate) struct Found {
     git_uses_gh: Result<bool, String>,
     claude: Result<(PathBuf, String), String>,
     claude_login: Result<String, String>,
+    pi: Result<(PathBuf, String), String>,
     system_sleep: Result<Option<u32>, String>,
 }
 
@@ -503,6 +533,31 @@ fn report(
         },
     });
     checks.extend(linux);
+    checks.push(match &found.pi {
+        Ok((path, version)) => pass(
+            CheckId::Pi,
+            format!(
+                "Pi {} is at {}",
+                version.split_whitespace().next().unwrap_or(version),
+                path.display()
+            ),
+        ),
+        Err(why) => DoctorCheck {
+            id: CheckId::Pi,
+            state: CheckState::Optional,
+            detail: sentence(why),
+            hint: Some(
+                if mac {
+                    "Only agents whose profile runs Pi need it: install it in Settings → Agents."
+                } else {
+                    "Only agents whose profile runs Pi need it: run `vibe pi install`."
+                }
+                .into(),
+            ),
+            fixable: false,
+            progress: None,
+        },
+    });
     DoctorReport { checks }
 }
 
@@ -540,6 +595,7 @@ impl Core {
                     git_uses_gh,
                     claude: checks.claude(),
                     claude_login: checks.claude_login(),
+                    pi: checks.pi(),
                     system_sleep: checks.system_sleep(),
                 }
             });
@@ -570,6 +626,7 @@ impl Core {
                 git_uses_gh: Err(why.clone()),
                 claude: Err(why.clone()),
                 claude_login: Err(why.clone()),
+                pi: Err(why.clone()),
                 system_sleep: Err(why),
             }
         }
@@ -691,6 +748,7 @@ mod tests {
                 "2.1.314 (Claude Code)".into(),
             )),
             claude_login: Ok("Claude Code is signed in".into()),
+            pi: Err("Pi isn't on your login shell's PATH".into()),
             system_sleep: Ok(Some(0)),
         }
     }
@@ -721,6 +779,7 @@ mod tests {
                 (CheckId::ClaudeLogin, CheckState::Pass),
                 (CheckId::Power, CheckState::Pass),
                 (CheckId::Tailscale, CheckState::Optional),
+                (CheckId::Pi, CheckState::Optional),
             ]
         );
         assert!(r.checks.iter().all(|c| !c.fixable));
@@ -738,6 +797,7 @@ mod tests {
             git_uses_gh: Ok(false),
             claude: Err("claude isn't on your login shell's PATH".into()),
             claude_login: Err("Claude Code isn't signed in".into()),
+            pi: Err("Pi isn't on your login shell's PATH".into()),
             system_sleep: Ok(Some(10)),
         };
         let gh = GhStatus {
@@ -778,20 +838,43 @@ mod tests {
         let ip: std::net::IpAddr = "100.64.0.7".parse().unwrap();
         let r = report(f, &logged_in(), &[ip], None, false);
         assert!(r.checks.iter().all(|c| c.id != CheckId::Power));
-        let ts = r.checks.last().unwrap();
+        let ts = r
+            .checks
+            .iter()
+            .find(|c| c.id == CheckId::Tailscale)
+            .unwrap();
         assert_eq!((ts.id, ts.state), (CheckId::Tailscale, CheckState::Pass));
+        // A Linux host's way to get Pi is its own command.
+        let pi = r.checks.last().unwrap();
+        assert_eq!((pi.id, pi.state), (CheckId::Pi, CheckState::Optional));
+        assert!(pi.hint.as_ref().unwrap().contains("vibe pi install"));
         assert!(ts.detail.contains("100.64.0.7"));
     }
 
     #[test]
-    fn the_linux_check_goes_last() {
+    fn the_linux_check_comes_after_the_machines_and_pi_last() {
         let linux = pass(CheckId::Linux, "ready");
         let r = report(found(), &logged_in(), &[], Some(linux), true);
-        assert_eq!(r.checks.last().unwrap().id, CheckId::Linux);
+        let last: Vec<CheckId> = r.checks.iter().rev().take(2).map(|c| c.id).collect();
+        assert_eq!(last, [CheckId::Pi, CheckId::Linux]);
         let ids: Vec<CheckId> = r.checks.iter().map(|c| c.id).collect();
         let mut sorted = ids.clone();
         sorted.sort_by_key(|id| CheckId::ALL.iter().position(|x| x == id));
         assert_eq!(ids, sorted, "checks come in CheckId's order");
+    }
+
+    #[test]
+    fn pi_is_optional_and_says_where_it_is_when_it_is_there() {
+        let r = report(found(), &logged_in(), &[], None, true);
+        let pi = r.checks.last().unwrap();
+        assert_eq!((pi.id, pi.state), (CheckId::Pi, CheckState::Optional));
+        assert!(pi.hint.as_ref().unwrap().contains("Settings"));
+        let mut f = found();
+        f.pi = Ok(("/h/.local/bin/pi".into(), "1.5.0".into()));
+        let r = report(f, &logged_in(), &[], None, true);
+        let pi = r.checks.last().unwrap();
+        assert_eq!(pi.state, CheckState::Pass);
+        assert_eq!(pi.detail, "Pi 1.5.0 is at /h/.local/bin/pi.");
     }
 
     fn script(dir: &Path, name: &str, body: &str) -> PathBuf {

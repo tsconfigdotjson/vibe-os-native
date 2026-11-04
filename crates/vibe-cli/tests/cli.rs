@@ -84,7 +84,7 @@ fn hello_prints_what_vibed_reports() {
     let out = vibe(&["hello"], &s.path, b"");
     assert!(out.status.success(), "{}", text(&out.stderr));
     let expected = format!(
-        "vibed {} · protocol 1 · {}/{} · pid {} · {}\n",
+        "vibed {} · protocol 2 · {}/{} · pid {} · {}\n",
         env!("CARGO_PKG_VERSION"),
         std::env::consts::OS,
         std::env::consts::ARCH,
@@ -179,7 +179,7 @@ fn doctor_lists_every_check_and_fixes_what_it_can() {
                 .iter()
                 .any(|m| l.starts_with(m)))
             .count(),
-        8,
+        9,
         "a line a check:\n{report}"
     );
     assert!(
@@ -243,7 +243,7 @@ fn rpc_answers_while_stdin_stays_open() {
     for id in 1..=3 {
         writeln!(
             stdin,
-            r#"{{"jsonrpc":"2.0","id":{id},"method":"daemon.hello","params":{{"client":"t","protocol":1}}}}"#
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"daemon.hello","params":{{"client":"t","protocol":2}}}}"#
         )
         .unwrap();
         stdin.flush().unwrap();

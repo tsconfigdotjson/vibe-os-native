@@ -268,7 +268,12 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
              Claude Code",
             PathBuf::from(&claude).display()
         );
-        config.backends = Backends::all(Arc::new(TestBackend::new(PathBuf::from(claude))));
+        let mut backend = TestBackend::new(PathBuf::from(claude));
+        if let Some(pi) = std::env::var_os("VIBE_TEST_PI").filter(|v| !v.is_empty()) {
+            let dir = config.layout.data_dir().join("test-pi");
+            backend = backend.with_pi(PathBuf::from(pi), dir);
+        }
+        config.backends = Backends::all(Arc::new(backend));
         // Tests' agents start whatever the machine running them is doing,
         // its memory and its disk, and never hold it awake.
         config.pressure = Arc::new(vibed::pressure::NoPressure);
@@ -313,6 +318,9 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
         if let Some(claude) = std::env::var_os("VIBE_CLAUDE").filter(|v| !v.is_empty()) {
             backend = backend.with_claude(PathBuf::from(claude));
         }
+        if let Some(pi) = std::env::var_os("VIBE_PI").filter(|v| !v.is_empty()) {
+            backend = backend.with_pi(PathBuf::from(pi));
+        }
         match backend.check() {
             Ok((systemd, warnings)) => {
                 vibed::log!(
@@ -336,6 +344,9 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
         let mut backend = Macos::new(config.layout.home());
         if let Some(claude) = std::env::var_os("VIBE_CLAUDE").filter(|v| !v.is_empty()) {
             backend = backend.with_claude(PathBuf::from(claude));
+        }
+        if let Some(pi) = std::env::var_os("VIBE_PI").filter(|v| !v.is_empty()) {
+            backend = backend.with_pi(PathBuf::from(pi));
         }
         vibed::log!("vibed: macos agents run natively, under the governor");
         let backend = Arc::new(backend);
@@ -364,6 +375,8 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
     let maintenance = core.spawn_maintenance(MAINTENANCE_EVERY);
     // Pauses and warnings from agents' limits, as events and states.
     let limit_watch = core.spawn_limit_watch(vibed::limit_watch::LIMITS_EVERY);
+    // The toolbox's Pi login moved to where agents find it; logins as they change.
+    let pi_watch = core.spawn_pi_watch(vibed::pi::PI_WATCH_EVERY);
     // Saves the toolbox when its shell exits, and runs the weekly update.
     let toolbox = core.spawn_toolbox(TOOLBOX_POLL, vibed::toolbox::UPDATE_CHECK_EVERY);
     // MCP on loopback, and on the Tailscale address when host.toml says.
@@ -403,6 +416,7 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
     status.abort();
     maintenance.abort();
     limit_watch.abort();
+    pi_watch.abort();
     pressure.abort();
     sleep.abort();
     adopting.abort();
