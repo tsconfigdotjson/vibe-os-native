@@ -563,6 +563,41 @@ async fn usage_limits_and_errors_are_shown() {
 
 /// A send wakes one that exited, on the same session id: the same file goes on.
 #[tokio::test]
+async fn a_request_id_reaches_a_pi_agent_once_as_it_does_any_agent() {
+    let w = world().await;
+    w.sign_in();
+    let a = w.start("hello").await;
+    let r = a.agent.clone();
+    w.wait_for(&r, Activity::Done).await;
+    let input = || vibe_mcp::Input::Text {
+        text: "only once".into(),
+        submit: true,
+        force: false,
+    };
+    w.core.send_once(None, &r, input(), "first").await.unwrap();
+    w.wait_screen(&r, "Working on: only once").await;
+    w.wait_for(&r, Activity::Done).await;
+    // The caller never heard, and makes it again: nothing more is typed.
+    w.core.send_once(None, &r, input(), "first").await.unwrap();
+    // Used for something else, it's refused.
+    let other = vibe_mcp::Input::Text {
+        text: "something else".into(),
+        submit: true,
+        force: false,
+    };
+    let refused = w
+        .core
+        .send_once(None, &r, other, "first")
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code, ErrorCode::Conflict.code(), "{refused:?}");
+    let messages = w.core.agent_messages(None, &r, 20).await.unwrap();
+    let times = messages.iter().filter(|m| m.text == "only once").count();
+    assert_eq!(times, 1, "{messages:?}");
+    w.delete(&r).await;
+}
+
+#[tokio::test]
 async fn a_resume_goes_on_with_the_same_session() {
     let w = world().await;
     w.sign_in();
