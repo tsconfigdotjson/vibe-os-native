@@ -392,7 +392,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn the_keychain_keeps_the_token() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
         let temp = crate::keychain::TempKeychain::create(dir.path()).unwrap();
         let store = TokenStore::Keychain {
             service: SERVICE.into(),
@@ -414,9 +414,12 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_test_cant_reach_the_login_keychains_token() {
+        // First, and an item of no use to anyone, as with the door open, what this
+        // tries would be real.
+        assert!(!crate::keychain::login_open());
         let store = TokenStore::Keychain {
-            service: SERVICE.into(),
-            account: ACCOUNT.into(),
+            service: "VibeOS-test".into(),
+            account: format!("closed-door-{}", std::process::id()),
             keychain: Target::Login,
         };
         for e in [

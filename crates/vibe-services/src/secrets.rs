@@ -246,17 +246,18 @@ impl SecretStore for Keychain {
             "add-generic-password -U -s {KEYCHAIN_SERVICE} -a {account} -l {KEYCHAIN_SERVICE}-{account} -w {}",
             encode(secret)?
         );
-        if let Some(file) = self.keychain.arg() {
-            line.push(' ');
-            line.push_str(file);
-        }
-        line.push('\n');
-        if line.len() > MAX_LINE {
+        if line.len() + 1 > MAX_LINE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("{service}'s login is too long for the Keychain through security"),
             ));
         }
+        // A test's own keychain file, whose path has room left for it.
+        if let Some(file) = self.keychain.arg() {
+            line.push(' ');
+            line.push_str(file);
+        }
+        line.push('\n');
         // `security -i` exits 0 whatever its commands did: what it kept is the
         // proof. What it said isn't repeated, as it may quote the command.
         self.run(&["-i"], Some(line.as_bytes()))?;
@@ -562,11 +563,15 @@ mod tests {
     /// the real thing to keep a login is what put a dialog on someone's screen.
     #[test]
     fn a_test_cant_reach_the_login_keychain() {
+        // First, and an item of no use to anyone, as with the door open, what this
+        // tries would be real.
+        assert!(!vibe_core::keychain::login_open());
+        let name = format!("closed-door-{}", std::process::id());
         let store = Keychain::default();
         for e in [
-            store.load("linear").unwrap_err(),
-            store.store("linear", &secret("a")).unwrap_err(),
-            store.delete("linear").unwrap_err(),
+            store.load(&name).unwrap_err(),
+            store.store(&name, &secret("a")).unwrap_err(),
+            store.delete(&name).unwrap_err(),
         ] {
             assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{e}");
         }
@@ -622,6 +627,26 @@ mod tests {
         }
     }
 
+    /// What a Mac's test below keeps, with the longest path a keychain file can
+    /// have: what's too long is the login, never its file's name.
+    #[test]
+    fn a_keychain_files_path_doesnt_count_against_a_login() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Keychain {
+            program: recording_security(dir.path()),
+            timeout: Duration::from_secs(10),
+            keychain: Target::File(PathBuf::from(format!("/{}", "x".repeat(89)))),
+        };
+        // It keeps nothing, so it's refused, but only once it's been asked.
+        let e = store
+            .store("test-4194304", &secret(&"x".repeat(2800)))
+            .unwrap_err();
+        assert_ne!(e.kind(), io::ErrorKind::InvalidInput, "{e}");
+        let asked = fs::read_to_string(dir.path().join("asked")).unwrap();
+        let line = asked.lines().find(|l| l.starts_with("add-")).unwrap();
+        assert!(line.len() < 4096, "{}", line.len());
+    }
+
     // Only a Mac has a Keychain, and this one is the test's own. A long login,
     // near what `security -i` takes, so a limit lower than thought shows up here,
     // not at a user's refresh.
@@ -629,7 +654,7 @@ mod tests {
     #[test]
     fn the_keychain_keeps_a_login_whole() {
         let name = format!("test-{}", std::process::id());
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
         let temp = vibe_core::keychain::TempKeychain::create(dir.path()).unwrap();
         let store = Keychain::in_file(temp.target());
         let long = "x".repeat(2800);

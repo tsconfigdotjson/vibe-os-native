@@ -73,8 +73,8 @@ environment:
                   behave as a Linux host's, whatever the OS
   VIBE_LOGIN_KEYCHAIN
                   never keeps this vibed out of the login Keychain; allow lets
-                  a debug build outside an app bundle in, which is otherwise
-                  kept out so that no test reaches it
+                  one outside an app bundle in, which is otherwise kept out so
+                  that no test reaches it
   VIBE_EXTERNAL_PORT, VIBE_EXTERNAL_LISTEN, VIBE_ACME_DIRECTORY
                   for tests only: the port the external address is served
                   on (default 443), the one address it listens on (default
@@ -469,7 +469,8 @@ fn serve_here(os: &str, test_backend: bool, stand_in: Option<&str>) -> bool {
 /// can't be talked into keeping a login elsewhere or sending one to a stand-in.
 /// And a debug build kept out of the login Keychain (`vibe_core::keychain`) keeps
 /// them as a Linux host does, in its own state directory, where a test can look.
-/// A release kept out has the Keychain's own refusal to report instead.
+/// A release kept out reports the Keychain's refusal: one can't be talked into
+/// keeping a login in a file.
 fn services_config(layout: &Layout) -> ServicesConfig {
     let stand_in_host =
         cfg!(debug_assertions) && env_text("VIBE_TEST_HOST_BROKER").as_deref() == Some("1");

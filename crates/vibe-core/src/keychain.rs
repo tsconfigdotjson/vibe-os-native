@@ -6,15 +6,16 @@
 //! dialog on their screen, and one with the real `HOME` writes among their real
 //! items. So the login Keychain is closed unless it's plainly a real install:
 //!
-//! - A release is let in, unless [`GUARD_ENV`] says `never`.
-//! - A debug build is kept out, whoever started it and whatever its `HOME`, unless
-//!   it's inside an app bundle or [`GUARD_ENV`] says `allow`.
-//! - Everything `cargo` runs has [`GUARD_ENV`] forced to `never`, in
-//!   `.cargo/config.toml`, so `cargo test --release` is kept out too, and so is a
-//!   shell that exported `allow`.
+//! - A program inside an app bundle is let in, unless [`GUARD_ENV`] says `never`:
+//!   every real install is one, reached through `/usr/local/bin/vibe` or not.
+//! - Anything else is kept out, debug or release, whoever started it and whatever
+//!   its `HOME`, unless [`GUARD_ENV`] says `allow`.
+//! - Everything `cargo` runs from this workspace has [`GUARD_ENV`] forced to
+//!   `never`, in `.cargo/config.toml`, so a shell that exported `allow` is beaten.
 //!
-//! The variable can only close a release, never send one elsewhere. A test that
-//! wants the real `security` uses a keychain file of its own: [`TempKeychain`].
+//! The variable can only open or close the Keychain, never send a login elsewhere.
+//! A test that wants the real `security` uses a keychain file of its own:
+//! [`TempKeychain`].
 
 use std::ffi::OsStr;
 use std::fs;
@@ -25,8 +26,8 @@ use std::process::{Command, Stdio};
 /// The program every Keychain call runs.
 pub const SECURITY: &str = "/usr/bin/security";
 
-/// `never` closes the login Keychain, in any build; `allow` opens it to a debug
-/// build.
+/// `never` closes the login Keychain to anything; `allow` opens it to a program
+/// outside an app bundle.
 pub const GUARD_ENV: &str = "VIBE_LOGIN_KEYCHAIN";
 
 /// What `security` is pointed at.
@@ -77,13 +78,18 @@ impl Target {
     }
 }
 
-/// A keychain file's path has to fit on a `security -i` line unquoted.
+/// `security -i` reads lines of at most 4 KB. A store's limit on what it keeps
+/// leaves this much of that for a keychain file's path.
+const MAX_FILE_PATH: usize = 90;
+
+/// A keychain file's path has to fit on a `security -i` line, unquoted.
 fn check_file(path: &Path) -> io::Result<()> {
     let plain = path.is_absolute()
         && path.to_str().is_some_and(|text| {
-            !text
-                .chars()
-                .any(|c| c.is_whitespace() || c.is_control() || "\"'\\".contains(c))
+            text.len() <= MAX_FILE_PATH
+                && !text
+                    .chars()
+                    .any(|c| c.is_whitespace() || c.is_control() || "\"'\\".contains(c))
         });
     if plain {
         Ok(())
@@ -99,33 +105,32 @@ fn closed() -> io::Error {
     io::Error::new(
         io::ErrorKind::PermissionDenied,
         format!(
-            "this build stays out of the login Keychain, as it may be a test: \
-             {GUARD_ENV}=allow lets a debug build in, outside cargo"
+            "this program stays out of the login Keychain, as it isn't in an app and may \
+             be a test: {GUARD_ENV}=allow lets it in, outside cargo"
         ),
     )
 }
 
 /// Whether this process may reach the login Keychain (see the module's text).
 pub fn login_open() -> bool {
-    decide(
-        cfg!(debug_assertions),
-        std::env::var_os(GUARD_ENV).as_deref(),
-        std::env::current_exe().ok().as_deref(),
-    )
+    // Resolved, as `vibe` is usually run through /usr/local/bin/vibe, a link into
+    // the app, and a Mac's `current_exe` doesn't follow links.
+    let exe = std::env::current_exe().and_then(fs::canonicalize).ok();
+    decide(std::env::var_os(GUARD_ENV).as_deref(), exe.as_deref())
 }
 
-fn decide(debug_build: bool, guard: Option<&OsStr>, exe: Option<&Path>) -> bool {
+fn decide(guard: Option<&OsStr>, exe: Option<&Path>) -> bool {
     if guard == Some(OsStr::new("never")) {
         false
-    } else if !debug_build || guard == Some(OsStr::new("allow")) {
+    } else if guard == Some(OsStr::new("allow")) {
         true
     } else {
         exe.is_some_and(in_app_bundle)
     }
 }
 
-/// Whether `exe` is a program in an app's `Contents/MacOS`. A debug build there
-/// was put there on purpose (`scripts/sign-macos.sh`), and is someone's real
+/// Whether `exe` is a program in an app's `Contents/MacOS`. One there was put there
+/// on purpose, by a release or `scripts/sign-macos.sh`, and is someone's real
 /// VibeOS; nothing's tested from inside a bundle.
 fn in_app_bundle(exe: &Path) -> bool {
     let mut parents = exe.ancestors().skip(1);
@@ -138,6 +143,7 @@ fn in_app_bundle(exe: &Path) -> bool {
 }
 
 /// A keychain file for a test of the real `security`, in a directory of its own
+/// under `/tmp`, as `$TMPDIR` on a Mac makes a path too long ([`MAX_FILE_PATH`]),
 /// and gone when this is dropped. Being outside the login Keychain, it needs no
 /// opening of the guard, and being unlocked by its maker, it can't ask anyone
 /// for anything.
@@ -206,40 +212,50 @@ impl Drop for TempKeychain {
 mod tests {
     use super::*;
 
-    const TESTS: Option<&str> = Some("/tmp/target/debug/deps/agents-0a1b2c");
+    const TESTS: Option<&str> = Some("/tmp/target/release/deps/agents-0a1b2c");
     const APP: Option<&str> = Some("/Applications/VibeOS.app/Contents/MacOS/vibed");
 
-    fn open(debug: bool, guard: Option<&str>, exe: Option<&str>) -> bool {
-        decide(debug, guard.map(OsStr::new), exe.map(Path::new))
+    fn open(guard: Option<&str>, exe: Option<&str>) -> bool {
+        decide(guard.map(OsStr::new), exe.map(Path::new))
     }
 
     #[test]
-    fn a_debug_build_stays_out_unless_its_told_or_in_an_app() {
-        assert!(!open(true, None, TESTS));
-        assert!(!open(true, None, None));
-        assert!(!open(true, Some(""), TESTS));
-        assert!(!open(true, Some("yes"), TESTS));
-        assert!(!open(true, None, Some("/tmp/x/bundle/aarch64/vibed")));
-        assert!(!open(true, None, Some("/tmp/VibeOS.app/vibed")));
-        assert!(open(true, Some("allow"), TESTS));
-        assert!(open(true, None, APP));
+    fn only_a_program_in_an_app_goes_in_untold() {
+        assert!(open(None, APP));
+        assert!(open(Some("anything"), APP));
+        assert!(!open(None, TESTS));
+        assert!(!open(None, None));
+        assert!(!open(Some(""), TESTS));
+        assert!(!open(Some("yes"), TESTS));
+        assert!(!open(None, Some("/tmp/x/bundle/aarch64/vibed")));
+        assert!(!open(None, Some("/tmp/VibeOS.app/vibed")));
+        assert!(!open(None, Some("/usr/local/bin/vibe")));
     }
 
     #[test]
-    fn a_release_goes_in_and_only_never_keeps_it_out() {
-        assert!(open(false, None, TESTS));
-        assert!(open(false, Some("allow"), TESTS));
-        assert!(open(false, Some("anything"), APP));
-        assert!(!open(false, Some("never"), APP));
+    fn allow_lets_anything_in_and_never_keeps_anything_out() {
+        assert!(open(Some("allow"), TESTS));
+        assert!(!open(Some("never"), APP));
+        assert!(!open(Some("never"), TESTS));
     }
 
+    /// `vibe` through the link the app makes is the app's: what a Mac's
+    /// `current_exe` gives is resolved first.
     #[test]
-    fn never_beats_everything() {
-        assert!(!open(true, Some("never"), APP));
-        assert!(!open(false, Some("never"), TESTS));
+    fn the_link_into_the_app_counts_as_the_app() {
+        let dir = tempfile::tempdir().unwrap();
+        let macos = dir.path().join("VibeOS.app/Contents/MacOS");
+        fs::create_dir_all(&macos).unwrap();
+        let vibe = macos.join("vibe");
+        fs::write(&vibe, "").unwrap();
+        let link = dir.path().join("vibe");
+        std::os::unix::fs::symlink(&vibe, &link).unwrap();
+        assert!(!in_app_bundle(&link));
+        assert!(in_app_bundle(&fs::canonicalize(&link).unwrap()));
     }
 
-    /// As these tests are: from cargo in any profile, or run by hand.
+    /// As these tests are: from cargo in any profile, or run by hand, in any
+    /// profile, from anywhere. Keeping this binary out of a bundle is all it takes.
     #[test]
     fn a_test_cant_reach_the_login_keychain() {
         assert!(!login_open());
@@ -265,7 +281,8 @@ mod tests {
 
     #[test]
     fn a_keychain_files_path_fits_on_a_line() {
-        for bad in ["relative", "/a b", "/a\nb", "/a\"b", "/a'b", "/a\\b"] {
+        let long = format!("/{}", "x".repeat(MAX_FILE_PATH));
+        for bad in ["relative", "/a b", "/a\nb", "/a\"b", "/a'b", "/a\\b", &long] {
             let e = Target::File(PathBuf::from(bad)).command().unwrap_err();
             assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{bad:?}");
         }
@@ -275,7 +292,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_temp_keychain_is_made_and_goes() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
         let temp = TempKeychain::create(dir.path()).unwrap();
         let path = PathBuf::from(temp.target().arg().unwrap());
         assert!(path.is_file(), "{path:?}");
