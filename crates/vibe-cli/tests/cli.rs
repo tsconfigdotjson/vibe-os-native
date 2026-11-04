@@ -191,11 +191,11 @@ fn rpc_bridges_the_whole_contract() {
 }
 
 /// `vibe doctor` on the golden host: a line a check, what to do about each
-/// that needs it, and exit 1 while one does. `--fix` has vibed run `gh auth
-/// setup-git`; the Mac's sleep setting is the owner's to change, so it
-/// still fails.
+/// that needs it, and exit 1 while one does. git through gh isn't among them,
+/// as vibed sets that up itself; the Mac's sleep setting is the owner's to
+/// change, so it still fails, and `--fix` has nothing to do.
 #[test]
-fn doctor_lists_every_check_and_fixes_what_it_can() {
+fn doctor_lists_every_check_and_only_what_needs_the_owner() {
     let golden = common::Golden::new().for_examples();
     let core = Core::open(golden.config()).unwrap();
     let s = start_core(core, tempfile::tempdir().unwrap());
@@ -217,13 +217,10 @@ fn doctor_lists_every_check_and_fixes_what_it_can() {
         "{report}"
     );
     assert!(
-        report.contains("!!  git through gh  git doesn't ask gh"),
+        report.contains("ok  git through gh  git asks gh for GitHub's credentials."),
         "{report}"
     );
-    assert!(
-        report.contains("`vibe doctor --fix` can do it."),
-        "{report}"
-    );
+    assert!(!report.contains("setup-git"), "{report}");
     assert!(
         report.contains("!!  system sleep    This Mac sleeps after 10 minutes"),
         "{report}"
@@ -232,12 +229,12 @@ fn doctor_lists_every_check_and_fixes_what_it_can() {
         report.contains("..  Linux images    Downloading the Linux base image (40%)."),
         "{report}"
     );
-    assert!(report.ends_with("2 checks need you.\n"), "{report}");
+    assert!(report.ends_with("1 check needs you.\n"), "{report}");
 
     let out = vibe(&["doctor", "--fix"], &s.path, b"");
     assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
     let report = text(&out.stdout);
-    assert!(report.starts_with("fixed: git through gh\n"), "{report}");
+    assert!(!report.contains("fixed: git through gh"), "{report}");
     assert!(
         report.contains("ok  git through gh  git asks gh for GitHub's credentials."),
         "{report}"

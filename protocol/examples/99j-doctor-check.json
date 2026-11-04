@@ -1,5 +1,5 @@
 {
-  "description": "vibe doctor, and the first run's checklist: every check, in order, as this host's vibed sees it. Here git doesn't use gh for GitHub yet, which VibeOS can fix (fixable), and the Mac sleeps after 10 minutes idle, which only the owner can change: each says what to do in its hint. Tailscale, when it isn't running, is optional rather than a fail. linux is the Mac's Linux images, the base image and Claude Code, which vibed downloads at first launch: here the base image is 40% of the way in, so the check is working, with its progress in percent.",
+  "description": "vibe doctor, and the first run's checklist: every check, in order, as this host's vibed sees it. git using gh for GitHub is VibeOS's to set up, so it has by now, with gh logged in. The Mac sleeps after 10 minutes idle, which only the owner can change: that says what to do in its hint. Tailscale, when it isn't running, is optional rather than a fail. linux is the Mac's Linux images, the base image and Claude Code, which vibed downloads at first launch: here the base image is 40% of the way in, so the check is working, with its progress in percent.",
   "request": {"jsonrpc": "2.0", "id": 101, "method": "doctor.check", "params": {}},
   "response": {
     "jsonrpc": "2.0",
@@ -20,10 +20,9 @@
         },
         {
           "id": "gh_git",
-          "state": "fail",
-          "detail": "git doesn't ask gh for GitHub's credentials yet.",
-          "hint": "Run `gh auth setup-git` in Terminal.",
-          "fixable": true
+          "state": "pass",
+          "detail": "git asks gh for GitHub's credentials.",
+          "fixable": false
         },
         {
           "id": "claude",

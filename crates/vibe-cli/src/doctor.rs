@@ -144,7 +144,7 @@ mod tests {
                 check(
                     CheckId::GhGit,
                     CheckState::Fail,
-                    Some("Run `gh auth setup-git`."),
+                    Some("VibeOS sets this up itself."),
                     true,
                 ),
                 check(
@@ -161,7 +161,7 @@ mod tests {
             "\
 ok  git             git said so.
 !!  git through gh  gh_git said so.
-                    Run `gh auth setup-git`. `vibe doctor --fix` can do it.
+                    VibeOS sets this up itself. `vibe doctor --fix` can do it.
 --  Tailscale       tailscale said so.
                     Install it, if you want it.
 ..  Linux images    linux said so (40%).

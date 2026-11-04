@@ -11,7 +11,7 @@
 #   - `vibe doctor` against a live vibed, on this machine as it is: a line
 #     for every check, and an exit that says whether one needs the owner
 #     (crates/vibe-cli/tests/cli.rs, in the test step, holds its every word
-#     to the golden host's, and --fix to running gh auth setup-git)
+#     to the golden host's)
 #   - the registry through `vibe rpc`: add a project, edit a profile, change
 #     a host limit, restart vibed, and find all of it
 #   - sessions: a shell held by vibe-shim keeps running when vibed is killed,

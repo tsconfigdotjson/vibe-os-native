@@ -1,5 +1,5 @@
 {
-  "description": "vibe doctor --fix, or the first run's Fix button: gh_git runs `gh auth setup-git`, and every check runs again.",
+  "description": "vibe doctor --fix, or the first run's Try Again button, for when VibeOS's own setup didn't take: gh_git tries `gh auth setup-git` now, and every check runs again.",
   "request": {"jsonrpc": "2.0", "id": 102, "method": "doctor.fix", "params": {"check": "gh_git"}},
   "response": {
     "jsonrpc": "2.0",

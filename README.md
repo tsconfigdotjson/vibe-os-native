@@ -44,7 +44,7 @@ It updates itself through Sparkle.
 
 ```sh
 vibe doctor          # git, gh and git using it, claude and its login, sleep off, Tailscale, Linux
-vibe doctor --fix    # and what vibed can fix: gh auth setup-git, the Linux download
+vibe doctor --fix    # and has vibed retry what it fixes itself, such as the Linux download
 ```
 
 ## Develop
