@@ -293,15 +293,13 @@ async fn rpc(core: &Core, method: &str, params: Value) -> Value {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_linux_hosts_agents_join_the_macs_view_over_the_link() {
     let w = world().await;
-    let mut events = Conn::open(
-        &serve(
-            Arc::clone(&w.mac),
-            common::short_tempdir(),
-            MAX_MESSAGE_BYTES,
-        )
-        .path,
-    )
-    .await;
+    // Kept for the whole test: dropping it stops the server.
+    let server = serve(
+        Arc::clone(&w.mac),
+        common::short_tempdir(),
+        MAX_MESSAGE_BYTES,
+    );
+    let mut events = Conn::open(&server.path).await;
     assert!(events.call("events.subscribe", json!({})).await["result"].is_object());
     w.add_host().await;
     let h = w.link().await;
