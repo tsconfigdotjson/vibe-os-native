@@ -225,7 +225,7 @@ fn the_services_socket_lasts_as_long_as_vibed() {
     let tmp = tempfile::tempdir().unwrap();
     let socket = socket_in(&tmp);
     let d = spawn(&mut vibed(&tmp, &socket), &socket);
-    let run = Layout::new(&tmp.path().join("home"), std::env::consts::OS).run_dir();
+    let run = Layout::new(tmp.path().join("home"), std::env::consts::OS).run_dir();
     let services = run.join(".services.sock");
     let deadline = Instant::now() + Duration::from_secs(20);
     while UnixStream::connect(&services).is_err() {
