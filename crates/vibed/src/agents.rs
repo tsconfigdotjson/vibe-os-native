@@ -1110,6 +1110,7 @@ impl Core {
             .await
             .map_err(failed)?;
         handle.session = Some(pid);
+        lock(&self.started_at).insert(record.agent_ref.clone(), std::time::Instant::now());
         let compartment = serde_json::to_string(&*handle).map_err(internal)?;
         self.store()
             .set_agent_compartment(&record.host, &record.agent_ref, &compartment)

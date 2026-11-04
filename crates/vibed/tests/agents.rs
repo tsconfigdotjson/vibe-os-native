@@ -1158,6 +1158,45 @@ fn loose_objects(dir: &Path) -> u32 {
         .unwrap()
 }
 
+/// A send to a program that's just been started waits until it takes input, as it
+/// does when the send wakes it. Typed sooner, it sits in a terminal that isn't raw
+/// yet, so its Enter becomes a newline in the text and nothing is ever submitted,
+/// which is what a real Pi did with a send right after a resume.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_send_just_after_a_start_is_submitted() {
+    let w = world().await;
+    let got = w.project.with_file_name("what-it-read");
+    // Slow to start, as a real one is, and only then raw, as a real one goes.
+    common::write_script(
+        &w.golden.claude,
+        &format!(
+            "#!/bin/sh\nsleep 2\nstty raw -echo\nprintf '\\033[?2004h> '\nexec cat >'{}'\n",
+            got.display()
+        ),
+    );
+    let a = w.core.start_agent(start("hello")).await.unwrap();
+    w.core
+        .send_input(
+            None,
+            &a.agent,
+            vibe_mcp::Input::Text {
+                text: "after a start".into(),
+                submit: true,
+                force: false,
+            },
+        )
+        .await
+        .unwrap();
+    let read = || fs::read(&got).unwrap_or_default();
+    common::wait_until("it to read what was sent", || {
+        read().ends_with(b"\r") || read().ends_with(b"\n")
+    });
+    let read = String::from_utf8_lossy(&read()).into_owned();
+    assert!(read.contains("after a start"), "{read:?}");
+    assert!(read.ends_with('\r'), "not submitted: {read:?}");
+    w.core.delete_agent(delete(&a.agent, true)).await.unwrap();
+}
+
 #[tokio::test]
 async fn git_maintenance_runs_only_while_a_project_is_quiet() {
     let w = world().await;

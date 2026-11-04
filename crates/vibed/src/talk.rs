@@ -367,13 +367,8 @@ impl Core {
             AgentState::Asleep | AgentState::Paused | AgentState::Exited
         );
         if woke {
-            let ran = self.session_runs(agent_ref).await;
             self.resume_agent(Some(&host), agent_ref).await?;
-            // A new Claude must be up before it's typed to; a frozen one
-            // thawed is where it was.
-            if !ran {
-                wait_ready(&socket).await;
-            }
+            self.wait_started(agent_ref, &socket).await;
             crate::log!("vibed: {agent_ref} was {state}, and a send woke it");
             // Asleep or paused, it read as that; woken where it was, it may
             // be on a question. One resumed with `--resume` has lost any
@@ -388,6 +383,8 @@ impl Core {
                 return Err(on_a_question(agent_ref, " It was woken first."));
             }
         }
+        // Started moments ago, by a resume or a start that came before this.
+        self.wait_started(agent_ref, &socket).await;
         // Where its transcript is now: the answer to this send is what
         // comes after. It's kept only once the send is in, so a send that
         // failed leaves the wait on the one before.
@@ -439,6 +436,17 @@ impl Core {
             Err(_) => AgentState::Exited,
         };
         Ok(Sent { woke, state })
+    }
+
+    /// If `agent_ref`'s program was started and hasn't been waited for yet, waits
+    /// until it's up: typed to before that, what's typed waits in a terminal that
+    /// isn't raw yet, so its Enter arrives as a newline in the text and nothing is
+    /// submitted. A frozen program thawed is where it was, and isn't waited for.
+    async fn wait_started(&self, agent_ref: &str, socket: &Path) {
+        let started = lock(&self.started_at).remove(agent_ref);
+        if let Some(left) = started.and_then(|at| READY_WITHIN.checked_sub(at.elapsed())) {
+            wait_ready(socket, left).await;
+        }
     }
 
     /// Where `agent_ref` is, and whether it has answered its last send
@@ -683,12 +691,11 @@ impl Core {
 
 /// Waits for a Claude just started to be ready for input: it has turned
 /// on bracketed paste, or its screen has drawn something and stayed still
-/// for [`SETTLE`]. Gives up after [`READY_WITHIN`], and at once if its
-/// session ends.
-async fn wait_ready(socket: &Path) {
+/// for [`SETTLE`]. Gives up after `within`, and at once if its session ends.
+async fn wait_ready(socket: &Path, within: Duration) {
     let begun = Instant::now();
     let mut last: Option<(String, Instant)> = None;
-    while begun.elapsed() < READY_WITHIN {
+    while begun.elapsed() < within {
         let s = socket.to_owned();
         let Ok(Ok(out)) = tokio::task::spawn_blocking(move || screen_now(&s)).await else {
             return;
