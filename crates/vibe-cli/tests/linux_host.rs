@@ -18,8 +18,8 @@ use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Output, Stdio};
-use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -220,7 +220,7 @@ esac
         );
         if Command::new("sh")
             .args(["-c", "command -v sha256sum"])
-            .output()
+            .in_files()
             .is_ok_and(|o| !o.status.success())
         {
             write_exe(
@@ -440,12 +440,7 @@ fn mac_with(
 }
 
 fn vibe(socket: &Path, args: &[&str]) -> Output {
-    Command::new(VIBE)
-        .arg("--socket")
-        .arg(socket)
-        .args(args)
-        .output()
-        .unwrap()
+    common::output_in_files(Command::new(VIBE).arg("--socket").arg(socket).args(args)).unwrap()
 }
 
 fn ok(out: Output) -> String {
@@ -456,6 +451,143 @@ fn ok(out: Output) -> String {
         String::from_utf8_lossy(&out.stderr)
     );
     String::from_utf8(out.stdout).unwrap()
+}
+
+/// [`common::output_in_files`], for what isn't `vibe` itself.
+trait InFiles {
+    fn in_files(&mut self) -> std::io::Result<Output>;
+}
+
+impl InFiles for Command {
+    fn in_files(&mut self) -> std::io::Result<Output> {
+        common::output_in_files(self)
+    }
+}
+
+/// How long a test here may take in all. They take under a minute on a quiet
+/// machine; a call they make can wait far longer than that, and a run that stops
+/// here stops a whole `check-full.sh` with it.
+const DEADLINE: Duration = Duration::from_secs(6 * 60);
+
+/// What a test here tells [`bounded`] about itself.
+#[derive(Clone, Default)]
+struct Watch {
+    /// The test's temporary directories, by name, which are in the command line of
+    /// what it starts that lasts: a shim, a relay, a host's `vibed`. What's left goes
+    /// with those.
+    dirs: Arc<Mutex<Vec<String>>>,
+    at: Arc<Mutex<String>>,
+}
+
+impl Watch {
+    fn owns(&self, dir: &Path) {
+        self.dirs.lock().unwrap().push(unique_name(dir));
+    }
+
+    /// Where the test has got to, for when it stops there.
+    fn at(&self, what: &str) {
+        what.clone_into(&mut self.at.lock().unwrap());
+    }
+
+    /// Ends whatever the test started that's still running: a shim, a relay or a
+    /// host's `vibed` it left, and any call it's stuck in. They'd otherwise outlive
+    /// it, holding on to the pipes of whatever's collecting its output.
+    fn end_what_it_started(&self) {
+        for dir in self.dirs.lock().unwrap().iter() {
+            let _ = Command::new("pkill")
+                .args(["-KILL", "-f"])
+                .arg(format!("{dir}/"))
+                .status();
+        }
+    }
+}
+
+/// A temporary directory's own name: unique, and the same whether or not its
+/// path has been through a link, as `/tmp` is on a Mac.
+fn unique_name(dir: &Path) -> String {
+    dir.file_name().unwrap().to_str().unwrap().to_owned()
+}
+
+/// Runs `test`, failing it if it takes longer than `within` rather than waiting on
+/// it forever, and says how far it got.
+fn bounded(within: Duration, test: impl FnOnce(&Watch) + Send + 'static) {
+    let watch = Watch::default();
+    let (finished, ended) = mpsc::channel::<()>();
+    let running = {
+        let watch = watch.clone();
+        std::thread::spawn(move || {
+            // Gone however the test ends, a panic included.
+            let _finished = finished;
+            test(&watch);
+        })
+    };
+    if ended
+        .recv_timeout(within)
+        .is_err_and(|e| e == mpsc::RecvTimeoutError::Timeout)
+    {
+        let at = watch.at.lock().unwrap().clone();
+        watch.end_what_it_started();
+        // What it was stuck in has ended, so it can clean up after itself, if
+        // that's all it was stuck in.
+        let _ = ended.recv_timeout(Duration::from_secs(30));
+        watch.end_what_it_started();
+        let at = if at.is_empty() {
+            "somewhere it doesn't say"
+        } else {
+            at.as_str()
+        };
+        panic!("past its deadline of {within:?}, at: {at}");
+    }
+    let result = running.join();
+    watch.end_what_it_started();
+    if let Err(panicked) = result {
+        std::panic::resume_unwind(panicked);
+    }
+}
+
+/// A test that's stuck fails by its deadline, says where it was, and takes what it
+/// started with it. And a test that isn't stuck ends as it would have.
+#[test]
+fn a_stuck_test_fails_by_its_deadline() {
+    let dir = common::short_tempdir();
+    // In a directory of the test's own, as what a test here starts always is.
+    fs::write(dir.path().join("nap"), "import time\ntime.sleep(600)\n").unwrap();
+    let path = dir.path().to_owned();
+    let begun = Instant::now();
+    let failed = std::panic::catch_unwind(|| {
+        bounded(Duration::from_secs(1), move |watch| {
+            watch.owns(&path);
+            watch.at("its nap");
+            // Blocks for far longer than the test may, unless it's ended.
+            let _ = Command::new("python3").arg(path.join("nap")).in_files();
+        });
+    })
+    .unwrap_err();
+    assert!(
+        begun.elapsed() < Duration::from_secs(30),
+        "{:?}",
+        begun.elapsed()
+    );
+    let said = failed.downcast_ref::<String>().unwrap();
+    assert!(said.contains("deadline"), "{said}");
+    assert!(said.contains("at: its nap"), "{said}");
+    let left = Command::new("pgrep")
+        .args(["-f", &format!("{}/nap", unique_name(dir.path()))])
+        .in_files()
+        .unwrap();
+    assert!(left.stdout.is_empty(), "{left:?}");
+
+    let passed = Arc::new(Mutex::new(false));
+    let set = Arc::clone(&passed);
+    bounded(Duration::from_secs(30), move |_| {
+        *set.lock().unwrap() = true
+    });
+    assert!(*passed.lock().unwrap());
+    let panicked = std::panic::catch_unwind(|| {
+        bounded(Duration::from_secs(30), |_| panic!("its own failure"));
+    })
+    .unwrap_err();
+    assert_eq!(panicked.downcast_ref::<&str>(), Some(&"its own failure"));
 }
 
 fn wait_for(what: &str, within: Duration, mut done: impl FnMut() -> bool) {
@@ -555,8 +687,17 @@ impl Drop for Bridge {
 
 #[test]
 fn a_linux_host_added_over_ssh_runs_agents_the_mac_drives() {
+    bounded(
+        DEADLINE,
+        a_linux_host_added_over_ssh_runs_agents_the_mac_drives_body,
+    );
+}
+
+fn a_linux_host_added_over_ssh_runs_agents_the_mac_drives_body(watch: &Watch) {
     let golden = common::Golden::new();
     let hosts = common::short_tempdir();
+    watch.owns(golden.dir.path());
+    watch.owns(hosts.path());
     let ssh = fake_ssh(hosts.path());
     let host = FakeHost::new(hosts.path(), "me@vps", &golden.claude);
     let mac = mac(&golden, &ssh, bundle(golden.dir.path()));
@@ -872,8 +1013,17 @@ fn any_file_has(dir: &Path, text: &str) -> Option<PathBuf> {
 /// key in the host's own shell. `ssh` and the service are the only stand-ins.
 #[test]
 fn a_linux_host_that_owns_a_login_serves_and_refreshes_alone_with_the_mac_gone() {
+    bounded(
+        DEADLINE,
+        a_linux_host_that_owns_a_login_serves_and_refreshes_alone_with_the_mac_gone_body,
+    );
+}
+
+fn a_linux_host_that_owns_a_login_serves_and_refreshes_alone_with_the_mac_gone_body(watch: &Watch) {
     let golden = common::Golden::new();
     let hosts = common::short_tempdir();
+    watch.owns(golden.dir.path());
+    watch.owns(hosts.path());
     let ssh = fake_ssh(hosts.path());
     let host = FakeHost::new(hosts.path(), "me@vps", &golden.claude);
     let fake = FakeService::start_detached();
@@ -939,7 +1089,7 @@ fn a_linux_host_that_owns_a_login_serves_and_refreshes_alone_with_the_mac_gone()
     assert_eq!(on_the_mac.load("linear").unwrap().unwrap().refresh, None);
 
     // Its own CLI sees it's here.
-    let status = ok(on_host(&host).arg("service").output().unwrap());
+    let status = ok(on_host(&host).arg("service").in_files().unwrap());
     assert!(
         status.starts_with("linear  connected  login here"),
         "{status}"
@@ -975,14 +1125,14 @@ fn a_linux_host_that_owns_a_login_serves_and_refreshes_alone_with_the_mac_gone()
     let lost = shim.call("list_issues");
     assert!(lost.contains("needs reconnecting on the Mac"), "{lost}");
     assert!(shim.has_tool("list_issues"));
-    let status = ok(on_host(&host).arg("service").output().unwrap());
+    let status = ok(on_host(&host).arg("service").in_files().unwrap());
     assert!(status.starts_with("linear  needs_reconnect"), "{status}");
     assert!(status.contains("invalid_grant"), "{status}");
 
     // There's no way to mend it from here: signing in takes the Mac's browser.
     let refused = on_host(&host)
         .args(["service", "set-key", "linear"])
-        .output()
+        .in_files()
         .unwrap();
     assert!(!refused.status.success());
 
@@ -990,14 +1140,14 @@ fn a_linux_host_that_owns_a_login_serves_and_refreshes_alone_with_the_mac_gone()
     // on. That comes first, before what's wrong with the login.
     let off = ok(on_host(&host)
         .args(["service", "off", "linear"])
-        .output()
+        .in_files()
         .unwrap());
     assert!(off.contains("turned off"), "{off}");
     let told = shim.call("list_issues");
     assert!(told.contains("`vibe service on linear`"), "{told}");
     let on = ok(on_host(&host)
         .args(["service", "on", "linear"])
-        .output()
+        .in_files()
         .unwrap());
     assert!(!on.contains("turned off"), "{on}");
 
@@ -1035,8 +1185,14 @@ fn a_linux_host_that_owns_a_login_serves_and_refreshes_alone_with_the_mac_gone()
 
 #[test]
 fn an_unreachable_server_is_refused_with_why() {
+    bounded(DEADLINE, an_unreachable_server_is_refused_with_why_body);
+}
+
+fn an_unreachable_server_is_refused_with_why_body(watch: &Watch) {
     let golden = common::Golden::new();
     let hosts = common::short_tempdir();
+    watch.owns(golden.dir.path());
+    watch.owns(hosts.path());
     let ssh = fake_ssh(hosts.path());
     let mac = mac(&golden, &ssh, bundle(golden.dir.path()));
     let out = vibe(&mac.socket, &["host", "add", "vps", "me@nowhere"]);
@@ -1107,7 +1263,7 @@ fn real_linux_host() {
     let pids = String::from_utf8(
         Command::new("pgrep")
             .args(["-f", &format!("ssh .*{dest} .local/lib/vibeos/vibe rpc")])
-            .output()
+            .in_files()
             .unwrap()
             .stdout,
     )
@@ -1154,6 +1310,8 @@ impl Outside {
         if let Some(key) = &self.key {
             config.push_str(&format!("header = \"Authorization: Bearer {key}\"\n"));
         }
+        let mut said = tempfile::NamedTempFile::new().expect("curl's config");
+        said.write_all(config.as_bytes()).unwrap();
         let mut cmd = Command::new("curl");
         cmd.args([
             "-sS",
@@ -1170,26 +1328,10 @@ impl Outside {
         if let Some(r) = &self.resolve {
             cmd.args(["--resolve", r]);
         }
-        let mut child = cmd
-            .args([
-                "--config",
-                "-",
-                "--data-binary",
-                &body.to_string(),
-                &self.url,
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("curl");
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(config.as_bytes())
-            .unwrap();
-        let out = child.wait_with_output().unwrap();
+        cmd.arg("--config")
+            .arg(said.path())
+            .args(["--data-binary", &body.to_string(), &self.url]);
+        let out = common::output_in_files(&mut cmd).expect("curl");
         let text = String::from_utf8_lossy(&out.stdout).into_owned();
         let (body, code) = text.rsplit_once('\n').unwrap_or(("", &text));
         let code = code.trim().parse().unwrap_or_else(|_| {
@@ -1239,7 +1381,7 @@ impl Outside {
 fn public_listeners(pid: u32) -> Vec<String> {
     let out = Command::new("lsof")
         .args(["-nP", "-a", "-p", &pid.to_string(), "-iTCP", "-sTCP:LISTEN"])
-        .output()
+        .in_files()
         .expect("lsof");
     String::from_utf8_lossy(&out.stdout)
         .lines()
@@ -1255,8 +1397,14 @@ fn public_listeners(pid: u32) -> Vec<String> {
 
 #[test]
 fn external_access_through_a_linux_host() {
+    bounded(DEADLINE, external_access_through_a_linux_host_body);
+}
+
+fn external_access_through_a_linux_host_body(watch: &Watch) {
     let golden = common::Golden::new();
     let hosts = common::short_tempdir();
+    watch.owns(golden.dir.path());
+    watch.owns(hosts.path());
     let ssh = fake_ssh(hosts.path());
     let host = FakeHost::new(hosts.path(), "me@vps", &golden.claude);
     let port = free_port().port();
@@ -1476,7 +1624,8 @@ fn every_local_tool_answers_promptly(c: &mut Outside, when: &str) {
                 eprintln!("{when}, round {round}: {why}");
                 last = why;
                 // What it started may be left: it's only in the way of nothing.
-                let _ = c.call("vibe_delete_agent", json!({"agent": name, "force": true}));
+                // Or it was never started, if a listing was what was slow.
+                let _ = c.tool("vibe_delete_agent", json!({"agent": name, "force": true}));
             }
         }
     }
@@ -1488,8 +1637,17 @@ fn every_local_tool_answers_promptly(c: &mut Outside, when: &str) {
 /// accepting with nothing behind it; then resumed, merging back; then the Mac stopped.
 #[test]
 fn external_access_answers_with_the_mac_asleep_or_stopped() {
+    bounded(
+        DEADLINE,
+        external_access_answers_with_the_mac_asleep_or_stopped_body,
+    );
+}
+
+fn external_access_answers_with_the_mac_asleep_or_stopped_body(watch: &Watch) {
     let golden = common::Golden::new();
     let hosts = common::short_tempdir();
+    watch.owns(golden.dir.path());
+    watch.owns(hosts.path());
     let ssh = fake_ssh(hosts.path());
     let host = FakeHost::new(hosts.path(), "me@vps", &golden.claude);
     let port = free_port().port();
@@ -1503,6 +1661,7 @@ fn external_access_answers_with_the_mac_asleep_or_stopped() {
             .unwrap_or_default()
             .to_owned()
     };
+    watch.at("the link");
     wait_for("the link", Duration::from_secs(30), || {
         vps_line(&mac.socket).contains("  connected")
     });
@@ -1527,6 +1686,7 @@ fn external_access_answers_with_the_mac_asleep_or_stopped() {
             ],
         ));
     }
+    watch.at("the tunnel");
     let on = ok(vibe(&mac.socket, &["host", "external", "vps", "vps.test"]));
     assert!(on.contains("external address https://vps.test/mcp"), "{on}");
     wait_for("the tunnel", Duration::from_secs(60), || {
@@ -1550,6 +1710,7 @@ fn external_access_answers_with_the_mac_asleep_or_stopped() {
         key: Some(key),
         next: 0,
     };
+    watch.at("the first calls from outside");
     let (code, body) = c.request(
         "initialize",
         json!({"protocolVersion": "2025-06-18", "capabilities": {},
@@ -1567,8 +1728,10 @@ fn external_access_answers_with_the_mac_asleep_or_stopped() {
         );
         assert!(started.contains("started"), "{started}");
     }
+    watch.at("talking to both agents");
     c.talk("on-vps");
     c.talk("mac:on-mac");
+    watch.at("both in one listing");
     let merged = |c: &mut Outside| {
         let listed = c.call("vibe_list_agents", json!({}));
         listed.contains("on-vps")
@@ -1580,10 +1743,13 @@ fn external_access_answers_with_the_mac_asleep_or_stopped() {
     });
 
     // The Mac sleeps: the tunnel's relay stops, with its socket on the host still there.
-    let relay = fs::canonicalize(hosts.path()).unwrap().join("relay.py");
+    watch.at("the Mac asleep");
+    // By its directory's own name, as `/tmp` is a link on a Mac: the relay runs as
+    // the path it was given, not the resolved one.
+    let relay = format!("{}/relay.py", unique_name(hosts.path()));
     let found = Command::new("pgrep")
-        .args(["-f", relay.to_str().unwrap()])
-        .output()
+        .args(["-f", &relay])
+        .in_files()
         .unwrap();
     let relays: Vec<String> = String::from_utf8_lossy(&found.stdout)
         .lines()
@@ -1603,6 +1769,7 @@ fn external_access_answers_with_the_mac_asleep_or_stopped() {
     every_local_tool_answers_promptly(&mut c, "asleep");
 
     // It wakes, and it all merges back with nothing done.
+    watch.at("the Mac waking");
     relays.signal("-CONT");
     wait_for("the Mac back", Duration::from_secs(60), || merged(&mut c));
     let read = c.call(
@@ -1612,7 +1779,9 @@ fn external_access_answers_with_the_mac_asleep_or_stopped() {
     assert!(!read.contains("unavailable"), "{read}");
 
     // The Mac stops altogether: the same.
+    watch.at("the Mac stopping");
     drop(mac.rt);
+    watch.at("the Mac stopped");
     let listed = c.call("vibe_list_agents", json!({}));
     let mac_row = listed
         .lines()
@@ -1719,7 +1888,7 @@ fn real_external_access() {
     c.call("vibe_list_agents", json!({}));
     let pgrep = Command::new("pgrep")
         .args(["-f", "ssh .*-R .*mac\\.sock"])
-        .output()
+        .in_files()
         .unwrap();
     let tunnel = String::from_utf8_lossy(&pgrep.stdout).trim().to_owned();
     assert!(!tunnel.is_empty(), "the Mac's ssh -R isn't running");
