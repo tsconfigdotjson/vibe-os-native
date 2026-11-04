@@ -3,3 +3,14 @@
 # cross C toolchain, on macOS or on Linux.
 [target.aarch64-unknown-linux-musl]
 linker = "rust-lld"
+
+# Nothing cargo runs from here may reach the login Keychain, whatever the shell
+# exported (vibe_core::keychain). `force` is what beats the shell. From elsewhere,
+# with --manifest-path, this doesn't apply, and the door is still closed.
+[env]
+VIBE_LOGIN_KEYCHAIN = { value = "never", force = true }
+# What git is told through the environment beats a repo's own config, and a test
+# of what vibed's git does goes by the repo's. Inside a VibeOS agent these carry
+# gc.auto=0.
+GIT_CONFIG_COUNT = { value = "0", force = true }
+GIT_CONFIG_PARAMETERS = { value = "", force = true }

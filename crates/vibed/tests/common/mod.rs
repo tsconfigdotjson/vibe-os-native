@@ -163,13 +163,12 @@ pub fn output_in_files(cmd: &mut Command) -> std::io::Result<std::process::Outpu
     })
 }
 
+/// Who a test's commits are by: the machine running it may have nobody set up,
+/// as a CI runner and a fresh host don't.
+const GIT_IDENTITY: [&str; 4] = ["-c", "user.name=t", "-c", "user.email=t@example.com"];
+
 pub fn git(args: &[&str]) {
-    let out = output_in_files(
-        Command::new("git")
-            .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
-            .args(args),
-    )
-    .unwrap();
+    let out = output_in_files(Command::new("git").args(GIT_IDENTITY).args(args)).unwrap();
     assert!(out.status.success(), "git {args:?}: {out:?}");
 }
 
@@ -198,7 +197,14 @@ pub fn clone_of_new_repo(origin: &Path, dir: &Path) {
 
 /// `git -C dir args`'s output, trimmed.
 pub fn git_out(dir: &Path, args: &[&str]) -> String {
-    let out = output_in_files(Command::new("git").arg("-C").arg(dir).args(args)).unwrap();
+    let out = output_in_files(
+        Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(GIT_IDENTITY)
+            .args(args),
+    )
+    .unwrap();
     assert!(out.status.success(), "git {args:?}: {out:?}");
     String::from_utf8(out.stdout).unwrap().trim().to_owned()
 }
