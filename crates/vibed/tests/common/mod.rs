@@ -138,12 +138,38 @@ pub fn examples(golden: &Golden) -> Vec<Example> {
         .collect()
 }
 
+/// [`Command::output`], with what it says in files rather than pipes. A Mac makes a
+/// pipe in two steps, so a program another thread starts between them inherits its
+/// write end: `output` then waits for as long as that one lives, which for a shim or
+/// a tunnel is the rest of the test. A test starting anything long-lived alongside
+/// other calls needs this. It only waits for the program itself.
+pub fn output_in_files(cmd: &mut Command) -> std::io::Result<std::process::Output> {
+    use std::io::{Read, Seek, SeekFrom};
+    let (mut out, mut err) = (tempfile::tempfile()?, tempfile::tempfile()?);
+    let status = cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(out.try_clone()?)
+        .stderr(err.try_clone()?)
+        .status()?;
+    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+    out.seek(SeekFrom::Start(0))?;
+    out.read_to_end(&mut stdout)?;
+    err.seek(SeekFrom::Start(0))?;
+    err.read_to_end(&mut stderr)?;
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
 pub fn git(args: &[&str]) {
-    let out = Command::new("git")
-        .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
-        .args(args)
-        .output()
-        .unwrap();
+    let out = output_in_files(
+        Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+            .args(args),
+    )
+    .unwrap();
     assert!(out.status.success(), "git {args:?}: {out:?}");
 }
 
@@ -172,12 +198,7 @@ pub fn clone_of_new_repo(origin: &Path, dir: &Path) {
 
 /// `git -C dir args`'s output, trimmed.
 pub fn git_out(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .unwrap();
+    let out = output_in_files(Command::new("git").arg("-C").arg(dir).args(args)).unwrap();
     assert!(out.status.success(), "git {args:?}: {out:?}");
     String::from_utf8(out.stdout).unwrap().trim().to_owned()
 }
