@@ -18,6 +18,8 @@ truth.
 | `crates/vibe-guest` | PID 1 in each `linux` VM; a static `aarch64-unknown-linux-musl` binary. Its library is the protocol `vibed` and `vibe-shim` speak to it |
 | `crates/vibe-testguest` | PID 1 of the small test guest `vibe-vm` is tested with, and a stand-in for Claude in the one `vibe-guest` is; not shipped |
 | `crates/vibe-mcp` | The MCP server |
+| `crates/vibe-services` | Shared MCP services' broker, in every `vibed`: each host's own login, its OAuth lifecycle, policy and audit |
+| `crates/vibe-relay` | Their `vibe mcp-proxy` stdio shim, and the relay out of a VM; `std` only, as `vibe-guest` links it |
 | `swift/VibeOS` | `VibeOS.app`, the SwiftUI menu bar app, and `VibeRPC`, its socket client |
 | `swift/vibe-vm` | `vibe-vm`, the Virtualization.framework helper |
 | `protocol/` | The socket contract both sides are tested against, `vibe-vm`'s in `protocol/vibe-vm/` and `vibe-guest`'s in `protocol/vibe-guest/`; see the READMEs |

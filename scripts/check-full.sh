@@ -727,6 +727,17 @@ s_mcp() {
 
 # The macos backend's own tests, with a bigger fork bomb than the test
 # step's, still bounded so a governor that failed wouldn't take the Mac down.
+# Real Claude Code through `vibe mcp-proxy` and a broker, to a stand-in for the
+# service: it spends a model call, so only here. The rest of shared services is in
+# the test step, and in a real VM in the vm-cycle step.
+s_services_claude() {
+  if ! command -v claude >/dev/null; then
+    echo "no claude on PATH"
+    return $NOT_APPLICABLE
+  fi
+  VIBE_TEST_REAL_CLAUDE=1 cargo test -p vibe-cli --locked --test services -- --nocapture
+}
+
 s_macos_governor() {
   VIBE_FORK_BOMB_DEPTH=8 cargo test -p vibe-env --locked --test macos -- --test-threads=1 --nocapture
 }
@@ -1429,6 +1440,7 @@ step registry "registry via vibe rpc survives a vibed restart" s_registry build
 step sessions "a session outlives a killed vibed and is re-adopted" s_sessions build
 step agents "agents start, outlive vibed, and delete to nothing but the branch" s_agents build
 step mcp "MCP: no key refused; VibeOS's round over vibe mcp, start to delete" s_mcp build
+step services-claude "shared MCP services: real Claude Code through the shim, to a stand-in" s_services_claude build
 step linux-host "a Linux host over SSH: install, link, an agent via MCP, a pulled network" s_linux_host build
 step real-host "a real Linux server over SSH (VIBE_TEST_LINUX_HOST), its cgroups too" s_real_host build
 step external "external access via a real server, Let's Encrypt and ssh -R (VIBE_TEST_EXTERNAL_DOMAIN)" s_real_external build

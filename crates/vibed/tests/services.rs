@@ -225,7 +225,7 @@ fn env_of<'a>(launch: &'a vibe_env::Launch, name: &str) -> Option<&'a str> {
 
 // ---- Offering.
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn every_profile_offers_the_services_per_launch_until_it_is_switched_off() {
     let fake = FakeService::start().await;
     let n = node(
@@ -297,8 +297,9 @@ async fn every_profile_offers_the_services_per_launch_until_it_is_switched_off()
 
     // And a shim that's in an off agent all the same is told no.
     let dir = tempfile::tempdir().unwrap();
-    let mut shim = Shim::start(&socket, dir.path(), Some(&off.agent));
-    let refused = shim.call("list_issues");
+    let (cache, agent) = (dir.path().to_owned(), off.agent.clone());
+    let refused =
+        blocking(move || Shim::start(&socket, &cache, Some(&agent)).call("list_issues")).await;
     assert_eq!(refused["result"]["isError"], true, "{refused}");
     assert!(
         text(&refused).contains("off for this agent's profile"),
@@ -308,20 +309,19 @@ async fn every_profile_offers_the_services_per_launch_until_it_is_switched_off()
 
 // ---- Shims.
 
-/// An MCP client on a real shim, on stdio pipes.
+/// An MCP client on a real shim, on its stdin and stdout.
 struct Shim {
-    to: UnixStream,
-    from: BufReader<UnixStream>,
+    to: Box<dyn Write + Send>,
+    from: std::sync::mpsc::Receiver<String>,
     next: i64,
     read: Vec<u8>,
 }
 
 impl Shim {
+    /// A shim in this process, as `vibe mcp-proxy` is.
     fn start(socket: &Path, cache: &Path, agent: Option<&str>) -> Shim {
         let (to, shim_in) = UnixStream::pair().unwrap();
         let (from, shim_out) = UnixStream::pair().unwrap();
-        from.set_read_timeout(Some(Duration::from_secs(30)))
-            .unwrap();
         let config = proxy::Config {
             service: "linear".into(),
             socket: socket.to_owned(),
@@ -337,13 +337,22 @@ impl Shim {
         std::thread::spawn(move || {
             let _ = proxy::run(config, BufReader::new(shim_in), shim_out);
         });
-        Shim::over(to, BufReader::new(from))
+        Shim::over(Box::new(to), from)
     }
 
-    fn over(to: UnixStream, from: BufReader<UnixStream>) -> Shim {
+    /// One over whatever it writes to and reads from.
+    fn over(to: Box<dyn Write + Send>, from: impl std::io::Read + Send + 'static) -> Shim {
+        let (tx, lines) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(from).lines().map_while(Result::ok) {
+                if tx.send(line).is_err() {
+                    return;
+                }
+            }
+        });
         let mut shim = Shim {
             to,
-            from,
+            from: lines,
             next: 10,
             read: Vec::new(),
         };
@@ -366,9 +375,12 @@ impl Shim {
         let m = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
         writeln!(self.to, "{m}").unwrap();
         loop {
-            let mut line = String::new();
-            self.from.read_line(&mut line).expect("the shim answers");
+            let line = self
+                .from
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the shim answers");
             self.read.extend_from_slice(line.as_bytes());
+            self.read.push(b'\n');
             let v: Value = serde_json::from_str(&line).expect("JSON");
             if v["id"] == json!(id) {
                 return v;
@@ -463,21 +475,9 @@ impl Guest {
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        // Between a child's pipes and the socket pairs a Shim reads.
-        let (to, near_in) = UnixStream::pair().unwrap();
-        let (from, near_out) = UnixStream::pair().unwrap();
-        from.set_read_timeout(Some(Duration::from_secs(30)))
-            .unwrap();
-        let mut stdin = child.stdin.take().unwrap();
-        let mut stdout = child.stdout.take().unwrap();
-        let (mut a, mut b) = (near_in, near_out);
-        std::thread::spawn(move || {
-            let _ = std::io::copy(&mut a, &mut stdin);
-        });
-        std::thread::spawn(move || {
-            let _ = std::io::copy(&mut stdout, &mut b);
-        });
-        (Shim::over(to, BufReader::new(from)), child)
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        (Shim::over(Box::new(stdin), stdout), child)
     }
 }
 
@@ -528,9 +528,7 @@ async fn a_vm_reaches_the_macs_broker_over_the_relay_the_mac_dials() {
     let (mut shim, mut child) = guest.shim("someone-else");
     let answer = blocking(move || {
         assert!(shim.tools().contains(&"list_issues".to_owned()));
-        let a = shim.call("list_issues");
-        drop(shim);
-        a
+        shim.call("list_issues")
     })
     .await;
     assert_eq!(text(&answer), "issues on /mcp", "{answer}");

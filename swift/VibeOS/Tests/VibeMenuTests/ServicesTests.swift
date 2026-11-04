@@ -69,8 +69,10 @@ struct ServicesTests {
         let json = #"{"name":"p","environment":"linux","model":"opus","reasoning":"high","mode":"auto","memory":1}"#
         var p = try JSONDecoder().decode(Profile.self, from: Data(json.utf8))
         #expect(p.sharedServicesOn)
+        #expect(!profileSummary(p).contains("shared"))
         p.sharedServices = false
         #expect(!p.sharedServicesOn)
+        #expect(profileSummary(p).hasSuffix(" · No shared services"))
         p.sharedServices = true
         #expect(p.sharedServicesOn)
     }

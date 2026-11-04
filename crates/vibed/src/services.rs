@@ -369,10 +369,9 @@ async fn keep_vm_relays(core: &Core, broker: &Arc<Services>, vms: &mut HashMap<S
     let agents = core.store().agents(LOCAL_HOST).unwrap_or_default();
     let wanted: Vec<&AgentRecord> = agents
         .iter()
+        // A start included, so its agent has its tools from the first.
         .filter(|a| {
-            a.shared_services
-                && !a.starting
-                && !matches!(a.state, AgentState::Asleep | AgentState::Exited)
+            a.shared_services && !matches!(a.state, AgentState::Asleep | AgentState::Exited)
         })
         .collect();
     vms.retain(|r, _| wanted.iter().any(|a| &a.agent_ref == r));

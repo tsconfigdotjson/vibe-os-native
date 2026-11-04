@@ -577,10 +577,13 @@ extension PermissionMode {
 /// A profile's settings in a line, in the app's voice: `Linux · Opus · High
 /// · Auto · 4G`.
 public func profileSummary(_ profile: Profile) -> String {
-    [
+    var parts = [
         profile.environment.title, profile.model.title, profile.reasoning.title, profile.mode.title,
         formatBytes(profile.memory),
-    ].joined(separator: " · ")
+    ]
+    // On is the default, so it says nothing unless it's off.
+    if !profile.sharedServicesOn { parts.append("No shared services") }
+    return parts.joined(separator: " · ")
 }
 
 /// The SF Symbol for an environment: a compartment, or this Mac.

@@ -651,7 +651,6 @@ async fn a_linux_host_serves_its_agents_on_its_own_login_and_survives_a_refresh(
     assert_eq!(fake.refreshes(), 1);
     drop(agent);
 
-    // The same happens after a restart, from what's on disk.
     let audit = host.audit.lock().unwrap().join("\n");
     assert!(
         audit.contains("agent=quiet-amber-otter service=linear"),

@@ -474,7 +474,7 @@ The menu bar lists every agent this app started, across all hosts and projects, 
 - **Click** a row to attach in Terminal. **Right-click** for: Interrupt, Reveal worktree in Finder, Open in editor, Copy attach command, Delete agent.
 - **Footer:**
   - New agent… (a small sheet: project, profile, prompt)
-  - Settings… (projects and their profiles, API keys, hosts and external access with Add Linux host…, the Linux toolbox: its state, open shell, rebuild template and the logins new agents start with, host limits)
+  - Settings… (projects and their profiles, API keys, hosts and external access with Add Linux host…, shared services with each host's status and Reconnect, the Linux toolbox: its state, open shell, rebuild template and the logins new agents start with, host limits)
   - Quit menu. This leaves `vibed` and every agent running.
 
 **Notifications** fire on a question, an error, a limit hit, and the end of a turn (off by default). Clicking one attaches.

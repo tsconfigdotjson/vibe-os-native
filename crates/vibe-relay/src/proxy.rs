@@ -368,7 +368,10 @@ impl Shim {
                 };
                 due = Instant::now() + every;
             }
-            std::thread::sleep(Duration::from_millis(50).min(self.config.timing.poll_away));
+            // Rarely awake, as an idle agent's processes should be: it's asleep
+            // until it's due, and looks in now and then to see if it's over.
+            let until_due = due.saturating_duration_since(Instant::now());
+            std::thread::sleep(until_due.clamp(Duration::from_millis(1), Duration::from_secs(1)));
         }
     }
 
