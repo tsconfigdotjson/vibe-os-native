@@ -8,9 +8,9 @@ use vibe_core::rpc::{ACCEPTS_CALLS, TUNNEL_METHODS};
 use vibe_core::rpc::{
     AgentsCheck, AgentsDelete, AgentsInterrupt, AgentsList, AgentsMessages, AgentsOutput,
     AgentsSend, AgentsStart, DoctorCheckGet, DoctorFix, ErrorCode, ErrorObject, Event,
-    EventsSubscribe, GhStatusGet, Hello, HelloParams, HelloResult, HostsAdd, HostsExternal,
-    HostsList, HostsRemove, HostsUpgrade, Id, KeysCreate, KeysList, KeysRevoke, KeysSync,
-    KeysVerify, LimitsGet, LimitsSet, McpGet, McpSet, Method, PROTOCOL_VERSION, PiForget,
+    EventsSubscribe, GhStatusGet, Hello, HelloParams, HelloResult, HostsAdd, HostsAdmin,
+    HostsExternal, HostsList, HostsRemove, HostsUpgrade, Id, KeysCreate, KeysList, KeysRevoke,
+    KeysSync, KeysVerify, LimitsGet, LimitsSet, McpGet, McpSet, Method, PROTOCOL_VERSION, PiForget,
     PiInstall, PiStatusGet, ProfilesCreate, ProfilesDelete, ProfilesList, ProfilesUpdate,
     ProjectsAdd, ProjectsList, ProjectsRemove, ProtocolMismatchData, Request, Response,
     ServicesAudit, ServicesComplete, ServicesConnect, ServicesDisconnect, ServicesFollow,
@@ -204,6 +204,7 @@ async fn call(
         HostsUpgrade::NAME => {
             encode_result(core.upgrade_host(decode::<HostsUpgrade>(params)?).await)
         }
+        HostsAdmin::NAME => encode_result(core.host_admin(decode::<HostsAdmin>(params)?)),
         HostsRemove::NAME => encode_result(core.remove_host(decode::<HostsRemove>(params)?).await),
         HostsExternal::NAME => {
             encode_result(core.set_external(decode::<HostsExternal>(params)?).await)

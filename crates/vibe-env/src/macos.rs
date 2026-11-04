@@ -288,13 +288,16 @@ impl Macos {
             return Ok(p.clone());
         }
         let path = self.path();
+        // Where VibeOS's own install links it, whether or not the login shell's
+        // PATH has that, as the doctor looks too.
         std::env::split_paths(&path)
+            .chain([self.home.join(".local/bin")])
             .map(|d| d.join("pi"))
             .find(|c| is_executable(c))
             .ok_or_else(|| {
                 EnvError::new(format!(
                     "can't find pi for macos agents: it isn't on your login shell's PATH \
-                     ({path}). Install it from Settings, or check `pi` runs in Terminal"
+                     ({path}). VibeOS installs it by itself when a profile here runs Pi"
                 ))
             })
     }
@@ -490,6 +493,10 @@ impl Compartment for Macos {
         model: &str,
     ) -> Option<crate::pi::AuthCheck> {
         native::pi_auth_check(&self.pi().ok()?, h, env, self.env(), model)
+    }
+
+    fn native_pi(&self) -> Option<std::result::Result<PathBuf, String>> {
+        Some(self.pi().map_err(|e| e.to_string()))
     }
 
     fn launch(&self, h: &Handle, launch: &Launch) -> Result<TerminalEnd> {

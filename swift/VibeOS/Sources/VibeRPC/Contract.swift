@@ -24,6 +24,7 @@ public enum VibeRPC {
         HostsList.name,
         HostsAdd.name,
         HostsUpgrade.name,
+        HostsAdmin.name,
         HostsRemove.name,
         HostsExternal.name,
         TunnelPrepare.name,
@@ -562,14 +563,22 @@ public enum LoginTool: String, Codable, CaseIterable, Hashable, Sendable {
 
 /// What `vibe doctor` checks, in the order it reports them: git; `gh`'s
 /// login, and git using `gh` for GitHub; the `claude` macos agents run, and
-/// its login; system sleep off; Tailscale (optional); on a Mac, the Linux
+/// its login; system sleep off, on a Mac; on a Linux host, vibed staying up
+/// while the owner's logged out; Tailscale (optional); on a Mac, the Linux
 /// images; and Pi (optional).
 public enum CheckId: String, Codable, CaseIterable, Hashable, Sendable {
     case git, gh
     case ghGit = "gh_git"
     case claude
     case claudeLogin = "claude_login"
-    case power, tailscale, linux, pi
+    case power, linger, tailscale, linux, pi
+}
+
+/// What a Linux host needs someone with sudo there to allow, once, as VibeOS
+/// tried every way it has without a password: `linger`, vibed staying up while
+/// the owner's logged out.
+public enum AdminNeed: String, Codable, CaseIterable, Hashable, Sendable {
+    case linger
 }
 
 /// How a doctor check went: `pass`; `fail`, which needs the owner;
@@ -610,6 +619,14 @@ public enum HostsUpgrade: RPCMethod {
     public typealias Params = HostNameParams
     public typealias Result = HostInstall
     public static let name = "hosts.upgrade"
+}
+
+/// `hosts.admin`: the one button for what a Linux host needs sudo for
+/// (`needsAdmin` in its row): the line to run in a Terminal.
+public enum HostsAdmin: RPCMethod {
+    public typealias Params = HostNameParams
+    public typealias Result = HostAdmin
+    public static let name = "hosts.admin"
 }
 
 /// `hosts.remove`: forgets a Linux host and ends its link; nothing on the
@@ -1001,11 +1018,15 @@ public struct HostInfo: Codable, Hashable, Sendable {
     /// What its memory is doing now: this host's own, and a Linux host's
     /// from its last ping while its link is up.
     public var memory: MemoryUse?
+    /// What this Linux host needs someone with sudo there to allow, once;
+    /// `hosts.admin` says how. Missing when there's nothing.
+    public var needsAdmin: [AdminNeed]?
 
     public enum CodingKeys: String, CodingKey, CaseIterable {
         case name, os, label, link, external, mcp, address, version, missing, detail, url, tunnel
         case externalDetail = "external_detail"
         case memory
+        case needsAdmin = "needs_admin"
     }
 }
 
@@ -1101,6 +1122,17 @@ public struct HostNameParams: Codable, Hashable, Sendable {
 }
 
 /// How an install over SSH went.
+/// `hosts.admin`'s answer.
+public struct HostAdmin: Codable, Hashable, Sendable {
+    /// The line a Terminal here runs: ssh to the host, where sudo asks for its
+    /// password. VibeOS never sees the password.
+    public var command: String
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case command
+    }
+}
+
 public struct HostInstall: Codable, Hashable, Sendable {
     public var host: HostInfo
     /// Whether it changed what the server runs.
@@ -1937,6 +1969,8 @@ public struct PiStatus: Codable, Hashable, Sendable {
     /// The `pi` this host's native agents run: `macos` agents on a Mac, every
     /// agent on a Linux host.
     public var native: PiBinary?
+    /// Why VibeOS couldn't install or update that, the last time it tried.
+    public var error: String?
     /// The providers the owner's own `~/.pi/agent` is signed in to, by name.
     /// Never what their logins hold.
     public var logins: [String]?
@@ -1944,7 +1978,7 @@ public struct PiStatus: Codable, Hashable, Sendable {
     public var vms: PiVms?
 
     public enum CodingKeys: String, CodingKey, CaseIterable {
-        case host, native, logins, vms
+        case host, native, error, logins, vms
     }
 }
 

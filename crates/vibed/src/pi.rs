@@ -1,11 +1,13 @@
 //! Pi on this host (PRD: Who gets which credentials; What's inside `linux`):
 //! what's installed and which providers it's signed in to, for Settings, and
-//! installing it, on the owner's word. VibeOS doesn't sign anyone in: `/login`
-//! is Pi's own, and only the providers' names are ever read here.
+//! installing it, once a profile here runs it, with nobody asked. VibeOS doesn't
+//! sign anyone in: `/login` is Pi's own, and only the providers' names are ever
+//! read here.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use vibe_core::model::{
     AgentKind, AgentState, Environment, EventKind, LOCAL_HOST, PiTarget, Profile,
@@ -18,11 +20,23 @@ use vibe_core::store::AgentRecord;
 use vibe_env::images::Images;
 use vibe_env::pi_logins::{self, Broker, Copy, Synced};
 use vibe_env::pi_release;
-use vibe_env::{AgentHome, pi};
+use vibe_env::{AgentHome, Backend, pi};
 
 /// How often the logins are looked at: a `/login` or a refreshed token passed on
 /// to every other copy, soon enough that nobody waits for it.
 pub const PI_WATCH_EVERY: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// How long a Pi agent's start waits for an install under way. A download has an
+/// end of its own, and this keeps a queue of starts from outlasting it.
+const PI_WAIT: Duration = Duration::from_secs(20 * 60);
+
+/// Why an install of Pi last failed and when, for each kind: for the doctor and
+/// Settings, and for starts that were waiting on it.
+#[derive(Debug, Default)]
+pub struct PiFailures {
+    pub(crate) native: Option<(String, Instant)>,
+    pub(crate) vm: Option<(String, Instant)>,
+}
 
 /// What was last said of Pi, to say so when it changes.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -34,6 +48,7 @@ pub struct PiSeen {
 }
 
 use crate::core::{Core, error, lock};
+use crate::doctor::PiWanted;
 
 /// What one look at the copies found: each copy's, and what's wrong with the store.
 type Look = (Vec<(Copy, std::io::Result<Synced>)>, Option<std::io::Error>);
@@ -386,22 +401,34 @@ impl Core {
         let (logins, vm_logins) = self.pi_logins_now().await;
         let alerts = self.pi_alerts_now().await;
         let offered = self.pi_offered_now().await;
+        let failures = {
+            let failures = lock(&self.pi_install_failures);
+            (
+                failures.native.as_ref().map(|(why, _)| why.clone()),
+                failures.vm.as_ref().map(|(why, _)| why.clone()),
+            )
+        };
         let vms = (self.info().os == "macos").then(|| PiVms {
             version: Images::new(self.layout.linux_dir()).pi().map(|(v, _)| v),
             logins: vm_logins,
-            error: self.linux_images.as_ref().and_then(|w| w.pi_error()),
+            error: self
+                .linux_images
+                .as_ref()
+                .and_then(|w| w.pi_error())
+                .or(failures.1),
             alerts,
             offered,
         });
         Ok(PiStatus {
             host,
             native,
+            error: failures.0,
             logins,
             vms,
         })
     }
 
-    /// `pi.install`: installs it, and says how things stand then. It takes as
+    /// `pi.install`: installs it now, and says how things stand then. It takes as
     /// long as the download does; one at a time. Either way a `pi.changed`
     /// event tells everyone else watching.
     pub async fn pi_install(&self, p: PiInstallParams) -> Result<PiStatus, ErrorObject> {
@@ -412,12 +439,8 @@ impl Core {
                 "only a Mac runs linux agents in VMs; install Pi for this host's own agents",
             ));
         }
-        let Ok(_one_at_a_time) = self.pi_installing.try_lock() else {
-            return Err(error(
-                ErrorCode::Conflict,
-                "Pi is being installed already; try again once that's done",
-            ));
-        };
+        // One under way is waited for, and this one then finds little left to do.
+        let _one_at_a_time = self.pi_installing.lock().await;
         let (releases, data, home, linux) = (
             self.pi_releases.clone(),
             self.layout.data_dir(),
@@ -430,29 +453,237 @@ impl Core {
         })
         .await
         .map_err(|e| error(ErrorCode::InternalError, e.to_string()))?;
+        self.pi_install_done(p.target, done)?;
+        self.pi_status(HostParams { host: None }).await
+    }
+
+    /// Says how an install went, to the log, to the doctor and to everyone
+    /// watching.
+    fn pi_install_done(
+        &self,
+        target: PiTarget,
+        done: Result<String, String>,
+    ) -> Result<(), ErrorObject> {
         *lock(&self.doctor_found) = None;
         let mut event = self.event(EventKind::PiChanged);
-        match done {
+        let mut failures = lock(&self.pi_install_failures);
+        let slot = match target {
+            PiTarget::Native => &mut failures.native,
+            PiTarget::Vm => &mut failures.vm,
+        };
+        let result = match done {
             Ok(what) => {
                 crate::log!("vibed: {what}");
-                self.publish(event);
-                self.pi_status(HostParams { host: None }).await
+                *slot = None;
+                Ok(())
             }
             Err(why) => {
                 crate::log!("vibed: can't install Pi: {why}");
+                *slot = Some((why.clone(), Instant::now()));
                 event.message = Some(why.clone());
-                self.publish(event);
                 Err(error(ErrorCode::CommandFailed, why))
             }
+        };
+        drop(failures);
+        self.publish(event);
+        result
+    }
+
+    /// The environments a profile here runs Pi in, with their backends.
+    fn pi_profile_backends(&self) -> Vec<(Environment, Arc<dyn Backend>)> {
+        let mut environments = Vec::new();
+        {
+            let store = self.store();
+            for project in store.projects(LOCAL_HOST).unwrap_or_default() {
+                for profile in store
+                    .profiles(LOCAL_HOST, &project.name)
+                    .unwrap_or_default()
+                {
+                    if profile.agent == AgentKind::Pi
+                        && !environments.contains(&profile.environment)
+                    {
+                        environments.push(profile.environment);
+                    }
+                }
+            }
+        }
+        environments
+            .into_iter()
+            .filter_map(|e| Some((e, self.backends.get(e)?)))
+            .collect()
+    }
+
+    /// Whether Pi needs installing on this machine for those: it isn't there, or
+    /// it's VibeOS's own and this build pins another. What the owner put there
+    /// themselves is used as it is.
+    async fn native_pi_needs_install(&self) -> bool {
+        let backends = self.pi_profile_backends();
+        let data = self.layout.data_dir();
+        let link = self.layout.home().join(".local/bin/pi");
+        tokio::task::spawn_blocking(move || {
+            backends.iter().any(|(_, b)| match b.native_pi() {
+                None => false,
+                Some(Err(_)) => true,
+                Some(Ok(path)) => pi_release::needs_update(&path, &link, &data, pi_release::PINNED),
+            })
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    /// Where Pi stands for the doctor. With nothing under way and nothing having
+    /// failed, asking starts it.
+    pub(crate) async fn pi_wanted(&self) -> PiWanted {
+        let failed = {
+            let failures = lock(&self.pi_install_failures);
+            (
+                failures.native.as_ref().map(|(why, _)| why.clone()),
+                failures.vm.as_ref().map(|(why, _)| why.clone()),
+            )
+        };
+        let backends = self.pi_profile_backends();
+        if self.native_pi_needs_install().await {
+            if self.pi_installing.try_lock().is_err() {
+                return PiWanted::Installing;
+            }
+            if let Some(why) = failed.0 {
+                return PiWanted::Failed(why);
+            }
+            self.in_background(|core| async move { core.repair_pi().await });
+            return PiWanted::Installing;
+        }
+        // A VM's layer the same way: what's in its download or a start's.
+        if backends.iter().any(|(e, _)| *e == Environment::Linux)
+            && let Some(watch) = &self.linux_images
+            && Images::new(self.layout.linux_dir()).pi().is_none()
+            && let Some(why) = watch.pi_error().or(failed.1)
+        {
+            return PiWanted::Failed(why);
+        }
+        // One's there, and VibeOS won't touch it: only the doctor knows if it runs.
+        let found = tokio::task::spawn_blocking(move || {
+            backends
+                .iter()
+                .any(|(_, b)| matches!(b.native_pi(), Some(Ok(_))))
+        })
+        .await
+        .unwrap_or(false);
+        if found {
+            PiWanted::Present
+        } else {
+            PiWanted::No
         }
     }
 
-    /// A saved profile that runs Pi in a VM asks for the Pi layer, if there
-    /// isn't one, in the background: its first agent shouldn't wait for the
-    /// next daily check, and Macs that never run Pi never download it.
+    /// One install of `target`, under `pi_installing`.
+    async fn install_pi_now(&self, target: PiTarget) -> Result<(), String> {
+        let (releases, data, home, linux) = (
+            self.pi_releases.clone(),
+            self.layout.data_dir(),
+            self.layout.home().to_owned(),
+            self.layout.linux_dir(),
+        );
+        let prune = !self.pi_agents_run();
+        let done = tokio::task::spawn_blocking(move || {
+            install(target, &releases, &data, &home, &linux, prune)
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+        self.pi_install_done(target, done).map_err(|e| e.message)
+    }
+
+    /// What a profile that runs Pi asks of this host, whenever that's looked at: at
+    /// each launch of `vibed`, every hour, and as one is saved. The layer for VMs,
+    /// from the watch that keeps those; for native agents, the pinned build. Nobody
+    /// is asked, and Macs and servers that never run Pi never download it.
+    pub(crate) async fn repair_pi(&self) {
+        let backends = self.pi_profile_backends();
+        if let Some(watch) = &self.linux_images
+            && backends.iter().any(|(e, _)| *e == Environment::Linux)
+        {
+            watch.want_pi();
+            if Images::new(self.layout.linux_dir()).pi().is_none() {
+                watch.kick();
+            }
+        }
+        if !self.native_pi_needs_install().await {
+            lock(&self.pi_install_failures).native = None;
+            return;
+        }
+        // One under way is doing this already, and nothing queues up behind it.
+        let Ok(_one_at_a_time) = self.pi_installing.try_lock() else {
+            return;
+        };
+        crate::log!("vibed: a profile here runs Pi, so VibeOS is installing it");
+        if let Err(why) = self.install_pi_now(PiTarget::Native).await {
+            crate::log!("vibed: VibeOS tries again later: {why}");
+        }
+    }
+
+    /// Before a Pi agent starts or comes back: Pi's there for it, waiting for it to
+    /// be installed if it isn't, so a first agent just starts, a little late. Only
+    /// if that can't be done does the agent fail, saying so. Starts waiting on one
+    /// install share how it went, rather than each download again.
+    pub(crate) async fn pi_ready(&self, backend: &Arc<dyn Backend>) -> Result<(), ErrorObject> {
+        let needed = |b: Arc<dyn Backend>| async move {
+            tokio::task::spawn_blocking(move || {
+                if matches!(b.native_pi(), Some(Err(_))) {
+                    Some(PiTarget::Native)
+                } else if b.pi_layer_missing() {
+                    Some(PiTarget::Vm)
+                } else {
+                    None
+                }
+            })
+            .await
+            .unwrap_or(None)
+        };
+        if needed(Arc::clone(backend)).await.is_none() {
+            return Ok(());
+        }
+        let cant = |why: String| {
+            error(
+                ErrorCode::CommandFailed,
+                format!(
+                    "Pi isn't installed here yet, and VibeOS couldn't install it: {why}. It tries \
+                     again every hour, and when a Pi agent next starts"
+                ),
+            )
+        };
+        let began = Instant::now();
+        let Ok(_one_at_a_time) = tokio::time::timeout(PI_WAIT, self.pi_installing.lock()).await
+        else {
+            return Err(cant(
+                "it's still being installed, so try again in a while".to_owned(),
+            ));
+        };
+        let Some(target) = needed(Arc::clone(backend)).await else {
+            return Ok(());
+        };
+        {
+            let failures = lock(&self.pi_install_failures);
+            let failed = match target {
+                PiTarget::Native => &failures.native,
+                PiTarget::Vm => &failures.vm,
+            };
+            if let Some((why, at)) = failed
+                && *at >= began
+            {
+                return Err(cant(why.clone()));
+            }
+        }
+        crate::log!("vibed: a Pi agent is starting, so VibeOS is installing Pi for it");
+        self.install_pi_now(target).await.map_err(cant)
+    }
+
+    /// A profile that runs Pi was saved, so its first agent should find Pi there
+    /// rather than wait for it: the layer for VMs is asked for, and the rest happens
+    /// in the background.
     pub(crate) fn pi_profile_saved(&self, profile: &Profile) {
-        if profile.agent == AgentKind::Pi
-            && profile.environment == Environment::Linux
+        if profile.agent != AgentKind::Pi {
+            return;
+        }
+        if profile.environment == Environment::Linux
             && let Some(watch) = &self.linux_images
         {
             watch.want_pi();
@@ -460,6 +691,7 @@ impl Core {
                 watch.kick();
             }
         }
+        self.in_background(|core| async move { core.repair_pi().await });
     }
 }
 

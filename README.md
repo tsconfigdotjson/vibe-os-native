@@ -43,8 +43,7 @@ key.
 It updates itself through Sparkle.
 
 ```sh
-vibe doctor          # git, gh and git using it, claude and its login, sleep off, Tailscale, Linux
-vibe doctor --fix    # and has vibed retry what it fixes itself, such as the Linux download
+vibe doctor          # what truly needs you; asking has vibed try again what it sets up itself
 ```
 
 ## Develop

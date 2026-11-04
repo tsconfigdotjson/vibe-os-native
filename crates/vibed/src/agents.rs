@@ -672,6 +672,16 @@ impl Core {
         if p.prompt.trim().is_empty() {
             return Err(invalid("give the agent a prompt"));
         }
+        // Pi's there first, installed now if it isn't. It can take a while, so this
+        // comes before anything's held: a removal, or room among the agents awake.
+        // What's wrong with the profile is said below.
+        let wanted = self.store().profile(host, &p.project, &p.profile);
+        if let Ok(profile) = wanted
+            && profile.agent == AgentKind::Pi
+        {
+            let backend = self.backend(profile.environment)?;
+            self.pi_ready(&backend).await?;
+        }
         // The project stays until the start is done: a removal waits for
         // it, and a start waits for a removal under way, then finds no
         // project.
@@ -1029,6 +1039,10 @@ impl Core {
         prompt: Option<&str>,
         resume: bool,
     ) -> Result<(), ErrorObject> {
+        // A resume may find it's gone since.
+        if record.agent == AgentKind::Pi {
+            self.pi_ready(backend).await?;
+        }
         let mut services = self.shared_services(backend, record);
         if services.is_some() {
             let (b, h) = (Arc::clone(backend), handle.clone());

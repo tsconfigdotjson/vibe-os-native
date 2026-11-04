@@ -285,6 +285,8 @@ pub fn golden_checks() -> vibed::doctor::FixedChecks {
         claude_login: Ok("Claude Code is signed in, with its login in your Keychain".into()),
         pi: Ok(("/usr/local/bin/pi".into(), "1.5.0".into())),
         system_sleep: Ok(Some(10)),
+        linger: std::sync::Mutex::new(Ok(None)),
+        enable_linger: Ok(()),
     }
 }
 
@@ -795,17 +797,32 @@ impl Remote for GoldenRemote {
 
     fn install<'a>(&'a self, address: &'a str) -> BoxFuture<'a, Result<Installed, String>> {
         Box::pin(async move {
+            // A server with no polkit and no passwordless sudo.
+            let refuses = address.starts_with("refuses@");
             Ok(Installed {
                 os: "linux".into(),
                 arch: "x86_64".into(),
                 label: "vps-1".into(),
                 version: "0.1.0".into(),
                 missing: vec!["claude".into()],
+                needs_admin: if refuses {
+                    vec![vibe_core::model::AdminNeed::Linger]
+                } else {
+                    Vec::new()
+                },
                 changed: true,
-                notes: vec![format!(
-                    "Lingering is on for you on {address}, so vibed runs when you're logged \
-                     out and starts again after a reboot."
-                )],
+                notes: vec![if refuses {
+                    format!(
+                        "Lingering couldn't be turned on, so vibed stops when you log out of \
+                         {address}. Settings → Hosts has a button that does it, asking for the \
+                         password there once."
+                    )
+                } else {
+                    format!(
+                        "Lingering is on for you on {address}, so vibed runs when you're logged \
+                         out and starts again after a reboot."
+                    )
+                }],
             })
         })
     }

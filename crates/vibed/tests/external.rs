@@ -190,6 +190,7 @@ impl Remote for Wires {
                 label: "vps-1".into(),
                 version: env!("CARGO_PKG_VERSION").into(),
                 missing: vec![],
+                needs_admin: Vec::new(),
                 changed: true,
                 notes: vec![],
             })

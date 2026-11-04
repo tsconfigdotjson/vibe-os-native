@@ -927,8 +927,19 @@ impl Version {
 
 /// Downloads `url` to `dest` with `curl`, over HTTPS or from a local file.
 pub(crate) fn fetch(url: &str, dest: &Path) -> Result<()> {
+    fetch_with(url, dest, &[])
+}
+
+/// [`fetch`], with an end to it however slowly it goes: for what something is
+/// waiting on, and small enough to have arrived by then.
+pub(crate) fn fetch_bounded(url: &str, dest: &Path) -> Result<()> {
+    fetch_with(url, dest, &["--max-time", "600", "--retry-max-time", "600"])
+}
+
+fn fetch_with(url: &str, dest: &Path, more: &[&str]) -> Result<()> {
     let out = Command::new("curl")
         .args(["-fsSL", "--retry", "3", "--proto", "=https,file"])
+        .args(more)
         // A download that stalls gives up, so the next check can run.
         .args([
             "--connect-timeout",

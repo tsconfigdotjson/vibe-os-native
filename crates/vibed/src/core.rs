@@ -406,6 +406,8 @@ pub struct Core {
     pub(crate) pi_releases: String,
     /// Held while Pi is being installed.
     pub(crate) pi_installing: tokio::sync::Mutex<()>,
+    /// Why Pi couldn't be installed, the last time.
+    pub(crate) pi_install_failures: Mutex<crate::pi::PiFailures>,
     /// One admission at a time, so two starts can't both take the last
     /// room under `max_awake_agents`.
     pub(crate) admitting: tokio::sync::Mutex<()>,
@@ -624,6 +626,7 @@ impl Core {
             claude_lock: Arc::new(Mutex::new(())),
             pi_releases: config.pi_releases,
             pi_installing: tokio::sync::Mutex::new(()),
+            pi_install_failures: Mutex::default(),
             admitting: tokio::sync::Mutex::new(()),
             starting: Mutex::new(0),
             fetching: Mutex::new(HashMap::new()),
@@ -1327,6 +1330,41 @@ impl Core {
 
     /// Checks `gh` now and then every `every`, for as long as the runtime
     /// runs.
+    /// Puts right whatever VibeOS can of this host's setup, nobody asked: now, and
+    /// then every `every` (PRD: Key user flows, Install and setup). Its `vibed`
+    /// staying up while the owner's logged out, and Pi once a profile runs it. What
+    /// `gh` and git need goes with `gh`'s own check.
+    pub fn spawn_repairs(self: &Arc<Self>, every: Duration) -> tokio::task::JoinHandle<()> {
+        let core = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut ticks = tokio::time::interval(every);
+            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticks.tick().await;
+                core.repair_setup().await;
+            }
+        })
+    }
+
+    /// One round of [`Core::spawn_repairs`].
+    pub async fn repair_setup(&self) {
+        let checks = Arc::clone(&self.checks);
+        match tokio::task::spawn_blocking(move || crate::doctor::lingering(&*checks)).await {
+            Ok(Err(why)) => crate::log!(
+                "vibed: lingering is off, so vibed stops when you log out of this server: {why}"
+            ),
+            Ok(Ok(_)) => {}
+            Err(e) => crate::log!("vibed: can't look at lingering: {e}"),
+        }
+        self.repair_pi().await;
+        // A download that failed goes on by itself, and sooner than its daily round.
+        if let Some(watch) = &self.linux_images
+            && watch.check().state == vibe_core::model::CheckState::Fail
+        {
+            watch.kick();
+        }
+    }
+
     pub fn spawn_gh_checks(self: &Arc<Self>, every: Duration) -> tokio::task::JoinHandle<()> {
         let core = Arc::clone(self);
         tokio::spawn(async move {

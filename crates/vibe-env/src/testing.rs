@@ -77,6 +77,11 @@ pub struct TestBackend {
     /// With [`TestBackend::with_pi_copies`], the store.
     pi_copies: Option<crate::pi_logins::Broker>,
     pi_config: Option<PathBuf>,
+    /// With [`TestBackend::with_native_pi_in`], where agents would find their
+    /// `pi` on this machine.
+    native_pi: Option<PathBuf>,
+    /// With [`TestBackend::with_pi_layer_in`], where a VM's Pi layer would be.
+    pi_layer: Option<crate::images::Images>,
     supervisors: Mutex<HashMap<String, Supervisor>>,
     /// Held to pause, to replace a supervisor and to wake, so a supervisor
     /// that was just replaced can't pause the agent a wake has continued.
@@ -118,6 +123,8 @@ impl TestBackend {
             pi: None,
             pi_copies: None,
             pi_config: None,
+            native_pi: None,
+            pi_layer: None,
             supervisors: Mutex::new(HashMap::new()),
             gate: Arc::new(Mutex::new(())),
             memory: None,
@@ -148,6 +155,19 @@ impl TestBackend {
     /// Runs `pi` as Pi, with `dir` as the agent dir all its agents share.
     pub fn with_pi(mut self, pi: impl Into<PathBuf>, dir: impl Into<PathBuf>) -> TestBackend {
         self.pi = Some((pi.into(), dir.into()));
+        self
+    }
+
+    /// Looks for Pi on this machine as a native backend does, at `path`. What
+    /// runs is still what [`TestBackend::with_pi`] says.
+    pub fn with_native_pi_in(mut self, path: impl Into<PathBuf>) -> TestBackend {
+        self.native_pi = Some(path.into());
+        self
+    }
+
+    /// Wants a VM's Pi layer as the VM backend does, from the images in `linux`.
+    pub fn with_pi_layer_in(mut self, linux: impl Into<PathBuf>) -> TestBackend {
+        self.pi_layer = Some(crate::images::Images::new(linux.into()));
         self
     }
 
@@ -221,6 +241,19 @@ impl TestBackend {
 }
 
 impl Compartment for TestBackend {
+    fn native_pi(&self) -> Option<std::result::Result<PathBuf, String>> {
+        let path = self.native_pi.as_ref()?;
+        Some(if path.exists() {
+            Ok(path.clone())
+        } else {
+            Err(format!("no pi at {}", path.display()))
+        })
+    }
+
+    fn pi_layer_missing(&self) -> bool {
+        self.pi_layer.as_ref().is_some_and(|i| i.pi().is_none())
+    }
+
     fn create(&self, spec: &AgentSpec) -> Result<Handle> {
         let home = match spec.agent {
             AgentKind::Claude => {

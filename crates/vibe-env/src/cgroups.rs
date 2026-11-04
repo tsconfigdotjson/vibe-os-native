@@ -798,8 +798,8 @@ impl Cgroups {
             .find(|c| is_executable(c))
             .ok_or_else(|| {
                 EnvError::new(format!(
-                    "can't find pi on this server's PATH ({}). Install it from the Mac's Settings \
-                     or with `vibe pi install`, then run `pi` and `/login` once",
+                    "can't find pi on this server's PATH ({}). VibeOS installs it by itself when \
+                     a profile here runs Pi",
                     self.path
                 ))
             })
@@ -980,6 +980,10 @@ impl Compartment for Cgroups {
         model: &str,
     ) -> Option<crate::pi::AuthCheck> {
         native::pi_auth_check(&self.pi().ok()?, h, env, self.env(), model)
+    }
+
+    fn native_pi(&self) -> Option<std::result::Result<PathBuf, String>> {
+        Some(self.pi().map_err(|e| e.to_string()))
     }
 
     fn launch(&self, h: &Handle, launch: &Launch) -> Result<TerminalEnd> {

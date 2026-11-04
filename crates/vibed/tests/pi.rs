@@ -12,13 +12,16 @@ use std::sync::{Arc, Once};
 use common::{Golden, publish_pi, wait_until};
 use serde_json::Value;
 use vibe_core::model::{
-    Activity, AgentKind, AgentState, Environment, MessageRole, Mode, PiTarget, StopReason,
+    Activity, AgentKind, AgentState, CheckId, CheckState, Environment, MessageRole, Mode, PiTarget,
+    StopReason,
 };
 use vibe_core::paths::Layout;
 use vibe_core::rpc::{
-    AgentDeleteParams, AgentMessagesParams, AgentStartParams, ErrorCode, HostParams,
-    PiInstallParams, ProfileCreateParams, ProfileUpdateParams, ProjectAddParams, ProjectParams,
+    AgentDeleteParams, AgentMessagesParams, AgentStartParams, DoctorFixParams, ErrorCode,
+    HostParams, PiInstallParams, ProfileCreateParams, ProfileUpdateParams, ProjectAddParams,
+    ProjectParams,
 };
+use vibed::agents::Backends;
 use vibed::core::Core;
 
 /// `vibed`'s own environment, with what a shell or a launchd job might leave
@@ -1624,4 +1627,354 @@ async fn installing_for_vms_builds_a_checked_layer() {
     assert_eq!(status.vms.unwrap().version.as_deref(), Some(pinned));
     assert!(layer.is_file());
     assert!(!w.layout.linux_dir().join("pi-99.0.0.img").exists());
+}
+
+/// #74: nobody installs Pi. A host with no `pi` where its agents look for one, as a
+/// native backend's: `~/.local/bin/pi`, where VibeOS's own install links it.
+struct NoPi {
+    golden: Golden,
+    core: Arc<Core>,
+    releases: PathBuf,
+    _tmp: tempfile::TempDir,
+}
+
+impl NoPi {
+    /// With `backend`, given the world's home, in place of one looking for Pi on
+    /// this machine.
+    async fn with(
+        backend: impl FnOnce(&Path, vibe_env::testing::TestBackend) -> vibe_env::testing::TestBackend,
+    ) -> NoPi {
+        set_stray_keys();
+        let tmp = tempfile::tempdir().unwrap();
+        let releases = tmp.path().join("releases");
+        fs::create_dir_all(&releases).unwrap();
+        let golden = Golden::new();
+        let mut config = golden.config();
+        config.pi_releases = format!("file://{}", releases.display());
+        // The real doctor, on what's really there, on a PATH of the home's own.
+        config.checks = Arc::new(vibed::doctor::Machine::new(&golden.home).with_path(format!(
+            "{}:/usr/bin:/bin",
+            golden.home.join(".local/bin").display()
+        )));
+        let base = vibe_env::testing::TestBackend::new(&golden.claude).with_pi(
+            golden.claude.with_file_name("pi"),
+            golden.home.join("pi-agent"),
+        );
+        config.backends = Backends::all(Arc::new(backend(&golden.home, base)));
+        let core = Arc::new(Core::open(config).unwrap());
+        core.add_project(ProjectAddParams {
+            path: Some(golden.home.join("src/app").to_str().unwrap().into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        NoPi {
+            golden,
+            core,
+            releases,
+            _tmp: tmp,
+        }
+    }
+
+    async fn native() -> NoPi {
+        NoPi::with(|home, backend| backend.with_native_pi_in(home.join(".local/bin/pi"))).await
+    }
+
+    fn link(&self) -> PathBuf {
+        self.golden.home.join(".local/bin/pi")
+    }
+
+    fn installed(&self, version: &str) -> PathBuf {
+        Layout::new(&self.golden.home, "macos")
+            .data_dir()
+            .join(format!("pi-{version}/pi"))
+    }
+
+    fn publish(&self) {
+        publish_pi(
+            &self.releases,
+            vibe_env::pi_release::PINNED,
+            vibe_env::pi_release::platform_here().unwrap(),
+        );
+    }
+
+    fn save_profile(&self) {
+        self.core
+            .create_profile(ProfileCreateParams {
+                project: "app".into(),
+                name: "pi-native".into(),
+                agent: Some(AgentKind::Pi),
+                pi_model: Some("mock/mock-model".into()),
+                ..Default::default()
+            })
+            .unwrap();
+    }
+
+    async fn start(&self) -> Result<vibe_core::rpc::Agent, vibe_core::rpc::ErrorObject> {
+        self.core
+            .start_agent(AgentStartParams {
+                project: "app".into(),
+                profile: "pi-native".into(),
+                prompt: "hello".into(),
+                ..Default::default()
+            })
+            .await
+    }
+
+    async fn doctors_row(&self) -> vibe_core::rpc::DoctorCheck {
+        let report = self.core.doctor().await;
+        report
+            .checks
+            .into_iter()
+            .find(|c| c.id == CheckId::Pi)
+            .unwrap()
+    }
+}
+
+#[tokio::test]
+async fn a_host_with_no_pi_profile_never_downloads_it_and_asks_nothing() {
+    let w = NoPi::native().await;
+    w.publish();
+    w.core.repair_setup().await;
+    assert!(!w.link().exists());
+    let row = w.doctors_row().await;
+    assert_eq!(row.state, CheckState::Optional, "{row:?}");
+    assert_eq!(row.hint, None);
+}
+
+#[tokio::test]
+async fn saving_a_pi_profile_installs_pi_with_nobody_asked() {
+    let w = NoPi::native().await;
+    w.publish();
+    // Background work only runs where the core knows itself, as in vibed.
+    w.core.spawn_links();
+    w.save_profile();
+    let link = w.link();
+    for _ in 0..1000 {
+        if link.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        fs::read_link(&link).unwrap(),
+        w.installed(vibe_env::pi_release::PINNED)
+    );
+}
+
+#[tokio::test]
+async fn a_pi_profile_from_before_gets_pi_at_the_next_look() {
+    let w = NoPi::native().await;
+    // Nothing is published, as with the network down when it was saved.
+    w.save_profile();
+    w.core.repair_setup().await;
+    assert!(!w.link().exists());
+    let row = w.doctors_row().await;
+    assert_eq!(
+        (row.state, row.fixable),
+        (CheckState::Fail, true),
+        "{row:?}"
+    );
+    assert!(row.hint.unwrap().contains("tries again"));
+    // The network's back: the next look does it, and the doctor has nothing to say.
+    w.publish();
+    w.core.repair_setup().await;
+    assert!(w.link().exists());
+    assert_eq!(w.doctors_row().await.state, CheckState::Pass);
+}
+
+#[tokio::test]
+async fn the_doctors_try_again_installs_pi_or_says_why_not() {
+    let w = NoPi::native().await;
+    w.save_profile();
+    w.core.repair_setup().await;
+    let e = w
+        .core
+        .doctor_fix(DoctorFixParams { check: CheckId::Pi })
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, ErrorCode::CommandFailed.code());
+    w.publish();
+    w.core
+        .doctor_fix(DoctorFixParams { check: CheckId::Pi })
+        .await
+        .unwrap();
+    assert!(w.link().exists());
+}
+
+#[tokio::test]
+async fn the_first_pi_agent_just_starts_with_pi_installed_on_the_way() {
+    let w = NoPi::native().await;
+    w.publish();
+    // No background work here, so it's the start that does it.
+    w.save_profile();
+    assert!(!w.link().exists());
+    w.start().await.unwrap();
+    assert!(w.link().exists());
+}
+
+#[tokio::test]
+async fn a_pi_that_cant_be_installed_fails_the_start_saying_so_and_leaves_nothing() {
+    let w = NoPi::native().await;
+    w.save_profile();
+    let e = w.start().await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::CommandFailed.code());
+    assert!(e.message.contains("couldn't install"), "{}", e.message);
+    assert!(e.message.contains("tries again"), "{}", e.message);
+    assert!(!e.message.contains("vibe pi"), "{}", e.message);
+    let agents = w
+        .core
+        .agents(HostParams { host: None })
+        .await
+        .unwrap()
+        .agents;
+    assert!(agents.is_empty(), "{agents:?}");
+    let worktrees = w.golden.home.join("VibeOS/worktrees/app");
+    assert!(
+        fs::read_dir(&worktrees).map_or(true, |mut d| d.next().is_none()),
+        "the start was undone"
+    );
+    // It works once it can.
+    w.publish();
+    w.start().await.unwrap();
+}
+
+#[tokio::test]
+async fn vibeos_own_older_pi_moves_to_the_pin_and_the_owners_is_left_alone() {
+    use std::os::unix::fs::PermissionsExt;
+    let w = NoPi::native().await;
+    w.publish();
+    w.save_profile();
+    // VibeOS's own, from a build that pinned another.
+    let old = w.installed("0.9.0");
+    fs::create_dir_all(old.parent().unwrap()).unwrap();
+    fs::write(&old, "#!/bin/sh\n").unwrap();
+    fs::set_permissions(&old, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::create_dir_all(w.link().parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&old, w.link()).unwrap();
+    w.core.repair_setup().await;
+    let pinned = w.installed(vibe_env::pi_release::PINNED);
+    assert_eq!(fs::read_link(w.link()).unwrap(), pinned);
+    // Again, there's nothing to do.
+    let before = fs::metadata(&pinned).unwrap().modified().unwrap();
+    w.core.repair_setup().await;
+    assert_eq!(fs::metadata(&pinned).unwrap().modified().unwrap(), before);
+
+    // The owner's own, however old, is used as it is.
+    fs::remove_file(w.link()).unwrap();
+    fs::write(w.link(), "#!/bin/sh\necho mine\n").unwrap();
+    fs::set_permissions(w.link(), fs::Permissions::from_mode(0o755)).unwrap();
+    w.core.repair_setup().await;
+    assert!(fs::symlink_metadata(w.link()).unwrap().is_file());
+    assert_eq!(
+        fs::read_to_string(w.link()).unwrap(),
+        "#!/bin/sh\necho mine\n"
+    );
+}
+
+#[tokio::test]
+async fn a_linux_vm_agent_gets_its_layer_on_the_way_too() {
+    let w = NoPi::with(|home, backend| {
+        backend.with_pi_layer_in(Layout::new(home, "macos").linux_dir())
+    })
+    .await;
+    publish_pi(
+        &w.releases,
+        vibe_env::pi_release::PINNED,
+        vibe_env::pi_release::VM_PLATFORM,
+    );
+    w.save_profile();
+    let layer = Layout::new(&w.golden.home, "macos")
+        .linux_dir()
+        .join(format!("pi-{}.img", vibe_env::pi_release::PINNED));
+    assert!(!layer.exists());
+    w.start().await.unwrap();
+    assert!(layer.is_file());
+}
+
+/// A hung or failing download holds nothing up that it needn't: starts waiting on it
+/// share how it went rather than each download again, and the doctor doesn't queue.
+#[tokio::test]
+async fn starts_waiting_on_one_install_share_how_it_went() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let w = NoPi::native().await;
+    w.save_profile();
+    // A release that hangs, for as long as the test says, then isn't there.
+    let release = w
+        .releases
+        .join(format!("download/v{}", vibe_env::pi_release::PINNED));
+    fs::create_dir_all(&release).unwrap();
+    let fifo = release.join("SHA256SUMS");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let core = Arc::clone(&w.core);
+    let start = |core: Arc<Core>| async move {
+        core.start_agent(AgentStartParams {
+            project: "app".into(),
+            profile: "pi-native".into(),
+            prompt: "hello".into(),
+            ..Default::default()
+        })
+        .await
+    };
+    let first = tokio::spawn(start(Arc::clone(&core)));
+    // Under way, by the curl waiting on the fifo: a second start queues behind it.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let second = tokio::spawn(start(Arc::clone(&core)));
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // Nothing's held: the project can go on being used, and the doctor just says.
+    let row = w.doctors_row().await;
+    assert_eq!(row.state, CheckState::Working, "{row:?}");
+    let opens = Arc::new(AtomicU32::new(0));
+    let counted = Arc::clone(&opens);
+    let release_fifo = fifo.clone();
+    // Gives curl an end to its read: nothing valid, so that install fails.
+    let writer = std::thread::spawn(move || {
+        counted.fetch_add(1, Ordering::SeqCst);
+        fs::write(&release_fifo, "not sums\n").unwrap();
+    });
+    let first = first.await.unwrap().unwrap_err();
+    let second = second.await.unwrap().unwrap_err();
+    writer.join().unwrap();
+    assert!(first.message.contains("doesn't list"), "{}", first.message);
+    assert_eq!(
+        second.message, first.message,
+        "the second start shares the first's failure rather than downloading again"
+    );
+    assert_eq!(opens.load(Ordering::SeqCst), 1);
+    assert!(
+        w.core
+            .pi_status(HostParams { host: None })
+            .await
+            .unwrap()
+            .error
+            .is_some_and(|why| why.contains("doesn't list"))
+    );
+}
+
+/// One that's there, and isn't VibeOS's to replace, isn't called something it'll fix.
+#[tokio::test]
+async fn an_owners_pi_that_doesnt_run_is_said_and_left_alone() {
+    use std::os::unix::fs::PermissionsExt;
+    let w = NoPi::native().await;
+    w.publish();
+    w.save_profile();
+    fs::create_dir_all(w.link().parent().unwrap()).unwrap();
+    fs::write(w.link(), "#!/bin/sh\necho broken >&2\nexit 3\n").unwrap();
+    fs::set_permissions(w.link(), fs::Permissions::from_mode(0o755)).unwrap();
+    w.core.repair_setup().await;
+    let row = w.doctors_row().await;
+    assert_eq!(
+        (row.state, row.fixable),
+        (CheckState::Fail, false),
+        "{row:?}"
+    );
+    assert!(row.detail.contains("broken"), "{row:?}");
+    assert!(fs::symlink_metadata(w.link()).unwrap().is_file());
 }

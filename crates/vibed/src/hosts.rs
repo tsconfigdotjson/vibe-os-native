@@ -12,11 +12,11 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use vibe_core::model::{
-    AgentState, EventKind, HostLink, LOCAL_HOST, TunnelState, validate_host_name, validate_ref,
-    validate_ssh_destination,
+    AdminNeed, AgentState, EventKind, HostLink, LOCAL_HOST, TunnelState, validate_host_name,
+    validate_ref, validate_ssh_destination,
 };
 use vibe_core::rpc::{
-    Agent, AgentList, AgentsList, ApiKey, ErrorCode, ErrorObject, HostAddParams,
+    Agent, AgentList, AgentsList, ApiKey, ErrorCode, ErrorObject, HostAddParams, HostAdmin,
     HostExternalParams, HostInfo, HostInstall, HostList, HostNameParams, HostsExternal, KeyList,
     KeySyncParams, KeysList, KeysSync, Method, NoParams,
 };
@@ -165,10 +165,14 @@ impl Core {
                 h.version = Some(self.info().version.clone());
                 h.missing = self.missing_tools();
                 h.memory = self.memory_use();
+                h.needs_admin = self.admin_needs();
                 self.describe_public(h);
             } else if let Some(link) = self.link(&h.name) {
                 *h = link.describe(h.clone());
-                h.memory = link.reported().and_then(|own| own.memory);
+                if let Some(own) = link.reported() {
+                    h.memory = own.memory;
+                    h.needs_admin = own.needs_admin;
+                }
                 self.describe_external(h, &link);
             }
         }
@@ -210,6 +214,35 @@ impl Core {
             .filter(|t| crate::core::find_tool(t, path.as_deref(), Some(home)).is_none())
             .map(|t| (*t).to_owned())
             .collect()
+    }
+
+    /// What this host needs `sudo` for, which VibeOS has tried everything else for.
+    /// Only a look at a file: `hosts.list` is asked with every ping.
+    fn admin_needs(&self) -> Vec<AdminNeed> {
+        let mut needs = Vec::new();
+        if self.checks.linger() == Ok(Some(false)) {
+            needs.push(AdminNeed::Linger);
+        }
+        needs
+    }
+
+    /// `hosts.admin`: the line that does, over SSH, what a Linux host needs `sudo`
+    /// for, with its password asked for there, on the terminal it runs in. It comes
+    /// from this side's list of what each need takes: the host only says which it
+    /// has, so a host can't have this Mac run anything else. With its link down it
+    /// goes by what it last said: SSH may well still reach it.
+    pub fn host_admin(&self, p: HostNameParams) -> Result<HostAdmin, ErrorObject> {
+        let link = self.linux_host(&p.host)?;
+        let needs = self.host_info(&p.host)?.needs_admin;
+        if needs.is_empty() {
+            return Err(error(
+                ErrorCode::Conflict,
+                format!("{} needs nothing of the kind now", p.host),
+            ));
+        }
+        Ok(HostAdmin {
+            command: self.remote.admin_line(&link.address, &needs),
+        })
     }
 
     pub(crate) fn host_info(&self, name: &str) -> Result<HostInfo, ErrorObject> {
@@ -269,6 +302,7 @@ impl Core {
             tunnel: None,
             external_detail: None,
             memory: None,
+            needs_admin: installed.needs_admin.clone(),
         };
         self.store()
             .add_host(&info, self.now())
@@ -323,6 +357,7 @@ impl Core {
         info.label = installed.label.clone();
         info.version = Some(installed.version.clone());
         info.missing = installed.missing.clone();
+        info.needs_admin = installed.needs_admin.clone();
         self.store().set_host_report(&info).map_err(store_error)?;
         crate::log!(
             "vibed: {} runs vibed {}{}",
@@ -546,6 +581,7 @@ impl Core {
             info.os = own.os.clone();
             info.label = own.label.clone();
             info.missing = own.missing.clone();
+            info.needs_admin = own.needs_admin.clone();
         }
         if version.is_some() {
             info.version = version;
@@ -576,6 +612,7 @@ impl Core {
             tunnel: None,
             external_detail: None,
             memory: None,
+            needs_admin: Vec::new(),
         });
         e.state = Some(info.link.to_string());
         e.message = info.detail;

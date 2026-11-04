@@ -509,8 +509,8 @@ impl LinuxVm {
                  starts, and daily",
             )),
             AgentKind::Pi if layers.pi.is_none() => Err(EnvError::new(
-                "Pi for linux agents isn't downloaded yet: download it from Settings, or wait \
-                 for vibed's next check, as a Pi profile asks for it",
+                "Pi for linux agents isn't downloaded yet: VibeOS fetches it by itself when a \
+                 profile runs Pi, and tries again every hour",
             )),
             _ => Ok(()),
         }
@@ -730,6 +730,10 @@ fn linux_signal(name: &str) -> Option<i32> {
 }
 
 impl Compartment for LinuxVm {
+    fn pi_layer_missing(&self) -> bool {
+        self.images.pi().is_none()
+    }
+
     fn create(&self, spec: &AgentSpec) -> Result<Handle> {
         let host = self.host_limits()?;
         let layers = self.images.layers()?;

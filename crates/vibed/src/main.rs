@@ -95,6 +95,9 @@ environment:
 /// How often `gh auth status` runs (PRD: Auth, security and trust).
 const GH_CHECK_EVERY: Duration = Duration::from_secs(60 * 60);
 
+/// How often what VibeOS sets up itself is looked at again.
+const REPAIR_EVERY: Duration = Duration::from_secs(60 * 60);
+
 /// How often an open toolbox's shell is checked, to save it once it exits.
 const TOOLBOX_POLL: Duration = Duration::from_secs(1);
 
@@ -175,7 +178,11 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match runtime.block_on(run(path, layout)) {
+    let done = runtime.block_on(run(path, layout));
+    // A download on a blocking thread isn't waited for: `run` has done all that
+    // matters, and systemd or launchd is waiting for this to end.
+    runtime.shutdown_timeout(Duration::from_secs(1));
+    match done {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             vibed::log!("vibed: {e}");
@@ -385,6 +392,7 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
         })
     };
     let gh_checks = core.spawn_gh_checks(GH_CHECK_EVERY);
+    let repairs = core.spawn_repairs(REPAIR_EVERY);
     // Every agent's transcript, read whole first: the states from before a
     // restart, rebuilt.
     let status = core.spawn_status();
@@ -429,6 +437,7 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
     }
     mcp.abort();
     gh_checks.abort();
+    repairs.abort();
     status.abort();
     maintenance.abort();
     limit_watch.abort();

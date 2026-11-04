@@ -48,6 +48,12 @@ struct AgentsPane: View {
                     Text("Not installed").foregroundStyle(.secondary)
                 }
             }
+            if let why = status.error {
+                Label(why, systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(Palette.attention)
+                    .textSelection(.enabled)
+            }
             loginsRow(status.logins ?? [])
             HStack {
                 if installing == .native {
@@ -56,7 +62,7 @@ struct AgentsPane: View {
                 Spacer()
                 // A `pi` of the owner's own is theirs to update.
                 if status.native == nil || status.native?.managed == true {
-                    Button(status.native == nil ? "Install Pi" : "Update Pi") {
+                    Button(status.error != nil ? "Try Again" : status.native == nil ? "Install Pi" : "Update Pi") {
                         Task { await install(.native) }
                     }
                     .disabled(installing != nil)

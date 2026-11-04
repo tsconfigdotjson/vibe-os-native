@@ -444,6 +444,17 @@ public final class MenuModel: ObservableObject {
         return installed
     }
 
+    /// The one button for what a Linux host needs sudo for: a Terminal over ssh,
+    /// where sudo asks for its password. VibeOS never sees the password.
+    public func allowOnHost(_ name: String) async {
+        do {
+            let admin = try await call(HostsAdmin.self, HostNameParams(host: name))
+            runCommandInTerminal("exec " + admin.command)
+        } catch {
+            message = describe(error)
+        }
+    }
+
     /// The Linux host that's the external address, if one is.
     public var externalHost: HostInfo? { hosts.first { $0.external } }
 

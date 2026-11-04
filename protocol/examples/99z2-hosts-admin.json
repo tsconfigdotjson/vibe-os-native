@@ -1,0 +1,18 @@
+{
+  "description": "hosts.admin is that button: `command` is the line a Terminal on the Mac runs, ssh to the host, where sudo asks for its password on that terminal. It's written on the Mac from which need the host says it has, never from anything else the host says.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 9951,
+    "method": "hosts.admin",
+    "params": {
+      "host": "strict"
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 9951,
+    "result": {
+      "command": "ssh -t refuses@strict.example.com 'sh -c '\\''sudo loginctl enable-linger \"$(id -un)\" && echo \"VibeOS: done. You can close this window.\"'\\'''"
+    }
+  }
+}

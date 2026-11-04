@@ -209,9 +209,25 @@ esac
             r#"#!/bin/sh
 case "$1" in
   show-user) if [ -e "$HOME.d/linger" ]; then echo Linger=yes; else echo Linger=no; fi ;;
-  enable-linger) touch "$HOME.d/linger" ;;
+  enable-linger)
+    # As logind does without polkit: refused, but for root.
+    if [ -e "$HOME.d/refuse-linger" ] && [ -z "$AS_ROOT" ]; then
+      echo 'Could not enable linger: Access denied' >&2
+      exit 1
+    fi
+    touch "$HOME.d/linger" ;;
   *) exit 1 ;;
 esac
+"#,
+        );
+        // `-n`, so it never asks: it lets this user run what it's given, or doesn't.
+        write_exe(
+            &bin.join("sudo"),
+            r#"#!/bin/sh
+[ "$1" = -n ] || { echo "sudo was asked without -n: $*" >>"$HOME.d/sudo-prompted"; exit 1; }
+shift
+[ -e "$HOME.d/sudo-ok" ] || { echo 'sudo: a password is required' >&2; exit 1; }
+AS_ROOT=1 exec "$@"
 "#,
         );
         write_exe(
@@ -1950,4 +1966,38 @@ fn real_external_access() {
     ok(vibe(&mac.socket, &["host", "external", "testhost", "off"]));
     ok(vibe(&mac.socket, &["host", "remove", "testhost"]));
     drop(mac.rt);
+}
+
+/// #74: lingering is VibeOS's to turn on: as the user, then with passwordless sudo,
+/// and only then one button on the Mac. Never a command to copy.
+#[test]
+fn lingering_is_turned_on_any_way_that_needs_no_password() {
+    let golden = common::Golden::new();
+    let hosts = common::short_tempdir();
+    let ssh = fake_ssh(hosts.path());
+    let host = FakeHost::new(hosts.path(), "me@vps", &golden.claude);
+    let state = PathBuf::from(format!("{}.d", host.home.display()));
+    fs::write(state.join("refuse-linger"), "").unwrap();
+    fs::write(state.join("sudo-ok"), "").unwrap();
+    let mac = mac(&golden, &ssh, bundle(golden.dir.path()));
+    let added = ok(vibe(&mac.socket, &["host", "add", "vps", "me@vps"]));
+    assert!(added.contains("Lingering is on for you"), "{added}");
+    assert!(state.join("linger").exists());
+    assert!(!state.join("sudo-prompted").exists(), "sudo must never ask");
+}
+
+#[test]
+fn a_host_that_refuses_lingering_gets_a_button_not_a_command() {
+    let golden = common::Golden::new();
+    let hosts = common::short_tempdir();
+    let ssh = fake_ssh(hosts.path());
+    let host = FakeHost::new(hosts.path(), "me@vps", &golden.claude);
+    let state = PathBuf::from(format!("{}.d", host.home.display()));
+    fs::write(state.join("refuse-linger"), "").unwrap();
+    let mac = mac(&golden, &ssh, bundle(golden.dir.path()));
+    let added = ok(vibe(&mac.socket, &["host", "add", "vps", "me@vps"]));
+    assert!(added.contains("Lingering couldn't be turned on"), "{added}");
+    assert!(added.contains("Settings → Hosts"), "{added}");
+    assert!(!added.contains("sudo loginctl"), "{added}");
+    assert!(!state.join("linger").exists());
 }

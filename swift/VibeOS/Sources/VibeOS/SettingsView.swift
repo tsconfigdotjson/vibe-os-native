@@ -1144,6 +1144,7 @@ struct HostsPane: View {
                     HostRow(
                         host: host, updating: updating == host.name,
                         upgrade: { Task { await upgrade(host.name) } },
+                        allow: { Task { await model.allowOnHost(host.name) } },
                         remove: { Task { await remove(host.name) } })
                 }
                 Button("Add Linux Host…") { show(WindowID.addHost, with: openWindow) }
@@ -1273,6 +1274,7 @@ struct HostRow: View {
     let host: HostInfo
     let updating: Bool
     let upgrade: () -> Void
+    let allow: () -> Void
     let remove: () -> Void
 
     var body: some View {
@@ -1302,11 +1304,20 @@ struct HostRow: View {
                         .foregroundStyle(Palette.attention)
                         .help("Install it on \(host.name), then log in there: gh auth login, and claude with /login. Pi, if you'll run it, signs in the same way: pi, then /login")
                 }
+                if let needs = host.needsAdmin, !needs.isEmpty {
+                    Label(adminNeedsText(needs, host: host.name), systemImage: "lock")
+                        .font(.caption)
+                        .foregroundStyle(Palette.attention)
+                }
             }
             Spacer()
             if updating {
                 Working(text: "Updating…")
             } else if !local {
+                if let needs = host.needsAdmin, !needs.isEmpty {
+                    Button("Allow…", action: allow)
+                        .help("Opens Terminal, where sudo on \(host.name) asks for its password. VibeOS never sees it.")
+                }
                 Menu {
                     Button("Update vibed", action: upgrade)
                     Divider()
@@ -1325,6 +1336,16 @@ struct HostRow: View {
         .help(host.link == .down ? sentence(host.detail ?? "its link is down; it reconnects on its own") : "")
         .accessibilityElement(children: .contain)
     }
+}
+
+/// What a Linux host needs sudo for, in a line.
+private func adminNeedsText(_ needs: [AdminNeed], host: String) -> String {
+    let what = needs.map { need -> String in
+        switch need {
+        case .linger: "keep vibed running while you're logged out"
+        }
+    }
+    return "\(host) needs your password once to \(what.joined(separator: " and "))"
 }
 
 /// The external address, under its picker: where outside clients reach it,
