@@ -11,10 +11,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use common::{short_tempdir, wait_until, workspace_bin};
+use common::{short_tempdir, workspace_bin};
 use vibe_core::model::{EventKind, ToolboxAction, ToolboxState};
 use vibe_core::paths::Layout;
-use vibe_core::rpc::{AgentStartParams, ErrorCode, NoParams, ProjectAddParams};
+use vibe_core::rpc::{
+    AgentStartParams, ErrorCode, NoParams, ProjectAddParams, SessionExit, ToolboxStatus,
+};
+use vibe_core::shim;
 use vibe_env::testing::TestToolbox;
 use vibed::core::{Config, Core, DaemonInfo};
 use vibed::sessions::{self, Probe};
@@ -120,6 +123,17 @@ async fn wait_gone(socket: &std::path::Path) {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("the toolbox shell didn't end");
+}
+
+/// Waits for the toolbox's status to satisfy `ok`.
+async fn wait_for_status(core: &Core, ok: impl Fn(&ToolboxStatus) -> bool) {
+    for _ in 0..800 {
+        if ok(&core.toolbox_status(NoParams {}).await.unwrap()) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("the toolbox never got there");
 }
 
 fn kill_shim(pid: u32) {
@@ -384,18 +398,13 @@ async fn a_restarted_vibed_saves_a_shell_that_exited_while_it_was_down() {
     let supervisor = core
         .spawn_toolbox(Duration::from_millis(50), Duration::from_secs(3600))
         .unwrap();
-    let watched = core.clone();
-    tokio::task::spawn_blocking(move || {
-        // Saved and recorded: the image is kept a moment before the run's
-        // record is written, and stopping the supervisor in between would
-        // cancel the record.
-        wait_until("the toolbox to be saved", || {
-            let s = watched.toolbox_status_now();
-            s.template == Some(1) && s.state == ToolboxState::Closed && s.last.is_some()
-        })
+    // Saved and recorded: the image is kept a moment before the run's
+    // record is written, and stopping the supervisor in between would
+    // cancel the record.
+    wait_for_status(&core, |s| {
+        s.template == Some(1) && s.state == ToolboxState::Closed && s.last.is_some()
     })
-    .await
-    .unwrap();
+    .await;
     supervisor.abort();
     // What it did survives another restart.
     drop(core);
@@ -430,15 +439,7 @@ async fn an_open_as_vibed_starts_waits_for_its_tidying_and_isnt_undone() {
     let status = core.toolbox_status(NoParams {}).await.unwrap();
     assert_eq!(status.state, ToolboxState::Open);
     assert!(running(&w.socket()).await.is_some(), "the shell runs");
-    let watched = core.clone();
-    tokio::task::spawn_blocking(move || {
-        wait_until("the shell to be saved", || {
-            let s = watched.toolbox_status_now();
-            s.template == Some(1) && s.last.is_some()
-        })
-    })
-    .await
-    .unwrap();
+    wait_for_status(&core, |s| s.template == Some(1) && s.last.is_some()).await;
     supervisor.abort();
 
     // Opened before the supervisor starts: its tidying leaves it alone.
@@ -467,9 +468,13 @@ async fn an_open_during_an_update_is_refused_not_queued() {
     let updating = core.clone();
     let update = tokio::spawn(async move { updating.update_toolbox(NoParams {}).await });
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let e = core.open_toolbox(NoParams {}).await.unwrap_err();
-    assert_eq!(e.code, ErrorCode::Conflict.code());
-    assert!(e.message.contains("busy updating"), "{}", e.message);
+    for e in [
+        core.open_toolbox(NoParams {}).await.unwrap_err(),
+        core.close_toolbox(NoParams {}).await.unwrap_err(),
+    ] {
+        assert_eq!(e.code, ErrorCode::Conflict.code());
+        assert!(e.message.contains("busy updating"), "{}", e.message);
+    }
     assert_eq!(update.await.unwrap().unwrap().template, Some(1));
 }
 
@@ -485,6 +490,7 @@ async fn a_host_without_a_toolbox_says_so() {
         core.update_toolbox(NoParams {}).await.unwrap_err(),
         core.rebuild_toolbox(NoParams {}).await.unwrap_err(),
         core.toolbox_logins(NoParams {}).await.unwrap_err(),
+        core.close_toolbox(NoParams {}).await.unwrap_err(),
     ] {
         assert_eq!(e.code, ErrorCode::Conflict.code());
         assert!(e.message.contains("no Linux toolbox"), "{}", e.message);
@@ -588,5 +594,258 @@ async fn see_logins_says_what_the_home_holds_and_whether_claude_is_logged_in() {
             .as_deref()
             .is_some_and(|p| p.contains("vibe setup-token")),
         "{l:?}"
+    );
+}
+
+/// A terminal attached to the toolbox shell, as `vibe toolbox` is: the
+/// shim counts it while it's connected.
+fn attach_terminal(socket: &std::path::Path) -> shim::Connection {
+    let hello = shim::Hello {
+        protocol: shim::PROTOCOL,
+        role: shim::Role::Attach,
+        client: "test".into(),
+        tty: Some("/dev/ttys042".into()),
+        size: None,
+    };
+    shim::connect(socket, &hello, Duration::from_secs(10)).unwrap()
+}
+
+/// Settings tells a shell open in a Terminal from one left open in the
+/// background, with nothing attached (#54); and says nothing when it can't
+/// know, rather than that nothing is attached.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_status_counts_the_terminals_attached_to_the_shell() {
+    let w = world();
+    let core = w.core(&["sleep", "600"]);
+    assert_eq!(
+        core.toolbox_status(NoParams {}).await.unwrap().clients,
+        None
+    );
+    core.open_toolbox(NoParams {}).await.unwrap();
+    // Open, with nothing attached: in the background.
+    let status = core.toolbox_status(NoParams {}).await.unwrap();
+    assert_eq!(
+        (status.state, status.clients),
+        (ToolboxState::Open, Some(0))
+    );
+    let first = attach_terminal(&w.socket());
+    let second = attach_terminal(&w.socket());
+    let clients = core.toolbox_status(NoParams {}).await.unwrap().clients;
+    assert_eq!(clients, Some(2));
+    // A detach leaves it open, and counted as it is.
+    drop(first);
+    wait_for_status(&core, |s| s.clients == Some(1)).await;
+    drop(second);
+    wait_for_status(&core, |s| s.clients == Some(0)).await;
+    assert_eq!(
+        core.toolbox_status(NoParams {}).await.unwrap().state,
+        ToolboxState::Open
+    );
+    kill_shim(running(&w.socket()).await.unwrap());
+}
+
+/// During a boot it's open, but no shim is up to ask: that's not known,
+/// not "nothing attached".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_count_is_unknown_while_the_toolbox_boots() {
+    let w = world();
+    let core = w.core_with(Some(
+        w.toolbox(&["sleep", "600"])
+            .with_slow_open(Duration::from_secs(1)),
+    ));
+    let opening = core.clone();
+    let open = tokio::spawn(async move { opening.open_toolbox(NoParams {}).await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let status = core.toolbox_status(NoParams {}).await.unwrap();
+    assert_eq!((status.state, status.clients), (ToolboxState::Open, None));
+    open.await.unwrap().unwrap();
+    assert_eq!(
+        core.toolbox_status(NoParams {}).await.unwrap().clients,
+        Some(0)
+    );
+    kill_shim(running(&w.socket()).await.unwrap());
+}
+
+/// Save & Close: the shell is hung up on, as closing its window does, and
+/// saved as an exit is, whoever is attached; and closing a closed toolbox
+/// changes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn save_and_close_ends_the_shell_and_saves_it() {
+    let w = world();
+    // A shell that ignores nothing: a hangup ends it, as it does bash.
+    let core = w.core(&["sleep", "600"]);
+    // Closed already: nothing to do, and nothing is said.
+    let (_, mut events) = core.subscribe();
+    let status = core.close_toolbox(NoParams {}).await.unwrap();
+    assert_eq!(
+        (status.state, status.template),
+        (ToolboxState::Closed, None)
+    );
+    assert!(events.try_recv().is_err());
+
+    core.open_toolbox(NoParams {}).await.unwrap();
+    assert!(
+        events
+            .recv()
+            .await
+            .unwrap()
+            .message
+            .unwrap()
+            .contains("is open")
+    );
+    let mut attached = attach_terminal(&w.socket());
+    let status = core.close_toolbox(NoParams {}).await.unwrap();
+    assert_eq!(status.state, ToolboxState::Closed);
+    assert_eq!(
+        (status.template, status.home, status.clients),
+        (Some(1), Some(1), None)
+    );
+    let last = status.last.unwrap();
+    assert_eq!(
+        (last.action, last.template, last.error),
+        (ToolboxAction::Shell, Some(1), None)
+    );
+    assert!(w.version("template-1.img") && w.version("home-1.img"));
+    assert_eq!(
+        events.recv().await.unwrap().message.as_deref(),
+        Some("The toolbox saved template 1 and Linux home 1")
+    );
+    // The attached terminal saw the shell end, as after an exit. (Its
+    // reads wait at most the 10 s it connected with.)
+    let exit = loop {
+        match shim::read_frame(&mut attached.stream).unwrap() {
+            Some(f) if f.kind == shim::FrameKind::Exit => break f.decode::<SessionExit>().unwrap(),
+            Some(_) => continue,
+            None => panic!("the shim went without saying the shell ended"),
+        }
+    };
+    assert_eq!(exit.signal.as_deref(), Some("SIGHUP"));
+    assert!(matches!(sessions::probe(&w.socket()).await, Probe::Gone));
+    // Its session is gone, not left listed as exited.
+    let listed = core.sessions(Default::default()).await.unwrap();
+    assert!(!listed.sessions.iter().any(|s| s.agent == "toolbox"));
+    // The supervisor, looking after, finds nothing more to do.
+    core.check_toolbox().await;
+    assert!(events.try_recv().is_err());
+
+    // Twice is harmless: closed, nothing new kept, nothing said.
+    let again = core.close_toolbox(NoParams {}).await.unwrap();
+    assert_eq!(again.state, ToolboxState::Closed);
+    assert_eq!((again.template, again.home), (Some(1), Some(1)));
+    assert!(!w.version("template-2.img"));
+    assert!(events.try_recv().is_err());
+
+    // With nothing attached, the same.
+    core.open_toolbox(NoParams {}).await.unwrap();
+    let status = core.close_toolbox(NoParams {}).await.unwrap();
+    assert_eq!(
+        (status.state, status.template),
+        (ToolboxState::Closed, Some(2))
+    );
+}
+
+/// A shell whose shim has died is saved by Save & Close all the same:
+/// nothing is attached to it, and the save ends what still runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn save_and_close_saves_a_shell_whose_shim_died() {
+    let w = world();
+    let core = w.core_with(Some(w.toolbox(&["sleep", "600"]).outliving_its_shim()));
+    core.open_toolbox(NoParams {}).await.unwrap();
+    kill_shim(running(&w.socket()).await.unwrap());
+    wait_gone(&w.socket()).await;
+    let status = core.close_toolbox(NoParams {}).await.unwrap();
+    assert_eq!(
+        (status.state, status.template),
+        (ToolboxState::Closed, Some(1))
+    );
+}
+
+/// A shell that ignores the hang-up is refused, not forced: nothing is
+/// saved, it stays open, and exiting it afterwards saves as usual.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn save_and_close_refuses_a_shell_that_wont_exit() {
+    let w = world();
+    // It says when the trap is set: a hang-up before then would end it.
+    let trapped = w.release().with_extension("trapped");
+    let shell = format!(
+        "trap '' HUP; : > '{}'; {}",
+        trapped.display(),
+        w.held_shell()
+    );
+    let core = w.core(&["sh", "-c", &shell]);
+    core.open_toolbox(NoParams {}).await.unwrap();
+    for _ in 0..400 {
+        if trapped.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(trapped.exists(), "the shell never set its trap");
+    let e = core.close_toolbox(NoParams {}).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::Conflict.code());
+    assert!(
+        e.message.contains("didn't exit when asked"),
+        "{}",
+        e.message
+    );
+    let status = core.toolbox_status(NoParams {}).await.unwrap();
+    assert_eq!((status.state, status.template), (ToolboxState::Open, None));
+    assert!(running(&w.socket()).await.is_some());
+    fs::write(w.release(), "").unwrap();
+    wait_gone(&w.socket()).await;
+    core.check_toolbox().await;
+    let status = core.toolbox_status(NoParams {}).await.unwrap();
+    assert_eq!(
+        (status.state, status.template),
+        (ToolboxState::Closed, Some(1))
+    );
+}
+
+/// A save that fails comes back as the call's error, and is the last run,
+/// as after an exit; the toolbox isn't left said to be open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn save_and_close_says_when_the_save_failed() {
+    let w = world();
+    let core = w.core(&["sleep", "600"]);
+    core.open_toolbox(NoParams {}).await.unwrap();
+    // The test toolbox can't save with no base image.
+    fs::remove_dir_all(w.layout.linux_dir().join("base-1")).unwrap();
+    let e = core.close_toolbox(NoParams {}).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::CommandFailed.code());
+    assert!(e.message.contains("no Linux base image"), "{}", e.message);
+    let status = core.toolbox_status(NoParams {}).await.unwrap();
+    assert_eq!(status.state, ToolboxState::Closed);
+    let last = status.last.unwrap();
+    assert_eq!(last.action, ToolboxAction::Shell);
+    assert_eq!(last.error.as_deref(), Some(e.message.as_str()));
+}
+
+/// A `kill` that fails because the shell had just exited isn't an error:
+/// it's saved like any exit. One that fails with the shell still there is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn save_and_close_tells_a_failed_hang_up_from_a_shell_just_gone() {
+    let w = world();
+    let shell = w.held_shell();
+    let core = w.core_with(Some(
+        w.toolbox(&["sh", "-c", &shell]).with_failing_hang_up(),
+    ));
+    core.open_toolbox(NoParams {}).await.unwrap();
+    let e = core.close_toolbox(NoParams {}).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::CommandFailed.code());
+    assert!(
+        e.message.contains("can't close the toolbox shell"),
+        "{}",
+        e.message
+    );
+    assert_eq!(
+        core.toolbox_status(NoParams {}).await.unwrap().state,
+        ToolboxState::Open
+    );
+    // Now the shell goes just as the call comes.
+    fs::write(w.release(), "").unwrap();
+    let status = core.close_toolbox(NoParams {}).await.unwrap();
+    assert_eq!(
+        (status.state, status.template),
+        (ToolboxState::Closed, Some(1))
     );
 }

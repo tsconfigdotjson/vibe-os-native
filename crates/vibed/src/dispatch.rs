@@ -12,7 +12,8 @@ use vibe_core::rpc::{
     KeysVerify, LimitsGet, LimitsSet, McpGet, McpSet, Method, PROTOCOL_VERSION, ProfilesCreate,
     ProfilesDelete, ProfilesList, ProfilesUpdate, ProjectsAdd, ProjectsList, ProjectsRemove,
     ProtocolMismatchData, Request, Response, SessionsAttach, SessionsList, Subscribed,
-    ToolboxLoginsGet, ToolboxOpen, ToolboxRebuild, ToolboxStatusGet, ToolboxUpdate, TunnelPrepare,
+    ToolboxClose, ToolboxLoginsGet, ToolboxOpen, ToolboxRebuild, ToolboxStatusGet, ToolboxUpdate,
+    TunnelPrepare,
 };
 
 use crate::core::Core;
@@ -257,6 +258,9 @@ async fn call(
             core.rebuild_toolbox(decode::<ToolboxRebuild>(params)?)
                 .await,
         ),
+        ToolboxClose::NAME => {
+            encode_result(core.close_toolbox(decode::<ToolboxClose>(params)?).await)
+        }
         ToolboxLoginsGet::NAME => encode_result(
             core.toolbox_logins(decode::<ToolboxLoginsGet>(params)?)
                 .await,

@@ -241,11 +241,14 @@ public struct ToolboxSummary: Equatable, Sendable {
     /// "Template v3 · Linux home v2 · Base 1", once there's any.
     public var versions: String?
     public var notes: [String]
+    /// Whether the shell is open, for Save & Close.
+    public var closable: Bool
 
     public init(_ status: ToolboxStatus?) {
         working = false
         versions = nil
         notes = []
+        closable = status?.state == .open
         guard let status else {
             state = "Loading…"
             return
@@ -253,7 +256,14 @@ public struct ToolboxSummary: Equatable, Sendable {
         switch status.state {
         case .unavailable: state = "Not on this host"
         case .closed: state = "Closed"
-        case .open: state = "Open: exit the shell to save"
+        case .open:
+            switch status.clients {
+            // Not known: a boot under way, a shim too slow to ask, or a
+            // vibed from before #54.
+            case nil: state = "Open: exit the shell to save"
+            case 0: state = "Open in the background, no Terminal attached"
+            default: state = "Attached in Terminal"
+            }
         case .saving: state = "Saving…"
         case .updating: state = "Running [update]…"
         case .rebuilding: state = "Rebuilding…"
@@ -353,10 +363,25 @@ public struct LoginsSummary: Equatable, Sendable {
     }
 }
 
+/// What Settings' sidebar does with its selection changing to `picked`,
+/// with `shown` the pane showing: a `List` clears its selection on a click
+/// in its empty space or a Command-click on the row, which mustn't move
+/// anything; it only puts the row's highlight back.
+public enum SidebarPick<Pane: Equatable>: Equatable {
+    case show(Pane)
+    case restore
+    case nothing
+}
+
+public func sidebarPick<Pane: Equatable>(_ picked: Pane?, shown: Pane) -> SidebarPick<Pane> {
+    guard let picked else { return .restore }
+    return picked == shown ? .nothing : .show(picked)
+}
+
 /// Where Settings is within its panes: the project drilled into, and the
-/// host each per-host pane shows. Picking a pane in the sidebar, the one
-/// shown included, takes it back to its first level, never a page drilled
-/// into before; the hosts picked stay as they were.
+/// host each per-host pane shows. Moving to another pane in the sidebar
+/// takes it back to its first level, never a page drilled into before; the
+/// hosts picked stay as they were.
 public struct SettingsPlace: Equatable, Sendable {
     /// The Projects pane's navigation path: the project shown, if any.
     public var projects: [String] = []

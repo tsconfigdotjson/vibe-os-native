@@ -2,15 +2,16 @@
 //! (PRD: How a click becomes a Terminal window). `vibed` says where the
 //! session is; from then on bytes go straight to its shim, so restarting
 //! `vibed` doesn't interrupt it. `Ctrl-\` detaches, as in dtach, and so does
-//! closing the window. It needs only a terminal, so `ssh -t host vibe attach
-//! <ref>` works from anywhere.
+//! closing the window (which `vibe toolbox` takes as Save & Close instead).
+//! It needs only a terminal, so `ssh -t host vibe attach <ref>` works from
+//! anywhere.
 
 use std::fmt;
-use std::io::{self, Write};
+use std::io;
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -68,6 +69,9 @@ impl From<io::Error> for AttachError {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum End {
     Detached,
+    /// The terminal hung up, as when its window closes: a detach, for an
+    /// agent's session.
+    HungUp,
     Exited(SessionExit),
     /// The shim went away without saying why.
     Lost,
@@ -99,7 +103,7 @@ pub(crate) fn window_size() -> Option<Size> {
     }
 }
 
-fn tty_name() -> Option<String> {
+pub(crate) fn tty_name() -> Option<String> {
     // SAFETY: ttyname's buffer is copied at once, while only this thread
     // runs.
     unsafe {
@@ -139,6 +143,9 @@ impl Drop for RawMode {
 /// Where the signal handler sends the signals it catches.
 static SIGNAL_PIPE: AtomicI32 = AtomicI32::new(-1);
 
+/// Whether a hangup has arrived since [`catch_hangup`] or [`catch`].
+static HUNG_UP: AtomicBool = AtomicBool::new(false);
+
 #[cfg(target_os = "linux")]
 fn errno() -> *mut libc::c_int {
     // SAFETY: returns this thread's errno.
@@ -152,6 +159,9 @@ fn errno() -> *mut libc::c_int {
 }
 
 extern "C" fn on_signal(signal: libc::c_int) {
+    if signal == libc::SIGHUP {
+        HUNG_UP.store(true, Ordering::SeqCst);
+    }
     let fd = SIGNAL_PIPE.load(Ordering::Relaxed);
     if fd >= 0 {
         let byte = signal as u8;
@@ -163,6 +173,29 @@ extern "C" fn on_signal(signal: libc::c_int) {
             *errno() = saved;
         }
     }
+}
+
+fn install_handler(signal: libc::c_int) -> io::Result<()> {
+    // SAFETY: the handler only sets a flag and writes to the pipe.
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = on_signal as *const () as libc::sighandler_t;
+        action.sa_flags = libc::SA_RESTART;
+        libc::sigemptyset(&mut action.sa_mask);
+        check(libc::sigaction(signal, &action, std::ptr::null_mut()))?;
+    }
+    Ok(())
+}
+
+/// Notes a hangup from now on, rather than dying of it, for a program with
+/// something to finish before it attaches: [`hung_up`] says if one came.
+pub(crate) fn catch_hangup() -> io::Result<()> {
+    install_handler(libc::SIGHUP)
+}
+
+/// Whether the terminal has hung up since [`catch_hangup`].
+pub(crate) fn hung_up() -> bool {
+    HUNG_UP.load(Ordering::SeqCst)
 }
 
 /// Catches `signals`, which are then read from the returned pipe, a byte
@@ -183,14 +216,7 @@ fn catch(signals: &[libc::c_int]) -> io::Result<std::fs::File> {
     }
     SIGNAL_PIPE.store(fds[1], Ordering::Relaxed);
     for &signal in signals {
-        // SAFETY: the handler only writes to the pipe.
-        unsafe {
-            let mut action: libc::sigaction = std::mem::zeroed();
-            action.sa_sigaction = on_signal as *const () as libc::sighandler_t;
-            action.sa_flags = libc::SA_RESTART;
-            libc::sigemptyset(&mut action.sa_mask);
-            check(libc::sigaction(signal, &action, std::ptr::null_mut()))?;
-        }
+        install_handler(signal)?;
     }
     // SAFETY: pipe made it, and only this owns the read end.
     Ok(unsafe { std::fs::File::from_raw_fd(fds[0]) })
@@ -338,6 +364,72 @@ fn locate(socket: &Path, agent: &str) -> Result<SessionAttach, AttachError> {
 /// Why the session's stream stopped, when this end stopped it.
 static STOPPED_BY: AtomicU8 = AtomicU8::new(0);
 const BY_DETACH: u8 = 1;
+const BY_HANGUP: u8 = 2;
+
+/// Notes why this end stops the stream: the first reason given stands, as
+/// a hangup also ends the terminal's input.
+fn stop(by: u8) {
+    let _ = STOPPED_BY.compare_exchange(0, by, Ordering::SeqCst, Ordering::SeqCst);
+}
+
+/// How the attachment ended, its stream having stopped.
+fn stopped() -> End {
+    match STOPPED_BY.load(Ordering::SeqCst) {
+        BY_DETACH => End::Detached,
+        BY_HANGUP => End::HungUp,
+        _ => End::Lost,
+    }
+}
+
+/// The terminal has gone, as its setup or a write to it failing says: a
+/// hangup, whether or not `SIGHUP` has got here yet.
+fn terminal_gone() -> End {
+    stop(BY_HANGUP);
+    stopped()
+}
+
+/// Writes `bytes` to the terminal. Some programs leave it non-blocking,
+/// which isn't its end: this waits for room. Any other error is.
+fn to_terminal(mut bytes: &[u8]) -> io::Result<()> {
+    while !bytes.is_empty() {
+        // SAFETY: writes from bytes, within its length.
+        let n = unsafe { libc::write(libc::STDOUT_FILENO, bytes.as_ptr().cast(), bytes.len()) };
+        if n == 0 {
+            return Err(io::ErrorKind::WriteZero.into());
+        }
+        if n > 0 {
+            bytes = &bytes[n as usize..];
+            continue;
+        }
+        let e = io::Error::last_os_error();
+        match e.kind() {
+            io::ErrorKind::Interrupted => {}
+            io::ErrorKind::WouldBlock => {
+                let mut pfd = libc::pollfd {
+                    fd: libc::STDOUT_FILENO,
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+                // SAFETY: pfd is valid for the call.
+                unsafe { libc::poll(&mut pfd, 1, -1) };
+            }
+            _ => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Taking over the terminal failed. If it's no longer a terminal, it has
+/// gone: a hangup. If it still is, that's a real error: `tcsetattr` also
+/// fails for an orphaned background job, whose terminal is still there, and
+/// which must not end the session or save the toolbox for it.
+fn raw_mode_failed(e: io::Error, still_a_terminal: bool) -> Result<End, AttachError> {
+    if still_a_terminal {
+        Err(e.into())
+    } else {
+        Ok(terminal_gone())
+    }
+}
 
 pub(crate) fn attach(socket: &Path, agent: &str) -> Result<End, AttachError> {
     if !is_tty(libc::STDIN_FILENO) || !is_tty(libc::STDOUT_FILENO) {
@@ -354,6 +446,7 @@ pub(crate) fn attach_to(found: &SessionAttach) -> Result<End, AttachError> {
         return Err(AttachError::NotATerminal);
     }
     let agent = found.agent.as_str();
+    STOPPED_BY.store(0, Ordering::SeqCst);
     // Caught before the size is read, so a resize in between isn't lost.
     // SIGHUP too: closing the window must detach even if whoever started
     // this left hangups ignored.
@@ -364,6 +457,10 @@ pub(crate) fn attach_to(found: &SessionAttach) -> Result<End, AttachError> {
         libc::SIGINT,
         libc::SIGQUIT,
     ])?;
+    // One that came before the pipe was there.
+    if hung_up() {
+        return Ok(terminal_gone());
+    }
     let hello = Hello {
         protocol: PROTOCOL,
         role: Role::Attach,
@@ -377,11 +474,13 @@ pub(crate) fn attach_to(found: &SessionAttach) -> Result<End, AttachError> {
     stream.set_read_timeout(None)?;
     stream.set_write_timeout(None)?;
     let writer = Arc::new(Mutex::new(stream.try_clone()?));
-    let raw = RawMode::enter()?;
-
-    let mut stdout = io::stdout().lock();
-    write!(stdout, "\x1b]0;{}\x07", found.title)?;
-    stdout.flush()?;
+    let raw = match RawMode::enter() {
+        Ok(raw) => raw,
+        Err(e) => return raw_mode_failed(e, is_tty(libc::STDIN_FILENO)),
+    };
+    if to_terminal(format!("\x1b]0;{}\x07", found.title).as_bytes()).is_err() {
+        return Ok(terminal_gone());
+    }
 
     spawn_keys(stream.try_clone()?, writer.clone());
     spawn_signals(signals, stream.try_clone()?, writer);
@@ -392,20 +491,15 @@ pub(crate) fn attach_to(found: &SessionAttach) -> Result<End, AttachError> {
     let end = loop {
         let frame = match shim::read_frame(&mut reading) {
             Ok(Some(f)) => f,
-            Ok(None) | Err(_) => {
-                break if STOPPED_BY.load(Ordering::SeqCst) == BY_DETACH {
-                    End::Detached
-                } else {
-                    End::Lost
-                };
-            }
+            Ok(None) | Err(_) => break stopped(),
         };
         match frame.kind {
             FrameKind::Output => {
                 out.clear();
                 filter.feed(&frame.payload, &mut out);
-                stdout.write_all(&out)?;
-                stdout.flush()?;
+                if to_terminal(&out).is_err() {
+                    break terminal_gone();
+                }
             }
             FrameKind::Exit => match frame.decode() {
                 Ok(exit) => break End::Exited(exit),
@@ -418,7 +512,7 @@ pub(crate) fn attach_to(found: &SessionAttach) -> Result<End, AttachError> {
     drop(raw);
     let leave_alternate = if filter.alternate { "\x1b[?1049l" } else { "" };
     let said = match &end {
-        End::Detached => format!("detached from {agent}"),
+        End::Detached | End::HungUp => format!("detached from {agent}"),
         End::Exited(exit) => match (&exit.code, &exit.signal) {
             (Some(code), _) => format!("{agent} exited with code {code}"),
             (None, Some(signal)) => format!("{agent} was ended by {signal}"),
@@ -427,16 +521,17 @@ pub(crate) fn attach_to(found: &SessionAttach) -> Result<End, AttachError> {
         End::Lost => format!("lost the session {agent}"),
     };
     // After a hangup the terminal is gone; saying goodbye is best effort.
-    let _ = write!(stdout, "{RESET}{leave_alternate}\r\n[{said}]\r\n");
-    let _ = stdout.flush();
+    let _ = to_terminal(format!("{RESET}{leave_alternate}\r\n[{said}]\r\n").as_bytes());
     Ok(end)
 }
 
 /// Sends what's typed to the session, until `Ctrl-\` or the end of input.
+/// A raw terminal has no end of input of its own (`Ctrl-D` is a key like
+/// any other), so its end is the terminal going away: a hangup.
 fn spawn_keys(stream: UnixStream, writer: Arc<Mutex<UnixStream>>) {
     std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
-        loop {
+        let by = loop {
             // SAFETY: reads into buf, within its length.
             let n = unsafe { libc::read(libc::STDIN_FILENO, buf.as_mut_ptr().cast(), buf.len()) };
             if n < 0 {
@@ -458,7 +553,7 @@ fn spawn_keys(stream: UnixStream, writer: Arc<Mutex<UnixStream>>) {
                 }
             }
             if n <= 0 {
-                break;
+                break BY_HANGUP;
             }
             let typed = &buf[..n as usize];
             let (keys, detach) = split_detach(typed);
@@ -470,10 +565,10 @@ fn spawn_keys(stream: UnixStream, writer: Arc<Mutex<UnixStream>>) {
                 }
             }
             if detach {
-                break;
+                break BY_DETACH;
             }
-        }
-        STOPPED_BY.store(BY_DETACH, Ordering::SeqCst);
+        };
+        stop(by);
         let _ = stream.shutdown(Shutdown::Both);
     });
 }
@@ -507,7 +602,14 @@ fn spawn_signals(mut signals: std::fs::File, stream: UnixStream, writer: Arc<Mut
                     return;
                 }
             } else {
-                STOPPED_BY.store(BY_DETACH, Ordering::SeqCst);
+                // A hangup is told apart, for `vibe toolbox`; any other
+                // polite kill is a detach.
+                let by = if libc::c_int::from(byte[0]) == libc::SIGHUP {
+                    BY_HANGUP
+                } else {
+                    BY_DETACH
+                };
+                stop(by);
                 let _ = stream.shutdown(Shutdown::Both);
                 return;
             }
@@ -564,6 +666,18 @@ mod tests {
         assert!(f.alternate);
         let (_, f) = filter(&[b"\x1b[?2004h\x1b[1049h"]);
         assert!(!f.alternate, "not a private mode");
+    }
+
+    #[test]
+    fn failing_to_take_over_the_terminal_is_a_hangup_only_if_it_has_gone() {
+        STOPPED_BY.store(0, Ordering::SeqCst);
+        let e = || io::Error::from_raw_os_error(libc::EIO);
+        assert!(matches!(
+            raw_mode_failed(e(), true),
+            Err(AttachError::Io(_))
+        ));
+        assert_eq!(STOPPED_BY.load(Ordering::SeqCst), 0, "no hangup was noted");
+        assert!(matches!(raw_mode_failed(e(), false), Ok(End::HungUp)));
     }
 
     #[test]

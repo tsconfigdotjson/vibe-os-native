@@ -2,23 +2,29 @@
 //! asks `vibed` to open the toolbox and attaches this terminal to its
 //! shell; when the shell exits, `vibed` saves a new template and Linux home
 //! version, and this waits to say which. `Ctrl-\` detaches and leaves the
-//! shell open, for `vibe toolbox` to attach to again.
+//! shell open, for `vibe toolbox` to attach to again. Closing the window
+//! saves and closes it, as Save & Close does, rather than leave it open
+//! with no terminal (#54); unless another terminal is still attached to it.
+//! Over SSH a hangup only detaches: a dropped connection says nothing about
+//! wanting the shell ended and saved.
 //!
-//! `vibe toolbox status`, `update` and `rebuild` show the versions, run
-//! `toolbox.toml`'s `[update]` now, and rebuild the template on the newest
-//! base image.
+//! `vibe toolbox status`, `update`, `rebuild` and `close` show the
+//! versions, run `toolbox.toml`'s `[update]` now, rebuild the template on
+//! the newest base image, and save and close an open shell.
 
 use std::fmt::Write as _;
+use std::io::Write as _;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use vibe_core::model::{LoginTool, ToolboxAction, ToolboxState};
+use vibe_core::model::{LoginTool, SessionState, ToolboxAction, ToolboxState};
 use vibe_core::rpc::{
-    NoParams, ToolboxLogins, ToolboxLoginsGet, ToolboxOpen, ToolboxRebuild, ToolboxRun,
-    ToolboxStatus, ToolboxStatusGet, ToolboxUpdate,
+    HostParams, NoParams, SessionAttach, SessionInfo, SessionsList, ToolboxClose, ToolboxLogins,
+    ToolboxLoginsGet, ToolboxOpen, ToolboxRebuild, ToolboxRun, ToolboxStatus, ToolboxStatusGet,
+    ToolboxUpdate,
 };
 
-use crate::attach::{self, End};
+use crate::attach::{self, AttachError, End};
 use crate::client;
 
 /// How long a boot of the toolbox may take, its disks' clones included.
@@ -30,6 +36,14 @@ const RUN_TIMEOUT: Duration = Duration::from_secs(4 * 60 * 60);
 /// How long saving may take once the shell exits: flushing a big install.
 const SAVE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
+/// How long, after a hangup, to keep trying to reach `vibed` and save: a
+/// shim or `vibed` under heavy swap can be slow to answer, and nobody is
+/// left to tell if this gives up.
+const LEAVING: Duration = Duration::from_secs(60);
+
+/// The toolbox shell's session.
+const TOOLBOX_REF: &str = "toolbox";
+
 /// Which `vibe toolbox`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Command {
@@ -38,6 +52,7 @@ pub(crate) enum Command {
     Update,
     Rebuild,
     Logins,
+    Close,
 }
 
 impl Command {
@@ -47,6 +62,7 @@ impl Command {
             "update" => Command::Update,
             "rebuild" => Command::Rebuild,
             "logins" => Command::Logins,
+            "close" => Command::Close,
             _ => return None,
         })
     }
@@ -84,6 +100,34 @@ pub(crate) fn run(socket: &Path, command: Command) -> Result<(), String> {
             println!("{}", describe_run(&run));
             Ok(())
         }
+        Command::Close => {
+            let was_open = matches!(
+                status(socket)?.state,
+                ToolboxState::Open | ToolboxState::Saving
+            );
+            if was_open {
+                eprintln!("Saving the template and the Linux home…");
+            }
+            let after = client::call::<ToolboxClose>(socket, &NoParams {}, SAVE_TIMEOUT)
+                .map_err(|e| e.to_string())?;
+            if was_open {
+                return report_saved(&after);
+            }
+            // Closed, but with changes a failed save kept for next time.
+            match after
+                .last
+                .as_ref()
+                .filter(|r| r.action == ToolboxAction::Shell)
+            {
+                Some(ToolboxRun { error: Some(e), .. }) => Err(format!(
+                    "the toolbox isn't open, but its last save failed: {e}"
+                )),
+                _ => {
+                    println!("The toolbox isn't open: there's nothing to save.");
+                    Ok(())
+                }
+            }
+        }
     }
 }
 
@@ -98,49 +142,194 @@ fn open(socket: &Path) -> Result<(), String> {
             "the toolbox shell needs a terminal; over SSH, use `ssh -t <host> vibe toolbox`".into(),
         );
     }
+    // Before the boot, which can take a while: the window may close during
+    // it, and that closes what it's booting too.
+    attach::catch_hangup().map_err(|e| format!("the terminal: {e}"))?;
+    let terminal = attach::tty_name();
     eprintln!("Opening the Linux toolbox…");
-    let mut found = client::call::<ToolboxOpen>(socket, &NoParams {}, OPEN_TIMEOUT)
-        .map_err(|e| e.to_string())?;
-    eprintln!(
+    let opened = client::call::<ToolboxOpen>(socket, &NoParams {}, OPEN_TIMEOUT);
+    if attach::hung_up() {
+        after_hangup(socket, terminal.as_deref());
+        return Ok(());
+    }
+    let mut found = opened.map_err(|e| e.to_string())?;
+    say(&format!(
         "What you install here (sudo apt install …, curl … | sh, npm -g) and log in to \
-         (gh auth login) every new linux agent gets. Exit the shell to save; Ctrl-\\ \
-         leaves it open."
-    );
+         (gh auth login) every new linux agent gets. {}",
+        if over_ssh() {
+            "Exit the shell to save; Ctrl-\\ or a dropped connection leaves it open."
+        } else {
+            "Exit the shell to save, or close the window; Ctrl-\\ leaves it open."
+        }
+    ));
     let mut lost = 0;
     loop {
-        match attach::attach_to(&found).map_err(|e| e.to_string())? {
-            End::Detached => {
-                eprintln!(
+        match attach::attach_to(&found) {
+            // It was a terminal when this began, so it went since.
+            Ok(End::HungUp) | Err(AttachError::NotATerminal) => {
+                after_hangup(socket, terminal.as_deref());
+                return Ok(());
+            }
+            // Whatever else went wrong, the window has closed.
+            Err(_) if attach::hung_up() => {
+                after_hangup(socket, terminal.as_deref());
+                return Ok(());
+            }
+            Err(e) => return Err(e.to_string()),
+            Ok(End::Detached) => {
+                say(
                     "The toolbox is still open: `vibe toolbox` attaches to it again. Exit its \
-                     shell to save."
+                     shell, or run `vibe toolbox close`, to save.",
                 );
                 return Ok(());
             }
-            End::Exited(_) => break,
+            Ok(End::Exited(_)) => break,
             // The shim went without saying why. If the shell runs on, vibed
             // holds it again: attach to that.
-            End::Lost => {
+            Ok(End::Lost) => {
                 std::thread::sleep(Duration::from_secs(2));
-                if lost >= 3 || status(socket)?.state != ToolboxState::Open {
-                    break;
+                match held_again(socket, lost) {
+                    Ok(Some(again)) => {
+                        lost += 1;
+                        found = again;
+                    }
+                    Ok(None) => break,
+                    Err(_) if attach::hung_up() => {
+                        after_hangup(socket, terminal.as_deref());
+                        return Ok(());
+                    }
+                    Err(e) => return Err(e),
                 }
-                lost += 1;
-                found = client::call::<ToolboxOpen>(socket, &NoParams {}, OPEN_TIMEOUT)
-                    .map_err(|e| e.to_string())?;
             }
         }
     }
-    eprintln!("Saving the template and the Linux home…");
-    let status = wait_saved(socket)?;
+    say("Saving the template and the Linux home…");
+    report_saved(&wait_saved(socket)?)
+}
+
+/// Where the shell is held again after its shim went, `lost` times now;
+/// `None` if it isn't to be attached to again.
+fn held_again(socket: &Path, lost: u32) -> Result<Option<SessionAttach>, String> {
+    if lost >= 3 || status(socket)?.state != ToolboxState::Open {
+        return Ok(None);
+    }
+    client::call::<ToolboxOpen>(socket, &NoParams {}, OPEN_TIMEOUT)
+        .map(Some)
+        .map_err(|e| e.to_string())
+}
+
+/// A line for the owner on stderr, if the terminal is still there: unlike
+/// `eprintln!`, a window that has closed doesn't panic it.
+fn say(line: &str) {
+    let _ = writeln!(std::io::stderr(), "{line}");
+}
+
+/// Whether this runs over SSH, where a hangup can be the network dropping.
+fn over_ssh() -> bool {
+    ["SSH_CONNECTION", "SSH_TTY"]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
+}
+
+/// Says what a save kept, or why it kept nothing.
+fn report_saved(status: &ToolboxStatus) -> Result<(), String> {
     match &status.last {
         Some(run) if run.action == ToolboxAction::Shell => match &run.error {
             Some(e) => Err(format!("the toolbox couldn't save: {e}")),
             None => {
-                println!("{}", describe_saved(&status));
+                let _ = writeln!(std::io::stdout(), "{}", describe_saved(status));
                 Ok(())
             }
         },
         _ => Err("the toolbox closed, but vibed didn't say what it saved".into()),
+    }
+}
+
+/// After the terminal hung up: Save & Close, unless this is over SSH or
+/// another terminal still holds the shell. `terminal` is this one's name,
+/// noted while it was there. Nobody sees this terminal any more, so an
+/// error goes only where stderr still leads, if anywhere.
+fn after_hangup(socket: &Path, terminal: Option<&str>) {
+    if over_ssh() {
+        return;
+    }
+    let deadline = Instant::now() + LEAVING;
+    loop {
+        // On every try: someone may have attached since the last one failed.
+        if another_terminal_holds_it(socket, terminal, deadline) {
+            return;
+        }
+        match client::call::<ToolboxClose>(socket, &NoParams {}, SAVE_TIMEOUT) {
+            Ok(_) => return,
+            Err(e) if Instant::now() >= deadline => {
+                say(&format!("vibe: the toolbox couldn't save: {e}"));
+                return;
+            }
+            Err(_) => std::thread::sleep(Duration::from_secs(1)),
+        }
+    }
+}
+
+/// Whether a terminal other than `terminal` is attached to the shell. If
+/// that still can't be told at `deadline`, it's taken as yes: the shell
+/// stays open, which Settings shows and loses nothing, rather than being
+/// ended under a terminal that may be in use.
+fn another_terminal_holds_it(socket: &Path, terminal: Option<&str>, deadline: Instant) -> bool {
+    loop {
+        match who_holds_it(socket, terminal) {
+            Some(answer) => return answer,
+            None if Instant::now() >= deadline => {
+                say("vibe: can't tell who's attached to the toolbox; leaving it open");
+                return true;
+            }
+            None => std::thread::sleep(Duration::from_millis(250)),
+        }
+    }
+}
+
+/// One look at who's attached; `None` if it can't be told yet. The list can
+/// still show this terminal, as a shim under load is slow to see it go, so
+/// it goes by whose terminals they are, not how many.
+fn who_holds_it(socket: &Path, terminal: Option<&str>) -> Option<bool> {
+    let list =
+        client::call::<SessionsList>(socket, &HostParams::default(), Duration::from_secs(30))
+            .ok()?;
+    let session = list
+        .sessions
+        .iter()
+        .find(|s| s.agent == TOOLBOX_REF && s.state == SessionState::Running);
+    let Some(session) = session else {
+        return Some(false);
+    };
+    let answer = holds_it(session, terminal)?;
+    // The list gives a shim that didn't answer as having no clients: that
+    // isn't "nobody" unless the shim itself says so. A count it gives now
+    // that isn't zero means the list was out of date: look again.
+    if !answer && session.clients == 0 && !shim_says_nobody(socket) {
+        return None;
+    }
+    Some(answer)
+}
+
+/// Whether `vibed` asked the shell's shim and it counted no terminals, or
+/// the toolbox isn't open any more. `clients` is there only if it answered.
+fn shim_says_nobody(socket: &Path) -> bool {
+    status(socket).is_ok_and(|s| s.state != ToolboxState::Open || s.clients == Some(0))
+}
+
+/// Whether `session` has a terminal attached other than `terminal`; `None`
+/// if that can't be told yet. A client with no terminal name can be told
+/// from this one only if this one has a name.
+fn holds_it(session: &SessionInfo, terminal: Option<&str>) -> Option<bool> {
+    if session.ttys.iter().any(|t| Some(t.as_str()) != terminal) {
+        return Some(true);
+    }
+    let unnamed = session.clients as usize > session.ttys.len();
+    match (terminal, unnamed) {
+        (Some(_), unnamed) => Some(unnamed),
+        (None, false) => Some(false),
+        // One of them may be this one, until the shim sees it go.
+        (None, true) => None,
     }
 }
 
@@ -255,7 +444,15 @@ pub(crate) fn describe_status(s: &ToolboxStatus) -> String {
         return "This host has no Linux toolbox: install tools on it directly.\n".into();
     }
     let mut out = String::new();
-    let _ = writeln!(out, "state     {}", s.state);
+    if s.state == ToolboxState::Open && s.clients == Some(0) {
+        let _ = writeln!(
+            out,
+            "state     open in the background, no terminal attached: `vibe toolbox` attaches to \
+             it, `vibe toolbox close` saves it"
+        );
+    } else {
+        let _ = writeln!(out, "state     {}", s.state);
+    }
     let _ = writeln!(
         out,
         "template  {}",
@@ -302,6 +499,7 @@ mod tests {
             base: Some(1),
             newest_base: Some(1),
             last: None,
+            clients: None,
         }
     }
 
@@ -311,6 +509,7 @@ mod tests {
         assert_eq!(Command::parse("update"), Some(Command::Update));
         assert_eq!(Command::parse("rebuild"), Some(Command::Rebuild));
         assert_eq!(Command::parse("logins"), Some(Command::Logins));
+        assert_eq!(Command::parse("close"), Some(Command::Close));
         assert_eq!(Command::parse("open"), None);
     }
 
@@ -386,6 +585,21 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("\n            apt: htop\n"), "{text}");
+        // Open with no terminal attached says so, and how to go on.
+        s.state = ToolboxState::Open;
+        // Not counted (a boot under way, a shim too slow to ask, an older
+        // vibed): it doesn't claim either way.
+        assert!(describe_status(&s).starts_with("state     open\n"));
+        s.clients = Some(0);
+        assert!(
+            describe_status(&s).starts_with(
+                "state     open in the background, no terminal attached: `vibe toolbox` attaches"
+            ),
+            "{}",
+            describe_status(&s)
+        );
+        s.clients = Some(1);
+        assert!(describe_status(&s).starts_with("state     open\n"));
         let none = ToolboxStatus {
             state: ToolboxState::Unavailable,
             template: None,
@@ -393,8 +607,36 @@ mod tests {
             base: None,
             newest_base: None,
             last: None,
+            clients: None,
         };
         assert!(describe_status(&none).contains("no Linux toolbox"));
+    }
+
+    #[test]
+    fn who_holds_the_shell_goes_by_the_terminals_names() {
+        let session = |clients, ttys: &[&str]| SessionInfo {
+            host: "local".into(),
+            agent: TOOLBOX_REF.into(),
+            state: SessionState::Running,
+            title: "Linux toolbox".into(),
+            clients,
+            ttys: ttys.iter().map(|t| (*t).to_owned()).collect(),
+            exit: None,
+        };
+        let me = Some("/dev/ttys001");
+        // Nobody; or only this one, which the shim hasn't seen go.
+        assert_eq!(holds_it(&session(0, &[]), me), Some(false));
+        assert_eq!(holds_it(&session(1, &["/dev/ttys001"]), me), Some(false));
+        // Another, at once, with this one still listed or not.
+        assert_eq!(holds_it(&session(1, &["/dev/ttys002"]), me), Some(true));
+        let both = session(2, &["/dev/ttys001", "/dev/ttys002"]);
+        assert_eq!(holds_it(&both, me), Some(true));
+        // One with no terminal name isn't this one, which has a name.
+        assert_eq!(holds_it(&session(1, &[]), me), Some(true));
+        // With no name of its own, this one might be it: wait and see.
+        assert_eq!(holds_it(&session(1, &[]), None), None);
+        assert_eq!(holds_it(&session(0, &[]), None), Some(false));
+        assert_eq!(holds_it(&session(1, &["/dev/ttys002"]), None), Some(true));
     }
 
     #[test]

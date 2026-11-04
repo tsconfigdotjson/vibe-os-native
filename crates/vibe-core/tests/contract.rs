@@ -296,6 +296,7 @@ fn rust_methods() -> BTreeMap<&'static str, MethodTypes> {
         method::<ToolboxUpdate>(),
         method::<ToolboxRebuild>(),
         method::<ToolboxLoginsGet>(),
+        method::<ToolboxClose>(),
         method::<DoctorCheckGet>(),
         method::<DoctorFix>(),
     ])

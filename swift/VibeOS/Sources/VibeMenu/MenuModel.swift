@@ -30,7 +30,15 @@ public final class MenuModel: ObservableObject {
     @Published public private(set) var unavailableHosts: Set<String> = []
     @Published public private(set) var gh: GhStatus?
     /// This host's Linux toolbox: its versions and what it's doing.
-    @Published public private(set) var toolbox: ToolboxStatus?
+    @Published public private(set) var toolbox: ToolboxStatus? {
+        // What Save & Close last failed at is past once the toolbox moves on.
+        didSet { if toolbox?.state != oldValue?.state { set(\.toolboxCloseError, nil) } }
+    }
+    /// While Save & Close runs: from the click until vibed answers. Kept
+    /// here, not in the pane, so it outlasts a look at another pane.
+    @Published public private(set) var toolboxClosing = false
+    /// Why the last Save & Close didn't save, unless the last run says so.
+    @Published public private(set) var toolboxCloseError: String?
     /// Where this host serves MCP, for the setup command and Settings.
     @Published public private(set) var mcp: McpSettings?
     @Published public private(set) var memory: HostMemory?
@@ -41,8 +49,6 @@ public final class MenuModel: ObservableObject {
     @Published public var message: String?
     /// Bumped by every event about settings, so open settings re-read.
     @Published public private(set) var settingsRevision = 0
-    /// The time rows count elapsed time to; moves on with each refresh.
-    @Published public private(set) var now = Date()
     /// Refs being attached, so a second click waits for the first.
     @Published public private(set) var attaching: Set<String> = []
     /// How this copy of the app is installed (Install.swift).
@@ -55,6 +61,13 @@ public final class MenuModel: ObservableObject {
     public var menuIsOpen = false {
         didSet { if menuIsOpen && !oldValue { pollNow() } }
     }
+
+    /// While the menu is said to be closed, how often a poll still publishes
+    /// the memory readings. Often enough that if it was never told the menu
+    /// opened (it goes by SwiftUI's `onAppear`), they go slow rather than
+    /// stop; rarely enough that they don't keep rebuilding Settings (#54).
+    public var closedReadingsEvery: Duration = .seconds(30)
+    private var readingsPublished: ContinuousClock.Instant?
 
     public let daemon: any DaemonConnection
     public let attacher: Attacher
@@ -183,13 +196,19 @@ public final class MenuModel: ObservableObject {
     private func refreshOnce() async {
         changedDuringRefresh = []
         defer { changedDuringRefresh = nil }
-        memory = HostMemory.current()
-        now = Date()
+        // The memory readings change on every poll, and only the menu shows
+        // them: on every poll while it's open, slowly while it's not.
+        let clock = ContinuousClock()
+        let readingsDue = menuIsOpen || readingsPublished.map { $0.duration(to: clock.now) >= closedReadingsEvery } ?? true
+        if readingsDue {
+            readingsPublished = clock.now
+            set(\.memory, HostMemory.current())
+        }
         let hosts: [HostInfo]
         do {
             hosts = try await call(HostsList.self, NoParams()).hosts
         } catch {
-            connection = .unavailable(describe(error))
+            set(\.connection, .unavailable(describe(error)))
             return
         }
         var agents: [Agent] = []
@@ -203,7 +222,7 @@ public final class MenuModel: ObservableObject {
                 continue
             } catch {
                 if host.link == .local {
-                    connection = .unavailable(describe(error))
+                    set(\.connection, .unavailable(describe(error)))
                     return
                 }
             }
@@ -211,19 +230,31 @@ public final class MenuModel: ObservableObject {
             unavailable.insert(host.name)
             agents += self.agents.filter { $0.host == host.name }
         }
-        self.hosts = hosts
-        self.agents = agents
+        if readingsDue || hosts.map(\.withoutReadings) != self.hosts.map(\.withoutReadings) {
+            set(\.hosts, hosts)
+        }
+        if readingsDue || agents.map(\.withoutReadings) != self.agents.map(\.withoutReadings) {
+            set(\.agents, agents)
+        }
         for changed in changedDuringRefresh ?? [] {
             apply(host: changed.host, ref: changed.ref, changed.change)
         }
         changedDuringRefresh = []
-        unavailableHosts = unavailable
-        connection = .connected
+        set(\.unavailableHosts, unavailable)
+        set(\.connection, .connected)
         takeOverIfUpdated()
-        gh = (try? await call(GhStatusGet.self, GhStatusParams())) ?? gh
-        toolbox = (try? await call(ToolboxStatusGet.self, NoParams())) ?? toolbox
-        mcp = (try? await call(McpGet.self, HostParams())) ?? mcp
+        set(\.gh, (try? await call(GhStatusGet.self, GhStatusParams())) ?? gh)
+        set(\.toolbox, (try? await call(ToolboxStatusGet.self, NoParams())) ?? toolbox)
+        set(\.mcp, (try? await call(McpGet.self, HostParams())) ?? mcp)
     }
+
+    /// Sets `keyPath` to `value` only if that changes it, so a poll that
+    /// finds nothing new publishes nothing, and the views watching the
+    /// model aren't rebuilt for it (#54).
+    private func set<T: Equatable>(_ keyPath: ReferenceWritableKeyPath<MenuModel, T>, _ value: T) {
+        if self[keyPath: keyPath] != value { self[keyPath: keyPath] = value }
+    }
+
 
     /// Opens Terminal on `agent`: raises its tab if it has one, or opens
     /// one running `vibe attach`. A second click while the first is still
@@ -302,14 +333,37 @@ public final class MenuModel: ObservableObject {
     /// Whether Open Shell can open the toolbox now: it's closed, or open
     /// already; an update, a rebuild or a save holds it.
     public var toolboxCanOpen: Bool {
-        toolbox?.state == .closed || toolbox?.state == .open
+        !toolboxClosing && (toolbox?.state == .closed || toolbox?.state == .open)
     }
 
     /// Reads the toolbox's status again, as Settings does while it shows
     /// it, so what it says is what vibed says now.
     public func refreshToolbox() async {
-        toolbox = (try? await call(ToolboxStatusGet.self, NoParams())) ?? toolbox
+        set(\.toolbox, (try? await call(ToolboxStatusGet.self, NoParams())) ?? toolbox)
     }
+
+    /// Settings → Linux Toolbox → Save & Close: hangs up on the open shell,
+    /// as closing its Terminal window does, and saves the template and the
+    /// Linux home, as exiting does. It waits for the save, which can take
+    /// minutes after a big install. A click while one runs does nothing.
+    public func closeToolbox() async {
+        guard !toolboxClosing else { return }
+        toolboxClosing = true
+        defer { toolboxClosing = false }
+        set(\.toolboxCloseError, nil)
+        do {
+            set(\.toolbox, try await call(ToolboxClose.self, NoParams(), timeout: MenuModel.saveTimeout))
+        } catch {
+            await refreshToolbox()
+            // A failed save is the last run, which the pane shows already.
+            let why = describe(error)
+            set(\.toolboxCloseError, why == toolbox?.last?.error ? nil : why)
+        }
+    }
+
+    /// How long Save & Close may take: as long as `vibe toolbox` waits for
+    /// a save after a big install.
+    public nonisolated static let saveTimeout: TimeInterval = 15 * 60
 
     /// What the Linux home holds, and whether Linux agents are signed in.
     /// It boots nothing, so it's fine to ask whenever Settings shows it.
@@ -429,14 +483,14 @@ public final class MenuModel: ObservableObject {
                     switch message {
                     case .subscribed:
                         backoff = 1
-                        live = true
+                        set(\.live, true)
                         await refresh()
                     case .event(let event):
                         await handle(event)
                     }
                 }
             } catch {}
-            live = false
+            set(\.live, false)
             if Task.isCancelled { return }
             // vibed went away, or isn't up yet: say so, and try again.
             await refresh()
@@ -466,14 +520,14 @@ public final class MenuModel: ObservableObject {
         case .agentAdded, .agentDeleted, .agentLimit:
             await refresh()
         case .ghStatus:
-            gh = (try? await call(GhStatusGet.self, GhStatusParams())) ?? gh
+            set(\.gh, (try? await call(GhStatusGet.self, GhStatusParams())) ?? gh)
         case .lagged:
             settingsRevision += 1
             await refresh()
         case .projectAdded, .projectRemoved, .profilesChanged, .limitsChanged, .keysChanged:
             settingsRevision += 1
         case .toolboxChanged:
-            toolbox = (try? await call(ToolboxStatusGet.self, NoParams())) ?? toolbox
+            set(\.toolbox, (try? await call(ToolboxStatusGet.self, NoParams())) ?? toolbox)
         case .mcpChanged:
             // Where it's served, and whether it is, for the header.
             settingsRevision += 1
@@ -492,7 +546,9 @@ public final class MenuModel: ObservableObject {
 
     private func apply(host: String, ref: String, _ change: (inout Agent) -> Void) {
         guard let i = agents.firstIndex(where: { $0.host == host && $0.ref == ref }) else { return }
-        change(&agents[i])
+        var changed = agents[i]
+        change(&changed)
+        if changed != agents[i] { agents[i] = changed }
     }
 
     private func replace(_ agent: Agent) {
@@ -536,6 +592,25 @@ public final class MenuModel: ObservableObject {
 }
 
 /// An error in a sentence for the menu.
+/// What a poll compares of a host when its memory readings aren't due:
+/// they change every time.
+extension HostInfo {
+    fileprivate var withoutReadings: HostInfo {
+        var host = self
+        host.memory?.used = 0
+        host.memory?.swapUsed = 0
+        return host
+    }
+}
+
+extension Agent {
+    fileprivate var withoutReadings: Agent {
+        var agent = self
+        agent.memoryUsed = nil
+        return agent
+    }
+}
+
 public func describe(_ error: any Error) -> String {
     switch error {
     case let error as VibedClientError:

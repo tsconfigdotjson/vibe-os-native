@@ -56,6 +56,7 @@ public enum VibeRPC {
         ToolboxUpdate.name,
         ToolboxRebuild.name,
         ToolboxLoginsGet.name,
+        ToolboxClose.name,
         DoctorCheckGet.name,
         DoctorFix.name,
     ]
@@ -804,6 +805,16 @@ public enum ToolboxLoginsGet: RPCMethod {
     public typealias Params = NoParams
     public typealias Result = ToolboxLogins
     public static let name = "toolbox.logins"
+}
+
+/// `toolbox.close`: Save & Close. Hangs up on the open shell, as closing its
+/// Terminal window does, saves as exiting it does, and gives the status
+/// after. A closed toolbox is left as it is; one updating or rebuilding is
+/// refused.
+public enum ToolboxClose: RPCMethod {
+    public typealias Params = NoParams
+    public typealias Result = ToolboxStatus
+    public static let name = "toolbox.close"
 }
 
 /// `doctor.check`: `vibe doctor`, and the first run's checklist. Runs every
@@ -1803,11 +1814,15 @@ public struct ToolboxStatus: Codable, Hashable, Sendable {
     public var newestBase: Int?
     /// The last shell, update or rebuild to finish.
     public var last: ToolboxRun?
+    /// How many terminals are attached to the open shell: 0 when it's open
+    /// in the background. Nil when that isn't known: it isn't open, its shim
+    /// isn't up yet or didn't answer, or a vibed from before this field.
+    public var clients: Int?
 
     public enum CodingKeys: String, CodingKey, CaseIterable {
         case state, template, home, base
         case newestBase = "newest_base"
-        case last
+        case last, clients
     }
 }
 

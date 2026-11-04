@@ -52,40 +52,37 @@ enum SettingsPane: String, CaseIterable, Identifiable {
 }
 
 struct SettingsView: View {
-    @ObservedObject var model: MenuModel
+    /// Not observed here: each pane watches what it shows, so a poll that
+    /// changes the model rebuilds that pane alone, never the split view or
+    /// the sidebar, where a click landing mid-rebuild could be lost (#54).
+    let model: MenuModel
     /// A pane to show instead of the one last shown, for the gallery.
     var showing: SettingsPane?
+    /// The pane last shown, kept for next time, and set by the menu to open
+    /// Settings on a pane (`showSettings`).
     @AppStorage(SettingsPane.storageKey) private var stored = SettingsPane.projects.rawValue
-    /// Where each pane is: picking one in the sidebar, the one shown
-    /// included, takes it back to its first level.
+    /// The sidebar's selection: its own, and mirrored to `stored` both ways.
+    @State private var selection: SettingsPane?
+    /// The pane showing. Never none, unlike a `List`'s selection.
+    @State private var shown: SettingsPane
+    /// Where each pane is: picking another pane takes it back to its first
+    /// level.
     @State private var place = SettingsPlace()
 
-    private var pane: Binding<SettingsPane?> {
-        Binding(
-            get: { showing ?? SettingsPane(rawValue: stored) ?? .projects },
-            set: {
-                if let pane = $0 { stored = pane.rawValue }
-                place.picked()
-            })
+    init(model: MenuModel, showing: SettingsPane? = nil) {
+        self.model = model
+        self.showing = showing
+        let stored = UserDefaults.standard.string(forKey: SettingsPane.storageKey)
+        let pane = showing ?? stored.flatMap(SettingsPane.init(rawValue:)) ?? .projects
+        _selection = State(initialValue: pane)
+        _shown = State(initialValue: pane)
     }
 
     var body: some View {
         NavigationSplitView {
-            List(SettingsPane.allCases, selection: pane) { item in
-                Label {
-                    Text(item.title)
-                } icon: {
-                    IconTile(symbol: item.symbol, color: item.color)
-                }
-                .tag(item)
-                // A click on the pane already shown takes it back to its
-                // first level too.
-                .simultaneousGesture(TapGesture().onEnded { if item == pane.wrappedValue { place.picked() } })
-            }
-            .navigationSplitViewColumnWidth(min: 180, ideal: 200, max: 240)
-            .toolbar(removing: .sidebarToggle)
+            SettingsSidebar(selection: $selection)
         } detail: {
-            switch pane.wrappedValue ?? .projects {
+            switch shown {
             case .projects:
                 NavigationStack(path: $place.projects) {
                     ProjectsPane(model: model, host: $place.projectsHost)
@@ -98,6 +95,40 @@ struct SettingsView: View {
             }
         }
         .frame(minWidth: 720, minHeight: 480)
+        .onChange(of: selection) { _, picked in
+            switch sidebarPick(picked, shown: shown) {
+            case .nothing: break
+            case .restore: selection = shown
+            case .show(let pane):
+                shown = pane
+                place.picked()
+                // The gallery shows a pane without making it the one kept.
+                if showing == nil, pane.rawValue != stored { stored = pane.rawValue }
+            }
+        }
+        // The menu asks for a pane while Settings is open.
+        .onChange(of: stored) { _, raw in
+            if showing == nil, let pane = SettingsPane(rawValue: raw), pane != selection { selection = pane }
+        }
+    }
+}
+
+/// Settings' sidebar: the panes, as System Settings lists them. It takes
+/// nothing but the selection, so nothing the model polls rebuilds it.
+private struct SettingsSidebar: View {
+    @Binding var selection: SettingsPane?
+
+    var body: some View {
+        List(SettingsPane.allCases, selection: $selection) { item in
+            Label {
+                Text(item.title)
+            } icon: {
+                IconTile(symbol: item.symbol, color: item.color)
+            }
+            .tag(item)
+        }
+        .navigationSplitViewColumnWidth(min: 180, ideal: 200, max: 240)
+        .toolbar(removing: .sidebarToggle)
     }
 }
 

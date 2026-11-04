@@ -1,18 +1,20 @@
 //! The toolbox (PRD: The toolbox shell): `toolbox.status`, `toolbox.open`,
-//! `toolbox.update` and `toolbox.rebuild`, and the supervisor that saves
-//! when the shell exits and runs `toolbox.toml`'s `[update]` weekly. The
-//! work is `vibe_env::toolbox`; this is when it runs, and what clients see
-//! of it.
+//! `toolbox.close`, `toolbox.update` and `toolbox.rebuild`, and the
+//! supervisor that saves when the shell exits and runs `toolbox.toml`'s
+//! `[update]` weekly. The work is `vibe_env::toolbox`; this is when it
+//! runs, and what clients see of it.
 //!
 //! The shell is a session like an agent's, ref `toolbox`, held by a shim
 //! on the guest's terminal, so `vibe toolbox` (and later the menu) attaches
-//! to it as to any session, and detaching leaves it open. The supervisor
-//! notices when the shim has gone: if the shell still runs (the shim
-//! died), a new shim holds it; if it exited, the toolbox is closed and its
-//! new versions kept. One toolbox operation runs at a time; another is
-//! refused as busy rather than queued. What the last one did is kept in
-//! `~/VibeOS/agents/toolbox/state.json`, with when the weekly update last
-//! ran.
+//! to it as to any session, and detaching leaves it open; `toolbox.status`
+//! counts the terminals attached. `toolbox.close` (Save & Close) hangs up
+//! on the shell, as closing its Terminal window does, and saves once it
+//! has exited. The supervisor notices when the shim has gone: if the
+//! shell still runs (the shim died), a new shim holds it; if it exited,
+//! the toolbox is closed and its new versions kept. One toolbox operation
+//! runs at a time; another is refused as busy rather than queued. What the
+//! last one did is kept in `~/VibeOS/agents/toolbox/state.json`, with when
+//! the weekly update last ran.
 
 use std::fs;
 use std::path::PathBuf;
@@ -47,6 +49,14 @@ pub const UPDATE_CHECK_EVERY: Duration = Duration::from_secs(60 * 60);
 
 /// The shell's window title.
 const TITLE: &str = "Linux toolbox";
+
+/// How long a shell `toolbox.close` hung up on may take to exit, its shim
+/// with it.
+const HANGUP_PATIENCE: Duration = Duration::from_secs(15);
+
+/// How long a shell whose hang-up failed may take to be seen gone: the
+/// `kill` fails too if the shell had just exited on its own.
+const JUST_EXITED: Duration = Duration::from_secs(2);
 
 /// What `state.json` keeps.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,6 +130,20 @@ fn describe(action: ToolboxAction, saved: &Saved) -> String {
         ));
     }
     text
+}
+
+/// Waits up to `patience` for the shim at `socket` to go.
+async fn shim_gone(socket: &std::path::Path, patience: Duration) -> bool {
+    let deadline = Instant::now() + patience;
+    loop {
+        if matches!(sessions::probe(socket).await, Probe::Gone) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 impl Core {
@@ -249,10 +273,19 @@ impl Core {
     /// as every other handler's file work is.
     pub async fn toolbox_status(&self, _: NoParams) -> Result<ToolboxStatus, ErrorObject> {
         let Some(host) = self.toolbox.clone() else {
-            return Ok(self.toolbox_status_of(None));
+            return Ok(self.toolbox_status_of(None, None));
         };
         let versions = blocking(move || Ok(host.versions())).await?.ok();
-        Ok(self.toolbox_status_of(versions))
+        // Only a shim that answers knows: during a boot there's none yet.
+        let open = *lock(&self.toolbox_state) == ToolboxState::Open;
+        let clients = match open {
+            true => match sessions::probe(&self.layout.session_socket(TOOLBOX_REF)).await {
+                Probe::Running(status) => Some(status.clients.len() as u32),
+                _ => None,
+            },
+            false => None,
+        };
+        Ok(self.toolbox_status_of(versions, clients))
     }
 
     /// `toolbox.logins`: what the newest Linux home holds, from the note
@@ -265,13 +298,7 @@ impl Core {
             .map_err(|e| error(ErrorCode::InternalError, e.to_string()))
     }
 
-    /// The status as it is now, without leaving the current thread.
-    pub fn toolbox_status_now(&self) -> ToolboxStatus {
-        let versions = self.toolbox.as_ref().map(|h| h.versions());
-        self.toolbox_status_of(versions)
-    }
-
-    fn toolbox_status_of(&self, versions: Option<Versions>) -> ToolboxStatus {
+    fn toolbox_status_of(&self, versions: Option<Versions>, clients: Option<u32>) -> ToolboxStatus {
         let Some(versions) = versions.filter(|_| self.toolbox.is_some()) else {
             return ToolboxStatus {
                 state: ToolboxState::Unavailable,
@@ -280,6 +307,7 @@ impl Core {
                 base: None,
                 newest_base: None,
                 last: None,
+                clients: None,
             };
         };
         ToolboxStatus {
@@ -289,6 +317,7 @@ impl Core {
             base: versions.base,
             newest_base: versions.newest_base,
             last: self.kept().last,
+            clients,
         }
     }
 
@@ -447,8 +476,69 @@ impl Core {
         self.finish_run(ToolboxAction::Rebuild, result)
     }
 
+    /// `toolbox.close`: **Save & Close**. Hangs up on the open shell, as
+    /// closing its Terminal window does, waits for it to exit, and saves
+    /// as an exit does; then says how the toolbox is. Closed already, it's
+    /// left as it is. Whoever is attached sees the shell exit.
+    pub async fn close_toolbox(&self, _: NoParams) -> Result<ToolboxStatus, ErrorObject> {
+        let host = self.toolbox_host()?;
+        // As for an open: a long update or rebuild is refused, and a brief
+        // hold (an open, or a save already under way) is waited for.
+        let doing = match *lock(&self.toolbox_state) {
+            ToolboxState::Updating => Some("updating"),
+            ToolboxState::Rebuilding => Some("rebuilding"),
+            _ => None,
+        };
+        if let Some(doing) = doing {
+            return Err(conflict(format!(
+                "the toolbox is busy {doing} the template; try again when it's done"
+            )));
+        }
+        {
+            let _op = self.toolbox_op.lock().await;
+            if host.is_open() {
+                self.hang_up_and_save(host).await?;
+            } else {
+                self.toolbox_closed();
+            }
+        }
+        self.toolbox_status(NoParams {}).await
+    }
+
+    /// Ends the open shell and saves, under the toolbox's lock.
+    async fn hang_up_and_save(&self, host: Arc<dyn ToolboxHost>) -> Result<(), ErrorObject> {
+        let socket = self.layout.session_socket(TOOLBOX_REF);
+        match sessions::probe(&socket).await {
+            Probe::Running(status) => {
+                let pid = status.child_pid;
+                let h = Arc::clone(&host);
+                if let Err(e) = blocking(move || h.hang_up(pid)).await? {
+                    // A shell that had just exited can't be hung up on, and
+                    // is saved like one that was.
+                    if !shim_gone(&socket, JUST_EXITED).await {
+                        return Err(failed(format!("can't close the toolbox shell: {e}")));
+                    }
+                } else if !shim_gone(&socket, HANGUP_PATIENCE).await {
+                    return Err(conflict(
+                        "the toolbox shell didn't exit when asked; exit it in Terminal to save",
+                    ));
+                }
+                crate::log!("vibed: the toolbox shell has gone, to be saved");
+            }
+            Probe::Broken(why) => {
+                return Err(failed(format!(
+                    "the toolbox shell's session isn't answering: {why}"
+                )));
+            }
+            // Nothing holds it (its shim died): nobody is attached, and
+            // the save ends what still runs, as it does after an exit.
+            Probe::Gone => {}
+        }
+        self.save_toolbox(host).await.map(drop)
+    }
+
     /// Once the shell has exited: keeps its new versions.
-    async fn close_toolbox(&self, host: Arc<dyn ToolboxHost>) {
+    async fn save_exited_toolbox(&self, host: Arc<dyn ToolboxHost>) {
         let _op = self.toolbox_op.lock().await;
         if !host.is_open() {
             self.toolbox_closed();
@@ -459,14 +549,22 @@ impl Core {
         if !matches!(sessions::probe(&socket).await, Probe::Gone) {
             return;
         }
+        let _ = self.save_toolbox(host).await;
+    }
+
+    /// Keeps an open toolbox's new versions, under the toolbox's lock, its
+    /// shell gone; and clears what its session left.
+    async fn save_toolbox(&self, host: Arc<dyn ToolboxHost>) -> Result<ToolboxRun, ErrorObject> {
         self.set_toolbox(ToolboxState::Saving);
         let result = match blocking(move || host.close()).await {
             Ok(r) => r,
             Err(e) => Err(vibe_env::EnvError::new(e.message)),
         };
-        let _ = self.finish_run(ToolboxAction::Shell, result);
+        let run = self.finish_run(ToolboxAction::Shell, result);
+        let socket = self.layout.session_socket(TOOLBOX_REF);
         let _ = crate::agents::remove_session_files(&socket);
         let _ = fs::remove_file(self.toolbox_dir().join(shim::RECORD_FILE));
+        run
     }
 
     /// One look at an open toolbox: a shell whose shim has gone is held
@@ -501,6 +599,12 @@ impl Core {
             let Ok(_op) = self.toolbox_op.try_lock() else {
                 return;
             };
+            // Saved and closed by `toolbox.close` since the look above, or
+            // held again by an open: a new shim here would boot it again, or
+            // take the session from under the one that's there.
+            if !host.is_open() || !matches!(sessions::probe(&socket).await, Probe::Gone) {
+                return;
+            }
             let end = {
                 let host = Arc::clone(&host);
                 blocking(move || host.open()).await
@@ -517,7 +621,7 @@ impl Core {
             }
             return;
         }
-        self.close_toolbox(host).await;
+        self.save_exited_toolbox(host).await;
     }
 
     /// Runs the weekly update if it's due.

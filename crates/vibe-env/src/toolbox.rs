@@ -112,6 +112,9 @@ exit 0"#;
 /// small files.
 const LOGINS_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long the hang-up's `kill` may take in the guest.
+const HANGUP_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Lists the logins in the Linux home `$1`, one `<tool>\t<whose>` per line,
 /// from the files the tools keep, so nothing goes over the network and no
 /// secret is printed: every account `gh` holds on each host (its `user` and
@@ -241,6 +244,14 @@ pub trait ToolboxHost: Send + Sync + fmt::Debug {
     fn is_open(&self) -> bool;
     /// Whether the open shell's command still runs.
     fn shell_running(&self) -> bool;
+    /// Hangs up on the open shell, as closing its terminal does: `SIGHUP`
+    /// to its process group, so the shell saves its history and ends what
+    /// it started. `shell_pid` is its pid where it runs, as its shim says
+    /// (`child_pid`): in the VM, for the real toolbox. Then [`close`] saves
+    /// once the shell has exited.
+    ///
+    /// [`close`]: ToolboxHost::close
+    fn hang_up(&self, shell_pid: u32) -> Result<()>;
     /// After the shell exits: seals, powers off and keeps the next version
     /// of the template and of the home. If the VM stopped first, nothing
     /// is kept and the error says so.
@@ -757,6 +768,9 @@ impl Toolbox {
             return Ok(ran.output);
         }
         let how = match (ran.timed_out, ran.code, ran.signal) {
+            (true, _, _) if timeout.as_secs() < 60 => {
+                format!("didn't finish in {} seconds", timeout.as_secs())
+            }
             (true, _, _) => format!("didn't finish in {} minutes", timeout.as_secs() / 60),
             (_, Some(code), _) => format!("exited with code {code}"),
             (_, None, Some(signal)) => format!("was ended by {signal}"),
@@ -964,6 +978,29 @@ impl ToolboxHost for Toolbox {
                 .machine
                 .status(&socket)
                 .is_ok_and(|s| s.state == GuestState::Running)
+    }
+
+    fn hang_up(&self, shell_pid: u32) -> Result<()> {
+        if self.opened().is_none() {
+            return Err(err("no toolbox shell is open"));
+        }
+        if shell_pid <= 1 {
+            return Err(err(format!("{shell_pid} isn't the toolbox shell's pid")));
+        }
+        // The guest started the shell leading its own session and group;
+        // its `kill` names the group, as the shim's hang-up does here.
+        self.run(
+            "hanging up on the toolbox shell",
+            vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "kill -s HUP -- \"-$1\"".into(),
+                "hang-up".into(),
+                shell_pid.to_string(),
+            ],
+            HANGUP_TIMEOUT,
+        )
+        .map(drop)
     }
 
     fn close(&self) -> Result<Saved> {
