@@ -58,6 +58,23 @@ const PI_ERROR_HELP: &str = "Use /login to log into a provider via OAuth or API 
     Credentials may have expired or network is unavailable. \
     Run to re-authenticate.";
 
+/// Whether `text` is still in the editor on a Pi's screen, between the two rules
+/// around it. Once Pi's taken a submit, the editor's empty.
+pub fn pi_editor_holds(screen: &str, text: &str) -> bool {
+    let Some(first) = text.lines().find(|l| !l.trim().is_empty()) else {
+        return false;
+    };
+    // Enough to know it by: a long line wraps in the editor.
+    let first: String = first.trim().chars().take(20).collect();
+    let lines: Vec<&str> = screen.lines().collect();
+    let is_rule = |l: &&str| l.trim().chars().count() >= 10 && l.trim().chars().all(|c| c == '─');
+    let mut rules = (0..lines.len()).rev().filter(|&i| is_rule(&lines[i]));
+    let (Some(below), Some(above)) = (rules.next(), rules.next()) else {
+        return false;
+    };
+    lines[above + 1..below].iter().any(|l| l.contains(&first))
+}
+
 /// What Pi's screen says stopped its turn before it started, if it does. Pi draws
 /// what it's told in order, so the error has to be the last thing above its
 /// editor, its own help and all: a message since, a tool's output that only reads
@@ -180,6 +197,34 @@ fn option(line: &str, word: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The screens are a real Pi 1.5.0's, in the shape they come.
+    #[test]
+    fn what_a_pi_hasnt_taken_is_in_its_editor() {
+        let rule = "─".repeat(80);
+        let screen = |above: &str, editor: &str| {
+            format!("{above}\n\n{rule}\n{editor}\n{rule}\n/tmp/x (x)\n↑4 ↓4 0.0%/128k (auto)\n")
+        };
+        // Handed back while it's starting, or after, once what said so has gone.
+        let held = screen(" Startup is still in progress", "after a reboot");
+        assert!(pi_editor_holds(&held, "after a reboot"));
+        assert!(pi_editor_holds(
+            &screen(" Answered.", "after a reboot"),
+            "after a reboot"
+        ));
+        // Taken: it's above the editor now, which is empty.
+        assert!(!pi_editor_holds(
+            &screen(" after a reboot", ""),
+            "after a reboot"
+        ));
+        assert!(!pi_editor_holds(&held, "something else"));
+        assert!(!pi_editor_holds(&held, ""));
+        // A long line wraps, and is known by its start.
+        let long = "x".repeat(200);
+        assert!(pi_editor_holds(&screen(" hi", &"x".repeat(80)), &long));
+        // With no editor to look in, it isn't this.
+        assert!(!pi_editor_holds("hi\nthere", "hi"));
+    }
 
     const EDITOR: &str =
         "\n──────────────────\n>\n──────────────────\n~/w  anthropic/claude-sonnet-4  0%\n";

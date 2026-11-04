@@ -419,6 +419,9 @@ pub struct Core {
     pub(crate) sends: Mutex<HashMap<String, vibe_status::Mark>>,
     /// When a Pi agent was last sent a line to answer.
     pub(crate) pi_sent_at: Mutex<HashMap<String, vibe_status::Timestamp>>,
+    /// When each agent's program was last started, until a send has waited for
+    /// it to take input (`Core::wait_started`).
+    pub(crate) started_at: Mutex<HashMap<String, std::time::Instant>>,
     /// What's wrong with a copy of Pi's login, or with the store, by what it's
     /// about (PRD: Who gets which credentials).
     pub(crate) pi_alerts: Mutex<std::collections::BTreeMap<String, String>>,
@@ -628,6 +631,7 @@ impl Core {
             tails: Mutex::new(HashMap::new()),
             sends: Mutex::new(HashMap::new()),
             pi_sent_at: Mutex::new(HashMap::new()),
+            started_at: Mutex::new(HashMap::new()),
             pi_alerts: Mutex::new(std::collections::BTreeMap::new()),
             mac_heard: Mutex::new(heard_at_start),
             sends_kept: Mutex::new(HashMap::new()),

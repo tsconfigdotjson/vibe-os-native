@@ -17,7 +17,7 @@ mod watch;
 
 pub use agent_tail::Timestamp;
 pub use messages::{Message, Role, last_messages};
-pub use screen::{approval_on_screen, pi_error_at_exit, pi_error_on_screen};
+pub use screen::{approval_on_screen, pi_editor_holds, pi_error_at_exit, pi_error_on_screen};
 pub use tail::{INFERRED_QUIET, Mark, Status, Tail, Wakeup, state_of};
 pub use watch::Watcher;
 

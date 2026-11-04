@@ -348,6 +348,7 @@ impl Core {
         lock(&self.tails).retain(|r, _| refs.contains(r.as_str()));
         lock(&self.sends).retain(|r, _| refs.contains(r.as_str()));
         lock(&self.pi_sent_at).retain(|r, _| refs.contains(r.as_str()));
+        lock(&self.started_at).retain(|r, _| refs.contains(r.as_str()));
         published.retain(|r, _| refs.contains(r.as_str()));
         let debounce = self.idle_debounce();
         let mut paths = Vec::new();
