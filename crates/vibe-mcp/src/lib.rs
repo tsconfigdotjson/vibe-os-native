@@ -144,6 +144,8 @@ pub struct AgentView {
     /// False while its host's link is down: it's the agent as its host
     /// last listed it, and calls for it fail until the link is back.
     pub available: bool,
+    /// When it was last seen, if it's unavailable and that's known.
+    pub last_seen: Option<String>,
 }
 
 /// A message of an agent's conversation.
@@ -170,6 +172,12 @@ pub trait Daemon: Send + Sync + 'static {
     /// The name of the API key `secret` is, if it's a key; checking it
     /// records that it was used.
     fn verify_key(&self, secret: &str) -> Option<String>;
+
+    /// The host `agent` was last seen on, as `c` may know it, with no asking: so
+    /// that a bare ref needn't go looking on every host.
+    fn known_host(&self, _c: &Caller, _agent: &str) -> Option<String> {
+        None
+    }
 
     /// Every host this one can reach now, itself (`local`) first.
     fn hosts(&self) -> impl Future<Output = Result<Vec<String>, Error>> + Send;

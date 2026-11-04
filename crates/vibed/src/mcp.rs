@@ -28,6 +28,10 @@ use vibe_mcp::{AgentView, Caller, Check, Daemon, Input, Message, Screen, Sent, T
 
 use crate::core::{Core, error, invalid, limits_error, lock};
 use crate::external::MacPeer;
+
+/// How long another host gets to answer a listing or a lookup: nothing local waits
+/// on one for longer than this, whatever state it's in.
+const PEER_READ: Duration = Duration::from_secs(3);
 use crate::hosts::call_timeout;
 
 /// A value the Mac answered with, as `T`.
@@ -174,15 +178,19 @@ impl Core {
     /// attaches from another machine.
     pub async fn agent_views(&self, host: &str) -> Result<Vec<AgentView>, ErrorObject> {
         if let Some(link) = self.link(host) {
-            let available = link.connected();
-            return Ok(self
-                .remote_agents(&link)
-                .await
+            // A link that's up but stuck is let go, with what it last listed.
+            let (agents, available) =
+                match tokio::time::timeout(PEER_READ, self.remote_agents(&link)).await {
+                    Ok(agents) => (agents, link.connected()),
+                    Err(_) => (self.kept_agents(&link), false),
+                };
+            return Ok(agents
                 .into_iter()
                 .map(|agent| AgentView {
                     // Its attach line is the one that reaches it from here.
                     attach_remote: agent.attach.clone(),
                     available,
+                    last_seen: None,
                     agent,
                 })
                 .collect());
@@ -200,6 +208,7 @@ impl Core {
             .map(|agent| AgentView {
                 attach_remote: format!("ssh -t {machine} {vibe} attach {}", agent.agent),
                 available: true,
+                last_seen: None,
                 agent,
             })
             .collect())
@@ -245,6 +254,20 @@ impl Daemon for Core {
         }
     }
 
+    fn known_host(&self, c: &Caller, agent: &str) -> Option<String> {
+        if let Some(seen) = self.mac().and_then(|mac| mac.last_seen(c.key()))
+            && seen.iter().any(|a| a.agent == agent)
+        {
+            return Some(MAC_HOST.to_owned());
+        }
+        let links: Vec<Arc<crate::link::Link>> =
+            crate::core::lock(&self.links).values().cloned().collect();
+        links
+            .iter()
+            .find(|l| self.kept_agents(l).iter().any(|a| a.agent == agent))
+            .map(|l| l.name.clone())
+    }
+
     async fn hosts(&self) -> Result<Vec<String>, ErrorObject> {
         let mut hosts: Vec<String> = Core::hosts(self)?
             .hosts
@@ -272,12 +295,7 @@ impl Daemon for Core {
             && !all.iter().any(|(h, _)| h == MAC_HOST)
         {
             let own = mac
-                .call(
-                    c.key(),
-                    HostsList::NAME,
-                    json!({}),
-                    call_timeout(HostsList::NAME),
-                )
+                .call(c.key(), HostsList::NAME, json!({}), PEER_READ)
                 .await
                 .and_then(typed::<HostList>)
                 .ok()
@@ -293,20 +311,22 @@ impl Daemon for Core {
     async fn projects(&self, c: &Caller, host: &str) -> Result<Vec<Project>, ErrorObject> {
         if let Some(mac) = self.mac_for(host) {
             let v = mac
-                .call(
-                    c.key(),
-                    ProjectsList::NAME,
-                    json!({}),
-                    call_timeout(ProjectsList::NAME),
-                )
+                .call(c.key(), ProjectsList::NAME, json!({}), PEER_READ)
                 .await?;
             return Ok(typed::<ProjectList>(v)?.projects);
         }
         if let Some(link) = self.link(host) {
-            return Ok(self
-                .forward_typed::<ProjectsList>(&link, &HostParams::default())
-                .await?
-                .projects);
+            let asked = self.forward_typed::<ProjectsList>(&link, &HostParams::default());
+            return match tokio::time::timeout(PEER_READ, asked).await {
+                Ok(list) => Ok(list?.projects),
+                Err(_) => Err(error(
+                    ErrorCode::HostUnavailable,
+                    format!(
+                        "{host} is unavailable: it didn't answer in {} s",
+                        PEER_READ.as_secs()
+                    ),
+                )),
+            };
         }
         Ok(Core::projects(
             self,
@@ -320,12 +340,7 @@ impl Daemon for Core {
     async fn agents(&self, c: &Caller, host: &str) -> Result<Vec<AgentView>, ErrorObject> {
         if let Some(mac) = self.mac_for(host) {
             let listed = mac
-                .call(
-                    c.key(),
-                    AgentsList::NAME,
-                    json!({}),
-                    call_timeout(AgentsList::NAME),
-                )
+                .call(c.key(), AgentsList::NAME, json!({}), PEER_READ)
                 .await
                 .and_then(typed::<AgentList>);
             let (agents, available) = match listed {
@@ -356,6 +371,7 @@ impl Daemon for Core {
                     // It attaches from a terminal on the Mac.
                     attach_remote: format!("on the Mac: {}", agent.attach),
                     available,
+                    last_seen: (!available).then(|| mac.seen_at(c.key())).flatten(),
                     agent,
                 })
                 .collect());

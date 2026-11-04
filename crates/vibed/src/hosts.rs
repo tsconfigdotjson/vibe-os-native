@@ -475,7 +475,7 @@ impl Core {
         self.kept_agents(link)
     }
 
-    fn kept_agents(&self, link: &Link) -> Vec<Agent> {
+    pub(crate) fn kept_agents(&self, link: &Link) -> Vec<Agent> {
         let kept = self.store().host_agents(&link.name).unwrap_or_default();
         serde_json::from_str::<Vec<Agent>>(&kept).unwrap_or_default()
     }

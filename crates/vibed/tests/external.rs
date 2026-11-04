@@ -19,7 +19,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::{Golden, TestServer, serve};
 use rustls::pki_types::{CertificateDer, ServerName};
@@ -45,6 +45,9 @@ const DOMAIN: &str = "vps.test";
 struct Wires {
     sockets: Mutex<HashMap<String, PathBuf>>,
     up: watch::Sender<bool>,
+    /// Nothing gets through, but nothing ends either, and new connections are
+    /// still accepted: a Mac asleep, with sshd none the wiser.
+    frozen: watch::Sender<bool>,
     /// Bumped to end every dial, as stopping the host's `vibed` ends each
     /// `vibe rpc`, while tunnels stay: sshd holds those.
     hang_up: watch::Sender<u64>,
@@ -58,6 +61,7 @@ impl Wires {
         Arc::new(Wires {
             sockets: Mutex::new(HashMap::new()),
             up: watch::channel(true).0,
+            frozen: watch::channel(false).0,
             hang_up: watch::channel(0).0,
             tunnels: Mutex::new(0),
             forwarding: AtomicBool::new(true),
@@ -72,13 +76,22 @@ impl Wires {
         self.up.send_replace(true);
     }
 
+    fn freeze(&self, frozen: bool) {
+        self.frozen.send_replace(frozen);
+    }
+
     fn hang_up_dials(&self) {
         self.hang_up.send_modify(|n| *n += 1);
     }
 }
 
 /// Copies bytes both ways until either side ends or the network goes.
-async fn pump(a: UnixStream, b: UnixStream, mut up: watch::Receiver<bool>) {
+async fn pump(
+    a: UnixStream,
+    b: UnixStream,
+    mut up: watch::Receiver<bool>,
+    mut frozen: watch::Receiver<bool>,
+) {
     let (mut ar, mut aw) = a.into_split();
     let (mut br, mut bw) = b.into_split();
     let mut x = vec![0u8; 1 << 16];
@@ -87,8 +100,16 @@ async fn pump(a: UnixStream, b: UnixStream, mut up: watch::Receiver<bool>) {
         if !*up.borrow_and_update() {
             return;
         }
+        if *frozen.borrow_and_update() {
+            tokio::select! {
+                _ = up.changed() => {}
+                _ = frozen.changed() => {}
+            }
+            continue;
+        }
         tokio::select! {
             _ = up.changed() => {}
+            _ = frozen.changed() => {}
             n = ar.read(&mut x) => match n {
                 Ok(0) | Err(_) => return,
                 Ok(n) => if bw.write_all(&x[..n]).await.is_err() { return },
@@ -117,10 +138,11 @@ impl Remote for Wires {
                 .map_err(|e| format!("vibe: can't reach vibed: {e}"))?;
             let (ours, theirs) = UnixStream::pair().map_err(|e| e.to_string())?;
             let up = self.up.subscribe();
+            let frozen = self.frozen.subscribe();
             let mut hang_up = self.hang_up.subscribe();
             tokio::spawn(async move {
                 tokio::select! {
-                    () = pump(host, theirs, up) => {}
+                    () = pump(host, theirs, up, frozen) => {}
                     _ = hang_up.changed() => {}
                 }
             });
@@ -170,6 +192,7 @@ impl Remote for Wires {
             let local = local.to_owned();
             let mut up = self.up.subscribe();
             let pumps = self.up.clone();
+            let frozen = self.frozen.clone();
             Ok(TunnelChild {
                 ended: Box::pin(async move {
                     loop {
@@ -177,7 +200,12 @@ impl Remote for Wires {
                             accepted = listener.accept() => {
                                 let Ok((there, _)) = accepted else { continue };
                                 let Ok(here) = UnixStream::connect(&local).await else { continue };
-                                tokio::spawn(pump(there, here, pumps.subscribe()));
+                                tokio::spawn(pump(
+                                    there,
+                                    here,
+                                    pumps.subscribe(),
+                                    frozen.subscribe(),
+                                ));
                             }
                             _ = up.changed() => {
                                 if !*up.borrow_and_update() {
@@ -841,6 +869,133 @@ async fn one_url_and_one_key_reach_agents_on_the_host_and_the_mac() {
     assert!(!socket.exists(), "{} is left", socket.display());
     assert!(!vibe_core::socket::lock_path(&socket).exists());
     assert!(!w.host.hosts().unwrap().hosts[0].external);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sleeping_mac_holds_up_nothing_on_the_host() {
+    let w = world(limits()).await;
+    w.turn_on().await;
+    let key = w.key("laptop");
+    w.pushed(&key).await;
+    let mut c = w.client(&key);
+    for (host, name, profile) in [
+        ("local", "on-vps", "software-eng-linux"),
+        ("mac", "on-mac", "software-eng-mac"),
+        ("local", "on-both", "software-eng-linux"),
+        ("mac", "on-both", "software-eng-mac"),
+    ] {
+        c.call(
+            "vibe_start_agent",
+            json!({"project": "app", "profile": profile, "prompt": format!("hello {host}"),
+                   "host": host, "name": name}),
+        )
+        .await;
+    }
+    for agent in ["on-vps", "mac:on-mac", "on-both", "mac:on-both"] {
+        c.call("vibe_wait", json!({"agents": agent, "timeout": 60}))
+            .await;
+    }
+    // A key's first listing of the Mac is what later ones fall back on.
+    let listed = c.call("vibe_list_agents", json!({})).await;
+    assert!(listed.contains("mac:on-mac"), "{listed}");
+    assert!(!listed.contains("unavailable"), "{listed}");
+
+    // This host wins a bare ref that's on both, with no asking.
+    let read = c
+        .call("vibe_read_messages", json!({"agent": "on-both", "last": 1}))
+        .await;
+    assert!(read.contains("> hello local"), "{read}");
+    let read = c
+        .call(
+            "vibe_read_messages",
+            json!({"agent": "mac:on-both", "last": 1}),
+        )
+        .await;
+    assert!(read.contains("> hello mac"), "{read}");
+
+    // The Mac sleeps. Its tunnel's end goes on accepting, with nothing behind it,
+    // and before anything's noticed that costs a listing a few seconds at most.
+    w.wires.freeze(true);
+    let started = Instant::now();
+    let listed = c.call("vibe_list_agents", json!({})).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(listed.contains("on-vps"), "{listed}");
+    let mac_line = listed
+        .lines()
+        .find(|l| l.starts_with("mac:on-mac"))
+        .unwrap_or_else(|| panic!("{listed}"));
+    assert!(
+        mac_line.contains("unavailable") && mac_line.contains("last seen at 20"),
+        "{mac_line}"
+    );
+
+    // Once the look at the tunnel has failed, nothing waits at all.
+    for _ in 0..1000 {
+        if w.host.hosts().unwrap().hosts[0].tunnel != Some(TunnelState::Up) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_ne!(
+        w.host.hosts().unwrap().hosts[0].tunnel,
+        Some(TunnelState::Up)
+    );
+    let started = Instant::now();
+    let listed = c.call("vibe_list_agents", json!({})).await;
+    assert!(listed.contains("on-vps"), "{listed}");
+    assert!(listed.contains("unavailable"), "{listed}");
+    let projects = c.call("vibe_list_projects", json!({})).await;
+    assert!(projects.contains("app (on local)"), "{projects}");
+    assert!(projects.contains("mac is unavailable"), "{projects}");
+    let read = c
+        .call("vibe_read_messages", json!({"agent": "on-vps", "last": 1}))
+        .await;
+    assert!(read.contains("> hello local"), "{read}");
+    // Where a bare ref was last seen is known, so it's not looked for.
+    let failed = c
+        .fails("vibe_read_messages", json!({"agent": "on-mac", "last": 1}))
+        .await;
+    assert!(failed.contains("mac is unavailable"), "{failed}");
+    let failed = c
+        .fails(
+            "vibe_send",
+            json!({"agent": "mac:on-mac", "text": "anyone?"}),
+        )
+        .await;
+    assert!(failed.contains("mac is unavailable"), "{failed}");
+    // A project on both goes to the only host answering.
+    let started_here = c
+        .call(
+            "vibe_start_agent",
+            json!({"project": "app", "profile": "software-eng-linux", "prompt": "talk",
+                   "name": "while-away"}),
+        )
+        .await;
+    assert!(
+        started_here.contains("started while-away"),
+        "{started_here}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "all of that together: {:?}",
+        started.elapsed()
+    );
+
+    // It wakes, and it all snaps back with nothing done.
+    w.wires.freeze(false);
+    for _ in 0..1000 {
+        if w.host.hosts().unwrap().hosts[0].tunnel == Some(TunnelState::Up) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let listed = c.call("vibe_list_agents", json!({})).await;
+    assert!(listed.contains("mac:on-mac"), "{listed}");
+    assert!(!listed.contains("unavailable"), "{listed}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

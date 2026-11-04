@@ -34,6 +34,10 @@ pub const MAX_RESULT_CHARS: usize = 32_000;
 pub const MAX_WAIT_SECS: u64 = 240;
 const DEFAULT_WAIT_SECS: u64 = 120;
 
+/// How long another host gets to answer a listing or a lookup. The daemon gives
+/// up a little sooner, with what that host last said; this is for one that doesn't.
+const PEER_WAIT: Duration = Duration::from_secs(4);
+
 /// How often a wait reports progress when nothing has changed, so a
 /// client's idle timeout never fires on a long turn.
 const PROGRESS_EVERY: Duration = Duration::from_secs(20);
@@ -346,6 +350,9 @@ fn agent_json(v: &AgentView) -> Value {
     if let Value::Object(m) = &mut j {
         m.insert("attach_remote".into(), json!(v.attach_remote));
         m.insert("available".into(), json!(v.available));
+        if let Some(at) = &v.last_seen {
+            m.insert("last_seen".into(), json!(at));
+        }
     }
     j
 }
@@ -389,8 +396,12 @@ fn agent_line(v: &AgentView) -> String {
     }
     parts.push(format!("attach: {}", v.attach_remote));
     if !v.available {
+        let at = v
+            .last_seen
+            .as_ref()
+            .map_or(String::new(), |at| format!(" at {at}"));
         parts.push(format!(
-            "unavailable: {} can't be reached now, so this is how it was last seen",
+            "unavailable: {} can't be reached now, so this is how it was last seen{at}",
             a.host
         ));
     }
@@ -462,8 +473,42 @@ impl<D: Daemon> Server<D> {
         Server { daemon }
     }
 
-    /// The host and ref `name` names. A bare ref is this host's, unless
-    /// another host has it and this one doesn't.
+    /// Asks `hosts` all at once. This host's answer never waits on another's, and
+    /// another that's slow is let go after a few seconds and said to be unavailable,
+    /// so no peer is ever on the critical path of a local answer. In `hosts`' order.
+    async fn ask_all<T, F, Fut>(&self, hosts: &[String], ask: F) -> Vec<(String, Result<T, Error>)>
+    where
+        T: Send + 'static,
+        F: Fn(Arc<D>, String) -> Fut,
+        Fut: Future<Output = Result<T, Error>> + Send + 'static,
+    {
+        let mut asked = tokio::task::JoinSet::new();
+        for (i, host) in hosts.iter().enumerate() {
+            let answer = ask(Arc::clone(&self.daemon), host.clone());
+            let host = host.clone();
+            asked.spawn(async move {
+                if host == LOCAL_HOST {
+                    return (i, host, answer.await);
+                }
+                let answer = tokio::time::timeout(PEER_WAIT, answer)
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(Error::new(
+                            ErrorCode::HostUnavailable,
+                            format!("didn't answer in {} s", PEER_WAIT.as_secs()),
+                        ))
+                    });
+                (i, host, answer)
+            });
+        }
+        let mut answers = asked.join_all().await;
+        answers.sort_by_key(|(i, _, _)| *i);
+        answers.into_iter().map(|(_, h, a)| (h, a)).collect()
+    }
+
+    /// The host and ref `name` names. A bare ref is this host's whenever this
+    /// host has it, whoever else does: nothing else is asked. If not, it's where
+    /// it was last seen, and only failing that are the others asked, all at once.
     async fn resolve(&self, c: &Caller, name: &str) -> Result<Target, String> {
         let (host, agent) = split_ref(name);
         if agent.is_empty() {
@@ -480,14 +525,29 @@ impl<D: Daemon> Server<D> {
         if hosts.len() <= 1 {
             return Ok(target(hosts.first().map_or(LOCAL_HOST, String::as_str)));
         }
-        let mut found = Vec::new();
-        for h in &hosts {
-            if let Ok(list) = self.daemon.agents(c, h).await
-                && list.iter().any(|v| v.agent.agent == agent)
-            {
-                found.push(h.clone());
-            }
+        let here = self.daemon.agents(c, LOCAL_HOST).await;
+        if here.is_ok_and(|list| list.iter().any(|v| v.agent.agent == agent)) {
+            return Ok(target(LOCAL_HOST));
         }
+        if let Some(h) = self.daemon.known_host(c, agent) {
+            return Ok(target(&h));
+        }
+        let others: Vec<String> = hosts.into_iter().filter(|h| h != LOCAL_HOST).collect();
+        let caller = c.clone();
+        let answers = self
+            .ask_all(&others, move |d, h| {
+                let c = caller.clone();
+                async move { d.agents(&c, &h).await }
+            })
+            .await;
+        let found: Vec<String> = answers
+            .into_iter()
+            .filter(|(_, list)| {
+                list.as_ref()
+                    .is_ok_and(|l| l.iter().any(|v| v.agent.agent == agent))
+            })
+            .map(|(h, _)| h)
+            .collect();
         match found.as_slice() {
             [] => Ok(target(LOCAL_HOST)),
             [one] => Ok(target(one)),
@@ -511,8 +571,15 @@ impl<D: Daemon> Server<D> {
         };
         let mut projects = Vec::new();
         let mut unreachable = Vec::new();
-        for h in &hosts {
-            match self.daemon.projects(c, h).await {
+        let caller = c.clone();
+        let answers = self
+            .ask_all(&hosts, move |d, h| {
+                let c = caller.clone();
+                async move { d.projects(&c, &h).await }
+            })
+            .await;
+        for (h, answer) in answers {
+            match answer {
                 Ok(p) => projects.extend(p),
                 Err(e) if only.is_some() => return Err(e.message),
                 Err(e) => unreachable.push(format!("{h} is unavailable: {}", e.message)),
@@ -588,14 +655,20 @@ impl<D: Daemon> Server<D> {
     /// The one host `project` is on.
     async fn project_host(&self, c: &Caller, project: &str) -> Result<String, String> {
         let hosts = self.daemon.hosts().await.map_err(|e| e.message)?;
-        let mut on = Vec::new();
-        for h in &hosts {
-            if let Ok(list) = self.daemon.projects(c, h).await
-                && list.iter().any(|p| p.name == project)
-            {
-                on.push(h.clone());
-            }
-        }
+        let caller = c.clone();
+        let on: Vec<String> = self
+            .ask_all(&hosts, move |d, h| {
+                let c = caller.clone();
+                async move { d.projects(&c, &h).await }
+            })
+            .await
+            .into_iter()
+            .filter(|(_, list)| {
+                list.as_ref()
+                    .is_ok_and(|l| l.iter().any(|p| p.name == project))
+            })
+            .map(|(h, _)| h)
+            .collect();
         match on.as_slice() {
             [one] => Ok(one.clone()),
             [] if hosts.len() <= 1 => Ok(hosts.first().cloned().unwrap_or(LOCAL_HOST.into())),
@@ -625,8 +698,16 @@ impl<D: Daemon> Server<D> {
         };
         let mut agents = Vec::new();
         let mut unreachable = Vec::new();
-        for h in &hosts {
-            match self.daemon.agents(c, h).await {
+        let caller = c.clone();
+        let (answers, memory) = tokio::join!(
+            self.ask_all(&hosts, move |d, h| {
+                let c = caller.clone();
+                async move { d.agents(&c, &h).await }
+            }),
+            self.daemon.memory(c)
+        );
+        for (h, answer) in answers {
+            match answer {
                 Ok(list) => agents.extend(list),
                 Err(e) if only.is_some() => return Err(e.message),
                 Err(e) => unreachable.push(format!("{h} is unavailable: {}", e.message)),
@@ -642,10 +723,7 @@ impl<D: Daemon> Server<D> {
         }
         text.extend(unreachable);
         let list: Vec<Value> = agents.iter().map(agent_json).collect();
-        let memory: Vec<(String, MemoryUse)> = self
-            .daemon
-            .memory(c)
-            .await
+        let memory: Vec<(String, MemoryUse)> = memory
             .into_iter()
             .filter(|(h, _)| only.as_ref().is_none_or(|o| o == h))
             .collect();

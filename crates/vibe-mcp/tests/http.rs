@@ -5,8 +5,9 @@ mod client;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use client::{Client, post_raw, text};
 use serde_json::{Value, json};
@@ -41,6 +42,8 @@ struct Fake {
     backgrounds: Mutex<Vec<bool>>,
     /// History given with `after`.
     history: Mutex<Option<Vec<String>>>,
+    /// `vps` takes every listing and never answers, as a host stalling would.
+    stuck: AtomicBool,
     /// Checks of an agent, by their count, that find its host's link down.
     link_down: Mutex<HashMap<String, std::ops::RangeInclusive<u32>>>,
 }
@@ -130,6 +133,9 @@ impl Daemon for Fake {
     }
 
     async fn projects(&self, _c: &Caller, host: &str) -> Result<Vec<Project>, ErrorObject> {
+        if host == "vps" && self.stuck.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
         match host {
             "local" => Ok(vec![project("local", "app"), project("local", "web")]),
             "vps" => Ok(vec![project("vps", "web")]),
@@ -142,6 +148,9 @@ impl Daemon for Fake {
     }
 
     async fn agents(&self, _c: &Caller, host: &str) -> Result<Vec<AgentView>, ErrorObject> {
+        if host == "vps" && self.stuck.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
         if host == "down" {
             return Err(ErrorObject::new(
                 ErrorCode::InternalError,
@@ -154,6 +163,7 @@ impl Daemon for Fake {
             .map(|a| AgentView {
                 attach_remote: format!("ssh -t mac {}", a.attach),
                 available: true,
+                last_seen: None,
                 agent: a,
             })
             .collect())
@@ -589,6 +599,48 @@ async fn agents_on_every_host_filtered() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_that_doesnt_answer_holds_up_nothing_of_this_ones() {
+    let (fake, mut c) = client().await;
+    fake.stuck.store(true, Ordering::SeqCst);
+
+    let started = Instant::now();
+    let r = c.call("vibe_list_agents", json!({})).await;
+    let t = text(&r);
+    assert!(t.contains("quiet-amber-otter  idle"), "{t}");
+    assert!(
+        t.contains("vps is unavailable: didn't answer in 4 s"),
+        "{t}"
+    );
+    let r = c.call("vibe_list_projects", json!({})).await;
+    let t = text(&r);
+    assert!(t.contains("app (on local)"), "{t}");
+    assert!(
+        t.contains("vps is unavailable: didn't answer in 4 s"),
+        "{t}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "{:?}",
+        started.elapsed()
+    );
+
+    // A bare ref this host has doesn't ask anyone, stuck or not.
+    let started = Instant::now();
+    c.call("vibe_read_output", json!({"agent": "quiet-amber-otter"}))
+        .await;
+    assert!(started.elapsed() < Duration::from_secs(2));
+
+    // And a project this host has goes here, with the other only let go.
+    let r = c
+        .call(
+            "vibe_start_agent",
+            json!({"project": "web", "profile": "p", "prompt": "go"}),
+        )
+        .await;
+    assert!(text(&r).contains("on local"), "{r}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sends_route_by_ref_and_type_text_or_keys() {
     let (fake, mut c) = client().await;
     let r = c
@@ -695,18 +747,12 @@ async fn sends_route_by_ref_and_type_text_or_keys() {
         .fails("vibe_send", json!({"agent": "slow", "keys": ["F13"]}))
         .await;
     assert!(e.starts_with("unknown key \"F13\""), "{e}");
-    // A bare ref on two hosts must say which; one on none is the core's
-    // not-found, with where to look.
-    let e = c
-        .fails(
-            "vibe_send",
-            json!({"agent": "quiet-amber-otter", "text": "x"}),
-        )
+    // A bare ref on this host and another is this host's; one on none is the
+    // core's not-found, with where to look.
+    c.call("vibe_read_output", json!({"agent": "quiet-amber-otter"}))
         .await;
-    assert_eq!(
-        e,
-        "quiet-amber-otter is on local and vps: name it with its host, as local:quiet-amber-otter or vps:quiet-amber-otter"
-    );
+    let read = fake.reads.lock().unwrap().last().unwrap().0.clone();
+    assert_eq!(read.host, "local");
     let e = c
         .fails("vibe_send", json!({"agent": "ghost", "text": "x"}))
         .await;

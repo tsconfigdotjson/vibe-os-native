@@ -118,8 +118,19 @@ pub(crate) struct MacPeer {
     /// The Mac's agents as each key last listed them, by the key's hash, to
     /// show unavailable while the tunnel is down. Only to that key: one the
     /// Mac doesn't take never sees them.
-    seen: Mutex<HashMap<String, Vec<Agent>>>,
+    seen: Mutex<HashMap<String, (i64, Vec<Agent>)>>,
 }
+
+/// How long a call waits its turn at the Mac, as stuck calls mustn't queue new
+/// ones for as long as they're stuck.
+const TURN_WITHIN: Duration = Duration::from_secs(3);
+
+/// How often a call under way looks at whether the Mac's been found gone.
+const STILL_THERE_EVERY: Duration = Duration::from_millis(250);
+
+/// Calls whose work may well carry on at the Mac whether or not anyone's listening,
+/// so a look that fails, as on a host stalling for a moment, isn't their answer.
+const SEES_ITSELF_THROUGH: &[&str] = &["agents.start", "agents.delete"];
 
 /// Channels to the Mac kept between calls, and for how long.
 const MAX_IDLE: usize = 4;
@@ -223,11 +234,17 @@ impl MacPeer {
         if let Some(map) = params.as_object_mut() {
             map.remove("host");
         }
+        // Asleep, the end of its tunnel may accept and then say nothing: once the
+        // look at it has found that, nothing more is sent there to wait for.
+        if !self.is_up() {
+            return Err(mac_unavailable(
+                "it didn't answer the last look at its tunnel",
+            ));
+        }
         let message = json!({"key": key, "method": method, "params": params});
-        let _turn = self
-            .calls
-            .acquire()
+        let _turn = tokio::time::timeout(TURN_WITHIN, self.calls.acquire())
             .await
+            .map_err(|_| mac_unavailable("too many calls to it are stuck"))?
             .map_err(|_| mac_unavailable("its tunnel is closing"))?;
         // A channel kept from before may lead to a tunnel since replaced:
         // one that fails is followed by a fresh one, once.
@@ -252,8 +269,18 @@ impl MacPeer {
                     }
                 },
             };
-            let answer =
-                tokio::time::timeout(timeout, channel.call("tunnel.call", message.clone())).await;
+            let waiting =
+                tokio::time::timeout(timeout, channel.call("tunnel.call", message.clone()));
+            let answer = if SEES_ITSELF_THROUGH.contains(&method) {
+                waiting.await
+            } else {
+                tokio::select! {
+                    answer = waiting => answer,
+                    () = self.found_gone() => {
+                        return Err(mac_unavailable("it stopped answering"));
+                    }
+                }
+            };
             let outcome = match answer {
                 Err(_) => {
                     return Err(mac_unavailable(&format!(
@@ -290,6 +317,13 @@ impl MacPeer {
         }
     }
 
+    /// Ends once the look at the tunnel finds the Mac gone.
+    async fn found_gone(&self) {
+        while self.is_up() {
+            tokio::time::sleep(STILL_THERE_EVERY).await;
+        }
+    }
+
     /// Keeps what `key` last listed of the Mac's agents.
     pub(crate) fn saw(&self, key: &str, agents: &[Agent]) {
         let mut seen = lock(&self.seen);
@@ -297,7 +331,7 @@ impl MacPeer {
         if !seen.contains_key(&k) && seen.len() >= MAX_SEEN {
             seen.clear();
         }
-        seen.insert(k, agents.to_vec());
+        seen.insert(k, (vibe_core::time::now(), agents.to_vec()));
     }
 
     /// Forgets what `key` listed, as when the Mac no longer takes it.
@@ -312,7 +346,16 @@ impl MacPeer {
 
     /// What `key` last listed of the Mac's agents, if it listed them.
     pub(crate) fn last_seen(&self, key: &str) -> Option<Vec<Agent>> {
-        lock(&self.seen).get(&vibe_core::keys::hash(key)).cloned()
+        lock(&self.seen)
+            .get(&vibe_core::keys::hash(key))
+            .map(|(_, agents)| agents.clone())
+    }
+
+    /// When `key` last listed the Mac's agents.
+    pub(crate) fn seen_at(&self, key: &str) -> Option<String> {
+        lock(&self.seen)
+            .get(&vibe_core::keys::hash(key))
+            .map(|(at, _)| vibe_core::time::rfc3339(*at))
     }
 }
 
