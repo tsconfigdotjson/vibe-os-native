@@ -51,7 +51,13 @@
     { "name": "toolbox.logins", "params": "NoParams", "result": "ToolboxLogins" },
     { "name": "toolbox.close", "params": "NoParams", "result": "ToolboxStatus" },
     { "name": "doctor.check", "params": "NoParams", "result": "DoctorReport" },
-    { "name": "doctor.fix", "params": "DoctorFixParams", "result": "DoctorReport" }
+    { "name": "doctor.fix", "params": "DoctorFixParams", "result": "DoctorReport" },
+    { "name": "services.list", "params": "NoParams", "result": "ServiceList" },
+    { "name": "services.connect", "params": "ServiceParams", "result": "ServiceAuthorization" },
+    { "name": "services.complete", "params": "ServiceCompleteParams", "result": "ServiceInfo" },
+    { "name": "services.connect_key", "params": "ServiceKeyParams", "result": "ServiceInfo" },
+    { "name": "services.disconnect", "params": "ServiceParams", "result": "ServiceInfo" },
+    { "name": "services.set", "params": "ServiceSetParams", "result": "ServiceInfo" }
   ],
   "notifications": [
     { "name": "events.event", "params": "Event" }
@@ -77,7 +83,9 @@
     "Mode": ["auto", "bypass"],
     "ProjectSource": ["github", "path"],
     "GhState": ["unknown", "logged_in", "logged_out", "not_installed", "error"],
-    "EventKind": ["project.added", "project.removed", "profiles.changed", "limits.changed", "keys.changed", "gh.status", "agent.added", "agent.deleted", "agent.state", "agent.status", "agent.limit", "lagged", "toolbox.changed", "mcp.changed", "host.added", "host.removed", "host.link"],
+    "EventKind": ["project.added", "project.removed", "profiles.changed", "limits.changed", "keys.changed", "gh.status", "agent.added", "agent.deleted", "agent.state", "agent.status", "agent.limit", "lagged", "toolbox.changed", "mcp.changed", "host.added", "host.removed", "host.link", "service.changed"],
+    "ServiceState": ["disconnected", "connected", "refreshing", "needs_reconnect", "revoked"],
+    "ServiceAuth": ["oauth", "api_key"],
     "HostLink": ["local", "connected", "down"],
     "TunnelState": ["connecting", "up", "down"],
     "SessionState": ["running", "exited"],
@@ -110,10 +118,10 @@
     "ProjectAddParams": ["host", "repo", "path", "name"],
     "ProjectParams": ["host", "project"],
     "ProjectRemoveParams": ["host", "project", "delete"],
-    "Profile": ["name", "environment", "model", "reasoning", "mode", "memory"],
+    "Profile": ["name", "environment", "model", "reasoning", "mode", "memory", "shared_services"],
     "ProfileList": ["profiles"],
-    "ProfileCreateParams": ["host", "project", "name", "environment", "model", "reasoning", "mode", "memory"],
-    "ProfileUpdateParams": ["host", "project", "profile", "name", "environment", "model", "reasoning", "mode", "memory"],
+    "ProfileCreateParams": ["host", "project", "name", "environment", "model", "reasoning", "mode", "memory", "shared_services"],
+    "ProfileUpdateParams": ["host", "project", "profile", "name", "environment", "model", "reasoning", "mode", "memory", "shared_services"],
     "ProfileParams": ["host", "project", "profile"],
     "HostLimits": ["reserve_memory", "reserve_cores", "max_awake_agents", "cpu_cores", "max_processes", "disk_soft", "disk_hard", "vm_disk", "idle_debounce", "snapshot_disk"],
     "LimitsSetParams": ["host", "reserve_cores", "max_awake_agents", "cpu_cores", "max_processes", "disk_soft", "disk_hard", "vm_disk", "idle_debounce", "snapshot_disk"],
@@ -163,7 +171,14 @@
     "AgentOutput": ["screen", "history", "cursor", "dropped", "more", "live"],
     "AgentMessagesParams": ["host", "ref", "last"],
     "Message": ["role", "text", "at"],
-    "MessageList": ["messages"]
+    "MessageList": ["messages"],
+    "ServiceInfo": ["name", "title", "state", "auth", "enabled", "read_only", "denied_tools", "tools", "detail", "detail_at"],
+    "ServiceList": ["services"],
+    "ServiceParams": ["service"],
+    "ServiceAuthorization": ["service", "url", "callback_scheme"],
+    "ServiceCompleteParams": ["service", "callback_url"],
+    "ServiceKeyParams": ["service", "key"],
+    "ServiceSetParams": ["service", "enabled", "read_only", "denied_tools"]
   },
   "optional": {
     "Request": ["id", "params"],
@@ -181,10 +196,10 @@
     "ProjectAddParams": ["host", "repo", "path", "name"],
     "ProjectParams": ["host"],
     "ProjectRemoveParams": ["host", "delete"],
-    "Profile": [],
+    "Profile": ["shared_services"],
     "ProfileList": [],
-    "ProfileCreateParams": ["host", "environment", "model", "reasoning", "mode", "memory"],
-    "ProfileUpdateParams": ["host", "name", "environment", "model", "reasoning", "mode", "memory"],
+    "ProfileCreateParams": ["host", "environment", "model", "reasoning", "mode", "memory", "shared_services"],
+    "ProfileUpdateParams": ["host", "name", "environment", "model", "reasoning", "mode", "memory", "shared_services"],
     "ProfileParams": ["host"],
     "HostLimits": ["reserve_memory"],
     "LimitsSetParams": ["host", "reserve_cores", "max_awake_agents", "cpu_cores", "max_processes", "disk_soft", "disk_hard", "vm_disk", "idle_debounce", "snapshot_disk"],
@@ -234,7 +249,14 @@
     "AgentOutput": [],
     "AgentMessagesParams": ["host", "last"],
     "Message": ["at"],
-    "MessageList": []
+    "MessageList": [],
+    "ServiceInfo": ["auth", "detail", "detail_at"],
+    "ServiceList": [],
+    "ServiceParams": [],
+    "ServiceAuthorization": [],
+    "ServiceCompleteParams": [],
+    "ServiceKeyParams": [],
+    "ServiceSetParams": ["enabled", "read_only", "denied_tools"]
   },
   "nested": {
     "HostList": { "hosts": "HostInfo" },
@@ -255,6 +277,7 @@
     "DoctorReport": { "checks": "DoctorCheck" },
     "HostInstall": { "host": "HostInfo" },
     "KeySyncParams": { "keys": "KeyHash" },
-    "MessageList": { "messages": "Message" }
+    "MessageList": { "messages": "Message" },
+    "ServiceList": { "services": "ServiceInfo" }
   }
 }

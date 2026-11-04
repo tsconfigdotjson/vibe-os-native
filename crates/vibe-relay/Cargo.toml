@@ -1,0 +1,18 @@
+[package]
+name = "vibe-relay"
+description = "Shared MCP services' path to the Mac: the `vibe mcp-proxy` stdio shim, its local socket, and the multiplexed relay that crosses vsock and SSH"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# std and serde_json only: it's linked into vibe-guest, a static musl binary.
+[dependencies]
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

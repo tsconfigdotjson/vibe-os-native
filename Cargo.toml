@@ -14,6 +14,8 @@ vibe-core = { path = "crates/vibe-core" }
 vibe-env = { path = "crates/vibe-env" }
 vibe-guest = { path = "crates/vibe-guest" }
 vibe-mcp = { path = "crates/vibe-mcp" }
+vibe-relay = { path = "crates/vibe-relay" }
+vibe-services = { path = "crates/vibe-services" }
 vibe-status = { path = "crates/vibe-status" }
 vibed = { path = "crates/vibed" }
 libc = "0.2"

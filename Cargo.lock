@@ -1760,6 +1760,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "vibe-relay"
+version = "0.1.4"
+dependencies = [
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "vibe-services"
+version = "0.1.4"
+
+[[package]]
 name = "vibe-shim"
 version = "0.1.4"
 dependencies = [

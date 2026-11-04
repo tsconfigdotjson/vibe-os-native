@@ -130,6 +130,12 @@ const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE hosts ADD COLUMN external TEXT;
     ",
+    // 5: shared MCP services (#51): on for every profile, and every agent
+    // already made, unless switched off.
+    "
+    ALTER TABLE profiles ADD COLUMN shared_services INTEGER NOT NULL DEFAULT 1;
+    ALTER TABLE agents ADD COLUMN shared_services INTEGER NOT NULL DEFAULT 1;
+    ",
 ];
 
 /// The schema version this build reads and writes.
@@ -214,11 +220,14 @@ pub struct AgentRecord {
     /// Its start hasn't finished. Once `vibed` is up, that means the start
     /// was cut short, and what it made is undone.
     pub starting: bool,
+    /// Whether it gets the shared MCP services, as its profile said when it
+    /// started.
+    pub shared_services: bool,
 }
 
 const AGENT_COLUMNS: &str = "a.host, a.ref, p.name, a.profile, a.environment, a.model, \
      a.reasoning, a.mode, a.memory, a.worktree, a.branch, a.session_id, a.shim_socket, a.state, \
-     a.created_at, a.compartment, a.starting";
+     a.created_at, a.compartment, a.starting, a.shared_services";
 
 fn agent_row(r: &Row<'_>) -> rusqlite::Result<AgentRecord> {
     let memory: i64 = r.get(8)?;
@@ -242,6 +251,7 @@ fn agent_row(r: &Row<'_>) -> rusqlite::Result<AgentRecord> {
         created_at: r.get(14)?,
         compartment: r.get(15)?,
         starting: r.get(16)?,
+        shared_services: r.get(17)?,
     })
 }
 
@@ -669,7 +679,7 @@ impl Store {
         }
         tx.execute(
             "UPDATE profiles SET name = ?3, environment = ?4, model = ?5, reasoning = ?6,
-                 mode = ?7, memory = ?8
+                 mode = ?7, memory = ?8, shared_services = ?9
              WHERE project_id = ?1 AND name = ?2",
             params![
                 id,
@@ -680,6 +690,7 @@ impl Store {
                 profile.reasoning.as_str(),
                 profile.mode.as_str(),
                 memory_column(profile.memory)?,
+                profile.shared_services,
             ],
         )?;
         tx.commit()?;
@@ -723,9 +734,9 @@ impl Store {
         tx.execute(
             "INSERT INTO agents (host, ref, project_id, profile, environment, model, reasoning,
                  mode, memory, worktree, branch, session_id, shim_socket, state, created_at,
-                 compartment, starting)
+                 compartment, starting, shared_services)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                 ?17)",
+                 ?17, ?18)",
             params![
                 a.host,
                 a.agent_ref,
@@ -744,6 +755,7 @@ impl Store {
                 a.created_at,
                 a.compartment,
                 a.starting,
+                a.shared_services,
             ],
         )?;
         tx.commit()?;
@@ -1048,7 +1060,7 @@ impl Store {
     }
 }
 
-const PROFILE_COLUMNS: &str = "name, environment, model, reasoning, mode, memory";
+const PROFILE_COLUMNS: &str = "name, environment, model, reasoning, mode, memory, shared_services";
 const KEY_COLUMNS: &str = "name, prefix, created_at, last_used_at";
 const PUSHED_KEY_COLUMNS: &str = "name, prefix, created_at, last_used_at";
 
@@ -1099,8 +1111,9 @@ fn profile_exists(conn: &Connection, project_id: i64, name: &str) -> Result<bool
 
 fn insert_profile(conn: &Connection, project_id: i64, p: &Profile) -> Result<()> {
     conn.execute(
-        "INSERT INTO profiles (project_id, name, environment, model, reasoning, mode, memory)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO profiles (project_id, name, environment, model, reasoning, mode, memory,
+             shared_services)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             project_id,
             p.name,
@@ -1109,6 +1122,7 @@ fn insert_profile(conn: &Connection, project_id: i64, p: &Profile) -> Result<()>
             p.reasoning.as_str(),
             p.mode.as_str(),
             memory_column(p.memory)?,
+            p.shared_services,
         ],
     )?;
     Ok(())
@@ -1140,6 +1154,7 @@ fn profile_row(r: &Row<'_>) -> rusqlite::Result<Profile> {
         memory: u64::try_from(memory).map_err(|e| {
             rusqlite::Error::FromSqlConversionFailure(5, Type::Integer, Box::new(e))
         })?,
+        shared_services: r.get(6)?,
     })
 }
 

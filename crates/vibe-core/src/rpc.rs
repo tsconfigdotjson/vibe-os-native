@@ -18,7 +18,8 @@ use serde_json::Value;
 pub use crate::limits::HostLimits;
 pub use crate::model::{
     Activity, AgentState, Certainty, CheckId, CheckState, Environment, EventKind, GhState,
-    HostLink, LoginTool, MessageRole, Mode, Model, Profile, ProjectSource, Reasoning, SessionState,
+    HostLink, LoginTool, MessageRole, Mode, Model, Profile, ProjectSource, Reasoning, ServiceAuth,
+    ServiceState, SessionState,
     StopReason, ToolboxAction, ToolboxState, TunnelState, WakeupKind,
 };
 
@@ -380,6 +381,12 @@ pub const METHODS: &[&str] = &[
     ToolboxClose::NAME,
     DoctorCheckGet::NAME,
     DoctorFix::NAME,
+    ServicesList::NAME,
+    ServicesConnect::NAME,
+    ServicesComplete::NAME,
+    ServicesConnectKey::NAME,
+    ServicesDisconnect::NAME,
+    ServicesSet::NAME,
 ];
 
 /// Every notification the daemon sends.
@@ -995,6 +1002,10 @@ pub struct ProfileCreateParams {
     /// Bytes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory: Option<u64>,
+    /// Whether its agents get the shared MCP services; on unless it's
+    /// `false`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shared_services: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1019,6 +1030,10 @@ pub struct ProfileUpdateParams {
     /// Bytes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory: Option<u64>,
+    /// Switches the shared MCP services on or off for agents started from
+    /// here on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shared_services: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1625,6 +1640,120 @@ pub struct Message {
 pub struct MessageList {
     /// Oldest first.
     pub messages: Vec<Message>,
+}
+
+// Shared MCP services (PRD: Shared MCP services). The Mac holds their logins,
+// so these are served by the Mac alone.
+
+method! {
+    /// `services.list`: the supported services, and how each stands.
+    ServicesList = "services.list", NoParams => ServiceList
+}
+
+method! {
+    /// `services.connect`: the first half of connecting or reconnecting with
+    /// OAuth. Answers with the page for the app to open in a web
+    /// authentication session. What's connected stays as it is until
+    /// `services.complete`, so a sign-in given up on loses nothing.
+    ServicesConnect = "services.connect", ServiceParams => ServiceAuthorization
+}
+
+method! {
+    /// `services.complete`: the second half: the URL that session ended on.
+    /// `vibed` makes the exchange and keeps the tokens in the Keychain.
+    ServicesComplete = "services.complete", ServiceCompleteParams => ServiceInfo
+}
+
+method! {
+    /// `services.connect_key`: connects with a personal API key instead.
+    ServicesConnectKey = "services.connect_key", ServiceKeyParams => ServiceInfo
+}
+
+method! {
+    /// `services.disconnect`: forgets the login, here and, where it can, at
+    /// the service.
+    ServicesDisconnect = "services.disconnect", ServiceParams => ServiceInfo
+}
+
+method! {
+    /// `services.set`: changes the settings given.
+    ServicesSet = "services.set", ServiceSetParams => ServiceInfo
+}
+
+/// One shared service. Nothing here is secret: tokens never leave `vibed`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceInfo {
+    /// Its name: `linear`. Its MCP server in an agent is `vibe-<name>`.
+    pub name: String,
+    /// Its name for people: `Linear`.
+    pub title: String,
+    pub state: ServiceState,
+    /// How it was connected, while there's a login.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<ServiceAuth>,
+    /// Off, every agent's calls are refused: the kill switch.
+    pub enabled: bool,
+    /// Agents reach its read-only endpoint.
+    pub read_only: bool,
+    /// Tools no agent may list or call, by their names at the service.
+    pub denied_tools: Vec<String>,
+    /// How many tools agents see.
+    pub tools: u32,
+    /// The last thing that went wrong, for people.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// When it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceList {
+    pub services: Vec<ServiceInfo>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceParams {
+    pub service: String,
+}
+
+/// What the app needs for a web authentication session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceAuthorization {
+    pub service: String,
+    /// The page to open.
+    pub url: String,
+    /// The scheme of the URL it ends on: `vibeos`.
+    pub callback_scheme: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceCompleteParams {
+    pub service: String,
+    /// The URL the session ended on, as it was.
+    pub callback_url: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceKeyParams {
+    pub service: String,
+    /// The key, which goes to the Keychain and nowhere else.
+    pub key: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceSetParams {
+    pub service: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_only: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub denied_tools: Option<Vec<String>>,
 }
 
 #[cfg(test)]
