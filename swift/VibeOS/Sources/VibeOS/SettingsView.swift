@@ -790,6 +790,7 @@ struct ProfileRow: View {
 struct KeysPane: View {
     @ObservedObject var model: MenuModel
     @State private var keys: [ApiKey] = []
+    @State private var pendingOn: [String] = []
     @State private var loaded = false
     @State private var creating = false
     @State private var error: String?
@@ -815,6 +816,9 @@ struct KeysPane: View {
             } footer: {
                 VStack(alignment: .leading, spacing: 6) {
                     if !keys.isEmpty { ErrorText(error: error) }
+                    if let pending = keysPending(on: pendingOn) {
+                        Text(pending).foregroundStyle(Palette.attention)
+                    }
                     Text(keysNote).foregroundStyle(.secondary)
                 }
             }
@@ -841,7 +845,9 @@ struct KeysPane: View {
 
     private func load() async {
         do {
-            keys = try await model.call(KeysList.self, NoParams()).keys
+            let list = try await model.call(KeysList.self, NoParams())
+            keys = list.keys
+            pendingOn = list.pendingOn ?? []
             error = nil
         } catch {
             self.error = describe(error)

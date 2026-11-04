@@ -295,6 +295,196 @@ async fn rpc(core: &Core, method: &str, params: Value) -> Value {
     serde_json::from_str(&reply).unwrap()
 }
 
+/// Section C, on the host: keys the Mac pushed say so when it's been away a while, and
+/// one that's leaked can be shut out here, and stays out when the Mac's back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_with_the_mac_away_can_see_stale_keys_and_revoke_them() {
+    let now = Arc::new(std::sync::atomic::AtomicI64::new(common::GOLDEN_NOW));
+    let clock = Arc::clone(&now);
+    let w = world_with(move |c| {
+        c.clock = Arc::new(move || clock.load(Ordering::SeqCst));
+        // Each side's own, or this host's key would be the same as the Mac's.
+        c.entropy = Arc::new(vibe_core::keys::random_bytes);
+    })
+    .await;
+    w.add_host().await;
+    w.link().await;
+    let leaked = w
+        .mac
+        .create_key(KeyCreateParams {
+            name: "leaked".into(),
+        })
+        .unwrap();
+    let other = w
+        .mac
+        .create_key(KeyCreateParams {
+            name: "other".into(),
+        })
+        .unwrap();
+    let mut pushed = false;
+    for _ in 0..250 {
+        if w.host.verify_key(&other.secret).unwrap().is_some() {
+            pushed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(pushed, "the keys reached the host");
+    let own = w
+        .host
+        .create_key(KeyCreateParams { name: "own".into() })
+        .unwrap();
+    let stale = |name: &str| {
+        w.host
+            .keys()
+            .unwrap()
+            .keys
+            .into_iter()
+            .find(|k| k.name == name)
+            .unwrap()
+            .stale
+    };
+    assert!(!stale("leaked"));
+
+    // Well past the limit, but with the link up: it's still hearing from the Mac.
+    now.fetch_add(11 * 60, Ordering::SeqCst);
+    let mut heard = false;
+    for _ in 0..250 {
+        if !stale("leaked") {
+            heard = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(heard, "a ping says the Mac's there");
+
+    // The Mac goes.
+    w.wires.pull();
+    w.wait_link(HostLink::Down).await;
+    assert!(!stale("leaked"), "not at once");
+    now.fetch_add(11 * 60, Ordering::SeqCst);
+    assert!(stale("leaked"));
+    assert!(stale("other"));
+    assert!(!stale("own"), "this host's own say what they say");
+
+    // The leaked one is shut out here, with the Mac nowhere to be seen.
+    let gone = w
+        .host
+        .revoke_key(KeyParams {
+            name: "leaked".into(),
+        })
+        .unwrap();
+    assert!(gone.pushed);
+    assert_eq!(w.host.verify_key(&leaked.secret).unwrap(), None);
+    assert!(w.host.verify_key(&other.secret).unwrap().is_some());
+    assert!(w.host.verify_key(&own.secret).unwrap().is_some());
+
+    // The Mac's back, still with it: its push doesn't bring it back here.
+    w.wires.plug_in();
+    w.wait_link(HostLink::Connected).await;
+    let mut fresh = false;
+    for _ in 0..500 {
+        if !stale("other") {
+            fresh = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(fresh, "heard from, nothing's stale");
+    assert!(w.mac.verify_key(&leaked.secret).unwrap().is_some());
+    // A new key makes it push again, with the leaked one in it.
+    let newer = w
+        .mac
+        .create_key(KeyCreateParams {
+            name: "newer".into(),
+        })
+        .unwrap();
+    let mut pushed = false;
+    for _ in 0..250 {
+        if w.host.verify_key(&newer.secret).unwrap().is_some() {
+            pushed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(pushed, "that push arrived");
+    assert_eq!(w.host.verify_key(&leaked.secret).unwrap(), None);
+    assert!(
+        !w.host
+            .keys()
+            .unwrap()
+            .keys
+            .iter()
+            .any(|k| k.name == "leaked")
+    );
+}
+
+/// Section C, on the Mac: a revoke made with a host away says it's not there yet, until
+/// it's arrived.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_revoke_with_a_host_away_says_its_pending_until_it_arrives() {
+    let w = world().await;
+    w.add_host().await;
+    w.link().await;
+    let key = w
+        .mac
+        .create_key(KeyCreateParams {
+            name: "laptop".into(),
+        })
+        .unwrap();
+    let mut pushed = false;
+    for _ in 0..250 {
+        if w.host.verify_key(&key.secret).unwrap().is_some() {
+            pushed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(pushed);
+    let listed = w.rpc("keys.list", json!({})).await;
+    assert!(listed["result"].get("pending_on").is_none(), "{listed}");
+
+    w.wires.pull();
+    w.wait_link(HostLink::Down).await;
+    // A listing with the link down and nothing changed has nothing pending.
+    let listed = w.rpc("keys.list", json!({})).await;
+    assert!(listed["result"].get("pending_on").is_none(), "{listed}");
+
+    w.mac
+        .revoke_key(KeyParams {
+            name: "laptop".into(),
+        })
+        .unwrap();
+    let listed = w.rpc("keys.list", json!({})).await;
+    assert_eq!(listed["result"]["pending_on"], json!(["vps"]), "{listed}");
+    assert!(
+        w.host.verify_key(&key.secret).unwrap().is_some(),
+        "as the host hasn't heard"
+    );
+
+    w.wires.plug_in();
+    w.wait_link(HostLink::Connected).await;
+    let mut arrived = false;
+    for _ in 0..500 {
+        if w.host.verify_key(&key.secret).unwrap().is_none() {
+            arrived = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(arrived, "the revoke arrived");
+    let mut cleared = false;
+    for _ in 0..250 {
+        let listed = w.rpc("keys.list", json!({})).await;
+        if listed["result"].get("pending_on").is_none() {
+            cleared = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(cleared, "and it no longer says so");
+}
+
 /// A host's link stays up by its pings here, so what catches it is the deadline.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_host_that_doesnt_take_a_call_fails_it_at_the_accept_deadline() {
@@ -613,17 +803,6 @@ async fn a_linux_hosts_agents_join_the_macs_view_over_the_link() {
         laptop(w.mac.keys().unwrap().keys).last_used_at,
         used_there,
         "kept on the Mac"
-    );
-    let refused = w
-        .host
-        .revoke_key(KeyParams {
-            name: "laptop".into(),
-        })
-        .unwrap_err();
-    assert_eq!(
-        refused.code,
-        ErrorCode::Conflict.code(),
-        "revoked on the Mac, not here"
     );
     w.mac
         .revoke_key(KeyParams {

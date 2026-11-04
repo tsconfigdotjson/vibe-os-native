@@ -1218,9 +1218,13 @@ pub struct ApiKey {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_used_at: Option<String>,
     /// It was made on the Mac this host is linked to, and pushed here by its
-    /// hash: revoke it there.
+    /// hash. It's revoked there for everywhere, or here for this host alone.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub pushed: bool,
+    /// On a Linux host: it was pushed here, and the Mac hasn't been heard from in a
+    /// while, so a revoke made there may not have arrived.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stale: bool,
 }
 
 /// A key as the Mac pushes it to its hosts: its hash, never the key.
@@ -1244,6 +1248,10 @@ pub struct KeySyncParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeyList {
     pub keys: Vec<ApiKey>,
+    /// On a Mac: the Linux hosts that haven't had its latest keys, so a revoke isn't
+    /// in force there yet. They get them when they're next reachable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_on: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

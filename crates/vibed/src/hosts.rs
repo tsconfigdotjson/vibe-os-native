@@ -657,8 +657,13 @@ impl Core {
     /// link is up, as after a key is made or revoked.
     pub(crate) fn push_keys(&self) {
         let links: Vec<Arc<Link>> = lock(&self.links).values().cloned().collect();
-        for link in links.iter().filter(|l| l.connected()) {
-            self.push_keys_to(link);
+        for link in &links {
+            if link.connected() {
+                self.push_keys_to(link);
+            } else {
+                // It gets them when it's back; until then the list says it hasn't.
+                link.keys_stale.store(true, Ordering::SeqCst);
+            }
         }
     }
 
@@ -725,7 +730,14 @@ impl Core {
                 self.ask_key_uses(&link).await;
             }
         }
-        self.keys()
+        let mut list = self.keys()?;
+        list.pending_on = lock(&self.links)
+            .values()
+            .filter(|l| l.keys_stale.load(Ordering::SeqCst))
+            .map(|l| l.name.clone())
+            .collect();
+        list.pending_on.sort();
+        Ok(list)
     }
 
     /// Asks `link`'s host when the keys pushed to it were last used there,

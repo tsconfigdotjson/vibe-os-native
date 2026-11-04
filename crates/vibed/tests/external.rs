@@ -1414,7 +1414,9 @@ async fn a_sleeping_mac_holds_up_nothing_on_the_host() {
         c.call("vibe_wait", json!({"agents": agent, "timeout": 60}))
             .await;
     }
-    // A key's first listing of the Mac is what later ones fall back on.
+    // A key's first listing of the Mac is what later ones fall back on. It has nothing
+    // to fall back on itself, so a busy machine may need a second go.
+    assert!(w.listing_shows(&mut c, "mac:on-mac").await);
     let listed = c.call("vibe_list_agents", json!({})).await;
     assert!(listed.contains("mac:on-mac"), "{listed}");
     assert!(!listed.contains("unavailable"), "{listed}");

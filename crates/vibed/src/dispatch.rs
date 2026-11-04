@@ -156,6 +156,9 @@ async fn call(
     method: &str,
     params: Option<Value>,
 ) -> Result<Value, ErrorObject> {
+    if session.link {
+        core.note_mac_heard();
+    }
     // A call for a Linux host goes to its vibed, over its link. While the
     // link is down, its agents are listed as they were last seen.
     if crate::hosts::FORWARDED.contains(&method)

@@ -55,10 +55,14 @@ fn describe(k: &ApiKey) -> String {
             Some(at) => format!("last used {at}"),
             None => "never used".into(),
         },
-        if k.pushed {
-            "  from the Mac this host is linked to (revoke it there)"
-        } else {
-            ""
+        match (k.pushed, k.stale) {
+            (true, true) => {
+                "  from the Mac this host is linked to, not heard from in a while: a revoke there may not have arrived. `vibe key revoke` shuts it out here"
+            }
+            (true, false) => {
+                "  from the Mac this host is linked to: revoke it there, or here for this host alone"
+            }
+            _ => "",
         }
     )
 }

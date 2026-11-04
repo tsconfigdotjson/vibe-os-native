@@ -1429,12 +1429,14 @@ public struct ApiKey: Codable, Hashable, Sendable {
     public var lastUsedAt: String?
     /// On a Linux host: made on the Mac it's linked to, and pushed there.
     public var pushed: Bool?
+    /// On a Linux host: pushed there, with the Mac not heard from in a while.
+    public var stale: Bool?
 
     public enum CodingKeys: String, CodingKey, CaseIterable {
         case name, prefix
         case createdAt = "created_at"
         case lastUsedAt = "last_used_at"
-        case pushed
+        case pushed, stale
     }
 }
 
@@ -1462,9 +1464,13 @@ public struct KeySyncParams: Codable, Hashable, Sendable {
 
 public struct KeyList: Codable, Hashable, Sendable {
     public var keys: [ApiKey]
+    /// On a Mac: the Linux hosts that haven't had its latest keys, so a revoke
+    /// isn't in force there yet.
+    public var pendingOn: [String]?
 
     public enum CodingKeys: String, CodingKey, CaseIterable {
         case keys
+        case pendingOn = "pending_on"
     }
 }
 

@@ -771,6 +771,14 @@ fn examples_cover_the_contract() {
         if ty == "PiVms" {
             seen_keys.insert("error");
         }
+        // Only a key pushed to a Linux host goes stale, and only a linked host with
+        // its link down has keys pending; vibed's own tests cover those.
+        if ty == "ApiKey" {
+            seen_keys.insert("stale");
+        }
+        if ty == "KeyList" {
+            seen_keys.insert("pending_on");
+        }
         assert_eq!(
             seen_keys, fields,
             "the examples don't use exactly the fields of {ty}"

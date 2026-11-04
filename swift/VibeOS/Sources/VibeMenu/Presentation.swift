@@ -414,6 +414,15 @@ public func keyUsage(_ lastUsedAt: String?, now: Date) -> String {
     return "Last used \(relative.localizedString(for: used, relativeTo: now))"
 }
 
+/// What Settings → API Keys says while a Linux host hasn't had this Mac's latest keys,
+/// if any: a key revoked here goes on working there until it has.
+public func keysPending(on hosts: [String]) -> String? {
+    guard !hosts.isEmpty else { return nil }
+    let names = hosts.joined(separator: ", ")
+    let verb = hosts.count == 1 ? "it's" : "they're"
+    return "Key changes are pending on \(names). A key revoked here still works there until \(verb) next reachable."
+}
+
 // MARK: External access
 
 /// How the external address is doing, as the menu and Settings say it
