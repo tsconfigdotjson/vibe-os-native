@@ -316,7 +316,8 @@ impl Daemon for Core {
             return Ok(typed::<ProjectList>(v)?.projects);
         }
         if let Some(link) = self.link(host) {
-            let asked = self.forward_typed::<ProjectsList>(&link, &HostParams::default());
+            let params = HostParams::default();
+            let asked = self.forward_typed::<ProjectsList>(&link, &params);
             return match tokio::time::timeout(PEER_READ, asked).await {
                 Ok(list) => Ok(list?.projects),
                 Err(_) => Err(error(

@@ -886,12 +886,24 @@ async fn a_sleeping_mac_holds_up_nothing_on_the_host() {
     ] {
         c.call(
             "vibe_start_agent",
-            json!({"project": "app", "profile": profile, "prompt": format!("hello {host}"),
+            json!({"project": "app", "profile": profile, "prompt": "talk",
                    "host": host, "name": name}),
         )
         .await;
     }
-    for agent in ["on-vps", "mac:on-mac", "on-both", "mac:on-both"] {
+    for (agent, whose) in [
+        ("on-vps", "local"),
+        ("mac:on-mac", "mac"),
+        ("local:on-both", "local"),
+        ("mac:on-both", "mac"),
+    ] {
+        c.call("vibe_wait", json!({"agents": agent, "timeout": 60}))
+            .await;
+        c.call(
+            "vibe_send",
+            json!({"agent": agent, "text": format!("hello {whose}")}),
+        )
+        .await;
         c.call("vibe_wait", json!({"agents": agent, "timeout": 60}))
             .await;
     }
