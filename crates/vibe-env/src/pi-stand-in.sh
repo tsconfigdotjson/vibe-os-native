@@ -41,8 +41,11 @@ if [ "$1" = auth ]; then
   exit 1
 fi
 id= prompt= extension=
-printf '%s\n' "$@" >"$PI_CODING_AGENT_SESSION_DIR.args"
-env >"$PI_CODING_AGENT_SESSION_DIR.env"
+# Whole or not at all, as a test reads them as soon as they're there.
+printf '%s\n' "$@" >"$PI_CODING_AGENT_SESSION_DIR.args.new"
+mv "$PI_CODING_AGENT_SESSION_DIR.args.new" "$PI_CODING_AGENT_SESSION_DIR.args"
+env >"$PI_CODING_AGENT_SESSION_DIR.env.new"
+mv "$PI_CODING_AGENT_SESSION_DIR.env.new" "$PI_CODING_AGENT_SESSION_DIR.env"
 while [ $# -gt 0 ]; do
   case $1 in
     --session-id) id=$2; shift 2 ;;
