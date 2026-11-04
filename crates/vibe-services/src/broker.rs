@@ -1429,13 +1429,13 @@ impl Services {
         }
     }
 
-    /// The Mac records that `service` was disconnected. Any host still saying it
-    /// owns it is then told otherwise, and not believed.
     /// Where this broker runs.
     pub fn place(&self) -> Place {
         self.deps.place
     }
 
+    /// The Mac records that `service` was disconnected. Any host still saying it
+    /// owns it is then told otherwise, and not believed.
     pub fn release(&self, service: &str) {
         if self.conn(service).is_some_and(|conn| {
             let mut saved = lock(&conn.saved);

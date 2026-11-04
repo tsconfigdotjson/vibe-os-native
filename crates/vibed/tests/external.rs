@@ -17,7 +17,7 @@ mod common;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -264,6 +264,9 @@ struct World {
     wires: Arc<Wires>,
     mac_world: Golden,
     host_world: Golden,
+    /// Seconds the Mac's clock is ahead of the host's, as time passing in the
+    /// tunnel looks to it.
+    mac_clock_ahead: Arc<AtomicI64>,
     public: SocketAddr,
     cert: CertificateDer<'static>,
     /// The host's external config, to start it again with.
@@ -287,6 +290,9 @@ async fn world_timed(limits: Limits, timing: Timing) -> World {
     let mut config = mac_world.config();
     config.remote = Arc::clone(&wires) as Arc<dyn Remote>;
     config.link_timing = timing;
+    let mac_clock_ahead = Arc::new(AtomicI64::new(0));
+    let ahead = Arc::clone(&mac_clock_ahead);
+    config.clock = Arc::new(move || common::GOLDEN_NOW + ahead.load(Ordering::SeqCst));
     let mac = Arc::new(Core::open(config).unwrap());
     mac.spawn_links();
     mac.spawn_external();
@@ -312,6 +318,7 @@ async fn world_timed(limits: Limits, timing: Timing) -> World {
         wires,
         mac_world,
         host_world,
+        mac_clock_ahead,
         public: SocketAddr::from(([127, 0, 0, 1], port)),
         cert,
         external,
@@ -471,6 +478,7 @@ impl World {
             wires,
             mac_world,
             host_world,
+            mac_clock_ahead,
             public,
             cert,
             external,
@@ -488,6 +496,7 @@ impl World {
             wires,
             mac_world,
             host_world,
+            mac_clock_ahead,
             public,
             cert,
             external,
@@ -529,6 +538,29 @@ impl World {
             .create_key(KeyCreateParams { name: name.into() })
             .unwrap()
             .secret
+    }
+
+    /// Thaws the tunnel, and waits until the host has found the Mac again.
+    async fn thaw(&self) {
+        self.wires.freeze(false);
+        for _ in 0..1000 {
+            if self.host.hosts().unwrap().hosts[0].tunnel == Some(TunnelState::Up) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("the tunnel never came back");
+    }
+
+    /// Whether `what` comes up in a listing within a few seconds.
+    async fn listing_shows(&self, c: &mut Client, what: &str) -> bool {
+        for _ in 0..100 {
+            if c.call("vibe_list_agents", json!({})).await.contains(what) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
     }
 
     /// Waits until the host takes `key`, once the Mac has pushed it.
@@ -991,13 +1023,7 @@ async fn a_send_held_up_by_a_sleeping_mac_lands_once_when_retried() {
     assert!(refused.contains("nothing was sent"), "{refused}");
     assert!(!refused.contains("request_id"), "{refused}");
 
-    w.wires.freeze(false);
-    for _ in 0..1000 {
-        if w.host.hosts().unwrap().hosts[0].tunnel == Some(TunnelState::Up) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    w.thaw().await;
     let times = async |c: &mut Client, text: &str| {
         c.call("vibe_wait", json!({"agents": agent, "timeout": 60}))
             .await;
@@ -1021,9 +1047,124 @@ async fn a_send_held_up_by_a_sleeping_mac_lands_once_when_retried() {
     assert_eq!(times(&mut c, "not this").await, 0);
 }
 
-/// A send a day late, as the bytes of one might be after a long sleep: not typed.
+/// A start held in a frozen tunnel: reported unknown. It runs if the Mac wakes in time,
+/// and not if it wakes past the window, when its caller may well have tried again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_send_too_old_when_it_reaches_the_mac_isnt_typed() {
+async fn a_start_held_up_by_a_sleeping_mac_doesnt_run_once_its_too_old() {
+    let w = world(limits()).await;
+    w.turn_on().await;
+    let key = w.key("laptop");
+    w.pushed(&key).await;
+    let mut c = w.client(&key);
+    let start = |name: &str| {
+        json!({"project": "app", "profile": "software-eng-mac", "prompt": "talk",
+               "host": "mac", "name": name})
+    };
+
+    // In time: the outcome really was unknown, and it runs.
+    w.wires.freeze(true);
+    let failed = c.fails("vibe_start_agent", start("in-time")).await;
+    assert!(failed.contains("Outcome unknown"), "{failed}");
+    assert!(failed.contains("check vibe_list_agents"), "{failed}");
+    w.thaw().await;
+    assert!(
+        w.listing_shows(&mut c, "mac:in-time").await,
+        "held for less than the window, it runs"
+    );
+
+    // Past the window: the same, but it doesn't.
+    w.wires.freeze(true);
+    let failed = c.fails("vibe_start_agent", start("too-late")).await;
+    assert!(failed.contains("Outcome unknown"), "{failed}");
+    w.mac_clock_ahead.store(61, Ordering::SeqCst);
+    w.thaw().await;
+    assert!(
+        !w.listing_shows(&mut c, "too-late").await,
+        "held past the window, it must not run"
+    );
+
+    // A clock that far out is the same to the Mac, and that's what it says.
+    let refused = c.fails("vibe_start_agent", start("skewed")).await;
+    assert!(refused.contains("didn't run"), "{refused}");
+    assert!(refused.contains("clocks"), "{refused}");
+    assert!(!w.listing_shows(&mut c, "skewed").await);
+
+    // With the clocks agreeing, trying again works.
+    w.mac_clock_ahead.store(0, Ordering::SeqCst);
+    c.call("vibe_start_agent", start("too-late")).await;
+    assert!(w.listing_shows(&mut c, "mac:too-late").await);
+}
+
+/// A delete held the same way: the agent is still there, past the window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delete_held_up_by_a_sleeping_mac_doesnt_run_once_its_too_old() {
+    let w = world(limits()).await;
+    w.turn_on().await;
+    let key = w.key("laptop");
+    w.pushed(&key).await;
+    let mut c = w.client(&key);
+    c.call(
+        "vibe_start_agent",
+        json!({"project": "app", "profile": "software-eng-mac", "prompt": "talk",
+               "host": "mac", "name": "on-mac"}),
+    )
+    .await;
+    let delete = json!({"agent": "mac:on-mac", "force": true});
+
+    w.wires.freeze(true);
+    let failed = c.fails("vibe_delete_agent", delete.clone()).await;
+    assert!(failed.contains("Outcome unknown"), "{failed}");
+    assert!(failed.contains("check vibe_list_agents"), "{failed}");
+    w.mac_clock_ahead.store(61, Ordering::SeqCst);
+    w.thaw().await;
+    // Time for it to have got there, had it been let through.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let listed = c.call("vibe_list_agents", json!({})).await;
+    assert!(listed.contains("mac:on-mac"), "{listed}");
+    assert!(!listed.contains("unavailable"), "{listed}");
+
+    w.mac_clock_ahead.store(0, Ordering::SeqCst);
+    c.call("vibe_delete_agent", delete).await;
+    let listed = c.call("vibe_list_agents", json!({})).await;
+    assert!(!listed.contains("mac:on-mac"), "{listed}");
+}
+
+/// A send held the same way: nothing's typed, past the window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_send_held_up_by_a_sleeping_mac_isnt_typed_once_its_too_old() {
+    let w = world(limits()).await;
+    w.turn_on().await;
+    let key = w.key("laptop");
+    w.pushed(&key).await;
+    let mut c = w.client(&key);
+    let agent = "mac:on-mac";
+    c.call(
+        "vibe_start_agent",
+        json!({"project": "app", "profile": "software-eng-mac", "prompt": "talk",
+               "host": "mac", "name": "on-mac"}),
+    )
+    .await;
+    c.call("vibe_wait", json!({"agents": agent, "timeout": 60}))
+        .await;
+
+    w.wires.freeze(true);
+    let failed = c
+        .fails("vibe_send", json!({"agent": agent, "text": "too late"}))
+        .await;
+    assert!(failed.contains("Outcome unknown"), "{failed}");
+    w.mac_clock_ahead.store(61, Ordering::SeqCst);
+    w.thaw().await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let read = c
+        .call("vibe_read_messages", json!({"agent": agent, "last": 50}))
+        .await;
+    assert!(!read.contains("> too late"), "{read}");
+}
+
+/// A send, start or delete a minute late, as the bytes of one might be after a long
+/// sleep: it doesn't run. Reads don't care.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_change_too_old_when_it_reaches_the_mac_doesnt_run() {
     let w = world(limits()).await;
     w.turn_on().await;
     let key = w.key("laptop");
@@ -1057,7 +1198,40 @@ async fn a_send_too_old_when_it_reaches_the_mac_isnt_typed() {
     let r = send("too late", 61).await;
     assert_eq!(r["error"]["code"], ErrorCode::Conflict.code(), "{r}");
     let why = r["error"]["message"].as_str().unwrap();
-    assert!(why.contains("wasn't typed"), "{why}");
+    assert!(why.contains("agents.send took 61 s"), "{why}");
+    assert!(why.contains("didn't run"), "{why}");
+    assert!(why.contains("clocks"), "{why}");
+    let raw = async |method: &str, params: Value, age: i64| {
+        let line = json!({"jsonrpc": "2.0", "id": 1, "method": "tunnel.call", "params": {
+            "key": key, "method": method, "sent_at": common::GOLDEN_NOW - age, "params": params,
+        }});
+        let mut s = UnixStream::connect(&socket).await.unwrap();
+        s.write_all(format!("{line}\n").as_bytes()).await.unwrap();
+        let mut r = BufReader::new(s);
+        let mut out = String::new();
+        tokio::io::AsyncBufReadExt::read_line(&mut r, &mut out)
+            .await
+            .unwrap();
+        serde_json::from_str::<Value>(&out).unwrap()
+    };
+    for (method, params) in [
+        (
+            "agents.start",
+            json!({"project": "app", "profile": "software-eng-mac", "prompt": "talk",
+                   "name": "too-late"}),
+        ),
+        ("agents.delete", json!({"ref": "on-mac", "force": true})),
+    ] {
+        let r = raw(method, params, 61).await;
+        assert_eq!(r["error"]["code"], ErrorCode::Conflict.code(), "{r}");
+        let why = r["error"]["message"].as_str().unwrap();
+        assert!(why.contains(&format!("{method} took 61 s")), "{why}");
+    }
+    let r = raw("agents.list", json!({}), 61).await;
+    assert!(r["result"].is_object(), "a read has nothing to fear: {r}");
+    let names = r["result"]["agents"].to_string();
+    assert!(names.contains("on-mac"), "{names}");
+    assert!(!names.contains("too-late"), "{names}");
     let r = send("in time", 30).await;
     assert!(r["result"].is_object(), "{r}");
 

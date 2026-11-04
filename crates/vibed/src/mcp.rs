@@ -19,16 +19,15 @@ use vibe_core::model::EventKind;
 use vibe_core::model::{LOCAL_HOST, MAC_HOST};
 use vibe_core::rpc::{
     Agent, AgentCheckParams, AgentDeleteParams, AgentList, AgentMessagesParams, AgentOutputParams,
-    AgentSent, AgentStartParams, AgentsCheck, AgentsDelete, AgentsList, AgentsMessages,
-    AgentsOutput, AgentsSend, AgentsStart, ErrorCode, ErrorObject, HostList, HostParams, HostsList,
-    McpSetParams, McpSettings, Method, Project, ProjectList, ProjectsList,
+    AgentStartParams, AgentsCheck, AgentsDelete, AgentsList, AgentsMessages, AgentsOutput,
+    AgentsSend, AgentsStart, ErrorCode, ErrorObject, HostList, HostParams, HostsList, McpSetParams,
+    McpSettings, Method, Project, ProjectList, ProjectsList,
 };
 use vibe_mcp::http::Settings;
 use vibe_mcp::{AgentView, Caller, Check, Daemon, Input, Message, Screen, Sent, Target};
 
 use crate::core::{Core, error, invalid, limits_error, lock};
 use crate::external::MacPeer;
-
 use crate::hosts::call_timeout;
 
 /// A value the Mac answered with, as `T`.
@@ -220,6 +219,28 @@ impl Core {
 }
 
 impl Core {
+    /// [`mac_call`] for a send, start or delete, saying when it was sent, as the Mac
+    /// refuses one that took too long to arrive.
+    async fn mac_change<M: Method>(
+        &self,
+        mac: &MacPeer,
+        c: &Caller,
+        params: &M::Params,
+    ) -> Result<M::Result, ErrorObject> {
+        let params = serde_json::to_value(params)
+            .map_err(|e| error(ErrorCode::InternalError, format!("Internal error: {e}")))?;
+        let v = mac
+            .call_at(
+                c.key(),
+                M::NAME,
+                params,
+                call_timeout(M::NAME),
+                Some(self.now()),
+            )
+            .await?;
+        typed(v)
+    }
+
     /// `asked`, for as long as another host gets to answer a read, all of it: its
     /// turn at that host as well as the answer. Whatever falls back on what the host
     /// last said then has time to, inside the deadline of whoever's waiting on it.
@@ -444,7 +465,7 @@ impl Daemon for Core {
 
     async fn start_agent(&self, c: &Caller, p: AgentStartParams) -> Result<Agent, ErrorObject> {
         if let Some(mac) = p.host.as_deref().and_then(|h| self.mac_for(h)) {
-            return mac_call::<AgentsStart>(mac, c, &p).await;
+            return self.mac_change::<AgentsStart>(mac, c, &p).await;
         }
         if let Some(link) = p.host.as_deref().and_then(|h| self.link(h)) {
             return self.forward_typed::<AgentsStart>(&link, &p).await;
@@ -454,7 +475,7 @@ impl Daemon for Core {
 
     async fn delete_agent(&self, c: &Caller, p: AgentDeleteParams) -> Result<Agent, ErrorObject> {
         if let Some(mac) = p.host.as_deref().and_then(|h| self.mac_for(h)) {
-            return mac_call::<AgentsDelete>(mac, c, &p).await;
+            return self.mac_change::<AgentsDelete>(mac, c, &p).await;
         }
         if let Some(link) = p.host.as_deref().and_then(|h| self.link(h)) {
             return self.forward_typed::<AgentsDelete>(&link, &p).await;
@@ -477,21 +498,7 @@ impl Daemon for Core {
         if mac.is_some() || link.is_some() {
             let params = crate::talk::send_params(&t.host, &t.agent, &input, request_id);
             let sent = match mac {
-                Some(mac) => {
-                    let params = serde_json::to_value(&params).map_err(|e| {
-                        error(ErrorCode::InternalError, format!("Internal error: {e}"))
-                    })?;
-                    let answer = mac
-                        .call_at(
-                            c.key(),
-                            AgentsSend::NAME,
-                            params,
-                            call_timeout(AgentsSend::NAME),
-                            Some(self.now()),
-                        )
-                        .await?;
-                    typed::<AgentSent>(answer)?
-                }
+                Some(mac) => self.mac_change::<AgentsSend>(mac, c, &params).await?,
                 None => {
                     let link = link.expect("one of them");
                     self.forward_typed::<AgentsSend>(&link, &params).await?

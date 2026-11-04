@@ -289,8 +289,8 @@ impl MacPeer {
         self.call_at(key, method, params, timeout, None).await
     }
 
-    /// [`MacPeer::call`], saying when it was sent, as the Mac refuses a send
-    /// that took too long to arrive.
+    /// [`MacPeer::call`], saying when it was sent, as the Mac refuses a send, start
+    /// or delete that took too long to arrive.
     pub(crate) async fn call_at(
         &self,
         key: &str,

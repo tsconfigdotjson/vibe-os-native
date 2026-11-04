@@ -19,6 +19,7 @@
 //! its shim saved, and its conversation comes from the transcript on the
 //! host.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -60,6 +61,36 @@ pub(crate) struct KeptSend {
     print: String,
     at: Instant,
     answer: watch::Receiver<Option<Result<Sent, ErrorObject>>>,
+}
+
+impl KeptSend {
+    /// Whether it's still being made: its answer's yet to come, and whatever was
+    /// making it hasn't gone.
+    fn under_way(&self) -> bool {
+        self.answer.borrow().is_none() && self.answer.has_changed().is_ok()
+    }
+}
+
+/// Forgets sends past [`SEND_KEPT`]. Not one under way: a retry would type it again.
+fn forget_old_sends(kept: &mut HashMap<String, KeptSend>) {
+    kept.retain(|_, s| s.under_way() || s.at.elapsed() < SEND_KEPT);
+}
+
+/// Forgets the oldest finished send if there's no room for another. Sends under way
+/// all stay for the same reason, even past [`MAX_SENDS_KEPT`]: there are only so many
+/// of those, as each is a call being answered.
+fn make_room_for_a_send(kept: &mut HashMap<String, KeptSend>) {
+    if kept.len() < MAX_SENDS_KEPT {
+        return;
+    }
+    let oldest = kept
+        .iter()
+        .filter(|(_, s)| !s.under_way())
+        .min_by_key(|(_, s)| s.at)
+        .map(|(slot, _)| slot.clone());
+    if let Some(oldest) = oldest {
+        kept.remove(&oldest);
+    }
 }
 
 /// After a wake that started Claude again, how long its screen must stay
@@ -241,7 +272,7 @@ impl Core {
         let slot = format!("{agent_ref}\n{id}");
         let (first, mut answer) = {
             let mut kept = lock(&self.sends_kept);
-            kept.retain(|_, s| s.at.elapsed() < SEND_KEPT);
+            forget_old_sends(&mut kept);
             match kept.get(&slot) {
                 Some(s) if s.print != print => {
                     return Err(error(
@@ -251,14 +282,7 @@ impl Core {
                 }
                 Some(s) => (None, s.answer.clone()),
                 None => {
-                    if kept.len() >= MAX_SENDS_KEPT
-                        && let Some(oldest) = kept
-                            .iter()
-                            .min_by_key(|(_, s)| s.at)
-                            .map(|(id, _)| id.clone())
-                    {
-                        kept.remove(&oldest);
-                    }
+                    make_room_for_a_send(&mut kept);
                     let (done, answer) = watch::channel(None);
                     kept.insert(
                         slot.clone(),
@@ -687,6 +711,78 @@ async fn wait_ready(socket: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A kept send, `age` old: finished, or still under way for as long as the sender
+    /// it comes with is held.
+    fn a_send(
+        age: Duration,
+        finished: bool,
+    ) -> (KeptSend, watch::Sender<Option<Result<Sent, ErrorObject>>>) {
+        let (done, answer) = watch::channel(None);
+        if finished {
+            done.send_replace(Some(Err(invalid("how it went"))));
+        }
+        let kept = KeptSend {
+            print: String::new(),
+            at: Instant::now().checked_sub(age).unwrap(),
+            answer,
+        };
+        (kept, done)
+    }
+
+    #[test]
+    fn a_send_under_way_is_never_forgotten() {
+        let mut kept = HashMap::new();
+        let mut held = Vec::new();
+        let long_ago = SEND_KEPT + Duration::from_secs(60);
+
+        // Past its time, it goes only if it's finished.
+        for (slot, finished) in [("under way", false), ("finished", true)] {
+            let (send, done) = a_send(long_ago, finished);
+            kept.insert(slot.to_owned(), send);
+            held.push(done);
+        }
+        forget_old_sends(&mut kept);
+        assert!(kept.contains_key("under way"));
+        assert!(!kept.contains_key("finished"));
+
+        // Whatever was making it having gone, it goes the same way.
+        held.clear();
+        forget_old_sends(&mut kept);
+        assert!(kept.is_empty());
+
+        // With no room, the oldest finished one goes, not an older one under way.
+        let (send, done) = a_send(long_ago, false);
+        kept.insert("under way".to_owned(), send);
+        held.push(done);
+        let (send, done) = a_send(Duration::from_secs(120), true);
+        kept.insert("oldest finished".to_owned(), send);
+        held.push(done);
+        for n in kept.len()..MAX_SENDS_KEPT {
+            let (send, done) = a_send(Duration::from_secs(1), true);
+            kept.insert(format!("newer {n}"), send);
+            held.push(done);
+        }
+        make_room_for_a_send(&mut kept);
+        assert_eq!(kept.len(), MAX_SENDS_KEPT - 1);
+        assert!(kept.contains_key("under way"));
+        assert!(!kept.contains_key("oldest finished"));
+
+        // With room, nothing goes.
+        make_room_for_a_send(&mut kept);
+        assert_eq!(kept.len(), MAX_SENDS_KEPT - 1);
+
+        // With all of them under way, none goes.
+        kept.clear();
+        held.clear();
+        for n in 0..MAX_SENDS_KEPT {
+            let (send, done) = a_send(Duration::from_secs(1), false);
+            kept.insert(format!("under way {n}"), send);
+            held.push(done);
+        }
+        make_room_for_a_send(&mut kept);
+        assert_eq!(kept.len(), MAX_SENDS_KEPT);
+    }
 
     #[test]
     fn pastes_are_bracketed_when_asked_for() {

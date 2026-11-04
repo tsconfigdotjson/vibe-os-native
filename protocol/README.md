@@ -117,8 +117,8 @@ left; the Mac forwards it with `ssh -R` to its own `run/tunnel.sock`.
 **The tunnel socket isn't this contract.** The Mac's `run/tunnel.sock`
 takes two methods only, in the same framing: `daemon.hello`, and
 `tunnel.call {key, method, params, sent_at}`. `sent_at` is when the host sent it,
-in Unix seconds: the Mac refuses an `agents.send` more than about 60 s old when it
-arrives. That runs `method` on the Mac, for its
+in Unix seconds: the Mac refuses an `agents.send`, `agents.start` or `agents.delete`
+more than about 60 s old when it arrives, so clocks that far apart refuse them too. That runs `method` on the Mac, for its
 own agents only (a `host` other than `local` is `invalid_params`), after
 the Mac checks `key`, the outside caller's API key, itself: a key it
 doesn't know, revoked here though a host hasn't heard yet, or a host's own,

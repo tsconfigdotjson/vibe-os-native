@@ -29,16 +29,17 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::task::JoinHandle;
 use vibe_core::model::{LOCAL_HOST, TunnelState};
 use vibe_core::rpc::{
-    AgentsSend, ErrorCode, ErrorObject, Hello, HelloParams, HostsList, Id, Method, NoParams,
-    Request, Response, TUNNEL_METHODS, TunnelCall, TunnelCallParams, TunnelPrepare,
+    ErrorCode, ErrorObject, Hello, HelloParams, HostsList, Id, Method, NoParams, Request, Response,
+    TUNNEL_METHODS, TunnelCall, TunnelCallParams, TunnelPrepare,
 };
 
 use crate::core::{Core, error, lock};
 use crate::link::{Link, Timing};
 
-/// The oldest a send can be on arriving, in seconds. Older, it sat in the tunnel while
-/// this Mac slept, and whoever sent it has long been told it may not have arrived.
-const SEND_TOO_OLD: i64 = 60;
+/// The oldest a send, start or delete can be on arriving, in seconds. Older, it sat in
+/// the tunnel while this Mac slept, and whoever made it has long been told nobody knows
+/// how it ended.
+const CHANGE_TOO_OLD: i64 = 60;
 
 /// The tunnel's socket, in `run/`.
 pub const TUNNEL_SOCKET: &str = "tunnel.sock";
@@ -182,14 +183,16 @@ async fn tunnel_call(core: &Core, params: Option<Value>) -> Result<Value, ErrorO
         Err(e) => return Err(e),
     };
     crate::log!("vibed: tunnel: key {:?} called {}", key.name, p.method);
-    if p.method == AgentsSend::NAME
+    if crate::external::check_after(&p.method).is_some()
         && let Some(age) = p.sent_at.map(|at| core.now().saturating_sub(at))
-        && age > SEND_TOO_OLD
+        && age > CHANGE_TOO_OLD
     {
+        crate::log!("vibed: tunnel: refused {}, {age} s old", p.method);
         return Err(error(
             ErrorCode::Conflict,
             format!(
-                "this send took {age} s to reach the Mac, so it wasn't typed. Send it again if it's still wanted"
+                "{} took {age} s to reach the Mac, so it didn't run. Try again if it's still wanted. If this keeps happening, the clocks on the Mac and this host may disagree",
+                p.method
             ),
         ));
     }

@@ -319,7 +319,10 @@ impl Link {
         };
         let answer = tokio::select! {
             a = tokio::time::timeout(timeout, exchange) => a,
-            () = went_down => return Err(lost(&self.name, method, None)),
+            () = went_down => {
+                let detail = lock(&self.status).detail.clone();
+                return Err(lost(&self.name, method, detail.as_deref()));
+            }
         };
         match answer {
             Ok(Ok(outcome)) => {

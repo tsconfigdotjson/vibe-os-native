@@ -919,8 +919,8 @@ pub struct TunnelCallParams {
     pub method: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<Value>,
-    /// When the host sent it, in Unix seconds. A send that arrives long after,
-    /// as one held in the tunnel while a Mac slept does, isn't typed.
+    /// When the host sent it, in Unix seconds. A send, start or delete that arrives
+    /// long after, as one held in the tunnel while a Mac slept does, doesn't run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sent_at: Option<i64>,
 }

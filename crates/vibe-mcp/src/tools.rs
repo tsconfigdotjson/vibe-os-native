@@ -120,8 +120,6 @@ fn fail(text: String) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(clip(&text))])
 }
 
-/// A core error, as a model reads it, with what to do next where that
-/// helps.
 /// A request id for a caller who didn't give one.
 fn new_request_id() -> Result<String, String> {
     let bytes =
@@ -151,6 +149,8 @@ fn on_several(agent: &str, hosts: &[String]) -> String {
     )
 }
 
+/// A core error, as a model reads it, with what to do next where that
+/// helps.
 fn explain(e: &Error, what: Option<&str>) -> String {
     let not_found = e.code == ErrorCode::NotFound.code();
     match what {
