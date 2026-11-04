@@ -1122,22 +1122,20 @@ async fn one_thing_at_a_time_per_agent() {
     assert!(w.list().await.is_empty());
 }
 
-#[tokio::test]
-async fn git_maintenance_runs_only_while_a_project_is_quiet() {
-    let w = world().await;
-    let project = w.project.to_str().unwrap();
-    // Loose objects, and a threshold they're over, so a maintenance run
-    // packs them. git counts only those in objects/17/ and guesses the
-    // rest, so there are enough for some to be there: their contents, and
-    // so their names, are fixed.
+/// Commits loose objects to a project, and sets a threshold they're over, so
+/// a maintenance run packs them. git counts only those in objects/17/ and
+/// guesses the rest, so there are enough for some to be there: their
+/// contents, and so their names, are fixed.
+fn commit_loose_objects(dir: &Path) {
+    let project = dir.to_str().unwrap();
     git(&["-C", project, "config", "gc.auto", "1"]);
-    fs::create_dir_all(w.project.join("many")).unwrap();
+    fs::create_dir_all(dir.join("many")).unwrap();
     for i in 0..1500 {
-        fs::write(w.project.join(format!("many/{i}")), format!("{i}\n")).unwrap();
+        fs::write(dir.join(format!("many/{i}")), format!("{i}\n")).unwrap();
     }
     git(&["-C", project, "add", "."]);
     // Not the maintenance git starts after a commit; and vibed's fetch, as
-    // the start makes one, mustn't start one either.
+    // a start makes one, mustn't start one either.
     git(&[
         "-C",
         project,
@@ -1148,22 +1146,129 @@ async fn git_maintenance_runs_only_while_a_project_is_quiet() {
         "-m",
         "many",
     ]);
-    let loose = || {
-        let out = git_out(&w.project, &["count-objects"]);
-        out.split_whitespace()
-            .next()
-            .unwrap()
-            .parse::<u32>()
-            .unwrap()
-    };
-    assert!(loose() > 1);
+    assert!(loose_objects(dir) > 1);
+}
+
+fn loose_objects(dir: &Path) -> u32 {
+    let out = git_out(dir, &["count-objects"]);
+    out.split_whitespace()
+        .next()
+        .unwrap()
+        .parse::<u32>()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn git_maintenance_runs_only_while_a_project_is_quiet() {
+    let w = world().await;
+    let project = w.project.to_str().unwrap();
+    commit_loose_objects(&w.project);
+    let loose = || loose_objects(&w.project);
 
     let a = w.core.start_agent(start("hello")).await.unwrap();
     w.core.maintain_if_quiet("local", "app", &w.project).await;
     assert!(loose() > 1, "not while an agent is awake");
     w.core.delete_agent(delete(&a.agent, false)).await.unwrap();
+    // Quiet, and it's `gc.auto` that says whether there's anything to do, on
+    // every git: its own default strategy would go by other thresholds, or
+    // not look at this one at all.
+    git(&["-C", project, "config", "gc.auto", "6700"]);
+    w.core.maintain_if_quiet("local", "app", &w.project).await;
+    assert!(loose() > 1, "not with so few loose objects");
+    git(&["-C", project, "config", "gc.auto", "0"]);
+    w.core.maintain_if_quiet("local", "app", &w.project).await;
+    assert!(loose() > 1, "not with gc turned off");
+    // The task by name, so a project's strategy isn't what decides, which
+    // would leave these loose on any git.
+    git(&["-C", project, "config", "gc.auto", "1"]);
+    git(&["-C", project, "config", "maintenance.gc.enabled", "false"]);
     w.core.maintain_if_quiet("local", "app", &w.project).await;
     assert_eq!(loose(), 0, "packed once it's quiet");
+}
+
+#[tokio::test]
+async fn git_maintenance_clears_only_a_stale_lock() {
+    let w = world().await;
+    let project = w.project.to_str().unwrap();
+    commit_loose_objects(&w.project);
+    let loose = || loose_objects(&w.project);
+    let lock = w.project.join(".git/objects/maintenance.lock");
+    let backdate = || {
+        let at = std::time::SystemTime::now() - Duration::from_secs(11 * 60);
+        let f = fs::OpenOptions::new().write(true).open(&lock).unwrap();
+        f.set_modified(at).unwrap();
+    };
+
+    // A new one could be a run that's under way, and git stops at it.
+    fs::write(&lock, "").unwrap();
+    w.core.maintain_if_quiet("local", "app", &w.project).await;
+    assert!(lock.exists(), "a new lock stays");
+    assert!(loose() > 1, "git stops at a lock");
+
+    // One older than the timeout goes, found from a linked checkout too.
+    let linked = w.project.with_file_name("linked");
+    git(&[
+        "-C",
+        project,
+        "worktree",
+        "add",
+        "-q",
+        "--detach",
+        linked.to_str().unwrap(),
+    ]);
+    git(&["-C", project, "config", "gc.auto", "0"]);
+    backdate();
+    w.core.maintain_if_quiet("local", "app", &linked).await;
+    assert!(!lock.exists(), "a stale lock goes, from a linked checkout");
+    assert!(loose() > 1, "and gc.auto is still off");
+
+    // And then the repo gets packed.
+    git(&["-C", project, "config", "gc.auto", "1"]);
+    fs::write(&lock, "").unwrap();
+    backdate();
+    w.core.maintain_if_quiet("local", "app", &w.project).await;
+    assert!(!lock.exists(), "a stale lock goes");
+    assert_eq!(loose(), 0, "and the repo is packed");
+}
+
+#[tokio::test]
+async fn git_maintenance_runs_no_hook_in_the_project() {
+    let w = world().await;
+    commit_loose_objects(&w.project);
+    // As an agent could plant it, its VM having `.git` read-write.
+    let ran = w.project.with_file_name("hook-ran");
+    let hooks = w.project.join(".git/hooks");
+    fs::create_dir_all(&hooks).unwrap();
+    common::write_script(
+        &hooks.join("pre-auto-gc"),
+        &format!("#!/bin/sh\ntouch '{}'\n", ran.display()),
+    );
+
+    w.core.maintain_if_quiet("local", "app", &w.project).await;
+    assert_eq!(loose_objects(&w.project), 0, "gc did run");
+    assert!(!ran.exists(), "and it ran no hook");
+}
+
+#[tokio::test]
+async fn git_maintenance_writes_the_commit_graph_even_without_packing() {
+    let w = world().await;
+    let project = w.project.to_str().unwrap();
+    // gc writes one too when it packs, so it's off, and any commit is enough.
+    git(&["-C", project, "config", "gc.auto", "0"]);
+    git(&[
+        "-C",
+        project,
+        "config",
+        "maintenance.commit-graph.auto",
+        "1",
+    ]);
+    let chain = w
+        .project
+        .join(".git/objects/info/commit-graphs/commit-graph-chain");
+    assert!(!chain.exists());
+
+    w.core.maintain_if_quiet("local", "app", &w.project).await;
+    assert!(chain.exists(), "written by the commit-graph task");
 }
 
 /// The test backend, but holding an agent to its limits fails, as a real

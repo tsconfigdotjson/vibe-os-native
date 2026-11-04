@@ -1621,15 +1621,34 @@ impl Core {
                 return;
             }
         }
+        clear_stale_maintenance_lock(project_name, project).await;
         // In the foreground: this is a background task already, and a
-        // detached gc would outlive it unseen.
+        // detached gc would outlive it unseen. `gc.autoDetach` keeps gc there
+        // on gits before 2.47. `maintenance.autoDetach` does nothing here,
+        // as only commands that start maintenance themselves read it, and
+        // it's harmless.
+        //
+        // Without hooks: this runs on the host, and `linux` agents can write
+        // to `.git`. Repo config that names a command isn't covered.
+        //
+        // The tasks by name, as what `run --auto` does by default depends on
+        // git's version: gc until 2.54, then geometric-repack, which ignores
+        // `gc.auto`, with a threshold that 2.56 raised. gc and commit-graph
+        // are in every git with `maintenance`, at the same thresholds:
+        // `gc.auto` and `gc.autoPackLimit`, and
+        // `maintenance.commit-graph.auto`. Neither depends on the order they
+        // run in.
         let maintain = [
             "-c",
             "gc.autoDetach=false",
             "-c",
             "maintenance.autoDetach=false",
+            "-c",
+            "core.hooksPath=/dev/null",
             "maintenance",
             "run",
+            "--task=gc",
+            "--task=commit-graph",
             "--auto",
             "--quiet",
         ];
@@ -1657,6 +1676,39 @@ impl Core {
                 }
             }
         })
+    }
+}
+
+/// Removes the lock of a `git maintenance` run that was killed, at its
+/// timeout or when vibed shut down, so couldn't remove it itself. With
+/// `--auto`, git takes a lock that's there to mean another run is under way,
+/// and quietly does nothing, for good. vibed's own run can't be older than
+/// its timeout. Someone else's could be, and then only overlaps with this
+/// one, which git allows for: gc has its own lock, `gc.pid`.
+async fn clear_stale_maintenance_lock(project_name: &str, project: &Path) {
+    // Where the lock is from any checkout, linked ones too. It can be
+    // relative to the checkout.
+    let path = ["rev-parse", "--git-path", "objects/maintenance.lock"];
+    let Ok(Ok(path)) = git(project, &path).await else {
+        return;
+    };
+    let lock = project.join(path);
+    // The link itself if it's one: `.git` is agents' to write to.
+    let stale = fs::symlink_metadata(&lock)
+        .and_then(|m| m.modified())
+        .is_ok_and(|at| at.elapsed().is_ok_and(|age| age > FETCH_TIMEOUT));
+    if !stale {
+        return;
+    }
+    match fs::remove_file(&lock) {
+        Ok(()) => crate::log!(
+            "vibed: git maintenance on {project_name}: removed a stale {}",
+            lock.display()
+        ),
+        Err(e) => crate::log!(
+            "vibed: git maintenance on {project_name}: can't remove a stale {}: {e}",
+            lock.display()
+        ),
     }
 }
 
