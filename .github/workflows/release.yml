@@ -122,7 +122,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install the Rust toolchain, zig and cargo-zigbuild
+      - name: Install the Rust toolchain
         run: |
           if ! command -v rustup >/dev/null; then
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
@@ -130,8 +130,13 @@ jobs:
             export PATH="$HOME/.cargo/bin:$PATH"
           fi
           rustup toolchain install
-          brew install zig
-          cargo install cargo-zigbuild --locked
+
+      # Here, before there's a certificate or a secret around for what cargo builds.
+      # scripts/host-bundle.sh finds them in the cache.
+      - name: Fetch zig and build cargo-zigbuild
+        run: |
+          . scripts/zig-tools.sh
+          ensure_zigbuild
 
       # The certificate goes into a keychain of this run's own, which goes
       # with the runner.

@@ -93,7 +93,6 @@ if [ "$REQUIRE" = 1 ]; then
   [ -n "${APPLE_TEAM_ID:-}" ] || die "no APPLE_TEAM_ID"
   $NOTARIZE || die "no notarization credentials: NOTARY_KEY_ID, NOTARY_ISSUER_ID and NOTARY_KEY_P8, or APPLE_ID and APPLE_APP_PASSWORD"
   $SPARKLE || die "no SPARKLE_PRIVATE_KEY"
-  command -v cargo-zigbuild >/dev/null || die "the Linux builds need cargo-zigbuild and zig"
 fi
 if [ -n "$IDENTITY" ] && [ -n "${APPLE_TEAM_ID:-}" ]; then
   # The identity, by name or SHA-1, must be the team's Developer ID.
@@ -118,13 +117,7 @@ cargo build --locked --release --target "$TARGET" -p vibed -p vibe-cli -p vibe-s
 RUST=target/$TARGET/release
 
 # The Linux builds Add Linux Host installs.
-HOST_BUNDLE=
-if command -v cargo-zigbuild >/dev/null; then
-  scripts/host-bundle.sh --out "$WORK/host-bundle"
-  HOST_BUNDLE=$WORK/host-bundle
-else
-  say "no cargo-zigbuild: this build has no Linux vibed for Add Linux Host"
-fi
+scripts/host-bundle.sh --out "$WORK/host-bundle"
 
 # The Swift products, each in a build directory of its own: Sparkle comes
 # in only with VIBEOS_SPARKLE=1, and switching that in one directory would
@@ -156,7 +149,7 @@ cp "swift/VibeOS/Support/$LABEL.plist" "$APP/Contents/Library/LaunchAgents/$LABE
 icns=$WORK/AppIcon.icns
 iconutil -c icns swift/VibeOS/Support/AppIcon.iconset -o "$icns"
 cp "$icns" "$APP/Contents/Resources/AppIcon.icns"
-if [ -n "$HOST_BUNDLE" ]; then cp -R "$HOST_BUNDLE" "$APP/Contents/Resources/linux"; fi
+cp -R "$WORK/host-bundle" "$APP/Contents/Resources/linux"
 if $SPARKLE; then
   [ -d "$app_bin_dir/Sparkle.framework" ] || die "swift build left no Sparkle.framework in $app_bin_dir"
   mkdir -p "$APP/Contents/Frameworks"

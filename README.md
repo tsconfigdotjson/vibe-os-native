@@ -23,7 +23,7 @@ truth.
 | `swift/VibeOS` | `VibeOS.app`, the SwiftUI menu bar app, and `VibeRPC`, its socket client |
 | `swift/vibe-vm` | `vibe-vm`, the Virtualization.framework helper |
 | `protocol/` | The socket contract both sides are tested against, `vibe-vm`'s in `protocol/vibe-vm/` and `vibe-guest`'s in `protocol/vibe-guest/`; see the READMEs |
-| `scripts/` | `check-full.sh` runs every check; `sign-macos.sh` signs for local use; `test-guest.sh` builds the test guest; `base-image.sh` builds the Linux base image (with Docker); `vm-reboot-test.sh` checks a saved VM survives a reboot; `host-bundle.sh` builds the Linux `vibed` that Add Linux Host installs; `release-macos.sh` builds a release DMG; `sparkle.py` signs it for Sparkle and writes the appcast |
+| `scripts/` | `check-full.sh` runs every check; `sign-macos.sh` signs for local use; `test-guest.sh` builds the test guest; `base-image.sh` builds the Linux base image (with Docker); `vm-reboot-test.sh` checks a saved VM survives a reboot; `host-bundle.sh` builds the Linux `vibed` that Add Linux Host installs, with `zig-tools.sh` fetching what that takes on first use; `release-macos.sh` builds a release DMG; `sparkle.py` signs it for Sparkle and writes the appcast |
 
 Every crate builds on macOS and Linux (x86_64 and arm64); `vibe-guest` and
 `vibe-testguest` do their work only as static `aarch64-unknown-linux-musl`
@@ -91,7 +91,7 @@ over SSH. A release carries them in the app; for a build of your own, make
 them and point `vibed` at them:
 
 ```sh
-scripts/host-bundle.sh          # build/host-bundle/{x86_64,aarch64}: static musl builds (needs zig, cargo-zigbuild)
+scripts/host-bundle.sh          # build/host-bundle/{x86_64,aarch64}: static musl builds (fetches zig and cargo-zigbuild on first use)
 VIBE_HOST_BUNDLE=$PWD/build/host-bundle target/debug/vibed
 target/debug/vibe host add vps me@vps.example.com   # or Settings → Hosts → Add Linux Host…
 ```
