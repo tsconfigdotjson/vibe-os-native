@@ -834,11 +834,13 @@ async fn a_bad_login_beside_a_good_one_is_told_of_by_provider() {
     let vms = status.vms.unwrap();
     assert_eq!(vms.logins, ["mock", "xai"]);
     let alerts = vms.alerts.join("\n");
+    // Each said once, the refused one first, as `linux_vm.rs` holds real VMs to.
+    assert_eq!(vms.alerts.len(), 2, "{alerts}");
     assert!(
-        alerts.contains("login for openai would run a command"),
+        vms.alerts[0].contains("login for openai would run a command"),
         "{alerts}"
     );
-    assert!(alerts.contains("signed in to xai"), "{alerts}");
+    assert!(vms.alerts[1].contains("signed in to xai"), "{alerts}");
     assert!(!alerts.contains("curl"), "{alerts}");
     w.delete(&r).await;
 }

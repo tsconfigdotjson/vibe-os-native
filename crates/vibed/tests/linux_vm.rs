@@ -654,7 +654,17 @@ async fn a_pi_agent_answers_in_a_vm_and_shares_the_one_login() {
     core.pi_watch(&mut seen).await;
     let status = core.pi_status(HostParams { host: None }).await.unwrap();
     let vms = status.vms.unwrap();
-    assert_eq!(vms.alerts.len(), 1, "{:?}", vms.alerts);
+    // Two things for the owner to hear, and each said once: the first sign-in to
+    // xai, a login every agent now uses, and the one that's refused.
+    assert_eq!(vms.alerts.len(), 2, "{:?}", vms.alerts);
+    let (signed_in, refused) = (&vms.alerts[1], &vms.alerts[0]);
+    assert!(signed_in.contains("signed in to xai"), "{:?}", vms.alerts);
+    assert!(
+        refused.contains("login for openai would run a command"),
+        "{:?}",
+        vms.alerts
+    );
+    assert!(!vms.alerts.concat().contains("touch"), "{:?}", vms.alerts);
     assert!(!vms.logins.contains(&"openai".to_owned()));
     assert!(
         !shared_run(&other, "cat /home/vibe/.pi/agent/auth.json")
