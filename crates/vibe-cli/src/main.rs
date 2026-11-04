@@ -57,7 +57,7 @@ commands:
   mcp-proxy SERVICE
               a shared service over stdin and stdout, as agents' MCP clients
               start it (vibe-linear, say). It goes through this host's vibed,
-              which holds this host's own login
+              which uses the one login, or a token from the host that holds it
   service     how this host's shared services stand. Connect them in VibeOS on
               the Mac, by signing in with a browser there
   service on SERVICE, service off SERVICE

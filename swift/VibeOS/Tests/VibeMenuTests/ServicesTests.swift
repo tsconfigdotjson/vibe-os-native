@@ -62,6 +62,18 @@ struct ServicesTests {
         #expect(ServiceSummary(service(.connected)).note == "3 tools")
     }
 
+    @Test func aFollowersTokenThatHasRunOutSaysSo() throws {
+        let until = "2026-11-04T12:00:00Z"
+        let time = try #require(ISO8601DateFormatter().date(from: until))
+        let info = service(.connected, owner: "vps", until: until)
+        let before = ServiceSummary(info, now: time.addingTimeInterval(-60))
+        #expect(before.status.hasPrefix("Has access until"))
+        #expect(before.tone == .good)
+        let after = ServiceSummary(info, now: time.addingTimeInterval(60))
+        #expect(after.status.hasPrefix("Access expired"))
+        #expect(after.tone == .needsYou)
+    }
+
     @Test func aTimeThatCantBeReadIsShownAsItWas() {
         #expect(serviceTime("soon") == "soon")
         #expect(serviceTime("2026-11-04T00:00:00Z") != "2026-11-04T00:00:00Z")

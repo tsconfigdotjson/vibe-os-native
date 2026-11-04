@@ -518,6 +518,167 @@ async fn a_crash_before_the_write_strands_nothing() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_rotated_login_that_cant_be_written_is_held_and_only_the_write_tried_again() {
+    let store = Recording::new();
+    let w = World::start(store.clone()).await;
+    w.sign_in().await;
+    let mut a = w.agent("a");
+    assert_eq!(a.tools().await.len(), TOOLS);
+    let kept = w.secret();
+    // With no grace for the old token: a second refresh would kill the login.
+    w.fake.set_replay_grace(false);
+    w.fake.expire_access();
+    store.fail.store(true, Ordering::SeqCst);
+    let answer = a.call("list_issues").await;
+    assert!(
+        text(&answer).contains("can't keep the refreshed login"),
+        "{answer}"
+    );
+    assert_eq!(w.fake.refreshes(), 1);
+
+    // However long the disk goes on failing, and whatever asks: no more refreshes.
+    let life = kept.expires_at.unwrap() - kept.obtained_at.unwrap();
+    w.now.fetch_add(life / 2 + 1, Ordering::SeqCst);
+    for _ in 0..3 {
+        w.services.refresh_due().await;
+        let answer = a.call("list_issues").await;
+        assert!(is_error(&answer), "{answer}");
+        assert_eq!(w.fake.refreshes(), 1, "only the write is tried again");
+        assert_eq!(w.secret(), kept);
+    }
+    assert!(
+        w.info()
+            .detail
+            .unwrap()
+            .contains("can't keep the refreshed login")
+    );
+
+    // It's writable again: the next pass keeps it, and that's the login from then on.
+    store.fail.store(false, Ordering::SeqCst);
+    w.services.refresh_due().await;
+    assert_eq!(w.fake.refreshes(), 1);
+    assert_ne!(w.secret().refresh, kept.refresh);
+    assert_eq!(w.info().detail, None);
+    assert_eq!(w.info().state, ServiceState::Connected);
+    let answer = a.call("list_issues").await;
+    assert_eq!(text(&answer), "issues on /mcp", "{answer}");
+    assert_eq!(w.fake.refreshes(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rotated_login_not_yet_written_is_what_a_disconnect_revokes() {
+    let store = Recording::new();
+    let w = World::start(store.clone()).await;
+    w.sign_in().await;
+    let mut a = w.agent("a");
+    assert_eq!(a.tools().await.len(), TOOLS);
+    w.fake.expire_access();
+    store.fail.store(true, Ordering::SeqCst);
+    a.call("list_issues").await;
+    let given = w
+        .fake
+        .log_lines()
+        .iter()
+        .find_map(|l| l.strip_prefix("refresh gave ").map(str::to_owned))
+        .expect("the service rotated");
+    store.fail.store(false, Ordering::SeqCst);
+    w.services.disconnect("linear").await.unwrap();
+    assert!(w.services.list().services[0].state == ServiceState::Disconnected);
+    let rotated_refresh = given.replace("access", "refresh");
+    assert_eq!(
+        w.fake.revocations(),
+        [rotated_refresh],
+        "the one the service now knows"
+    );
+    // Nothing is left to write: it can't come back from here.
+    w.services.refresh_due().await;
+    assert!(store.load("linear").unwrap().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn signing_in_again_on_the_same_host_revokes_the_old_grant() {
+    let w = World::new().await;
+    w.sign_in().await;
+    let old = w.secret();
+    w.sign_in().await;
+    let new = w.secret();
+    assert_ne!(new.refresh, old.refresh);
+    assert_eq!(w.fake.revocations(), [old.refresh.unwrap()]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_followers_refusals_cant_make_the_owner_refresh_as_fast_as_it_can_ask() {
+    let w = World::new().await;
+    w.sign_in().await;
+    let first = w
+        .services
+        .token("linear", None)
+        .await
+        .unwrap()
+        .access
+        .unwrap();
+
+    // The first refusal of the current token refreshes.
+    let second = w
+        .services
+        .token("linear", Some(&first))
+        .await
+        .unwrap()
+        .access
+        .unwrap();
+    assert_ne!(second, first);
+    assert_eq!(w.fake.refreshes(), 1);
+
+    // Another right after gets what's current, with nothing used up.
+    let again = w
+        .services
+        .token("linear", Some(&second))
+        .await
+        .unwrap()
+        .access
+        .unwrap();
+    assert_eq!(again, second);
+    assert_eq!(w.fake.refreshes(), 1);
+
+    // After a while it may again.
+    w.now.fetch_add(61, Ordering::SeqCst);
+    let third = w
+        .services
+        .token("linear", Some(&second))
+        .await
+        .unwrap()
+        .access
+        .unwrap();
+    assert_ne!(third, second);
+    assert_eq!(w.fake.refreshes(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_follower_whose_owner_has_no_login_says_to_connect_at_once() {
+    let w = World::new().await;
+    let f = w.follower();
+    f.services
+        .follow(ServiceFollowParams {
+            service: "linear".into(),
+            owner: Some("vps-1".into()),
+            state: ServiceState::Disconnected,
+            access: None,
+            expires_at: None,
+            detail: None,
+        })
+        .await
+        .unwrap();
+    assert!(!f.info().wants_token);
+    let mut a = Shim::open(&f.services, "a");
+    let answer = a.call("list_issues").await;
+    assert!(is_error(&answer), "{answer}");
+    let said = text(&answer);
+    assert!(said.contains("isn't connected on the Mac"), "{said}");
+    assert!(!said.contains("once it's back"), "{said}");
+    assert!(!f.info().wants_token, "there's nothing to ask for");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_crash_after_the_write_strands_nothing() {
     // Crash just after it's kept, before it's used: a new daemon reads the new
     // tokens, and they go on working and rotating.

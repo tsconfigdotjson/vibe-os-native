@@ -20,7 +20,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader as TokioBufReader};
 use vibe_core::model::{LOCAL_HOST, ServiceRole, ServiceState};
 use vibe_core::paths::Layout;
 use vibe_core::rpc::{
-    AgentStartParams, HostAddParams, MAX_MESSAGE_BYTES, ProfileUpdateParams, ProjectAddParams,
+    AgentStartParams, ErrorCode, HostAddParams, MAX_MESSAGE_BYTES, ProfileUpdateParams,
+    ProjectAddParams,
 };
 use vibe_env::testing::TestBackend;
 use vibe_relay::proxy;
@@ -1376,6 +1377,120 @@ async fn moving_the_login_is_signing_in_on_the_new_owner() {
     assert_eq!(overview["result"]["services"][0]["owner"], "vps");
 }
 
+/// The socket's door to the calls that hand out tokens and forget logins.
+async fn over_socket(core: &Core, session: &mut Session, method: &str, params: Value) -> Value {
+    let line = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).to_string();
+    let reply = handle_message(core, session, line.as_bytes())
+        .await
+        .unwrap();
+    serde_json::from_str(&reply).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn only_a_link_can_ask_for_a_token_or_tell_a_host_to_forget_its_login() {
+    let fake = FakeService::start().await;
+    let logins = Arc::new(MemoryStore::default());
+    let host = node(&fake, Place::LinuxHost, logins.clone(), None, |_| {}).await;
+    host.sign_in_here().await;
+    let held = logins.load("linear").unwrap().unwrap();
+
+    // A plain client, as the PoC had it: nothing given, and nothing forgotten.
+    let token = json!({"service": "linear"});
+    let forget = json!({"service": "linear", "state": "disconnected"});
+    let mut plain = Session::default();
+    let hello = json!({"client": "someone else", "protocol": vibe_core::rpc::PROTOCOL_VERSION});
+    over_socket(&host.core, &mut plain, "daemon.hello", hello).await;
+    for (method, params) in [("services.token", &token), ("services.follow", &forget)] {
+        let r = over_socket(&host.core, &mut plain, method, params.clone()).await;
+        assert_eq!(r["error"]["code"], ErrorCode::Unauthorized.code(), "{r}");
+        assert!(!r.to_string().contains(&held.access), "{r}");
+    }
+    // With no hello at all, the same.
+    let r = over_socket(
+        &host.core,
+        &mut Session::default(),
+        "services.token",
+        token.clone(),
+    )
+    .await;
+    assert_eq!(r["error"]["code"], ErrorCode::Unauthorized.code(), "{r}");
+    assert_eq!(logins.load("linear").unwrap().unwrap(), held);
+    assert_eq!(host.service().role, ServiceRole::Owner);
+
+    // A link can.
+    let mut link = Session::default();
+    let hello = json!({"client": "vibed link calls from mac", "protocol": vibe_core::rpc::PROTOCOL_VERSION});
+    over_socket(&host.core, &mut link, "daemon.hello", hello).await;
+    let r = over_socket(&host.core, &mut link, "services.token", token).await;
+    assert_eq!(r["result"]["access"], held.access, "{r}");
+    let r = over_socket(&host.core, &mut link, "services.follow", forget).await;
+    assert_eq!(r["result"]["state"], "disconnected", "{r}");
+    assert!(logins.load("linear").unwrap().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_disconnect_on_a_mac_with_no_links_leaves_the_next_login_free_to_go_to_a_host() {
+    let fake = FakeService::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let host = node(
+        &fake,
+        Place::LinuxHost,
+        Arc::new(FileStore(dir.path().join("services"))),
+        None,
+        |_| {},
+    )
+    .await;
+    let server = serve(
+        host.core.clone(),
+        common::short_tempdir(),
+        MAX_MESSAGE_BYTES,
+    );
+    let tapped = Arc::new(Tapped::default());
+    tapped
+        .sockets
+        .lock()
+        .unwrap()
+        .insert("me@vps".to_owned(), server.path.clone());
+    let wires = tapped.clone();
+    let mac = node(
+        &fake,
+        Place::Mac,
+        Arc::new(MemoryStore::default()),
+        None,
+        move |config| config.remote = wires,
+    )
+    .await;
+    mac.core.spawn_links();
+    let owner = async || {
+        let r = rpc(&mac.core, "services.overview", json!({})).await;
+        r["result"]["services"][0]["owner"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+
+    // With no host to go to, the Mac's, and then nobody's.
+    mac.sign_in_here().await;
+    assert_eq!(owner().await, LOCAL_HOST);
+    let done = rpc(
+        &mac.core,
+        "services.disconnect",
+        json!({"service": "linear"}),
+    )
+    .await;
+    assert_eq!(done["result"]["state"], "disconnected", "{done}");
+
+    // A host linked since is where the next login goes.
+    mac.core
+        .add_host(HostAddParams {
+            name: "vps".into(),
+            address: "me@vps".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(owner().await, "vps");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn disconnecting_forgets_it_everywhere_and_an_owner_away_is_told_when_its_back() {
     let fake = FakeService::start().await;
@@ -1399,9 +1514,9 @@ async fn disconnecting_forgets_it_everywhere_and_an_owner_away_is_told_when_its_
     assert!(done["result"].is_object(), "{done}");
     wait_for("the Mac to forget", || {
         p.mac_logins.load("linear").unwrap().is_none()
+            && p.mac.service().state == ServiceState::Disconnected
     })
     .await;
-    assert_eq!(p.mac.service().state, ServiceState::Disconnected);
 
     // It's back, still saying it holds it, and isn't believed: it forgets too,
     // there and at the service.

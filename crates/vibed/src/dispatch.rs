@@ -61,6 +61,18 @@ impl Session {
             self.link = true;
         }
     }
+
+    /// Refuses a call that only the Mac makes of a host over its link: an access
+    /// token, and being told to forget a login, aren't for any other client.
+    fn link_only(&self, method: &str) -> Result<(), ErrorObject> {
+        if self.link {
+            return Ok(());
+        }
+        Err(ErrorObject::new(
+            ErrorCode::Unauthorized,
+            format!("{method} is only for another host's link"),
+        ))
+    }
 }
 
 /// Handles one message, a line without its newline, and returns the line to
@@ -281,12 +293,16 @@ async fn call(
                 .await,
         ),
         ServicesToken::NAME => {
+            session.link_only(ServicesToken::NAME)?;
             encode_result(core.services_token(decode::<ServicesToken>(params)?).await)
         }
-        ServicesFollow::NAME => encode_result(
-            core.services_follow(decode::<ServicesFollow>(params)?)
-                .await,
-        ),
+        ServicesFollow::NAME => {
+            session.link_only(ServicesFollow::NAME)?;
+            encode_result(
+                core.services_follow(decode::<ServicesFollow>(params)?)
+                    .await,
+            )
+        }
         ServicesOverview::NAME => {
             decode::<ServicesOverview>(params)?;
             encode_result(core.services_overview().await)

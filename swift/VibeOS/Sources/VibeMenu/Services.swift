@@ -67,8 +67,11 @@ public struct ServiceSummary: Equatable, Sendable {
     /// How many tools its agents see, and how they reach them.
     public var note: String?
 
-    public init(_ service: ServiceInfo) {
+    public init(_ service: ServiceInfo, now: Date = Date()) {
         let until = service.accessUntil.map(serviceTime)
+        let ranOut = service.accessUntil
+            .flatMap { ISO8601DateFormatter().date(from: $0) }
+            .map { $0 <= now } ?? false
         switch (service.state, service.role) {
         case (.disconnected, _):
             status = "No access"
@@ -76,6 +79,9 @@ public struct ServiceSummary: Equatable, Sendable {
         case (.connected, .owner):
             status = until.map { "Holds the login · access until \($0)" } ?? "Holds the login"
             tone = .good
+        case (.connected, .follower) where ranOut:
+            status = until.map { "Access expired \($0)" } ?? "Access expired"
+            tone = .needsYou
         case (.connected, .follower):
             status = until.map { "Has access until \($0)" } ?? "Has access"
             tone = .good

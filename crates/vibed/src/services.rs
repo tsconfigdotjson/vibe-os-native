@@ -189,8 +189,9 @@ impl Core {
                 broker.disconnect(&p.service).await?;
             }
         }
-        // Only for whoever gives out tokens: a Linux host has no one to tell.
-        if !crate::core::lock(&self.links).is_empty() {
+        // On the Mac, which decides who owns it, links or none: the next sign-in
+        // goes where a new one should. A Linux host decides nothing.
+        if broker.place() == Place::Mac {
             broker.release(&p.service);
         }
         self.services_wake.notify_one();

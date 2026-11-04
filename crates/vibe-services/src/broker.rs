@@ -66,6 +66,11 @@ use crate::util::{base64url, query_of};
 /// A token this close to running out is refreshed first.
 const REFRESH_EARLY: i64 = 60;
 
+/// Seconds between refreshes asked for because a follower had a token turned down.
+/// Each uses up a token at the service, so a follower being refused over and over
+/// doesn't get to do that as fast as it can ask.
+const REFUSED_REFRESH_EVERY: i64 = 60;
+
 /// How long a service gets to start answering a call, and to go on: its SSE
 /// keep-alives count.
 const CALL_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -253,6 +258,12 @@ struct Conn {
     loaded: AtomicBool,
     /// Held across a refresh, so there's one at a time.
     refreshing: tokio::sync::Mutex<()>,
+    /// A login the service has rotated to that couldn't be written. It isn't used
+    /// until it's kept, and while it's here only the write is tried again: another
+    /// refresh would replay the old token, which the service takes only for so long.
+    unsaved: Mutex<Option<Secret>>,
+    /// When a follower's refusal last made this owner refresh.
+    refused_refresh_at: Mutex<Option<i64>>,
     saved: Mutex<Saved>,
     /// When the catalog was last read from the service.
     catalog_read: Mutex<Option<Instant>>,
@@ -472,6 +483,8 @@ impl Services {
                     secret: Mutex::new(None),
                     loaded: AtomicBool::new(false),
                     refreshing: tokio::sync::Mutex::new(()),
+                    unsaved: Mutex::new(None),
+                    refused_refresh_at: Mutex::new(None),
                     saved: Mutex::new(saved),
                     catalog_read: Mutex::new(None),
                     catalog_gate: tokio::sync::Mutex::new(()),
@@ -885,8 +898,17 @@ impl Services {
         self.write_secret(conn, secret.clone())
             .await
             .map_err(|e| failed(format!("Can't keep the login for {}: {e}", conn.def.title)))?;
-        self.hold_login(conn, Some(secret.clone()));
+        let rotated = lock(&conn.unsaved).take();
+        let before = self.hold_login(conn, Some(secret.clone()));
         drop(refreshing);
+        // Signing in again on the same host leaves one grant at the service, as
+        // moving the login does: the old one's no use to anyone now.
+        if let Some(old) = rotated.or(before).filter(|old| old.refresh.is_some())
+            && let Some(endpoint) = &old.revocation_endpoint
+        {
+            let token = old.refresh.as_deref().unwrap_or(&old.access);
+            oauth::revoke(&self.http, endpoint, token, old.client_id.as_deref()).await;
+        }
         self.forget_sessions(&conn.def.name);
         *lock(&conn.catalog_read) = None;
         self.update(conn, |s| {
@@ -933,7 +955,8 @@ impl Services {
             .await
             .map_err(|e| failed(e.to_string()))?
             .map_err(|e| failed(format!("Can't forget the login: {e}")))?;
-        let gone = self.hold_login(conn, None);
+        let rotated = lock(&conn.unsaved).take();
+        let gone = rotated.or(self.hold_login(conn, None));
         drop(refreshing);
         self.forget_sessions(service);
         lock(&self.pending).remove(service);
@@ -1173,6 +1196,11 @@ impl Services {
         if matches!(state, ServiceState::NeedsReconnect | ServiceState::Revoked) {
             return Some(Err(AuthFailure::NeedsReconnect));
         }
+        // The owner has no login to give: waiting won't get one, and nor will its
+        // coming back.
+        if state == ServiceState::Disconnected {
+            return Some(Err(AuthFailure::NotConnected));
+        }
         let held = lock(&conn.secret).clone();
         let Some(held) = held else {
             return owner.is_none().then_some(Err(AuthFailure::NotConnected));
@@ -1185,7 +1213,8 @@ impl Services {
     /// Refreshes any login this host owns that's past half its life, so followers
     /// are handed a token with the most time on it, to carry them through the
     /// owner or the Mac being away. Failing is fine: the next pass tries again,
-    /// with the current token good for hours yet.
+    /// with the current token good for hours yet. A rotated login that couldn't be
+    /// written is written instead, with no refresh, until that works.
     pub async fn refresh_due(&self) {
         for conn in &self.conns {
             if self.load_secret(conn).await.is_err() {
@@ -1199,6 +1228,11 @@ impl Services {
             if role != ServiceRole::Owner
                 || matches!(state, ServiceState::NeedsReconnect | ServiceState::Revoked)
             {
+                continue;
+            }
+            let unsaved = lock(&conn.unsaved).clone();
+            if let Some(rotated) = unsaved {
+                let _ = self.keep_rotated(conn, rotated).await;
                 continue;
             }
             // As it is now that the lock's held: a call may just have refreshed it.
@@ -1241,6 +1275,8 @@ impl Services {
                 ))
             };
         }
+        let rejected =
+            rejected.filter(|token| self.may_refresh_for_refusal(conn, held.as_ref(), token));
         match self.access(conn, rejected).await {
             Ok(access) => {
                 let expires_at = lock(&conn.secret).as_ref().and_then(|s| s.expires_at);
@@ -1255,6 +1291,22 @@ impl Services {
         }
     }
 
+    /// Whether a follower's having had `token` turned down can make this owner
+    /// refresh now. One for a token that's no longer current costs nothing, as
+    /// what's current is simply given.
+    fn may_refresh_for_refusal(&self, conn: &Conn, held: Option<&Secret>, token: &str) -> bool {
+        if held.is_none_or(|s| s.access != token) {
+            return true;
+        }
+        let now = (self.deps.clock)();
+        let mut last = lock(&conn.refused_refresh_at);
+        if last.is_some_and(|at| now - at < REFUSED_REFRESH_EVERY) {
+            return false;
+        }
+        *last = Some(now);
+        true
+    }
+
     /// Makes this host a follower of a login another host owns, using the token
     /// given. If it held a login of its own, that's forgotten first, here and at
     /// the service, so there's never a second host with a refresh token.
@@ -1265,7 +1317,8 @@ impl Services {
         let conn = self.require(&p.service)?.clone();
         let refreshing = conn.refreshing.lock().await;
         let _ = self.load_secret(&conn).await;
-        let old = lock(&conn.secret).clone();
+        let rotated = lock(&conn.unsaved).take();
+        let old = rotated.or_else(|| lock(&conn.secret).clone());
         let now = (self.deps.clock)();
         let next = p.access.clone().map(|access| Secret {
             access,
@@ -1378,16 +1431,33 @@ impl Services {
 
     /// The Mac records that `service` was disconnected. Any host still saying it
     /// owns it is then told otherwise, and not believed.
+    /// Where this broker runs.
+    pub fn place(&self) -> Place {
+        self.deps.place
+    }
+
     pub fn release(&self, service: &str) {
-        if let Some(conn) = self.conn(service) {
-            self.update(conn, |s| {
-                s.assigned = None;
-                s.released = true;
-            });
+        if self.conn(service).is_some_and(|conn| {
+            let mut saved = lock(&conn.saved);
+            saved.assigned = None;
+            saved.released = true;
+            true
+        })
+            // Written, with nothing said: who it's assigned to isn't in what's shown.
+            && let Err(e) = self.persist()
+        {
+            (self.deps.audit)(&format!(
+                "services: can't keep {}: {e}",
+                self.state_file.display()
+            ));
         }
     }
 
     async fn refresh(&self, conn: &Conn, secret: Secret) -> Result<String, AuthFailure> {
+        let unsaved = lock(&conn.unsaved).clone();
+        if let Some(rotated) = unsaved {
+            return self.keep_rotated(conn, rotated).await;
+        }
         let title = &conn.def.title;
         let (Some(refresh), Some(endpoint), Some(client_id)) = (
             secret.refresh.as_deref(),
@@ -1446,21 +1516,30 @@ impl Services {
             expires_at: tokens.expires_in.map(|s| now + s),
             ..secret
         };
-        // Write, then use. If the write fails, or a crash comes first, the new
-        // token is never used, and the next attempt replays the old refresh
-        // token, which a service that rotates takes within its replay grace.
+        self.keep_rotated(conn, rotated).await
+    }
+
+    /// Write, then use. If the write fails the new token isn't used, but it's held
+    /// here, and only the write is tried again: a failing disk or Keychain mustn't
+    /// use up the service's replay grace on the old token. After a crash, with
+    /// nothing held, the next attempt does replay the old refresh token, which a
+    /// service that rotates takes within that grace.
+    async fn keep_rotated(&self, conn: &Conn, rotated: Secret) -> Result<String, AuthFailure> {
         if let Err(e) = self.write_secret(conn, rotated.clone()).await {
             let why = format!("can't keep the refreshed login ({e})");
             self.note(conn, ServiceState::Connected, Some(why.clone()));
+            *lock(&conn.unsaved) = Some(rotated);
             return Err(AuthFailure::Unavailable(why));
         }
+        *lock(&conn.unsaved) = None;
+        let access = rotated.access.clone();
         self.hold_login(conn, Some(rotated));
         self.update(conn, |s| {
             s.state = ServiceState::Connected;
             s.detail = None;
             s.detail_at = None;
         });
-        Ok(tokens.access)
+        Ok(access)
     }
 
     // ---- Upstream.
