@@ -1,0 +1,20 @@
+{
+  "description": "The owning host says its login needs reconnecting, and gives no token. The Mac passes that on to every other host, so their agents are told how it's mended.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 9913,
+    "method": "services.token",
+    "params": {
+      "service": "linear"
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 9913,
+    "result": {
+      "detail": "Linear refused the refresh (invalid_client)",
+      "service": "linear",
+      "state": "needs_reconnect"
+    }
+  }
+}

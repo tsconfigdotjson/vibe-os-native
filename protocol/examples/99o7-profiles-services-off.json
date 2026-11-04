@@ -1,0 +1,40 @@
+{
+  "description": "A profile whose agents get no shared services. Only `false` is ever written: a profile says nothing while they're on, as they are by default.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 9907,
+    "method": "profiles.create",
+    "params": {
+      "host": "local",
+      "project": "app",
+      "name": "no-services",
+      "shared_services": false
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 9907,
+    "result": {
+      "environment": "linux",
+      "memory": 4294967296,
+      "mode": "auto",
+      "model": "opus",
+      "name": "no-services",
+      "reasoning": "high",
+      "shared_services": false
+    }
+  },
+  "events": [
+    {
+      "jsonrpc": "2.0",
+      "method": "events.event",
+      "params": {
+        "at": "2026-10-30T12:00:00Z",
+        "host": "local",
+        "kind": "profiles.changed",
+        "project": "app",
+        "seq": 34
+      }
+    }
+  ]
+}

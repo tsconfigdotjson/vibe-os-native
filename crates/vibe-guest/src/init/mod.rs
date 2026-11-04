@@ -9,10 +9,14 @@ mod sys;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use vibe_guest::boot::Boot;
 use vibe_guest::proto::{CONTROL_PORT, ShareMount, TERMINAL_PORT};
+use vibe_relay::frame::VSOCK_PORT;
+use vibe_relay::hub::{Hub, Timing};
+use vibe_relay::local;
 
 use crate::USAGE;
 use serve::{Guest, bind_patiently, serve};
@@ -125,6 +129,8 @@ pub(crate) fn main(args: Vec<String>) -> ExitCode {
                 shares: setup.shares,
                 problems: Mutex::new(setup.problems),
                 network,
+                services: Hub::new(Box::new(|_, _| Ok(())), Timing::default()),
+                services_ready: AtomicBool::new(false),
             };
             (guest, None)
         }
@@ -152,11 +158,34 @@ pub(crate) fn main(args: Vec<String>) -> ExitCode {
                 shares: test.shares,
                 problems: Mutex::new(Vec::new()),
                 network,
+                services: Hub::new(Box::new(|_, _| Ok(())), Timing::default()),
+                services_ready: AtomicBool::new(false),
             };
             (guest, Some(test.vsock_dir))
         }
     };
     let guest = Arc::new(guest);
+    // Shared MCP services: the socket agents' shims reach, and in a VM the
+    // program they run. It's the Mac that dials in to carry them. All before the
+    // ports below, as the first status anyone can read is what a launch goes by,
+    // and it asks only once.
+    let socket = match &unix_dir {
+        Some(dir) => dir.join("services.sock"),
+        None => PathBuf::from(local::GUEST_SOCKET),
+    };
+    let program = if unix_dir.is_some() {
+        Ok(())
+    } else {
+        serve::install_program(std::path::Path::new(local::GUEST_PROGRAM))
+    };
+    if let Err(e) = &program {
+        log!("can't install the shared services' program: {e}");
+    }
+    // Only if all's well does the status say so, and the Mac offer them.
+    let serving = serve::serve_services_socket(guest.clone(), socket);
+    guest
+        .services_ready
+        .store(program.is_ok() && serving, Ordering::Relaxed);
     for (port, name, handle) in [
         (
             CONTROL_PORT,
@@ -164,6 +193,7 @@ pub(crate) fn main(args: Vec<String>) -> ExitCode {
             serve::control as fn(&Guest, std::fs::File),
         ),
         (TERMINAL_PORT, "terminal", serve::terminal),
+        (VSOCK_PORT, "services", serve::services_relay),
     ] {
         let guest = guest.clone();
         let dir = unix_dir.clone();

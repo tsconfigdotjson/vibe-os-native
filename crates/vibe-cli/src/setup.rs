@@ -32,6 +32,7 @@ pub(crate) struct Settings {
     pub(crate) reasoning: Option<Reasoning>,
     pub(crate) mode: Option<Mode>,
     pub(crate) memory: Option<u64>,
+    pub(crate) shared_services: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,6 +134,13 @@ fn settings(found: &[(&str, &str)]) -> Result<Settings, String> {
         reasoning: parse("reasoning").map(|v| v.parse()).transpose()?,
         mode: parse("mode").map(|v| v.parse()).transpose()?,
         memory: parse("memory").map(|v| parse_size(&v)).transpose()?,
+        shared_services: parse("shared-services")
+            .map(|v| match v.as_str() {
+                "on" => Ok(true),
+                "off" => Ok(false),
+                other => Err(format!("--shared-services is on or off, not {other}")),
+            })
+            .transpose()?,
     })
 }
 
@@ -141,13 +149,14 @@ const SUBCOMMANDS: [&str; 8] = [
     "list", "ls", "create", "add", "set", "update", "delete", "rm",
 ];
 
-const PROFILE_FLAGS: [&str; 6] = [
+const PROFILE_FLAGS: [&str; 7] = [
     "host",
     "environment",
     "model",
     "reasoning",
     "mode",
     "memory",
+    "shared-services",
 ];
 
 impl Command {
@@ -315,7 +324,11 @@ pub(crate) fn describe_profile(p: &Profile) -> String {
         p.reasoning,
         p.mode,
         format_size(p.memory).unwrap_or_else(|| format!("{} bytes", p.memory))
-    )
+    ) + if p.shared_services {
+        ""
+    } else {
+        ", shared services off"
+    }
 }
 
 pub(crate) fn describe_host(h: &HostInfo) -> String {
@@ -484,6 +497,7 @@ pub(crate) fn run(socket: &Path, command: Command) -> Result<(), String> {
                 reasoning: s.reasoning,
                 mode: s.mode,
                 memory: s.memory,
+                shared_services: s.shared_services,
             };
             let p = client::call::<ProfilesCreate>(socket, &params, TIMEOUT).map_err(e)?;
             println!("created {}", describe_profile(&p));
@@ -505,6 +519,7 @@ pub(crate) fn run(socket: &Path, command: Command) -> Result<(), String> {
                 reasoning: s.reasoning,
                 mode: s.mode,
                 memory: s.memory,
+                shared_services: s.shared_services,
             };
             let p = client::call::<ProfilesUpdate>(socket, &params, TIMEOUT).map_err(e)?;
             println!("{}", describe_profile(&p));

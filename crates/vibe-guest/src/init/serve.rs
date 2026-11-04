@@ -1,9 +1,11 @@
-//! The two ports: the control channel and the terminal (`vibe_guest::proto`).
-//! Each connection gets a thread of its own.
+//! The ports: the control channel and the terminal (`vibe_guest::proto`), and
+//! the shared services' relay (`vibe_relay`). Each connection gets a thread of
+//! its own.
 
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
@@ -29,6 +31,9 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 /// seconds more (`session::Conn`).
 const SHIM_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// How long one write to the Mac's relay may block.
+const RELAY_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// How long a poweroff gives the agent to end before it's killed.
 const POWEROFF_GRACE: Duration = Duration::from_secs(3);
 
@@ -48,6 +53,11 @@ pub(crate) struct Guest {
     pub(crate) shares: Vec<ShareMount>,
     pub(crate) problems: Mutex<Vec<String>>,
     pub(crate) network: Arc<Mutex<Option<Network>>>,
+    /// The shims in this VM, and the relay the Mac opens to carry them.
+    pub(crate) services: vibe_relay::hub::Hub,
+    /// Its socket's up and its program's there, so the status says it serves
+    /// them, and the Mac offers them to the agent.
+    pub(crate) services_ready: std::sync::atomic::AtomicBool,
 }
 
 /// A vsock listener, or a Unix one standing in for it in tests.
@@ -170,6 +180,83 @@ pub(crate) fn serve(
 }
 
 // ---------------------------------------------------------------------------
+// Shared MCP services
+
+/// Carries the relay the Mac opened, until it ends or a newer one replaces it.
+/// It only ever comes in here, on the vsock port, which takes the host alone: a
+/// process in the guest can't pose as it.
+pub(crate) fn services_relay(guest: &Guest, conn: File) {
+    let (Ok(reader), Ok(closer)) = (conn.try_clone(), conn.try_clone()) else {
+        return;
+    };
+    // A Mac that's stopped reading mustn't hold up every shim here for longer
+    // than this. It's no help for reads, which wait for as long as it's quiet.
+    if let Err(e) = set_timeouts(conn.as_raw_fd(), None, Some(RELAY_WRITE_TIMEOUT)) {
+        log!("services: the Mac's relay: {e}");
+        return;
+    }
+    log!("services: the Mac's relay is up");
+    let ended = guest.services.carry(reader, conn, move || {
+        // SAFETY: shutdown on a descriptor the closure owns.
+        unsafe { libc::shutdown(closer.as_raw_fd(), libc::SHUT_RDWR) };
+    });
+    match ended {
+        Ok(()) => log!("services: the Mac's relay ended"),
+        Err(e) => log!("services: the Mac's relay ended: {e}"),
+    }
+}
+
+/// Serves the socket agents' shims reach, on a thread of its own. It's for `vibe`
+/// as well as root, and only ever reaches this VM's relay. Says whether it could.
+pub(crate) fn serve_services_socket(guest: Arc<Guest>, path: PathBuf) -> bool {
+    let bound = (|| {
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir)?;
+        }
+        let _ = fs::remove_file(&path);
+        let listener = UnixListener::bind(&path)?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666))?;
+        Ok::<_, io::Error>(listener)
+    })();
+    let listener = match bound {
+        Ok(l) => l,
+        Err(e) => {
+            log!("can't serve {}: {e}", path.display());
+            return false;
+        }
+    };
+    let accepting = std::thread::Builder::new()
+        .name("services-socket".into())
+        .spawn(move || {
+            for conn in listener.incoming().flatten() {
+                let hub = guest.services.clone();
+                if let Err(e) = std::thread::Builder::new()
+                    .name("services-shim".into())
+                    .spawn(move || hub.serve(conn))
+                {
+                    log!("can't start a thread for a shim: {e}");
+                }
+            }
+        });
+    if let Err(e) = accepting {
+        log!("can't serve {}: {e}", path.display());
+        return false;
+    }
+    true
+}
+
+/// Copies this program to `path`, for agents to run as `vibe`. The initrd it
+/// came from is hidden under the root by now, and this way it's always the
+/// version the VM booted with. It's a couple of MB of the VM's tmpfs.
+pub(crate) fn install_program(path: &Path) -> io::Result<()> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    fs::copy("/proc/self/exe", path)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+}
+
+// ---------------------------------------------------------------------------
 // The control channel
 
 pub(crate) fn control(guest: &Guest, conn: File) {
@@ -279,6 +366,9 @@ fn status(guest: &Guest) -> Status {
         layers: guest.layers.clone(),
         shares: guest.shares.clone(),
         problems: lock(&guest.problems).clone(),
+        services: guest
+            .services_ready
+            .load(std::sync::atomic::Ordering::Relaxed),
     }
 }
 

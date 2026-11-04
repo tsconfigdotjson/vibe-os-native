@@ -1,5 +1,6 @@
-//! What `vibe-guest` serves, on two vsock ports in the guest. The host
-//! reaches them only through `vibe-vm`'s `connect`, since only the process
+//! What `vibe-guest` serves on its control and terminal vsock ports (the shared
+//! services' relay, on a third, is `vibe_relay`'s). The host reaches them only
+//! through `vibe-vm`'s `connect`, since only the process
 //! that owns a VM can reach its vsock (`protocol/vibe-vm/`).
 //!
 //! - [`CONTROL_PORT`]: `vibed`'s channel. A connection carries one
@@ -342,6 +343,10 @@ pub struct Status {
     /// that wouldn't mount.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub problems: Vec<String>,
+    /// It serves shared MCP services: its socket's up, and agents have its
+    /// program to run the shim with. An older guest doesn't say, so it's false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub services: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

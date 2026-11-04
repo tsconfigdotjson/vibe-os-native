@@ -1,0 +1,21 @@
+{
+  "description": "The first half of connecting or reconnecting, on the host that's to own the login. It registers its client and makes the PKCE verifier, which it keeps, and gives the page for the app to open. What's connected stays as it is until the second half.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 9902,
+    "method": "services.connect",
+    "params": {
+      "host": "local",
+      "service": "linear"
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 9902,
+    "result": {
+      "callback_scheme": "vibeos",
+      "service": "linear",
+      "url": "http://services.example/authorize?response_type=code&client_id=fake-client-1&redirect_uri=vibeos%3A%2F%2Foauth%2Fcallback&scope=read%20write&state=oKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr8&code_challenge=rN4zJ28AG73PbsJ2nR8lHWH0eIqNuKSVrG4BwHaRHGE&code_challenge_method=S256&resource=http%3A%2F%2Fservices.example%2Fmcp"
+    }
+  }
+}

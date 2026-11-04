@@ -117,6 +117,11 @@ pub struct Config {
     /// The Linux images kept current in the background, on a Mac that
     /// runs `linux` agents in VMs: the doctor's `linux` check.
     pub linux_images: Option<Arc<crate::linux::Watch>>,
+    /// The `vibe` agents on this machine run the shared services' shim with.
+    pub vibe_cli: OsString,
+    /// This host's broker for shared services. None by default, so nothing
+    /// reaches a Keychain or a real service unless `vibed`'s `main` asks.
+    pub services: Option<crate::services::ServicesConfig>,
 }
 
 impl std::fmt::Debug for Config {
@@ -170,9 +175,21 @@ impl Config {
             },
             checks,
             linux_images: None,
+            vibe_cli: find_vibe(std::env::current_exe().ok().as_deref()),
+            services: None,
             info,
         }
     }
+}
+
+/// The `vibe` beside `vibed`, as it's installed on every host, or just `vibe`
+/// for `PATH` to find.
+fn find_vibe(vibed: Option<&Path>) -> OsString {
+    vibed
+        .and_then(Path::parent)
+        .map(|dir| dir.join("vibe"))
+        .filter(|p| p.is_file())
+        .map_or_else(|| "vibe".into(), PathBuf::into_os_string)
 }
 
 /// The first executable `name` on `path`, then in the usual places
@@ -278,6 +295,16 @@ struct EventBus {
     last: Mutex<u64>,
 }
 
+impl EventBus {
+    fn publish(&self, mut event: Event) {
+        let mut last = lock(&self.last);
+        *last += 1;
+        event.seq = *last;
+        // No subscribers is fine.
+        let _ = self.tx.send(event);
+    }
+}
+
 pub struct Core {
     info: DaemonInfo,
     label: String,
@@ -334,7 +361,15 @@ pub struct Core {
     /// no other add may take its name or its directory, but other adds go
     /// ahead.
     adding: Mutex<HashSet<String>>,
-    events: EventBus,
+    events: Arc<EventBus>,
+    /// The `vibe` agents here run the shared services' shim with.
+    pub(crate) vibe_cli: OsString,
+    /// This host's broker for shared services.
+    pub(crate) services: Option<Arc<vibe_services::Services>>,
+    /// Wakes the look at what each service's followers have been given.
+    pub(crate) services_wake: Arc<tokio::sync::Notify>,
+    /// What each follower was last given, by (host, service).
+    pub(crate) services_given: tokio::sync::Mutex<crate::services::GivenTokens>,
     pub(crate) gh_status: Mutex<GhStatus>,
     pub(crate) checks: Arc<dyn crate::doctor::HostChecks>,
     pub(crate) linux_images: Option<Arc<crate::linux::Watch>>,
@@ -477,6 +512,37 @@ impl Core {
             .ensure_host(LOCAL_HOST, &config.info.os, &config.label, (config.clock)())
             .map_err(OpenError::Store)?;
         let (tx, _) = broadcast::channel(EVENT_BACKLOG);
+        let events = Arc::new(EventBus {
+            tx,
+            last: Mutex::new(0),
+        });
+        let services_wake = Arc::new(tokio::sync::Notify::new());
+        let services = config.services.clone().map(|services| {
+            let (bus, clock) = (Arc::clone(&events), Arc::clone(&config.clock));
+            let wake = Arc::clone(&services_wake);
+            Core::make_broker(
+                services,
+                config.layout.data_dir().join("services.json"),
+                Arc::clone(&config.clock),
+                Arc::clone(&config.entropy),
+                // `state` is its state, and `message` its name.
+                Arc::new(move |info| {
+                    wake.notify_one();
+                    bus.publish(Event {
+                        seq: 0,
+                        at: rfc3339(clock()),
+                        host: LOCAL_HOST.into(),
+                        kind: EventKind::ServiceChanged,
+                        project: None,
+                        agent: None,
+                        state: Some(info.state.to_string()),
+                        limit: None,
+                        message: Some(info.name.clone()),
+                        status: None,
+                    });
+                }),
+            )
+        });
         let tunnel_end = config.layout.run_dir().join(crate::external::TUNNEL_END);
         let core = Core {
             info: config.info,
@@ -508,10 +574,11 @@ impl Core {
             store: Mutex::new(store),
             limits_lock: Mutex::new(()),
             adding: Mutex::new(HashSet::new()),
-            events: EventBus {
-                tx,
-                last: Mutex::new(0),
-            },
+            events,
+            vibe_cli: config.vibe_cli,
+            services,
+            services_wake,
+            services_given: tokio::sync::Mutex::default(),
             gh_status: Mutex::new(GhStatus {
                 state: GhState::Unknown,
                 account: None,
@@ -611,12 +678,8 @@ impl Core {
     }
 
     /// Numbers `event` and sends it to every subscriber.
-    pub fn publish(&self, mut event: Event) {
-        let mut last = lock(&self.events.last);
-        *last += 1;
-        event.seq = *last;
-        // No subscribers is fine.
-        let _ = self.events.tx.send(event);
+    pub fn publish(&self, event: Event) {
+        self.events.publish(event);
     }
 
     /// A new subscription, and the `seq` of the last event before it.
@@ -929,6 +992,7 @@ impl Core {
         profile.reasoning = p.reasoning.unwrap_or(profile.reasoning);
         profile.mode = p.mode.unwrap_or(profile.mode);
         profile.memory = p.memory.unwrap_or(profile.memory);
+        profile.shared_services = p.shared_services.unwrap_or(profile.shared_services);
         profile.validate(&self.info.os).map_err(invalid)?;
         let profile = self
             .store()
@@ -950,6 +1014,7 @@ impl Core {
         profile.reasoning = p.reasoning.unwrap_or(profile.reasoning);
         profile.mode = p.mode.unwrap_or(profile.mode);
         profile.memory = p.memory.unwrap_or(profile.memory);
+        profile.shared_services = p.shared_services.unwrap_or(profile.shared_services);
         profile.validate(&self.info.os).map_err(invalid)?;
         let profile = store
             .replace_profile(host, &p.project, &p.profile, &profile)

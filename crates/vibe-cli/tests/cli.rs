@@ -126,8 +126,22 @@ fn rpc_bridges_the_whole_contract() {
     let core = Core::open(golden.config()).unwrap();
     let s = start_core(core, tempfile::tempdir().unwrap());
     let mut input = Vec::new();
-    let mut expected = Vec::new();
-    for ex in common::examples(&golden.home) {
+    let mut expected: Vec<Value> = Vec::new();
+    let mut said_link = false;
+    for ex in common::examples(&golden) {
+        // What only another host's link can call: this connection says it's one
+        // from there on, as a link's would, with the hello it would use.
+        if !said_link && (ex.name.contains("services-token") || ex.name.contains("services-follow"))
+        {
+            said_link = true;
+            let hello = serde_json::json!({"jsonrpc": "2.0", "id": "link", "method": "daemon.hello",
+                "params": {"client": "vibed link calls from tests",
+                           "protocol": vibe_core::rpc::PROTOCOL_VERSION}});
+            input.extend(format!("{hello}\n").into_bytes());
+            let mut answer = expected[0].clone();
+            answer["id"] = "link".into();
+            expected.push(answer);
+        }
         let Some(line) = ex.line else { continue };
         input.extend(line);
         input.push(b'\n');
@@ -136,6 +150,7 @@ fn rpc_bridges_the_whole_contract() {
         }
         expected.extend(ex.events);
     }
+    assert!(said_link, "the examples have the link's calls");
     let out = vibe(&["rpc"], &s.path, &input);
     assert!(out.status.success(), "{}", text(&out.stderr));
     let got: Vec<Value> = text(&out.stdout)

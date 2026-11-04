@@ -1,0 +1,31 @@
+[package]
+name = "vibe-services"
+description = "Shared MCP services: the broker every vibed runs for its own agents, the OAuth lifecycle, and the one login per install"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+vibe-core.workspace = true
+vibe-relay.workspace = true
+bytes = "1"
+http = "1"
+http-body-util = "0.1"
+# The client for services; the server only for `testing`'s stand-ins.
+hyper = { version = "1", features = ["client", "http1", "server"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "logging", "ring", "tls12"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+rustls.workspace = true
+rustls-native-certs = "0.8"
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

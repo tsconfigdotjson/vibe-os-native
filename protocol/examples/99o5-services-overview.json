@@ -1,0 +1,44 @@
+{
+  "description": "Each service's one connection, for the app: who owns the login, or would at the next sign-in, how it stands, and how every host stands with it. A host that doesn't answer in a few seconds is marked so.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 9905,
+    "method": "services.overview",
+    "params": {}
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 9905,
+    "result": {
+      "services": [
+        {
+          "hosts": [
+            {
+              "host": "local",
+              "reachable": true,
+              "service": {
+                "auto_allow": true,
+                "denied_tools": [
+                  "delete_issue"
+                ],
+                "enabled": true,
+                "name": "linear",
+                "read_only": true,
+                "role": "follower",
+                "state": "disconnected",
+                "title": "Linear",
+                "tools": 0,
+                "wants_token": false
+              }
+            }
+          ],
+          "name": "linear",
+          "owner": "local",
+          "signed_in": false,
+          "state": "disconnected",
+          "title": "Linear"
+        }
+      ]
+    }
+  }
+}

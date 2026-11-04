@@ -9,15 +9,35 @@ use serde_json::Value;
 use vibe_core::rpc::MAX_MESSAGE_BYTES;
 use vibed::dispatch::{Session, handle_message};
 
+/// What another host's link opens with.
+fn link_hello() -> String {
+    serde_json::json!({"jsonrpc": "2.0", "id": "link", "method": "daemon.hello", "params": {
+        "client": "vibed link calls from tests", "protocol": vibe_core::rpc::PROTOCOL_VERSION,
+    }})
+    .to_string()
+}
+
+/// Whether an example is of a call only another host's link can make.
+fn link_only(example: &str) -> bool {
+    example.contains("services-token") || example.contains("services-follow")
+}
+
 #[tokio::test]
 async fn dispatcher_answers_every_example_exactly() {
     let golden = Golden::new().for_examples();
     let core = golden.core();
     let mut session = Session::default();
+    let mut link = Session::default();
+    handle_message(&core, &mut link, link_hello().as_bytes()).await;
     let mut events = None;
-    for ex in examples(&golden.home) {
+    for ex in examples(&golden) {
         let Some(line) = &ex.line else { continue };
-        let got = handle_message(&core, &mut session, line)
+        let session = if link_only(&ex.name) {
+            &mut link
+        } else {
+            &mut session
+        };
+        let got = handle_message(&core, session, line)
             .await
             .map(|s| serde_json::from_str::<Value>(&s).unwrap())
             .unwrap_or(Value::Null);
@@ -46,8 +66,17 @@ async fn socket_answers_every_example_exactly() {
     );
     // One connection for all of them: the socket serves many messages.
     let mut conn = Conn::open(&server.path).await;
-    for ex in examples(&golden.home) {
+    let mut link = Conn::open(&server.path).await;
+    link.send(format!("{}\n", link_hello()).as_bytes()).await;
+    link.reply().await;
+    for ex in examples(&golden) {
         let Some(line) = &ex.line else { continue };
+        if link_only(&ex.name) {
+            link.send(line).await;
+            link.send(b"\n").await;
+            assert_eq!(link.reply().await, ex.response, "{}", ex.name);
+            continue;
+        }
         conn.send(line).await;
         conn.send(b"\n").await;
         if ex.response.is_null() {
@@ -80,7 +109,7 @@ async fn record_examples() {
     let core = golden.core();
     let mut session = Session::default();
     let mut events = None;
-    for ex in examples(&golden.home) {
+    for ex in examples(&golden) {
         let Some(line) = &ex.line else { continue };
         // As the daemon writes them, so their fields stay in its order.
         let got = handle_message(&core, &mut session, line)
@@ -96,8 +125,11 @@ async fn record_examples() {
                 sent.push(serde_json::to_string(&note).unwrap());
             }
         }
-        let text = format!(r#"{{"response": {got}, "events": [{}]}}"#, sent.join(", "))
+        let mut text = format!(r#"{{"response": {got}, "events": [{}]}}"#, sent.join(", "))
             .replace(&home, GOLDEN_HOME);
+        if let Some(fake) = &golden.service {
+            text = common::swap_service(&text, &fake.base, common::GOLDEN_SERVICE);
+        }
         std::fs::write(out.join(&ex.name), text).unwrap();
     }
 }

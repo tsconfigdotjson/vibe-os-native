@@ -1,0 +1,46 @@
+{
+  "description": "The one connection needing to be signed in to again, as its owner says, with why and since when. Reconnect goes to the host named in `owner`.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 9915,
+    "method": "services.overview",
+    "params": {}
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 9915,
+    "result": {
+      "services": [
+        {
+          "detail": "Linear refused the refresh (invalid_client)",
+          "detail_at": "2026-10-30T12:00:00Z",
+          "hosts": [
+            {
+              "host": "local",
+              "reachable": true,
+              "service": {
+                "auto_allow": false,
+                "denied_tools": [],
+                "detail": "Linear refused the refresh (invalid_client)",
+                "detail_at": "2026-10-30T12:00:00Z",
+                "enabled": true,
+                "name": "linear",
+                "read_only": false,
+                "role": "owner",
+                "state": "needs_reconnect",
+                "title": "Linear",
+                "tools": 0,
+                "wants_token": false
+              }
+            }
+          ],
+          "name": "linear",
+          "owner": "local",
+          "signed_in": true,
+          "state": "needs_reconnect",
+          "title": "Linear"
+        }
+      ]
+    }
+  }
+}

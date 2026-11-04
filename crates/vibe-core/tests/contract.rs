@@ -10,8 +10,8 @@ use serde::{Serialize, forward_to_deserialize_any};
 use serde_json::Value;
 use vibe_core::model::{
     Activity, AgentState, Certainty, CheckId, CheckState, Environment, EventKind, GhState,
-    HostLink, LoginTool, MessageRole, Mode, Model, ProjectSource, Reasoning, SessionState,
-    StopReason, ToolboxAction, ToolboxState, TunnelState, WakeupKind,
+    HostLink, LoginTool, MessageRole, Mode, Model, ProjectSource, Reasoning, ServiceRole,
+    ServiceState, SessionState, StopReason, ToolboxAction, ToolboxState, TunnelState, WakeupKind,
 };
 use vibe_core::paths;
 use vibe_core::rpc::*;
@@ -219,6 +219,20 @@ fn rust_types() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
         entry::<DoctorReport>(),
         entry::<DoctorCheck>(),
         entry::<DoctorFixParams>(),
+        entry::<ServiceInfo>(),
+        entry::<ServiceList>(),
+        entry::<ServiceParams>(),
+        entry::<ServiceAuthorization>(),
+        entry::<ServiceCompleteParams>(),
+        entry::<ServiceTokenParams>(),
+        entry::<ServiceAccess>(),
+        entry::<ServiceFollowParams>(),
+        entry::<ServiceHost>(),
+        entry::<ServiceOverview>(),
+        entry::<ServiceOverviewList>(),
+        entry::<ServiceSetParams>(),
+        entry::<ServiceAuditEntry>(),
+        entry::<ServiceAuditList>(),
     ])
 }
 
@@ -299,6 +313,15 @@ fn rust_methods() -> BTreeMap<&'static str, MethodTypes> {
         method::<ToolboxClose>(),
         method::<DoctorCheckGet>(),
         method::<DoctorFix>(),
+        method::<ServicesList>(),
+        method::<ServicesConnect>(),
+        method::<ServicesComplete>(),
+        method::<ServicesToken>(),
+        method::<ServicesFollow>(),
+        method::<ServicesOverview>(),
+        method::<ServicesDisconnect>(),
+        method::<ServicesSet>(),
+        method::<ServicesAudit>(),
     ])
 }
 
@@ -349,6 +372,11 @@ fn rust_enums() -> BTreeMap<&'static str, Vec<&'static str>> {
         ("LoginTool", names(LoginTool::ALL, LoginTool::as_str)),
         ("CheckId", names(CheckId::ALL, CheckId::as_str)),
         ("CheckState", names(CheckState::ALL, CheckState::as_str)),
+        (
+            "ServiceState",
+            names(ServiceState::ALL, ServiceState::as_str),
+        ),
+        ("ServiceRole", names(ServiceRole::ALL, ServiceRole::as_str)),
         ("MessageRole", names(MessageRole::ALL, MessageRole::as_str)),
     ])
 }
@@ -727,5 +755,52 @@ fn examples_cover_the_contract() {
             "the examples don't use exactly the fields of {ty}"
         );
         assert!(declared.get(ty).is_some());
+    }
+}
+
+#[test]
+fn a_sign_ins_code_and_a_personal_key_dont_show_in_debug() {
+    let complete = ServiceCompleteParams {
+        host: Some("vps".into()),
+        service: "linear".into(),
+        callback_url: "vibeos://oauth/callback?code=the-code".into(),
+    };
+    let shown = format!("{complete:?}");
+    assert!(
+        shown.contains("vps") && !shown.contains("the-code"),
+        "{shown}"
+    );
+    let asked = ServiceTokenParams {
+        service: "linear".into(),
+        rejected: Some("the-token".into()),
+    };
+    let given = ServiceAccess {
+        service: "linear".into(),
+        state: ServiceState::Connected,
+        access: Some("the-token".into()),
+        expires_at: Some(5),
+        detail: None,
+    };
+    let follow = ServiceFollowParams {
+        service: "linear".into(),
+        owner: Some("vps".into()),
+        state: ServiceState::Connected,
+        access: Some("the-token".into()),
+        expires_at: Some(5),
+        detail: None,
+    };
+    for shown in [
+        format!("{asked:?}"),
+        format!("{given:?}"),
+        format!("{follow:?}"),
+    ] {
+        assert!(
+            shown.contains("linear") && !shown.contains("the-token"),
+            "{shown}"
+        );
+    }
+    // And they go only between `vibed`s: nothing from outside can ask for one.
+    for method in [ServicesToken::NAME, ServicesFollow::NAME] {
+        assert!(!TUNNEL_METHODS.contains(&method), "{method}");
     }
 }

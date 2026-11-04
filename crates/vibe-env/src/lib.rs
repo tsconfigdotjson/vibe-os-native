@@ -308,6 +308,26 @@ pub trait Compartment {
     /// Every process of the agent but its shim, for the idle rule.
     fn processes(&self, h: &Handle) -> Result<Vec<Proc>>;
 
+    /// The program the agent runs the shared services' shim with, if this
+    /// compartment is a machine of its own, whose `vibe` isn't the host's.
+    fn services_program(&self) -> Option<String> {
+        None
+    }
+
+    /// Why an agent starting now can't have the shared services here, if it
+    /// can't, for a compartment whose machine may be too old to serve them. It's
+    /// asked at a launch, so a VM may be booted by it.
+    fn services_unsupported(&self, _h: &Handle) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// Dials the shared services' relay into a compartment that's a machine of
+    /// its own, while it runs: the host's end of a connection the guest's hub
+    /// takes. `None` if it isn't running, or its guest doesn't serve them.
+    fn services_relay(&self, _h: &Handle) -> Result<Option<std::os::unix::net::UnixStream>> {
+        Ok(None)
+    }
+
     /// Ends every process of the agent, its shim's too. The compartment
     /// stays; a later launch starts it again.
     fn stop(&self, h: &Handle) -> Result<()>;

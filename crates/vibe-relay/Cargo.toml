@@ -1,0 +1,18 @@
+[package]
+name = "vibe-relay"
+description = "How an agent reaches its host's shared MCP services: the `vibe mcp-proxy` stdio shim, its local socket, and the relay out of a VM"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# std and serde_json only: it's linked into vibe-guest, a static musl binary.
+[dependencies]
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

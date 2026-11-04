@@ -21,10 +21,14 @@ use vibe_core::rpc::Login;
 use vibe_core::units::GIB;
 use vibe_env::images::Images;
 use vibe_env::testing::{STAND_IN, TestBackend, TestToolbox};
+use vibe_services::secrets::MemoryStore;
+use vibe_services::testing::FakeService;
+use vibe_services::{Secret, SecretStore};
 use vibed::agents::Backends;
 use vibed::core::{Config, Core, DaemonInfo};
 use vibed::remote::{BoxFuture, Channel, Installed, Remote};
 use vibed::server::{self, SocketGuard};
+use vibed::services::ServicesConfig;
 
 /// The daemon the contract examples were recorded against.
 pub fn golden_info() -> DaemonInfo {
@@ -81,8 +85,20 @@ pub struct Example {
     pub events: Vec<Value>,
 }
 
-/// The examples, with [`GOLDEN_HOME`] replaced by `home`.
-pub fn examples(home: &Path) -> Vec<Example> {
+/// The examples' name for the stand-in for a service, which is really on a port
+/// of its own.
+pub const GOLDEN_SERVICE: &str = "http://services.example";
+
+/// Puts the stand-in's real address in place of [`GOLDEN_SERVICE`], or the other
+/// way round, whether it's plain or as it is in a query.
+pub fn swap_service(text: &str, from: &str, to: &str) -> String {
+    let encoded = |u: &str| u.replace(':', "%3A").replace('/', "%2F");
+    text.replace(&encoded(from), &encoded(to)).replace(from, to)
+}
+
+/// The examples, with [`GOLDEN_HOME`] replaced by the world's home.
+pub fn examples(golden: &Golden) -> Vec<Example> {
+    let home = golden.home.as_path();
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../protocol/examples");
     let mut paths: Vec<PathBuf> = fs::read_dir(&dir)
         .unwrap()
@@ -95,7 +111,10 @@ pub fn examples(home: &Path) -> Vec<Example> {
     paths
         .into_iter()
         .map(|p| {
-            let text = fs::read_to_string(&p).unwrap().replace(GOLDEN_HOME, home);
+            let mut text = fs::read_to_string(&p).unwrap().replace(GOLDEN_HOME, home);
+            if let Some(fake) = &golden.service {
+                text = swap_service(&text, GOLDEN_SERVICE, &fake.base);
+            }
             let v: Value = serde_json::from_str(&text).unwrap();
             let line = if v.get("notification").is_some() {
                 None
@@ -248,6 +267,9 @@ pub struct Golden {
     pub gh: PathBuf,
     pub claude: PathBuf,
     sessions: Vec<RunningShim>,
+    /// A stand-in for Linear, for the examples. No other test gets a broker.
+    pub service: Option<FakeService>,
+    logins: Arc<MemoryStore>,
 }
 
 impl Golden {
@@ -265,6 +287,8 @@ impl Golden {
             gh,
             claude,
             sessions: Vec::new(),
+            service: None,
+            logins: Arc::default(),
         }
     }
 
@@ -274,6 +298,7 @@ impl Golden {
     /// in `app` that copies `.env.example` to `.env.local`, so a new
     /// agent's worktree has a change it hasn't committed.
     pub fn for_examples(mut self) -> Golden {
+        self.seed_services();
         let origin = self.dir.path().canonicalize().unwrap().join("remotes/app");
         fs::create_dir_all(origin.join(".vibe")).unwrap();
         fs::write(
@@ -346,6 +371,12 @@ impl Golden {
 
     pub fn config(&self) -> Config {
         let mut config = Config::new(golden_info(), Layout::new(&self.home, "macos"));
+        config.services = self.service.as_ref().map(|fake| ServicesConfig {
+            services: vec![fake.service()],
+            store: self.logins.clone(),
+            place: vibe_services::Place::Mac,
+            token_wait: std::time::Duration::from_millis(100),
+        });
         config.label = "mac-mini".into();
         config.gh = self.gh.clone().into();
         config.shim = workspace_bin("vibe-shim").into_os_string();
@@ -397,6 +428,58 @@ impl Golden {
 
     pub fn core(&self) -> Arc<Core> {
         Arc::new(Core::open(self.config()).unwrap())
+    }
+}
+
+impl Golden {
+    /// A stand-in for Linear, with no tools so that nothing it does in the
+    /// background adds to the examples' events, and a login to it that needs
+    /// reconnecting because its client was forgotten.
+    fn seed_services(&mut self) {
+        let fake = FakeService::start_detached();
+        fake.set_tools(Vec::new());
+        fake.accept_code("golden-code");
+        let secret = Secret {
+            access: "FAKESECRET-golden-access".into(),
+            refresh: Some("FAKESECRET-golden-refresh".into()),
+            obtained_at: None,
+            expires_at: None,
+            client_id: Some("forgotten-client".into()),
+            token_endpoint: Some(format!("{}/token", fake.base)),
+            revocation_endpoint: None,
+            scopes: vec!["read".into(), "write".into()],
+        };
+        self.logins.store("linear", &secret).unwrap();
+        let dir = Layout::new(&self.home, "macos").data_dir();
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("services.json"),
+            serde_json::json!({"linear": {
+                "state": "needs_reconnect",
+                "role": "owner",
+                "detail": "Linear refused the refresh (invalid_client)",
+                "detail_at": GOLDEN_NOW,
+                "client_stale": true,
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("services-audit.log"),
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "at": "2026-10-30T11:59:00Z",
+                    "agent": "dark-mode-review",
+                    "service": "linear",
+                    "tool": "list_issues",
+                    "outcome": "ok",
+                    "ms": 42,
+                })
+            ),
+        )
+        .unwrap();
+        self.service = Some(fake);
     }
 }
 

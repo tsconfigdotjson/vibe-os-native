@@ -92,7 +92,7 @@ fn call<T: DeserializeOwned>(
 ) -> Result<T, GuestError> {
     let mut stream =
         vm::connect_within(socket, proto::CONTROL_PORT, timeout).map_err(GuestError::Vm)?;
-    vm::set_timeouts(&stream, Some(timeout), Some(CALL_TIMEOUT))
+    vm::set_timeouts(&stream, Some(timeout), Some(timeout.min(CALL_TIMEOUT)))
         .map_err(io_err("set socket timeouts"))?;
     let mut line = serde_json::to_string(request).expect("a request always encodes");
     line.push('\n');
@@ -117,7 +117,13 @@ fn call<T: DeserializeOwned>(
 }
 
 pub fn status(socket: &Path) -> Result<Status, GuestError> {
-    let status: Status = call(socket, &Request::Status, CALL_TIMEOUT)?;
+    status_within(socket, CALL_TIMEOUT)
+}
+
+/// [`status`], giving up after `timeout` at each step: for a look that others
+/// are waiting behind, which a stuck guest mustn't hold up.
+pub fn status_within(socket: &Path, timeout: Duration) -> Result<Status, GuestError> {
+    let status: Status = call(socket, &Request::Status, timeout)?;
     if status.protocol != proto::PROTOCOL {
         return Err(GuestError::Protocol(format!(
             "vibe-guest speaks protocol {}, not {}",
@@ -314,6 +320,8 @@ mod tests {
     enum Answer {
         Line(&'static str),
         Frames(Vec<proto::Frame>),
+        /// Takes the connection and never says anything on it.
+        Silence,
     }
 
     impl FakeVm {
@@ -345,6 +353,7 @@ mod tests {
                                 .push((port, request.trim_end().to_owned()));
                             stream.write_all(format!("{reply}\n").as_bytes()).unwrap();
                         }
+                        Answer::Silence => std::thread::sleep(Duration::from_secs(20)),
                         Answer::Frames(frames) => {
                             let hello = proto::read_frame(&mut reader).unwrap().unwrap();
                             let hello: TermHello = hello.decode().unwrap();
@@ -379,6 +388,19 @@ mod tests {
             started_ms: 900,
             exit: None,
         }
+    }
+
+    #[test]
+    fn a_bounded_status_gives_up_on_a_guest_that_never_answers() {
+        let vm = FakeVm::serve(vec![Answer::Silence]);
+        let started = std::time::Instant::now();
+        let gave_up = status_within(&vm.socket, Duration::from_millis(200));
+        assert!(gave_up.is_err(), "{gave_up:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

@@ -11,9 +11,10 @@ use vibe_core::rpc::{
     HostsList, HostsRemove, HostsUpgrade, Id, KeysCreate, KeysList, KeysRevoke, KeysSync,
     KeysVerify, LimitsGet, LimitsSet, McpGet, McpSet, Method, PROTOCOL_VERSION, ProfilesCreate,
     ProfilesDelete, ProfilesList, ProfilesUpdate, ProjectsAdd, ProjectsList, ProjectsRemove,
-    ProtocolMismatchData, Request, Response, SessionsAttach, SessionsList, Subscribed,
-    ToolboxClose, ToolboxLoginsGet, ToolboxOpen, ToolboxRebuild, ToolboxStatusGet, ToolboxUpdate,
-    TunnelPrepare,
+    ProtocolMismatchData, Request, Response, ServicesAudit, ServicesComplete, ServicesConnect,
+    ServicesDisconnect, ServicesFollow, ServicesList, ServicesOverview, ServicesSet, ServicesToken,
+    SessionsAttach, SessionsList, Subscribed, ToolboxClose, ToolboxLoginsGet, ToolboxOpen,
+    ToolboxRebuild, ToolboxStatusGet, ToolboxUpdate, TunnelPrepare,
 };
 
 use crate::core::Core;
@@ -59,6 +60,18 @@ impl Session {
         if client.starts_with(LINK_CLIENT) {
             self.link = true;
         }
+    }
+
+    /// Refuses a call that only the Mac makes of a host over its link: an access
+    /// token, and being told to forget a login, aren't for any other client.
+    fn link_only(&self, method: &str) -> Result<(), ErrorObject> {
+        if self.link {
+            return Ok(());
+        }
+        Err(ErrorObject::new(
+            ErrorCode::Unauthorized,
+            format!("{method} is only for another host's link"),
+        ))
     }
 }
 
@@ -270,6 +283,36 @@ async fn call(
             encode_result(Ok(core.doctor().await))
         }
         DoctorFix::NAME => encode_result(core.doctor_fix(decode::<DoctorFix>(params)?).await),
+        ServicesList::NAME => encode_result(core.services_list(decode::<ServicesList>(params)?)),
+        ServicesConnect::NAME => encode_result(
+            core.services_connect(decode::<ServicesConnect>(params)?)
+                .await,
+        ),
+        ServicesComplete::NAME => encode_result(
+            core.services_complete(decode::<ServicesComplete>(params)?)
+                .await,
+        ),
+        ServicesToken::NAME => {
+            session.link_only(ServicesToken::NAME)?;
+            encode_result(core.services_token(decode::<ServicesToken>(params)?).await)
+        }
+        ServicesFollow::NAME => {
+            session.link_only(ServicesFollow::NAME)?;
+            encode_result(
+                core.services_follow(decode::<ServicesFollow>(params)?)
+                    .await,
+            )
+        }
+        ServicesOverview::NAME => {
+            decode::<ServicesOverview>(params)?;
+            encode_result(core.services_overview().await)
+        }
+        ServicesDisconnect::NAME => encode_result(
+            core.services_disconnect(decode::<ServicesDisconnect>(params)?)
+                .await,
+        ),
+        ServicesSet::NAME => encode_result(core.services_set(decode::<ServicesSet>(params)?)),
+        ServicesAudit::NAME => encode_result(core.services_audit(decode::<ServicesAudit>(params)?)),
         _ => Err(ErrorObject::new(
             ErrorCode::MethodNotFound,
             format!("Method not found: {method}"),

@@ -25,6 +25,9 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 use vibe_core::paths::Layout;
 use vibe_core::rpc::{KeyCreateParams, MAX_MESSAGE_BYTES};
+use vibe_services::SecretStore;
+use vibe_services::secrets::FileStore;
+use vibe_services::testing::{FakeService, SECRET_MARK};
 use vibed::core::Core;
 use vibed::link::Timing;
 use vibed::remote::Ssh;
@@ -358,6 +361,32 @@ struct Mac {
 }
 
 fn mac(golden: &common::Golden, ssh: &Path, bundle: PathBuf) -> Mac {
+    mac_with(golden, ssh, bundle, None)
+}
+
+/// A Mac whose broker goes to `fake`, keeping what it's given in `logins`.
+fn mac_with_services(
+    golden: &common::Golden,
+    ssh: &Path,
+    bundle: PathBuf,
+    fake: &FakeService,
+    logins: &FileStore,
+) -> Mac {
+    let services = vibed::services::ServicesConfig {
+        services: vec![fake.service()],
+        store: Arc::new(logins.clone()),
+        place: vibe_services::Place::Mac,
+        token_wait: Duration::from_secs(1),
+    };
+    mac_with(golden, ssh, bundle, Some(services))
+}
+
+fn mac_with(
+    golden: &common::Golden,
+    ssh: &Path,
+    bundle: PathBuf,
+    services: Option<vibed::services::ServicesConfig>,
+) -> Mac {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -379,11 +408,15 @@ fn mac(golden: &common::Golden, ssh: &Path, bundle: PathBuf) -> Mac {
         max_backoff: Duration::from_secs(1),
         ..Timing::default()
     };
+    if services.is_some() {
+        config.services = services;
+    }
     let core = Arc::new(Core::open(config).unwrap());
     {
         let _in = rt.enter();
         core.spawn_links();
         core.spawn_external();
+        drop(core.spawn_services());
     }
     let listener = rt
         .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
@@ -694,6 +727,310 @@ fn a_linux_host_added_over_ssh_runs_agents_the_mac_drives() {
         host.log()
     );
     drop(mac.rt);
+}
+
+/// One JSON-RPC call on the Mac, as the app makes it.
+fn on_mac(mac: &Mac, method: &str, params: Value) -> Value {
+    let line = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).to_string();
+    let answer = mac.rt.block_on(vibed::dispatch::handle_message(
+        &mac.core,
+        &mut vibed::dispatch::Session::default(),
+        line.as_bytes(),
+    ));
+    serde_json::from_str(&answer.expect("an answer")).unwrap()
+}
+
+/// A process on the host, as its own user runs it.
+fn on_host(host: &FakeHost) -> Command {
+    let mut c = Command::new(VIBE);
+    c.env("HOME", &host.home)
+        .env_remove("VIBE_SOCKET")
+        .env_remove("VIBE_SERVICES_SOCKET")
+        .env_remove("XDG_CACHE_HOME");
+    c
+}
+
+/// `vibe mcp-proxy linear` on the host, as an agent's MCP client starts it.
+struct HostShim {
+    child: Child,
+    stdin: ChildStdin,
+    lines: Receiver<String>,
+    next: i64,
+    read: String,
+}
+
+impl Drop for HostShim {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl HostShim {
+    fn start(host: &FakeHost, agent: &str) -> HostShim {
+        let mut child = on_host(host)
+            .args(["mcp-proxy", "linear"])
+            .env("VIBE_AGENT", agent)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (tx, lines) = mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if tx.send(line).is_err() {
+                    return;
+                }
+            }
+        });
+        let mut shim = HostShim {
+            child,
+            stdin,
+            lines,
+            next: 10,
+            read: String::new(),
+        };
+        let init = shim.ask(
+            "initialize",
+            json!({"protocolVersion": "2025-06-18", "capabilities": {}}),
+        );
+        assert_eq!(init["result"]["serverInfo"]["name"], "vibe-linear");
+        writeln!(
+            shim.stdin,
+            r#"{{"jsonrpc":"2.0","method":"notifications/initialized"}}"#
+        )
+        .unwrap();
+        shim
+    }
+
+    fn ask(&mut self, method: &str, params: Value) -> Value {
+        self.next += 1;
+        let id = self.next;
+        let m = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+        writeln!(self.stdin, "{m}").unwrap();
+        loop {
+            let line = self
+                .lines
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the shim answers");
+            self.read.push_str(&line);
+            self.read.push('\n');
+            let v: Value = serde_json::from_str(&line).unwrap();
+            if v["id"] == json!(id) {
+                return v;
+            }
+        }
+    }
+
+    fn call(&mut self, tool: &str) -> String {
+        let v = self.ask("tools/call", json!({"name": tool, "arguments": {}}));
+        v["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    fn has_tool(&mut self, tool: &str) -> bool {
+        for _ in 0..100 {
+            let v = self.ask("tools/list", json!({}));
+            if v["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["name"] == tool)
+            {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        false
+    }
+}
+
+/// Whether `text` is in any file under `dir`.
+fn any_file_has(dir: &Path, text: &str) -> Option<PathBuf> {
+    for e in fs::read_dir(dir).ok()?.flatten() {
+        let path = e.path();
+        if path.is_dir() {
+            if let Some(found) = any_file_has(&path, text) {
+                return Some(found);
+            }
+        } else if fs::read(&path).is_ok_and(|b| b.windows(text.len()).any(|w| w == text.as_bytes()))
+        {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// The design in one run, with every process real: the app connects a host to
+/// a service from the Mac, the host holds the login, and when the Mac goes away
+/// the host's agents carry on, refresh by themselves, and can be mended with a
+/// key in the host's own shell. `ssh` and the service are the only stand-ins.
+#[test]
+fn a_linux_host_that_owns_a_login_serves_and_refreshes_alone_with_the_mac_gone() {
+    let golden = common::Golden::new();
+    let hosts = common::short_tempdir();
+    let ssh = fake_ssh(hosts.path());
+    let host = FakeHost::new(hosts.path(), "me@vps", &golden.claude);
+    let fake = FakeService::start_detached();
+    // Its vibed finds its stand-in for Linear; a debug build's only.
+    let env = host.d.join("env");
+    let mut setup = fs::read_to_string(&env).unwrap();
+    setup.push_str(&format!(
+        "export VIBE_TEST_SERVICES_UPSTREAM='{}'\n",
+        fake.base
+    ));
+    fs::write(&env, setup).unwrap();
+    let on_the_mac = FileStore(golden.dir.path().join("mac-services"));
+    let carried = bundle(golden.dir.path());
+    let mac = mac_with_services(&golden, &ssh, carried.clone(), &fake, &on_the_mac);
+
+    ok(vibe(&mac.socket, &["host", "add", "vps", "me@vps"]));
+    wait_for("the link", Duration::from_secs(30), || {
+        ok(vibe(&mac.socket, &["host"]))
+            .lines()
+            .any(|l| l.starts_with("vps  ") && l.contains("  connected"))
+    });
+
+    // Settings → Services → Connect: the host is its owner, as a linked Linux
+    // host is the default. Its vibed makes the verifier and the exchange, and all
+    // the Mac does is carry a code.
+    let overview = on_mac(&mac, "services.overview", json!({}));
+    assert_eq!(
+        overview["result"]["services"][0]["owner"], "vps",
+        "{overview}"
+    );
+    assert_eq!(overview["result"]["services"][0]["signed_in"], false);
+    let begun = on_mac(
+        &mac,
+        "services.connect",
+        json!({"host": "vps", "service": "linear"}),
+    );
+    let url = begun["result"]["url"].as_str().expect("a page").to_owned();
+    assert_eq!(begun["result"]["callback_scheme"], "vibeos");
+    let back = mac.rt.block_on(fake.sign_in(&url));
+    let done = on_mac(
+        &mac,
+        "services.complete",
+        json!({"host": "vps", "service": "linear", "callback_url": back}),
+    );
+    assert_eq!(done["result"]["state"], "connected", "{done}");
+
+    // It's on the host, private; the Mac has an access token and nothing more.
+    let dir = Layout::new(&host.home, std::env::consts::OS)
+        .data_dir()
+        .join("services");
+    let login = dir.join("linear.login");
+    let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&login), 0o600);
+    assert_eq!(mode(&dir), 0o700);
+    assert_eq!(
+        any_file_has(golden.dir.path(), SECRET_MARK),
+        None,
+        "nothing of a token in the clear on the Mac"
+    );
+    wait_for("the Mac to follow", Duration::from_secs(30), || {
+        ok(vibe(&mac.socket, &["service"])).starts_with("linear  connected  login on vps")
+    });
+    assert_eq!(on_the_mac.load("linear").unwrap().unwrap().refresh, None);
+
+    // Its own CLI sees it's here.
+    let status = ok(on_host(&host).arg("service").output().unwrap());
+    assert!(
+        status.starts_with("linear  connected  login here"),
+        "{status}"
+    );
+
+    // An agent on the host, on the real shim.
+    let mut shim = HostShim::start(&host, "quiet-amber-otter");
+    assert!(shim.has_tool("list_issues"));
+    assert_eq!(shim.call("list_issues"), "issues on /mcp");
+    let before = fs::read(&login).unwrap();
+
+    // The Mac goes: the network's pulled, and its vibed stops.
+    fs::write(host.d.join("down"), "").unwrap();
+    drop(mac);
+
+    assert_eq!(shim.call("list_issues"), "issues on /mcp");
+    assert!(shim.has_tool("create_issue"));
+
+    // Its token runs out, and the host refreshes alone, and keeps what it got.
+    fake.expire_access();
+    assert_eq!(shim.call("list_issues"), "issues on /mcp");
+    assert_eq!(fake.refreshes(), 1);
+    assert_ne!(
+        fs::read(&login).unwrap(),
+        before,
+        "the rotated login was kept"
+    );
+    assert_eq!(mode(&login), 0o600);
+
+    // Its login is lost: the agent is told how it's mended, and tools list.
+    fake.expire_access();
+    fake.refuse_refresh("invalid_grant");
+    let lost = shim.call("list_issues");
+    assert!(lost.contains("needs reconnecting on the Mac"), "{lost}");
+    assert!(shim.has_tool("list_issues"));
+    let status = ok(on_host(&host).arg("service").output().unwrap());
+    assert!(status.starts_with("linear  needs_reconnect"), "{status}");
+    assert!(status.contains("invalid_grant"), "{status}");
+
+    // There's no way to mend it from here: signing in takes the Mac's browser.
+    let refused = on_host(&host)
+        .args(["service", "set-key", "linear"])
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+
+    // Turned off, with no Mac to do it from: the agent's told how to turn it back
+    // on. That comes first, before what's wrong with the login.
+    let off = ok(on_host(&host)
+        .args(["service", "off", "linear"])
+        .output()
+        .unwrap());
+    assert!(off.contains("turned off"), "{off}");
+    let told = shim.call("list_issues");
+    assert!(told.contains("`vibe service on linear`"), "{told}");
+    let on = ok(on_host(&host)
+        .args(["service", "on", "linear"])
+        .output()
+        .unwrap());
+    assert!(!on.contains("turned off"), "{on}");
+
+    // The Mac's back, and Reconnect there lands at the owner, in the browser and
+    // back: the agent goes on with no restart.
+    fs::remove_file(host.d.join("down")).unwrap();
+    let mac = mac_with_services(&golden, &ssh, carried, &fake, &on_the_mac);
+    wait_for("the link again", Duration::from_secs(30), || {
+        ok(vibe(&mac.socket, &["host"]))
+            .lines()
+            .any(|l| l.starts_with("vps  ") && l.contains("  connected"))
+    });
+    let begun = on_mac(
+        &mac,
+        "services.connect",
+        json!({"host": "vps", "service": "linear"}),
+    );
+    let url = begun["result"]["url"].as_str().expect("a page").to_owned();
+    let back = mac.rt.block_on(fake.sign_in(&url));
+    let done = on_mac(
+        &mac,
+        "services.complete",
+        json!({"host": "vps", "service": "linear", "callback_url": back}),
+    );
+    assert_eq!(done["result"]["state"], "connected", "{done}");
+    assert_eq!(shim.call("list_issues"), "issues on /mcp");
+
+    // And in all of that, what's readable on the host's disk or in its logs
+    // holds no token: only the login file does, encoded, private.
+    let shown = shim.read.clone();
+    assert!(!shown.contains(SECRET_MARK), "{shown}");
+    let found = any_file_has(hosts.path(), SECRET_MARK);
+    assert_eq!(found, None, "a secret in the clear on the host");
 }
 
 #[test]

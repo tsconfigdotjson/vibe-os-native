@@ -45,6 +45,15 @@ pub const FORWARDED: &[&str] = &[
     "limits.set",
     "mcp.get",
     "mcp.set",
+    // How a host stands with a service, and its own settings for it, go to it.
+    // A sign-in starts on the host that's to own the login. `services.complete`
+    // and `services.disconnect` also go to a host, but aren't here as there's more
+    // to them on this side: see `Core::services_complete`. `services.token` and
+    // `services.follow` are only ever sent, never forwarded.
+    "services.list",
+    "services.connect",
+    "services.set",
+    "services.audit",
     "sessions.list",
     "sessions.attach",
     "agents.start",
@@ -377,8 +386,10 @@ impl Core {
                 e.message
             );
         }
+        self.services_host_leaving(&p.host).await;
         self.store().remove_host(&p.host).map_err(store_error)?;
         lock(&self.links).remove(&p.host);
+        self.services_wake.notify_one();
         link.stop();
         self.sync_tunnel();
         crate::log!(
@@ -555,6 +566,7 @@ impl Core {
     /// What follows a link coming up: the host's agents read again, this
     /// host's keys pushed to it, and an upgrade if it runs another `vibed`.
     pub(crate) fn link_came_up(&self, link: &Arc<Link>) {
+        self.services_wake.notify_one();
         self.refresh_agents(link);
         self.push_keys_to(link);
         self.reconcile_external(link);
@@ -613,6 +625,8 @@ impl Core {
             EventKind::AgentAdded | EventKind::AgentDeleted | EventKind::Lagged => {
                 self.refresh_agents(link);
             }
+            // A refresh there, or a follower wanting a token.
+            EventKind::ServiceChanged => self.services_wake.notify_one(),
             _ => {}
         }
         self.publish(event);

@@ -26,6 +26,8 @@ pub(crate) struct Vm {
     pub(crate) config: PathBuf,
     /// Whether the host has set the guest's clock since it booted.
     pub(crate) clock_set: bool,
+    /// Its guest is older than shared services.
+    pub(crate) old_guest: bool,
 }
 
 #[derive(Default)]
@@ -49,6 +51,8 @@ pub(crate) struct State {
     /// How many more status calls report no network yet; `u32::MAX` for
     /// never.
     pub(crate) network_after: u32,
+    /// How long each bounded status call was given.
+    pub(crate) status_bounds: Vec<Duration>,
 }
 
 /// How a fake run goes, from what it was asked to run and the VM's
@@ -118,6 +122,7 @@ impl Fake {
             "version": env!("CARGO_PKG_VERSION"),
             "boot_id": "b",
             "uptime_ms": 10,
+            "services": !vm.old_guest,
             "state": match vm.session {
                 None => "idle",
                 Some(None) => "running",
@@ -214,6 +219,11 @@ impl Machine for Fake {
     }
 
     fn ready(&self, socket: &Path, _: Duration) -> Result<guest::Status> {
+        self.status(socket)
+    }
+
+    fn status_within(&self, socket: &Path, timeout: Duration) -> Result<guest::Status> {
+        lock(&self.state).status_bounds.push(timeout);
         self.status(socket)
     }
 

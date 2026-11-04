@@ -170,6 +170,31 @@ impl Watch {
             progress,
         };
         if let (Some(base), Some((claude, _))) = (&base, &managed) {
+            // A template keeps the base it was built on, so one from before
+            // shared services stays there until it's rebuilt. Nothing's broken,
+            // and the download can't help: it says what will.
+            let boots = self.images.layers().map(|l| l.base.version);
+            if self.sources.base_release >= images::SERVICES_BASE
+                && boots.as_ref().is_ok_and(|v| *v < images::SERVICES_BASE)
+            {
+                return DoctorCheck {
+                    fixable: false,
+                    ..check(
+                        CheckState::Optional,
+                        format!(
+                            "Linux agents have no shared MCP services yet: the template is on \
+                             base image {}, and they need {}.",
+                            boots.unwrap_or(0),
+                            images::SERVICES_BASE
+                        ),
+                        Some(
+                            "Rebuild Template in Settings → Linux Toolbox, or run `vibe toolbox \
+                             rebuild`.",
+                        ),
+                        None,
+                    )
+                };
+            }
             return check(
                 CheckState::Pass,
                 format!(
@@ -309,6 +334,52 @@ mod tests {
             serde_json::json!({"version": 1, "files": files}).to_string(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn the_doctor_says_to_rebuild_a_template_from_before_shared_services() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = Layout::new(tmp.path().join("home"), "macos");
+        let dir = layout.linux_dir();
+        for n in [2, 3] {
+            let base = dir.join(format!("base-{n}"));
+            fs::create_dir_all(&base).unwrap();
+            for f in ["Image", "initrd", "base.img"] {
+                fs::write(base.join(f), f).unwrap();
+            }
+        }
+        let bin = tmp.path().join("claude-bin");
+        fs::write(&bin, "claude").unwrap();
+        Images::new(dir.clone())
+            .add_managed("2.1.308", &bin, "x")
+            .unwrap();
+        let sources = || Sources {
+            base_releases: "file:///nowhere".into(),
+            base_release: vibe_env::images::SERVICES_BASE,
+            claude_releases: "file:///nowhere".into(),
+        };
+
+        // No template yet: new agents boot the newest base, and all's well.
+        let check = Watch::new(&layout, sources()).check();
+        assert_eq!(check.state, CheckState::Pass, "{check:?}");
+
+        // A template built on the older one keeps that one's guest.
+        fs::write(dir.join("template-1.img"), "t").unwrap();
+        fs::write(dir.join("template-1.base"), "2").unwrap();
+        let check = Watch::new(&layout, sources()).check();
+        assert_eq!(check.state, CheckState::Optional, "{check:?}");
+        assert!(check.detail.contains("no shared MCP services"), "{check:?}");
+        assert!(
+            check.hint.as_deref().unwrap().contains("Rebuild Template"),
+            "{check:?}"
+        );
+        assert!(!check.fixable, "downloading can't fix it: {check:?}");
+
+        // Rebuilt, on the base that has them.
+        fs::write(dir.join("template-2.img"), "t").unwrap();
+        fs::write(dir.join("template-2.base"), "3").unwrap();
+        let check = Watch::new(&layout, sources()).check();
+        assert_eq!(check.state, CheckState::Pass, "{check:?}");
     }
 
     #[test]

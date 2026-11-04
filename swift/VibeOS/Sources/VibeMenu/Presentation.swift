@@ -278,6 +278,11 @@ public struct ToolboxSummary: Equatable, Sendable {
         if let newest = status.newestBase, newest > (status.base ?? 0) {
             notes.append("Base \(newest) is installed. Rebuild Template moves to it.")
         }
+        if servicesNeedRebuild(status) {
+            notes.append(
+                "Linux agents have no shared services until the template is on base \(VibeRPC.sharedServicesBase): "
+                    + "Rebuild Template.")
+        }
         if let last = status.last {
             let what: String
             switch last.action {
@@ -577,10 +582,13 @@ extension PermissionMode {
 /// A profile's settings in a line, in the app's voice: `Linux · Opus · High
 /// · Auto · 4G`.
 public func profileSummary(_ profile: Profile) -> String {
-    [
+    var parts = [
         profile.environment.title, profile.model.title, profile.reasoning.title, profile.mode.title,
         formatBytes(profile.memory),
-    ].joined(separator: " · ")
+    ]
+    // On is the default, so it says nothing unless it's off.
+    if !profile.sharedServicesOn { parts.append("No shared services") }
+    return parts.joined(separator: " · ")
 }
 
 /// The SF Symbol for an environment: a compartment, or this Mac.

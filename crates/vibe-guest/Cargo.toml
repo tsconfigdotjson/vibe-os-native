@@ -12,6 +12,7 @@ repository.workspace = true
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+vibe-relay.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true

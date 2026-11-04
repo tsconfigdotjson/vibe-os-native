@@ -26,8 +26,8 @@ use std::time::Duration;
 
 use vibe_core::limits::{self, HostLimits};
 use vibe_core::model::{
-    AgentState, Environment, EventKind, LOCAL_HOST, Mode, ref_from_bytes, validate_new_ref,
-    validate_ref,
+    AgentKind, AgentState, Environment, EventKind, LOCAL_HOST, Mode, ref_from_bytes,
+    validate_new_ref, validate_ref,
 };
 use vibe_core::rpc::{
     Agent, AgentDeleteParams, AgentList, AgentParams, AgentStartParams, ErrorCode, ErrorObject,
@@ -38,9 +38,11 @@ use vibe_core::store::{AgentRecord, StoreError};
 use vibe_core::time::rfc3339;
 use vibe_core::units::{GIB, MIB};
 use vibe_env::{AgentSpec, Backend, Handle, Launch, Limits, Run, TerminalEnd, Woke};
+use vibe_relay::local;
 
 use crate::core::{Core, error, invalid, lock, store_error};
 use crate::projects::{git, git_within};
+use crate::services::injection;
 use crate::sessions::{self, Probe, SessionSpec};
 use crate::sleep::Early;
 
@@ -162,15 +164,26 @@ pub(crate) async fn blocking<T: Send + 'static>(
 
 /// Claude's arguments for an agent: a new session on `prompt`, or with
 /// `resume`, the session it had.
-pub fn claude_args(a: &AgentRecord, prompt: Option<&str>, resume: bool) -> Vec<String> {
+///
+/// `offered` is how the shared services are offered it, which goes ahead of the
+/// flags that follow, as `--mcp-config` takes as many values as it can find.
+pub fn claude_args(
+    a: &AgentRecord,
+    prompt: Option<&str>,
+    resume: bool,
+    offered: &[String],
+) -> Vec<String> {
     let mut args = vec![
         if resume { "--resume" } else { "--session-id" }.to_owned(),
         a.session_id.clone(),
+    ];
+    args.extend_from_slice(offered);
+    args.extend([
         "--model".into(),
         a.model.to_string(),
         "--effort".into(),
         a.reasoning.to_string(),
-    ];
+    ]);
     match a.mode {
         Mode::Auto => args.extend(["--permission-mode".into(), "auto".into()]),
         Mode::Bypass => args.push("--dangerously-skip-permissions".into()),
@@ -775,6 +788,7 @@ impl Core {
             created_at: self.now(),
             compartment: "{}".into(),
             starting: true,
+            shared_services: profile.shared_services,
         };
         self.store().add_agent(&record).map_err(store_error)?;
         undo.record = Some(agent_ref.to_owned());
@@ -928,9 +942,31 @@ impl Core {
         prompt: Option<&str>,
         resume: bool,
     ) -> Result<(), ErrorObject> {
+        let mut services = self.shared_services(backend, record);
+        if services.is_some() {
+            let (b, h) = (Arc::clone(backend), handle.clone());
+            // They're optional, so not being able to tell costs them and no more:
+            // if the compartment's really in trouble, the launch below says so.
+            let why = match blocking(move || b.services_unsupported(&h)).await {
+                Ok(why) => why,
+                Err(e) => Some(format!("can't tell if its guest has them: {}", e.message)),
+            };
+            if let Some(why) = why {
+                crate::log!("vibed: {} gets no shared services: {why}", record.agent_ref);
+                services = None;
+            }
+        }
+        let auto_allowed = self.services_auto_allowed();
+        let offered = injection(AgentKind::Claude, services.as_deref(), &auto_allowed);
+        let mut env = agent_env();
+        env.push((local::AGENT_ENV.to_owned(), record.agent_ref.clone()));
+        if services.is_some() {
+            env.extend(self.services_socket_env(backend));
+        }
+        env.extend(offered.env);
         let launch = Launch {
-            args: claude_args(record, prompt, resume),
-            env: agent_env(),
+            args: claude_args(record, prompt, resume, &offered.args),
+            env,
             cwd: PathBuf::from(&record.worktree),
         };
         let end = {
@@ -1802,13 +1838,49 @@ mod tests {
             created_at: 0,
             compartment: "{}".into(),
             starting: false,
+            shared_services: true,
         }
+    }
+
+    #[test]
+    fn the_shared_services_go_where_no_other_flag_is_swallowed_by_them() {
+        let offered = vec!["--mcp-config".to_owned(), "{\"mcpServers\":{}}".to_owned()];
+        let args = claude_args(&record(Mode::Auto), Some("-fix the build"), false, &offered);
+        assert_eq!(
+            args,
+            [
+                "--session-id",
+                "0b5c3f6e-0000-4000-8000-000000000000",
+                "--mcp-config",
+                "{\"mcpServers\":{}}",
+                "--model",
+                "sonnet",
+                "--effort",
+                "xhigh",
+                "--permission-mode",
+                "auto",
+                "--",
+                "-fix the build"
+            ]
+        );
+        // On a resume too, which has no `--` to end it.
+        let args = claude_args(&record(Mode::Bypass), None, true, &offered);
+        assert_eq!(
+            args[..4],
+            [
+                "--resume",
+                "0b5c3f6e-0000-4000-8000-000000000000",
+                "--mcp-config",
+                "{\"mcpServers\":{}}"
+            ]
+        );
+        assert_eq!(args[4], "--model");
     }
 
     #[test]
     fn claude_gets_the_profile_and_the_prompt_as_an_argument() {
         assert_eq!(
-            claude_args(&record(Mode::Auto), Some("-fix the build"), false),
+            claude_args(&record(Mode::Auto), Some("-fix the build"), false, &[]),
             [
                 "--session-id",
                 "0b5c3f6e-0000-4000-8000-000000000000",
@@ -1823,7 +1895,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            claude_args(&record(Mode::Bypass), None, true),
+            claude_args(&record(Mode::Bypass), None, true, &[]),
             [
                 "--resume",
                 "0b5c3f6e-0000-4000-8000-000000000000",

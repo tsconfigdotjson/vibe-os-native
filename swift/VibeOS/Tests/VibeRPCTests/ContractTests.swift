@@ -176,6 +176,20 @@ let swiftTypes: [String: Set<String>] = [
     "DoctorReport": keys(DoctorReport.CodingKeys.self),
     "DoctorCheck": keys(DoctorCheck.CodingKeys.self),
     "DoctorFixParams": keys(DoctorFixParams.CodingKeys.self),
+    "ServiceInfo": keys(ServiceInfo.CodingKeys.self),
+    "ServiceList": keys(ServiceList.CodingKeys.self),
+    "ServiceParams": keys(ServiceParams.CodingKeys.self),
+    "ServiceAuthorization": keys(ServiceAuthorization.CodingKeys.self),
+    "ServiceCompleteParams": keys(ServiceCompleteParams.CodingKeys.self),
+    "ServiceTokenParams": keys(ServiceTokenParams.CodingKeys.self),
+    "ServiceAccess": keys(ServiceAccess.CodingKeys.self),
+    "ServiceFollowParams": keys(ServiceFollowParams.CodingKeys.self),
+    "ServiceHost": keys(ServiceHost.CodingKeys.self),
+    "ServiceOverview": keys(ServiceOverview.CodingKeys.self),
+    "ServiceOverviewList": keys(ServiceOverviewList.CodingKeys.self),
+    "ServiceSetParams": keys(ServiceSetParams.CodingKeys.self),
+    "ServiceAuditEntry": keys(ServiceAuditEntry.CodingKeys.self),
+    "ServiceAuditList": keys(ServiceAuditList.CodingKeys.self),
 ]
 
 /// The index's enums, from the Swift ones.
@@ -200,6 +214,8 @@ let swiftEnums: [String: [String]] = [
     "LoginTool": LoginTool.allCases.map(\.rawValue),
     "CheckId": CheckId.allCases.map(\.rawValue),
     "CheckState": CheckState.allCases.map(\.rawValue),
+    "ServiceState": ServiceState.allCases.map(\.rawValue),
+    "ServiceRole": ServiceRole.allCases.map(\.rawValue),
     "MessageRole": MessageRole.allCases.map(\.rawValue),
 ]
 
@@ -267,6 +283,15 @@ func methodChecks() -> [String: MethodCheck] {
         check(ToolboxClose.self),
         check(DoctorCheckGet.self),
         check(DoctorFix.self),
+        check(ServicesList.self),
+        check(ServicesConnect.self),
+        check(ServicesComplete.self),
+        check(ServicesToken.self),
+        check(ServicesFollow.self),
+        check(ServicesOverview.self),
+        check(ServicesDisconnect.self),
+        check(ServicesSet.self),
+        check(ServicesAudit.self),
     ])
 }
 

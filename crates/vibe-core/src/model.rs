@@ -142,6 +142,47 @@ names! {
         /// changed; `state` is the new [`HostLink`], `message` why it's
         /// down.
         HostLink = "host.link",
+        /// A shared service changed: its state, settings or tools.
+        ServiceChanged = "service.changed",
+    }
+}
+
+names! {
+    /// Where a shared service stands, on the host that holds its login.
+    ServiceState {
+        /// Never connected, or disconnected on purpose.
+        Disconnected = "disconnected",
+        Connected = "connected",
+        /// A refresh is under way.
+        Refreshing = "refreshing",
+        /// This host's access token has run out or been refused, and the host
+        /// that owns the login can't be reached to give it another.
+        OwnerUnreachable = "owner_unreachable",
+        /// A refresh was refused (`invalid_grant`, `invalid_client`): only
+        /// connecting again helps.
+        NeedsReconnect = "needs_reconnect",
+        /// The service turned down a freshly refreshed token, or a key: the
+        /// owner revoked it there.
+        Revoked = "revoked",
+    }
+}
+
+names! {
+    /// A host's part in a service's one login.
+    ServiceRole {
+        /// It holds the refresh token, and it alone ever refreshes.
+        Owner = "owner",
+        /// It holds only an access token, given to it by way of the Mac.
+        Follower = "follower",
+    }
+}
+
+names! {
+    /// Which coding agent an agent runs. The shared services don't care; only
+    /// how they're offered to it differs by kind.
+    AgentKind {
+        Claude = "claude",
+        Pi = "pi",
     }
 }
 
@@ -317,6 +358,20 @@ pub struct Profile {
     /// The agent's high-water mark in bytes: a `linux` VM's RAM, or a
     /// `macos` agent's hard limit.
     pub memory: u64,
+    /// Whether its agents get the shared MCP services (PRD: Shared MCP
+    /// services). On for every profile unless it's switched off, so only
+    /// `false` is ever written, and a host that doesn't know of them reads
+    /// as on.
+    #[serde(default = "shared_services_on", skip_serializing_if = "is_on")]
+    pub shared_services: bool,
+}
+
+fn shared_services_on() -> bool {
+    true
+}
+
+fn is_on(on: &bool) -> bool {
+    *on
 }
 
 impl Profile {
@@ -329,6 +384,7 @@ impl Profile {
             reasoning: Reasoning::High,
             mode: Mode::Auto,
             memory: DEFAULT_PROFILE_MEMORY,
+            shared_services: true,
         }
     }
 

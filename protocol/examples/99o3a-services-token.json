@@ -1,0 +1,22 @@
+{
+  "description": "The owning host's current access token, which the Mac asks for to give the other hosts, and never its refresh token. `rejected` says a follower had that token turned down, so the owner refreshes if it's still its current one. It goes only between `vibed`s: the app never calls it, and the tunnel and the public endpoint can't. The token here is the stand-in's.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 9914,
+    "method": "services.token",
+    "params": {
+      "service": "linear",
+      "rejected": "FAKESECRET-a-token-it-no-longer-uses"
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 9914,
+    "result": {
+      "access": "FAKESECRET-access-2",
+      "expires_at": 1793448000,
+      "service": "linear",
+      "state": "connected"
+    }
+  }
+}

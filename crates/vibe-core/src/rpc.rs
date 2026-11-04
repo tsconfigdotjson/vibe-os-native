@@ -18,8 +18,8 @@ use serde_json::Value;
 pub use crate::limits::HostLimits;
 pub use crate::model::{
     Activity, AgentState, Certainty, CheckId, CheckState, Environment, EventKind, GhState,
-    HostLink, LoginTool, MessageRole, Mode, Model, Profile, ProjectSource, Reasoning, SessionState,
-    StopReason, ToolboxAction, ToolboxState, TunnelState, WakeupKind,
+    HostLink, LoginTool, MessageRole, Mode, Model, Profile, ProjectSource, Reasoning, ServiceRole,
+    ServiceState, SessionState, StopReason, ToolboxAction, ToolboxState, TunnelState, WakeupKind,
 };
 
 /// Bumped on any incompatible change to the contract. Clients send theirs in
@@ -380,6 +380,15 @@ pub const METHODS: &[&str] = &[
     ToolboxClose::NAME,
     DoctorCheckGet::NAME,
     DoctorFix::NAME,
+    ServicesList::NAME,
+    ServicesConnect::NAME,
+    ServicesComplete::NAME,
+    ServicesToken::NAME,
+    ServicesFollow::NAME,
+    ServicesOverview::NAME,
+    ServicesDisconnect::NAME,
+    ServicesSet::NAME,
+    ServicesAudit::NAME,
 ];
 
 /// Every notification the daemon sends.
@@ -995,6 +1004,10 @@ pub struct ProfileCreateParams {
     /// Bytes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory: Option<u64>,
+    /// Whether its agents get the shared MCP services; on unless it's
+    /// `false`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shared_services: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1019,6 +1032,10 @@ pub struct ProfileUpdateParams {
     /// Bytes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory: Option<u64>,
+    /// Switches the shared MCP services on or off for agents started from
+    /// here on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shared_services: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1625,6 +1642,301 @@ pub struct Message {
 pub struct MessageList {
     /// Oldest first.
     pub messages: Vec<Message>,
+}
+
+// Shared MCP services (PRD: Shared MCP services). Each host holds its own logins,
+// so these go to the host they name, over its link, and only ever say how it
+// stands. No token crosses a link: `services.connect` and `services.complete`
+// have the host do everything but the browser, and a personal key is entered on
+// the host it's for.
+
+method! {
+    /// `services.list`: the supported services, and how each stands.
+    ServicesList = "services.list", HostParams => ServiceList
+}
+
+method! {
+    /// `services.connect`: the first half of connecting or reconnecting a host
+    /// with OAuth. That host registers its client and makes the PKCE verifier,
+    /// which it keeps, and answers with the page for the app to open in a web
+    /// authentication session. What's connected stays as it is until
+    /// `services.complete`, so a sign-in given up on loses nothing.
+    ServicesConnect = "services.connect", ServiceParams => ServiceAuthorization
+}
+
+method! {
+    /// `services.complete`: the second half: the URL that session ended on. The
+    /// code in it is useless without the host's verifier; the host makes the
+    /// exchange and keeps the tokens.
+    ServicesComplete = "services.complete", ServiceCompleteParams => ServiceInfo
+}
+
+method! {
+    /// `services.disconnect`: forgets the login, here and, where it can, at
+    /// the service.
+    ServicesDisconnect = "services.disconnect", ServiceParams => ServiceInfo
+}
+
+method! {
+    /// `services.set`: changes the settings given. If they can't be kept,
+    /// nothing changes and it says so.
+    ServicesSet = "services.set", ServiceSetParams => ServiceInfo
+}
+
+method! {
+    /// `services.token`: the owner's current access token, refreshed first if
+    /// `rejected` is what's current. The Mac asks it, for the other hosts.
+    ServicesToken = "services.token", ServiceTokenParams => ServiceAccess
+}
+
+method! {
+    /// `services.follow`: makes this host a follower of a login, with the access
+    /// token it's to use. The Mac sends it. There's no way to send a refresh
+    /// token this way.
+    ServicesFollow = "services.follow", ServiceFollowParams => ServiceInfo
+}
+
+method! {
+    /// `services.overview`: each service's one connection: who owns it, and how
+    /// every host stands with it, those that don't answer in a few seconds
+    /// marked so.
+    ServicesOverview = "services.overview", NoParams => ServiceOverviewList
+}
+
+method! {
+    /// `services.audit`: the last calls agents on that host made to its services,
+    /// oldest first. Never arguments or tokens.
+    ServicesAudit = "services.audit", HostParams => ServiceAuditList
+}
+
+/// One shared service, on one host. Nothing here is secret.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceInfo {
+    /// Its name: `linear`. Its MCP server in an agent is `vibe-<name>`.
+    pub name: String,
+    /// Its name for people: `Linear`.
+    pub title: String,
+    pub state: ServiceState,
+    /// This host's part in the login.
+    pub role: ServiceRole,
+    /// Who owns the login, for people, if it's another host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    /// When this host's access token runs out, if it has one and that's known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_until: Option<String>,
+    /// A follower whose token was refused or ran out, waiting to be given another.
+    #[serde(default)]
+    pub wants_token: bool,
+    /// Off, every agent's calls are refused: the kill switch.
+    pub enabled: bool,
+    /// Agents reach its read-only endpoint.
+    pub read_only: bool,
+    /// Tools no agent may list or call, by their names at the service.
+    pub denied_tools: Vec<String>,
+    /// Claude Code runs its tools without asking, for agents started from here
+    /// on. Off, its own permission prompts govern them.
+    pub auto_allow: bool,
+    /// How many tools agents see.
+    pub tools: u32,
+    /// The last thing that went wrong, for people.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// When it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceList {
+    pub services: Vec<ServiceInfo>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    pub service: String,
+}
+
+/// What the app needs for a web authentication session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceAuthorization {
+    pub service: String,
+    /// The page to open.
+    pub url: String,
+    /// The scheme of the URL it ends on: `vibeos`.
+    pub callback_scheme: String,
+}
+
+// By hand, below: it holds a sign-in's code.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceCompleteParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    pub service: String,
+    /// The URL the session ended on, as it was.
+    pub callback_url: String,
+}
+
+impl fmt::Debug for ServiceCompleteParams {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ServiceCompleteParams")
+            .field("host", &self.host)
+            .field("service", &self.service)
+            .finish_non_exhaustive()
+    }
+}
+
+// By hand, below: it can hold an access token.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceTokenParams {
+    pub service: String,
+    /// The access token a follower had turned down, so that the owner refreshes
+    /// if it's still the current one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rejected: Option<String>,
+}
+
+impl fmt::Debug for ServiceTokenParams {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ServiceTokenParams")
+            .field("service", &self.service)
+            .finish_non_exhaustive()
+    }
+}
+
+/// What the owner of a login gives out: an access token and how the login stands.
+/// Never its refresh token.
+// By hand, below: it holds an access token.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceAccess {
+    pub service: String,
+    pub state: ServiceState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<String>,
+    /// When it runs out, in seconds since the epoch, if the service said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
+    /// What's wrong with the login, for people.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+impl fmt::Debug for ServiceAccess {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ServiceAccess")
+            .field("service", &self.service)
+            .field("state", &self.state)
+            .field("expires_at", &self.expires_at)
+            .finish_non_exhaustive()
+    }
+}
+
+/// What the Mac tells a host that doesn't own a login. Any login of its own that
+/// it held is forgotten, as another host has it now.
+// By hand, below: it holds an access token.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceFollowParams {
+    pub service: String,
+    /// Who owns it, for people: a host's name, or `the Mac`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    /// How the login stands at its owner.
+    pub state: ServiceState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+impl fmt::Debug for ServiceFollowParams {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ServiceFollowParams")
+            .field("service", &self.service)
+            .field("owner", &self.owner)
+            .field("state", &self.state)
+            .field("expires_at", &self.expires_at)
+            .finish_non_exhaustive()
+    }
+}
+
+/// How one host stands with a service.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceHost {
+    /// The host's name; `local` is the one asked.
+    pub host: String,
+    /// Whether it answered just now.
+    pub reachable: bool,
+    /// What it says, if it answered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<ServiceInfo>,
+}
+
+/// A service's one connection, as this install sees it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceOverview {
+    pub name: String,
+    pub title: String,
+    /// How the login stands, as its owner last said.
+    pub state: ServiceState,
+    /// The host that holds the login, or would at the next sign-in.
+    pub owner: String,
+    /// Whether it holds it yet.
+    pub signed_in: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail_at: Option<String>,
+    pub hosts: Vec<ServiceHost>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceOverviewList {
+    pub services: Vec<ServiceOverview>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceSetParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    pub service: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_only: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub denied_tools: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_allow: Option<bool>,
+}
+
+/// One call an agent made to a service. Never its arguments or a token.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceAuditEntry {
+    pub at: String,
+    /// The agent's ref, as far as its host could tell.
+    pub agent: String,
+    pub service: String,
+    /// The tool, by its name at the service.
+    pub tool: String,
+    /// How it ended: `ok`, `tool_error`, `denied`, `off`, `invalid`,
+    /// `not_connected`, `needs_reconnect`, `unavailable` or `cancelled`.
+    pub outcome: String,
+    /// How long it took, in milliseconds.
+    pub ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceAuditList {
+    pub entries: Vec<ServiceAuditEntry>,
 }
 
 #[cfg(test)]

@@ -155,6 +155,7 @@ async fn an_agents_session_is_titled_with_its_profile() {
             created_at: 0,
             compartment: "{}".into(),
             starting: false,
+            shared_services: true,
         })
         .unwrap();
     let _shim = start_shim(&w.layout, "quiet-amber-otter", &["sleep", "600"]);

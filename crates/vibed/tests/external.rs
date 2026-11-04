@@ -1104,6 +1104,7 @@ fn legacy_agent(home: &Path, os: &str, agent_ref: &str) {
             created_at: 0,
             compartment: "{}".into(),
             starting: false,
+            shared_services: true,
         })
         .unwrap();
 }

@@ -579,6 +579,7 @@ dependencies = [
  "http",
  "hyper",
  "hyper-util",
+ "log",
  "rustls",
  "rustls-native-certs",
  "rustls-platform-verifier",
@@ -1694,6 +1695,8 @@ dependencies = [
  "vibe-core",
  "vibe-env",
  "vibe-mcp",
+ "vibe-relay",
+ "vibe-services",
  "vibed",
 ]
 
@@ -1721,6 +1724,7 @@ dependencies = [
  "tempfile",
  "vibe-core",
  "vibe-guest",
+ "vibe-relay",
  "vibe-status",
  "vt100",
 ]
@@ -1733,6 +1737,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "vibe-relay",
  "vt100",
 ]
 
@@ -1757,6 +1762,35 @@ dependencies = [
  "tower-service",
  "vibe-core",
  "vibe-status",
+]
+
+[[package]]
+name = "vibe-relay"
+version = "0.1.4"
+dependencies = [
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "vibe-services"
+version = "0.1.4"
+dependencies = [
+ "bytes",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "rustls",
+ "rustls-native-certs",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "vibe-core",
+ "vibe-relay",
 ]
 
 [[package]]
@@ -1810,6 +1844,8 @@ dependencies = [
  "vibe-core",
  "vibe-env",
  "vibe-mcp",
+ "vibe-relay",
+ "vibe-services",
  "vibe-status",
 ]
 

@@ -654,3 +654,38 @@ fn a_share_that_didnt_mount_fails_the_boot() {
     lock(&s.fake.state).unmounted = None;
     s.launch(&h).unwrap();
 }
+
+#[test]
+fn shared_services_go_by_what_the_running_guest_says() {
+    let s = Setup::new();
+    let h = s.backend.create(&s.spec("quiet-amber-otter")).unwrap();
+    assert_eq!(
+        s.backend.services_program().as_deref(),
+        Some(vibe_relay::local::GUEST_PROGRAM)
+    );
+    // Stopped: nothing to dial, and looking at it mustn't boot it.
+    assert!(s.backend.services_relay(&h).unwrap().is_none());
+    assert!(!s.fake.vm(&s.socket("quiet-amber-otter")).running);
+
+    // A launch asks, which may boot it. This guest serves them, so it's dialed.
+    assert_eq!(s.backend.services_unsupported(&h).unwrap(), None);
+    assert!(s.fake.vm(&s.socket("quiet-amber-otter")).running);
+    let dialed = s.backend.services_relay(&h).unwrap_err();
+    assert!(dialed.message().contains("dial"), "{dialed}");
+    // Every VM's relay waits behind this look, so a stuck guest gets no longer
+    // than the dial itself does.
+    assert_eq!(
+        lock(&s.fake.state).status_bounds.last(),
+        Some(&super::DIAL_TIMEOUT)
+    );
+
+    // A template on an older base goes on booting that base's guest: nothing's
+    // offered, it says what to do, and it's not dialed for a port it hasn't got.
+    s.fake
+        .with(&s.socket("quiet-amber-otter"), "old guest", |vm| {
+            vm.old_guest = true;
+        });
+    let why = s.backend.services_unsupported(&h).unwrap().unwrap();
+    assert!(why.contains("Rebuild Template"), "{why}");
+    assert!(s.backend.services_relay(&h).unwrap().is_none());
+}

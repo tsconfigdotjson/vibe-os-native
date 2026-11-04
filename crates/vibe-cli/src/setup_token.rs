@@ -162,9 +162,9 @@ fn run_claude(claude: &OsString) -> io::Result<(std::process::ExitStatus, Vec<u8
     Ok((status, seen))
 }
 
-/// Reads a pasted token without echoing it.
-fn ask_for_token() -> io::Result<String> {
-    eprint!("vibe: paste the token `claude setup-token` printed, then press Return: ");
+/// Reads a pasted secret from the terminal without echoing it.
+pub(crate) fn read_hidden(prompt: &str) -> io::Result<String> {
+    eprint!("{prompt}");
     io::stderr().flush()?;
     // SAFETY: termios is plain data, filled in by tcgetattr; echo is put
     // back below.
@@ -195,7 +195,10 @@ pub(crate) fn setup_token(claude: &OsString, store: &TokenStore) -> Result<(), S
             return Err(format!("claude setup-token didn't finish ({status})"));
         }
         None if is_tty(libc::STDIN_FILENO) => {
-            let pasted = ask_for_token().map_err(|e| e.to_string())?;
+            let pasted = read_hidden(
+                "vibe: paste the token `claude setup-token` printed, then press Return: ",
+            )
+            .map_err(|e| e.to_string())?;
             claude_token::validate(&pasted).map_err(|e| format!("what was pasted {e}"))?;
             pasted
         }

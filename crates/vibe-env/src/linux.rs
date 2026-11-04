@@ -107,6 +107,8 @@ pub trait Machine: Send + Sync + fmt::Debug {
     fn wait_gone(&self, socket: &Path, timeout: Duration) -> bool;
     fn ready(&self, socket: &Path, timeout: Duration) -> Result<guest::Status>;
     fn status(&self, socket: &Path) -> Result<guest::Status>;
+    /// [`Machine::status`], giving up after `timeout`.
+    fn status_within(&self, socket: &Path, timeout: Duration) -> Result<guest::Status>;
     fn launch(&self, socket: &Path, launch: &guest::Launch) -> Result<()>;
     fn processes(&self, socket: &Path) -> Result<guest::Processes>;
     fn freeze(&self, socket: &Path) -> Result<guest::Frozen>;
@@ -121,7 +123,14 @@ pub trait Machine: Send + Sync + fmt::Debug {
     fn set_clock(&self, socket: &Path, now: SystemTime) -> Result<()>;
     /// Runs a command to completion in the guest, beside the agent's.
     fn run(&self, socket: &Path, run: &proto::Run) -> Result<proto::Ran>;
+    /// Dials a port in the guest, for the shared services' relay.
+    fn dial(&self, _socket: &Path, _port: u32) -> Result<std::os::unix::net::UnixStream> {
+        Err(EnvError::new("this machine can't dial its guest"))
+    }
 }
+
+/// How long dialing a port in the guest may take.
+const DIAL_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The real thing: `vibe-vm` and the guest behind it.
 #[derive(Debug, Clone)]
@@ -135,6 +144,11 @@ fn env_err(what: &str) -> impl FnOnce(guest::GuestError) -> EnvError + '_ {
 }
 
 impl Machine for Real {
+    fn dial(&self, socket: &Path, port: u32) -> Result<std::os::unix::net::UnixStream> {
+        vm::connect_within(socket, port, DIAL_TIMEOUT)
+            .map_err(|e| EnvError::new(format!("can't dial the guest: {e}")))
+    }
+
     fn create(&self, config: &Path) -> Result<()> {
         vm::create(&self.vibe_vm, config)
             .map(drop)
@@ -207,6 +221,10 @@ impl Machine for Real {
 
     fn status(&self, socket: &Path) -> Result<guest::Status> {
         guest::status(socket).map_err(env_err("vibe-guest's status"))
+    }
+
+    fn status_within(&self, socket: &Path, timeout: Duration) -> Result<guest::Status> {
+        guest::status_within(socket, timeout).map_err(env_err("vibe-guest's status"))
     }
 
     fn launch(&self, socket: &Path, launch: &guest::Launch) -> Result<()> {
@@ -732,6 +750,37 @@ impl Compartment for LinuxVm {
             },
         )?;
         Ok(TerminalEnd::Vm { socket })
+    }
+
+    fn services_program(&self) -> Option<String> {
+        Some(vibe_relay::local::GUEST_PROGRAM.to_owned())
+    }
+
+    fn services_unsupported(&self, h: &Handle) -> Result<Option<String>> {
+        // What counts is the guest this VM really runs: a template built on an
+        // older base goes on booting that base's.
+        self.ensure_running(h)?;
+        let status = self.machine.status(&self.socket(h))?;
+        Ok((!status.services).then(|| {
+            format!(
+                "its VM's guest, vibe-guest {}, is too old for shared services: Rebuild Template \
+                 in Settings → Linux Toolbox moves new agents to a base image that has them",
+                status.version
+            )
+        }))
+    }
+
+    fn services_relay(&self, h: &Handle) -> Result<Option<std::os::unix::net::UnixStream>> {
+        let socket = self.socket(h);
+        // Bounded like the dial, as every VM's relay waits behind this one's.
+        if !self.machine.running(&socket)
+            || !self.machine.status_within(&socket, DIAL_TIMEOUT)?.services
+        {
+            return Ok(None);
+        }
+        self.machine
+            .dial(&socket, vibe_relay::frame::VSOCK_PORT)
+            .map(Some)
     }
 
     fn processes(&self, h: &Handle) -> Result<Vec<Proc>> {

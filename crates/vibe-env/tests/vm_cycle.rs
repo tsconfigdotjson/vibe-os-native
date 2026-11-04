@@ -840,6 +840,140 @@ fn reboot() {
 /// and nowhere else.
 const TOKEN: &str = "sk-ant-oat01-vm-cycle-test-token";
 
+/// Shared MCP services in a real VM (PRD: Shared MCP services, In a VM): a shim
+/// in the guest, run as the guest's own `vibe`, reaches this test standing in for
+/// the Mac's broker over the relay it dialed to port 1102. With no relay the shim
+/// says the Mac's unreachable; the relay goes with a snapshot, and the shim goes
+/// on after a wake once the relay's dialed again, with nothing restarted.
+#[test]
+fn guest_shim_reaches_the_broker_over_the_relay_across_a_sleep() {
+    let Some(g) = guest("guest_shim_reaches_the_broker_over_the_relay_across_a_sleep") else {
+        return;
+    };
+    let root = short_tempdir();
+    let vm = TestVm::create_as(
+        &g,
+        root.path(),
+        "relay",
+        1024 * MIB,
+        root.path().join("relay.vm"),
+        &Kind::VibeGuest { claude: None },
+    );
+    vm.boot_guest();
+    let share = vm.share.to_string_lossy().into_owned();
+
+    // A shim started in the guest, its client a script fed from a file in the
+    // share, answering into another, so it lives across the sleep.
+    let program = vibe_relay::local::GUEST_PROGRAM;
+    let input = vm.share.join("to-shim");
+    fs::write(&input, "").unwrap();
+    let launch = vibe_guest::Launch {
+        command: vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            format!(
+                "tail -f '{share}/to-shim' | {program} mcp-proxy linear > '{share}/from-shim' 2>&1"
+            ),
+        ],
+        env: [
+            (
+                vibe_relay::local::AGENT_ENV.to_owned(),
+                "relay-test".to_owned(),
+            ),
+            (
+                vibe_relay::local::CACHE_ENV.to_owned(),
+                "/tmp/services-cache".to_owned(),
+            ),
+        ]
+        .into(),
+        cwd: Some(share.clone()),
+        size: None,
+        time_ms: Some(vibe_guest::millis(std::time::SystemTime::now())),
+    };
+    vibe_guest::launch(&vm.socket, &launch).unwrap();
+    let say = |m: serde_json::Value| {
+        let mut f = fs::OpenOptions::new().append(true).open(&input).unwrap();
+        writeln!(f, "{m}").unwrap();
+    };
+    // Waits for the shim's answer to `id`.
+    let answer = |id: i64| -> serde_json::Value {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            let out = fs::read_to_string(vm.share.join("from-shim")).unwrap_or_default();
+            for line in out.lines() {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(line)
+                    && v["id"] == id
+                {
+                    return v;
+                }
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        panic!("no answer to {id}\n{}", vm.logs());
+    };
+    let call = |id: i64| serde_json::json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"name": "list_issues"}});
+
+    // The handshake works, and a call says why not, before any relay's up.
+    say(
+        serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}}),
+    );
+    assert_eq!(answer(1)["result"]["serverInfo"]["name"], "vibe-linear");
+    say(serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+    say(call(2));
+    let down = answer(2);
+    assert_eq!(down["result"]["isError"], true, "{down}");
+    assert!(down.to_string().contains("Mac unreachable"), "{down}");
+
+    // The Mac's part: dial, say hello, answer a call on whatever stream it came.
+    fn serve_one(socket: &Path, id: i64) -> std::thread::JoinHandle<()> {
+        let socket = socket.to_owned();
+        thread::spawn(move || {
+            use vibe_relay::frame::{Frame, PROTOCOL, VSOCK_PORT, read_frame, write_frame};
+            let mut relay =
+                vm::connect_within(&socket, VSOCK_PORT, Duration::from_secs(10)).unwrap();
+            write_frame(&mut relay, &Frame::Hello { protocol: PROTOCOL }).unwrap();
+            while let Ok(Some(frame)) = read_frame(&mut relay) {
+                match frame {
+                    Frame::Ping => write_frame(&mut relay, &Frame::Pong).unwrap(),
+                    Frame::Message { stream, body } => {
+                        let m: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                        if m["id"] == id {
+                            let ok = serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {
+                                "content": [{"type": "text", "text": "from the Mac"}],
+                            }});
+                            let frame = Frame::Message {
+                                stream,
+                                body: ok.to_string().into_bytes(),
+                            };
+                            write_frame(&mut relay, &frame).unwrap();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        })
+    }
+    let first = serve_one(&vm.socket, 3);
+    thread::sleep(Duration::from_secs(1));
+    say(call(3));
+    assert_eq!(answer(3)["result"]["content"][0]["text"], "from the Mac");
+
+    // Sleep takes the relay with it.
+    let frozen = vibe_guest::freeze(&vm.socket).unwrap();
+    vm.sleep_down_to(None, Some(vibe_guest::balloon_floor(frozen.memory)));
+    first.join().unwrap();
+    vm.restore_guest();
+    vibe_guest::thaw(&vm.socket, std::time::SystemTime::now(), None).unwrap();
+
+    // Dialed again after the wake: the same shim just carries on.
+    let _second = serve_one(&vm.socket, 4);
+    thread::sleep(Duration::from_secs(1));
+    say(call(4));
+    assert_eq!(answer(4)["result"]["content"][0]["text"], "from the Mac");
+    vm.stop();
+    mark("guest_shim_reaches_the_broker_over_the_relay_across_a_sleep");
+}
+
 fn shim_binary() -> PathBuf {
     let path = std::env::var_os("VIBE_SHIM_BIN")
         .map(|p| absolute(PathBuf::from(p)))

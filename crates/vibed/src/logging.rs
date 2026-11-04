@@ -50,9 +50,9 @@ pub fn write(args: fmt::Arguments<'_>) {
     }
 }
 
-/// How tokens other than ours start: GitHub's (`gh` and git credentials)
-/// and Claude's.
-const TOKEN_PREFIXES: [&str; 7] = [
+/// How tokens other than ours start: GitHub's (`gh` and git credentials),
+/// Claude's and Linear's. The broker never logs a token: these are a backstop.
+const TOKEN_PREFIXES: [&str; 9] = [
     "github_pat_",
     "ghp_",
     "gho_",
@@ -60,6 +60,8 @@ const TOKEN_PREFIXES: [&str; 7] = [
     "ghs_",
     "ghr_",
     "sk-ant-",
+    "lin_api_",
+    "lin_oauth_",
 ];
 
 /// Shortest secret part a token has; shorter runs are left alone.
@@ -115,6 +117,8 @@ mod tests {
         assert_eq!(redact_tokens(line), "push with ghp_… and sk-ant-…, ok");
         let pat = "token=github_pat_11ABCDEFG0123456789_abcdefghij";
         assert_eq!(redact_tokens(pat), "token=github_pat_…");
+        let linear = "Bearer lin_api_abcdefghijklmnopqrstuv lin_oauth_abcdefghijklmnopqrstuv";
+        assert_eq!(redact_tokens(linear), "Bearer lin_api_… lin_oauth_…");
         // Short runs and look-alikes inside words stay.
         for keep in [
             "ghp_short",

@@ -1,0 +1,44 @@
+{
+  "description": "Forgets the one login, at its owning host and, where it can, at the service, and every other host is told to forget its access token. Its tools go from every agent.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 9904,
+    "method": "services.disconnect",
+    "params": {
+      "host": "local",
+      "service": "linear"
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 9904,
+    "result": {
+      "auto_allow": true,
+      "denied_tools": [
+        "delete_issue"
+      ],
+      "enabled": true,
+      "name": "linear",
+      "read_only": true,
+      "role": "follower",
+      "state": "disconnected",
+      "title": "Linear",
+      "tools": 0,
+      "wants_token": false
+    }
+  },
+  "events": [
+    {
+      "jsonrpc": "2.0",
+      "method": "events.event",
+      "params": {
+        "at": "2026-10-30T12:00:00Z",
+        "host": "local",
+        "kind": "service.changed",
+        "message": "linear",
+        "seq": 33,
+        "state": "disconnected"
+      }
+    }
+  ]
+}

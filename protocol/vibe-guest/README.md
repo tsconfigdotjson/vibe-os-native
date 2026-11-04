@@ -14,7 +14,7 @@ to it:
 | `examples/*.json` | Requests on the control port with their exact replies (`request`, or a malformed `request_raw`, and `reply`) |
 | `terminal/*.json` | The JSON frames on the terminal port (`kind` and `payload`) |
 
-Only `vibe-vm` can reach a VM's vsock, so the host reaches both ports with
+Only `vibe-vm` can reach a VM's vsock, so the host reaches its ports with
 `vibe-vm`'s `connect` (`protocol/vibe-vm/`). The guest's real test is
 `crates/vibe-env/tests/vm_cycle.rs` on a Mac: `guest_question_survives_sleep`
 boots it, starts a stand-in for Claude with a question pending, and puts it
@@ -68,7 +68,7 @@ first, and runs from its initrd, without layers.
 
 ## The control port: 1100
 
-Both ports take connections from the host (vsock CID 2) only, never from a
+All its ports take connections from the host (vsock CID 2) only, never from a
 process in the guest.
 
 A connection carries one request line, sent within 30 s, and gets one reply
@@ -113,3 +113,36 @@ that connects after a dropped link, a crash or a restore is sent the screen
 as it is. A shim that takes more than 5 s to take a frame is dropped. When the command has
 already exited, a shim that connects gets the welcome, the last screen and
 the exit at once.
+
+## The shared services' relay: 1102
+
+The Mac dials this port while the VM runs, for an agent whose profile has shared
+MCP services on, and carries every shim in the VM to the Mac's broker over that
+one connection. A newer connection replaces an older one, whose streams end. The
+guest pings every 15 s and takes the Mac for gone after 45 s of silence. Its types
+are `vibe_relay::frame`.
+
+A frame is a kind byte, a big-endian `u32` stream, a big-endian `u32` length, and
+that many bytes, at most 16 MiB.
+
+| Kind | Byte | Way | Payload |
+| --- | --- | --- | --- |
+| `hello` | 0 | both, first | JSON: `protocol` |
+| `open` | 1 | guest → Mac | JSON: `service`, and `agent` if the shim said. The Mac goes by which VM it dialed |
+| `message` | 2 | both | one JSON-RPC message |
+| `close` | 3 | both | why, as text, or nothing |
+| `ping` | 4 | guest → Mac | |
+| `pong` | 5 | Mac → guest | |
+
+The control port's `status` says `services: true` once all this is up. An older
+guest doesn't say at all, and the Mac then offers its agent nothing and dials
+nothing: a VM boots its base image's guest, and a template stays on the base it
+was built on. It takes base release 3 or later.
+
+Inside the VM, `vibe-guest` serves `/run/vibe/services.sock` (`0666`, as `vibe`
+must reach it): a shim's one JSON line, `{"open":"linear","agent":…}`, and its
+answer, `{"ok":true}` or `{"ok":false,"error":…}`, then JSON-RPC, one message per
+line. It takes no relay, so a process in the guest can't pose as one. With no
+relay up it answers that the Mac can't be reached. And it's the shim too: it copies
+itself to `/run/vibe/bin/vibe`, and as `vibe mcp-proxy SERVICE` is an MCP server on
+stdio. No token or verifier ever reaches the guest.
