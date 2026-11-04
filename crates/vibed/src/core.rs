@@ -1427,15 +1427,26 @@ impl Core {
             Probe::Gone => {
                 let _ = sessions::remove_stale(&socket);
                 Err(match sessions::read_record(&self.layout, &p.agent) {
-                    Some(record) => error(
-                        ErrorCode::NotFound,
-                        format!(
-                            "session {} isn't running: its command {} at {}",
-                            p.agent,
-                            sessions::describe_exit(&record.exit),
-                            record.exit.at
-                        ),
-                    ),
+                    Some(record) => {
+                        // Why a Pi that gave up did: clicking it is asking.
+                        let is_pi = self
+                            .store()
+                            .agent(host, &p.agent)
+                            .is_ok_and(|a| a.agent == AgentKind::Pi);
+                        let why = (is_pi && record.exit.code.unwrap_or(0) != 0)
+                            .then(|| vibe_status::pi_error_at_exit(&record.output.screen))
+                            .flatten()
+                            .map_or(String::new(), |why| format!(". {why}"));
+                        error(
+                            ErrorCode::NotFound,
+                            format!(
+                                "session {} isn't running: its command {} at {}{why}",
+                                p.agent,
+                                sessions::describe_exit(&record.exit),
+                                record.exit.at
+                            ),
+                        )
+                    }
                     None => error(
                         ErrorCode::NotFound,
                         format!("no session {} on {host}", p.agent),

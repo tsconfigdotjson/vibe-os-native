@@ -374,6 +374,25 @@ let swiftErrorData: [RPCErrorCode: String] = [.protocolMismatch: "ProtocolMismat
         }
     }
 
+    @Test func piModelsAreDecidedAsVibedDecidesThem() throws {
+        let cases = try #require(
+            try loadJSON(protocolDir.appendingPathComponent("pi-models.json")) as? [String: Any])
+        let accepted = try #require(cases["accepted"] as? [String])
+        let refused = try #require(cases["refused"] as? [String])
+        #expect(!accepted.isEmpty && !refused.isEmpty)
+        for model in accepted {
+            #expect(isValidPiModel(model), "\(model)")
+        }
+        for model in refused {
+            #expect(!isValidPiModel(model), "\(model)")
+        }
+        // The cap, in bytes.
+        let longest = String(repeating: "x", count: 200)
+        #expect(isValidPiModel(longest))
+        #expect(!isValidPiModel(longest + "x"))
+        #expect(!isValidPiModel(String(longest.dropFirst()) + "é"))
+    }
+
     @Test func examplesRoundTripThroughTheTypes() throws {
         var succeeded = Set<String>()
         for example in try contractExamples() {

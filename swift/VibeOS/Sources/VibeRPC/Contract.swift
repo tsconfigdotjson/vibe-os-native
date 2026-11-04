@@ -394,6 +394,20 @@ public enum PiTarget: String, Codable, CaseIterable, Hashable, Sendable {
     case native, vm
 }
 
+/// Whether `model` is safe to give Pi as one argument, which is all that's asked of
+/// a Pi profile's model: `provider/id`, a bare id, whatever Pi may know. Pi says if
+/// it doesn't know it. vibed's `validate_pi_model` is the same rule, and
+/// `protocol/pi-models.json` holds both to it.
+public func isValidPiModel(_ model: String) -> Bool {
+    // By byte, not `hasPrefix`, which compares whole characters: `-` with a combining
+    // mark on it still starts with a `-` to anyone reading the argument.
+    guard let first = model.utf8.first, first != UInt8(ascii: "-"), model.utf8.count <= 200 else { return false }
+    return model.unicodeScalars.allSatisfy { scalar in
+        !scalar.properties.isWhitespace && scalar.properties.generalCategory != .control
+            && !"'\"`$\\".unicodeScalars.contains(scalar)
+    }
+}
+
 /// Claude's `--model` (index: Model). A Pi profile names its own, in `piModel`.
 public enum ClaudeModel: String, Codable, CaseIterable, Hashable, Sendable {
     case opus, sonnet
@@ -1123,7 +1137,8 @@ public struct Profile: Codable, Hashable, Sendable {
 
     /// Which coding agent it runs; none means Claude.
     public var agent: AgentKind?
-    /// A Pi profile's model, as `provider/id`; none uses Pi's own default.
+    /// A Pi profile's model, as Pi is to be given it: `provider/id` or a bare id;
+    /// none uses Pi's own default.
     public var piModel: String?
 
     /// Which coding agent it runs.

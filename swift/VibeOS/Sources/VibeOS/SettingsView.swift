@@ -470,8 +470,8 @@ struct ProjectDetail: View {
 
 /// One profile: its agent, environment, model, reasoning, mode and memory
 /// (PRD: Profiles). Each change is sent as it's made. Claude has a model of two
-/// and permission modes; Pi takes its model as `provider/id`, thinks at the
-/// same levels and never asks, which says so here.
+/// and permission modes; Pi takes whatever model it's told, thinks at the same
+/// levels and never asks, which says so here.
 struct ProfileRow: View {
     @ObservedObject var model: MenuModel
     let host: String
@@ -528,7 +528,8 @@ struct ProfileRow: View {
                     LabeledContent("Model") {
                         CommitField(
                             title: "Model", value: profile.piModel ?? "", prompt: "Pi's default", width: 240,
-                            help: "As provider/id, as pi --list-models shows it. Empty uses Pi's own default.",
+                            help: "Any model Pi has, such as openai/gpt-5 or deepseek-v4.1-flash. Pi says if it can't use it. "
+                                + "Empty uses Pi's own default.",
                             trailing: false, isValid: validPiModel
                         ) { text in
                             let model = text.trimmingCharacters(in: .whitespaces)
@@ -672,14 +673,11 @@ struct ProfileRow: View {
         pending = nil
     }
 
-    /// Empty for Pi's own default, or `provider/id` with no spaces; vibed has
-    /// the last word.
+    /// Empty for Pi's own default, or anything safe to give Pi as it is; Pi says
+    /// if it can't use it.
     private func validPiModel(_ text: String) -> Bool {
         let model = text.trimmingCharacters(in: .whitespaces)
-        if model.isEmpty { return true }
-        let parts = model.split(separator: "/", omittingEmptySubsequences: false)
-        return parts.count >= 2 && parts.allSatisfy { !$0.isEmpty } && !model.hasPrefix("-")
-            && !model.contains(where: \.isWhitespace)
+        return model.isEmpty || isValidPiModel(model)
     }
 
     /// Pi on this Mac is the owner's call, as Claude's bypass is, and is said

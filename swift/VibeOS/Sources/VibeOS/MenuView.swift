@@ -389,6 +389,14 @@ struct AgentRow: View {
 
     var body: some View {
         let lines = rowLines(agent)
+        // What stopped it is shown whole: it can hold the very thing to do next.
+        let failure = agent.status.activity == .errored ? agent.status.error : nil
+        let tipLines: [String?] = [
+            "\(agent.profile) · \(agent.kind.title) · \(agent.environment.title)",
+            unavailable ? "\(agent.host) can't be reached. Its agents keep running there." : "Click to open it in Terminal.",
+            failure,
+        ]
+        let tip = tipLines.compactMap { $0 }.joined(separator: "\n")
         Button {
             Task { await model.attach(agent) }
         } label: {
@@ -446,7 +454,9 @@ struct AgentRow: View {
                                             .imageScale(.small)
                                             .foregroundStyle(agent.state == .question ? Palette.attention : .secondary)
                                     }
-                                    Text(line).lineLimit(1)
+                                    Text(line)
+                                        .lineLimit(failure == nil ? 1 : 8)
+                                        .fixedSize(horizontal: false, vertical: failure != nil)
                                 }
                                 .foregroundStyle(.secondary)
                             }
@@ -466,9 +476,7 @@ struct AgentRow: View {
         .buttonStyle(MenuRowStyle(selected: selected))
         .opacity(unavailable ? 0.45 : 1)
         .disabled(unavailable)
-        .help(
-            "\(agent.profile) · \(agent.kind.title) · \(agent.environment.title)\n"
-                + (unavailable ? "\(agent.host) can't be reached. Its agents keep running there." : "Click to open it in Terminal."))
+        .help(tip)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(rowAccessibilityLabel(agent, now: Date(), unavailable: unavailable))
         .accessibilityHint(unavailable ? "" : "Opens it in Terminal")

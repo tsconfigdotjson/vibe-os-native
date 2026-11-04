@@ -415,8 +415,9 @@ pub struct Profile {
     /// what was saved before Pi still reads the same.
     #[serde(default, skip_serializing_if = "AgentKind::is_claude")]
     pub agent: AgentKind,
-    /// A Pi profile's model, as `provider/id`. Without one, Pi uses what its
-    /// own settings and logins give: VibeOS doesn't pick a provider.
+    /// A Pi profile's model, as Pi is to be given it: `provider/id` or a bare id.
+    /// Without one, Pi uses what its own settings and logins give: VibeOS doesn't
+    /// pick a provider.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pi_model: Option<String>,
 }
@@ -514,24 +515,28 @@ impl Profile {
     }
 }
 
-/// A Pi model as `--model` takes it: `provider/id`, such as
-/// `anthropic/claude-sonnet-4` or `openrouter/moonshotai/kimi-k2`. Never read
-/// as an option or split by a shell.
+/// The longest Pi model name there can be, in bytes.
+pub const MAX_PI_MODEL_BYTES: usize = 200;
+
+/// Whether `model` is safe to give Pi as one argument, which is all that's asked
+/// of it: `provider/id`, a bare id, whatever Pi may know now or later. Pi says if
+/// it doesn't know it, once it runs. Never read as an option, split by a shell or
+/// shown with what moves a cursor. `isValidPiModel`, in Swift, is the same rule, and
+/// `protocol/pi-models.json` holds both to it.
 pub fn validate_pi_model(model: &str) -> Result<(), String> {
     let ok = !model.is_empty()
-        && model.len() <= 200
+        && model.len() <= MAX_PI_MODEL_BYTES
         && !model.starts_with('-')
-        && model.split_once('/').is_some_and(|(provider, id)| {
-            !provider.is_empty() && !id.is_empty() && !id.starts_with('/')
-        })
-        && model
-            .chars()
-            .all(|c| c.is_ascii_graphic() && !matches!(c, '\'' | '"' | '`' | '$' | '\\'));
+        && model.chars().all(|c| {
+            !c.is_whitespace() && !c.is_control() && !matches!(c, '\'' | '"' | '`' | '$' | '\\')
+        });
     if ok {
         Ok(())
     } else {
         Err(format!(
-            "`{model}` isn't a Pi model: write it as provider/id, as `pi --list-models` shows it"
+            "`{}` isn't a Pi model: it can't be empty, start with -, have spaces or any of \
+             ' \" ` $ \\ in it, or run past {MAX_PI_MODEL_BYTES} bytes",
+            clean_alert(model)
         ))
     }
 }
@@ -1116,34 +1121,36 @@ mod tests {
         );
     }
 
+    /// The list Swift's `isValidPiModel` is held to as well.
     #[test]
     fn pi_models() {
-        for good in [
-            "anthropic/claude-sonnet-4",
-            "openrouter/moonshotai/kimi-k2.6",
-            "openai/gpt-5:high",
-            "ollama/qwen3:30b",
-        ] {
-            assert_eq!(validate_pi_model(good), Ok(()), "{good}");
+        let cases: serde_json::Value =
+            serde_json::from_str(include_str!("../../../protocol/pi-models.json")).unwrap();
+        let list = |name: &str| -> Vec<String> {
+            let list = cases[name].as_array().unwrap();
+            assert!(!list.is_empty(), "{name}");
+            list.iter()
+                .map(|v| v.as_str().unwrap().to_owned())
+                .collect()
+        };
+        for good in list("accepted") {
+            assert_eq!(validate_pi_model(&good), Ok(()), "{good:?}");
         }
-        for bad in [
-            "",
-            "gpt-5",
-            "/gpt-5",
-            "openai/",
-            "openai//x",
-            "-x/y",
-            "--help/y",
-            "a b/c",
-            "a/b c",
-            "a/b\nc",
-            "a/$(x)",
-            "a/`x`",
-            "a/'x",
-            &format!("a/{}", "x".repeat(200)),
-        ] {
-            assert!(validate_pi_model(bad).is_err(), "{bad:?}");
+        for bad in list("refused") {
+            assert!(validate_pi_model(&bad).is_err(), "{bad:?}");
         }
+        // The cap, in bytes.
+        let longest = "x".repeat(MAX_PI_MODEL_BYTES);
+        assert_eq!(validate_pi_model(&longest), Ok(()));
+        assert!(validate_pi_model(&format!("{longest}x")).is_err());
+        assert!(validate_pi_model(&format!("{}é", &longest[1..])).is_err());
+    }
+
+    #[test]
+    fn a_refused_model_is_said_without_its_control_characters() {
+        let said = validate_pi_model("a\u{1b}[2Jb").unwrap_err();
+        assert!(said.contains("a[2Jb"), "{said}");
+        assert!(!said.contains('\u{1b}'), "{said}");
     }
 
     #[test]

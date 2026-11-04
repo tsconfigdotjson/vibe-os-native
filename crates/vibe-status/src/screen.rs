@@ -86,6 +86,49 @@ pub fn pi_error_on_screen(screen: &str) -> Option<String> {
     only_help.then(|| message(tail[at])).flatten()
 }
 
+/// What Pi said as it gave up, if it did: `screen` is what was left when it exited
+/// with a failure. One it won't start at all, such as on a model it doesn't know or
+/// can't choose for, prints `Error: ` and why and exits, before it draws anything
+/// (`main.ts`), so the error is the last thing there, however a terminal wrapped it.
+/// In Pi's words, but for what it says to type: nobody here is at Pi's command line.
+/// Part of a screen can come from a guest, so it's said as an alert is.
+pub fn pi_error_at_exit(screen: &str) -> Option<String> {
+    let lines: Vec<&str> = screen.trim_end().lines().map(str::trim_end).collect();
+    let at = lines.iter().rposition(|l| l.starts_with("Error: "))?;
+    let said = &lines[at..];
+    if said.iter().any(|l| l.is_empty()) {
+        return None;
+    }
+    // A full row ran on to the next in the middle of whatever it was saying. One
+    // shorter broke at a space, which the screen trims, or was the end of a line.
+    let row = said.iter().map(|l| l.chars().count()).max()?;
+    let mut message = String::new();
+    for line in said {
+        message.push_str(line);
+        if line.chars().count() < row {
+            message.push(' ');
+        }
+    }
+    let message = message.strip_prefix("Error: ")?;
+    // Where a terminal broke the line, the space on either side of `Use` may have gone.
+    let words = message
+        .match_indices("Use")
+        .find(|(at, _)| message[at + 3..].trim_start().starts_with("--"))
+        .map_or(message, |(at, _)| &message[..at]);
+    let words = vibe_core::model::clean_alert(words.trim());
+    if words.is_empty() {
+        return None;
+    }
+    Some(if words.starts_with("Model \"") {
+        format!(
+            "{words} Set this profile's model to one Pi has, written as provider/id, then start \
+             a new agent: this one keeps the model it started with."
+        )
+    } else {
+        words
+    })
+}
+
 /// Whether a line of Pi's screen is its spinner: `⠋ Working (esc to interrupt)`
 /// where it stands alone, or `── ⠋ Working ───` set in the editor's border
 /// (`status-indicator.ts`, `custom-editor.ts`), under whatever message an
@@ -173,6 +216,102 @@ mod tests {
             let screen = above_the_editor(&format!("hello\n\nError: {message}"));
             assert_eq!(pi_error_on_screen(&screen).as_deref(), Some(message));
         }
+    }
+
+    /// Pi 1.5's own words, read off it with a model it won't take.
+    const NOT_FOUND: &str =
+        "Error: Model \"no-such-model\" not found. Use --list-models to see available models.";
+    const AMBIGUOUS: &str = "Error: Model \"deepseek-v4.1-flash\" is ambiguous across providers: \
+         opencode-go/deepseek-v4.1-flash, opencode/deepseek-v4.1-flash. More than one matching \
+         provider is authenticated. Use --provider or provider/model.";
+    const WARNING: &str = "Warning: No project session found with id 'x'; creating a new session \
+         with that id.";
+
+    #[test]
+    fn what_pi_said_as_it_gave_up_is_said_in_its_words_with_nothing_to_type() {
+        assert_eq!(
+            pi_error_at_exit(&format!("{WARNING}\n{NOT_FOUND}\n\n\n")).as_deref(),
+            Some(
+                "Model \"no-such-model\" not found. Set this profile's model to one Pi has, \
+                 written as provider/id, then start a new agent: this one keeps the model it \
+                 started with."
+            )
+        );
+        assert_eq!(
+            pi_error_at_exit(AMBIGUOUS).as_deref(),
+            Some(
+                "Model \"deepseek-v4.1-flash\" is ambiguous across providers: \
+                 opencode-go/deepseek-v4.1-flash, opencode/deepseek-v4.1-flash. More than one \
+                 matching provider is authenticated. Set this profile's model to one Pi has, \
+                 written as provider/id, then start a new agent: this one keeps the model it \
+                 started with."
+            )
+        );
+        // Not about a model: only Pi's words.
+        assert_eq!(
+            pi_error_at_exit("Error: Invalid settings").as_deref(),
+            Some("Invalid settings")
+        );
+    }
+
+    #[test]
+    fn what_pi_said_as_it_gave_up_reads_the_same_however_it_was_wrapped() {
+        let whole = pi_error_at_exit(AMBIGUOUS).unwrap();
+        for width in [40, 61, 80, 120] {
+            let chars: Vec<char> = AMBIGUOUS.chars().collect();
+            let rows: Vec<String> = chars
+                .chunks(width)
+                .map(|row| row.iter().collect::<String>().trim_end().to_owned())
+                .collect();
+            let screen = format!("{WARNING}\n{}\n", rows.join("\n"));
+            assert_eq!(
+                pi_error_at_exit(&screen).as_deref(),
+                Some(&*whole),
+                "{width}"
+            );
+        }
+    }
+
+    /// As read off the real Pi through the real shim, at 80 columns, with the model
+    /// long enough to put the wrap either side of `Use`.
+    #[test]
+    fn what_to_type_goes_wherever_the_terminal_broke_the_line() {
+        for screen in [
+            "Error: Model \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" not found. Use\n\
+             --list-models to see available models.\n",
+            "Error: Model \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" not found.\n\
+             Use --list-models to see available models.\n",
+        ] {
+            let said = pi_error_at_exit(screen).unwrap();
+            assert!(!said.contains("--list-models"), "{said}");
+            assert!(!said.contains("Use"), "{said}");
+            assert!(said.contains("not found."), "{said}");
+        }
+        // A model named with the word is left alone.
+        let said = pi_error_at_exit("Error: Model \"Use-it\" not found.").unwrap();
+        assert!(said.contains("Use-it"), "{said}");
+    }
+
+    #[test]
+    fn only_the_last_thing_on_the_screen_is_what_pi_gave_up_with() {
+        assert_eq!(pi_error_at_exit(""), None);
+        assert_eq!(pi_error_at_exit("all done\n"), None);
+        assert_eq!(pi_error_at_exit("Error: "), None);
+        // A tool's output, long before.
+        assert_eq!(
+            pi_error_at_exit("Error: from a tool\n\nand on it went\n\nbye\n"),
+            None
+        );
+        // In prose, not at the start of a line.
+        assert_eq!(pi_error_at_exit("It said Error: nothing much\n"), None);
+    }
+
+    #[test]
+    fn what_pi_said_as_it_gave_up_moves_no_cursor_and_is_kept_short() {
+        let said = pi_error_at_exit("Error: a\u{1b}[2Jb\u{202e}c\n").unwrap();
+        assert_eq!(said, "a[2Jbc");
+        let said = pi_error_at_exit(&format!("Error: {}", "x".repeat(5000))).unwrap();
+        assert!(said.chars().count() <= 401, "{}", said.len());
     }
 
     #[test]

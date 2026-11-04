@@ -98,6 +98,34 @@ impl Core {
         }
     }
 
+    /// What Pi said as it gave up on `a`, if that's how its session ended: with a
+    /// model it won't take, say, it's gone before it writes or draws anything, and
+    /// this is all that says why. Pi has the last word on what a model is (PRD:
+    /// Profiles), so this is how it's heard. A new session makes it old news.
+    async fn pi_gave_up_with(&self, a: &AgentRecord) -> Option<String> {
+        if a.state == AgentState::Asleep
+            || self.is_busy(&a.agent_ref)
+            || !self
+                .layout
+                .agent_dir(&a.agent_ref)
+                .join(vibe_core::shim::RECORD_FILE)
+                .is_file()
+            || self.session_runs(&a.agent_ref).await
+        {
+            return None;
+        }
+        let (layout, agent_ref) = (self.layout.clone(), a.agent_ref.clone());
+        let record =
+            tokio::task::spawn_blocking(move || crate::sessions::read_record(&layout, &agent_ref))
+                .await
+                .ok()??;
+        // Ended on its own and not well: not told to go, and not a quit.
+        if record.exit.code.unwrap_or(0) == 0 {
+            return None;
+        }
+        vibe_status::pi_error_at_exit(&record.output.screen)
+    }
+
     /// When the last thing typed to `a` was, if its transcript has shown nothing
     /// of it since. Any later turn fails as a first one does: an answered agent
     /// reads as done, and goes on reading so.
@@ -118,13 +146,17 @@ impl Core {
     /// It writes nothing on a resume, so a turn left open from before stays open
     /// there. And a turn that fails before it starts, for want of a login, writes
     /// nothing and shows only on its screen. Either would read as it did before:
-    /// busy for ever, or a send that never got an answer.
+    /// busy for ever, or a send that never got an answer. And one that gave up
+    /// before it drew anything has only what it left behind to say why.
     pub(crate) async fn pi_read_status(
         &self,
         a: &mut AgentRecord,
         debounce: Duration,
         status: Status,
     ) -> (Status, bool) {
+        if let Some(error) = self.pi_gave_up_with(a).await {
+            return (status.failed_on_screen(error), true);
+        }
         let sent = self.pi_unanswered_send(a, debounce).await;
         if !status.open_turn() && sent.is_none() {
             return (status, false);

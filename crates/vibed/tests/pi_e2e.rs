@@ -16,7 +16,7 @@ mod mock_model;
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 
 use common::{Golden, wait_until, workspace_bin};
@@ -64,15 +64,19 @@ struct World {
     _tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
+static STRAY: Once = Once::new();
+
 async fn world(pi: PathBuf) -> World {
     // What Pi would silently use, were it given them.
-    // SAFETY: this binary has one test, which sets these before starting
-    // anything.
-    unsafe {
-        std::env::set_var("OPENROUTER_API_KEY", "stray-openrouter");
-        std::env::set_var("ANTHROPIC_API_KEY", "stray-anthropic");
-        std::env::set_var("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-stray");
-    }
+    STRAY.call_once(|| {
+        // SAFETY: only here, before either of this binary's tests starts anything
+        // of Pi's; nothing else in it reads or writes these.
+        unsafe {
+            std::env::set_var("OPENROUTER_API_KEY", "stray-openrouter");
+            std::env::set_var("ANTHROPIC_API_KEY", "stray-anthropic");
+            std::env::set_var("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-stray");
+        }
+    });
     let golden = Golden::new();
     let layout = Layout::new(&golden.home, "macos");
     let agent_dir = layout.linux_pi_dir();
@@ -402,4 +406,74 @@ async fn a_real_pi_lives_a_whole_life_on_a_mock_model() {
         .await
         .unwrap();
     mark();
+}
+
+/// A profile's Model field lets through what's safe to pass on, and the real Pi has
+/// the last word: it resolves a bare id only it can, and says of one it won't take,
+/// and that's what the app says.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_real_pi_decides_what_a_model_is() {
+    let Some(pi) = pi_binary() else {
+        eprintln!("a_real_pi_decides_…: skipped: no `pi` on PATH, nor in VIBE_TEST_PI_BIN");
+        return;
+    };
+    let w = world(pi).await;
+    for (name, model) in [("pi-bare", "mock-model"), ("pi-nosuch", "no-such-model")] {
+        w.core
+            .create_profile(ProfileCreateParams {
+                project: "app".into(),
+                name: name.into(),
+                agent: Some(AgentKind::Pi),
+                pi_model: Some(model.into()),
+                ..Default::default()
+            })
+            .unwrap();
+    }
+    let start = async |profile: &str| {
+        w.core
+            .start_agent(AgentStartParams {
+                project: "app".into(),
+                profile: profile.into(),
+                prompt: "hello".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .agent
+    };
+
+    // A bare id, as `pi auth check` can't resolve and Pi itself can.
+    let bare = start("pi-bare").await;
+    w.wait_for(&bare, Activity::Done).await;
+
+    // One it won't take: gone before it draws anything, saying why.
+    let nosuch = start("pi-nosuch").await;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let said = loop {
+        let list = w.core.agents(HostParams { host: None }).await.unwrap();
+        let this = list.agents.iter().find(|x| x.agent == nosuch).unwrap();
+        if this.status.activity == Activity::Errored {
+            assert_eq!(this.state, AgentState::Exited);
+            break this.status.error.clone().unwrap_or_default();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "it never read as errored: {:?}",
+            this.status
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert!(said.contains("Model \"no-such-model\" not found"), "{said}");
+    assert!(!said.contains("--list-models"), "{said}");
+
+    for agent in [bare, nosuch] {
+        w.core
+            .delete_agent(AgentDeleteParams {
+                host: None,
+                agent,
+                force: Some(true),
+            })
+            .await
+            .unwrap();
+    }
 }
