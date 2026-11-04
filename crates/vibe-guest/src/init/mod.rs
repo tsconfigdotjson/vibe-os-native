@@ -165,6 +165,27 @@ pub(crate) fn main(args: Vec<String>) -> ExitCode {
         }
     };
     let guest = Arc::new(guest);
+    // Shared MCP services: the socket agents' shims reach, and in a VM the
+    // program they run. It's the Mac that dials in to carry them. All before the
+    // ports below, as the first status anyone can read is what a launch goes by,
+    // and it asks only once.
+    let socket = match &unix_dir {
+        Some(dir) => dir.join("services.sock"),
+        None => PathBuf::from(local::GUEST_SOCKET),
+    };
+    let program = if unix_dir.is_some() {
+        Ok(())
+    } else {
+        serve::install_program(std::path::Path::new(local::GUEST_PROGRAM))
+    };
+    if let Err(e) = &program {
+        log!("can't install the shared services' program: {e}");
+    }
+    // Only if all's well does the status say so, and the Mac offer them.
+    let serving = serve::serve_services_socket(guest.clone(), socket);
+    guest
+        .services_ready
+        .store(program.is_ok() && serving, Ordering::Relaxed);
     for (port, name, handle) in [
         (
             CONTROL_PORT,
@@ -183,25 +204,6 @@ pub(crate) fn main(args: Vec<String>) -> ExitCode {
             log!("can't start the {name} port: {e}");
         }
     }
-    // Shared MCP services: the socket agents' shims reach, and in a VM the
-    // program they run. It's the Mac that dials in to carry them.
-    let socket = match &unix_dir {
-        Some(dir) => dir.join("services.sock"),
-        None => PathBuf::from(local::GUEST_SOCKET),
-    };
-    let program = if unix_dir.is_some() {
-        Ok(())
-    } else {
-        serve::install_program(std::path::Path::new(local::GUEST_PROGRAM))
-    };
-    if let Err(e) = &program {
-        log!("can't install the shared services' program: {e}");
-    }
-    // Only if all's well does the status say so, and the Mac offer them.
-    let serving = serve::serve_services_socket(guest.clone(), socket);
-    guest
-        .services_ready
-        .store(program.is_ok() && serving, Ordering::Relaxed);
     // PID 1 never returns: the main thread reaps.
     session::reap(guest.agent.clone())
 }

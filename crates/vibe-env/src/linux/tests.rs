@@ -672,6 +672,12 @@ fn shared_services_go_by_what_the_running_guest_says() {
     assert!(s.fake.vm(&s.socket("quiet-amber-otter")).running);
     let dialed = s.backend.services_relay(&h).unwrap_err();
     assert!(dialed.message().contains("dial"), "{dialed}");
+    // Every VM's relay waits behind this look, so a stuck guest gets no longer
+    // than the dial itself does.
+    assert_eq!(
+        lock(&s.fake.state).status_bounds.last(),
+        Some(&super::DIAL_TIMEOUT)
+    );
 
     // A template on an older base goes on booting that base's guest: nothing's
     // offered, it says what to do, and it's not dialed for a port it hasn't got.

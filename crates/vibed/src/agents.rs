@@ -945,7 +945,13 @@ impl Core {
         let mut services = self.shared_services(backend, record);
         if services.is_some() {
             let (b, h) = (Arc::clone(backend), handle.clone());
-            if let Some(why) = blocking(move || b.services_unsupported(&h)).await? {
+            // They're optional, so not being able to tell costs them and no more:
+            // if the compartment's really in trouble, the launch below says so.
+            let why = match blocking(move || b.services_unsupported(&h)).await {
+                Ok(why) => why,
+                Err(e) => Some(format!("can't tell if its guest has them: {}", e.message)),
+            };
+            if let Some(why) = why {
                 crate::log!("vibed: {} gets no shared services: {why}", record.agent_ref);
                 services = None;
             }

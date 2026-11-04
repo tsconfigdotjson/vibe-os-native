@@ -105,7 +105,7 @@ impl Hub {
                     let Some(state) = watched.upgrade() else {
                         return;
                     };
-                    let writer = {
+                    let (writer, generation) = {
                         let mut state = lock(&state);
                         let Some(carrier) = &state.carrier else {
                             continue;
@@ -117,14 +117,18 @@ impl Hub {
                             }
                             continue;
                         }
-                        carrier.writer.clone()
+                        (carrier.writer.clone(), carrier.generation)
                     };
                     // With nothing held that a shim needs. And never waiting on
                     // a relay that's stuck, whose silence is what ends it: a
                     // write's stuck only as long as its connection's send
                     // timeout, which `carry`'s caller sets.
-                    if let Ok(mut w) = writer.try_lock() {
-                        let _ = write_frame(&mut *w, &Frame::Ping);
+                    let wrote = match writer.try_lock() {
+                        Ok(mut w) => write_frame(&mut *w, &Frame::Ping),
+                        Err(_) => Ok(()),
+                    };
+                    if wrote.is_err() {
+                        end_carrier(&state, generation);
                     }
                 }
             });
@@ -178,16 +182,7 @@ impl Hub {
             });
         }
         let ended = self.read_carrier(&mut reader, generation);
-        let mut state = lock(&self.state);
-        if state
-            .carrier
-            .as_ref()
-            .is_some_and(|c| c.generation == generation)
-            && let Some(old) = state.carrier.take()
-        {
-            (old.close)();
-            close_streams(old.streams);
-        }
+        end_carrier(&self.state, generation);
         ended
     }
 
@@ -262,8 +257,10 @@ impl Hub {
             service: service.to_owned(),
             agent: agent.map(str::to_owned),
         };
-        write_frame(&mut *lock(&writer), &open)
-            .map_err(|e| format!("Mac unreachable: the connection to it broke: {e}"))?;
+        if let Err(e) = write_frame(&mut *lock(&writer), &open) {
+            end_carrier(&self.state, generation);
+            return Err(format!("Mac unreachable: the connection to it broke: {e}"));
+        }
         Ok((id, writer, generation))
     }
 
@@ -316,6 +313,7 @@ impl Hub {
         while let Ok(Some(body)) = read_line(&mut reader) {
             let message = Frame::Message { stream, body };
             if write_frame(&mut *lock(&writer), &message).is_err() {
+                end_carrier(&self.state, generation);
                 break;
             }
         }
@@ -332,13 +330,29 @@ impl Hub {
             c.streams.remove(&stream);
         }
         drop(state);
-        let _ = write_frame(
-            &mut *lock(writer),
-            &Frame::Close {
-                stream,
-                reason: None,
-            },
-        );
+        let close = Frame::Close {
+            stream,
+            reason: None,
+        };
+        if write_frame(&mut *lock(writer), &close).is_err() {
+            end_carrier(&self.state, generation);
+        }
+    }
+}
+
+/// Ends the relay `generation`, if it's still the one. A write that failed may
+/// have left part of a frame on it, and anything after that would be read as
+/// nonsense, so a failed write ends the relay and the Mac dials again.
+fn end_carrier(state: &Mutex<State>, generation: u64) {
+    let mut state = lock(state);
+    if state
+        .carrier
+        .as_ref()
+        .is_some_and(|c| c.generation == generation)
+        && let Some(old) = state.carrier.take()
+    {
+        (old.close)();
+        close_streams(old.streams);
     }
 }
 

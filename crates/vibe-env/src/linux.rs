@@ -107,6 +107,8 @@ pub trait Machine: Send + Sync + fmt::Debug {
     fn wait_gone(&self, socket: &Path, timeout: Duration) -> bool;
     fn ready(&self, socket: &Path, timeout: Duration) -> Result<guest::Status>;
     fn status(&self, socket: &Path) -> Result<guest::Status>;
+    /// [`Machine::status`], giving up after `timeout`.
+    fn status_within(&self, socket: &Path, timeout: Duration) -> Result<guest::Status>;
     fn launch(&self, socket: &Path, launch: &guest::Launch) -> Result<()>;
     fn processes(&self, socket: &Path) -> Result<guest::Processes>;
     fn freeze(&self, socket: &Path) -> Result<guest::Frozen>;
@@ -219,6 +221,10 @@ impl Machine for Real {
 
     fn status(&self, socket: &Path) -> Result<guest::Status> {
         guest::status(socket).map_err(env_err("vibe-guest's status"))
+    }
+
+    fn status_within(&self, socket: &Path, timeout: Duration) -> Result<guest::Status> {
+        guest::status_within(socket, timeout).map_err(env_err("vibe-guest's status"))
     }
 
     fn launch(&self, socket: &Path, launch: &guest::Launch) -> Result<()> {
@@ -766,7 +772,10 @@ impl Compartment for LinuxVm {
 
     fn services_relay(&self, h: &Handle) -> Result<Option<std::os::unix::net::UnixStream>> {
         let socket = self.socket(h);
-        if !self.machine.running(&socket) || !self.machine.status(&socket)?.services {
+        // Bounded like the dial, as every VM's relay waits behind this one's.
+        if !self.machine.running(&socket)
+            || !self.machine.status_within(&socket, DIAL_TIMEOUT)?.services
+        {
             return Ok(None);
         }
         self.machine

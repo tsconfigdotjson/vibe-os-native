@@ -269,7 +269,11 @@ impl Conn {
                 format!("{title} is turned off on the Mac (VibeOS → Settings → Services).")
             }
             Place::LinuxHost => {
-                format!("{title} is turned off on this host (VibeOS → Settings → Services).")
+                format!(
+                    "{title} is turned off on this host (`vibe service on {}` here, or VibeOS → \
+                     Settings → Services on the Mac).",
+                    self.def.name
+                )
             }
         }
     }
@@ -406,11 +410,7 @@ impl Services {
                 }
                 if unreadable.is_some() {
                     saved.enabled = false;
-                    saved.detail = Some(format!(
-                        "This host's settings for {} couldn't be read, so its read-only and denied \
-                         tools choices are lost. It's off until you turn it on.",
-                        def.title
-                    ));
+                    saved.detail = Some(settings_lost_text(&def, deps.place));
                     saved.detail_at = Some(now);
                 }
                 Arc::new(Conn {
@@ -425,7 +425,7 @@ impl Services {
                 })
             })
             .collect();
-        Arc::new_cyclic(|me| Services {
+        let services = Arc::new_cyclic(|me| Services {
             me: me.clone(),
             conns,
             http: Http::new(),
@@ -437,7 +437,20 @@ impl Services {
             pending: Mutex::default(),
             audit: Mutex::new(audit),
             audit_file,
-        })
+        });
+        // Off has to outlast this run. Until it's written the bad file stays
+        // where it is, so a restart finds it and comes up off again; nothing but
+        // this write takes its place.
+        if unreadable.is_some() {
+            set_aside(&services.state_file);
+            if let Err(e) = services.persist() {
+                (services.deps.audit)(&format!(
+                    "services: can't keep {}: {e}",
+                    services.state_file.display()
+                ));
+            }
+        }
+        services
     }
 
     /// Reads every login, so what's shown is right before anything's asked of
@@ -846,8 +859,7 @@ impl Services {
         self.write_secret(conn, secret.clone())
             .await
             .map_err(|e| failed(format!("Can't keep the login for {}: {e}", conn.def.title)))?;
-        *lock(&conn.secret) = Some(secret.clone());
-        conn.loaded.store(true, Ordering::Relaxed);
+        self.hold_login(conn, Some(secret.clone()));
         drop(refreshing);
         self.forget_sessions(&conn.def.name);
         *lock(&conn.catalog_read) = None;
@@ -878,8 +890,7 @@ impl Services {
             .await
             .map_err(|e| failed(e.to_string()))?
             .map_err(|e| failed(format!("Can't forget the login: {e}")))?;
-        let gone = lock(&conn.secret).take();
-        conn.loaded.store(true, Ordering::Relaxed);
+        let gone = self.hold_login(conn, None);
         drop(refreshing);
         self.forget_sessions(service);
         lock(&self.pending).remove(service);
@@ -915,6 +926,14 @@ impl Services {
             let before = saved.clone();
             if let Some(enabled) = p.enabled {
                 saved.enabled = enabled;
+                // That was the owner's answer to it.
+                if enabled
+                    && saved.detail.as_deref()
+                        == Some(settings_lost_text(&conn.def, conn.place).as_str())
+                {
+                    saved.detail = None;
+                    saved.detail_at = None;
+                }
             }
             if let Some(read_only) = p.read_only {
                 saved.read_only = read_only;
@@ -953,14 +972,25 @@ impl Services {
         }
         let store = self.store.clone();
         let name = conn.def.name.clone();
-        let secret = tokio::task::spawn_blocking(move || store.load(&name))
+        // Without the refresh lock, so a slow store can't hold up a sign-in. What
+        // comes back may be out of date by then: a login held since is newer
+        // than anything read from before it, whatever this read found.
+        let read = tokio::task::spawn_blocking(move || store.load(&name))
             .await
-            .map_err(io::Error::other)??;
-        *lock(&conn.secret) = secret.clone();
-        conn.loaded.store(true, Ordering::Relaxed);
+            .map_err(io::Error::other)?;
+        let secret = {
+            let mut held = lock(&conn.secret);
+            if conn.loaded.load(Ordering::Relaxed) {
+                return Ok(held.clone());
+            }
+            let secret = read?;
+            *held = secret.clone();
+            conn.loaded.store(true, Ordering::Relaxed);
+            secret
+        };
         // Whatever the state file says, the login's the truth of whether
-        // there is one.
-        self.update(conn, |saved| match &secret {
+        // there is one: as it is now, should a sign-in have come since.
+        self.update(conn, |saved| match &*lock(&conn.secret) {
             None => {
                 saved.state = ServiceState::Disconnected;
                 saved.auth = None;
@@ -973,6 +1003,15 @@ impl Services {
             }
         });
         Ok(secret)
+    }
+
+    /// Holds `secret` as the login now, the one before it being returned. With
+    /// `loaded` set under the same lock, so a read that began earlier can't land
+    /// on top of it.
+    fn hold_login(&self, conn: &Conn, secret: Option<Secret>) -> Option<Secret> {
+        let mut held = lock(&conn.secret);
+        conn.loaded.store(true, Ordering::Relaxed);
+        std::mem::replace(&mut *held, secret)
     }
 
     /// Writes a login to the store, durably, on a thread that may block.
@@ -1107,7 +1146,7 @@ impl Services {
             self.note(conn, ServiceState::Connected, Some(why.clone()));
             return Err(AuthFailure::Unavailable(why));
         }
-        *lock(&conn.secret) = Some(rotated);
+        self.hold_login(conn, Some(rotated));
         self.update(conn, |s| {
             s.state = ServiceState::Connected;
             s.detail = None;
@@ -1438,23 +1477,29 @@ impl Services {
                         let Ok(message) = serde_json::from_slice::<Value>(&line) else {
                             continue;
                         };
-                        if calls.len() >= MAX_IN_FLIGHT {
-                            if let Some(id) = message.get("id").filter(|_| message.get("method").is_some()) {
-                                let error = json!({"code": -32000, "message": format!(
-                                    "Too many calls under way on this connection (at most {MAX_IN_FLIGHT}); try again shortly"
-                                )});
-                                // Off this loop: it must go on reading, to notice the
-                                // shim going, however slowly that shim reads.
-                                let _ = out.try_send(
-                                    json!({"jsonrpc": "2.0", "id": id, "error": error})
-                                        .to_string()
-                                        .into_bytes(),
-                                );
-                            }
+                        // Room's kept past the limit for what isn't a new call: a
+                        // cancel or an answer may be what frees one, and a refusal
+                        // mustn't be lost. Beyond that the shim isn't reading what
+                        // it's sent, so there's no one to tell.
+                        if calls.len() >= MAX_IN_FLIGHT * 2 {
                             continue;
                         }
                         let (services, conn, agent, out) =
                             (services.clone(), conn.clone(), agent.clone(), out.clone());
+                        if calls.len() >= MAX_IN_FLIGHT
+                            && message.get("method").is_some()
+                            && let Some(id) = message.get("id").cloned()
+                        {
+                            let error = json!({"code": -32000, "message": format!(
+                                "Too many calls under way on this connection (at most {MAX_IN_FLIGHT}); try again shortly"
+                            )});
+                            // Off this loop: it must go on reading, to notice the
+                            // shim going, however slowly that shim reads.
+                            calls.spawn(async move {
+                                send(&out, json!({"jsonrpc": "2.0", "id": id, "error": error})).await;
+                            });
+                            continue;
+                        }
                         calls.spawn(async move {
                             services.handle(&conn, &agent, message, &out).await;
                         });
@@ -1653,12 +1698,34 @@ fn read_state(path: &std::path::Path) -> (HashMap<String, Saved>, Option<String>
     };
     match serde_json::from_slice(&bytes) {
         Ok(all) => (all, None),
-        Err(e) => {
-            // Kept to look at, as the next write replaces it. Nothing's secret.
-            let _ = fs::rename(path, path.with_extension("corrupt"));
-            (HashMap::new(), Some(e.to_string()))
-        }
+        Err(e) => (HashMap::new(), Some(e.to_string())),
     }
+}
+
+/// What a service says once its settings are lost. Turning it on clears this.
+fn settings_lost_text(def: &Service, place: Place) -> String {
+    let title = &def.title;
+    let how = match place {
+        Place::Mac => "in VibeOS → Settings → Services".to_owned(),
+        Place::LinuxHost => format!(
+            "with `vibe service on {}` here, or in VibeOS → Settings → Services on the Mac",
+            def.name
+        ),
+    };
+    format!(
+        "This host's settings for {title} couldn't be read, so its read-only and denied tools \
+         choices are lost. It's off until you turn it on {how}."
+    )
+}
+
+/// Keeps a state file that can't be used, to look at, as the next write replaces
+/// it. Beside it and not instead of it: if the file went and that write failed,
+/// the next start would find no file, which means nothing's been chosen. Nothing
+/// in it's secret.
+fn set_aside(path: &std::path::Path) {
+    let aside = path.with_extension("corrupt");
+    let _ = fs::remove_file(&aside);
+    let _ = fs::hard_link(path, &aside);
 }
 
 /// The last entries of the audit file.

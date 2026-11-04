@@ -51,6 +51,8 @@ pub(crate) struct State {
     /// How many more status calls report no network yet; `u32::MAX` for
     /// never.
     pub(crate) network_after: u32,
+    /// How long each bounded status call was given.
+    pub(crate) status_bounds: Vec<Duration>,
 }
 
 /// How a fake run goes, from what it was asked to run and the VM's
@@ -217,6 +219,11 @@ impl Machine for Fake {
     }
 
     fn ready(&self, socket: &Path, _: Duration) -> Result<guest::Status> {
+        self.status(socket)
+    }
+
+    fn status_within(&self, socket: &Path, timeout: Duration) -> Result<guest::Status> {
+        lock(&self.state).status_bounds.push(timeout);
         self.status(socket)
     }
 

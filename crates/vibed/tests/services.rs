@@ -10,6 +10,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -43,6 +44,8 @@ struct Seen {
     relays: Arc<Mutex<usize>>,
     /// Its guest says it's too old for shared services.
     old_guest: bool,
+    /// Asking its guest fails.
+    check_fails: Arc<AtomicBool>,
 }
 
 impl vibe_env::Compartment for Seen {
@@ -79,6 +82,9 @@ impl vibe_env::Compartment for Seen {
             .map(|_| vibe_relay::local::GUEST_PROGRAM.to_owned())
     }
     fn services_unsupported(&self, _: &vibe_env::Handle) -> vibe_env::Result<Option<String>> {
+        if self.check_fails.load(Ordering::SeqCst) {
+            return Err(vibe_env::EnvError::new("its guest didn't answer"));
+        }
         Ok(self.old_guest.then(|| "its guest is too old".to_owned()))
     }
     fn services_relay(&self, _: &vibe_env::Handle) -> vibe_env::Result<Option<UnixStream>> {
@@ -125,6 +131,7 @@ struct Node {
     fake: FakeService,
     launches: Arc<Mutex<Vec<vibe_env::Launch>>>,
     relays: Arc<Mutex<usize>>,
+    check_fails: Arc<AtomicBool>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
     layout: Layout,
 }
@@ -159,12 +166,14 @@ async fn node_with(
     let mut config = golden.config();
     let launches: Arc<Mutex<Vec<vibe_env::Launch>>> = Arc::default();
     let relays: Arc<Mutex<usize>> = Arc::default();
+    let check_fails: Arc<AtomicBool> = Arc::default();
     config.backends = Backends::all(Arc::new(Seen {
         backend: TestBackend::new(&golden.claude),
         launches: launches.clone(),
         vm,
         relays: relays.clone(),
         old_guest,
+        check_fails: check_fails.clone(),
     }));
     config.services = Some(ServicesConfig {
         services: vec![fake.service()],
@@ -197,6 +206,7 @@ async fn node_with(
         fake: fake.clone(),
         launches,
         relays,
+        check_fails,
         tasks,
         layout,
     }
@@ -404,6 +414,74 @@ async fn switching_a_profile_off_takes_them_from_its_agents_next_launch() {
     let launches = n.launches.lock().unwrap().clone();
     assert!(launches.len() > before);
     assert!(offered(launches.last().unwrap()).is_some());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_renamed_profile_goes_on_deciding_for_its_agents() {
+    let fake = FakeService::start().await;
+    let n = node(
+        &fake,
+        Place::Mac,
+        Arc::new(MemoryStore::default()),
+        None,
+        |_| {},
+    )
+    .await;
+    let a = n
+        .core
+        .start_agent(start("on", "software-eng-linux"))
+        .await
+        .unwrap();
+    assert!(offered(n.launches.lock().unwrap().last().unwrap()).is_some());
+
+    // Renamed and switched off at once: what the agent started with mustn't
+    // decide for it, as it would if its profile only looked deleted.
+    n.core
+        .update_profile(ProfileUpdateParams {
+            project: "app".into(),
+            profile: "software-eng-linux".into(),
+            name: Some("renamed".into()),
+            shared_services: Some(false),
+            ..Default::default()
+        })
+        .unwrap();
+    end_session(&n, &a.agent);
+    n.core.resume_agent(None, &a.agent).await.unwrap();
+    assert_eq!(offered(n.launches.lock().unwrap().last().unwrap()), None);
+
+    // And it goes by the new name from here on.
+    n.core
+        .update_profile(ProfileUpdateParams {
+            project: "app".into(),
+            profile: "renamed".into(),
+            shared_services: Some(true),
+            ..Default::default()
+        })
+        .unwrap();
+    end_session(&n, &a.agent);
+    n.core.resume_agent(None, &a.agent).await.unwrap();
+    assert!(offered(n.launches.lock().unwrap().last().unwrap()).is_some());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failing_to_ask_the_guest_costs_the_services_and_not_the_launch() {
+    let fake = FakeService::start().await;
+    let n = node(
+        &fake,
+        Place::Mac,
+        Arc::new(MemoryStore::default()),
+        None,
+        |_| {},
+    )
+    .await;
+    n.check_fails.store(true, Ordering::SeqCst);
+    n.core
+        .start_agent(start("unsure", "software-eng-linux"))
+        .await
+        .expect("they're optional, so the agent still starts");
+    let launch = n.launches.lock().unwrap().last().unwrap().clone();
+    assert_eq!(offered(&launch), None, "{:?}", launch.args);
+    assert_eq!(env_of(&launch, "VIBE_SERVICES_SOCKET"), None);
 }
 
 #[tokio::test(flavor = "multi_thread")]

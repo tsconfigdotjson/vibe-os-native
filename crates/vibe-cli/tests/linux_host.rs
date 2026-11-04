@@ -950,6 +950,22 @@ fn a_linux_hosts_shared_services_are_its_own_and_outlast_the_mac() {
     assert_eq!(shim.call("list_issues"), "issues on /mcp");
     assert_eq!(fake.calls().pop().unwrap().bearer.as_deref(), Some(API_KEY));
 
+    // Turned off, and back on, with no Mac to do it from: the agent's told how,
+    // and goes on with no restart.
+    let off = ok(on_host(&host)
+        .args(["service", "off", "linear"])
+        .output()
+        .unwrap());
+    assert!(off.contains("turned off"), "{off}");
+    let told = shim.call("list_issues");
+    assert!(told.contains("`vibe service on linear`"), "{told}");
+    let on = ok(on_host(&host)
+        .args(["service", "on", "linear"])
+        .output()
+        .unwrap());
+    assert!(!on.contains("turned off"), "{on}");
+    assert_eq!(shim.call("list_issues"), "issues on /mcp");
+
     // A key on a command line is refused, without repeating it.
     let refused = on_host(&host)
         .args(["service", "set-key", "linear", "secret-on-argv"])

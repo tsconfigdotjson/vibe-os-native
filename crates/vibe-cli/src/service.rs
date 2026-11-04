@@ -9,8 +9,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use vibe_core::rpc::{
-    HostParams, ServiceInfo, ServiceKeyParams, ServiceParams, ServicesAudit, ServicesConnectKey,
-    ServicesDisconnect, ServicesList,
+    HostParams, ServiceInfo, ServiceKeyParams, ServiceParams, ServiceSetParams, ServicesAudit,
+    ServicesConnectKey, ServicesDisconnect, ServicesList, ServicesSet,
 };
 
 use crate::attach::is_tty;
@@ -27,6 +27,7 @@ pub(crate) enum Command {
     Audit,
     SetKey(String),
     Disconnect(String),
+    Turn { service: String, on: bool },
 }
 
 impl Command {
@@ -38,7 +39,11 @@ impl Command {
             [w] if w == "audit" => Ok(Command::Audit),
             [w, name] if w == "set-key" => Ok(Command::SetKey(name.clone())),
             [w, name] if w == "disconnect" => Ok(Command::Disconnect(name.clone())),
-            [w] if w == "set-key" || w == "disconnect" => {
+            [w, name] if w == "on" || w == "off" => Ok(Command::Turn {
+                service: name.clone(),
+                on: w == "on",
+            }),
+            [w] if w == "set-key" || w == "disconnect" || w == "on" || w == "off" => {
                 Err(format!("service {w} needs a service, such as linear"))
             }
             [w, _, ..] if w == "set-key" => Err(
@@ -46,7 +51,11 @@ impl Command {
                  stdin, so it stays off command lines"
                     .into(),
             ),
-            _ => Err("service takes list, audit, set-key SERVICE or disconnect SERVICE".into()),
+            _ => Err(
+                "service takes list, audit, on SERVICE, off SERVICE, set-key SERVICE or \
+                 disconnect SERVICE"
+                    .into(),
+            ),
         }
     }
 }
@@ -130,6 +139,16 @@ pub(crate) fn run(socket: &Path, command: Command) -> Result<(), String> {
                 .map_err(|e| e.to_string())?;
             println!("{}", describe(&info));
         }
+        Command::Turn { service, on } => {
+            let params = ServiceSetParams {
+                service,
+                enabled: Some(on),
+                ..Default::default()
+            };
+            let info =
+                client::call::<ServicesSet>(socket, &params, TIMEOUT).map_err(|e| e.to_string())?;
+            println!("{}", describe(&info));
+        }
     }
     Ok(())
 }
@@ -156,6 +175,21 @@ mod tests {
             parse(&["disconnect", "linear"]),
             Ok(Command::Disconnect("linear".into()))
         );
+        assert_eq!(
+            parse(&["on", "linear"]),
+            Ok(Command::Turn {
+                service: "linear".into(),
+                on: true
+            })
+        );
+        assert_eq!(
+            parse(&["off", "linear"]),
+            Ok(Command::Turn {
+                service: "linear".into(),
+                on: false
+            })
+        );
+        assert!(parse(&["on"]).is_err());
         assert!(parse(&["set-key"]).is_err());
         assert!(parse(&["nonsense"]).is_err());
     }

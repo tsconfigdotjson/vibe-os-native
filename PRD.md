@@ -609,6 +609,7 @@ Never put to sleep: `thinking`, `running_tool` or `background_work`.
 | The Mac is offline while a host is the external address | The host keeps answering for its own agents; Mac agents show as unavailable until the tunnel is back |
 | The Mac is off or away while a Linux host's agents use shared services | Nothing changes for them: they use that host's own broker and login, and it refreshes by itself. Only signing in through the app waits for the Mac; `vibe service set-key` on the host doesn't |
 | A VM's template is on a base image older than shared services | Its agents run as ever, with no `vibe-*` servers offered. `vibe doctor` and Settings say to Rebuild Template |
+| A host's `services.json` can't be read | Its read-only and denied-tools choices are lost, so every service on that host comes up off, says why, and stays off across restarts until the owner turns it on: in Settings, or with `vibe service on` on the host. The bad file is kept beside it as `services.corrupt` |
 | A shared service's login is lost (a refresh refused, or access revoked at the service) | That host's agents get a tool error saying how to mend it, and tools still list. It works again after Reconnect, with no agent restarted. Other hosts' logins aren't touched |
 | `vibed` isn't answering, or a VM's relay is down, as an agent uses a shared service | Tools still list, and calls get a clear tool error. The next call after it's back just works |
 
@@ -617,7 +618,7 @@ Never put to sleep: `thinking`, `running_tool` or `background_work`.
 - SQLite at `~/Library/Application Support/VibeOS/vibe.db`: hosts, projects, profiles, agents (ref, profile and the settings it was started with, shim socket, Claude session id, worktree, last state, the compartment's handle; one agent has one worktree, so it's a column), API key hashes. The state directory is private (`0700`), and a lock in it allows one `vibed` at a time
 - snapshots in `~/VibeOS/snapshots/`; each `linux` agent's `vm.json`, console log and `vibe-vm.log` in its directory under `~/VibeOS/agents/`
 - logs in `~/Library/Logs/VibeOS/vibed.log`, with anything shaped like an API key redacted; each agent's changes of state, and of activity with its certainty, are logged there, and an audit line for each call to a shared service
-- shared MCP services: each host's login in its Keychain on a Mac, and in `services/<service>.login` (`0600`) in the state directory on a Linux host; their settings, states and last-seen tools, nothing secret, in `services.json` beside it
+- shared MCP services: each host's login in its Keychain on a Mac, and in `services/<service>.login` (`0600`) in the state directory on a Linux host; their settings, states and last-seen tools, nothing secret, in `services.json` beside it, and the last calls to them, with no arguments or tokens, in `services-audit.log` beside that
 - sockets in `…/VibeOS/run/`
 - host limits in `~/.config/vibeos/host.toml`
 - on a Linux host: the same layout under `~/.local/share/vibeos/` (logs in its `logs/`), with projects and worktrees in `~/VibeOS/` and host limits in `~/.config/vibeos/host.toml`

@@ -941,6 +941,21 @@ async fn a_linux_host_says_where_its_own_login_gets_mended() {
         "Linear needs reconnecting on this host (VibeOS → Settings → Services → Reconnect on the \
          Mac, or `vibe service set-key linear` here)."
     );
+    fake.reject_all_tokens(false);
+    services
+        .set(ServiceSetParams {
+            service: "linear".into(),
+            enabled: Some(false),
+            ..ServiceSetParams::default()
+        })
+        .unwrap();
+    let off = a.call("list_issues").await;
+    assert!(is_error(&off));
+    assert_eq!(
+        text(&off),
+        "Linear is turned off on this host (`vibe service on linear` here, or VibeOS → Settings \
+         → Services on the Mac)."
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1416,4 +1431,244 @@ async fn running_unasked_is_a_choice_per_service() {
     assert!(info.auto_allow);
     assert_eq!(w.services.auto_allowed(), ["linear"]);
     assert_eq!(w.restarted().auto_allowed(), ["linear"]);
+}
+
+/// A store whose next read takes its time, as `security` can at a daemon's
+/// start: what it returns is what was there when it began.
+#[derive(Debug)]
+struct SlowFirstRead {
+    inner: MemoryStore,
+    slow: AtomicBool,
+}
+
+impl SlowFirstRead {
+    fn new() -> Arc<SlowFirstRead> {
+        Arc::new(SlowFirstRead {
+            inner: MemoryStore::default(),
+            slow: AtomicBool::new(false),
+        })
+    }
+}
+
+impl SecretStore for SlowFirstRead {
+    fn load(&self, service: &str) -> io::Result<Option<Secret>> {
+        let read = self.inner.load(service);
+        if self.slow.swap(false, Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(800));
+        }
+        read
+    }
+    fn store(&self, service: &str, secret: &Secret) -> io::Result<()> {
+        self.inner.store(service, secret)
+    }
+    fn delete(&self, service: &str) -> io::Result<()> {
+        self.inner.delete(service)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slow_first_read_cant_bring_back_a_login_rotated_since() {
+    let store = SlowFirstRead::new();
+    let w = World::start(store.clone()).await;
+    w.sign_in().await;
+    // With no grace, using the old refresh token again would lose the login.
+    w.fake.set_replay_grace(false);
+    let again = w.restarted();
+    store.slow.store(true, Ordering::SeqCst);
+    let loading = {
+        let again = again.clone();
+        tokio::spawn(async move { again.load_logins().await })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // While that read is out, a call reads for itself and rotates the login.
+    w.fake.expire_access();
+    let mut a = Shim::open(&again, "a");
+    let first = a.call("list_issues").await;
+    assert!(!is_error(&first), "{first}");
+    let rotated = w.secret();
+    assert_eq!(w.fake.refreshes(), 1);
+
+    // The old read lands, and is thrown away.
+    loading.await.unwrap();
+    let second = a.call("list_issues").await;
+    assert!(!is_error(&second), "{second}");
+    assert_eq!(
+        w.fake.calls().pop().unwrap().bearer.as_deref(),
+        Some(rotated.access.as_str())
+    );
+    let info = again.list().services.remove(0);
+    assert_eq!(info.state, ServiceState::Connected, "{info:?}");
+    assert_eq!(w.secret().access, rotated.access);
+    assert_eq!(w.fake.refreshes(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slow_first_read_cant_undo_a_login_made_since() {
+    let store = SlowFirstRead::new();
+    let w = World::start(store.clone()).await;
+    let again = w.restarted();
+    store.slow.store(true, Ordering::SeqCst);
+    let loading = {
+        let again = again.clone();
+        tokio::spawn(async move { again.load_logins().await })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // The read found no login, and the owner makes one before it comes back.
+    let info = again.connect_key("linear", API_KEY).await.unwrap();
+    assert_eq!(info.state, ServiceState::Connected);
+    loading.await.unwrap();
+
+    let info = again.list().services.remove(0);
+    assert_eq!(info.state, ServiceState::Connected, "{info:?}");
+    assert_eq!(info.auth, Some(ServiceAuth::ApiKey));
+    let mut a = Shim::open(&again, "a");
+    let answer = a.call("list_issues").await;
+    assert!(!is_error(&answer), "{answer}");
+    assert_eq!(
+        w.fake.calls().pop().unwrap().bearer.as_deref(),
+        Some(API_KEY)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_corrupt_state_file_stays_off_across_restarts_until_its_turned_on() {
+    let w = World::new().await;
+    w.services
+        .set(ServiceSetParams {
+            service: "linear".into(),
+            denied_tools: Some(vec!["create_issue".into()]),
+            ..ServiceSetParams::default()
+        })
+        .unwrap();
+    std::fs::write(&w.state_file, "{ half a file").unwrap();
+
+    // Off is written down by the first restart, so the next finds it too.
+    let first = w.restarted().list().services.remove(0);
+    assert!(!first.enabled, "{first:?}");
+    assert!(w.state_file.exists(), "off has to outlast this run");
+    serde_json::from_slice::<Value>(&std::fs::read(&w.state_file).unwrap()).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(w.state_file.with_extension("corrupt")).unwrap(),
+        "{ half a file",
+        "the bad file is kept to look at"
+    );
+    let second = w.restarted();
+    let info = second.list().services.remove(0);
+    assert!(!info.enabled, "{info:?}");
+    assert_eq!(info.detail, first.detail, "it still says why");
+    assert!(
+        info.detail
+            .as_deref()
+            .unwrap()
+            .contains("VibeOS → Settings")
+    );
+
+    // Turning it on is the answer to that, and it lasts.
+    let on = second
+        .set(ServiceSetParams {
+            service: "linear".into(),
+            enabled: Some(true),
+            ..ServiceSetParams::default()
+        })
+        .unwrap();
+    assert!(on.enabled);
+    assert_eq!((on.detail, on.detail_at), (None, None));
+    let info = w.restarted().list().services.remove(0);
+    assert!(info.enabled, "{info:?}");
+    assert_eq!(info.detail, None);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn off_that_cant_be_written_leaves_the_corrupt_file_to_find_again() {
+    let w = World::new().await;
+    std::fs::write(&w.state_file, "{ half a file").unwrap();
+    // Where its next version would be written: a directory, so that fails.
+    let blocked = w.state_file.with_extension("new");
+    std::fs::create_dir(&blocked).unwrap();
+
+    assert!(!w.restarted().list().services.remove(0).enabled);
+    assert_eq!(
+        std::fs::read_to_string(&w.state_file).unwrap(),
+        "{ half a file",
+        "with no file a restart would take it that nothing was ever chosen"
+    );
+    assert!(
+        w.audit
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.contains("can't keep"))
+    );
+    assert!(!w.restarted().list().services.remove(0).enabled);
+
+    // Once it can be written, it is.
+    std::fs::remove_dir(&blocked).unwrap();
+    assert!(!w.restarted().list().services.remove(0).enabled);
+    serde_json::from_slice::<Value>(&std::fs::read(&w.state_file).unwrap()).unwrap();
+    assert!(!w.restarted().list().services.remove(0).enabled);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn at_the_limit_a_cancel_and_an_answer_still_get_through_and_no_refusal_is_lost() {
+    let w = World::new().await;
+    w.sign_in().await;
+    let mut first = w.agent("first");
+    first.tools().await;
+    w.fake.hold_streams();
+
+    // Room for one message at a time, and nobody reading it yet.
+    let (out, mut rx) = mpsc::channel(1);
+    let tx = w.services.open("linear", "a".to_owned(), out).unwrap();
+    let say = |m: Value| {
+        let tx = tx.clone();
+        async move { tx.send(m.to_string().into_bytes()).await.unwrap() }
+    };
+    for id in 0..32 {
+        say(json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": {"name": "stream_issues"}}))
+        .await;
+    }
+    for id in 1000..1003 {
+        say(json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": {"name": "stream_issues"}}))
+        .await;
+    }
+    let seen = w.fake.seen().len();
+    say(
+        json!({"jsonrpc": "2.0", "method": "notifications/cancelled",
+        "params": {"requestId": 0}}),
+    )
+    .await;
+    say(json!({"jsonrpc": "2.0", "id": "from-the-service", "result": {}})).await;
+
+    // Both reach the service, though every call's still held.
+    for _ in 0..1000 {
+        if w.fake.seen().len() >= seen + 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        w.fake.seen().len() >= seen + 2,
+        "{:?}",
+        &w.fake.seen()[seen..]
+    );
+
+    // Every one over the limit is told, however slowly this end reads.
+    let mut refused = Vec::new();
+    while refused.len() < 3 {
+        let bytes = tokio::time::timeout(Duration::from_secs(20), rx.recv())
+            .await
+            .expect("every refusal in time")
+            .expect("the stream is open");
+        let answer: Value = serde_json::from_slice(&bytes).unwrap();
+        if answer["error"]["code"] == -32000 {
+            refused.push(answer["id"].as_i64().unwrap());
+        }
+    }
+    refused.sort_unstable();
+    assert_eq!(refused, vec![1000, 1001, 1002]);
+    w.fake.release();
 }

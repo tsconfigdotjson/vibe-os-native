@@ -63,6 +63,8 @@ commands:
   service set-key SERVICE
               connect this host with a personal API key, read from the terminal
               or stdin; how a host mends itself with the Mac away
+  service on SERVICE, service off SERVICE
+              turn a shared service on or off on this host, with no Mac needed
   service disconnect SERVICE
               forget this host's login to a service
   service audit

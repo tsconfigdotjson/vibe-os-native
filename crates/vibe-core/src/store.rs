@@ -693,6 +693,11 @@ impl Store {
                 profile.shared_services,
             ],
         )?;
+        // Its agents are still its agents, and go by its settings at each launch.
+        tx.execute(
+            "UPDATE agents SET profile = ?3 WHERE project_id = ?1 AND profile = ?2",
+            params![id, name, profile.name],
+        )?;
         tx.commit()?;
         Ok(profile.clone())
     }
@@ -1458,6 +1463,25 @@ mod tests {
             s.add_project(&p, &[], 1),
             Err(StoreError::Sqlite(_))
         ));
+    }
+
+    #[test]
+    fn a_renamed_profile_keeps_its_agents() {
+        let mut s = store();
+        s.add_project(&new_project("web", "/p/web"), &starter_profiles("macos"), 1)
+            .unwrap();
+        s.add_project(&new_project("api", "/p/api"), &starter_profiles("macos"), 1)
+            .unwrap();
+        let (mine, other) = (agent("web", "mine"), agent("api", "other"));
+        s.add_agent(&mine).unwrap();
+        s.add_agent(&other).unwrap();
+
+        let mut p = s.profile(LOCAL_HOST, "web", &mine.profile).unwrap();
+        let was = std::mem::replace(&mut p.name, "renamed".into());
+        s.replace_profile(LOCAL_HOST, "web", &was, &p).unwrap();
+
+        assert_eq!(s.agent(LOCAL_HOST, "mine").unwrap().profile, "renamed");
+        assert_eq!(s.agent(LOCAL_HOST, "other").unwrap().profile, was);
     }
 
     #[test]

@@ -4,6 +4,8 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use vibe_relay::frame::{Frame, PROTOCOL, read_frame, write_frame};
@@ -326,4 +328,91 @@ fn a_stuck_relay_doesnt_stop_the_hub_answering() {
         "{:?}",
         started.elapsed()
     );
+}
+
+/// A connection to the Mac whose writes start failing when it's told to, part
+/// way through a frame as a send timeout would.
+struct Breaks {
+    to: UnixStream,
+    broken: Arc<AtomicBool>,
+}
+
+impl Write for Breaks {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.broken.load(Ordering::SeqCst) {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        self.to.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.to.flush()
+    }
+}
+
+/// The Mac's end of a relay whose hub writes through [`Breaks`].
+fn dial_breaking(hub: &Hub) -> (UnixStream, Arc<AtomicBool>) {
+    let (mut here, there) = UnixStream::pair().unwrap();
+    here.set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    let broken = Arc::new(AtomicBool::new(false));
+    let (hub, closer, to) = (
+        hub.clone(),
+        there.try_clone().unwrap(),
+        there.try_clone().unwrap(),
+    );
+    let writer = Breaks {
+        to,
+        broken: broken.clone(),
+    };
+    std::thread::spawn(move || {
+        let _ = hub.carry(there, writer, move || {
+            let _ = closer.shutdown(std::net::Shutdown::Both);
+        });
+    });
+    write_frame(&mut here, &Frame::Hello { protocol: PROTOCOL }).unwrap();
+    read_frame(&mut here).unwrap().unwrap();
+    std::thread::sleep(Duration::from_millis(30));
+    (here, broken)
+}
+
+/// The relay's gone, for the Mac, the hub and whoever was on it.
+fn relay_ended(hub: &Hub, mac: &mut UnixStream) {
+    while let Ok(Some(_)) = read_frame(mac) {}
+    for _ in 0..500 {
+        if !hub.connected() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("the relay is still up");
+}
+
+#[test]
+fn a_failed_write_from_a_shim_ends_the_relay_rather_than_leave_part_of_a_frame() {
+    let (hub, socket, _dir) = hub(anyone(), Timing::default());
+    let (mut mac, broken) = dial_breaking(&hub);
+    let (mut conn, mut reader, answer) = shim(&socket, None);
+    assert_eq!(answer, Ok(()));
+    next_not_ping(&mut mac);
+
+    broken.store(true, Ordering::SeqCst);
+    writeln!(conn, "this one fails").unwrap();
+    relay_ended(&hub, &mut mac);
+    let mut rest = String::new();
+    assert_eq!(reader.read_line(&mut rest).unwrap(), 0, "the shim's told");
+}
+
+#[test]
+fn a_failed_ping_ends_the_relay_rather_than_leave_part_of_a_frame() {
+    let (hub, _socket, _dir) = hub(
+        anyone(),
+        Timing {
+            ping_every: Duration::from_millis(30),
+            // Long enough that only the write failing can be what ends it.
+            dead_after: Duration::from_secs(300),
+        },
+    );
+    let (mut mac, broken) = dial_breaking(&hub);
+    broken.store(true, Ordering::SeqCst);
+    relay_ended(&hub, &mut mac);
 }
