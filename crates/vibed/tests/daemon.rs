@@ -222,7 +222,9 @@ fn a_second_daemon_on_the_same_state_is_refused() {
 /// its lock stays, as `vibed.sock`'s does.
 #[test]
 fn the_services_socket_lasts_as_long_as_vibed() {
-    let tmp = tempfile::tempdir().unwrap();
+    // Under /tmp: this socket is in $HOME, and $TMPDIR plus the macOS state
+    // directory would pass the 104-byte limit on Unix socket paths.
+    let tmp = common::short_tempdir();
     let socket = socket_in(&tmp);
     let d = spawn(&mut vibed(&tmp, &socket), &socket);
     let run = Layout::new(tmp.path().join("home"), std::env::consts::OS).run_dir();
