@@ -168,8 +168,9 @@
 #     sleeps, and carries on its conversation after the wake, with Claude
 #     Code's managed layer downloaded from downloads.claude.ai
 #     (crates/vibed/tests/linux_vm.rs). It needs the Claude token: from
-#     CLAUDE_CODE_OAUTH_TOKEN, or what `vibe setup-token` kept in the
-#     Keychain. Then the toolbox: gcloud and a login made in it reach a new
+#     CLAUDE_CODE_OAUTH_TOKEN, or with VIBE_CHECK_KEYCHAIN_TOKEN=1, what
+#     `vibe setup-token` kept in the Keychain. Nothing else in a check reaches
+#     the Keychain. Then the toolbox: gcloud and a login made in it reach a new
 #     agent, See logins names the logins its save found in the real guest
 #     (gh, git, an SSH key), an agent asleep on the old template restores,
 #     and [update] and
@@ -204,6 +205,9 @@ ROOT=$(pwd)
 OS=$(uname -s)
 export PATH="$HOME/.cargo/bin:$PATH"
 export CARGO_TERM_COLOR=never
+# Whatever this shell allows, what's checked stays out of the login Keychain
+# (vibe_core::keychain), including the debug binaries run here without cargo.
+export VIBE_LOGIN_KEYCHAIN=never
 
 TEST_ARGS=()
 if [ "$OS" = Linux ]; then
@@ -1033,8 +1037,13 @@ s_linux_vm() {
     return $NOT_APPLICABLE
   fi
   if [ -z "$token" ]; then
+    # The only time a check reads the login Keychain, and only when asked to.
+    if [ "${VIBE_CHECK_KEYCHAIN_TOKEN:-}" != 1 ]; then
+      echo "no Claude token: set CLAUDE_CODE_OAUTH_TOKEN, or VIBE_CHECK_KEYCHAIN_TOKEN=1 to read what \`vibe setup-token\` kept"
+      return 1
+    fi
     token=$(security find-generic-password -s VibeOS -a claude-setup-token -w 2>/dev/null) || {
-      echo "no Claude token: run \`target/debug/vibe setup-token\` or set CLAUDE_CODE_OAUTH_TOKEN"
+      echo "no Claude token: run \`VIBE_LOGIN_KEYCHAIN=allow target/debug/vibe setup-token\` or set CLAUDE_CODE_OAUTH_TOKEN"
       return 1
     }
   fi

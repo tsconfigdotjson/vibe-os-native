@@ -15,6 +15,8 @@ use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+use crate::keychain::Target;
+
 /// What Claude Code reads its token from.
 pub const TOKEN_ENV: &str = "CLAUDE_CODE_OAUTH_TOKEN";
 
@@ -26,8 +28,6 @@ pub const TEST_FILE_ENV: &str = "VIBE_TEST_TOKEN_FILE";
 pub const SERVICE: &str = "VibeOS";
 pub const ACCOUNT: &str = "claude-setup-token";
 
-const SECURITY: &str = "/usr/bin/security";
-
 /// What `security` exits with when there's no such item.
 const NOT_FOUND: i32 = 44;
 
@@ -37,8 +37,13 @@ pub const PREFIX: &str = "sk-ant-oat";
 /// Where the token is kept.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TokenStore {
-    /// The login Keychain, under this service and account.
-    Keychain { service: String, account: String },
+    /// The Keychain, under this service and account: the login Keychain, unless
+    /// a test keeps it in a file of its own.
+    Keychain {
+        service: String,
+        account: String,
+        keychain: Target,
+    },
     /// A private file. Only for tests, through [`TEST_FILE_ENV`].
     File(PathBuf),
 }
@@ -57,6 +62,7 @@ impl TokenStore {
             None => TokenStore::Keychain {
                 service: SERVICE.into(),
                 account: ACCOUNT.into(),
+                keychain: Target::Login,
             },
         }
     }
@@ -69,9 +75,14 @@ impl TokenStore {
                 Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
                 Err(e) => return Err(e),
             },
-            TokenStore::Keychain { service, account } => {
-                let out = security()?
+            TokenStore::Keychain {
+                service,
+                account,
+                keychain,
+            } => {
+                let out = security(keychain)?
                     .args(["find-generic-password", "-s", service, "-a", account, "-w"])
+                    .args(keychain.arg())
                     .stdin(Stdio::null())
                     .output()?;
                 if out.status.code() == Some(NOT_FOUND) {
@@ -107,7 +118,11 @@ impl TokenStore {
                 f.write_all(b"\n")?;
                 f.sync_all()?;
             }
-            TokenStore::Keychain { service, account } => {
+            TokenStore::Keychain {
+                service,
+                account,
+                keychain,
+            } => {
                 for name in [service, account] {
                     if !name
                         .bytes()
@@ -121,10 +136,15 @@ impl TokenStore {
                 }
                 // `-U` replaces the item if there is one. The token's
                 // characters need no quoting (see `validate`).
-                let line = format!(
-                    "add-generic-password -U -s {service} -a {account} -l {service}-{account} -w {token}\n"
+                let mut line = format!(
+                    "add-generic-password -U -s {service} -a {account} -l {service}-{account} -w {token}"
                 );
-                let mut child = security()?
+                if let Some(file) = keychain.arg() {
+                    line.push(' ');
+                    line.push_str(file);
+                }
+                line.push('\n');
+                let mut child = security(keychain)?
                     .arg("-i")
                     .stdin(Stdio::piped())
                     .stdout(Stdio::null())
@@ -161,9 +181,14 @@ impl TokenStore {
                 Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
                 Err(e) => Err(e),
             },
-            TokenStore::Keychain { service, account } => {
-                let out = security()?
+            TokenStore::Keychain {
+                service,
+                account,
+                keychain,
+            } => {
+                let out = security(keychain)?
                     .args(["delete-generic-password", "-s", service, "-a", account])
+                    .args(keychain.arg())
                     .stdin(Stdio::null())
                     .output()?;
                 match out.status.code() {
@@ -179,14 +204,14 @@ impl TokenStore {
     }
 }
 
-fn security() -> io::Result<Command> {
+fn security(keychain: &Target) -> io::Result<Command> {
     if !cfg!(target_os = "macos") {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "the Claude token for linux agents is kept in the Keychain, which only a Mac has",
         ));
     }
-    Ok(Command::new(SECURITY))
+    keychain.command()
 }
 
 fn bad(why: impl std::fmt::Display) -> io::Error {
@@ -363,15 +388,17 @@ mod tests {
         assert!(!store.remove().unwrap());
     }
 
-    /// The real Keychain, under an item of the test's own.
+    /// The real `security`, on a keychain of the test's own.
     #[cfg(target_os = "macos")]
     #[test]
     fn the_keychain_keeps_the_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let temp = crate::keychain::TempKeychain::create(dir.path()).unwrap();
         let store = TokenStore::Keychain {
-            service: "VibeOS-test".into(),
-            account: format!("claude-{}", std::process::id()),
+            service: SERVICE.into(),
+            account: ACCOUNT.into(),
+            keychain: temp.target(),
         };
-        let _ = store.remove();
         assert_eq!(store.load().unwrap(), None);
         store.store(TOKEN).unwrap();
         assert_eq!(store.load().unwrap().as_deref(), Some(TOKEN));
@@ -382,12 +409,32 @@ mod tests {
         assert_eq!(store.load().unwrap(), None);
     }
 
+    /// Reading, keeping and forgetting alike, and on the Mac before `security`
+    /// is started: this is what `vibe setup-token` and the `linux` backend use.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_test_cant_reach_the_login_keychains_token() {
+        let store = TokenStore::Keychain {
+            service: SERVICE.into(),
+            account: ACCOUNT.into(),
+            keychain: Target::Login,
+        };
+        for e in [
+            store.load().unwrap_err(),
+            store.store(TOKEN).unwrap_err(),
+            store.remove().unwrap_err(),
+        ] {
+            assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{e}");
+        }
+    }
+
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn only_a_mac_has_the_keychain() {
         let store = TokenStore::Keychain {
             service: SERVICE.into(),
             account: ACCOUNT.into(),
+            keychain: Target::Login,
         };
         let e = store.load().unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::Unsupported);

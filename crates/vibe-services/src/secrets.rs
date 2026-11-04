@@ -10,11 +10,12 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use vibe_core::keychain::{SECURITY, Target};
 
 use crate::util::{base64_decode, base64_standard};
 
@@ -75,7 +76,6 @@ fn decode(text: &str) -> io::Result<Secret> {
 
 /// The Keychain item's service, as for the Claude token.
 const KEYCHAIN_SERVICE: &str = "VibeOS";
-const SECURITY: &str = "/usr/bin/security";
 /// What `security` exits with when there's no such item.
 const NOT_FOUND: i32 = 44;
 /// `security -i` reads lines of at most 4 KB. The tokens seen in practice are
@@ -84,8 +84,7 @@ const MAX_LINE: usize = 4000;
 /// How long a call to `security` may take.
 const SECURITY_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The login Keychain, through `/usr/bin/security`, for writing and reading
-/// alike, so the item's access list lets `vibed` read it without a prompt. A
+/// The login Keychain, through `security`, for writing and reading alike, so the item's access list lets `vibed` read it without a prompt. A
 /// login never goes on a command line: `security -i` reads the command that
 /// stores it from a pipe. Every call has a time limit, as a locked Keychain can
 /// leave one waiting on someone who isn't there.
@@ -93,6 +92,7 @@ const SECURITY_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct Keychain {
     program: PathBuf,
     timeout: Duration,
+    keychain: Target,
 }
 
 impl Default for Keychain {
@@ -100,6 +100,7 @@ impl Default for Keychain {
         Keychain {
             program: PathBuf::from(SECURITY),
             timeout: SECURITY_TIMEOUT,
+            keychain: Target::Login,
         }
     }
 }
@@ -114,7 +115,19 @@ struct Ran {
 impl Keychain {
     /// Another `security`, with another limit: for tests.
     pub fn with_program(program: PathBuf, timeout: Duration) -> Keychain {
-        Keychain { program, timeout }
+        Keychain {
+            program,
+            timeout,
+            keychain: Target::Login,
+        }
+    }
+
+    /// The real `security`, on a keychain file of a test's own.
+    pub fn in_file(keychain: Target) -> Keychain {
+        Keychain {
+            keychain,
+            ..Keychain::default()
+        }
     }
 
     fn account(service: &str) -> io::Result<String> {
@@ -131,10 +144,14 @@ impl Keychain {
         Ok(format!("service-{service}"))
     }
 
-    /// Runs `security` with `args`, giving it `input`, for at most the limit.
+    /// Runs `security` with `args` and then the keychain to use, giving it `input`
+    /// instead, whose lines name their own, for at most the limit.
     fn run(&self, args: &[&str], input: Option<&[u8]>) -> io::Result<Ran> {
-        let mut child = Command::new(&self.program)
+        let mut child = self
+            .keychain
+            .command_with(&self.program)?
             .args(args)
+            .args(self.keychain.arg().filter(|_| input.is_none()))
             .stdin(if input.is_some() {
                 Stdio::piped()
             } else {
@@ -225,10 +242,15 @@ impl SecretStore for Keychain {
         let account = Keychain::account(service)?;
         // `-U` replaces the item if there is one, as one operation. Base64
         // needs no quoting.
-        let line = format!(
-            "add-generic-password -U -s {KEYCHAIN_SERVICE} -a {account} -l {KEYCHAIN_SERVICE}-{account} -w {}\n",
+        let mut line = format!(
+            "add-generic-password -U -s {KEYCHAIN_SERVICE} -a {account} -l {KEYCHAIN_SERVICE}-{account} -w {}",
             encode(secret)?
         );
+        if let Some(file) = self.keychain.arg() {
+            line.push(' ');
+            line.push_str(file);
+        }
+        line.push('\n');
         if line.len() > MAX_LINE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -536,13 +558,80 @@ mod tests {
         store.delete("linear").unwrap();
     }
 
-    // Only a Mac has a Keychain. A long login, near what `security -i` takes,
-    // so a limit lower than thought shows up here, not at a user's refresh.
+    /// The door is shut before anything's started: a test's `vibed` that asks
+    /// the real thing to keep a login is what put a dialog on someone's screen.
+    #[test]
+    fn a_test_cant_reach_the_login_keychain() {
+        let store = Keychain::default();
+        for e in [
+            store.load("linear").unwrap_err(),
+            store.store("linear", &secret("a")).unwrap_err(),
+            store.delete("linear").unwrap_err(),
+        ] {
+            assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{e}");
+        }
+    }
+
+    /// A stand-in for `security` that records what it's asked.
+    fn recording_security(dir: &std::path::Path) -> PathBuf {
+        let program = dir.join("security");
+        let tmp = program.with_extension("new");
+        fs::write(
+            &tmp,
+            format!(
+                "#!/bin/sh\necho \"$HOME: $*\" >>{0}/asked\ncat >>{0}/asked\nexit 44\n",
+                dir.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::rename(&tmp, &program).unwrap();
+        program
+    }
+
+    /// Without its name on every call, a store on a file would be using the
+    /// login Keychain.
+    #[test]
+    fn a_store_on_a_file_names_it_on_every_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = recording_security(dir.path());
+        let file = dir.path().join("own/test.keychain-db");
+        let store = Keychain {
+            program,
+            timeout: Duration::from_secs(10),
+            keychain: Target::File(file.clone()),
+        };
+        assert_eq!(store.load("linear").unwrap(), None);
+        store.delete("linear").unwrap();
+        // It keeps nothing, so that's refused, once it's been asked.
+        assert!(store.store("linear", &secret("a")).is_err());
+
+        let asked = fs::read_to_string(dir.path().join("asked")).unwrap();
+        let file = file.display().to_string();
+        let home = dir.path().join("own").display().to_string();
+        let lines: Vec<&str> = asked.lines().collect();
+        // The load, the delete, `-i` with its line, and the load that checks.
+        assert_eq!(lines.len(), 5, "{asked}");
+        for line in [lines[0], lines[1], lines[3], lines[4]] {
+            assert!(line.ends_with(&file), "{asked}");
+        }
+        assert!(lines[2].ends_with(": -i"), "{asked}");
+        assert!(lines[3].starts_with("add-generic-password "), "{asked}");
+        for line in [lines[0], lines[1], lines[2], lines[4]] {
+            assert!(line.starts_with(&format!("{home}: ")), "{asked}");
+        }
+    }
+
+    // Only a Mac has a Keychain, and this one is the test's own. A long login,
+    // near what `security -i` takes, so a limit lower than thought shows up here,
+    // not at a user's refresh.
     #[cfg(target_os = "macos")]
     #[test]
     fn the_keychain_keeps_a_login_whole() {
         let name = format!("test-{}", std::process::id());
-        let store = Keychain::default();
+        let dir = tempfile::tempdir().unwrap();
+        let temp = vibe_core::keychain::TempKeychain::create(dir.path()).unwrap();
+        let store = Keychain::in_file(temp.target());
         let long = "x".repeat(2800);
         store.store(&name, &secret(&long)).unwrap();
         let kept = store.load(&name);

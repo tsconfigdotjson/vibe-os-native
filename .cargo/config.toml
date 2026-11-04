@@ -3,3 +3,8 @@
 # cross C toolchain, on macOS or on Linux.
 [target.aarch64-unknown-linux-musl]
 linker = "rust-lld"
+
+# Nothing cargo runs may reach the login Keychain, in any profile, whatever the
+# shell exported (vibe_core::keychain). `force` is what beats the shell.
+[env]
+VIBE_LOGIN_KEYCHAIN = { value = "never", force = true }

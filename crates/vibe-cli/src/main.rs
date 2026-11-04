@@ -119,7 +119,10 @@ options:
 
 environment:
   VIBE_CLAUDE     the claude that setup-token runs (default: claude on PATH)
-  VIBE_API_KEY    the API key vibe mcp sends";
+  VIBE_API_KEY    the API key vibe mcp sends
+  VIBE_LOGIN_KEYCHAIN
+                  allow lets a debug build outside an app bundle reach the
+                  login Keychain for setup-token; never keeps any build out";
 
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
