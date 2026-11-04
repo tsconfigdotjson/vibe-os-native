@@ -19,8 +19,9 @@ use std::time::{Duration, Instant};
 
 use vibe_core::model::{LoginTool, SessionState, ToolboxAction, ToolboxState};
 use vibe_core::rpc::{
-    HostParams, NoParams, SessionInfo, SessionsList, ToolboxClose, ToolboxLogins, ToolboxLoginsGet,
-    ToolboxOpen, ToolboxRebuild, ToolboxRun, ToolboxStatus, ToolboxStatusGet, ToolboxUpdate,
+    HostParams, NoParams, SessionAttach, SessionInfo, SessionsList, ToolboxClose, ToolboxLogins,
+    ToolboxLoginsGet, ToolboxOpen, ToolboxRebuild, ToolboxRun, ToolboxStatus, ToolboxStatusGet,
+    ToolboxUpdate,
 };
 
 use crate::attach::{self, AttachError, End};
@@ -169,6 +170,11 @@ fn open(socket: &Path) -> Result<(), String> {
                 after_hangup(socket, terminal.as_deref());
                 return Ok(());
             }
+            // Whatever else went wrong, the window has closed.
+            Err(_) if attach::hung_up() => {
+                after_hangup(socket, terminal.as_deref());
+                return Ok(());
+            }
             Err(e) => return Err(e.to_string()),
             Ok(End::Detached) => {
                 say(
@@ -182,17 +188,34 @@ fn open(socket: &Path) -> Result<(), String> {
             // holds it again: attach to that.
             Ok(End::Lost) => {
                 std::thread::sleep(Duration::from_secs(2));
-                if lost >= 3 || status(socket)?.state != ToolboxState::Open {
-                    break;
+                match held_again(socket, lost) {
+                    Ok(Some(again)) => {
+                        lost += 1;
+                        found = again;
+                    }
+                    Ok(None) => break,
+                    Err(_) if attach::hung_up() => {
+                        after_hangup(socket, terminal.as_deref());
+                        return Ok(());
+                    }
+                    Err(e) => return Err(e),
                 }
-                lost += 1;
-                found = client::call::<ToolboxOpen>(socket, &NoParams {}, OPEN_TIMEOUT)
-                    .map_err(|e| e.to_string())?;
             }
         }
     }
     say("Saving the template and the Linux home…");
     report_saved(&wait_saved(socket)?)
+}
+
+/// Where the shell is held again after its shim went, `lost` times now;
+/// `None` if it isn't to be attached to again.
+fn held_again(socket: &Path, lost: u32) -> Result<Option<SessionAttach>, String> {
+    if lost >= 3 || status(socket)?.state != ToolboxState::Open {
+        return Ok(None);
+    }
+    client::call::<ToolboxOpen>(socket, &NoParams {}, OPEN_TIMEOUT)
+        .map(Some)
+        .map_err(|e| e.to_string())
 }
 
 /// A line for the owner on stderr, if the terminal is still there: unlike
@@ -227,11 +250,15 @@ fn report_saved(status: &ToolboxStatus) -> Result<(), String> {
 /// noted while it was there. Nobody sees this terminal any more, so an
 /// error goes only where stderr still leads, if anywhere.
 fn after_hangup(socket: &Path, terminal: Option<&str>) {
-    if over_ssh() || another_terminal_holds_it(socket, terminal) {
+    if over_ssh() {
         return;
     }
     let deadline = Instant::now() + LEAVING;
     loop {
+        // On every try: someone may have attached since the last one failed.
+        if another_terminal_holds_it(socket, terminal, deadline) {
+            return;
+        }
         match client::call::<ToolboxClose>(socket, &NoParams {}, SAVE_TIMEOUT) {
             Ok(_) => return,
             Err(e) if Instant::now() >= deadline => {
@@ -243,35 +270,51 @@ fn after_hangup(socket: &Path, terminal: Option<&str>) {
     }
 }
 
-/// Whether a terminal other than `terminal` is attached to the shell. The
-/// list can still show this one, as a shim under load is slow to see it go,
-/// so it goes by whose terminals they are, not how many.
-fn another_terminal_holds_it(socket: &Path, terminal: Option<&str>) -> bool {
-    let deadline = Instant::now() + LEAVING;
+/// Whether a terminal other than `terminal` is attached to the shell. If
+/// that still can't be told at `deadline`, it's taken as yes: the shell
+/// stays open, which Settings shows and loses nothing, rather than being
+/// ended under a terminal that may be in use.
+fn another_terminal_holds_it(socket: &Path, terminal: Option<&str>, deadline: Instant) -> bool {
     loop {
-        let session = match client::call::<SessionsList>(
-            socket,
-            &HostParams::default(),
-            Duration::from_secs(30),
-        ) {
-            Ok(list) => list
-                .sessions
-                .into_iter()
-                .find(|s| s.agent == TOOLBOX_REF && s.state == SessionState::Running),
-            Err(_) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_secs(1));
-                continue;
-            }
-            // Saving may still get through, and says if it can't.
-            Err(_) => return false,
-        };
-        let Some(session) = session else { return false };
-        match holds_it(&session, terminal) {
+        match who_holds_it(socket, terminal) {
             Some(answer) => return answer,
-            None if Instant::now() >= deadline => return false,
-            None => std::thread::sleep(Duration::from_millis(100)),
+            None if Instant::now() >= deadline => {
+                say("vibe: can't tell who's attached to the toolbox; leaving it open");
+                return true;
+            }
+            None => std::thread::sleep(Duration::from_millis(250)),
         }
     }
+}
+
+/// One look at who's attached; `None` if it can't be told yet. The list can
+/// still show this terminal, as a shim under load is slow to see it go, so
+/// it goes by whose terminals they are, not how many.
+fn who_holds_it(socket: &Path, terminal: Option<&str>) -> Option<bool> {
+    let list =
+        client::call::<SessionsList>(socket, &HostParams::default(), Duration::from_secs(30))
+            .ok()?;
+    let session = list
+        .sessions
+        .iter()
+        .find(|s| s.agent == TOOLBOX_REF && s.state == SessionState::Running);
+    let Some(session) = session else {
+        return Some(false);
+    };
+    let answer = holds_it(session, terminal)?;
+    // The list gives a shim that didn't answer as having no clients: that
+    // isn't "nobody" unless the shim itself says so. A count it gives now
+    // that isn't zero means the list was out of date: look again.
+    if !answer && session.clients == 0 && !shim_says_nobody(socket) {
+        return None;
+    }
+    Some(answer)
+}
+
+/// Whether `vibed` asked the shell's shim and it counted no terminals, or
+/// the toolbox isn't open any more. `clients` is there only if it answered.
+fn shim_says_nobody(socket: &Path) -> bool {
+    status(socket).is_ok_and(|s| s.state != ToolboxState::Open || s.clients == Some(0))
 }
 
 /// Whether `session` has a terminal attached other than `terminal`; `None`

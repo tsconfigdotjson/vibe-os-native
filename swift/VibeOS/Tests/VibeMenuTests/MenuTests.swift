@@ -747,8 +747,8 @@ import VibeRPC
     }
 
     /// A poll that finds nothing new publishes nothing, so it rebuilds no
-    /// view; and with the menu closed, nor do the memory readings, which
-    /// only it shows, and which change every time (#54).
+    /// view; and with the menu closed, the memory readings, which only it
+    /// shows and which change every time, publish only slowly (#54).
     @Test func aPollThatFindsNothingNewPublishesNothing() async throws {
         let reading = Box(1)
         let state = Box(AgentState.busy)
@@ -784,13 +784,29 @@ import VibeRPC
         #expect(model.agents.first?.state == .idle)
         #expect(model.agents.first?.memoryUsed == 2 << 20)
 
-        // With the menu open, the readings are what it shows.
-        model.menuIsOpen = true
+        // Said to be closed, the readings still come, slowly: they can't
+        // freeze if the menu never said it opened.
+        model.closedReadingsEvery = .zero
         published.value = 0
         reading.value = 3
         await model.refresh()
         #expect(published.value > 0)
         #expect(model.hosts.first?.memory?.used == 3 << 30)
+        #expect(model.agents.first?.memoryUsed == 3 << 20)
+        model.closedReadingsEvery = .seconds(3600)
+        reading.value = 4
+        await model.refresh()
+        #expect(model.hosts.first?.memory?.used == 3 << 30, "not due again yet")
+
+        // With the menu open, on every poll: the readings are what it shows.
+        model.menuIsOpen = true
+        published.value = 0
+        await model.refresh()
+        #expect(published.value > 0)
+        #expect(model.hosts.first?.memory?.used == 4 << 30)
+        reading.value = 5
+        await model.refresh()
+        #expect(model.hosts.first?.memory?.used == 5 << 30)
     }
 
     @Test func rebuildAndTheClaudeLoginRunInTerminal() async throws {

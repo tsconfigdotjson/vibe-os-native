@@ -62,6 +62,13 @@ public final class MenuModel: ObservableObject {
         didSet { if menuIsOpen && !oldValue { pollNow() } }
     }
 
+    /// While the menu is said to be closed, how often a poll still publishes
+    /// the memory readings. Often enough that if it was never told the menu
+    /// opened (it goes by SwiftUI's `onAppear`), they go slow rather than
+    /// stop; rarely enough that they don't keep rebuilding Settings (#54).
+    public var closedReadingsEvery: Duration = .seconds(30)
+    private var readingsPublished: ContinuousClock.Instant?
+
     public let daemon: any DaemonConnection
     public let attacher: Attacher
     public let installer: any Installer
@@ -189,9 +196,14 @@ public final class MenuModel: ObservableObject {
     private func refreshOnce() async {
         changedDuringRefresh = []
         defer { changedDuringRefresh = nil }
-        // Only the menu shows this, and it changes on every poll: with it
-        // closed, it'd only rebuild Settings for nothing (#54).
-        if menuIsOpen || memory == nil { set(\.memory, HostMemory.current()) }
+        // The memory readings change on every poll, and only the menu shows
+        // them: on every poll while it's open, slowly while it's not.
+        let clock = ContinuousClock()
+        let readingsDue = menuIsOpen || readingsPublished.map { $0.duration(to: clock.now) >= closedReadingsEvery } ?? true
+        if readingsDue {
+            readingsPublished = clock.now
+            set(\.memory, HostMemory.current())
+        }
         let hosts: [HostInfo]
         do {
             hosts = try await call(HostsList.self, NoParams()).hosts
@@ -218,12 +230,10 @@ public final class MenuModel: ObservableObject {
             unavailable.insert(host.name)
             agents += self.agents.filter { $0.host == host.name }
         }
-        // So with the hosts' and agents' memory readings, which only the
-        // menu shows: opening it polls again at once.
-        if menuIsOpen || hosts.map(\.withoutReadings) != self.hosts.map(\.withoutReadings) {
+        if readingsDue || hosts.map(\.withoutReadings) != self.hosts.map(\.withoutReadings) {
             set(\.hosts, hosts)
         }
-        if menuIsOpen || agents.map(\.withoutReadings) != self.agents.map(\.withoutReadings) {
+        if readingsDue || agents.map(\.withoutReadings) != self.agents.map(\.withoutReadings) {
             set(\.agents, agents)
         }
         for changed in changedDuringRefresh ?? [] {
@@ -582,8 +592,8 @@ public final class MenuModel: ObservableObject {
 }
 
 /// An error in a sentence for the menu.
-/// What a poll compares of a host while the menu, which alone shows its
-/// memory readings, is closed: they change every time.
+/// What a poll compares of a host when its memory readings aren't due:
+/// they change every time.
 extension HostInfo {
     fileprivate var withoutReadings: HostInfo {
         var host = self

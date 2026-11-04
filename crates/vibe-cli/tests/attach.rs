@@ -837,3 +837,45 @@ fn closing_after_a_failed_save_says_it_failed() {
         "{out:?}"
     );
 }
+
+/// A shim too busy to answer is listed with no clients, which isn't
+/// "nobody": a window closing then waits to find out, rather than end the
+/// shell under another window once the shim answers vibed again (#54).
+#[test]
+fn a_shim_that_doesnt_answer_isnt_taken_for_no_terminals() {
+    let w = toolbox_world();
+    let size = Size { rows: 24, cols: 80 };
+    let toolbox = || {
+        let mut cmd = w.vibe();
+        cmd.arg("toolbox");
+        Term::spawn(cmd, size)
+    };
+    let mut first = toolbox();
+    first.attached();
+    let mut second = toolbox();
+    second.attached();
+    let socket = w.layout.session_socket("toolbox");
+    let shim_pid = shim::connect(&socket, &control_hello("t"), WAIT)
+        .unwrap()
+        .status()
+        .unwrap()
+        .pid as libc::pid_t;
+    // SAFETY: signals to a shim and a process this test started.
+    unsafe {
+        libc::kill(shim_pid, libc::SIGSTOP);
+        libc::kill(first.child.id() as libc::pid_t, libc::SIGHUP);
+    }
+    // Long enough for a probe of it to give up: 5 s.
+    std::thread::sleep(Duration::from_secs(7));
+    // SAFETY: as above.
+    unsafe { libc::kill(shim_pid, libc::SIGCONT) };
+    assert_eq!(first.wait(), Some(0), "{}", first.text());
+    assert!(
+        !w.layout.linux_dir().join("template-1.img").exists(),
+        "saved under the other window"
+    );
+    second.type_line("echo $((6*7))-still-here");
+    second.expect("42-still-here");
+    let out = w.vibe().args(["toolbox", "close"]).output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+}

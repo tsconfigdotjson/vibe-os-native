@@ -394,7 +394,10 @@ fn to_terminal(mut bytes: &[u8]) -> io::Result<()> {
     while !bytes.is_empty() {
         // SAFETY: writes from bytes, within its length.
         let n = unsafe { libc::write(libc::STDOUT_FILENO, bytes.as_ptr().cast(), bytes.len()) };
-        if n >= 0 {
+        if n == 0 {
+            return Err(io::ErrorKind::WriteZero.into());
+        }
+        if n > 0 {
             bytes = &bytes[n as usize..];
             continue;
         }
@@ -414,6 +417,18 @@ fn to_terminal(mut bytes: &[u8]) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Taking over the terminal failed. If it's no longer a terminal, it has
+/// gone: a hangup. If it still is, that's a real error: `tcsetattr` also
+/// fails for an orphaned background job, whose terminal is still there, and
+/// which must not end the session or save the toolbox for it.
+fn raw_mode_failed(e: io::Error, still_a_terminal: bool) -> Result<End, AttachError> {
+    if still_a_terminal {
+        Err(e.into())
+    } else {
+        Ok(terminal_gone())
+    }
 }
 
 pub(crate) fn attach(socket: &Path, agent: &str) -> Result<End, AttachError> {
@@ -459,9 +474,9 @@ pub(crate) fn attach_to(found: &SessionAttach) -> Result<End, AttachError> {
     stream.set_read_timeout(None)?;
     stream.set_write_timeout(None)?;
     let writer = Arc::new(Mutex::new(stream.try_clone()?));
-    // It was a terminal a moment ago, so if this fails, it's gone.
-    let Ok(raw) = RawMode::enter() else {
-        return Ok(terminal_gone());
+    let raw = match RawMode::enter() {
+        Ok(raw) => raw,
+        Err(e) => return raw_mode_failed(e, is_tty(libc::STDIN_FILENO)),
     };
     if to_terminal(format!("\x1b]0;{}\x07", found.title).as_bytes()).is_err() {
         return Ok(terminal_gone());
@@ -651,6 +666,18 @@ mod tests {
         assert!(f.alternate);
         let (_, f) = filter(&[b"\x1b[?2004h\x1b[1049h"]);
         assert!(!f.alternate, "not a private mode");
+    }
+
+    #[test]
+    fn failing_to_take_over_the_terminal_is_a_hangup_only_if_it_has_gone() {
+        STOPPED_BY.store(0, Ordering::SeqCst);
+        let e = || io::Error::from_raw_os_error(libc::EIO);
+        assert!(matches!(
+            raw_mode_failed(e(), true),
+            Err(AttachError::Io(_))
+        ));
+        assert_eq!(STOPPED_BY.load(Ordering::SeqCst), 0, "no hangup was noted");
+        assert!(matches!(raw_mode_failed(e(), false), Ok(End::HungUp)));
     }
 
     #[test]

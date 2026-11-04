@@ -599,9 +599,10 @@ impl Core {
             let Ok(_op) = self.toolbox_op.try_lock() else {
                 return;
             };
-            // Saved and closed by `toolbox.close` since the look above: a new
-            // shim here would boot it again.
-            if !host.is_open() {
+            // Saved and closed by `toolbox.close` since the look above, or
+            // held again by an open: a new shim here would boot it again, or
+            // take the session from under the one that's there.
+            if !host.is_open() || !matches!(sessions::probe(&socket).await, Probe::Gone) {
                 return;
             }
             let end = {
