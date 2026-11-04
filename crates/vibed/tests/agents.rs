@@ -1162,6 +1162,13 @@ async fn git_maintenance_runs_only_while_a_project_is_quiet() {
     w.core.maintain_if_quiet("local", "app", &w.project).await;
     assert!(loose() > 1, "not while an agent is awake");
     w.core.delete_agent(delete(&a.agent, false)).await.unwrap();
+    // Quiet, and it's `gc.auto` that says whether there's anything to do, on
+    // every git: its own default strategy would go by other thresholds, or
+    // not look at this one at all.
+    git(&["-C", project, "config", "gc.auto", "6700"]);
+    w.core.maintain_if_quiet("local", "app", &w.project).await;
+    assert!(loose() > 1, "not with so few loose objects");
+    git(&["-C", project, "config", "gc.auto", "1"]);
     w.core.maintain_if_quiet("local", "app", &w.project).await;
     assert_eq!(loose(), 0, "packed once it's quiet");
 }

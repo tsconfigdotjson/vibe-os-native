@@ -1622,7 +1622,11 @@ impl Core {
             }
         }
         // In the foreground: this is a background task already, and a
-        // detached gc would outlive it unseen.
+        // detached gc would outlive it unseen. The gc task by name, as what
+        // `run --auto` does by default depends on git's version: gc until
+        // 2.54, then geometric-repack, which ignores `gc.auto`, with a
+        // threshold that 2.56 raised. gc is in every git with `maintenance`,
+        // and at the same thresholds: `gc.auto` and `gc.autoPackLimit`.
         let maintain = [
             "-c",
             "gc.autoDetach=false",
@@ -1630,6 +1634,7 @@ impl Core {
             "maintenance.autoDetach=false",
             "maintenance",
             "run",
+            "--task=gc",
             "--auto",
             "--quiet",
         ];
