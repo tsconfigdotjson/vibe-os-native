@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Once};
 
 use common::{Golden, publish_pi, wait_until};
-use serde_json::{Value, json};
+use serde_json::Value;
 use vibe_core::model::{
     Activity, AgentKind, AgentState, Environment, MessageRole, Mode, PiTarget, StopReason,
 };
