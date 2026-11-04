@@ -19,10 +19,13 @@
 //! its shim saved, and its conversation comes from the transcript on the
 //! host.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use tokio::sync::watch;
 use vibe_core::model::{Activity, AgentState, validate_ref};
 use vibe_core::rpc::{
     AgentCheck, AgentCheckParams, AgentMessagesParams, AgentOutput, AgentOutputParams,
@@ -43,6 +46,52 @@ const KEY_GAP: Duration = Duration::from_millis(100);
 
 /// How long a shim may take to take a send, or answer a read.
 const SHIM_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a request id is remembered: time for a caller who never heard to
+/// find out why and ask again.
+const SEND_KEPT: Duration = Duration::from_secs(10 * 60);
+
+/// The most request ids remembered; past it the oldest goes first.
+const MAX_SENDS_KEPT: usize = 4096;
+
+/// A send made with a request id, for its agent: what it was, and how it went
+/// once it's done.
+/// Its text isn't kept, only a hash of it.
+pub(crate) struct KeptSend {
+    print: String,
+    at: Instant,
+    answer: watch::Receiver<Option<Result<Sent, ErrorObject>>>,
+}
+
+impl KeptSend {
+    /// Whether it's still being made: its answer's yet to come, and whatever was
+    /// making it hasn't gone.
+    fn under_way(&self) -> bool {
+        self.answer.borrow().is_none() && self.answer.has_changed().is_ok()
+    }
+}
+
+/// Forgets sends past [`SEND_KEPT`]. Not one under way: a retry would type it again.
+fn forget_old_sends(kept: &mut HashMap<String, KeptSend>) {
+    kept.retain(|_, s| s.under_way() || s.at.elapsed() < SEND_KEPT);
+}
+
+/// Forgets the oldest finished send if there's no room for another. Sends under way
+/// all stay for the same reason, even past [`MAX_SENDS_KEPT`]: there are only so many
+/// of those, as each is a call being answered.
+fn make_room_for_a_send(kept: &mut HashMap<String, KeptSend>) {
+    if kept.len() < MAX_SENDS_KEPT {
+        return;
+    }
+    let oldest = kept
+        .iter()
+        .filter(|(_, s)| !s.under_way())
+        .min_by_key(|(_, s)| s.at)
+        .map(|(slot, _)| slot.clone());
+    if let Some(oldest) = oldest {
+        kept.remove(&oldest);
+    }
+}
 
 /// After a wake that started Claude again, how long its screen must stay
 /// still before it's taken to be ready for input, unless it turns on
@@ -201,6 +250,88 @@ impl Core {
         agent_ref: &str,
         input: Input,
     ) -> Result<Sent, ErrorObject> {
+        self.send_noting(host, agent_ref, input, &AtomicBool::new(false))
+            .await
+    }
+
+    /// [`Core::send_input`] at most once for `id`, so a caller who never heard
+    /// how a send went can make it again. The same id gets the first one's
+    /// answer without typing anything, and waits for it if it's still under
+    /// way. One refused before any of it was typed isn't remembered, so it can
+    /// be made again with the same id. It's kept for its agent on the host that
+    /// types, and forgotten after [`SEND_KEPT`] or when that `vibed` restarts.
+    pub async fn send_once(
+        &self,
+        host: Option<&str>,
+        agent_ref: &str,
+        input: Input,
+        id: &str,
+    ) -> Result<Sent, ErrorObject> {
+        vibe_mcp::check_request_id(id).map_err(invalid)?;
+        let print = vibe_core::keys::hash(&format!("{input:?}"));
+        let slot = format!("{agent_ref}\n{id}");
+        let (first, mut answer) = {
+            let mut kept = lock(&self.sends_kept);
+            forget_old_sends(&mut kept);
+            match kept.get(&slot) {
+                Some(s) if s.print != print => {
+                    return Err(error(
+                        ErrorCode::Conflict,
+                        format!("request_id {id} was used for a different send; use a new one"),
+                    ));
+                }
+                Some(s) => (None, s.answer.clone()),
+                None => {
+                    make_room_for_a_send(&mut kept);
+                    let (done, answer) = watch::channel(None);
+                    kept.insert(
+                        slot.clone(),
+                        KeptSend {
+                            print,
+                            at: Instant::now(),
+                            answer: answer.clone(),
+                        },
+                    );
+                    (Some(done), answer)
+                }
+            }
+        };
+        if let Some(done) = first {
+            let once = SendOnce {
+                slot,
+                host: host.map(str::to_owned),
+                agent: agent_ref.to_owned(),
+                input,
+                done,
+            };
+            // On a task of its own, where it can: a caller that goes away
+            // mustn't leave it half typed for its retry to type again.
+            match self.me.get().and_then(std::sync::Weak::upgrade) {
+                Some(core) => {
+                    tokio::spawn(async move { once.run(&core).await });
+                }
+                None => once.run(self).await,
+            }
+        }
+        let answered = answer.wait_for(Option::is_some).await;
+        match answered {
+            Ok(a) => a.clone().expect("waited for it"),
+            Err(_) => Err(error(
+                ErrorCode::InternalError,
+                format!("Internal error: the send to {agent_ref} ended without an answer"),
+            )),
+        }
+    }
+
+    /// [`Core::send_input`], with `typing_began` set just before any of it is
+    /// typed: until then, nothing has reached the agent.
+    async fn send_noting(
+        &self,
+        host: Option<&str>,
+        agent_ref: &str,
+        input: Input,
+        typing_began: &AtomicBool,
+    ) -> Result<Sent, ErrorObject> {
         let record = self.named(host, agent_ref)?;
         let host = record.host.clone();
         // A sleep or a wake under way is waited for: then it's woken, or
@@ -272,6 +403,7 @@ impl Core {
                 )
             })?;
         let chunks = chunks_of(&input, screen.bracketed_paste);
+        typing_began.store(true, Ordering::SeqCst);
         tokio::task::spawn_blocking(move || type_into(&socket, &chunks))
             .await
             .map_err(|e| error(ErrorCode::InternalError, format!("Internal error: {e}")))?
@@ -449,11 +581,35 @@ pub fn input_of(p: &AgentSendParams) -> Result<Input, ErrorObject> {
     }
 }
 
-/// `input` as `agents.send` carries it to another host.
-pub fn send_params(host: &str, agent: &str, input: &Input) -> AgentSendParams {
+/// One send under way for [`Core::send_once`].
+struct SendOnce {
+    slot: String,
+    host: Option<String>,
+    agent: String,
+    input: Input,
+    done: watch::Sender<Option<Result<Sent, ErrorObject>>>,
+}
+
+impl SendOnce {
+    async fn run(self, core: &Core) {
+        let typing_began = AtomicBool::new(false);
+        let answer = core
+            .send_noting(self.host.as_deref(), &self.agent, self.input, &typing_began)
+            .await;
+        if answer.is_err() && !typing_began.load(Ordering::SeqCst) {
+            lock(&core.sends_kept).remove(&self.slot);
+        }
+        self.done.send_replace(Some(answer));
+    }
+}
+
+/// `input` as `agents.send` carries it to another host, to be typed there once
+/// for `request_id`.
+pub fn send_params(host: &str, agent: &str, input: &Input, request_id: &str) -> AgentSendParams {
     let mut p = AgentSendParams {
         host: Some(host.to_owned()),
         agent: agent.to_owned(),
+        request_id: Some(request_id.to_owned()),
         ..Default::default()
     };
     match input {
@@ -476,7 +632,11 @@ pub fn send_params(host: &str, agent: &str, input: &Input) -> AgentSendParams {
 impl Core {
     pub async fn send_call(&self, p: AgentSendParams) -> Result<AgentSent, ErrorObject> {
         let input = input_of(&p)?;
-        let sent = self.send_input(p.host.as_deref(), &p.agent, input).await?;
+        let host = p.host.as_deref();
+        let sent = match p.request_id.as_deref() {
+            Some(id) => self.send_once(host, &p.agent, input, id).await?,
+            None => self.send_input(host, &p.agent, input).await?,
+        };
         Ok(AgentSent {
             woke: sent.woke,
             state: sent.state,
@@ -552,6 +712,78 @@ async fn wait_ready(socket: &Path) {
 mod tests {
     use super::*;
 
+    /// A kept send, `age` old: finished, or still under way for as long as the sender
+    /// it comes with is held.
+    fn a_send(
+        age: Duration,
+        finished: bool,
+    ) -> (KeptSend, watch::Sender<Option<Result<Sent, ErrorObject>>>) {
+        let (done, answer) = watch::channel(None);
+        if finished {
+            done.send_replace(Some(Err(invalid("how it went"))));
+        }
+        let kept = KeptSend {
+            print: String::new(),
+            at: Instant::now().checked_sub(age).unwrap(),
+            answer,
+        };
+        (kept, done)
+    }
+
+    #[test]
+    fn a_send_under_way_is_never_forgotten() {
+        let mut kept = HashMap::new();
+        let mut held = Vec::new();
+        let long_ago = SEND_KEPT + Duration::from_secs(60);
+
+        // Past its time, it goes only if it's finished.
+        for (slot, finished) in [("under way", false), ("finished", true)] {
+            let (send, done) = a_send(long_ago, finished);
+            kept.insert(slot.to_owned(), send);
+            held.push(done);
+        }
+        forget_old_sends(&mut kept);
+        assert!(kept.contains_key("under way"));
+        assert!(!kept.contains_key("finished"));
+
+        // Whatever was making it having gone, it goes the same way.
+        held.clear();
+        forget_old_sends(&mut kept);
+        assert!(kept.is_empty());
+
+        // With no room, the oldest finished one goes, not an older one under way.
+        let (send, done) = a_send(long_ago, false);
+        kept.insert("under way".to_owned(), send);
+        held.push(done);
+        let (send, done) = a_send(Duration::from_secs(120), true);
+        kept.insert("oldest finished".to_owned(), send);
+        held.push(done);
+        for n in kept.len()..MAX_SENDS_KEPT {
+            let (send, done) = a_send(Duration::from_secs(1), true);
+            kept.insert(format!("newer {n}"), send);
+            held.push(done);
+        }
+        make_room_for_a_send(&mut kept);
+        assert_eq!(kept.len(), MAX_SENDS_KEPT - 1);
+        assert!(kept.contains_key("under way"));
+        assert!(!kept.contains_key("oldest finished"));
+
+        // With room, nothing goes.
+        make_room_for_a_send(&mut kept);
+        assert_eq!(kept.len(), MAX_SENDS_KEPT - 1);
+
+        // With all of them under way, none goes.
+        kept.clear();
+        held.clear();
+        for n in 0..MAX_SENDS_KEPT {
+            let (send, done) = a_send(Duration::from_secs(1), false);
+            kept.insert(format!("under way {n}"), send);
+            held.push(done);
+        }
+        make_room_for_a_send(&mut kept);
+        assert_eq!(kept.len(), MAX_SENDS_KEPT);
+    }
+
     #[test]
     fn pastes_are_bracketed_when_asked_for() {
         assert_eq!(paste_bytes("hi", false), b"hi");
@@ -605,6 +837,7 @@ mod tests {
             submit,
             force: None,
             keys: keys.map(|k| k.iter().map(|s| s.to_string()).collect()),
+            request_id: None,
         };
         assert_eq!(
             input_of(&p(Some("hi"), None, None)).unwrap(),
@@ -637,8 +870,9 @@ mod tests {
             },
             Input::Keys(vec!["2".into(), "Enter".into()]),
         ] {
-            let params = send_params("vps", "a", &input);
+            let params = send_params("vps", "a", &input, "id-1");
             assert_eq!(params.host.as_deref(), Some("vps"));
+            assert_eq!(params.request_id.as_deref(), Some("id-1"));
             assert_eq!(input_of(&params).unwrap(), input);
         }
     }

@@ -1429,12 +1429,14 @@ public struct ApiKey: Codable, Hashable, Sendable {
     public var lastUsedAt: String?
     /// On a Linux host: made on the Mac it's linked to, and pushed there.
     public var pushed: Bool?
+    /// On a Linux host: pushed there, with the Mac not heard from in a while.
+    public var stale: Bool?
 
     public enum CodingKeys: String, CodingKey, CaseIterable {
         case name, prefix
         case createdAt = "created_at"
         case lastUsedAt = "last_used_at"
-        case pushed
+        case pushed, stale
     }
 }
 
@@ -1462,9 +1464,13 @@ public struct KeySyncParams: Codable, Hashable, Sendable {
 
 public struct KeyList: Codable, Hashable, Sendable {
     public var keys: [ApiKey]
+    /// On a Mac: the Linux hosts that haven't had its latest keys, so a revoke
+    /// isn't in force there yet.
+    public var pendingOn: [String]?
 
     public enum CodingKeys: String, CodingKey, CaseIterable {
         case keys
+        case pendingOn = "pending_on"
     }
 }
 
@@ -1709,10 +1715,12 @@ public struct AgentSendParams: Codable, Hashable, Sendable {
     public var force: Bool?
     /// Keys by name: "2", "Enter", "Down", "Ctrl+C".
     public var keys: [String]?
+    /// Types it at most once: a repeat of this id gets how the first went.
+    public var requestId: String?
 
     public init(
         host: String? = nil, ref: String, text: String? = nil, submit: Bool? = nil,
-        force: Bool? = nil, keys: [String]? = nil
+        force: Bool? = nil, keys: [String]? = nil, requestId: String? = nil
     ) {
         self.host = host
         self.ref = ref
@@ -1720,10 +1728,12 @@ public struct AgentSendParams: Codable, Hashable, Sendable {
         self.submit = submit
         self.force = force
         self.keys = keys
+        self.requestId = requestId
     }
 
     public enum CodingKeys: String, CodingKey, CaseIterable {
         case host, ref, text, submit, force, keys
+        case requestId = "request_id"
     }
 }
 

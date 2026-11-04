@@ -34,6 +34,10 @@ pub const MAX_RESULT_CHARS: usize = 32_000;
 pub const MAX_WAIT_SECS: u64 = 240;
 const DEFAULT_WAIT_SECS: u64 = 120;
 
+/// How long past [`Daemon::peer_deadline`] a host is let go. The daemon gives up at
+/// the deadline, with what that host last said; this is for one that doesn't.
+const PEER_GRACE: Duration = Duration::from_millis(250);
+
 /// How often a wait reports progress when nothing has changed, so a
 /// client's idle timeout never fires on a long turn.
 const PROGRESS_EVERY: Duration = Duration::from_secs(20);
@@ -114,6 +118,35 @@ fn ok(text: &str, structured: Value) -> Outcome {
 
 fn fail(text: String) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(clip(&text))])
+}
+
+/// A request id for a caller who didn't give one.
+fn new_request_id() -> Result<String, String> {
+    let bytes =
+        vibe_core::keys::random_bytes().map_err(|e| format!("can't make a request id: {e}"))?;
+    Ok(bytes[..16].iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// The line a listing has for a host that didn't answer it with `e`.
+fn unavailable_line(host: &str, e: &Error) -> String {
+    if e.message.starts_with(&format!("{host} is unavailable")) {
+        e.message.clone()
+    } else {
+        format!("{host} is unavailable: {}", e.message)
+    }
+}
+
+/// The error for `agent` being on each of `hosts`.
+fn on_several(agent: &str, hosts: &[String]) -> String {
+    format!(
+        "{agent} is on {}: name it with its host, as {}",
+        hosts.join(" and "),
+        hosts
+            .iter()
+            .map(|h| format!("{h}:{agent}"))
+            .collect::<Vec<_>>()
+            .join(" or ")
+    )
 }
 
 /// A core error, as a model reads it, with what to do next where that
@@ -273,7 +306,8 @@ pub(crate) fn tools() -> Vec<Tool> {
                 "text": {"type": "string", "description": "Text to paste"},
                 "submit": {"type": "boolean", "description": "Press Enter after the text. Default true"},
                 "keys": {"type": "array", "items": {"type": "string"}, "description": "Instead of text: keys to press, like [\"2\"] or [\"Enter\"]"},
-                "force": {"type": "boolean", "description": "Paste the text even when the agent is on a question"}
+                "force": {"type": "boolean", "description": "Paste the text even when the agent is on a question"},
+                "request_id": {"type": "string", "description": "Makes a retry safe: a send with the same request_id and the same input is delivered once, for about 10 minutes. A send whose outcome is unknown gives you one to use"}
             }, "required": ["agent"]}),
         ),
         tool(
@@ -346,6 +380,9 @@ fn agent_json(v: &AgentView) -> Value {
     if let Value::Object(m) = &mut j {
         m.insert("attach_remote".into(), json!(v.attach_remote));
         m.insert("available".into(), json!(v.available));
+        if let Some(at) = &v.last_seen {
+            m.insert("last_seen".into(), json!(at));
+        }
     }
     j
 }
@@ -389,8 +426,12 @@ fn agent_line(v: &AgentView) -> String {
     }
     parts.push(format!("attach: {}", v.attach_remote));
     if !v.available {
+        let at = v
+            .last_seen
+            .as_ref()
+            .map_or(String::new(), |at| format!(" at {at}"));
         parts.push(format!(
-            "unavailable: {} can't be reached now, so this is how it was last seen",
+            "unavailable: {} can't be reached now, so this is how it was last seen{at}",
             a.host
         ));
     }
@@ -462,8 +503,82 @@ impl<D: Daemon> Server<D> {
         Server { daemon }
     }
 
-    /// The host and ref `name` names. A bare ref is this host's, unless
-    /// another host has it and this one doesn't.
+    /// Asks `hosts` all at once. This host's answer never waits on another's, and
+    /// another that's slow is let go after a few seconds and said to be unavailable,
+    /// so no peer is ever on the critical path of a local answer. In `hosts`' order.
+    async fn ask_all<T, F, Fut>(&self, hosts: &[String], ask: F) -> Vec<(String, Result<T, Error>)>
+    where
+        T: Send + 'static,
+        F: Fn(Arc<D>, String) -> Fut,
+        Fut: Future<Output = Result<T, Error>> + Send + 'static,
+    {
+        let deadline = self.daemon.peer_deadline();
+        let mut asked = tokio::task::JoinSet::new();
+        for (i, host) in hosts.iter().enumerate() {
+            let answer = ask(Arc::clone(&self.daemon), host.clone());
+            let host = host.clone();
+            asked.spawn(async move {
+                if host == LOCAL_HOST {
+                    return (i, host, answer.await);
+                }
+                let answer = tokio::time::timeout(deadline + PEER_GRACE, answer)
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(Error::new(
+                            ErrorCode::HostUnavailable,
+                            format!("didn't answer in {} s", deadline.as_secs()),
+                        ))
+                    });
+                (i, host, answer)
+            });
+        }
+        let mut answers = asked.join_all().await;
+        answers.sort_by_key(|(i, _, _)| *i);
+        answers.into_iter().map(|(_, h, a)| (h, a)).collect()
+    }
+
+    /// Checks `targets` all at once: this host's never waits on another's, and one on
+    /// a host that doesn't answer in time counts as that host being unavailable.
+    async fn check_all(
+        &self,
+        c: &Caller,
+        targets: &[Target],
+        background: bool,
+    ) -> Vec<(Target, Result<Check, Error>)> {
+        let limit = self.daemon.peer_deadline();
+        let mut asked = tokio::task::JoinSet::new();
+        for (i, t) in targets.iter().cloned().enumerate() {
+            let daemon = Arc::clone(&self.daemon);
+            let c = c.clone();
+            asked.spawn(async move {
+                let check = daemon.check(&c, &t, background);
+                let answer = if t.host == LOCAL_HOST {
+                    check.await
+                } else {
+                    tokio::time::timeout(limit, check)
+                        .await
+                        .unwrap_or_else(|_| {
+                            Err(Error::new(
+                                ErrorCode::HostUnavailable,
+                                format!(
+                                    "{} is unavailable: it didn't answer in {} s",
+                                    t.host,
+                                    limit.as_secs()
+                                ),
+                            ))
+                        })
+                };
+                (i, t, answer)
+            });
+        }
+        let mut answers = asked.join_all().await;
+        answers.sort_by_key(|(i, _, _)| *i);
+        answers.into_iter().map(|(_, t, a)| (t, a)).collect()
+    }
+
+    /// The host and ref `name` names. A bare ref is this host's whenever this
+    /// host has it, whoever else does: nothing else is asked. If not, it's where
+    /// it was last seen, and only failing that are the others asked, all at once.
     async fn resolve(&self, c: &Caller, name: &str) -> Result<Target, String> {
         let (host, agent) = split_ref(name);
         if agent.is_empty() {
@@ -480,26 +595,41 @@ impl<D: Daemon> Server<D> {
         if hosts.len() <= 1 {
             return Ok(target(hosts.first().map_or(LOCAL_HOST, String::as_str)));
         }
+        let here = self.daemon.agents(c, LOCAL_HOST).await;
+        if here.is_ok_and(|list| list.iter().any(|v| v.agent.agent == agent)) {
+            return Ok(target(LOCAL_HOST));
+        }
+        match self.daemon.known_hosts(c, agent).as_slice() {
+            [] => {}
+            [one] => return Ok(target(one)),
+            several => return Err(on_several(agent, several)),
+        }
+        let others: Vec<String> = hosts.into_iter().filter(|h| h != LOCAL_HOST).collect();
+        let caller = c.clone();
+        let answers = self
+            .ask_all(&others, move |d, h| {
+                let c = caller.clone();
+                async move { d.agents(&c, &h).await }
+            })
+            .await;
         let mut found = Vec::new();
-        for h in &hosts {
-            if let Ok(list) = self.daemon.agents(c, h).await
-                && list.iter().any(|v| v.agent.agent == agent)
-            {
-                found.push(h.clone());
+        let mut silent = Vec::new();
+        for (h, list) in answers {
+            match list {
+                Ok(l) if l.iter().any(|v| v.agent.agent == agent) => found.push(h),
+                Err(e) if e.code == ErrorCode::HostUnavailable.code() => silent.push(h),
+                _ => {}
             }
         }
-        match found.as_slice() {
-            [] => Ok(target(LOCAL_HOST)),
-            [one] => Ok(target(one)),
-            several => Err(format!(
-                "{agent} is on {}: name it with its host, as {}",
-                several.join(" and "),
-                several
-                    .iter()
-                    .map(|h| format!("{h}:{agent}"))
-                    .collect::<Vec<_>>()
-                    .join(" or ")
+        match (found.as_slice(), silent.as_slice()) {
+            ([], []) => Ok(target(LOCAL_HOST)),
+            ([], silent) => Err(format!(
+                "{agent} isn't on any host that answered, and {} didn't, so it may be there. Try again when it's back, or name its host, as {}:{agent}",
+                silent.join(" and "),
+                silent[0]
             )),
+            ([one], _) => Ok(target(one)),
+            (several, _) => Err(on_several(agent, several)),
         }
     }
 
@@ -511,11 +641,18 @@ impl<D: Daemon> Server<D> {
         };
         let mut projects = Vec::new();
         let mut unreachable = Vec::new();
-        for h in &hosts {
-            match self.daemon.projects(c, h).await {
+        let caller = c.clone();
+        let answers = self
+            .ask_all(&hosts, move |d, h| {
+                let c = caller.clone();
+                async move { d.projects(&c, &h).await }
+            })
+            .await;
+        for (h, answer) in answers {
+            match answer {
                 Ok(p) => projects.extend(p),
                 Err(e) if only.is_some() => return Err(e.message),
-                Err(e) => unreachable.push(format!("{h} is unavailable: {}", e.message)),
+                Err(e) => unreachable.push(unavailable_line(&h, &e)),
             }
         }
         let mut text: Vec<String> = projects
@@ -588,17 +725,38 @@ impl<D: Daemon> Server<D> {
     /// The one host `project` is on.
     async fn project_host(&self, c: &Caller, project: &str) -> Result<String, String> {
         let hosts = self.daemon.hosts().await.map_err(|e| e.message)?;
+        let caller = c.clone();
+        let answers = self
+            .ask_all(&hosts, move |d, h| {
+                let c = caller.clone();
+                async move { d.projects(&c, &h).await }
+            })
+            .await;
+        // A host that didn't answer in time still has what it last said it had,
+        // so what's ambiguous doesn't turn on how quickly it answers.
+        let known = self.daemon.known_project_hosts(c, project);
         let mut on = Vec::new();
-        for h in &hosts {
-            if let Ok(list) = self.daemon.projects(c, h).await
-                && list.iter().any(|p| p.name == project)
-            {
-                on.push(h.clone());
+        let mut silent = Vec::new();
+        for (h, list) in answers {
+            match list {
+                Ok(l) if l.iter().any(|p| p.name == project) => on.push(h),
+                Err(e) if e.code == ErrorCode::HostUnavailable.code() => {
+                    if known.contains(&h) {
+                        on.push(h);
+                    } else {
+                        silent.push(h);
+                    }
+                }
+                _ => {}
             }
         }
         match on.as_slice() {
             [one] => Ok(one.clone()),
             [] if hosts.len() <= 1 => Ok(hosts.first().cloned().unwrap_or(LOCAL_HOST.into())),
+            [] if !silent.is_empty() => Err(format!(
+                "no project called {project} on any host that answered, and {} didn't, so it may be there. Try again when it's back, or pass host to say which",
+                silent.join(" and ")
+            )),
             [] => Err(format!(
                 "no project called {project} on {}. vibe_list_projects lists them",
                 hosts.join(", ")
@@ -625,11 +783,22 @@ impl<D: Daemon> Server<D> {
         };
         let mut agents = Vec::new();
         let mut unreachable = Vec::new();
-        for h in &hosts {
-            match self.daemon.agents(c, h).await {
+        let caller = c.clone();
+        let answers = self
+            .ask_all(&hosts, move |d, h| {
+                let c = caller.clone();
+                async move { d.agents(&c, &h).await }
+            })
+            .await;
+        // After them: another host's can come with its agents.
+        let memory = tokio::time::timeout(self.daemon.peer_deadline(), self.daemon.memory(c))
+            .await
+            .unwrap_or_default();
+        for (h, answer) in answers {
+            match answer {
                 Ok(list) => agents.extend(list),
                 Err(e) if only.is_some() => return Err(e.message),
-                Err(e) => unreachable.push(format!("{h} is unavailable: {}", e.message)),
+                Err(e) => unreachable.push(unavailable_line(&h, &e)),
             }
         }
         agents.retain(|v| {
@@ -642,10 +811,7 @@ impl<D: Daemon> Server<D> {
         }
         text.extend(unreachable);
         let list: Vec<Value> = agents.iter().map(agent_json).collect();
-        let memory: Vec<(String, MemoryUse)> = self
-            .daemon
-            .memory(c)
-            .await
+        let memory: Vec<(String, MemoryUse)> = memory
             .into_iter()
             .filter(|(h, _)| only.as_ref().is_none_or(|o| o == h))
             .collect();
@@ -659,6 +825,13 @@ impl<D: Daemon> Server<D> {
         let text = string(args, "text")?;
         let submit = boolean(args, "submit")?;
         let force = boolean(args, "force")?.unwrap_or(false);
+        let request_id = match string(args, "request_id")? {
+            Some(id) => {
+                crate::check_request_id(&id)?;
+                id
+            }
+            None => new_request_id()?,
+        };
         let keys = match args.get("keys").filter(|v| !v.is_null()) {
             None => None,
             Some(Value::Array(items)) if !items.is_empty() => Some(
@@ -704,9 +877,18 @@ impl<D: Daemon> Server<D> {
         };
         let sent = self
             .daemon
-            .send(c, &t, input)
+            .send(c, &t, input, &request_id)
             .await
-            .map_err(|e| explain(&e, Some(&t.agent)))?;
+            .map_err(|e| {
+                let why = explain(&e, Some(&t.agent));
+                if e.is_outcome_unknown() {
+                    format!(
+                        "{why}, or call vibe_send with the same input and request_id \"{request_id}\", which delivers it at most once."
+                    )
+                } else {
+                    why
+                }
+            })?;
         ok(
             &format!(
                 "{what}{}. Call vibe_wait to know when it has answered",
@@ -928,18 +1110,18 @@ impl<D: Daemon> Server<D> {
         let mut last: HashMap<Target, Check> = HashMap::new();
         let (target, check, reached, checks) = loop {
             let mut checks = Vec::new();
-            for t in &targets {
-                match self.daemon.check(c, t, background).await {
+            for (t, answer) in self.check_all(c, &targets, background).await {
+                match answer {
                     Ok(c) => {
                         last.insert(t.clone(), c.clone());
-                        checks.push((t.clone(), c));
+                        checks.push((t, c));
                     }
                     Err(e)
                         if e.code == vibe_core::rpc::ErrorCode::HostUnavailable.code()
                             && Instant::now() < deadline =>
                     {
-                        if let Some(c) = last.get(t) {
-                            checks.push((t.clone(), c.clone()));
+                        if let Some(c) = last.get(&t) {
+                            checks.push((t, c.clone()));
                         }
                     }
                     Err(e) => return Err(explain(&e, Some(&t.agent))),

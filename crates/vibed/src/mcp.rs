@@ -40,6 +40,15 @@ fn typed<T: serde::de::DeserializeOwned>(v: Value) -> Result<T, ErrorObject> {
     })
 }
 
+/// What a call for `agent` on the Mac says of it: there, or not there any more.
+fn note_mac_answer<T>(mac: &MacPeer, c: &Caller, agent: &str, answer: &Result<T, ErrorObject>) {
+    match answer {
+        Ok(_) => mac.note_ref(c.key(), agent),
+        Err(e) if e.code == ErrorCode::NotFound.code() => mac.forget_ref(c.key(), agent),
+        Err(_) => {}
+    }
+}
+
 /// Calls `M` on the Mac behind this host for `c`, whose key the Mac checks.
 async fn mac_call<M: Method>(
     mac: &MacPeer,
@@ -174,15 +183,19 @@ impl Core {
     /// attaches from another machine.
     pub async fn agent_views(&self, host: &str) -> Result<Vec<AgentView>, ErrorObject> {
         if let Some(link) = self.link(host) {
-            let available = link.connected();
-            return Ok(self
-                .remote_agents(&link)
-                .await
+            // A link that's up but stuck is let go, with what it last listed.
+            let (agents, available) =
+                match tokio::time::timeout(self.peer_read(), self.remote_agents(&link)).await {
+                    Ok(agents) => (agents, link.connected()),
+                    Err(_) => (self.kept_agents(&link), false),
+                };
+            return Ok(agents
                 .into_iter()
                 .map(|agent| AgentView {
                     // Its attach line is the one that reaches it from here.
                     attach_remote: agent.attach.clone(),
                     available,
+                    last_seen: None,
                     agent,
                 })
                 .collect());
@@ -200,6 +213,7 @@ impl Core {
             .map(|agent| AgentView {
                 attach_remote: format!("ssh -t {machine} {vibe} attach {}", agent.agent),
                 available: true,
+                last_seen: None,
                 agent,
             })
             .collect())
@@ -210,6 +224,52 @@ impl Core {
     /// The Mac, when `host` names it on the Linux host it's behind.
     fn mac_for(&self, host: &str) -> Option<&MacPeer> {
         (host == MAC_HOST).then(|| self.mac()).flatten()
+    }
+}
+
+impl Core {
+    /// [`mac_call`] for a send, start or delete, saying when it was sent, as the Mac
+    /// refuses one that took too long to arrive.
+    async fn mac_change<M: Method>(
+        &self,
+        mac: &MacPeer,
+        c: &Caller,
+        params: &M::Params,
+    ) -> Result<M::Result, ErrorObject> {
+        let params = serde_json::to_value(params)
+            .map_err(|e| error(ErrorCode::InternalError, format!("Internal error: {e}")))?;
+        let v = mac
+            .call_at(
+                c.key(),
+                M::NAME,
+                params,
+                call_timeout(M::NAME),
+                Some(self.now()),
+            )
+            .await?;
+        typed(v)
+    }
+
+    /// `asked`, for as long as another host gets to answer a read, all of it: its
+    /// turn at that host as well as the answer. Whatever falls back on what the host
+    /// last said then has time to, inside the deadline of whoever's waiting on it.
+    async fn within_peer_read<T>(
+        &self,
+        host: &str,
+        asked: impl Future<Output = Result<T, ErrorObject>>,
+    ) -> Result<T, ErrorObject> {
+        let limit = self.peer_read();
+        tokio::time::timeout(limit, asked)
+            .await
+            .unwrap_or_else(|_| {
+                Err(error(
+                    ErrorCode::HostUnavailable,
+                    format!(
+                        "{host} is unavailable: it didn't answer in {} s",
+                        limit.as_secs()
+                    ),
+                ))
+            })
     }
 }
 
@@ -245,6 +305,45 @@ impl Daemon for Core {
         }
     }
 
+    fn known_hosts(&self, c: &Caller, agent: &str) -> Vec<String> {
+        let mut on = Vec::new();
+        if self.mac().is_some_and(|mac| mac.knows_ref(c.key(), agent)) {
+            on.push(MAC_HOST.to_owned());
+        }
+        let links: Vec<Arc<crate::link::Link>> =
+            crate::core::lock(&self.links).values().cloned().collect();
+        on.extend(
+            links
+                .iter()
+                .filter(|l| self.kept_agents(l).iter().any(|a| a.agent == agent))
+                .map(|l| l.name.clone()),
+        );
+        on.sort();
+        on
+    }
+
+    fn known_project_hosts(&self, c: &Caller, project: &str) -> Vec<String> {
+        let mut on = Vec::new();
+        if self
+            .mac()
+            .is_some_and(|mac| mac.saw_project(c.key(), project))
+        {
+            on.push(MAC_HOST.to_owned());
+        }
+        on.extend(
+            crate::core::lock(&self.links)
+                .values()
+                .filter(|l| lock(&l.projects_seen).iter().any(|p| p == project))
+                .map(|l| l.name.clone()),
+        );
+        on.sort();
+        on
+    }
+
+    fn peer_deadline(&self) -> Duration {
+        self.peer_read()
+    }
+
     async fn hosts(&self) -> Result<Vec<String>, ErrorObject> {
         let mut hosts: Vec<String> = Core::hosts(self)?
             .hosts
@@ -265,24 +364,25 @@ impl Daemon for Core {
             .into_iter()
             .filter_map(|h| Some((h.name, h.memory?)))
             .collect();
-        // The Mac behind this host, while it's the external address: its
-        // own row, down the tunnel, with the caller's key. While the tunnel
-        // is down, or the Mac doesn't take the key, it's left out.
+        // The Mac behind this host, while it's the external address: what came with
+        // the caller's last listing of it. If that couldn't be had, or the Mac doesn't
+        // take the key, it's left out. An older Mac doesn't send it, and is asked.
         if let Some(mac) = self.mac()
             && !all.iter().any(|(h, _)| h == MAC_HOST)
         {
-            let own = mac
-                .call(
-                    c.key(),
-                    HostsList::NAME,
-                    json!({}),
-                    call_timeout(HostsList::NAME),
+            let own = if mac.accepts_calls() {
+                mac.memory_seen(c.key())
+            } else {
+                self.within_peer_read(
+                    MAC_HOST,
+                    mac.call(c.key(), HostsList::NAME, json!({}), self.peer_read()),
                 )
                 .await
                 .and_then(typed::<HostList>)
                 .ok()
                 .and_then(|l| l.hosts.into_iter().find(|h| h.name == LOCAL_HOST))
-                .and_then(|h| h.memory);
+                .and_then(|h| h.memory)
+            };
             if let Some(m) = own {
                 all.push((MAC_HOST.to_owned(), m));
             }
@@ -292,21 +392,32 @@ impl Daemon for Core {
 
     async fn projects(&self, c: &Caller, host: &str) -> Result<Vec<Project>, ErrorObject> {
         if let Some(mac) = self.mac_for(host) {
-            let v = mac
-                .call(
-                    c.key(),
-                    ProjectsList::NAME,
-                    json!({}),
-                    call_timeout(ProjectsList::NAME),
+            let listed = self
+                .within_peer_read(
+                    host,
+                    mac.call(c.key(), ProjectsList::NAME, json!({}), self.peer_read()),
                 )
-                .await?;
-            return Ok(typed::<ProjectList>(v)?.projects);
+                .await
+                .and_then(typed::<ProjectList>);
+            return match listed {
+                Ok(list) => {
+                    mac.saw_projects(c.key(), &list.projects);
+                    Ok(list.projects)
+                }
+                Err(e) => {
+                    if e.code == ErrorCode::Unauthorized.code() {
+                        mac.forget(c.key());
+                    }
+                    Err(e)
+                }
+            };
         }
         if let Some(link) = self.link(host) {
-            return Ok(self
-                .forward_typed::<ProjectsList>(&link, &HostParams::default())
-                .await?
-                .projects);
+            let params = HostParams::default();
+            let asked = self.forward_typed::<ProjectsList>(&link, &params);
+            let projects = self.within_peer_read(host, asked).await?.projects;
+            *lock(&link.projects_seen) = projects.iter().map(|p| p.name.clone()).collect();
+            return Ok(projects);
         }
         Ok(Core::projects(
             self,
@@ -319,16 +430,24 @@ impl Daemon for Core {
 
     async fn agents(&self, c: &Caller, host: &str) -> Result<Vec<AgentView>, ErrorObject> {
         if let Some(mac) = self.mac_for(host) {
-            let listed = mac
-                .call(
-                    c.key(),
-                    AgentsList::NAME,
-                    json!({}),
-                    call_timeout(AgentsList::NAME),
+            let listed = self
+                .within_peer_read(
+                    host,
+                    mac.call(c.key(), AgentsList::NAME, json!({}), self.peer_read()),
                 )
                 .await
-                .and_then(typed::<AgentList>);
-            let (agents, available) = match listed {
+                .and_then(|answer| {
+                    let memory = answer
+                        .get("memory")
+                        .and_then(|m| serde_json::from_value(m.clone()).ok());
+                    Ok((typed::<AgentList>(answer)?, memory))
+                });
+            let memory = match &listed {
+                Ok((_, memory)) => memory.clone(),
+                Err(_) => None,
+            };
+            mac.saw_memory(c.key(), memory);
+            let (agents, available) = match listed.map(|(list, _)| list) {
                 Ok(list) => {
                     mac.saw(c.key(), &list.agents);
                     (list.agents, true)
@@ -356,6 +475,7 @@ impl Daemon for Core {
                     // It attaches from a terminal on the Mac.
                     attach_remote: format!("on the Mac: {}", agent.attach),
                     available,
+                    last_seen: (!available).then(|| mac.seen_at(c.key())).flatten(),
                     agent,
                 })
                 .collect());
@@ -365,31 +485,52 @@ impl Daemon for Core {
 
     async fn start_agent(&self, c: &Caller, p: AgentStartParams) -> Result<Agent, ErrorObject> {
         if let Some(mac) = p.host.as_deref().and_then(|h| self.mac_for(h)) {
-            return mac_call::<AgentsStart>(mac, c, &p).await;
+            let started = self.mac_change::<AgentsStart>(mac, c, &p).await?;
+            mac.note_ref(c.key(), &started.agent);
+            return Ok(started);
         }
         if let Some(link) = p.host.as_deref().and_then(|h| self.link(h)) {
-            return self.forward_typed::<AgentsStart>(&link, &p).await;
+            let started = self.forward_typed::<AgentsStart>(&link, &p).await?;
+            self.note_kept_agent(&link, &started);
+            return Ok(started);
         }
         Core::start_agent(self, p).await
     }
 
     async fn delete_agent(&self, c: &Caller, p: AgentDeleteParams) -> Result<Agent, ErrorObject> {
         if let Some(mac) = p.host.as_deref().and_then(|h| self.mac_for(h)) {
-            return mac_call::<AgentsDelete>(mac, c, &p).await;
+            let deleted = self.mac_change::<AgentsDelete>(mac, c, &p).await?;
+            mac.forget_ref(c.key(), &deleted.agent);
+            return Ok(deleted);
         }
         if let Some(link) = p.host.as_deref().and_then(|h| self.link(h)) {
-            return self.forward_typed::<AgentsDelete>(&link, &p).await;
+            let deleted = self.forward_typed::<AgentsDelete>(&link, &p).await?;
+            self.forget_kept_agent(&link, &deleted.agent);
+            return Ok(deleted);
         }
         Core::delete_agent(self, p).await
     }
 
-    async fn send(&self, c: &Caller, t: &Target, input: Input) -> Result<Sent, ErrorObject> {
+    async fn send(
+        &self,
+        c: &Caller,
+        t: &Target,
+        input: Input,
+        request_id: &str,
+    ) -> Result<Sent, ErrorObject> {
+        // It's this key's id: another key's the same one is another send.
+        let request_id = vibe_core::keys::hash(&format!("{}\n{request_id}", c.key()));
+        let request_id = request_id.as_str();
         let mac = self.mac_for(&t.host);
         let link = self.link(&t.host);
         if mac.is_some() || link.is_some() {
-            let params = crate::talk::send_params(&t.host, &t.agent, &input);
+            let params = crate::talk::send_params(&t.host, &t.agent, &input, request_id);
             let sent = match mac {
-                Some(mac) => mac_call::<AgentsSend>(mac, c, &params).await?,
+                Some(mac) => {
+                    let sent = self.mac_change::<AgentsSend>(mac, c, &params).await;
+                    note_mac_answer(mac, c, &t.agent, &sent);
+                    sent?
+                }
                 None => {
                     let link = link.expect("one of them");
                     self.forward_typed::<AgentsSend>(&link, &params).await?
@@ -400,7 +541,8 @@ impl Daemon for Core {
                 state: sent.state,
             });
         }
-        self.send_input(Some(&t.host), &t.agent, input).await
+        self.send_once(Some(&t.host), &t.agent, input, request_id)
+            .await
     }
 
     async fn check(&self, c: &Caller, t: &Target, background: bool) -> Result<Check, ErrorObject> {
@@ -410,7 +552,9 @@ impl Daemon for Core {
             background: background.then_some(true),
         };
         let checked = if let Some(mac) = self.mac_for(&t.host) {
-            mac_call::<AgentsCheck>(mac, c, &params).await?
+            let checked = mac_call::<AgentsCheck>(mac, c, &params).await;
+            note_mac_answer(mac, c, &t.agent, &checked);
+            checked?
         } else if let Some(link) = self.link(&t.host) {
             self.forward_typed::<AgentsCheck>(&link, &params).await?
         } else {
@@ -436,7 +580,9 @@ impl Daemon for Core {
             after,
         };
         let o = if let Some(mac) = self.mac_for(&t.host) {
-            mac_call::<AgentsOutput>(mac, c, &params).await?
+            let output = mac_call::<AgentsOutput>(mac, c, &params).await;
+            note_mac_answer(mac, c, &t.agent, &output);
+            output?
         } else if let Some(link) = self.link(&t.host) {
             self.forward_typed::<AgentsOutput>(&link, &params).await?
         } else {
@@ -464,7 +610,9 @@ impl Daemon for Core {
             last: Some(u32::try_from(last).unwrap_or(u32::MAX)),
         };
         if let Some(mac) = self.mac_for(&t.host) {
-            return Ok(mac_call::<AgentsMessages>(mac, c, &params).await?.messages);
+            let read = mac_call::<AgentsMessages>(mac, c, &params).await;
+            note_mac_answer(mac, c, &t.agent, &read);
+            return Ok(read?.messages);
         }
         if let Some(link) = self.link(&t.host) {
             return Ok(self

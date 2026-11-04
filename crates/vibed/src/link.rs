@@ -14,12 +14,13 @@ use serde_json::{Value, json};
 use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
 use vibe_core::model::{HostLink, LOCAL_HOST};
+use vibe_core::rpc::{ACCEPTS_CALLS, TUNNEL_METHODS};
 use vibe_core::rpc::{
     ErrorCode, ErrorObject, Event, Hello, HostInfo, HostList, HostsList, Method, PROTOCOL_VERSION,
 };
 
 use crate::core::{Core, error, lock};
-use crate::remote::Channel;
+use crate::remote::{ACCEPT_WITHIN, Channel};
 
 /// How often the host is pinged (with `hosts.list`, whose answer also says
 /// whether it serves MCP).
@@ -97,9 +98,14 @@ pub struct Link {
     pub(crate) upgrade_tried: AtomicBool,
     /// A read of its agents is wanted: one runs at a time.
     pub(crate) refresh_wanted: AtomicBool,
-    /// The last push of this host's keys there failed: the next ping tries
-    /// again.
+    /// It hasn't had this host's latest keys, as far as this `vibed` knows: the last
+    /// push failed or couldn't be made, or none has been since it started. The next
+    /// ping tries again.
     pub(crate) keys_stale: AtomicBool,
+    /// The projects it last listed, as it still has them while it's away.
+    pub(crate) projects_seen: Mutex<Vec<String>>,
+    /// Whether its `vibed` sends [`vibe_core::rpc::CALL_ACCEPTED`].
+    accepts_calls: AtomicBool,
 }
 
 impl std::fmt::Debug for Link {
@@ -131,6 +137,19 @@ pub fn unavailable(name: &str, why: Option<&str>) -> ErrorObject {
     )
 }
 
+/// What a call gets that went out over a link and hasn't been heard of since.
+fn lost(name: &str, method: &str, why: Option<&str>) -> ErrorObject {
+    let e = unavailable(name, why);
+    match crate::external::check_after(method) {
+        Some(check) => ErrorObject {
+            message: format!("{}. Outcome unknown: {check}", e.message),
+            ..e
+        }
+        .outcome_unknown(),
+        None => e,
+    }
+}
+
 impl Link {
     pub fn new(name: &str, address: &str) -> Link {
         Link {
@@ -147,7 +166,9 @@ impl Link {
             task: Mutex::new(None),
             upgrade_tried: AtomicBool::new(false),
             refresh_wanted: AtomicBool::new(false),
-            keys_stale: AtomicBool::new(false),
+            keys_stale: AtomicBool::new(true),
+            projects_seen: Mutex::new(Vec::new()),
+            accepts_calls: AtomicBool::new(false),
         }
     }
 
@@ -291,19 +312,32 @@ impl Link {
             // A new channel says it's a link's, so the host closes it once
             // it's quiet, as it would be left by a pulled network.
             if fresh {
-                channel
+                let hello = channel
                     .call(
                         Hello::NAME,
                         json!({"client": format!("{LINK_CALLS} {}", core.label()), "protocol": PROTOCOL_VERSION}),
                     )
                     .await?
                     .map_err(|e| std::io::Error::other(e.message))?;
+                self.accepts_calls.store(
+                    hello.get(ACCEPTS_CALLS) == Some(&Value::Bool(true)),
+                    Ordering::SeqCst,
+                );
             }
-            channel.call(method, params).await
+            // Only the agent calls are said to be taken. Others, as a clone in
+            // `projects.add` is, take their time with no word till they're done.
+            if self.accepts_calls.load(Ordering::SeqCst) && TUNNEL_METHODS.contains(&method) {
+                channel.call_accepted(method, params, ACCEPT_WITHIN).await
+            } else {
+                channel.call(method, params).await
+            }
         };
         let answer = tokio::select! {
             a = tokio::time::timeout(timeout, exchange) => a,
-            () = went_down => return Err(unavailable(&self.name, None)),
+            () = went_down => {
+                let detail = lock(&self.status).detail.clone();
+                return Err(lost(&self.name, method, detail.as_deref()));
+            }
         };
         match answer {
             Ok(Ok(outcome)) => {
@@ -313,9 +347,10 @@ impl Link {
                 }
                 outcome
             }
-            Ok(Err(e)) => Err(unavailable(&self.name, Some(&e.to_string()))),
-            Err(_) => Err(unavailable(
+            Ok(Err(e)) => Err(lost(&self.name, method, Some(&e.to_string()))),
+            Err(_) => Err(lost(
                 &self.name,
+                method,
                 Some(&format!(
                     "it didn't answer {method} in {} s",
                     timeout.as_secs()

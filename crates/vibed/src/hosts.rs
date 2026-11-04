@@ -475,7 +475,7 @@ impl Core {
         self.kept_agents(link)
     }
 
-    fn kept_agents(&self, link: &Link) -> Vec<Agent> {
+    pub(crate) fn kept_agents(&self, link: &Link) -> Vec<Agent> {
         let kept = self.store().host_agents(&link.name).unwrap_or_default();
         serde_json::from_str::<Vec<Agent>>(&kept).unwrap_or_default()
     }
@@ -485,6 +485,22 @@ impl Core {
         if let Err(e) = self.store().set_host_agents(&link.name, &json) {
             crate::log!("vibed: can't keep {}'s agents: {e}", link.name);
         }
+    }
+
+    /// Adds an agent to those kept of `link`'s host, as its start just said, so a
+    /// bare ref finds it before the event's refresh does.
+    pub(crate) fn note_kept_agent(&self, link: &Link, agent: &Agent) {
+        let mut agents = self.kept_agents(link);
+        agents.retain(|a| a.agent != agent.agent);
+        agents.push(agent.clone());
+        self.keep_agents(link, &agents);
+    }
+
+    /// Takes an agent from those kept of `link`'s host, as its delete just said.
+    pub(crate) fn forget_kept_agent(&self, link: &Link, agent: &str) {
+        let mut agents = self.kept_agents(link);
+        agents.retain(|a| a.agent != agent);
+        self.keep_agents(link, &agents);
     }
 
     /// Changes one kept agent of `link`'s host, as an event says.
@@ -641,8 +657,13 @@ impl Core {
     /// link is up, as after a key is made or revoked.
     pub(crate) fn push_keys(&self) {
         let links: Vec<Arc<Link>> = lock(&self.links).values().cloned().collect();
-        for link in links.iter().filter(|l| l.connected()) {
-            self.push_keys_to(link);
+        for link in &links {
+            if link.connected() {
+                self.push_keys_to(link);
+            } else {
+                // It gets them when it's back; until then the list says it hasn't.
+                link.keys_stale.store(true, Ordering::SeqCst);
+            }
         }
     }
 
@@ -709,7 +730,14 @@ impl Core {
                 self.ask_key_uses(&link).await;
             }
         }
-        self.keys()
+        let mut list = self.keys()?;
+        list.pending_on = lock(&self.links)
+            .values()
+            .filter(|l| l.keys_stale.load(Ordering::SeqCst))
+            .map(|l| l.name.clone())
+            .collect();
+        list.pending_on.sort();
+        Ok(list)
     }
 
     /// Asks `link`'s host when the keys pushed to it were last used there,

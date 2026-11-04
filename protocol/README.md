@@ -116,7 +116,9 @@ left; the Mac forwards it with `ssh -R` to its own `run/tunnel.sock`.
 
 **The tunnel socket isn't this contract.** The Mac's `run/tunnel.sock`
 takes two methods only, in the same framing: `daemon.hello`, and
-`tunnel.call {key, method, params}`. That runs `method` on the Mac, for its
+`tunnel.call {key, method, params, sent_at}`. `sent_at` is when the host sent it,
+in Unix seconds: the Mac refuses an `agents.send`, `agents.start` or `agents.delete`
+more than about 60 s old when it arrives, so clocks that far apart refuse them too. That runs `method` on the Mac, for its
 own agents only (a `host` other than `local` is `invalid_params`), after
 the Mac checks `key`, the outside caller's API key, itself: a key it
 doesn't know, revoked here though a host hasn't heard yet, or a host's own,
@@ -124,7 +126,12 @@ gets `unauthorized` (-32006), after a pause. `method` is one of the calls
 MCP's tools stand on: `projects.list`, `agents.list`, `agents.start`,
 `agents.delete`, `agents.send`, `agents.check`, `agents.output`,
 `agents.messages`; anything else is `method_not_found`. Its result is that
-call's. On the external host the Mac goes by `mac`, so its agents are
+call's, and `agents.list` also says the Mac's `memory`. As soon as it has a call,
+the socket says so with a notification, `call.accepted {id}`, and a host fails one
+that hasn't that or an answer within 5 s, however long it may run after that. A Mac
+that does this says `accepts_calls: true` in its `daemon.hello` answer. So does
+`vibed.sock` to a connection whose hello says it's a link, sending `call.accepted`
+for those same agent calls. On the external host the Mac goes by `mac`, so its agents are
 `mac:<ref>` to outside callers.
 
 **Shared MCP services.** There's one login per install for each service, held by

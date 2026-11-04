@@ -187,11 +187,16 @@ async fn world() -> World {
 
 /// [`world`], with the Linux host's config changed by `change`.
 async fn world_with(change: impl FnOnce(&mut vibed::core::Config)) -> World {
+    world_timed(quick(), change).await
+}
+
+/// [`world_with`], with the Mac's link timed by `timing`.
+async fn world_timed(timing: Timing, change: impl FnOnce(&mut vibed::core::Config)) -> World {
     let wires = Wires::new();
     let mac_world = Golden::new();
     let mut config = mac_world.config();
     config.remote = Arc::clone(&wires) as Arc<dyn Remote>;
-    config.link_timing = quick();
+    config.link_timing = timing;
     let mac = Arc::new(Core::open(config).unwrap());
     mac.spawn_links();
 
@@ -290,18 +295,341 @@ async fn rpc(core: &Core, method: &str, params: Value) -> Value {
     serde_json::from_str(&reply).unwrap()
 }
 
+/// Section C, on the host: keys the Mac pushed say so when it's been away a while, and
+/// one that's leaked can be shut out here, and stays out when the Mac's back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_with_the_mac_away_can_see_stale_keys_and_revoke_them() {
+    let now = Arc::new(std::sync::atomic::AtomicI64::new(common::GOLDEN_NOW));
+    let clock = Arc::clone(&now);
+    let w = world_with(move |c| {
+        c.clock = Arc::new(move || clock.load(Ordering::SeqCst));
+        // Each side's own, or this host's key would be the same as the Mac's.
+        c.entropy = Arc::new(vibe_core::keys::random_bytes);
+    })
+    .await;
+    w.add_host().await;
+    w.link().await;
+    let leaked = w
+        .mac
+        .create_key(KeyCreateParams {
+            name: "leaked".into(),
+        })
+        .unwrap();
+    let other = w
+        .mac
+        .create_key(KeyCreateParams {
+            name: "other".into(),
+        })
+        .unwrap();
+    let mut pushed = false;
+    for _ in 0..250 {
+        if w.host.verify_key(&other.secret).unwrap().is_some() {
+            pushed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(pushed, "the keys reached the host");
+    let own = w
+        .host
+        .create_key(KeyCreateParams { name: "own".into() })
+        .unwrap();
+    let stale = |name: &str| {
+        w.host
+            .keys()
+            .unwrap()
+            .keys
+            .into_iter()
+            .find(|k| k.name == name)
+            .unwrap()
+            .stale
+    };
+    assert!(!stale("leaked"));
+
+    // Well past the limit, but with the link up: it's still hearing from the Mac.
+    now.fetch_add(11 * 60, Ordering::SeqCst);
+    let mut heard = false;
+    for _ in 0..250 {
+        if !stale("leaked") {
+            heard = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(heard, "a ping says the Mac's there");
+
+    // The Mac goes.
+    w.wires.pull();
+    w.wait_link(HostLink::Down).await;
+    assert!(!stale("leaked"), "not at once");
+    now.fetch_add(11 * 60, Ordering::SeqCst);
+    assert!(stale("leaked"));
+    assert!(stale("other"));
+    assert!(!stale("own"), "this host's own say what they say");
+
+    // The leaked one is shut out here, with the Mac nowhere to be seen.
+    let gone = w
+        .host
+        .revoke_key(KeyParams {
+            name: "leaked".into(),
+        })
+        .unwrap();
+    assert!(gone.pushed);
+    assert_eq!(w.host.verify_key(&leaked.secret).unwrap(), None);
+    assert!(w.host.verify_key(&other.secret).unwrap().is_some());
+    assert!(w.host.verify_key(&own.secret).unwrap().is_some());
+
+    // The Mac's back, still with it: its push doesn't bring it back here.
+    w.wires.plug_in();
+    w.wait_link(HostLink::Connected).await;
+    let mut fresh = false;
+    for _ in 0..500 {
+        if !stale("other") {
+            fresh = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(fresh, "heard from, nothing's stale");
+    assert!(w.mac.verify_key(&leaked.secret).unwrap().is_some());
+    // A new key makes it push again, with the leaked one in it.
+    let newer = w
+        .mac
+        .create_key(KeyCreateParams {
+            name: "newer".into(),
+        })
+        .unwrap();
+    let mut pushed = false;
+    for _ in 0..250 {
+        if w.host.verify_key(&newer.secret).unwrap().is_some() {
+            pushed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(pushed, "that push arrived");
+    assert_eq!(w.host.verify_key(&leaked.secret).unwrap(), None);
+    assert!(
+        !w.host
+            .keys()
+            .unwrap()
+            .keys
+            .iter()
+            .any(|k| k.name == "leaked")
+    );
+}
+
+/// Section C, on the Mac: a revoke made with a host away says it's not there yet, until
+/// it's arrived.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_revoke_with_a_host_away_says_its_pending_until_it_arrives() {
+    let w = world().await;
+    w.add_host().await;
+    w.link().await;
+    let key = w
+        .mac
+        .create_key(KeyCreateParams {
+            name: "laptop".into(),
+        })
+        .unwrap();
+    let mut pushed = false;
+    for _ in 0..250 {
+        if w.host.verify_key(&key.secret).unwrap().is_some() {
+            pushed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(pushed);
+    let listed = w.rpc("keys.list", json!({})).await;
+    assert!(listed["result"].get("pending_on").is_none(), "{listed}");
+
+    w.wires.pull();
+    w.wait_link(HostLink::Down).await;
+    // A listing with the link down and nothing changed has nothing pending.
+    let listed = w.rpc("keys.list", json!({})).await;
+    assert!(listed["result"].get("pending_on").is_none(), "{listed}");
+
+    w.mac
+        .revoke_key(KeyParams {
+            name: "laptop".into(),
+        })
+        .unwrap();
+    let listed = w.rpc("keys.list", json!({})).await;
+    assert_eq!(listed["result"]["pending_on"], json!(["vps"]), "{listed}");
+    assert!(
+        w.host.verify_key(&key.secret).unwrap().is_some(),
+        "as the host hasn't heard"
+    );
+
+    w.wires.plug_in();
+    w.wait_link(HostLink::Connected).await;
+    let mut arrived = false;
+    for _ in 0..500 {
+        if w.host.verify_key(&key.secret).unwrap().is_none() {
+            arrived = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(arrived, "the revoke arrived");
+    let mut cleared = false;
+    for _ in 0..250 {
+        let listed = w.rpc("keys.list", json!({})).await;
+        if listed["result"].get("pending_on").is_none() {
+            cleared = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(cleared, "and it no longer says so");
+}
+
+/// The accept deadline is for agent calls, which say they're taken. A clone on a host
+/// says nothing till it's done, and takes as long as it takes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slow_call_thats_not_an_agents_isnt_held_to_the_accept_deadline() {
+    let dir = common::short_tempdir();
+    let bin = dir.path().join("bin");
+    let remotes = dir.path().join("remotes");
+    common::repo(&remotes.join("big"));
+    let gh = common::fake_gh(&bin, &remotes);
+    // Over the deadline, a clone that's slow.
+    let slow = bin.join("slow-gh");
+    std::fs::write(
+        &slow,
+        format!(
+            "#!/bin/sh\ncase \"$1 $2\" in \"repo clone\") sleep 6 ;; esac\nexec {} \"$@\"\n",
+            gh.display()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&slow, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let w = world_with(move |c| c.gh = slow.into()).await;
+    w.add_host().await;
+    w.link().await;
+    // A first call, so the link has a channel and knows what the host says of it.
+    let listed = w.rpc("projects.list", json!({"host": "vps"})).await;
+    assert!(listed["result"].is_object(), "{listed}");
+
+    let begun = std::time::Instant::now();
+    let added = w
+        .rpc("projects.add", json!({"host": "vps", "repo": "o/big"}))
+        .await;
+    assert_eq!(added["result"]["name"], "big", "{added}");
+    assert!(
+        begun.elapsed() > Duration::from_secs(5),
+        "it's meant to outlast the deadline: {:?}",
+        begun.elapsed()
+    );
+}
+
+/// A host's link stays up by its pings here, so what catches it is the deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_that_doesnt_take_a_call_fails_it_at_the_accept_deadline() {
+    let w = world_timed(
+        Timing {
+            ping_timeout: Duration::from_secs(120),
+            ..quick()
+        },
+        |_| {},
+    )
+    .await;
+    w.add_host().await;
+    w.link().await;
+    let t = Target {
+        host: "vps".into(),
+        agent: "nobody".into(),
+    };
+    // The channel's made, and it's said it takes these.
+    let unknown = Daemon::check(&*w.mac, &caller(), &t, false)
+        .await
+        .unwrap_err();
+    assert_eq!(unknown.code, ErrorCode::NotFound.code(), "{unknown:?}");
+
+    w.wires.freeze();
+    let begun = std::time::Instant::now();
+    let failed = Daemon::send(
+        &*w.mac,
+        &caller(),
+        &t,
+        Input::Keys(vec!["y".into()]),
+        "frozen-1",
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        begun.elapsed() < Duration::from_secs(8),
+        "{:?}",
+        begun.elapsed()
+    );
+    assert_eq!(failed.code, ErrorCode::HostUnavailable.code(), "{failed:?}");
+    assert!(failed.is_outcome_unknown(), "{failed:?}");
+    assert!(
+        failed.message.contains("didn't take agents.send"),
+        "{failed:?}"
+    );
+    w.wires.plug_in();
+}
+
+/// Rule 5 on the Mac's side: an agent's added or deleted on a host, whoever by, and
+/// the link's events say so, with no listing asked for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hosts_events_tell_the_mac_where_a_ref_is() {
+    let w = world().await;
+    w.add_host().await;
+    w.link().await;
+    w.host_project().await;
+    let known = |name: &str| Daemon::known_hosts(&*w.mac, &caller(), name);
+    let started = w
+        .host
+        .start_agent(AgentStartParams {
+            project: "app".into(),
+            profile: "software-eng-linux".into(),
+            prompt: "talk".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let mut found = false;
+    for _ in 0..500 {
+        if known(&started.agent) == ["vps"] {
+            found = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(found, "the event told it");
+    w.host
+        .delete_agent(vibe_core::rpc::AgentDeleteParams {
+            host: None,
+            agent: started.agent.clone(),
+            force: Some(true),
+        })
+        .await
+        .unwrap();
+    let mut gone = false;
+    for _ in 0..500 {
+        if known(&started.agent).is_empty() {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(gone, "and its delete too");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_linux_hosts_agents_join_the_macs_view_over_the_link() {
     let w = world().await;
-    let mut events = Conn::open(
-        &serve(
-            Arc::clone(&w.mac),
-            common::short_tempdir(),
-            MAX_MESSAGE_BYTES,
-        )
-        .path,
-    )
-    .await;
+    // Kept for the whole test: dropping it stops the server.
+    let server = serve(
+        Arc::clone(&w.mac),
+        common::short_tempdir(),
+        MAX_MESSAGE_BYTES,
+    );
+    let mut events = Conn::open(&server.path).await;
     assert!(events.call("events.subscribe", json!({})).await["result"].is_object());
     w.add_host().await;
     let h = w.link().await;
@@ -416,6 +744,7 @@ async fn a_linux_hosts_agents_join_the_macs_view_over_the_link() {
             submit: true,
             force: false,
         },
+        "ping-1",
     )
     .await
     .unwrap();
@@ -437,9 +766,23 @@ async fn a_linux_hosts_agents_join_the_macs_view_over_the_link() {
         &caller(),
         &t,
         Input::Keys(vec!["y".into(), "Enter".into()]),
+        "keys-1",
     )
     .await
     .unwrap();
+    // A request id gets over the link to the host that types: there, it knows this
+    // one was for something else, and nothing more is typed.
+    let reused = Daemon::send(
+        &*w.mac,
+        &caller(),
+        &t,
+        Input::Keys(vec!["n".into()]),
+        "keys-1",
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(reused.code, ErrorCode::Conflict.code(), "{reused:?}");
+    assert!(reused.message.contains("different send"), "{reused:?}");
     let check = Daemon::check(&*w.mac, &caller(), &t, false).await.unwrap();
     assert_ne!(check.state, AgentState::Exited);
     assert!(
@@ -478,7 +821,19 @@ async fn a_linux_hosts_agents_join_the_macs_view_over_the_link() {
     let used_there = laptop(on_host).last_used_at;
     assert!(used_there.is_some(), "the host recorded the use");
     assert_eq!(laptop(w.mac.keys().unwrap().keys).last_used_at, None);
-    let listed = w.rpc("keys.list", json!({})).await;
+    // Each listing gives the host a few seconds and then goes without it, as it
+    // should, and a busy machine can use them up. So it's asked again here; a
+    // host that never says fails, and so does a listing that doesn't end.
+    let mut listed = Value::Null;
+    for _ in 0..10 {
+        listed = tokio::time::timeout(Duration::from_secs(20), w.rpc("keys.list", json!({})))
+            .await
+            .expect("a listing doesn't wait on a host for long");
+        if listed["result"]["keys"][0]["last_used_at"].as_str() == used_there.as_deref() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     assert_eq!(
         listed["result"]["keys"][0]["last_used_at"].as_str(),
         used_there.as_deref(),
@@ -488,17 +843,6 @@ async fn a_linux_hosts_agents_join_the_macs_view_over_the_link() {
         laptop(w.mac.keys().unwrap().keys).last_used_at,
         used_there,
         "kept on the Mac"
-    );
-    let refused = w
-        .host
-        .revoke_key(KeyParams {
-            name: "laptop".into(),
-        })
-        .unwrap_err();
-    assert_eq!(
-        refused.code,
-        ErrorCode::Conflict.code(),
-        "revoked on the Mac, not here"
     );
     w.mac
         .revoke_key(KeyParams {
@@ -825,9 +1169,14 @@ async fn a_mac_restarted_keeps_its_hosts_and_links_again() {
     let kept = Daemon::agents(&*mac, &caller(), "vps").await.unwrap();
     assert_eq!(kept.len(), 1, "{kept:?}");
     assert!(!kept[0].available);
+    // Nothing's reached it since this Mac started, so for all it knows, a revoke hasn't.
+    let keys = rpc(&mac, "keys.list", json!({})).await;
+    assert_eq!(keys["result"]["pending_on"], json!(["vps"]), "{keys}");
     wires.plug_in();
     for _ in 0..500 {
-        if mac.link("vps").is_some_and(|l| l.connected()) {
+        let up = mac.link("vps").is_some_and(|l| l.connected());
+        let keys = rpc(&mac, "keys.list", json!({})).await;
+        if up && keys["result"].get("pending_on").is_none() {
             return;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;

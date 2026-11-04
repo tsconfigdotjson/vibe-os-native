@@ -4,6 +4,7 @@
 
 use serde_json::Value;
 use tokio::sync::broadcast;
+use vibe_core::rpc::{ACCEPTS_CALLS, TUNNEL_METHODS};
 use vibe_core::rpc::{
     AgentsCheck, AgentsDelete, AgentsInterrupt, AgentsList, AgentsMessages, AgentsOutput,
     AgentsSend, AgentsStart, DoctorCheckGet, DoctorFix, ErrorCode, ErrorObject, Event,
@@ -61,6 +62,15 @@ impl Session {
         if client.starts_with(LINK_CLIENT) {
             self.link = true;
         }
+    }
+
+    /// The line that says a call has been taken, if this is a link and it's one of
+    /// the agent calls, which can run for a long time.
+    pub(crate) fn accepted_frame(&self, line: &[u8]) -> Option<String> {
+        if !self.link {
+            return None;
+        }
+        vibe_core::rpc::accepted_frame(line, |method| TUNNEL_METHODS.contains(&method))
     }
 
     /// Refuses a call that only the Mac makes of a host over its link: an access
@@ -146,6 +156,9 @@ async fn call(
     method: &str,
     params: Option<Value>,
 ) -> Result<Value, ErrorObject> {
+    if session.link {
+        core.note_mac_heard();
+    }
     // A call for a Linux host goes to its vibed, over its link. While the
     // link is down, its agents are listed as they were last seen.
     if crate::hosts::FORWARDED.contains(&method)
@@ -177,7 +190,11 @@ async fn call(
             }
             let params = decode::<Hello>(params)?;
             session.hello_from(&params.client);
-            encode_result(hello(core.info(), params))
+            let mut answer = encode_result(hello(core.info(), params))?;
+            if session.link {
+                answer[ACCEPTS_CALLS] = Value::Bool(true);
+            }
+            Ok(answer)
         }
         HostsList::NAME => {
             decode::<HostsList>(params)?;

@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
 };
-use vibe_core::rpc::{ErrorObject, MAX_MESSAGE_BYTES, Outcome, Response};
+use vibe_core::rpc::{CALL_ACCEPTED, ErrorObject, MAX_MESSAGE_BYTES, Outcome, Response};
 
 /// A future a [`Remote`] returns.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -266,7 +266,51 @@ impl Channel {
             }
         }
     }
+
+    /// [`Channel::call`] on a peer that sends [`CALL_ACCEPTED`]: it fails with
+    /// [`io::ErrorKind::TimedOut`] if neither that nor the answer comes `within` this
+    /// long, the bytes having gone nobody knows where.
+    pub async fn call_accepted(
+        &mut self,
+        method: &str,
+        params: Value,
+        within: Duration,
+    ) -> io::Result<Result<Value, ErrorObject>> {
+        let id = self.request(method, params).await?;
+        let deadline = tokio::time::Instant::now() + within;
+        let mut accepted = false;
+        loop {
+            let message = if accepted {
+                self.read().await?
+            } else {
+                match tokio::time::timeout_at(deadline, self.read()).await {
+                    Ok(message) => message?,
+                    Err(_) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!("it didn't take {method} in {} s", within.as_secs()),
+                        ));
+                    }
+                }
+            };
+            let Some(message) = message else {
+                return Err(self.closed());
+            };
+            if message.get("id") == Some(&json!(id)) {
+                return outcome(message);
+            }
+            if message.get("method").and_then(Value::as_str) == Some(CALL_ACCEPTED)
+                && message["params"]["id"] == json!(id)
+            {
+                accepted = true;
+            }
+        }
+    }
 }
+
+/// How long a peer that sends [`CALL_ACCEPTED`] has to say it has a call. After that
+/// it's the method's own timeout: a call may take as long as it takes.
+pub(crate) const ACCEPT_WITHIN: Duration = Duration::from_secs(5);
 
 /// A response's result or error.
 pub fn outcome(message: Value) -> io::Result<Result<Value, ErrorObject>> {
@@ -1044,6 +1088,84 @@ fn configure_script(uploads: &[(&str, String)], unit: &str, path: &str) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A channel to a far end the test plays, and that far end.
+    fn a_channel() -> (Channel, tokio::io::DuplexStream) {
+        let (ours, theirs) = tokio::io::duplex(1 << 16);
+        let (read, write) = tokio::io::split(ours);
+        let channel = Channel::new(
+            tokio::io::BufReader::new(read),
+            write,
+            (),
+            Arc::new(Mutex::new(String::new())),
+        );
+        (channel, theirs)
+    }
+
+    #[tokio::test]
+    async fn a_call_nobody_takes_fails_at_the_accept_deadline() {
+        let (mut channel, _silent) = a_channel();
+        let begun = std::time::Instant::now();
+        let e = channel
+            .call_accepted("agents.start", json!({}), Duration::from_millis(100))
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::TimedOut);
+        assert!(e.to_string().contains("didn't take agents.start"), "{e}");
+        assert!(begun.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn a_call_taken_may_take_longer_than_the_deadline() {
+        use tokio::io::AsyncWriteExt;
+        let (mut channel, mut far) = a_channel();
+        let far_end = tokio::spawn(async move {
+            let accepted = json!({"jsonrpc": "2.0", "method": CALL_ACCEPTED, "params": {"id": 1}});
+            far.write_all(format!("{accepted}\n").as_bytes())
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            let answer = json!({"jsonrpc": "2.0", "id": 1, "result": {"done": true}});
+            far.write_all(format!("{answer}\n").as_bytes())
+                .await
+                .unwrap();
+            far
+        });
+        let answer = channel
+            .call_accepted("agents.start", json!({}), Duration::from_millis(100))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(answer["done"], true);
+        far_end.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn only_a_calls_own_accepted_counts_and_an_answer_needs_none() {
+        use tokio::io::AsyncWriteExt;
+        let (mut channel, mut far) = a_channel();
+        let other = json!({"jsonrpc": "2.0", "method": CALL_ACCEPTED, "params": {"id": 99}});
+        far.write_all(format!("{other}\n").as_bytes())
+            .await
+            .unwrap();
+        let e = channel
+            .call_accepted("agents.start", json!({}), Duration::from_millis(100))
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::TimedOut);
+
+        let (mut channel, mut far) = a_channel();
+        let answer = json!({"jsonrpc": "2.0", "id": 1, "result": {"done": true}});
+        far.write_all(format!("{answer}\n").as_bytes())
+            .await
+            .unwrap();
+        let answer = channel
+            .call_accepted("agents.list", json!({}), Duration::from_millis(100))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(answer["done"], true);
+    }
 
     #[test]
     fn the_tunnel_is_its_own_ssh_and_fails_when_its_forward_does() {

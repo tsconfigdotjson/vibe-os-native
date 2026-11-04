@@ -128,6 +128,7 @@ fn rpc_bridges_the_whole_contract() {
     let mut input = Vec::new();
     let mut expected: Vec<Value> = Vec::new();
     let mut said_link = false;
+    let mut taken: Vec<Value> = Vec::new();
     for ex in common::examples(&golden) {
         // What only another host's link can call: this connection says it's one
         // from there on, as a link's would, with the hello it would use.
@@ -140,9 +141,19 @@ fn rpc_bridges_the_whole_contract() {
             input.extend(format!("{hello}\n").into_bytes());
             let mut answer = expected[0].clone();
             answer["id"] = "link".into();
+            answer["result"][vibe_core::rpc::ACCEPTS_CALLS] = true.into();
             expected.push(answer);
         }
         let Some(line) = ex.line else { continue };
+        // And an agent call on a link is said to be taken before it's answered.
+        if said_link
+            && let Some(frame) = vibe_core::rpc::accepted_frame(&line, |method| {
+                vibe_core::rpc::TUNNEL_METHODS.contains(&method)
+            })
+        {
+            let frame: Value = serde_json::from_str(&frame).unwrap();
+            taken.push(frame["params"]["id"].clone());
+        }
         input.extend(line);
         input.push(b'\n');
         if !ex.response.is_null() {
@@ -157,6 +168,25 @@ fn rpc_bridges_the_whole_contract() {
         .lines()
         .map(|l| serde_json::from_str(l).unwrap())
         .collect();
+    // Each frame goes out at once, so it can pass the last call's events, and it only
+    // has to come before its own call's answer.
+    let is_frame = |m: &Value| m["method"] == vibe_core::rpc::CALL_ACCEPTED;
+    assert!(
+        !taken.is_empty(),
+        "the examples have agent calls after that"
+    );
+    for id in &taken {
+        let frame = got
+            .iter()
+            .position(|m| is_frame(m) && m["params"]["id"] == *id)
+            .unwrap_or_else(|| panic!("no call.accepted for {id}"));
+        let answer = got.iter().position(|m| m.get("id") == Some(id)).unwrap();
+        assert!(
+            frame < answer,
+            "{id}: said to be taken only after its answer"
+        );
+    }
+    let got: Vec<Value> = got.into_iter().filter(|m| !is_frame(m)).collect();
     assert_eq!(got, expected);
 }
 

@@ -294,6 +294,21 @@ impl ErrorObject {
         }
     }
 
+    /// Says this call went out and nobody heard how it ended: what it asked
+    /// for may have happened, or may yet.
+    pub fn outcome_unknown(self) -> Self {
+        self.with_data(serde_json::json!({"outcome": "unknown"}))
+    }
+
+    /// Whether [`ErrorObject::outcome_unknown`] said so.
+    pub fn is_outcome_unknown(&self) -> bool {
+        self.data
+            .as_ref()
+            .and_then(|d| d.get("outcome"))
+            .and_then(Value::as_str)
+            == Some("unknown")
+    }
+
     pub fn with_data(mut self, data: impl Serialize) -> Self {
         self.data = Some(serde_json::to_value(data).expect("error data serializes to JSON"));
         self
@@ -880,9 +895,31 @@ impl Method for TunnelCall {
     type Result = Value;
 }
 
-/// The calls the tunnel takes, each for this Mac's own agents only; and
-/// `hosts.list`, answered with this Mac's own row alone, for its memory in
-/// `vibe_list_agents`.
+/// The notification a peer sends as soon as it has a call it will run: `{id}`,
+/// the call's id. What's listening knows within seconds that the far side is there,
+/// however long the call itself goes on to take, so it needn't wait out a long
+/// timeout on a Mac that's asleep. A client that isn't looking for it passes over it.
+pub const CALL_ACCEPTED: &str = "call.accepted";
+
+/// In a `daemon.hello` answer on the tunnel's socket or a link: this peer sends
+/// [`CALL_ACCEPTED`], and on the tunnel's socket gives its memory with `agents.list`.
+/// One without it is older, and isn't held to the accept deadline.
+pub const ACCEPTS_CALLS: &str = "accepts_calls";
+
+/// The [`CALL_ACCEPTED`] line for a message, if it's a call to a `method` that `wanted`
+/// says is to get one.
+pub fn accepted_frame(line: &[u8], wanted: impl FnOnce(&str) -> bool) -> Option<String> {
+    let message: Value = serde_json::from_slice(line).ok()?;
+    let id = message.get("id").filter(|id| !id.is_null())?;
+    wanted(message.get("method")?.as_str()?).then(|| {
+        serde_json::json!({"jsonrpc": "2.0", "method": CALL_ACCEPTED, "params": {"id": id}})
+            .to_string()
+    })
+}
+
+/// The calls the tunnel takes, each for this Mac's own agents only; and `hosts.list`,
+/// answered with this Mac's own row alone, for a host older than its memory coming with
+/// `agents.list`. On a link, these are the calls that get [`CALL_ACCEPTED`].
 pub const TUNNEL_METHODS: &[&str] = &[
     "hosts.list",
     "projects.list",
@@ -904,6 +941,10 @@ pub struct TunnelCallParams {
     pub method: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<Value>,
+    /// When the host sent it, in Unix seconds. A send, start or delete that arrives
+    /// long after, as one held in the tunnel while a Mac slept does, doesn't run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sent_at: Option<i64>,
 }
 
 impl fmt::Debug for TunnelCallParams {
@@ -1177,9 +1218,13 @@ pub struct ApiKey {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_used_at: Option<String>,
     /// It was made on the Mac this host is linked to, and pushed here by its
-    /// hash: revoke it there.
+    /// hash. It's revoked there for everywhere, or here for this host alone.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub pushed: bool,
+    /// On a Linux host: it was pushed here, and the Mac hasn't been heard from in a
+    /// while, so a revoke made there may not have arrived.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stale: bool,
 }
 
 /// A key as the Mac pushes it to its hosts: its hash, never the key.
@@ -1203,6 +1248,10 @@ pub struct KeySyncParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeyList {
     pub keys: Vec<ApiKey>,
+    /// On a Mac: the Linux hosts that haven't had its latest keys, so a revoke isn't
+    /// in force there yet. They get them when they're next reachable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_on: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1681,6 +1730,11 @@ pub struct AgentSendParams {
     /// `"Ctrl+C"`, as `vibe_send` takes them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keys: Option<Vec<String>>,
+    /// Types it at most once: the host that types answers a repeat of this id
+    /// for this agent with how the first went, for about 10 minutes. 1 to 128
+    /// printable ASCII characters, no spaces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

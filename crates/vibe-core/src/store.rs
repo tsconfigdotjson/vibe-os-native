@@ -145,6 +145,13 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE agents ADD COLUMN agent TEXT NOT NULL DEFAULT 'claude';
     ALTER TABLE agents ADD COLUMN pi_model TEXT;
     ",
+    // 7: pushed keys revoked on this host (#59), by their hashes, so that the Mac's
+    // next push doesn't bring them back.
+    "
+    CREATE TABLE revoked_pushed_keys (
+        hash TEXT PRIMARY KEY
+    ) STRICT;
+    ",
 ];
 
 /// The schema version this build reads and writes.
@@ -997,7 +1004,21 @@ impl Store {
             }
         }
         tx.execute("DELETE FROM pushed_keys", [])?;
-        for k in keys {
+        // Revoked here, and so it stays. One the Mac has stopped pushing needn't be
+        // remembered: no key comes back with the same hash but by chance.
+        let mut revoked = std::collections::HashSet::new();
+        {
+            let mut stmt = tx.prepare("SELECT hash FROM revoked_pushed_keys")?;
+            for row in stmt.query_map([], |r| r.get::<_, String>(0))? {
+                let hash = row?;
+                if hashes.contains(&hash.as_str()) {
+                    revoked.insert(hash);
+                } else {
+                    tx.execute("DELETE FROM revoked_pushed_keys WHERE hash = ?1", [&hash])?;
+                }
+            }
+        }
+        for k in keys.iter().filter(|k| !revoked.contains(&k.hash)) {
             tx.execute(
                 "INSERT INTO pushed_keys (name, hash, prefix, created_at, last_used_at)
                  VALUES (?1, ?2, ?3, ?4, ?5)
@@ -1015,6 +1036,28 @@ impl Store {
         Ok(())
     }
 
+    /// The pushed key `name`, gone for good on this host, if there is one.
+    fn revoke_pushed_key(&mut self, name: &str) -> Result<Option<ApiKey>> {
+        let tx = self.conn.transaction()?;
+        let found = tx
+            .query_row(
+                &format!("SELECT {PUSHED_KEY_COLUMNS}, hash FROM pushed_keys WHERE name = ?1"),
+                [name],
+                |r| Ok((pushed_key_row(r)?, r.get::<_, String>("hash")?)),
+            )
+            .optional()?;
+        let Some((key, hash)) = found else {
+            return Ok(None);
+        };
+        tx.execute(
+            "INSERT OR IGNORE INTO revoked_pushed_keys (hash) VALUES (?1)",
+            [&hash],
+        )?;
+        tx.execute("DELETE FROM pushed_keys WHERE hash = ?1", [&hash])?;
+        tx.commit()?;
+        Ok(Some(key))
+    }
+
     fn key(&self, name: &str) -> Result<ApiKey> {
         self.conn
             .query_row(
@@ -1026,26 +1069,13 @@ impl Store {
             .ok_or_else(|| StoreError::NotFound(format!("no key named {name}")))
     }
 
-    /// Deletes a key, so its hash matches nothing from now on. A key pushed
-    /// by a Mac is revoked there, which pushes the change.
+    /// Deletes a key, so its hash matches nothing from now on. A key pushed here goes
+    /// for this host alone, and stays gone whatever the Mac pushes next: it's how a host
+    /// shuts out a key that's leaked while the Mac is away.
     pub fn revoke_key(&mut self, name: &str) -> Result<ApiKey> {
         let key = match self.key(name) {
             Err(StoreError::NotFound(m)) => {
-                let pushed = self
-                    .conn
-                    .query_row("SELECT 1 FROM pushed_keys WHERE name = ?1", [name], |_| {
-                        Ok(())
-                    })
-                    .optional()?
-                    .is_some();
-                return Err(if pushed {
-                    StoreError::Conflict(format!(
-                        "{name} was made on the Mac this host is linked to: revoke it there, in \
-                         Settings → API keys"
-                    ))
-                } else {
-                    StoreError::NotFound(m)
-                });
+                return self.revoke_pushed_key(name)?.ok_or(StoreError::NotFound(m));
             }
             other => other?,
         };
@@ -1207,6 +1237,7 @@ fn key_row(r: &Row<'_>) -> rusqlite::Result<ApiKey> {
         created_at: rfc3339(r.get(2)?),
         last_used_at: r.get::<_, Option<i64>>(3)?.map(rfc3339),
         pushed: false,
+        stale: false,
     })
 }
 
@@ -1217,6 +1248,7 @@ fn pushed_key_row(r: &Row<'_>) -> rusqlite::Result<ApiKey> {
         created_at: r.get(2)?,
         last_used_at: r.get::<_, Option<i64>>(3)?.map(rfc3339),
         pushed: true,
+        stale: false,
     })
 }
 
@@ -1446,6 +1478,42 @@ mod tests {
     }
 
     #[test]
+    fn a_pushed_key_revoked_here_stays_revoked_whatever_is_pushed_next() {
+        let mut s = store();
+        let pushed = |name: &str, hash: &str| KeyHash {
+            name: name.into(),
+            prefix: format!("vk_{name}"),
+            hash: hash.into(),
+            created_at: "2026-10-30T12:00:00Z".into(),
+        };
+        s.sync_pushed_keys(&[pushed("laptop", "h1"), pushed("ci", "h2")])
+            .unwrap();
+        let gone = s.revoke_key("laptop").unwrap();
+        assert!(gone.pushed);
+        assert_eq!(s.use_key("h1", 10).unwrap(), None);
+        assert!(s.use_key("h2", 10).unwrap().is_some(), "only that one");
+
+        // The Mac doesn't know, and pushes it again.
+        s.sync_pushed_keys(&[pushed("laptop", "h1"), pushed("ci", "h2")])
+            .unwrap();
+        assert_eq!(s.use_key("h1", 20).unwrap(), None);
+        let names: Vec<_> = s.keys().unwrap().into_iter().map(|k| k.name).collect();
+        assert_eq!(names, ["ci"]);
+
+        // A new key of the same name is another key.
+        s.sync_pushed_keys(&[pushed("laptop", "h3"), pushed("ci", "h2")])
+            .unwrap();
+        assert!(s.use_key("h3", 30).unwrap().is_some());
+
+        // Once the Mac stops pushing it, there's nothing left to remember.
+        let left: i64 = s
+            .conn
+            .query_row("SELECT COUNT(*) FROM revoked_pushed_keys", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 0);
+    }
+
+    #[test]
     fn pushed_keys() {
         let mut s = store();
         s.create_key("own", "h0", "vk_own", 1).unwrap();
@@ -1474,9 +1542,6 @@ mod tests {
             .collect();
         assert_eq!(hashes, ["h0"]);
 
-        // A pushed key is revoked on the Mac, not here.
-        let refused = s.revoke_key("laptop").unwrap_err();
-        assert!(matches!(refused, StoreError::Conflict(_)), "{refused}");
         assert!(matches!(s.revoke_key("nope"), Err(StoreError::NotFound(_))));
 
         // The next push replaces them all; a key kept keeps its last use.

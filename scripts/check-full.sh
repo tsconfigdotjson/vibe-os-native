@@ -61,7 +61,10 @@
 #     by the key's name (never the key), sees the Mac's agents unavailable
 #     while the Mac is offline and the host's still answering, and is cut
 #     off on the host when the key is revoked on the Mac; the Mac listens on
-#     no public port. (crates/vibed/tests/external.rs, in the test step,
+#     no public port. Then, with the tunnel's relay stopped as with a Mac
+#     asleep (#59), every tool for the host's own agents answers in under 5 s,
+#     the listing merges back when it resumes, and with the Mac stopped
+#     altogether, the same. (crates/vibed/tests/external.rs, in the test step,
 #     covers the same in one process, plus rate limits, the Mac refusing a
 #     host's own key and a revoked one even before the host hears, and the
 #     tunnel's supervision.)
@@ -86,7 +89,9 @@
 #     tunnel comes up; then a client on the internet with
 #     https://<domain>/mcp and a key starts and talks to an agent on the
 #     Mac, and one on the server when VIBE_TEST_LINUX_PROJECT names a
-#     project there; it gets nothing without a key, nothing once the key is
+#     project there; with that ssh stopped, as with a Mac asleep, the server
+#     still lists it all promptly, with the Mac's agents as last seen, and
+#     has them back once it resumes; it gets nothing without a key, nothing once the key is
 #     revoked, and the Mac listens on no public port
 #   - the Linux host's cgroups backend on this machine, on Linux with a
 #     systemd user manager (N/A otherwise; on a Mac, the real-host step runs

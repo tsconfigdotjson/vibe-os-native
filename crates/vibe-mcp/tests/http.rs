@@ -5,8 +5,9 @@ mod client;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use client::{Client, post_raw, text};
 use serde_json::{Value, json};
@@ -25,6 +26,17 @@ const KEY: &str = "vk_aaaqeayeaudaocajbifqydiob4ibceqtcqkrmfyydenbwha5dypq";
 struct Fake {
     log: Mutex<Vec<String>>,
     sends: Mutex<Vec<(Target, Input)>>,
+    request_ids: Mutex<Vec<String>>,
+    /// Sends go out and nothing's heard of them again.
+    sends_lost: AtomicBool,
+    /// Sends find their host unavailable before they go.
+    sends_refused: AtomicBool,
+    /// A third host, `vps2`, and `twin`, an agent on it and on `vps`.
+    third_host: AtomicBool,
+    /// [`Daemon::known_hosts`].
+    known: Mutex<HashMap<String, Vec<String>>>,
+    /// [`Daemon::known_project_hosts`].
+    known_projects: Mutex<HashMap<String, Vec<String>>>,
     starts: Mutex<Vec<AgentStartParams>>,
     deletes: Mutex<Vec<AgentDeleteParams>>,
     /// How many checks each agent stays busy for before it has answered;
@@ -41,6 +53,8 @@ struct Fake {
     backgrounds: Mutex<Vec<bool>>,
     /// History given with `after`.
     history: Mutex<Option<Vec<String>>>,
+    /// `vps` takes every listing and never answers, as a host stalling would.
+    stuck: AtomicBool,
     /// Checks of an agent, by their count, that find its host's link down.
     link_down: Mutex<HashMap<String, std::ops::RangeInclusive<u32>>>,
 }
@@ -109,6 +123,9 @@ fn all_agents() -> Vec<Agent> {
 
 impl Fake {
     fn find(&self, t: &Target) -> Result<Agent, ErrorObject> {
+        if t.agent == "twin" && self.third_host.load(Ordering::SeqCst) && t.host != "local" {
+            return Ok(agent(&t.host, "twin", "app", AgentState::Idle));
+        }
         all_agents()
             .into_iter()
             .find(|a| a.host == t.host && a.agent == t.agent)
@@ -125,14 +142,40 @@ impl Daemon for Fake {
         (secret == KEY).then(|| "laptop".to_owned())
     }
 
+    fn known_hosts(&self, _c: &Caller, agent: &str) -> Vec<String> {
+        self.known
+            .lock()
+            .unwrap()
+            .get(agent)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn known_project_hosts(&self, _c: &Caller, project: &str) -> Vec<String> {
+        self.known_projects
+            .lock()
+            .unwrap()
+            .get(project)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     async fn hosts(&self) -> Result<Vec<String>, ErrorObject> {
-        Ok(vec!["local".into(), "vps".into(), "down".into()])
+        let mut hosts = vec!["local".to_owned(), "vps".to_owned(), "down".to_owned()];
+        if self.third_host.load(Ordering::SeqCst) {
+            hosts.push("vps2".to_owned());
+        }
+        Ok(hosts)
     }
 
     async fn projects(&self, _c: &Caller, host: &str) -> Result<Vec<Project>, ErrorObject> {
+        if host == "vps" && self.stuck.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
         match host {
             "local" => Ok(vec![project("local", "app"), project("local", "web")]),
             "vps" => Ok(vec![project("vps", "web")]),
+            "vps2" => Ok(vec![]),
             "down" => Err(ErrorObject::new(
                 ErrorCode::InternalError,
                 "its link is down",
@@ -142,18 +185,25 @@ impl Daemon for Fake {
     }
 
     async fn agents(&self, _c: &Caller, host: &str) -> Result<Vec<AgentView>, ErrorObject> {
+        if host == "vps" && self.stuck.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
         if host == "down" {
             return Err(ErrorObject::new(
                 ErrorCode::InternalError,
                 "its link is down",
             ));
         }
+        let twin = (self.third_host.load(Ordering::SeqCst) && host != "local")
+            .then(|| agent(host, "twin", "app", AgentState::Idle));
         Ok(all_agents()
             .into_iter()
             .filter(|a| a.host == host)
+            .chain(twin)
             .map(|a| AgentView {
                 attach_remote: format!("ssh -t mac {}", a.attach),
                 available: true,
+                last_seen: None,
                 agent: a,
             })
             .collect())
@@ -182,8 +232,28 @@ impl Daemon for Fake {
         Ok(a)
     }
 
-    async fn send(&self, _c: &Caller, t: &Target, input: Input) -> Result<Sent, ErrorObject> {
+    async fn send(
+        &self,
+        _c: &Caller,
+        t: &Target,
+        input: Input,
+        request_id: &str,
+    ) -> Result<Sent, ErrorObject> {
         let a = self.find(t)?;
+        self.request_ids.lock().unwrap().push(request_id.to_owned());
+        if self.sends_lost.load(Ordering::SeqCst) {
+            return Err(ErrorObject::new(
+                ErrorCode::HostUnavailable,
+                "vps is unavailable: its link is down. Outcome unknown: check vibe_read_messages before resending",
+            )
+            .outcome_unknown());
+        }
+        if self.sends_refused.load(Ordering::SeqCst) {
+            return Err(ErrorObject::new(
+                ErrorCode::HostUnavailable,
+                "vps is unavailable: its link is down, so nothing was sent",
+            ));
+        }
         self.sends.lock().unwrap().push((t.clone(), input));
         Ok(Sent {
             woke: a.state == AgentState::Asleep,
@@ -192,6 +262,9 @@ impl Daemon for Fake {
     }
 
     async fn check(&self, _c: &Caller, t: &Target, background: bool) -> Result<Check, ErrorObject> {
+        if t.host == "vps" && self.stuck.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
         self.backgrounds.lock().unwrap().push(background);
         let a = self.find(t)?;
         let n = {
@@ -589,6 +662,245 @@ async fn agents_on_every_host_filtered() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_that_doesnt_answer_holds_up_nothing_of_this_ones() {
+    let (fake, mut c) = client().await;
+    fake.stuck.store(true, Ordering::SeqCst);
+
+    let started = Instant::now();
+    let r = c.call("vibe_list_agents", json!({})).await;
+    let t = text(&r);
+    assert!(t.contains("quiet-amber-otter  idle"), "{t}");
+    assert!(
+        t.contains("vps is unavailable: didn't answer in 3 s"),
+        "{t}"
+    );
+    let r = c.call("vibe_list_projects", json!({})).await;
+    let t = text(&r);
+    assert!(t.contains("app (on local)"), "{t}");
+    assert!(
+        t.contains("vps is unavailable: didn't answer in 3 s"),
+        "{t}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "{:?}",
+        started.elapsed()
+    );
+
+    // A bare ref this host has doesn't ask anyone, stuck or not.
+    let started = Instant::now();
+    c.call("vibe_read_output", json!({"agent": "quiet-amber-otter"}))
+        .await;
+    assert!(started.elapsed() < Duration::from_secs(2));
+
+    // And a project this host has goes here, with the other only let go.
+    let r = c
+        .call(
+            "vibe_start_agent",
+            json!({"project": "web", "profile": "p", "prompt": "go"}),
+        )
+        .await;
+    assert!(text(&r).contains("on local"), "{r}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bare_ref_on_two_other_hosts_is_an_error_known_or_asked() {
+    let (fake, mut c) = client().await;
+    fake.third_host.store(true, Ordering::SeqCst);
+    let said = "twin is on vps and vps2: name it with its host, as vps:twin or vps2:twin";
+
+    // Asked.
+    let e = c.fails("vibe_read_output", json!({"agent": "twin"})).await;
+    assert!(e.contains(said), "{e}");
+
+    // Known from before, on both: the same, and not whichever comes first.
+    fake.known
+        .lock()
+        .unwrap()
+        .insert("twin".into(), vec!["vps".into(), "vps2".into()]);
+    let e = c
+        .fails("vibe_send", json!({"agent": "twin", "text": "hi"}))
+        .await;
+    assert!(e.contains(said), "{e}");
+    assert!(fake.sends.lock().unwrap().is_empty());
+
+    // Naming the host says which.
+    c.call("vibe_send", json!({"agent": "vps2:twin", "text": "hi"}))
+        .await;
+
+    // Known on one, with the others stuck: it goes there, with no waiting.
+    fake.known
+        .lock()
+        .unwrap()
+        .insert("twin".into(), vec!["vps".into()]);
+    fake.stuck.store(true, Ordering::SeqCst);
+    let begun = Instant::now();
+    c.call("vibe_send", json!({"agent": "twin", "text": "hi"}))
+        .await;
+    assert!(begun.elapsed() < Duration::from_secs(2));
+
+    // This host having it beats any of that.
+    fake.known
+        .lock()
+        .unwrap()
+        .insert("slow".into(), vec!["vps".into(), "vps2".into()]);
+    c.call("vibe_send", json!({"agent": "slow", "text": "hi"}))
+        .await;
+    assert_eq!(fake.sends.lock().unwrap().last().unwrap().0.host, "local");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lookups_say_when_a_host_just_didnt_answer() {
+    let (fake, mut c) = client().await;
+    fake.stuck.store(true, Ordering::SeqCst);
+
+    // Not a plain not-found: it may well be on the host that didn't answer.
+    let e = c
+        .fails("vibe_read_output", json!({"agent": "nobody"}))
+        .await;
+    assert!(e.contains("nobody isn't on any host that answered"), "{e}");
+    assert!(e.contains("vps didn't"), "{e}");
+    let e = c
+        .fails(
+            "vibe_start_agent",
+            json!({"project": "nope", "profile": "p", "prompt": "go"}),
+        )
+        .await;
+    assert!(
+        e.contains("no project called nope on any host that answered, and vps didn't"),
+        "{e}"
+    );
+
+    // A project last seen there is still there, so this is no quicker a way to say
+    // which: the same answer it gets from a host that answers in time.
+    fake.known_projects
+        .lock()
+        .unwrap()
+        .insert("web".into(), vec!["vps".into()]);
+    let e = c
+        .fails(
+            "vibe_start_agent",
+            json!({"project": "web", "profile": "p", "prompt": "go"}),
+        )
+        .await;
+    assert!(
+        e.contains("web is a project on local and vps: pass host to say which"),
+        "{e}"
+    );
+    assert!(fake.starts.lock().unwrap().is_empty());
+
+    // And one only there goes there, to fail or not as that host's calls do.
+    fake.known_projects
+        .lock()
+        .unwrap()
+        .insert("only-there".into(), vec!["vps".into()]);
+    c.call(
+        "vibe_start_agent",
+        json!({"project": "only-there", "profile": "p", "prompt": "go"}),
+    )
+    .await;
+    let starts = fake.starts.lock().unwrap();
+    assert_eq!(starts.last().unwrap().host.as_deref(), Some("vps"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_wait_doesnt_stand_behind_a_host_that_doesnt_answer() {
+    let (fake, mut c) = client().await;
+    fake.busy_for
+        .lock()
+        .unwrap()
+        .insert("quiet-amber-otter".into(), 0);
+    fake.stuck.store(true, Ordering::SeqCst);
+    let begun = Instant::now();
+    let r = c
+        .call(
+            "vibe_wait",
+            json!({"agents": ["vps:remote-only", "local:quiet-amber-otter"], "timeout": 60}),
+        )
+        .await;
+    assert!(
+        text(&r).starts_with("quiet-amber-otter has answered"),
+        "{}",
+        text(&r)
+    );
+    assert!(
+        begun.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        begun.elapsed()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_send_that_may_have_arrived_says_how_to_retry_it_safely() {
+    let (fake, mut c) = client().await;
+    // Every send carries an id, each its own unless the caller gives one.
+    for args in [
+        json!({"agent": "slow", "text": "one"}),
+        json!({"agent": "slow", "text": "one"}),
+        json!({"agent": "slow", "text": "two", "request_id": "mine-1"}),
+    ] {
+        c.call("vibe_send", args).await;
+    }
+    {
+        let ids = fake.request_ids.lock().unwrap();
+        assert_eq!(ids.len(), 3);
+        assert_ne!(ids[0], ids[1]);
+        assert_eq!(ids[2], "mine-1");
+    }
+
+    // A host unavailable names the id to retry with.
+    fake.sends_lost.store(true, Ordering::SeqCst);
+    let e = c
+        .fails("vibe_send", json!({"agent": "slow", "text": "three"}))
+        .await;
+    let id = fake.request_ids.lock().unwrap().last().unwrap().clone();
+    assert!(e.contains("vps is unavailable"), "{e}");
+    assert!(e.contains(&format!("request_id \"{id}\"")), "{e}");
+
+    // It says to look first, and that the id delivers it at most once.
+    assert!(e.contains("check vibe_read_messages"), "{e}");
+    assert!(e.contains("at most once"), "{e}");
+
+    // Yours is the one it names, if you gave one.
+    let e = c
+        .fails(
+            "vibe_send",
+            json!({"agent": "slow", "text": "three", "request_id": "mine-2"}),
+        )
+        .await;
+    assert!(e.contains("request_id \"mine-2\""), "{e}");
+    fake.sends_lost.store(false, Ordering::SeqCst);
+
+    // One known not to have gone is in no doubt, whatever its host is up to.
+    fake.sends_refused.store(true, Ordering::SeqCst);
+    let e = c
+        .fails("vibe_send", json!({"agent": "slow", "text": "three"}))
+        .await;
+    assert!(e.contains("nothing was sent"), "{e}");
+    assert!(!e.contains("request_id"), "{e}");
+    fake.sends_refused.store(false, Ordering::SeqCst);
+
+    // Nor is anything else, and it doesn't mention it.
+    let e = c
+        .fails("vibe_send", json!({"agent": "nobody", "text": "four"}))
+        .await;
+    assert!(!e.contains("request_id"), "{e}");
+
+    // A bad id goes nowhere.
+    let before = fake.request_ids.lock().unwrap().len();
+    for bad in ["", "has space", &"x".repeat(129)] {
+        let e = c
+            .fails(
+                "vibe_send",
+                json!({"agent": "slow", "text": "five", "request_id": bad}),
+            )
+            .await;
+        assert!(e.contains("request_id must be"), "{e}");
+    }
+    assert_eq!(fake.request_ids.lock().unwrap().len(), before);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sends_route_by_ref_and_type_text_or_keys() {
     let (fake, mut c) = client().await;
     let r = c
@@ -695,18 +1007,12 @@ async fn sends_route_by_ref_and_type_text_or_keys() {
         .fails("vibe_send", json!({"agent": "slow", "keys": ["F13"]}))
         .await;
     assert!(e.starts_with("unknown key \"F13\""), "{e}");
-    // A bare ref on two hosts must say which; one on none is the core's
-    // not-found, with where to look.
-    let e = c
-        .fails(
-            "vibe_send",
-            json!({"agent": "quiet-amber-otter", "text": "x"}),
-        )
+    // A bare ref on this host and another is this host's; one on none is the
+    // core's not-found, with where to look.
+    c.call("vibe_read_output", json!({"agent": "quiet-amber-otter"}))
         .await;
-    assert_eq!(
-        e,
-        "quiet-amber-otter is on local and vps: name it with its host, as local:quiet-amber-otter or vps:quiet-amber-otter"
-    );
+    let read = fake.reads.lock().unwrap().last().unwrap().0.clone();
+    assert_eq!(read.host, "local");
     let e = c
         .fails("vibe_send", json!({"agent": "ghost", "text": "x"}))
         .await;

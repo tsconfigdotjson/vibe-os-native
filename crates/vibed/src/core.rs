@@ -71,6 +71,10 @@ pub type TailscaleAddresses = Arc<dyn Fn() -> Vec<std::net::IpAddr> + Send + Syn
 /// where that can't be told.
 pub type FreeDisk = Arc<dyn Fn(&Path) -> Option<u64> + Send + Sync>;
 
+/// Seconds without hearing from the Mac before keys it pushed count as stale. Its link
+/// pings far more often than this, so that's a Mac away, not a quiet one.
+const KEYS_STALE_AFTER: i64 = 10 * 60;
+
 /// Everything [`Core::open`] needs. Tests swap the clock, the randomness and
 /// `gh` for fixed ones.
 pub struct Config {
@@ -356,6 +360,10 @@ pub struct Core {
     /// What's wrong with a copy of Pi's login, or with the store, by what it's
     /// about (PRD: Who gets which credentials).
     pub(crate) pi_alerts: Mutex<std::collections::BTreeMap<String, String>>,
+    /// When a Mac was last heard from over a link, or else when this `vibed` started.
+    pub(crate) mac_heard: Mutex<i64>,
+    /// Sends made with a request id, by agent and id: see [`Core::send_once`].
+    pub(crate) sends_kept: Mutex<HashMap<String, crate::talk::KeptSend>>,
     /// Held while a send types into an agent, so two can't interleave.
     pub(crate) typing: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// One fetch at a time per project, as concurrent fetches of the same
@@ -518,6 +526,7 @@ impl Core {
                 }
             }
         }
+        let heard_at_start = (config.clock)();
         let mut store = Store::open(&config.layout.db()).map_err(OpenError::Store)?;
         store
             .ensure_host(LOCAL_HOST, &config.info.os, &config.label, (config.clock)())
@@ -598,6 +607,8 @@ impl Core {
             sends: Mutex::new(HashMap::new()),
             pi_sent_at: Mutex::new(HashMap::new()),
             pi_alerts: Mutex::new(std::collections::BTreeMap::new()),
+            mac_heard: Mutex::new(heard_at_start),
+            sends_kept: Mutex::new(HashMap::new()),
             typing: Mutex::new(HashMap::new()),
             store: Mutex::new(store),
             limits_lock: Mutex::new(()),
@@ -1106,8 +1117,22 @@ impl Core {
     // API keys.
 
     pub fn keys(&self) -> Result<KeyList, ErrorObject> {
-        let keys = self.store().keys().map_err(store_error)?;
-        Ok(KeyList { keys })
+        let mut keys = self.store().keys().map_err(store_error)?;
+        let quiet = self.now().saturating_sub(*lock(&self.mac_heard));
+        if quiet > KEYS_STALE_AFTER {
+            for key in keys.iter_mut().filter(|k| k.pushed) {
+                key.stale = true;
+            }
+        }
+        Ok(KeyList {
+            keys,
+            pending_on: Vec::new(),
+        })
+    }
+
+    /// The Mac's been heard from over a link, so a revoke made there would have come.
+    pub(crate) fn note_mac_heard(&self) {
+        *lock(&self.mac_heard) = self.now();
     }
 
     pub fn create_key(&self, p: KeyCreateParams) -> Result<KeyCreated, ErrorObject> {

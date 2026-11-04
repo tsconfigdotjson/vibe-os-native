@@ -402,7 +402,7 @@ fn mac_with(
     });
     config.link_timing = Timing {
         ping_every: Duration::from_millis(500),
-        ping_timeout: Duration::from_secs(2),
+        ping_timeout: Duration::from_secs(6),
         connect_timeout: Duration::from_secs(20),
         min_backoff: Duration::from_millis(200),
         max_backoff: Duration::from_secs(1),
@@ -1411,6 +1411,217 @@ fn external_access_through_a_linux_host() {
     drop(mac.rt);
 }
 
+/// The tunnel's relays, which don't outlast the test stopped, whatever becomes of it.
+struct Relays(Vec<String>);
+
+impl Relays {
+    fn signal(&self, which: &str) {
+        for pid in &self.0 {
+            // It may have gone by itself, once the Mac has.
+            let _ = Command::new("kill").args([which, pid]).status();
+        }
+    }
+}
+
+impl Drop for Relays {
+    fn drop(&mut self) {
+        self.signal("-KILL");
+    }
+}
+
+/// One round of every tool a host's own agents need, as a caller makes them, or the first
+/// that took 5 s or more. `name` is this round's agent.
+fn one_round_of_local_tools(c: &mut Outside, name: &str) -> Result<(), String> {
+    let mut timed = |tool: &str, args: Value| {
+        let begun = Instant::now();
+        let said = c.call(tool, args);
+        let took = begun.elapsed();
+        if took < Duration::from_secs(5) {
+            Ok(said)
+        } else {
+            Err(format!("{tool} took {took:?}: {said}"))
+        }
+    };
+    let listed = timed("vibe_list_agents", json!({}))?;
+    assert!(listed.contains("on-vps"), "{listed}");
+    let projects = timed("vibe_list_projects", json!({}))?;
+    assert!(projects.contains("host-only (on local)"), "{projects}");
+    // A project only this host has, with no host named.
+    let started = timed(
+        "vibe_start_agent",
+        json!({"project": "host-only", "profile": "small", "prompt": "talk", "name": name}),
+    )?;
+    assert!(started.contains(&format!("started {name}")), "{started}");
+    // A bare ref on this host, through all of it.
+    let sent = timed("vibe_send", json!({"agent": name, "text": "hello"}))?;
+    assert!(sent.contains("sent to"), "{sent}");
+    timed("vibe_wait", json!({"agents": name, "timeout": 4}))?;
+    timed("vibe_read_output", json!({"agent": name}))?;
+    timed("vibe_read_messages", json!({"agent": name, "last": 1}))?;
+    let deleted = timed("vibe_delete_agent", json!({"agent": name, "force": true}))?;
+    assert!(deleted.contains("deleted"), "{deleted}");
+    Ok(())
+}
+
+/// Every local tool under 5 s, whatever's become of the Mac. A busy machine can stall
+/// any of them, with a healthy Mac too, so a slow round gets another go. Anything waiting
+/// on the Mac would be slow every time, and so fail.
+fn every_local_tool_answers_promptly(c: &mut Outside, when: &str) {
+    let mut last = String::new();
+    for round in 0..3 {
+        let name = format!("while-{when}-{round}");
+        match one_round_of_local_tools(c, &name) {
+            Ok(()) => return,
+            Err(why) => {
+                eprintln!("{when}, round {round}: {why}");
+                last = why;
+                // What it started may be left: it's only in the way of nothing.
+                let _ = c.call("vibe_delete_agent", json!({"agent": name, "force": true}));
+            }
+        }
+    }
+    panic!("{when}: every round had something slow, the last: {last}");
+}
+
+/// #59's integration, in real processes: a Mac and a Linux host's `vibed`, with the
+/// tunnel's stand-in relay stopped, as with a Mac asleep, so its end on the host goes on
+/// accepting with nothing behind it; then resumed, merging back; then the Mac stopped.
+#[test]
+fn external_access_answers_with_the_mac_asleep_or_stopped() {
+    let golden = common::Golden::new();
+    let hosts = common::short_tempdir();
+    let ssh = fake_ssh(hosts.path());
+    let host = FakeHost::new(hosts.path(), "me@vps", &golden.claude);
+    let port = free_port().port();
+    let ca = host.serve_publicly(port, "vps.test");
+    let mac = mac(&golden, &ssh, bundle(golden.dir.path()));
+    ok(vibe(&mac.socket, &["host", "add", "vps", "me@vps"]));
+    let vps_line = |socket: &Path| {
+        ok(vibe(socket, &["host"]))
+            .lines()
+            .find(|l| l.starts_with("vps  "))
+            .unwrap_or_default()
+            .to_owned()
+    };
+    wait_for("the link", Duration::from_secs(30), || {
+        vps_line(&mac.socket).contains("  connected")
+    });
+    let app = golden.home.join("src/app");
+    ok(vibe(
+        &mac.socket,
+        &["project", "add", app.to_str().unwrap()],
+    ));
+    let host_only = host.home.join("src/host-only");
+    common::repo(&host_only);
+    for path in [host.home.join("src/app"), host_only] {
+        ok(vibe(
+            &mac.socket,
+            &["project", "add", "--host", "vps", path.to_str().unwrap()],
+        ));
+    }
+    for project in ["app", "host-only"] {
+        ok(vibe(
+            &mac.socket,
+            &[
+                "profile", "create", project, "small", "--memory", "1G", "--host", "vps",
+            ],
+        ));
+    }
+    let on = ok(vibe(&mac.socket, &["host", "external", "vps", "vps.test"]));
+    assert!(on.contains("external address https://vps.test/mcp"), "{on}");
+    wait_for("the tunnel", Duration::from_secs(60), || {
+        vps_line(&mac.socket).contains("tunnel up")
+    });
+    let key = mac
+        .core
+        .create_key(KeyCreateParams {
+            name: "laptop".into(),
+        })
+        .unwrap()
+        .secret;
+    let socket = host.socket();
+    wait_for("the key pushed", Duration::from_secs(20), || {
+        ok(vibe(&socket, &["key"])).contains("laptop")
+    });
+    let mut c = Outside {
+        url: format!("https://vps.test:{port}/mcp"),
+        ca: Some(ca.clone()),
+        resolve: Some(format!("vps.test:{port}:127.0.0.1")),
+        key: Some(key),
+        next: 0,
+    };
+    let (code, body) = c.request(
+        "initialize",
+        json!({"protocolVersion": "2025-06-18", "capabilities": {},
+               "clientInfo": {"name": "outside", "version": "1"}}),
+    );
+    assert_eq!(code, 200, "{body}");
+    for (profile, whose, name) in [
+        ("small", "local", "on-vps"),
+        ("software-eng-mac", "mac", "on-mac"),
+    ] {
+        let started = c.call(
+            "vibe_start_agent",
+            json!({"project": "app", "profile": profile, "prompt": "talk", "host": whose,
+                   "name": name}),
+        );
+        assert!(started.contains("started"), "{started}");
+    }
+    c.talk("on-vps");
+    c.talk("mac:on-mac");
+    let merged = |c: &mut Outside| {
+        let listed = c.call("vibe_list_agents", json!({}));
+        listed.contains("on-vps")
+            && listed.contains("mac:on-mac")
+            && !listed.contains("unavailable")
+    };
+    wait_for("both in one listing", Duration::from_secs(30), || {
+        merged(&mut c)
+    });
+
+    // The Mac sleeps: the tunnel's relay stops, with its socket on the host still there.
+    let relay = fs::canonicalize(hosts.path()).unwrap().join("relay.py");
+    let found = Command::new("pgrep")
+        .args(["-f", relay.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let relays: Vec<String> = String::from_utf8_lossy(&found.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert!(!relays.is_empty(), "the tunnel's relay isn't running");
+    let relays = Relays(relays);
+    relays.signal("-STOP");
+    // First, as a Mac still up restarts a tunnel gone quiet for a minute, which forgets
+    // what it listed, and that's not what's being shown here.
+    let listed = c.call("vibe_list_agents", json!({}));
+    let mac_row = listed
+        .lines()
+        .find(|l| l.starts_with("mac:on-mac"))
+        .unwrap_or_else(|| panic!("{listed}"));
+    assert!(mac_row.contains("unavailable"), "{listed}");
+    every_local_tool_answers_promptly(&mut c, "asleep");
+
+    // It wakes, and it all merges back with nothing done.
+    relays.signal("-CONT");
+    wait_for("the Mac back", Duration::from_secs(60), || merged(&mut c));
+    let read = c.call(
+        "vibe_read_messages",
+        json!({"agent": "mac:on-mac", "last": 1}),
+    );
+    assert!(!read.contains("unavailable"), "{read}");
+
+    // The Mac stops altogether: the same.
+    drop(mac.rt);
+    let listed = c.call("vibe_list_agents", json!({}));
+    let mac_row = listed
+        .lines()
+        .find(|l| l.starts_with("mac:on-mac"))
+        .unwrap_or_else(|| panic!("{listed}"));
+    assert!(mac_row.contains("unavailable"), "{listed}");
+    every_local_tool_answers_promptly(&mut c, "stopped");
+}
+
 /// External access through a real server (`VIBE_TEST_LINUX_HOST`, with the
 /// Linux builds in `VIBE_HOST_BUNDLE`) at a public name pointing at it
 /// (`VIBE_TEST_EXTERNAL_DOMAIN`), with a real certificate from Let's
@@ -1502,6 +1713,39 @@ fn real_external_access() {
     );
     assert!(started.contains("started mac:external-mac"), "{started}");
     c.talk("mac:external-mac");
+    // The Mac's real `ssh -R` stops passing anything with its ends still open, as
+    // with a Mac asleep: the server goes on answering, with the Mac's agents as last
+    // seen, and has them back when it resumes.
+    c.call("vibe_list_agents", json!({}));
+    let pgrep = Command::new("pgrep")
+        .args(["-f", "ssh .*-R .*mac\\.sock"])
+        .output()
+        .unwrap();
+    let tunnel = String::from_utf8_lossy(&pgrep.stdout).trim().to_owned();
+    assert!(!tunnel.is_empty(), "the Mac's ssh -R isn't running");
+    let signal = |which: &str| {
+        for pid in tunnel.lines() {
+            assert!(
+                Command::new("kill")
+                    .args([which, pid])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+    };
+    signal("-STOP");
+    let begun = Instant::now();
+    let listed = c.call("vibe_list_agents", json!({}));
+    let took = begun.elapsed();
+    signal("-CONT");
+    assert!(took < Duration::from_secs(10), "{took:?}");
+    assert!(listed.contains("mac:external-mac"), "{listed}");
+    assert!(listed.contains("unavailable"), "{listed}");
+    wait_for("the Mac back", Duration::from_secs(60), || {
+        !c.call("vibe_list_agents", json!({}))
+            .contains("unavailable")
+    });
     if let Ok(project) = std::env::var("VIBE_TEST_LINUX_PROJECT") {
         let started = c.call(
             "vibe_start_agent",

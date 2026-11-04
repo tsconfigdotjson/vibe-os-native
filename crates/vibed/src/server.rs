@@ -177,6 +177,11 @@ async fn read_messages(
             if let Some(f) = forwarder.as_ref() {
                 let _ = f.gate.send(start);
             }
+            if let Some(frame) = session.accepted_frame(&line)
+                && tx.send(frame).await.is_err()
+            {
+                return Ok(());
+            }
             let reply = dispatch::handle_message(core, &mut session, &line).await;
             if let Some(f) = forwarder.as_mut() {
                 // Those published before it go first.

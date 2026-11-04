@@ -234,6 +234,16 @@ import VibeRPC
         #expect(sidebarPick("projects", shown: "projects") == .nothing)
     }
 
+    @Test func keysSayWhereARevokeHasntArrived() {
+        #expect(keysPending(on: []) == nil)
+        #expect(
+            keysPending(on: ["vps"])
+                == "Key changes are pending on vps. A key revoked here still works there until it's next reachable.")
+        #expect(
+            keysPending(on: ["a", "b"])
+                == "Key changes are pending on a, b. A key revoked here still works there until they're next reachable.")
+    }
+
     @Test func aKeySaysWhenItWasLastUsed() {
         let now = Date(timeIntervalSince1970: 1_793_361_600)
         #expect(keyUsage(nil, now: now) == "Never used")
