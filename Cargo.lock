@@ -579,6 +579,7 @@ dependencies = [
  "http",
  "hyper",
  "hyper-util",
+ "log",
  "rustls",
  "rustls-native-certs",
  "rustls-platform-verifier",
@@ -1770,6 +1771,23 @@ dependencies = [
 [[package]]
 name = "vibe-services"
 version = "0.1.4"
+dependencies = [
+ "bytes",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "rustls",
+ "rustls-native-certs",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "vibe-core",
+ "vibe-relay",
+]
 
 [[package]]
 name = "vibe-shim"
