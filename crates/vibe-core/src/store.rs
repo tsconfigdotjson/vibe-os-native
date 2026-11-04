@@ -220,8 +220,8 @@ pub struct AgentRecord {
     /// Its start hasn't finished. Once `vibed` is up, that means the start
     /// was cut short, and what it made is undone.
     pub starting: bool,
-    /// Whether it gets the shared MCP services, as its profile said when it
-    /// started.
+    /// Whether it got the shared MCP services as it started. Each launch goes by
+    /// what its profile says then: this is for when that profile has gone.
     pub shared_services: bool,
 }
 

@@ -750,3 +750,26 @@ fn examples_cover_the_contract() {
         assert!(declared.get(ty).is_some());
     }
 }
+
+#[test]
+fn a_sign_ins_code_and_a_personal_key_dont_show_in_debug() {
+    let complete = ServiceCompleteParams {
+        host: Some("vps".into()),
+        service: "linear".into(),
+        callback_url: "vibeos://oauth/callback?code=the-code".into(),
+    };
+    let shown = format!("{complete:?}");
+    assert!(
+        shown.contains("vps") && !shown.contains("the-code"),
+        "{shown}"
+    );
+    let key = ServiceKeyParams {
+        service: "linear".into(),
+        key: "the-key".into(),
+    };
+    let shown = format!("{key:?}");
+    assert!(
+        shown.contains("linear") && !shown.contains("the-key"),
+        "{shown}"
+    );
+}
