@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use vibe_core::model::ServiceState;
 use vibe_services::secrets::MemoryStore;
-use vibe_services::testing::{API_KEY, FakeService, SECRET_MARK};
+use vibe_services::testing::{FakeService, SECRET_MARK};
 use vibe_services::{Deps, Place, Services, relay};
 
 const VIBE: &str = env!("CARGO_BIN_EXE_vibe");
@@ -42,9 +42,10 @@ async fn real_claude_calls_a_shared_service_through_the_shim() {
 
     let fake = FakeService::start().await;
     let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(MemoryStore::default());
     let services = Services::new(
         vec![fake.service()],
-        Arc::new(MemoryStore::default()),
+        store.clone(),
         dir.path().join("services.json"),
         Deps {
             clock: Arc::new(vibe_core::time::now),
@@ -52,9 +53,15 @@ async fn real_claude_calls_a_shared_service_through_the_shim() {
             changed: Arc::new(|_| {}),
             audit: Arc::new(|line| eprintln!("{line}")),
             place: Place::LinuxHost,
+            token_wait: Duration::from_secs(1),
         },
     );
-    let info = services.connect_key("linear", API_KEY).await.unwrap();
+    let auth = services.connect("linear").await.unwrap();
+    let back = fake.sign_in(&auth.url).await;
+    let info = services.complete("linear", &back).await.unwrap();
+    let login = vibe_services::SecretStore::load(&*store, "linear")
+        .unwrap()
+        .expect("a login");
     assert_eq!(info.state, ServiceState::Connected);
 
     let socket = dir.path().join("services.sock");
@@ -109,7 +116,7 @@ async fn real_claude_calls_a_shared_service_through_the_shim() {
     }
     let call = fake.calls().pop().expect("the tool was called");
     assert_eq!(call.tool.as_deref(), Some("list_issues"));
-    assert_eq!(call.bearer.as_deref(), Some(API_KEY));
+    assert_eq!(call.bearer.as_deref(), Some(login.access.as_str()));
     assert!(said.contains("issues on /mcp"), "{said}");
     assert!(!said.contains(SECRET_MARK), "{said}");
 }

@@ -10,7 +10,7 @@ use serde::{Serialize, forward_to_deserialize_any};
 use serde_json::Value;
 use vibe_core::model::{
     Activity, AgentState, Certainty, CheckId, CheckState, Environment, EventKind, GhState,
-    HostLink, LoginTool, MessageRole, Mode, Model, ProjectSource, Reasoning, ServiceAuth,
+    HostLink, LoginTool, MessageRole, Mode, Model, ProjectSource, Reasoning, ServiceRole,
     ServiceState, SessionState, StopReason, ToolboxAction, ToolboxState, TunnelState, WakeupKind,
 };
 use vibe_core::paths;
@@ -224,7 +224,12 @@ fn rust_types() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
         entry::<ServiceParams>(),
         entry::<ServiceAuthorization>(),
         entry::<ServiceCompleteParams>(),
-        entry::<ServiceKeyParams>(),
+        entry::<ServiceTokenParams>(),
+        entry::<ServiceAccess>(),
+        entry::<ServiceFollowParams>(),
+        entry::<ServiceHost>(),
+        entry::<ServiceOverview>(),
+        entry::<ServiceOverviewList>(),
         entry::<ServiceSetParams>(),
         entry::<ServiceAuditEntry>(),
         entry::<ServiceAuditList>(),
@@ -311,7 +316,9 @@ fn rust_methods() -> BTreeMap<&'static str, MethodTypes> {
         method::<ServicesList>(),
         method::<ServicesConnect>(),
         method::<ServicesComplete>(),
-        method::<ServicesConnectKey>(),
+        method::<ServicesToken>(),
+        method::<ServicesFollow>(),
+        method::<ServicesOverview>(),
         method::<ServicesDisconnect>(),
         method::<ServicesSet>(),
         method::<ServicesAudit>(),
@@ -369,7 +376,7 @@ fn rust_enums() -> BTreeMap<&'static str, Vec<&'static str>> {
             "ServiceState",
             names(ServiceState::ALL, ServiceState::as_str),
         ),
-        ("ServiceAuth", names(ServiceAuth::ALL, ServiceAuth::as_str)),
+        ("ServiceRole", names(ServiceRole::ALL, ServiceRole::as_str)),
         ("MessageRole", names(MessageRole::ALL, MessageRole::as_str)),
     ])
 }
@@ -763,13 +770,37 @@ fn a_sign_ins_code_and_a_personal_key_dont_show_in_debug() {
         shown.contains("vps") && !shown.contains("the-code"),
         "{shown}"
     );
-    let key = ServiceKeyParams {
+    let asked = ServiceTokenParams {
         service: "linear".into(),
-        key: "the-key".into(),
+        rejected: Some("the-token".into()),
     };
-    let shown = format!("{key:?}");
-    assert!(
-        shown.contains("linear") && !shown.contains("the-key"),
-        "{shown}"
-    );
+    let given = ServiceAccess {
+        service: "linear".into(),
+        state: ServiceState::Connected,
+        access: Some("the-token".into()),
+        expires_at: Some(5),
+        detail: None,
+    };
+    let follow = ServiceFollowParams {
+        service: "linear".into(),
+        owner: Some("vps".into()),
+        state: ServiceState::Connected,
+        access: Some("the-token".into()),
+        expires_at: Some(5),
+        detail: None,
+    };
+    for shown in [
+        format!("{asked:?}"),
+        format!("{given:?}"),
+        format!("{follow:?}"),
+    ] {
+        assert!(
+            shown.contains("linear") && !shown.contains("the-token"),
+            "{shown}"
+        );
+    }
+    // And they go only between `vibed`s: nothing from outside can ask for one.
+    for method in [ServicesToken::NAME, ServicesFollow::NAME] {
+        assert!(!TUNNEL_METHODS.contains(&method), "{method}");
+    }
 }

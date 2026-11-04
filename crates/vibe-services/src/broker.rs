@@ -1244,7 +1244,8 @@ impl Services {
             }
             Err(AuthFailure::NotConnected) => Ok(answer(ServiceState::Disconnected, None, None)),
             Err(AuthFailure::NeedsReconnect | AuthFailure::OwnerUnreachable) => {
-                Ok(answer(lock(&conn.saved).state, None, None))
+                let state = lock(&conn.saved).state;
+                Ok(answer(state, None, None))
             }
             Err(AuthFailure::Unavailable(why)) => Err(failed(why)),
         }
@@ -1600,7 +1601,7 @@ impl Services {
                         }
                         Err(Rejected::Token) => {
                             if refused_before {
-                                match self.turned_down(conn, &token) {
+                                match self.turned_down(conn, &token).await {
                                     Some(e) => return Err(e),
                                     None => {
                                         rejected = None;
@@ -1624,7 +1625,7 @@ impl Services {
             match reply.status {
                 401 => {
                     if refused_before {
-                        match self.turned_down(conn, &token) {
+                        match self.turned_down(conn, &token).await {
                             Some(e) => return Err(e),
                             None => rejected = None,
                         }
@@ -1668,7 +1669,9 @@ impl Services {
     /// access there. Unless it's no longer the login in use, as when a Reconnect
     /// came meanwhile: then it says nothing of that login, and `None` says to go
     /// again with the one there is now.
-    fn turned_down(&self, conn: &Conn, token: &str) -> Option<CallError> {
+    async fn turned_down(&self, conn: &Conn, token: &str) -> Option<CallError> {
+        // After any sign-in that's waiting on the refresh this token came from.
+        let _settled = conn.refreshing.lock().await;
         let current = lock(&conn.secret)
             .as_ref()
             .is_some_and(|s| s.access == token);

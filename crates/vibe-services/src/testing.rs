@@ -49,7 +49,7 @@ struct Inner {
     codes: HashMap<String, (String, String)>,
     access: HashSet<String>,
     /// The refresh token that's current.
-    refresh: Option<String>,
+    refresh: HashSet<String>,
     /// Refresh tokens used, and what they gave: taken again in the grace.
     used_refresh: HashMap<String, (String, String)>,
     grace: bool,
@@ -74,8 +74,11 @@ struct Inner {
     token_outage: bool,
     held_answers: HashMap<String, oneshot::Sender<Value>>,
     hold_streams: bool,
-    /// Tokens are turned down and API keys aren't.
-    reject_oauth: bool,
+    /// Tokens from before now are turned down, and any a refresh makes, as when
+    /// a login's revoked. One from a new sign-in is good.
+    reject_old_logins: bool,
+    /// The tokens a sign-in made, which that doesn't touch.
+    signed_in: HashSet<String>,
     /// Its streams stay open after their answers, as a server's may.
     linger_streams: bool,
     lingering: Vec<mpsc::Sender<Bytes>>,
@@ -351,10 +354,12 @@ impl FakeService {
         self.state().token_outage = out;
     }
 
-    /// Only OAuth tokens are turned down, as when a login's revoked while a
-    /// personal key is good.
-    pub fn reject_oauth_tokens(&self, reject: bool) {
-        self.state().reject_oauth = reject;
+    /// Every token so far is turned down, and any a refresh makes, as when a
+    /// login's revoked. One from signing in again is good.
+    pub fn reject_old_logins(&self) {
+        let mut state = self.state();
+        state.reject_old_logins = true;
+        state.signed_in.clear();
     }
 
     /// Its event streams, `initialize`'s too, stay open after their answers.
@@ -507,7 +512,7 @@ fn new_tokens(state: &mut Inner) -> (String, String) {
     let access = format!("{SECRET_MARK}-access-{}", state.next);
     let refresh = format!("{SECRET_MARK}-refresh-{}", state.next);
     state.access.insert(access.clone());
-    state.refresh = Some(refresh.clone());
+    state.refresh.insert(refresh.clone());
     (access, refresh)
 }
 
@@ -560,6 +565,7 @@ async fn token(inner: &Mutex<Inner>, base: &str, body: &[u8]) -> Response<Channe
                 return oauth_error("invalid_grant");
             }
             let (access, refresh) = new_tokens(&mut state);
+            state.signed_in.insert(access.clone());
             tokens_reply(&access, &refresh)
         }
         "refresh_token" => {
@@ -582,7 +588,8 @@ async fn token(inner: &Mutex<Inner>, base: &str, body: &[u8]) -> Response<Channe
                 return oauth_error("invalid_client");
             }
             let given = get("refresh_token");
-            if state.refresh.as_deref() == Some(given.as_str()) {
+            // Each sign-in is a grant of its own, with a refresh token that rotates.
+            if state.refresh.remove(&given) {
                 let (access, refresh) = new_tokens(&mut state);
                 state
                     .used_refresh
@@ -630,7 +637,10 @@ async fn mcp(
     let authorized = !state.reject_all
         && bearer
             .as_deref()
-            .is_some_and(|b| !state.reject_oauth && state.access.contains(b));
+            .is_some_and(|b| {
+                state.access.contains(b)
+                    && (!state.reject_old_logins || state.signed_in.contains(b))
+            });
     let known_session = session.as_ref().is_some_and(|s| state.sessions.contains(s));
     let status = if !authorized {
         401

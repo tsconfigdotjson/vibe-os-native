@@ -25,7 +25,9 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 use vibe_core::paths::Layout;
 use vibe_core::rpc::{KeyCreateParams, MAX_MESSAGE_BYTES};
-use vibe_services::testing::{API_KEY, FakeService, SECRET_MARK};
+use vibe_services::SecretStore;
+use vibe_services::secrets::FileStore;
+use vibe_services::testing::{FakeService, SECRET_MARK};
 use vibed::core::Core;
 use vibed::link::Timing;
 use vibed::remote::Ssh;
@@ -839,7 +841,7 @@ fn any_file_has(dir: &Path, text: &str) -> Option<PathBuf> {
 /// the host's agents carry on, refresh by themselves, and can be mended with a
 /// key in the host's own shell. `ssh` and the service are the only stand-ins.
 #[test]
-fn a_linux_hosts_shared_services_are_its_own_and_outlast_the_mac() {
+fn a_linux_host_that_owns_a_login_serves_and_refreshes_alone_with_the_mac_gone() {
     let golden = common::Golden::new();
     let hosts = common::short_tempdir();
     let ssh = fake_ssh(hosts.path());
@@ -862,8 +864,15 @@ fn a_linux_hosts_shared_services_are_its_own_and_outlast_the_mac() {
             .any(|l| l.starts_with("vps  ") && l.contains("  connected"))
     });
 
-    // Settings → Services → Connect, for that host: its vibed is what makes
-    // the verifier and the exchange, and all the Mac does is carry a code.
+    // Settings → Services → Connect: the host is its owner, as a linked Linux
+    // host is the default. Its vibed makes the verifier and the exchange, and all
+    // the Mac does is carry a code.
+    let overview = on_mac(&mac, "services.overview", json!({}));
+    assert_eq!(
+        overview["result"]["services"][0]["owner"], "vps",
+        "{overview}"
+    );
+    assert_eq!(overview["result"]["services"][0]["signed_in"], false);
     let begun = on_mac(
         &mac,
         "services.connect",
@@ -879,7 +888,7 @@ fn a_linux_hosts_shared_services_are_its_own_and_outlast_the_mac() {
     );
     assert_eq!(done["result"]["state"], "connected", "{done}");
 
-    // It's on the host, private; the Mac has nothing of it.
+    // It's on the host, private; the Mac has an access token and nothing more.
     let dir = Layout::new(&host.home, std::env::consts::OS)
         .data_dir()
         .join("services");
@@ -890,15 +899,26 @@ fn a_linux_hosts_shared_services_are_its_own_and_outlast_the_mac() {
     assert_eq!(
         any_file_has(golden.dir.path(), SECRET_MARK),
         None,
-        "nothing of a token on the Mac"
+        "nothing of a token in the clear on the Mac"
+    );
+    let on_the_mac = FileStore(
+        Layout::new(golden.home.as_path(), std::env::consts::OS)
+            .data_dir()
+            .join("services"),
+    );
+    wait_for("the Mac to follow", Duration::from_secs(30), || {
+        on_the_mac.load("linear").unwrap().is_some()
+    });
+    assert_eq!(on_the_mac.load("linear").unwrap().unwrap().refresh, None);
+    let mac_says = ok(vibe(&mac.socket, &["service"]));
+    assert!(
+        mac_says.starts_with("linear  connected  login on vps"),
+        "{mac_says}"
     );
 
-    // Its own CLI sees the same.
+    // Its own CLI sees it's here.
     let status = ok(on_host(&host).arg("service").output().unwrap());
-    assert!(
-        status.starts_with("linear  connected  by oauth"),
-        "{status}"
-    );
+    assert!(status.starts_with("linear  connected  login here"), "{status}");
 
     // An agent on the host, on the real shim.
     let mut shim = HostShim::start(&host, "quiet-amber-otter");
@@ -924,34 +944,25 @@ fn a_linux_hosts_shared_services_are_its_own_and_outlast_the_mac() {
     );
     assert_eq!(mode(&login), 0o600);
 
-    // Its login is lost: the agent is told how to mend it here, and tools list.
+    // Its login is lost: the agent is told how it's mended, and tools list.
     fake.expire_access();
     fake.refuse_refresh("invalid_grant");
     let lost = shim.call("list_issues");
-    assert!(lost.contains("needs reconnecting on this host"), "{lost}");
-    assert!(lost.contains("vibe service set-key linear"), "{lost}");
+    assert!(lost.contains("needs reconnecting on the Mac"), "{lost}");
     assert!(shim.has_tool("list_issues"));
     let status = ok(on_host(&host).arg("service").output().unwrap());
     assert!(status.starts_with("linear  needs_reconnect"), "{status}");
     assert!(status.contains("invalid_grant"), "{status}");
 
-    // The owner mends it in the host's own shell, with the key on stdin, and the
-    // agent goes on with no restart.
-    let mut set = on_host(&host)
+    // There's no way to mend it from here: signing in takes the Mac's browser.
+    let refused = on_host(&host)
         .args(["service", "set-key", "linear"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .output()
         .unwrap();
-    writeln!(set.stdin.take().unwrap(), "{API_KEY}").unwrap();
-    let said = ok(set.wait_with_output().unwrap());
-    assert!(said.starts_with("linear  connected  by api_key"), "{said}");
-    assert_eq!(shim.call("list_issues"), "issues on /mcp");
-    assert_eq!(fake.calls().pop().unwrap().bearer.as_deref(), Some(API_KEY));
+    assert!(!refused.status.success());
 
-    // Turned off, and back on, with no Mac to do it from: the agent's told how,
-    // and goes on with no restart.
+    // Turned off, with no Mac to do it from: the agent's told how to turn it back
+    // on. That comes first, before what's wrong with the login.
     let off = ok(on_host(&host)
         .args(["service", "off", "linear"])
         .output()
@@ -964,15 +975,30 @@ fn a_linux_hosts_shared_services_are_its_own_and_outlast_the_mac() {
         .output()
         .unwrap());
     assert!(!on.contains("turned off"), "{on}");
-    assert_eq!(shim.call("list_issues"), "issues on /mcp");
 
-    // A key on a command line is refused, without repeating it.
-    let refused = on_host(&host)
-        .args(["service", "set-key", "linear", "secret-on-argv"])
-        .output()
-        .unwrap();
-    assert!(!refused.status.success());
-    assert!(!String::from_utf8_lossy(&refused.stderr).contains("secret-on-argv"));
+    // The Mac's back, and Reconnect there lands at the owner, in the browser and
+    // back: the agent goes on with no restart.
+    fs::remove_file(host.d.join("down")).unwrap();
+    let mac = self::mac(&golden, &ssh, bundle(golden.dir.path()));
+    wait_for("the link again", Duration::from_secs(30), || {
+        ok(vibe(&mac.socket, &["host"]))
+            .lines()
+            .any(|l| l.starts_with("vps  ") && l.contains("  connected"))
+    });
+    let begun = on_mac(
+        &mac,
+        "services.connect",
+        json!({"host": "vps", "service": "linear"}),
+    );
+    let url = begun["result"]["url"].as_str().expect("a page").to_owned();
+    let back = mac.rt.block_on(fake.sign_in(&url));
+    let done = on_mac(
+        &mac,
+        "services.complete",
+        json!({"host": "vps", "service": "linear", "callback_url": back}),
+    );
+    assert_eq!(done["result"]["state"], "connected", "{done}");
+    assert_eq!(shim.call("list_issues"), "issues on /mcp");
 
     // And in all of that, what's readable on the host's disk or in its logs
     // holds no token: only the login file does, encoded, private.

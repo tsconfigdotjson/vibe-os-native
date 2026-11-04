@@ -10,10 +10,10 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
-use vibe_core::model::{ServiceAuth, ServiceState};
-use vibe_core::rpc::{ServiceInfo, ServiceSetParams};
+use vibe_core::model::{ServiceRole, ServiceState};
+use vibe_core::rpc::{ServiceFollowParams, ServiceInfo, ServiceSetParams};
 use vibe_services::secrets::MemoryStore;
-use vibe_services::testing::{API_KEY, FakeService, SECRET_MARK};
+use vibe_services::testing::{FakeService, SECRET_MARK};
 use vibe_services::{Deps, Place, Secret, SecretStore, Services};
 
 /// The stand-in's tools.
@@ -49,6 +49,7 @@ fn deps(
         changed: Arc::new(move |info| changes.lock().unwrap().push(info.clone())),
         audit: Arc::new(move |line| audit.lock().unwrap().push(line.to_owned())),
         place: Place::Mac,
+        token_wait: Duration::from_millis(300),
     }
 }
 
@@ -195,7 +196,7 @@ async fn signing_in_keeps_the_login_in_the_store_and_only_there() {
     assert_eq!(w.info().state, ServiceState::Disconnected);
     let info = w.sign_in().await;
     assert_eq!(info.state, ServiceState::Connected);
-    assert_eq!(info.auth, Some(ServiceAuth::Oauth));
+    assert_eq!(info.role, ServiceRole::Owner);
     assert_eq!(w.fake.registrations(), 1);
     let secret = w.secret();
     assert!(secret.access.contains(SECRET_MARK));
@@ -661,34 +662,6 @@ async fn a_shim_reconnecting_keeps_the_agents_session() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn an_api_key_works_and_when_refused_means_revoked() {
-    let w = World::new().await;
-    let bad = w.services.connect_key("linear", "not-the-key").await;
-    assert!(bad.unwrap_err().message.contains("refused that key"));
-    assert_eq!(w.info().state, ServiceState::Disconnected);
-    assert_eq!(w.store.load("linear").unwrap(), None);
-
-    let info = w
-        .services
-        .connect_key("linear", &format!(" {API_KEY}\n"))
-        .await
-        .unwrap();
-    assert_eq!(info.state, ServiceState::Connected);
-    assert_eq!(info.auth, Some(ServiceAuth::ApiKey));
-    let mut a = w.agent("a");
-    assert_eq!(text(&a.call("list_issues").await), "issues on /mcp");
-    assert_eq!(
-        w.fake.calls().pop().unwrap().bearer.as_deref(),
-        Some(API_KEY)
-    );
-
-    w.fake.reject_all_tokens(true);
-    assert_eq!(text(&a.call("list_issues").await), RECONNECT);
-    assert_eq!(w.info().state, ServiceState::Revoked);
-    assert_eq!(w.fake.refreshes(), 0);
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn a_sign_in_given_up_on_leaves_the_connection_as_it_was() {
     let w = World::new().await;
     w.sign_in().await;
@@ -709,7 +682,7 @@ async fn disconnecting_forgets_the_login_and_tells_the_service() {
     assert_eq!(a.tools().await.len(), TOOLS);
     let info = w.services.disconnect("linear").await.unwrap();
     assert_eq!(info.state, ServiceState::Disconnected);
-    assert_eq!(info.auth, None);
+    assert_eq!(info.role, ServiceRole::Follower);
     assert_eq!(info.tools, 0);
     assert_eq!(w.store.load("linear").unwrap(), None);
     assert_eq!(w.fake.revocations(), [refresh]);
@@ -910,7 +883,7 @@ async fn a_tool_error_from_the_service_is_passed_on_as_it_is() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_linux_host_says_where_its_own_login_gets_mended() {
+async fn a_linux_host_says_a_login_gets_mended_on_the_mac() {
     let fake = FakeService::start().await;
     let dir = tempfile::tempdir().unwrap();
     let store: Arc<dyn SecretStore> = Arc::new(MemoryStore::default());
@@ -929,18 +902,15 @@ async fn a_linux_host_says_where_its_own_login_gets_mended() {
     assert!(is_error(&not_yet));
     assert_eq!(
         text(&not_yet),
-        "Linear isn't connected on this host (VibeOS → Settings → Services → Connect on the Mac, \
-         or `vibe service set-key linear` here)."
+        "Linear isn't connected on the Mac (VibeOS → Settings → Services → Connect)."
     );
-    services.connect_key("linear", API_KEY).await.unwrap();
+    let auth = services.connect("linear").await.unwrap();
+    let back = fake.sign_in(&auth.url).await;
+    services.complete("linear", &back).await.unwrap();
     fake.reject_all_tokens(true);
     let lost = a.call("list_issues").await;
     assert!(is_error(&lost));
-    assert_eq!(
-        text(&lost),
-        "Linear needs reconnecting on this host (VibeOS → Settings → Services → Reconnect on the \
-         Mac, or `vibe service set-key linear` here)."
-    );
+    assert_eq!(text(&lost), RECONNECT);
     fake.reject_all_tokens(false);
     services
         .set(ServiceSetParams {
@@ -1291,9 +1261,9 @@ async fn starting_doesnt_wait_on_the_store() {
 
 fn secret_like() -> Secret {
     Secret {
-        auth: ServiceAuth::ApiKey,
-        access: API_KEY.into(),
+        access: "FAKESECRET-a-token".into(),
         refresh: None,
+        obtained_at: None,
         expires_at: None,
         client_id: None,
         token_endpoint: None,
@@ -1369,10 +1339,10 @@ async fn a_token_turned_down_after_the_login_changed_says_nothing_of_the_new_one
     w.sign_in().await;
     let mut a = w.agent("a");
     a.call("list_issues").await;
-    // A call finds its token refused, and is refreshing, while the owner connects
-    // with a key. The refreshed token's refused too, but it's no longer the login.
-    w.fake.reject_oauth_tokens(true);
-    w.fake.slow_refreshes(Duration::from_millis(300));
+    // A call finds its token refused, and is refreshing, while the owner signs in
+    // again. The refreshed token's refused too, but it's no longer the login.
+    w.fake.reject_old_logins();
+    w.fake.slow_refreshes(Duration::from_secs(2));
     let calling = tokio::spawn(async move { a.call("list_issues").await });
     for _ in 0..500 {
         if w.info().state == ServiceState::Refreshing {
@@ -1380,7 +1350,7 @@ async fn a_token_turned_down_after_the_login_changed_says_nothing_of_the_new_one
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    w.services.connect_key("linear", API_KEY).await.unwrap();
+    w.sign_in().await;
     let answer = calling.await.unwrap();
     assert_eq!(text(&answer), "issues on /mcp", "{answer}");
     assert_eq!(w.info().state, ServiceState::Connected);
@@ -1516,19 +1486,22 @@ async fn a_slow_first_read_cant_undo_a_login_made_since() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // The read found no login, and the owner makes one before it comes back.
-    let info = again.connect_key("linear", API_KEY).await.unwrap();
+    let auth = again.connect("linear").await.unwrap();
+    let back = w.fake.sign_in(&auth.url).await;
+    let info = again.complete("linear", &back).await.unwrap();
     assert_eq!(info.state, ServiceState::Connected);
     loading.await.unwrap();
 
     let info = again.list().services.remove(0);
     assert_eq!(info.state, ServiceState::Connected, "{info:?}");
-    assert_eq!(info.auth, Some(ServiceAuth::ApiKey));
+    assert_eq!(info.role, ServiceRole::Owner);
+    let made = w.secret();
     let mut a = Shim::open(&again, "a");
     let answer = a.call("list_issues").await;
     assert!(!is_error(&answer), "{answer}");
     assert_eq!(
         w.fake.calls().pop().unwrap().bearer.as_deref(),
-        Some(API_KEY)
+        Some(made.access.as_str())
     );
 }
 
@@ -1671,4 +1644,358 @@ async fn at_the_limit_a_cancel_and_an_answer_still_get_through_and_no_refusal_is
     refused.sort_unstable();
     assert_eq!(refused, vec![1000, 1001, 1002]);
     w.fake.release();
+}
+
+// ---- Followers: a host that holds only an access token, given by way of the Mac.
+
+/// A host that doesn't own the login, on a store and state of its own.
+struct Follower {
+    services: Arc<Services>,
+    store: Arc<MemoryStore>,
+    state_file: PathBuf,
+    now: Arc<AtomicI64>,
+    audit: Arc<Mutex<Vec<String>>>,
+    _dir: tempfile::TempDir,
+}
+
+impl World {
+    fn follower(&self) -> Follower {
+        let dir = tempfile::tempdir().unwrap();
+        let state_file = dir.path().join("services.json");
+        let store = Arc::new(MemoryStore::default());
+        let audit: Arc<Mutex<Vec<String>>> = Arc::default();
+        let services = Services::new(
+            vec![self.fake.service()],
+            store.clone(),
+            state_file.clone(),
+            deps(&self.now, &audit, &Arc::default()),
+        );
+        Follower {
+            services,
+            store,
+            state_file,
+            now: self.now.clone(),
+            audit,
+            _dir: dir,
+        }
+    }
+}
+
+impl Follower {
+    fn info(&self) -> ServiceInfo {
+        self.services.list().services.remove(0)
+    }
+
+    /// Until it's read the service's tools, which it does in the background.
+    async fn knows_the_tools(&self) {
+        for _ in 0..1000 {
+            if self.info().tools > 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("it never read the tools");
+    }
+
+    /// What the Mac does: asks the owner for its token, and hands it over.
+    async fn given_by(&self, owner: &Services, rejected: Option<&str>) -> String {
+        let access = owner.token("linear", rejected).await.unwrap();
+        let token = access.access.clone().expect("a token");
+        self.services
+            .follow(ServiceFollowParams {
+                service: "linear".into(),
+                owner: Some("vps-1".into()),
+                state: access.state,
+                access: access.access,
+                expires_at: access.expires_at,
+                detail: None,
+            })
+            .await
+            .unwrap();
+        token
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_follower_uses_the_token_it_was_given_and_holds_no_refresh_token() {
+    let w = World::new().await;
+    w.sign_in().await;
+    let f = w.follower();
+    assert_eq!(f.info().role, ServiceRole::Follower);
+    assert_eq!(f.info().state, ServiceState::Disconnected);
+
+    let token = f.given_by(&w.services, None).await;
+    assert_eq!(token, w.secret().access);
+    let info = f.info();
+    assert_eq!(info.state, ServiceState::Connected);
+    assert_eq!(info.role, ServiceRole::Follower);
+    assert_eq!(info.owner.as_deref(), Some("vps-1"));
+    assert!(info.access_until.is_some(), "{info:?}");
+
+    let mut a = Shim::open(&f.services, "a");
+    assert_eq!(text(&a.call("list_issues").await), "issues on /mcp");
+    assert_eq!(
+        w.fake.calls().pop().unwrap().bearer.as_deref(),
+        Some(token.as_str())
+    );
+    let held = f.store.load("linear").unwrap().expect("its token");
+    assert_eq!(held.access, token);
+    assert_eq!(held.refresh, None);
+    assert_eq!(held.client_id, None);
+    assert_eq!(held.token_endpoint, None);
+    assert_eq!(w.fake.refreshes(), 0);
+
+    // It outlasts a restart, with the owner nowhere to be seen.
+    let again = Services::new(
+        vec![w.fake.service()],
+        f.store.clone(),
+        f.state_file.clone(),
+        deps(&f.now, &f.audit, &Arc::default()),
+    );
+    let mut b = Shim::open(&again, "b");
+    assert_eq!(text(&b.call("list_issues").await), "issues on /mcp");
+    let info = again.list().services.remove(0);
+    assert_eq!(info.role, ServiceRole::Follower);
+    assert_eq!(info.owner.as_deref(), Some("vps-1"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_follower_turned_down_asks_once_and_the_owner_refreshes() {
+    let w = World::new().await;
+    w.sign_in().await;
+    let f = w.follower();
+    let first = f.given_by(&w.services, None).await;
+    let mut a = Shim::open(&f.services, "a");
+    a.call("list_issues").await;
+
+    // The Mac sees it wanting one, and passes on that this token was turned down.
+    w.fake.expire_access();
+    let mac = {
+        let (owner, follower) = (w.services.clone(), f.services.clone());
+        let first = first.clone();
+        tokio::spawn(async move {
+            for _ in 0..500 {
+                if follower.list().services[0].wants_token {
+                    let access = owner.token("linear", Some(&first)).await.unwrap();
+                    follower
+                        .follow(ServiceFollowParams {
+                            service: "linear".into(),
+                            owner: Some("vps-1".into()),
+                            state: access.state,
+                            access: access.access,
+                            expires_at: access.expires_at,
+                            detail: None,
+                        })
+                        .await
+                        .unwrap();
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            panic!("it never asked");
+        })
+    };
+    let answer = a.call("list_issues").await;
+    assert_eq!(text(&answer), "issues on /mcp", "{answer}");
+    mac.await.unwrap();
+    assert_eq!(w.fake.refreshes(), 1, "the owner's, and only the owner's");
+    assert_ne!(w.secret().access, first);
+    assert_eq!(f.store.load("linear").unwrap().unwrap().refresh, None);
+    let info = f.info();
+    assert!(!info.wants_token, "{info:?}");
+    assert_eq!(info.state, ServiceState::Connected);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_follower_serves_until_its_token_runs_out_then_says_the_owner_is_away() {
+    let w = World::new().await;
+    w.sign_in().await;
+    let f = w.follower();
+    f.given_by(&w.services, None).await;
+    f.knows_the_tools().await;
+    let mut a = Shim::open(&f.services, "a");
+
+    // The owner's away from here on, however long it's been.
+    let until = w.secret().expires_at.unwrap();
+    w.now.store(until - 1, Ordering::SeqCst);
+    assert_eq!(text(&a.call("list_issues").await), "issues on /mcp");
+    assert_eq!(w.fake.refreshes(), 0);
+
+    w.now.store(until, Ordering::SeqCst);
+    let away = a.call("list_issues").await;
+    assert!(is_error(&away), "{away}");
+    assert_eq!(
+        text(&away),
+        "Linear has no current access token here: its login is on vps-1, which can't be reached \
+         from here right now. Calls work again once it's back."
+    );
+    let info = f.info();
+    assert_eq!(info.state, ServiceState::OwnerUnreachable);
+    assert!(info.wants_token, "{info:?}");
+    assert_eq!(w.fake.refreshes(), 0, "a follower can't refresh");
+    assert!(
+        f.audit
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.contains("outcome=owner_unreachable")),
+        "{:?}",
+        f.audit.lock().unwrap()
+    );
+    // Tools still list, and the next call doesn't wait all over again.
+    assert!(a.tools().await.contains(&"list_issues".to_owned()));
+    let started = std::time::Instant::now();
+    assert!(is_error(&a.call("list_issues").await));
+    assert!(started.elapsed() < Duration::from_millis(250));
+
+    // It's back: no restart, no sign-in.
+    w.services.refresh_due().await;
+    assert_eq!(w.fake.refreshes(), 1);
+    f.given_by(&w.services, None).await;
+    assert_eq!(text(&a.call("list_issues").await), "issues on /mcp");
+    assert_eq!(f.info().state, ServiceState::Connected);
+    assert!(!f.info().wants_token);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn many_calls_on_a_follower_never_mean_a_refresh() {
+    let w = World::new().await;
+    w.sign_in().await;
+    let f = w.follower();
+    f.given_by(&w.services, None).await;
+    let mut a = Shim::open(&f.services, "a");
+    a.call("list_issues").await;
+
+    w.fake.expire_access();
+    w.fake.reject_all_tokens(true);
+    for id in 0..8 {
+        a.send(json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": {"name": "list_issues"}}))
+            .await;
+    }
+    let mut told = 0;
+    while told < 8 {
+        let answer = a.recv().await;
+        if is_error(&answer) {
+            told += 1;
+        }
+    }
+    assert_eq!(w.fake.refreshes(), 0);
+    assert_eq!(f.info().state, ServiceState::OwnerUnreachable);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_owner_refreshes_at_half_life_and_followers_get_the_fresh_token() {
+    let w = World::new().await;
+    w.sign_in().await;
+    let f = w.follower();
+    let first = f.given_by(&w.services, None).await;
+    let login = w.secret();
+    let (from, until) = (login.obtained_at.unwrap(), login.expires_at.unwrap());
+
+    w.now.store(from + (until - from) / 2 - 1, Ordering::SeqCst);
+    w.services.refresh_due().await;
+    assert_eq!(w.fake.refreshes(), 0, "not before half way");
+
+    w.now.store(from + (until - from) / 2, Ordering::SeqCst);
+    w.services.refresh_due().await;
+    assert_eq!(w.fake.refreshes(), 1);
+    w.services.refresh_due().await;
+    assert_eq!(w.fake.refreshes(), 1, "and only the once");
+    let second = f.given_by(&w.services, None).await;
+    assert_ne!(first, second);
+    assert!(f.store.load("linear").unwrap().unwrap().expires_at.unwrap() > until);
+
+    // A follower has nothing to refresh, however late it is.
+    w.now.store(until * 2, Ordering::SeqCst);
+    f.services.refresh_due().await;
+    assert_eq!(w.fake.refreshes(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_login_lost_at_the_owner_reaches_its_followers() {
+    let w = World::new().await;
+    w.sign_in().await;
+    let f = w.follower();
+    f.given_by(&w.services, None).await;
+    let mut a = Shim::open(&f.services, "a");
+
+    w.fake.expire_access();
+    w.fake.refuse_refresh("invalid_grant");
+    let access = w
+        .services
+        .token("linear", Some(&w.secret().access))
+        .await
+        .unwrap();
+    assert_eq!(access.state, ServiceState::NeedsReconnect);
+    assert_eq!(access.access, None);
+    assert!(access.detail.as_deref().unwrap().contains("invalid_grant"));
+    f.services
+        .follow(ServiceFollowParams {
+            service: "linear".into(),
+            owner: Some("vps-1".into()),
+            state: access.state,
+            access: None,
+            expires_at: None,
+            detail: access.detail,
+        })
+        .await
+        .unwrap();
+    assert_eq!(text(&a.call("list_issues").await), RECONNECT);
+    assert_eq!(f.info().state, ServiceState::NeedsReconnect);
+    assert_eq!(f.store.load("linear").unwrap(), None);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn following_makes_an_owner_forget_its_login_there_and_at_the_service() {
+    let w = World::new().await;
+    w.sign_in().await;
+    let refresh = w.secret().refresh.unwrap();
+    w.services
+        .follow(ServiceFollowParams {
+            service: "linear".into(),
+            owner: Some("vps-1".into()),
+            state: ServiceState::Connected,
+            access: Some("FAKESECRET-from-the-new-owner".into()),
+            expires_at: None,
+            detail: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(w.info().role, ServiceRole::Follower);
+    let held = w.secret();
+    assert_eq!(held.refresh, None);
+    assert_eq!(held.client_id, None);
+    assert_eq!(w.fake.revocations(), [refresh]);
+
+    // And it comes back a follower.
+    let again = w.restarted();
+    again.load_logins().await;
+    assert_eq!(again.list().services[0].role, ServiceRole::Follower);
+    w.services.refresh_due().await;
+    assert_eq!(w.fake.refreshes(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn only_the_owner_gives_out_tokens_and_never_a_refresh_token() {
+    let w = World::new().await;
+    assert_eq!(
+        w.services.token("linear", None).await.unwrap().state,
+        ServiceState::Disconnected
+    );
+    w.sign_in().await;
+    let f = w.follower();
+    f.given_by(&w.services, None).await;
+
+    let refused = f.services.token("linear", None).await.unwrap_err();
+    assert!(refused.message.contains("doesn't own"), "{}", refused.message);
+    let refused = f.services.disconnect("linear").await.unwrap_err();
+    assert!(refused.message.contains("vps-1"), "{}", refused.message);
+    assert!(f.store.load("linear").unwrap().is_some());
+
+    let access = w.services.token("linear", None).await.unwrap();
+    let on_the_wire = serde_json::to_string(&access).unwrap();
+    assert!(!on_the_wire.contains(&w.secret().refresh.unwrap()));
+    assert!(on_the_wire.contains(&w.secret().access));
+    assert!(!format!("{access:?}").contains(&w.secret().access));
 }

@@ -17,7 +17,7 @@ use std::time::Duration;
 use common::{Golden, TestServer, serve, workspace_bin};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader as TokioBufReader};
-use vibe_core::model::{LOCAL_HOST, ServiceState};
+use vibe_core::model::{ServiceRole, LOCAL_HOST, ServiceState};
 use vibe_core::paths::Layout;
 use vibe_core::rpc::{
     AgentStartParams, HostAddParams, MAX_MESSAGE_BYTES, ProfileUpdateParams, ProjectAddParams,
@@ -25,7 +25,7 @@ use vibe_core::rpc::{
 use vibe_env::testing::TestBackend;
 use vibe_relay::proxy;
 use vibe_services::secrets::{FileStore, MemoryStore};
-use vibe_services::testing::{API_KEY, FakeService, SECRET_MARK};
+use vibe_services::testing::{FakeService, SECRET_MARK};
 use vibe_services::{Place, SecretStore};
 use vibed::agents::Backends;
 use vibed::core::{Config, Core};
@@ -179,6 +179,7 @@ async fn node_with(
         services: vec![fake.service()],
         store,
         place,
+        token_wait: Duration::from_millis(500),
     });
     config.vibe_cli = "/opt/test/vibe".into();
     // Real randomness: two hosts mustn't share a verifier or a state.
@@ -743,13 +744,7 @@ async fn a_vm_reaches_the_macs_broker_over_the_relay_the_mac_dials() {
         |_| {},
     )
     .await;
-    n.core
-        .services_connect_key(vibe_core::rpc::ServiceKeyParams {
-            service: "linear".into(),
-            key: API_KEY.into(),
-        })
-        .await
-        .unwrap();
+    n.sign_in_here().await;
 
     // Offered as the guest's own program, and with no host socket to find.
     n.core
@@ -827,6 +822,11 @@ struct Tapped {
 }
 
 impl Tapped {
+    /// The network's back: the link dials again by itself.
+    fn restore(&self) {
+        self.down.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
     fn cut(&self) {
         self.down.store(true, std::sync::atomic::Ordering::SeqCst);
         for t in self.tasks.lock().unwrap().drain(..) {
@@ -902,7 +902,31 @@ impl Remote for Tapped {
     }
 }
 
-/// A Mac and a Linux host, each with a broker and a login of its own, linked.
+impl Node {
+    /// The app's Connect button, for a login on this node itself.
+    async fn sign_in_here(&self) {
+        let begun = rpc(&self.core, "services.connect", json!({"service": "linear"})).await;
+        let url = begun["result"]["url"].as_str().expect("a page").to_owned();
+        let back = self.fake.sign_in(&url).await;
+        let done = rpc(
+            &self.core,
+            "services.complete",
+            json!({"service": "linear", "callback_url": back}),
+        )
+        .await;
+        assert_eq!(done["result"]["state"], "connected", "{done}");
+    }
+
+    fn service(&self) -> vibe_core::rpc::ServiceInfo {
+        self.core
+            .services_list(Default::default())
+            .unwrap()
+            .services
+            .remove(0)
+    }
+}
+
+/// A Mac and a Linux host, each with a broker, linked.
 struct Pair {
     mac: Node,
     host: Node,
@@ -997,6 +1021,18 @@ impl Pair {
     }
 }
 
+impl Pair {
+    /// Until the Mac holds the token the host's login has now.
+    async fn mac_following(&self) {
+        wait_for("the Mac to be given the token", || {
+            let owner = self.logins.load("linear").unwrap();
+            let mac = self.mac_logins.load("linear").unwrap();
+            matches!((owner, mac), (Some(o), Some(m)) if o.access == m.access)
+        })
+        .await;
+    }
+}
+
 fn state_of(list: &Value) -> &str {
     list["result"]["services"][0]["state"]
         .as_str()
@@ -1027,25 +1063,51 @@ fn all_files(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_host_signs_in_for_itself_and_no_token_or_verifier_crosses_the_link() {
+async fn signing_in_on_the_mac_lands_at_the_owner_and_no_refresh_token_or_verifier_crosses() {
     let fake = FakeService::start().await;
     let p = pair(&fake).await;
     let mac = &p.mac.core;
 
-    // Each is on its own: the Mac's own says nothing of the host's.
-    let host_list = rpc(mac, "services.list", json!({"host": "vps"})).await;
-    assert_eq!(state_of(&host_list), "disconnected", "{host_list}");
+    // A linked Linux host is the default owner, and nothing's signed in yet.
+    let overview = rpc(mac, "services.overview", json!({})).await;
+    let one = &overview["result"]["services"][0];
+    assert_eq!(one["owner"], "vps", "{overview}");
+    assert_eq!(one["signed_in"], false, "{overview}");
+    assert_eq!(one["state"], "disconnected", "{overview}");
 
     let (url, back) = p.connect_host().await;
 
-    // The host holds it: in its own store, and nothing on the Mac.
+    // The host holds the login, in its own store. The Mac is given an access
+    // token, and has nothing to refresh it with.
     let login = p.logins.load("linear").unwrap().expect("the host's login");
     assert!(login.access.contains(SECRET_MARK));
-    assert_eq!(p.mac_logins.load("linear").unwrap(), None);
+    assert!(login.refresh.is_some());
+    assert_eq!(fake.registrations(), 1);
+    p.mac_following().await;
+    let given = p.mac_logins.load("linear").unwrap().unwrap();
+    assert_eq!(given.refresh, None);
+    assert_eq!(given.client_id, None);
     let host_list = rpc(mac, "services.list", json!({"host": "vps"})).await;
     assert_eq!(state_of(&host_list), "connected", "{host_list}");
-    let mac_list = rpc(mac, "services.list", json!({"host": LOCAL_HOST})).await;
-    assert_eq!(state_of(&mac_list), "disconnected", "{mac_list}");
+    assert_eq!(host_list["result"]["services"][0]["role"], "owner");
+    let mac_info = p.mac.service();
+    assert_eq!(mac_info.state, ServiceState::Connected);
+    assert_eq!(mac_info.role, ServiceRole::Follower);
+    assert_eq!(mac_info.owner.as_deref(), Some("vps"));
+
+    let overview = rpc(mac, "services.overview", json!({})).await;
+    let one = &overview["result"]["services"][0];
+    assert_eq!(one["owner"], "vps", "{overview}");
+    assert_eq!(one["signed_in"], true, "{overview}");
+    assert_eq!(one["state"], "connected", "{overview}");
+    let hosts = one["hosts"].as_array().unwrap();
+    assert_eq!(hosts.len(), 2);
+    assert_eq!(hosts[0]["host"], LOCAL_HOST);
+    assert_eq!(hosts[0]["service"]["role"], "follower");
+    assert!(hosts[0]["service"]["access_until"].is_string(), "{overview}");
+    assert_eq!(hosts[1]["host"], "vps");
+    assert_eq!(hosts[1]["reachable"], true);
+    assert_eq!(hosts[1]["service"]["role"], "owner");
 
     // A host's change reaches the Mac's event stream under its name.
     let (_, mut events) = mac.subscribe();
@@ -1087,32 +1149,35 @@ async fn a_host_signs_in_for_itself_and_no_token_or_verifier_crosses_the_link() 
     assert_eq!(fake.refreshes(), 1);
     let rotated = p.logins.load("linear").unwrap().unwrap();
     assert_ne!(rotated.refresh, login.refresh);
+    p.mac_following().await;
 
-    // What the host may never let out, and everywhere it might have gone.
+    // What the owner may never let out, and everywhere it might have gone.
     let verifiers = fake.verifiers();
     assert_eq!(verifiers.len(), 1);
-    let secrets: Vec<String> = [
-        login.access,
-        login.refresh.unwrap(),
-        rotated.access,
-        rotated.refresh.unwrap(),
-    ]
-    .into_iter()
-    .chain(verifiers)
-    .collect();
+    let never: Vec<String> = [login.refresh.unwrap(), rotated.refresh.unwrap()]
+        .into_iter()
+        .chain(verifiers)
+        .collect();
     let wire = p.tapped.wire.lock().unwrap().clone();
-    // The search can fail: the wire did carry the sign-in, and only a code that
-    // the verifier makes useless.
+    // The search can fail: the wire did carry the sign-in, a code that the
+    // verifier makes useless, and access tokens, as it now may.
     assert!(find(&wire, "services.complete"), "the tap saw the link");
     assert!(find(&wire, "fake-code-"), "the code crosses, as it may");
-    let mut places = vec![
-        ("the link".to_owned(), wire),
-        (
-            "what the app saw".to_owned(),
-            format!("{url} {back}").into_bytes(),
-        ),
-        ("the shim's stdout".to_owned(), shim.read.clone()),
-    ];
+    assert!(find(&wire, &rotated.access), "access tokens cross, as they may");
+    let app_saw = format!("{url} {back}").into_bytes();
+    let shim_said = shim.read.clone();
+    for (place, bytes) in [("the link", &wire), ("the app", &app_saw), ("the shim", &shim_said)] {
+        for secret in &never {
+            assert!(!find(bytes, secret), "{secret} is in {place}");
+        }
+    }
+    // An access token, too, goes only over the link: not to the app or an agent.
+    for (place, bytes) in [("the app", &app_saw), ("the shim", &shim_said)] {
+        assert!(!find(bytes, SECRET_MARK), "a secret is in {place}");
+    }
+    // And nothing in the clear in any file on either, logs included. The stores
+    // here are a private file, encoded, and memory.
+    let mut places: Vec<(String, Vec<u8>)> = Vec::new();
     places.extend(
         all_files(p.mac.golden.dir.path())
             .into_iter()
@@ -1126,27 +1191,8 @@ async fn a_host_signs_in_for_itself_and_no_token_or_verifier_crosses_the_link() 
     assert!(places.len() > 3);
     for (place, bytes) in &places {
         assert!(!find(bytes, SECRET_MARK), "a secret is in {place}");
-        for secret in &secrets {
-            assert!(!find(bytes, secret), "{secret} is in {place}");
-        }
     }
     drop(shim);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_personal_key_never_crosses_a_link() {
-    let fake = FakeService::start().await;
-    let p = pair(&fake).await;
-    let refused = rpc(
-        &p.mac.core,
-        "services.connect_key",
-        json!({"host": "vps", "service": "linear", "key": API_KEY}),
-    )
-    .await;
-    assert_eq!(refused["error"]["code"], -32602, "{refused}");
-    assert!(!find(&p.tapped.wire.lock().unwrap(), API_KEY));
-    assert_eq!(p.logins.load("linear").unwrap(), None);
-    assert_eq!(p.mac_logins.load("linear").unwrap(), None);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1193,19 +1239,15 @@ async fn with_the_mac_gone_a_hosts_agent_lists_calls_and_survives_a_refresh() {
         kept.refresh
     );
 
-    // And when its login goes, it says how to mend it here, with no Mac.
+    // And when its login goes, it says how it's mended: on the Mac, when it's back.
     fake.expire_access();
     fake.refuse_refresh("invalid_grant");
-    shim = blocking(move || {
+    let _shim = blocking(move || {
         let lost = shim.call("list_issues");
         assert_eq!(lost["result"]["isError"], true, "{lost}");
-        assert!(
-            text(&lost).contains("needs reconnecting on this host"),
-            "{lost}"
-        );
-        assert!(
-            text(&lost).contains("vibe service set-key linear"),
-            "{lost}"
+        assert_eq!(
+            text(&lost),
+            "Linear needs reconnecting on the Mac (VibeOS → Settings → Services → Reconnect)."
         );
         assert!(
             shim.tools().contains(&"list_issues".to_owned()),
@@ -1222,17 +1264,253 @@ async fn with_the_mac_gone_a_hosts_agent_lists_calls_and_survives_a_refresh() {
             .state,
         ServiceState::NeedsReconnect
     );
+}
 
-    host.core
-        .services_connect_key(vibe_core::rpc::ServiceKeyParams {
-            service: "linear".into(),
-            key: API_KEY.into(),
+/// How long something given by way of the Mac may take.
+async fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
+    for _ in 0..1000 {
+        if done() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("timed out waiting for {what}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_mac_as_a_follower_serves_its_agents_and_a_401_gets_it_a_new_token() {
+    let fake = FakeService::start().await;
+    let p = pair(&fake).await;
+    p.connect_host().await;
+    p.mac_following().await;
+
+    let socket = p.mac.core.services_socket();
+    let cache = p.mac.golden.home.join("cache");
+    let mut shim = blocking(move || {
+        let mut shim = Shim::start(&socket, &cache, Some("on-the-mac"));
+        assert_eq!(text(&shim.call("list_issues")), "issues on /mcp");
+        shim
+    })
+    .await;
+    let first = p.logins.load("linear").unwrap().unwrap();
+    assert_eq!(
+        fake.calls().pop().unwrap().bearer.as_deref(),
+        Some(first.access.as_str())
+    );
+    assert_eq!(fake.refreshes(), 0);
+
+    // Turned down at the Mac: it asks once, the owner refreshes, and the same
+    // call goes through with no one the wiser.
+    fake.expire_access();
+    shim = blocking(move || {
+        let answer = shim.call("list_issues");
+        assert_eq!(text(&answer), "issues on /mcp", "{answer}");
+        shim
+    })
+    .await;
+    assert_eq!(fake.refreshes(), 1, "at the owner");
+    assert_ne!(p.logins.load("linear").unwrap().unwrap().refresh, first.refresh);
+    p.mac_following().await;
+    assert_eq!(p.mac_logins.load("linear").unwrap().unwrap().refresh, None);
+
+    // With the owner away, the token it has serves until it's refused or runs
+    // out, and then the agent's told why, and the tools still list.
+    p.tapped.cut();
+    wait_for("the link to go", || !p.mac.core.link("vps").unwrap().connected()).await;
+    shim = blocking(move || {
+        assert_eq!(text(&shim.call("list_issues")), "issues on /mcp");
+        shim
+    })
+    .await;
+    fake.expire_access();
+    blocking(move || {
+        let away = shim.call("list_issues");
+        assert_eq!(away["result"]["isError"], true, "{away}");
+        assert!(text(&away).contains("its login is on vps"), "{away}");
+        assert!(shim.tools().contains(&"list_issues".to_owned()));
+    })
+    .await;
+    assert_eq!(p.mac.service().state, ServiceState::OwnerUnreachable);
+    assert_eq!(fake.refreshes(), 1, "the Mac can't, and the owner wasn't asked");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn moving_the_login_is_signing_in_on_the_new_owner() {
+    let fake = FakeService::start().await;
+    let p = pair(&fake).await;
+
+    // On the Mac first, so the host follows it.
+    p.mac.sign_in_here().await;
+    let on_mac = p.mac_logins.load("linear").unwrap().unwrap();
+    let old_refresh = on_mac.refresh.clone().expect("the owner's");
+    wait_for("the host to follow", || {
+        p.logins
+            .load("linear")
+            .unwrap()
+            .is_some_and(|l| l.access == on_mac.access)
+    })
+    .await;
+    assert_eq!(p.logins.load("linear").unwrap().unwrap().refresh, None);
+    assert_eq!(p.host.service().owner.as_deref(), Some("the Mac"));
+    assert_eq!(p.mac.service().role, ServiceRole::Owner);
+
+    // Moved to the host: there's still one login, and only it can refresh.
+    p.connect_host().await;
+    let on_host = p.logins.load("linear").unwrap().unwrap();
+    assert!(on_host.refresh.is_some());
+    p.mac_following().await;
+    assert_eq!(p.mac_logins.load("linear").unwrap().unwrap().refresh, None);
+    assert_eq!(p.mac.service().role, ServiceRole::Follower);
+    assert_eq!(p.host.service().role, ServiceRole::Owner);
+    assert_eq!(fake.revocations(), [old_refresh], "the old login's gone");
+    let overview = rpc(&p.mac.core, "services.overview", json!({})).await;
+    assert_eq!(overview["result"]["services"][0]["owner"], "vps");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn disconnecting_forgets_it_everywhere_and_an_owner_away_is_told_when_its_back() {
+    let fake = FakeService::start().await;
+    let p = pair(&fake).await;
+    p.connect_host().await;
+    p.mac_following().await;
+    let refresh = p.logins.load("linear").unwrap().unwrap().refresh.unwrap();
+
+    // With the owner out of reach: the Mac forgets at once.
+    p.tapped.cut();
+    wait_for("the link to go", || !p.mac.core.link("vps").unwrap().connected()).await;
+    let done = rpc(&p.mac.core, "services.disconnect", json!({"service": "linear"})).await;
+    assert!(done["result"].is_object(), "{done}");
+    wait_for("the Mac to forget", || {
+        p.mac_logins.load("linear").unwrap().is_none()
+    })
+    .await;
+    assert_eq!(p.mac.service().state, ServiceState::Disconnected);
+
+    // It's back, still saying it holds it, and isn't believed: it forgets too,
+    // there and at the service.
+    p.tapped.restore();
+    wait_for("the owner to forget", || {
+        p.logins.load("linear").unwrap().is_none()
+    })
+    .await;
+    assert_eq!(fake.revocations(), [refresh]);
+    assert_eq!(p.host.service().state, ServiceState::Disconnected);
+    assert_eq!(p.mac.service().state, ServiceState::Disconnected);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mac_that_lost_track_finds_the_owner_and_needs_no_new_sign_in() {
+    let fake = FakeService::start().await;
+    let p = pair(&fake).await;
+    // Signed in at the host without this Mac recording it, as a Mac reinstalled
+    // or with its settings lost would find it.
+    p.host.sign_in_here().await;
+    p.mac_following().await;
+    assert_eq!(p.mac.service().owner.as_deref(), Some("vps"));
+    let overview = rpc(&p.mac.core, "services.overview", json!({})).await;
+    assert_eq!(overview["result"]["services"][0]["signed_in"], true);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_linux_host_gets_its_token_by_way_of_the_mac() {
+    let fake = FakeService::start().await;
+    let p = pair(&fake).await;
+    let dir = tempfile::tempdir().unwrap();
+    let logins = FileStore(dir.path().join("services"));
+    let second = node(
+        &fake,
+        Place::LinuxHost,
+        Arc::new(logins.clone()),
+        None,
+        |_| {},
+    )
+    .await;
+    let server = serve(
+        second.core.clone(),
+        common::short_tempdir(),
+        MAX_MESSAGE_BYTES,
+    );
+    p.tapped
+        .sockets
+        .lock()
+        .unwrap()
+        .insert("me@second".to_owned(), server.path.clone());
+    p.mac
+        .core
+        .add_host(HostAddParams {
+            name: "second".into(),
+            address: "me@second".into(),
         })
         .await
         .unwrap();
+
+    p.connect_host().await;
+    let owner = p.logins.load("linear").unwrap().unwrap();
+    wait_for("the second host to follow", || {
+        logins
+            .load("linear")
+            .unwrap()
+            .is_some_and(|l| l.access == owner.access)
+    })
+    .await;
+    assert_eq!(logins.load("linear").unwrap().unwrap().refresh, None);
+    assert_eq!(second.service().owner.as_deref(), Some("vps"));
+
+    // The owner's refresh reaches it too, pushed through the Mac.
+    let rotating = p.host.core.clone();
+    fake.expire_access();
+    let token = owner.access.clone();
+    rotating
+        .services_token(vibe_core::rpc::ServiceTokenParams {
+            service: "linear".into(),
+            rejected: Some(token),
+        })
+        .await
+        .unwrap();
+    let rotated = p.logins.load("linear").unwrap().unwrap();
+    assert_ne!(rotated.access, owner.access);
+    wait_for("the fresh token to reach it", || {
+        logins
+            .load("linear")
+            .unwrap()
+            .is_some_and(|l| l.access == rotated.access)
+    })
+    .await;
+
+    // With the Mac gone there's no way between the two hosts: it goes on with
+    // what it has, and only until that's no good. A limit, and a stated one.
+    p.tapped.cut();
+    let socket = second.core.services_socket();
+    let cache = second.golden.home.join("cache");
     blocking(move || {
+        let mut shim = Shim::start(&socket, &cache, Some("on-the-second-host"));
         assert_eq!(text(&shim.call("list_issues")), "issues on /mcp");
     })
     .await;
-    assert_eq!(fake.calls().pop().unwrap().bearer.as_deref(), Some(API_KEY));
+    assert_eq!(fake.refreshes(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn keys_are_gone_and_tokens_only_go_between_vibeds() {
+    let fake = FakeService::start().await;
+    let n = node(
+        &fake,
+        Place::Mac,
+        Arc::new(MemoryStore::default()),
+        None,
+        |_| {},
+    )
+    .await;
+    let gone = rpc(
+        &n.core,
+        "services.connect_key",
+        json!({"service": "linear", "key": "x"}),
+    )
+    .await;
+    assert_eq!(gone["error"]["code"], -32601, "{gone}");
+    // With no linked host, the login would be here.
+    let overview = rpc(&n.core, "services.overview", json!({})).await;
+    assert_eq!(overview["result"]["services"][0]["owner"], LOCAL_HOST);
+    assert!(!vibe_core::rpc::TUNNEL_METHODS.contains(&"services.token"));
+    assert!(!vibed::hosts::FORWARDED.contains(&"services.token"));
 }

@@ -18,7 +18,7 @@ use vibe_relay::hub::{Admit, Hub, Timing};
 use vibe_relay::proxy;
 use vibe_services::relay;
 use vibe_services::secrets::{FileStore, MemoryStore};
-use vibe_services::testing::{API_KEY, FakeService, SECRET_MARK};
+use vibe_services::testing::{FakeService, SECRET_MARK};
 use vibe_services::{Deps, Place, SecretStore, Services};
 
 const RECONNECT: &str =
@@ -57,6 +57,7 @@ impl Mac {
                 changed: Arc::new(|_| {}),
                 audit: Arc::new(move |l| a.lock().unwrap().push(l.to_owned())),
                 place: Place::Mac,
+                token_wait: Duration::from_millis(300),
             },
         );
         Mac {
@@ -317,7 +318,7 @@ fn find(haystack: &[u8], needle: &str) -> bool {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_token_never_leaves_the_host_that_holds_it() {
+async fn no_token_ever_reaches_a_vm() {
     let mac = Mac::start().await;
     // Signing in, as the app does it from wherever it is: all that crosses to
     // it, or from it, is the page's address and where the page ended.
@@ -578,6 +579,7 @@ impl Host {
                 changed: Arc::new(|_| {}),
                 audit: Arc::new(move |l| a.lock().unwrap().push(l.to_owned())),
                 place: Place::LinuxHost,
+                token_wait: Duration::from_millis(300),
             },
         );
         let socket = dir.path().join("services.sock");
@@ -659,76 +661,58 @@ async fn a_linux_host_serves_its_agents_on_its_own_login_and_survives_a_refresh(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn each_host_holds_a_login_of_its_own_and_one_refreshing_cant_hurt_another() {
-    // The very thing a synced token would break: rotation on one kills the
+async fn one_login_serves_two_hosts_and_only_its_owner_has_a_refresh_token() {
+    // The very thing a copied login would break: rotation on one kills the
     // others. With grace off, a copy of a used refresh token would fail here.
     let fake = FakeService::start().await;
     fake.set_replay_grace(false);
-    let a = Host::start(&fake).await;
-    let b = Host::start(&fake).await;
-    a.sign_in().await;
-    b.sign_in().await;
-    assert_eq!(
-        fake.registrations(),
-        2,
-        "each registered a client of its own"
-    );
-    let (la, lb) = (a.login(), b.login());
-    assert_ne!(la.access, lb.access);
-    assert_ne!(la.refresh, lb.refresh);
-    assert_ne!(la.client_id, lb.client_id);
+    let owner = Host::start(&fake).await;
+    let follower = Host::start(&fake).await;
+    owner.sign_in().await;
+    assert_eq!(fake.registrations(), 1, "one client, for the one login");
 
-    // Disconnecting one leaves the other.
-    b.services.disconnect("linear").await.unwrap();
-    assert_eq!(a.services.list().services[0].state, ServiceState::Connected);
-    assert!(a.login().refresh.is_some());
-    let (socket, cache) = (a.socket.clone(), a.dir.path().join("cache"));
-    blocking(move || {
-        let mut agent = Agent::start(&socket, &cache, Some("x"));
-        assert_eq!(text(&agent.call("list_issues")), "issues on /mcp");
-    })
-    .await;
-}
+    let hand_over = |access: vibe_core::rpc::ServiceAccess| vibe_core::rpc::ServiceFollowParams {
+        service: "linear".into(),
+        owner: Some("vps-1".into()),
+        state: access.state,
+        access: access.access,
+        expires_at: access.expires_at,
+        detail: None,
+    };
+    let access = owner.services.token("linear", None).await.unwrap();
+    follower.services.follow(hand_over(access)).await.unwrap();
 
-#[tokio::test(flavor = "multi_thread")]
-async fn a_personal_key_is_how_a_host_mends_itself_with_the_mac_away() {
-    let fake = FakeService::start().await;
-    let host = Host::start(&fake).await;
-    host.sign_in().await;
-    let (socket, cache) = (host.socket.clone(), host.dir.path().join("cache"));
+    let (socket, cache) = (follower.socket.clone(), follower.dir.path().join("cache"));
     let mut agent = blocking(move || {
         let mut agent = Agent::start(&socket, &cache, Some("x"));
-        assert!(agent.tools_once_known().contains("list_issues"));
-        agent
-    })
-    .await;
-    fake.expire_access();
-    fake.refuse_refresh("invalid_grant");
-    agent = blocking(move || {
-        let lost = agent.call("list_issues");
-        assert!(
-            text(&lost).contains("needs reconnecting on this host"),
-            "{lost}"
-        );
-        assert!(
-            text(&lost).contains("vibe service set-key linear"),
-            "{lost}"
-        );
+        assert_eq!(text(&agent.call("list_issues")), "issues on /mcp");
         agent
     })
     .await;
 
-    host.services.connect_key("linear", API_KEY).await.unwrap();
-    assert_eq!(
-        host.services.list().services[0].state,
-        ServiceState::Connected
-    );
+    // The owner rotates, and hands over the result: the follower's agent goes on.
+    fake.expire_access();
+    let access = owner
+        .services
+        .token("linear", Some(&follower.login().access))
+        .await
+        .unwrap();
+    follower.services.follow(hand_over(access)).await.unwrap();
     blocking(move || {
         assert_eq!(text(&agent.call("list_issues")), "issues on /mcp");
     })
     .await;
-    assert_eq!(fake.calls().pop().unwrap().bearer.as_deref(), Some(API_KEY));
-    assert_eq!(host.login().refresh, None);
+    assert_eq!(fake.refreshes(), 1);
+
+    // Look in every store and file the follower has for any refresh token.
+    let refreshes = [owner.login().refresh.expect("the owner's")];
+    assert_eq!(follower.login().refresh, None);
+    assert_eq!(follower.login().access, owner.login().access);
+    for (file, bytes) in all_files(follower.dir.path()) {
+        for token in &refreshes {
+            assert!(!find(&bytes, token), "a refresh token is in {file:?}");
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
