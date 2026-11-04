@@ -61,7 +61,10 @@
 #     by the key's name (never the key), sees the Mac's agents unavailable
 #     while the Mac is offline and the host's still answering, and is cut
 #     off on the host when the key is revoked on the Mac; the Mac listens on
-#     no public port. (crates/vibed/tests/external.rs, in the test step,
+#     no public port. Then, with the tunnel's relay stopped as with a Mac
+#     asleep (#59), every tool for the host's own agents answers in under 5 s,
+#     the listing merges back when it resumes, and with the Mac stopped
+#     altogether, the same. (crates/vibed/tests/external.rs, in the test step,
 #     covers the same in one process, plus rate limits, the Mac refusing a
 #     host's own key and a revoked one even before the host hears, and the
 #     tunnel's supervision.)

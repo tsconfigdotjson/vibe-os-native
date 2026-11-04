@@ -126,7 +126,12 @@ gets `unauthorized` (-32006), after a pause. `method` is one of the calls
 MCP's tools stand on: `projects.list`, `agents.list`, `agents.start`,
 `agents.delete`, `agents.send`, `agents.check`, `agents.output`,
 `agents.messages`; anything else is `method_not_found`. Its result is that
-call's. On the external host the Mac goes by `mac`, so its agents are
+call's, and `agents.list` also says the Mac's `memory`. As soon as it has a call,
+the socket says so with a notification, `call.accepted {id}`, and a host fails one
+that hasn't that or an answer within 5 s, however long it may run after that. A Mac
+that does this says `accepts_calls: true` in its `daemon.hello` answer. So does
+`vibed.sock` to a connection whose hello says it's a link, sending `call.accepted`
+for those same agent calls. On the external host the Mac goes by `mac`, so its agents are
 `mac:<ref>` to outside callers.
 
 **Shared MCP services.** There's one login per install for each service, held by
