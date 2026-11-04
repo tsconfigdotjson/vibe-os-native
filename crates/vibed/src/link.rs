@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
 use vibe_core::model::{HostLink, LOCAL_HOST};
-use vibe_core::rpc::ACCEPTS_CALLS;
+use vibe_core::rpc::{ACCEPTS_CALLS, TUNNEL_METHODS};
 use vibe_core::rpc::{
     ErrorCode, ErrorObject, Event, Hello, HostInfo, HostList, HostsList, Method, PROTOCOL_VERSION,
 };
@@ -98,8 +98,9 @@ pub struct Link {
     pub(crate) upgrade_tried: AtomicBool,
     /// A read of its agents is wanted: one runs at a time.
     pub(crate) refresh_wanted: AtomicBool,
-    /// The last push of this host's keys there failed: the next ping tries
-    /// again.
+    /// It hasn't had this host's latest keys, as far as this `vibed` knows: the last
+    /// push failed or couldn't be made, or none has been since it started. The next
+    /// ping tries again.
     pub(crate) keys_stale: AtomicBool,
     /// The projects it last listed, as it still has them while it's away.
     pub(crate) projects_seen: Mutex<Vec<String>>,
@@ -165,7 +166,7 @@ impl Link {
             task: Mutex::new(None),
             upgrade_tried: AtomicBool::new(false),
             refresh_wanted: AtomicBool::new(false),
-            keys_stale: AtomicBool::new(false),
+            keys_stale: AtomicBool::new(true),
             projects_seen: Mutex::new(Vec::new()),
             accepts_calls: AtomicBool::new(false),
         }
@@ -323,7 +324,9 @@ impl Link {
                     Ordering::SeqCst,
                 );
             }
-            if self.accepts_calls.load(Ordering::SeqCst) {
+            // Only the agent calls are said to be taken. Others, as a clone in
+            // `projects.add` is, take their time with no word till they're done.
+            if self.accepts_calls.load(Ordering::SeqCst) && TUNNEL_METHODS.contains(&method) {
                 channel.call_accepted(method, params, ACCEPT_WITHIN).await
             } else {
                 channel.call(method, params).await

@@ -485,6 +485,46 @@ async fn a_revoke_with_a_host_away_says_its_pending_until_it_arrives() {
     assert!(cleared, "and it no longer says so");
 }
 
+/// The accept deadline is for agent calls, which say they're taken. A clone on a host
+/// says nothing till it's done, and takes as long as it takes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slow_call_thats_not_an_agents_isnt_held_to_the_accept_deadline() {
+    let dir = common::short_tempdir();
+    let bin = dir.path().join("bin");
+    let remotes = dir.path().join("remotes");
+    common::repo(&remotes.join("big"));
+    let gh = common::fake_gh(&bin, &remotes);
+    // Over the deadline, a clone that's slow.
+    let slow = bin.join("slow-gh");
+    std::fs::write(
+        &slow,
+        format!(
+            "#!/bin/sh\ncase \"$1 $2\" in \"repo clone\") sleep 6 ;; esac\nexec {} \"$@\"\n",
+            gh.display()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&slow, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let w = world_with(move |c| c.gh = slow.into()).await;
+    w.add_host().await;
+    w.link().await;
+    // A first call, so the link has a channel and knows what the host says of it.
+    let listed = w.rpc("projects.list", json!({"host": "vps"})).await;
+    assert!(listed["result"].is_object(), "{listed}");
+
+    let begun = std::time::Instant::now();
+    let added = w
+        .rpc("projects.add", json!({"host": "vps", "repo": "o/big"}))
+        .await;
+    assert_eq!(added["result"]["name"], "big", "{added}");
+    assert!(
+        begun.elapsed() > Duration::from_secs(5),
+        "it's meant to outlast the deadline: {:?}",
+        begun.elapsed()
+    );
+}
+
 /// A host's link stays up by its pings here, so what catches it is the deadline.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_host_that_doesnt_take_a_call_fails_it_at_the_accept_deadline() {
@@ -1129,9 +1169,14 @@ async fn a_mac_restarted_keeps_its_hosts_and_links_again() {
     let kept = Daemon::agents(&*mac, &caller(), "vps").await.unwrap();
     assert_eq!(kept.len(), 1, "{kept:?}");
     assert!(!kept[0].available);
+    // Nothing's reached it since this Mac started, so for all it knows, a revoke hasn't.
+    let keys = rpc(&mac, "keys.list", json!({})).await;
+    assert_eq!(keys["result"]["pending_on"], json!(["vps"]), "{keys}");
     wires.plug_in();
     for _ in 0..500 {
-        if mac.link("vps").is_some_and(|l| l.connected()) {
+        let up = mac.link("vps").is_some_and(|l| l.connected());
+        let keys = rpc(&mac, "keys.list", json!({})).await;
+        if up && keys["result"].get("pending_on").is_none() {
             return;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;

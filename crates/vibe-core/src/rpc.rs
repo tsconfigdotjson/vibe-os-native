@@ -895,9 +895,6 @@ impl Method for TunnelCall {
     type Result = Value;
 }
 
-/// The calls the tunnel takes, each for this Mac's own agents only; and
-/// `hosts.list`, answered with this Mac's own row alone, for its memory in
-/// `vibe_list_agents`.
 /// The notification a peer sends as soon as it has a call it will run: `{id}`,
 /// the call's id. What's listening knows within seconds that the far side is there,
 /// however long the call itself goes on to take, so it needn't wait out a long
@@ -920,6 +917,9 @@ pub fn accepted_frame(line: &[u8], wanted: impl FnOnce(&str) -> bool) -> Option<
     })
 }
 
+/// The calls the tunnel takes, each for this Mac's own agents only; and `hosts.list`,
+/// answered with this Mac's own row alone, for a host older than its memory coming with
+/// `agents.list`. On a link, these are the calls that get [`CALL_ACCEPTED`].
 pub const TUNNEL_METHODS: &[&str] = &[
     "hosts.list",
     "projects.list",
