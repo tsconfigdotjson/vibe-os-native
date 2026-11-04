@@ -842,7 +842,10 @@ fn a_full_store_stops_new_providers_and_never_a_refresh() {
     }
     let full = fs::metadata(w.store_path()).unwrap().len() as usize;
     assert!(full > MAX_AGENT_STORE - MAX_AGENT_ENTRY, "{full}");
-    write(&vm, r#"{"xai":{"type":"api_key","key":"k"}}"#);
+    write(
+        &vm,
+        &format!(r#"{{"xai":{{"type":"api_key","key":"{size}"}}}}"#),
+    );
     let report = w.done(&vm);
     assert!(report.refused["xai"].contains("no more room"), "{report:?}");
     // A rotated token still goes everywhere.
@@ -871,12 +874,46 @@ fn a_full_store_stops_new_providers_and_never_a_refresh() {
     assert_eq!(w.stored()["anthropic"]["access"], "second");
 }
 
-/// R2: an agent inflating every login there is, as far as each may go, leaves
-/// every copy readable.
+/// R2: an agent inflating every login there is, as far as each may go, by refresh
+/// after refresh, leaves every copy readable.
 #[test]
 fn nothing_agents_can_do_makes_a_copy_unreadable() {
-    let total = MAX_AGENT_ENTRY * MAX_AGENT_PROVIDERS;
-    assert!((total as u64) * 2 < pi::MAX_AUTH_FILE, "{total}");
+    let w = world();
+    let (hostile, other, toolbox) = (w.copy("hostile"), w.copy("other"), w.toolbox());
+    let login = |round: usize, access: &str, expires: u64| {
+        format!(
+            r#""p{round}":{{"type":"oauth","access":"{access}","refresh":"r","expires":{expires}}}"#
+        )
+    };
+    // As many providers as may be offered, one at a time.
+    let mut all = Vec::new();
+    for round in 0..MAX_AGENT_PROVIDERS {
+        all.push(login(round, "a", NOW + 1));
+        write(&hostile, &format!("{{{}}}", all.join(",")));
+        assert_eq!(w.done(&hostile).first, [format!("p{round}")]);
+    }
+    // Then each as big as a login may be.
+    let big = "a".repeat(MAX_AGENT_ENTRY - 200);
+    let all: Vec<String> = (0..MAX_AGENT_PROVIDERS)
+        .map(|round| login(round, &big, NOW + 2))
+        .collect();
+    write(&hostile, &format!("{{{}}}", all.join(",")));
+    assert_eq!(w.done(&hostile).taken.len(), MAX_AGENT_PROVIDERS);
+    let bytes = fs::metadata(w.store_path()).unwrap().len();
+    assert!(bytes > 1 << 20, "past the old limit: {bytes}");
+    assert!(bytes < pi::MAX_AUTH_FILE, "{bytes}");
+    // Everything still reads it, and the owner still gets through.
+    for copy in [&other, &toolbox] {
+        w.done(copy);
+        assert_eq!(held(copy).len(), MAX_AGENT_PROVIDERS);
+    }
+    let mut entries = held(&toolbox);
+    entries.insert(
+        "mine".to_owned(),
+        serde_json::json!({"type":"api_key","key":"owner"}),
+    );
+    write(&toolbox, &Value::Object(entries).to_string());
+    assert_eq!(w.done(&toolbox).taken, ["mine"]);
 }
 
 /// R3: a guest's text doesn't reach the owner's terminal as a provider's name.
