@@ -36,7 +36,8 @@ jobs:
           - name: macos-26
             runner: macos-26
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
+    # The macOS job builds the Linux bundles too, about 10 minutes of it.
+    timeout-minutes: 60
     env:
       CARGO_BUILD_JOBS: 4
       TEST_THREADS: 4

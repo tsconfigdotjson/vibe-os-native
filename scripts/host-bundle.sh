@@ -8,7 +8,8 @@
 # By default it builds both CPUs, statically linked against musl, so they
 # run on any Linux server. SQLite is compiled in, which needs a C compiler
 # for the target: this uses cargo-zigbuild, with zig as that compiler, on a
-# Mac or on Linux (brew install zig; cargo install cargo-zigbuild).
+# Mac or on Linux, fetched on first use if you haven't got them
+# (scripts/zig-tools.sh).
 #
 # --native builds for this Linux machine's own CPU with its own toolchain:
 # dynamically linked, for a server like this one, and quick, for tests.
@@ -22,11 +23,12 @@ while [ $# -gt 0 ]; do
     --out) OUT=$2; shift 2 ;;
     --target) TARGETS+=("$2"); shift 2 ;;
     --native) NATIVE=true; shift ;;
-    -h | --help) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h | --help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "host-bundle: unexpected $1" >&2; exit 2 ;;
   esac
 done
 BINS=(vibed vibe vibe-shim)
+TARGET_DIR=${CARGO_TARGET_DIR:-target}
 PACKAGES=(-p vibed -p vibe-cli -p vibe-shim)
 
 place() { # place <arch> <dir the binaries are in>
@@ -43,13 +45,14 @@ if $NATIVE; then
   arch=$(uname -m)
   case $arch in amd64) arch=x86_64 ;; arm64) arch=aarch64 ;; esac
   cargo build --locked --release "${PACKAGES[@]}"
-  place "$arch" target/release
+  place "$arch" "$TARGET_DIR/release"
   exit 0
 fi
 
 [ ${#TARGETS[@]} -gt 0 ] || TARGETS=(x86_64 aarch64)
-command -v cargo-zigbuild >/dev/null || {
-  echo "host-bundle: needs cargo-zigbuild and zig (brew install zig; cargo install cargo-zigbuild), or --native on Linux" >&2
+. scripts/zig-tools.sh
+ensure_zigbuild || {
+  echo "host-bundle: can't get zig and cargo-zigbuild, which it needs for this; on Linux, --native needs neither" >&2
   exit 1
 }
 for arch in "${TARGETS[@]}"; do
@@ -62,8 +65,8 @@ for arch in "${TARGETS[@]}"; do
   rustup target add "$target"
   cargo zigbuild --locked --release --target "$target" "${PACKAGES[@]}"
   for b in "${BINS[@]}"; do
-    info=$(file "target/$target/release/$b")
+    info=$(file "$TARGET_DIR/$target/release/$b")
     case $info in *"statically linked"* | *"static-pie linked"*) ;; *) echo "$b isn't static: $info" >&2; exit 1 ;; esac
   done
-  place "$arch" "target/$target/release"
+  place "$arch" "$TARGET_DIR/$target/release"
 done

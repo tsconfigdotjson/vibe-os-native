@@ -70,8 +70,8 @@
 #     tunnel's supervision.)
 #   - a real Linux server, when VIBE_TEST_LINUX_HOST is an SSH destination
 #     that logs in with a key (N/A otherwise): the Linux builds of vibed
-#     (scripts/host-bundle.sh, which needs zig and cargo-zigbuild, or
-#     VIBE_HOST_BUNDLE), installed over real ssh, linked, listed through
+#     (scripts/host-bundle.sh, which fetches zig and cargo-zigbuild on first
+#     use, or VIBE_HOST_BUNDLE), installed over real ssh, linked, listed through
 #     the Mac's MCP, and a hung link noticed and taken up again. With
 #     VIBE_TEST_LINUX_PROJECT naming a project on the server, an agent
 #     started there through MCP too, in a cgroup of its own. Then the
@@ -130,7 +130,7 @@
 #     Sparkle built in and a key made for the check: the DMG holds the app
 #     and Applications; the app holds VibeOS, vibed, vibe, vibe-shim and
 #     vibe-vm for Apple Silicon, vibed's LaunchAgent and Sparkle.framework,
-#     and the Linux builds when cargo-zigbuild is there; its signature
+#     and the Linux builds; its signature
 #     verifies, vibe-vm keeps the virtualization entitlement and the app the
 #     Apple Events one; Info.plist has the version, the appcast's URL and
 #     the public key of the key the DMG is signed with; the appcast names
@@ -1393,13 +1393,9 @@ s_release_build() {
   plutil -extract NSLocalNetworkUsageDescription raw "$plist" | grep -q . || { echo "Info.plist lacks NSLocalNetworkUsageDescription"; return 1; }
   [ -d "$app/Contents/Frameworks/Sparkle.framework" ] || { echo "no Sparkle.framework"; return 1; }
   otool -l "$app/Contents/MacOS/VibeOS" | grep -q '@executable_path/../Frameworks'
-  if command -v cargo-zigbuild >/dev/null; then
-    for a in x86_64 aarch64; do
-      [ -x "$app/Contents/Resources/linux/$a/vibed" ] || { echo "no Linux vibed for $a"; return 1; }
-    done
-  else
-    echo "no cargo-zigbuild here, so no Linux builds to look for"
-  fi
+  for a in x86_64 aarch64; do
+    [ -x "$app/Contents/Resources/linux/$a/vibed" ] || { echo "no Linux vibed for $a"; return 1; }
+  done
   python3 -I - "$ROOT" "$out/appcast.xml" "$dmg" "$version" "$public" <<'PY'
 import base64, os, sys
 sys.path.insert(0, os.path.join(sys.argv[1], "scripts"))
@@ -1465,8 +1461,9 @@ s_real_external() {
 real_host_cgroups() {
   local dest=$1 arch=$2 bundle=$3 target json bin dir rc
   local ssh_opts=(-o BatchMode=yes -o StrictHostKeyChecking=accept-new)
-  command -v cargo-zigbuild >/dev/null || {
-    echo "the cgroups tests are built for the server with cargo-zigbuild and zig (brew install zig; cargo install cargo-zigbuild)"
+  . scripts/zig-tools.sh
+  ensure_zigbuild || {
+    echo "the cgroups tests are built for the server with cargo-zigbuild and zig, and they can't be had"
     return 1
   }
   [ -x "$bundle/$arch/vibe-shim" ] || { echo "no $bundle/$arch/vibe-shim"; return 1; }
