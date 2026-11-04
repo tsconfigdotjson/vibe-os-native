@@ -24,7 +24,7 @@
       "profile": "pi-linux",
       "project": "app",
       "ref": "able-aqua-bison",
-      "session_id": "a0a1a2a3-a4a5-46a7-a8a9-aaabacadaeaf",
+      "session_id": "e0e1e2e3-e4e5-46e7-a8e9-eaebecedeeef",
       "state": "busy",
       "status": {
         "activity": "unknown",
@@ -44,7 +44,7 @@
         "kind": "agent.added",
         "project": "app",
         "ref": "able-aqua-bison",
-        "seq": 34,
+        "seq": 42,
         "state": "busy"
       }
     }
