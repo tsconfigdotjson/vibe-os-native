@@ -1,5 +1,6 @@
 //! Shared MCP services in the daemon: how agents are offered them, a Mac's
-//! relays to its VMs through the real `vibe-guest`, and a Linux host's own
+//! relays to its VMs through a real `vibe-guest`, on a Mac only the part of it
+//! that carries services (`--services-only`), and a Linux host's own
 //! broker, its sign-in driven from a Mac over a tapped link. A stand-in plays
 //! the service; nothing reaches a real one.
 
@@ -12,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::{Golden, TestServer, serve, workspace_bin};
 use serde_json::{Value, json};
@@ -347,6 +348,16 @@ async fn every_profile_offers_the_services_per_launch_until_it_is_switched_off()
     );
 }
 
+/// Whether there's a file called `name` anywhere under `dir`.
+fn has_file(dir: &std::path::Path, name: &str) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|entries| {
+        entries.flatten().any(|e| {
+            e.file_name() == name
+                || e.file_type().is_ok_and(|t| t.is_dir()) && has_file(&e.path(), name)
+        })
+    })
+}
+
 /// Ends an agent's session, as Claude exiting does.
 fn end_session(n: &Node, agent: &str) {
     let status = vibe_core::shim::connect(
@@ -399,7 +410,10 @@ async fn switching_a_profile_off_takes_them_from_its_agents_next_launch() {
         "{refused}"
     );
 
-    // ...and when it's next launched, by a resume, it isn't offered them.
+    // ...and when it's next launched, by a resume, it isn't offered them. One
+    // that's written nothing yet starts again instead, with nothing to resume.
+    let transcript = format!("{}.jsonl", a.session_id);
+    wait_for("its transcript", || has_file(n.layout.home(), &transcript)).await;
     let before = n.launches.lock().unwrap().len();
     end_session(&n, &a.agent);
     n.core.resume_agent(None, &a.agent).await.unwrap();
@@ -677,18 +691,25 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
 
 // ---- A Mac's VMs.
 
-/// The real guest, on Unix sockets standing in for its vsock ports.
+/// The guest, on Unix sockets standing in for its vsock ports.
 struct Guest {
     dir: tempfile::TempDir,
     child: Child,
 }
 
 impl Guest {
+    /// As much of the guest as this OS can run: the whole of it on Linux, and on a
+    /// Mac what carries the services, which is what's being tested.
     fn start() -> Guest {
+        Guest::start_as(!cfg!(target_os = "linux"))
+    }
+
+    fn start_as(services_only: bool) -> Guest {
         let dir = tempfile::tempdir().unwrap();
         let child = Command::new(workspace_bin("vibe-guest"))
             .arg("--vsock-dir")
             .arg(dir.path())
+            .args(services_only.then_some("--services-only"))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -739,6 +760,48 @@ impl Drop for Guest {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// What a Mac runs in place of the whole guest carries a real call, wherever it's
+/// run, so Linux's runs cover a Mac's path too.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_services_alone_carry_a_call_as_the_whole_guest_does() {
+    let fake = FakeService::start().await;
+    let guest = Guest::start_as(true);
+    let n = node(
+        &fake,
+        Place::Mac,
+        Arc::new(MemoryStore::default()),
+        Some(guest.dir.path().to_owned()),
+        |_| {},
+    )
+    .await;
+    n.sign_in_here().await;
+    n.core
+        .start_agent(start("in a vm", "software-eng-linux"))
+        .await
+        .unwrap();
+    let relays = n.relays.clone();
+    wait_for("the Mac to dial the VM", || *relays.lock().unwrap() >= 1).await;
+    // The Mac's end is up a moment before the guest takes it, and a call says so
+    // until then.
+    let (mut shim, mut child) = guest.shim("someone-else");
+    let answer = blocking(move || {
+        let begun = Instant::now();
+        loop {
+            let answer = shim.call("list_issues");
+            if !text(&answer).contains("Mac unreachable")
+                || begun.elapsed() > Duration::from_secs(30)
+            {
+                return answer;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    })
+    .await;
+    assert_eq!(text(&answer), "issues on /mcp", "{answer}");
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1354,6 +1417,11 @@ impl Pair {
             matches!((owner, mac), (Some(o), Some(m)) if o.access == m.access)
         })
         .await;
+        // Its state comes a moment after the login it's about.
+        wait_for("the Mac to say whose it is", || {
+            self.mac.service().role == ServiceRole::Follower && self.mac.service().owner.is_some()
+        })
+        .await;
     }
 }
 
@@ -1684,7 +1752,11 @@ async fn moving_the_login_is_signing_in_on_the_new_owner() {
     })
     .await;
     assert_eq!(p.logins.load("linear").unwrap().unwrap().refresh, None);
-    assert_eq!(p.host.service().owner.as_deref(), Some("the Mac"));
+    // Its state comes a moment after the login it's about.
+    wait_for("the host to say whose it is", || {
+        p.host.service().owner.as_deref() == Some("the Mac")
+    })
+    .await;
     assert_eq!(p.mac.service().role, ServiceRole::Owner);
 
     // Moved to the host: there's still one login, and only it can refresh.
@@ -1695,7 +1767,10 @@ async fn moving_the_login_is_signing_in_on_the_new_owner() {
     assert_eq!(p.mac_logins.load("linear").unwrap().unwrap().refresh, None);
     assert_eq!(p.mac.service().role, ServiceRole::Follower);
     assert_eq!(p.host.service().role, ServiceRole::Owner);
-    assert_eq!(fake.revocations(), [old_refresh], "the old login's gone");
+    wait_for("the old login to go", || {
+        fake.revocations() == [old_refresh.clone()]
+    })
+    .await;
     let overview = rpc(&p.mac.core, "services.overview", json!({})).await;
     assert_eq!(overview["result"]["services"][0]["owner"], "vps");
 }
@@ -1912,7 +1987,11 @@ async fn a_second_linux_host_gets_its_token_by_way_of_the_mac() {
     })
     .await;
     assert_eq!(logins.load("linear").unwrap().unwrap().refresh, None);
-    assert_eq!(second.service().owner.as_deref(), Some("vps"));
+    // Its state comes a moment after the login it's about.
+    wait_for("the second host to say whose it is", || {
+        second.service().owner.as_deref() == Some("vps")
+    })
+    .await;
 
     // The owner's refresh reaches it too, pushed through the Mac.
     let rotating = p.host.core.clone();
@@ -1968,7 +2047,11 @@ async fn removing_the_host_that_owns_it_leaves_it_to_be_signed_in_again() {
         p.mac_logins.load("linear").unwrap().is_none()
     })
     .await;
-    assert_eq!(p.mac.service().state, ServiceState::Disconnected);
+    // Its state comes a moment after the login it's about.
+    wait_for("the Mac to say it's signed out", || {
+        p.mac.service().state == ServiceState::Disconnected
+    })
+    .await;
     let overview = rpc(&p.mac.core, "services.overview", json!({})).await;
     let one = &overview["result"]["services"][0];
     assert_eq!(one["owner"], LOCAL_HOST, "{overview}");
