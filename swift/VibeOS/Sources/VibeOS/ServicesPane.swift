@@ -256,7 +256,7 @@ private struct ServiceHostRow: View {
     }
 
     private var summary: some View {
-        let status = host.service.map(ServiceSummary.init)
+        let status = host.service.map { ServiceSummary($0) }
         return HStack(spacing: 10) {
             IconTile(symbol: local ? "laptopcomputer" : "server.rack", color: local ? .blue : .indigo, size: 26)
             VStack(alignment: .leading, spacing: 2) {
