@@ -204,6 +204,14 @@ ROOT=$(pwd)
 OS=$(uname -s)
 export PATH="$HOME/.cargo/bin:$PATH"
 export CARGO_TERM_COLOR=never
+# Whatever this shell allows, what's checked stays out of the login Keychain
+# (vibe_core::keychain), including the debug binaries run here without cargo.
+export VIBE_LOGIN_KEYCHAIN=never
+# What's checked goes by each repo's own git config, even run inside an agent,
+# whose environment carries gc.auto=0 and more. .cargo/config.toml does the same
+# for what cargo runs; this is for the binaries run here without it.
+export GIT_CONFIG_COUNT=0
+unset GIT_CONFIG_PARAMETERS
 
 TEST_ARGS=()
 if [ "$OS" = Linux ]; then
