@@ -1,0 +1,31 @@
+{
+  "description": "This host's shared services, and how each stands: here, Linear needs reconnecting, as its registered client was forgotten. A host holds its own login to each, so `host` names which host's; on any other host this goes over its link, and only ever says how it stands.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 9900,
+    "method": "services.list",
+    "params": {
+      "host": "local"
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 9900,
+    "result": {
+      "services": [
+        {
+          "auth": "oauth",
+          "denied_tools": [],
+          "detail": "Linear refused the refresh (invalid_client)",
+          "detail_at": "2026-10-30T12:00:00Z",
+          "enabled": true,
+          "name": "linear",
+          "read_only": false,
+          "state": "needs_reconnect",
+          "title": "Linear",
+          "tools": 0
+        }
+      ]
+    }
+  }
+}

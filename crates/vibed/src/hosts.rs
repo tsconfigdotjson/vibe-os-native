@@ -45,6 +45,14 @@ pub const FORWARDED: &[&str] = &[
     "limits.set",
     "mcp.get",
     "mcp.set",
+    // A host's shared services are its own, so these go to it, and only ever
+    // say how it stands. `services.connect_key` isn't here: a key is entered on
+    // the host it's for, so it never crosses a link.
+    "services.list",
+    "services.connect",
+    "services.complete",
+    "services.disconnect",
+    "services.set",
     "sessions.list",
     "sessions.attach",
     "agents.start",

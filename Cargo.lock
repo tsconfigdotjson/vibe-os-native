@@ -1695,6 +1695,8 @@ dependencies = [
  "vibe-core",
  "vibe-env",
  "vibe-mcp",
+ "vibe-relay",
+ "vibe-services",
  "vibed",
 ]
 
@@ -1722,6 +1724,7 @@ dependencies = [
  "tempfile",
  "vibe-core",
  "vibe-guest",
+ "vibe-relay",
  "vibe-status",
  "vt100",
 ]
@@ -1734,6 +1737,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "vibe-relay",
  "vt100",
 ]
 
@@ -1840,6 +1844,8 @@ dependencies = [
  "vibe-core",
  "vibe-env",
  "vibe-mcp",
+ "vibe-relay",
+ "vibe-services",
  "vibe-status",
 ]
 

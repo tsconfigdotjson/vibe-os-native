@@ -63,6 +63,10 @@ struct Inner {
     refreshes: usize,
     registrations: usize,
     revocations: Vec<String>,
+    /// PKCE verifiers it was given, so a test can look for them elsewhere.
+    verifiers: Vec<String>,
+    /// Codes taken for a stand-in's fixed answers, with no page to get them.
+    fixed_code: Option<String>,
     log: Vec<String>,
     refuse_refresh: Option<String>,
     /// Every token is turned down, new ones too, while refreshes still work:
@@ -255,6 +259,35 @@ impl FakeService {
 
     pub fn revocations(&self) -> Vec<String> {
         self.state().revocations.clone()
+    }
+
+    /// The PKCE verifiers exchanges brought.
+    pub fn verifiers(&self) -> Vec<String> {
+        self.state().verifiers.clone()
+    }
+
+    /// Takes `code` from any client, with any verifier: for the contract's
+    /// examples, which play no browser.
+    pub fn accept_code(&self, code: &str) {
+        self.state().fixed_code = Some(code.to_owned());
+    }
+
+    /// One on a thread and a runtime of its own, for a caller with neither,
+    /// such as the contract's world. It serves for as long as the process runs.
+    pub fn start_detached() -> FakeService {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a runtime");
+            runtime.block_on(async move {
+                let fake = FakeService::start().await;
+                let _ = tx.send(fake.clone());
+                std::future::pending::<()>().await;
+            });
+        });
+        rx.recv().expect("it started")
     }
 
     /// Adds to the running log of what happened, in order: this stand-in
@@ -481,9 +514,14 @@ async fn token(inner: &Mutex<Inner>, base: &str, body: &[u8]) -> Response<Channe
     match get("grant_type").as_str() {
         "authorization_code" => {
             let mut state = lock(inner);
+            if state.fixed_code.as_deref() == Some(get("code").as_str()) {
+                let (access, refresh) = new_tokens(&mut state);
+                return tokens_reply(&access, &refresh);
+            }
             if !state.clients.contains(&get("client_id")) {
                 return oauth_error("invalid_client");
             }
+            state.verifiers.push(get("code_verifier"));
             let Some((client, wanted)) = state.codes.remove(&get("code")) else {
                 return oauth_error("invalid_grant");
             };

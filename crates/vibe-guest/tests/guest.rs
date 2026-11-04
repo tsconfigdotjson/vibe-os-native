@@ -704,3 +704,179 @@ fn a_run_goes_to_completion_beside_the_command() {
     let r = g.ask(json!({"op": "run", "command": ["true"], "timeout_ms": 0}));
     assert_eq!(r["code"], "bad_request", "{r}");
 }
+
+// Shared MCP services: the guest's end of the relay, and its own `vibe`.
+
+mod services {
+    use super::*;
+    use vibe_relay::frame::{
+        Frame as Relay, PROTOCOL as RELAY, VSOCK_PORT, read_frame, write_frame,
+    };
+    use vibe_relay::local;
+
+    /// The Mac's end: dials the guest's port, and says hello.
+    fn dial(guest: &Guest) -> UnixStream {
+        let mut mac = UnixStream::connect(guest.socket(VSOCK_PORT)).unwrap();
+        mac.set_read_timeout(Some(WAIT)).unwrap();
+        write_frame(&mut mac, &Relay::Hello { protocol: RELAY }).unwrap();
+        assert_eq!(
+            read_frame(&mut mac).unwrap(),
+            Some(Relay::Hello { protocol: RELAY })
+        );
+        mac
+    }
+
+    fn next(mac: &mut UnixStream) -> Relay {
+        loop {
+            match read_frame(mac).unwrap().expect("the relay is up") {
+                Relay::Ping => {}
+                f => return f,
+            }
+        }
+    }
+
+    /// `vibe mcp-proxy linear` in the guest, by the guest's own binary.
+    fn shim(guest: &Guest, program: &Path, args: &[&str]) -> Child {
+        Command::new(program)
+            .args(args)
+            .env(local::SOCKET_ENV, guest.dir.path().join("services.sock"))
+            .env(local::CACHE_ENV, guest.dir.path().join("cache"))
+            .env(local::AGENT_ENV, "quiet-amber-otter")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    fn say(child: &mut Child, message: Value) {
+        writeln!(child.stdin.as_mut().unwrap(), "{message}").unwrap();
+    }
+
+    fn wait_for_socket(guest: &Guest) {
+        wait_until("the services socket", || {
+            guest.dir.path().join("services.sock").exists() && guest.socket(VSOCK_PORT).exists()
+        });
+    }
+
+    #[test]
+    fn a_shim_in_the_guest_reaches_the_mac_over_the_relay_it_dialed() {
+        let guest = Guest::start("services-relay", false, &[]);
+        wait_for_socket(&guest);
+        let mut mac = dial(&guest);
+        std::thread::sleep(Duration::from_millis(50));
+
+        let mut child = shim(&guest, Path::new(GUEST), &["mcp-proxy", "linear"]);
+        let mut out = BufReader::new(child.stdout.take().unwrap());
+        say(
+            &mut child,
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}}),
+        );
+        let mut line = String::new();
+        out.read_line(&mut line).unwrap();
+        let init: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(init["result"]["serverInfo"]["name"], "vibe-linear");
+
+        // It opened a stream, saying who it is.
+        let Relay::Open {
+            stream,
+            service,
+            agent,
+        } = next(&mut mac)
+        else {
+            panic!("not an open")
+        };
+        assert_eq!(service, "linear");
+        assert_eq!(agent.as_deref(), Some("quiet-amber-otter"));
+
+        // A call goes out on it, and its answer comes back to the client.
+        say(
+            &mut child,
+            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "list_issues"}}),
+        );
+        loop {
+            let Relay::Message { stream: s, body } = next(&mut mac) else {
+                panic!("not a message")
+            };
+            assert_eq!(s, stream);
+            let m: Value = serde_json::from_slice(&body).unwrap();
+            if m["method"] == "tools/call" {
+                break;
+            }
+        }
+        write_frame(
+            &mut mac,
+            &Relay::Message {
+                stream,
+                body: json!({"jsonrpc": "2.0", "id": 2, "result": {"content": [{"type": "text", "text": "from the Mac"}]}})
+                    .to_string()
+                    .into_bytes(),
+            },
+        )
+        .unwrap();
+        let answer = loop {
+            let mut line = String::new();
+            out.read_line(&mut line).unwrap();
+            let v: Value = serde_json::from_str(&line).unwrap();
+            if v["id"] == 2 {
+                break v;
+            }
+        };
+        assert_eq!(answer["result"]["content"][0]["text"], "from the Mac");
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn with_no_relay_a_call_says_the_mac_is_unreachable_and_a_new_one_works() {
+        let guest = Guest::start("services-norelay", false, &[]);
+        wait_for_socket(&guest);
+        let mut child = shim(&guest, Path::new(GUEST), &["mcp-proxy", "linear"]);
+        let mut out = BufReader::new(child.stdout.take().unwrap());
+        say(
+            &mut child,
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "x"}}),
+        );
+        let mut line = String::new();
+        out.read_line(&mut line).unwrap();
+        let v: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["result"]["isError"], true, "{v}");
+        let text = v["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("Mac unreachable"), "{text}");
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn its_binary_answers_to_vibe() {
+        let guest = Guest::start("services-name", false, &[]);
+        wait_for_socket(&guest);
+        let vibe = guest.dir.path().join("vibe");
+        std::os::unix::fs::symlink(GUEST, &vibe).unwrap();
+        let mut child = shim(&guest, &vibe, &["mcp-proxy", "linear"]);
+        let mut out = BufReader::new(child.stdout.take().unwrap());
+        say(
+            &mut child,
+            json!({"jsonrpc": "2.0", "id": 7, "method": "ping"}),
+        );
+        let mut line = String::new();
+        out.read_line(&mut line).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&line).unwrap()["id"], 7);
+        let _ = child.kill();
+        let _ = child.wait();
+
+        // And as `vibe` it does nothing else.
+        let other = Command::new(&vibe).arg("attach").output().unwrap();
+        assert!(!other.status.success());
+        let said = String::from_utf8_lossy(&other.stderr);
+        assert!(said.contains("only does mcp-proxy"), "{said}");
+    }
+
+    #[test]
+    fn the_control_ports_still_answer_with_a_relay_up() {
+        let guest = Guest::start("services-beside", false, &[]);
+        wait_for_socket(&guest);
+        let _mac = dial(&guest);
+        assert_eq!(guest.ok(json!({"op": "status"}))["ok"], true);
+    }
+}

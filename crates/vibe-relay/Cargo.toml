@@ -1,6 +1,6 @@
 [package]
 name = "vibe-relay"
-description = "Shared MCP services' path to the Mac: the `vibe mcp-proxy` stdio shim, its local socket, and the multiplexed relay that crosses vsock and SSH"
+description = "How an agent reaches its host's shared MCP services: the `vibe mcp-proxy` stdio shim, its local socket, and the relay out of a VM"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

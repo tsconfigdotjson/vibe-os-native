@@ -1,5 +1,6 @@
-//! What `vibe-guest` serves, on two vsock ports in the guest. The host
-//! reaches them only through `vibe-vm`'s `connect`, since only the process
+//! What `vibe-guest` serves on its control and terminal vsock ports (the shared
+//! services' relay, on a third, is `vibe_relay`'s). The host reaches them only
+//! through `vibe-vm`'s `connect`, since only the process
 //! that owns a VM can reach its vsock (`protocol/vibe-vm/`).
 //!
 //! - [`CONTROL_PORT`]: `vibed`'s channel. A connection carries one

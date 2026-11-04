@@ -10,8 +10,8 @@ use serde::{Serialize, forward_to_deserialize_any};
 use serde_json::Value;
 use vibe_core::model::{
     Activity, AgentState, Certainty, CheckId, CheckState, Environment, EventKind, GhState,
-    HostLink, LoginTool, MessageRole, Mode, Model, ProjectSource, Reasoning, SessionState,
-    StopReason, ToolboxAction, ToolboxState, TunnelState, WakeupKind,
+    HostLink, LoginTool, MessageRole, Mode, Model, ProjectSource, Reasoning, ServiceAuth,
+    ServiceState, SessionState, StopReason, ToolboxAction, ToolboxState, TunnelState, WakeupKind,
 };
 use vibe_core::paths;
 use vibe_core::rpc::*;
@@ -219,6 +219,13 @@ fn rust_types() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
         entry::<DoctorReport>(),
         entry::<DoctorCheck>(),
         entry::<DoctorFixParams>(),
+        entry::<ServiceInfo>(),
+        entry::<ServiceList>(),
+        entry::<ServiceParams>(),
+        entry::<ServiceAuthorization>(),
+        entry::<ServiceCompleteParams>(),
+        entry::<ServiceKeyParams>(),
+        entry::<ServiceSetParams>(),
     ])
 }
 
@@ -299,6 +306,12 @@ fn rust_methods() -> BTreeMap<&'static str, MethodTypes> {
         method::<ToolboxClose>(),
         method::<DoctorCheckGet>(),
         method::<DoctorFix>(),
+        method::<ServicesList>(),
+        method::<ServicesConnect>(),
+        method::<ServicesComplete>(),
+        method::<ServicesConnectKey>(),
+        method::<ServicesDisconnect>(),
+        method::<ServicesSet>(),
     ])
 }
 
@@ -349,6 +362,11 @@ fn rust_enums() -> BTreeMap<&'static str, Vec<&'static str>> {
         ("LoginTool", names(LoginTool::ALL, LoginTool::as_str)),
         ("CheckId", names(CheckId::ALL, CheckId::as_str)),
         ("CheckState", names(CheckState::ALL, CheckState::as_str)),
+        (
+            "ServiceState",
+            names(ServiceState::ALL, ServiceState::as_str),
+        ),
+        ("ServiceAuth", names(ServiceAuth::ALL, ServiceAuth::as_str)),
         ("MessageRole", names(MessageRole::ALL, MessageRole::as_str)),
     ])
 }

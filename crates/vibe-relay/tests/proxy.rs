@@ -1,5 +1,5 @@
 //! The shim, driven as an MCP client drives it, with a stand-in for what's
-//! behind its local socket. No network, and no Mac.
+//! behind its local socket. No network.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -200,7 +200,7 @@ impl Broker {
 }
 
 #[test]
-fn with_the_mac_away_the_handshake_works_and_calls_say_why_then_recover() {
+fn with_the_broker_away_the_handshake_works_and_calls_say_why_then_recover() {
     let dir = tempfile::tempdir().unwrap();
     let config = config(dir.path());
     let socket: PathBuf = config.socket.clone();
@@ -224,25 +224,25 @@ fn with_the_mac_away_the_handshake_works_and_calls_say_why_then_recover() {
     assert_eq!(down["result"]["isError"], true, "{down}");
     let text = tool_text(&down);
     assert!(
-        text.contains("VibeOS shared service 'linear' unavailable: Mac unreachable"),
+        text.contains("VibeOS shared service 'linear' unavailable: VibeOS isn't answering"),
         "{text}"
     );
 
-    // The Mac comes back: the next call just works, on the same shim.
+    // It comes back: the next call just works, on the same shim.
     let broker = Broker::serve(&socket, &["list_issues"]);
     let up = c.call(5, "list_issues");
     assert_eq!(tool_text(&up), "did \"list_issues\"", "{up}");
     assert_eq!(broker.calls.load(Ordering::SeqCst), 1);
 
     // And it said which agent it's for.
-    assert!(broker.hellos.lock().unwrap().contains(&Hello::Open {
+    assert!(broker.hellos.lock().unwrap().contains(&Hello {
         service: "linear".into(),
         agent: Some("quiet-amber-otter".into()),
     }));
 }
 
 #[test]
-fn a_new_catalog_is_announced_kept_and_listed_when_the_mac_is_away_again() {
+fn a_new_catalog_is_announced_kept_and_listed_when_the_broker_is_away_again() {
     let dir = tempfile::tempdir().unwrap();
     let config = config(dir.path());
     let broker = Broker::serve(&config.socket, &["list_issues"]);
@@ -288,7 +288,7 @@ fn a_connection_lost_during_a_call_answers_that_call_and_the_next_reconnects() {
     c.handshake();
     let lost = c.call(2, "hang_up");
     assert_eq!(lost["result"]["isError"], true, "{lost}");
-    assert!(tool_text(&lost).contains("Mac unreachable"), "{lost}");
+    assert!(tool_text(&lost).contains("connection dropped"), "{lost}");
     assert_eq!(tool_text(&c.call(3, "list_issues")), "did \"list_issues\"");
 
     broker.hang_up_everyone();

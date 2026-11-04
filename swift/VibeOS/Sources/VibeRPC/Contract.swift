@@ -59,6 +59,12 @@ public enum VibeRPC {
         ToolboxClose.name,
         DoctorCheckGet.name,
         DoctorFix.name,
+        ServicesList.name,
+        ServicesConnect.name,
+        ServicesComplete.name,
+        ServicesConnectKey.name,
+        ServicesDisconnect.name,
+        ServicesSet.name,
     ]
     /// Every notification vibed sends.
     public static let notifications = [EventNotice.name]
@@ -421,6 +427,24 @@ public enum EventKind: String, Codable, CaseIterable, Hashable, Sendable {
     /// A Linux host's link came up or went down, or what it reports
     /// changed; `state` is its `HostLink`, `message` why it's down.
     case hostLink = "host.link"
+    /// A shared service changed on `host`: `state` is its `ServiceState`,
+    /// `message` its name.
+    case serviceChanged = "service.changed"
+}
+
+/// Where a shared service stands, on the host that holds its login.
+public enum ServiceState: String, Codable, CaseIterable, Hashable, Sendable {
+    case disconnected, connected, refreshing
+    /// A refresh was refused: only connecting again helps.
+    case needsReconnect = "needs_reconnect"
+    /// The service turned down a freshly refreshed token, or a key.
+    case revoked
+}
+
+/// How a shared service was connected.
+public enum ServiceAuth: String, Codable, CaseIterable, Hashable, Sendable {
+    case oauth
+    case apiKey = "api_key"
 }
 
 /// How vibed reaches a host: `local` for itself, else whether its link is up.
@@ -1037,9 +1061,15 @@ public struct Profile: Codable, Hashable, Sendable {
     public var mode: PermissionMode
     /// Bytes.
     public var memory: Int
+    /// `false` if its agents get no shared MCP services. Absent means on, as
+    /// it is for every profile by default; `sharedServicesOn` says.
+    public var sharedServices: Bool?
+
+    public var sharedServicesOn: Bool { sharedServices ?? true }
 
     public enum CodingKeys: String, CodingKey, CaseIterable {
         case name, environment, model, reasoning, mode, memory
+        case sharedServices = "shared_services"
     }
 }
 
@@ -1139,11 +1169,12 @@ public struct ProfileCreateParams: Codable, Hashable, Sendable {
     public var reasoning: ReasoningLevel?
     public var mode: PermissionMode?
     public var memory: Int?
+    public var sharedServices: Bool?
 
     public init(
         host: String? = nil, project: String, name: String, environment: AgentEnvironment? = nil,
         model: ClaudeModel? = nil, reasoning: ReasoningLevel? = nil, mode: PermissionMode? = nil,
-        memory: Int? = nil
+        memory: Int? = nil, sharedServices: Bool? = nil
     ) {
         self.host = host
         self.project = project
@@ -1153,10 +1184,12 @@ public struct ProfileCreateParams: Codable, Hashable, Sendable {
         self.reasoning = reasoning
         self.mode = mode
         self.memory = memory
+        self.sharedServices = sharedServices
     }
 
     public enum CodingKeys: String, CodingKey, CaseIterable {
         case host, project, name, environment, model, reasoning, mode, memory
+        case sharedServices = "shared_services"
     }
 }
 
@@ -1171,11 +1204,12 @@ public struct ProfileUpdateParams: Codable, Hashable, Sendable {
     public var reasoning: ReasoningLevel?
     public var mode: PermissionMode?
     public var memory: Int?
+    public var sharedServices: Bool?
 
     public init(
         host: String? = nil, project: String, profile: String, name: String? = nil,
         environment: AgentEnvironment? = nil, model: ClaudeModel? = nil,
-        reasoning: ReasoningLevel? = nil, mode: PermissionMode? = nil, memory: Int? = nil
+        reasoning: ReasoningLevel? = nil, mode: PermissionMode? = nil, memory: Int? = nil, sharedServices: Bool? = nil
     ) {
         self.host = host
         self.project = project
@@ -1186,10 +1220,12 @@ public struct ProfileUpdateParams: Codable, Hashable, Sendable {
         self.reasoning = reasoning
         self.mode = mode
         self.memory = memory
+        self.sharedServices = sharedServices
     }
 
     public enum CodingKeys: String, CodingKey, CaseIterable {
         case host, project, profile, name, environment, model, reasoning, mode, memory
+        case sharedServices = "shared_services"
     }
 }
 
@@ -1927,5 +1963,186 @@ public struct DoctorFixParams: Codable, Hashable, Sendable {
 
     public enum CodingKeys: String, CodingKey, CaseIterable {
         case check
+    }
+}
+
+// MARK: Shared MCP services
+
+/// The supported services, and how each stands on the host named. A host holds
+/// its own logins, so these go to it over its link, and only ever say how it
+/// stands; no token crosses.
+public enum ServicesList: RPCMethod {
+    public typealias Params = HostParams
+    public typealias Result = ServiceList
+    public static let name = "services.list"
+}
+
+/// The first half of connecting or reconnecting a host: it makes the PKCE
+/// verifier, which it keeps, and gives the page to open in a web authentication
+/// session. What's connected stays until `services.complete`.
+public enum ServicesConnect: RPCMethod {
+    public typealias Params = ServiceParams
+    public typealias Result = ServiceAuthorization
+    public static let name = "services.connect"
+}
+
+/// The second half: the URL the session ended on. The host makes the exchange
+/// and keeps the tokens.
+public enum ServicesComplete: RPCMethod {
+    public typealias Params = ServiceCompleteParams
+    public typealias Result = ServiceInfo
+    public static let name = "services.complete"
+}
+
+/// Connects this host with a personal API key. It takes no `host`: a key never
+/// crosses a link.
+public enum ServicesConnectKey: RPCMethod {
+    public typealias Params = ServiceKeyParams
+    public typealias Result = ServiceInfo
+    public static let name = "services.connect_key"
+}
+
+public enum ServicesDisconnect: RPCMethod {
+    public typealias Params = ServiceParams
+    public typealias Result = ServiceInfo
+    public static let name = "services.disconnect"
+}
+
+public enum ServicesSet: RPCMethod {
+    public typealias Params = ServiceSetParams
+    public typealias Result = ServiceInfo
+    public static let name = "services.set"
+}
+
+/// One shared service, on one host. Nothing here is secret.
+public struct ServiceInfo: Codable, Hashable, Sendable {
+    public var name: String
+    public var title: String
+    public var state: ServiceState
+    public var auth: ServiceAuth?
+    /// Off, every agent's calls are refused: the kill switch.
+    public var enabled: Bool
+    public var readOnly: Bool
+    public var deniedTools: [String]
+    /// How many tools agents see.
+    public var tools: Int
+    /// The last thing that went wrong, for people, and when.
+    public var detail: String?
+    public var detailAt: String?
+
+    public init(
+        name: String, title: String, state: ServiceState, auth: ServiceAuth? = nil, enabled: Bool = true,
+        readOnly: Bool = false, deniedTools: [String] = [], tools: Int = 0, detail: String? = nil,
+        detailAt: String? = nil
+    ) {
+        self.name = name
+        self.title = title
+        self.state = state
+        self.auth = auth
+        self.enabled = enabled
+        self.readOnly = readOnly
+        self.deniedTools = deniedTools
+        self.tools = tools
+        self.detail = detail
+        self.detailAt = detailAt
+    }
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case name, title, state, auth, enabled
+        case readOnly = "read_only"
+        case deniedTools = "denied_tools"
+        case tools, detail
+        case detailAt = "detail_at"
+    }
+}
+
+public struct ServiceList: Codable, Hashable, Sendable {
+    public var services: [ServiceInfo]
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case services
+    }
+}
+
+public struct ServiceParams: Codable, Hashable, Sendable {
+    public var host: String?
+    public var service: String
+
+    public init(host: String? = nil, service: String) {
+        self.host = host
+        self.service = service
+    }
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case host, service
+    }
+}
+
+public struct ServiceAuthorization: Codable, Hashable, Sendable {
+    public var service: String
+    /// The page to open.
+    public var url: String
+    /// The scheme of the URL it ends on.
+    public var callbackScheme: String
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case service, url
+        case callbackScheme = "callback_scheme"
+    }
+}
+
+public struct ServiceCompleteParams: Codable, Hashable, Sendable {
+    public var host: String?
+    public var service: String
+    public var callbackUrl: String
+
+    public init(host: String? = nil, service: String, callbackUrl: String) {
+        self.host = host
+        self.service = service
+        self.callbackUrl = callbackUrl
+    }
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case host, service
+        case callbackUrl = "callback_url"
+    }
+}
+
+public struct ServiceKeyParams: Codable, Hashable, Sendable {
+    public var service: String
+    public var key: String
+
+    public init(service: String, key: String) {
+        self.service = service
+        self.key = key
+    }
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case service, key
+    }
+}
+
+public struct ServiceSetParams: Codable, Hashable, Sendable {
+    public var host: String?
+    public var service: String
+    public var enabled: Bool?
+    public var readOnly: Bool?
+    public var deniedTools: [String]?
+
+    public init(
+        host: String? = nil, service: String, enabled: Bool? = nil, readOnly: Bool? = nil,
+        deniedTools: [String]? = nil
+    ) {
+        self.host = host
+        self.service = service
+        self.enabled = enabled
+        self.readOnly = readOnly
+        self.deniedTools = deniedTools
+    }
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case host, service, enabled
+        case readOnly = "read_only"
+        case deniedTools = "denied_tools"
     }
 }

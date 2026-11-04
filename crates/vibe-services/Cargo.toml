@@ -1,6 +1,6 @@
 [package]
 name = "vibe-services"
-description = "Shared MCP services on the Mac: the broker that holds their logins, the OAuth lifecycle, and the tokens that never leave it"
+description = "Shared MCP services: the broker every vibed runs for its own agents, its OAuth lifecycle, and the login each host holds for itself"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

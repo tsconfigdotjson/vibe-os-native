@@ -1,8 +1,8 @@
 //! The whole path, with only the far ends stood in for: an MCP client on the
-//! real shim, the real hub, the relay framing over a socket as over vsock or
-//! SSH, the real broker, and a stand-in for the service. Nothing reaches a real
-//! service, and everything that crosses to an agent's machine is searched for
-//! secrets.
+//! real shim, the real hub for a VM with the relay over a socket as over vsock,
+//! or the local socket for an agent on the host itself, the real broker, and a
+//! stand-in for the service. Nothing reaches a real service, and everything
+//! that leaves the broker is searched for secrets.
 
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -16,10 +16,10 @@ use serde_json::{Value, json};
 use vibe_core::model::ServiceState;
 use vibe_relay::hub::{Admit, Hub, Timing};
 use vibe_relay::proxy;
-use vibe_services::relay::{self, Origin};
-use vibe_services::secrets::MemoryStore;
-use vibe_services::testing::{FakeService, SECRET_MARK};
-use vibe_services::{Deps, SecretStore, Services};
+use vibe_services::relay;
+use vibe_services::secrets::{FileStore, MemoryStore};
+use vibe_services::testing::{API_KEY, FakeService, SECRET_MARK};
+use vibe_services::{Deps, Place, SecretStore, Services};
 
 const RECONNECT: &str =
     "Linear needs reconnecting on the Mac (VibeOS → Settings → Services → Reconnect).";
@@ -56,6 +56,7 @@ impl Mac {
                 random: Arc::new(move || Ok([count.fetch_add(1, Ordering::SeqCst) as u8; 32])),
                 changed: Arc::new(|_| {}),
                 audit: Arc::new(move |l| a.lock().unwrap().push(l.to_owned())),
+                place: Place::Mac,
             },
         );
         Mac {
@@ -80,7 +81,7 @@ impl Mac {
     }
 }
 
-/// A machine with agents on it: a hub and its local socket.
+/// A VM on the Mac: a hub and its local socket.
 struct Machine {
     hub: Hub,
     socket: PathBuf,
@@ -98,7 +99,7 @@ fn machine() -> Machine {
         for conn in listener.incoming() {
             let h = h.clone();
             let Ok(conn) = conn else { return };
-            std::thread::spawn(move || h.serve(conn, false));
+            std::thread::spawn(move || h.serve(conn));
         }
     });
     Machine { hub, socket, dir }
@@ -124,7 +125,7 @@ fn tee(mut from: UnixStream, mut to: UnixStream, kept: Arc<Mutex<Vec<u8>>>) {
 
 /// A relay the Mac opened to a machine, returned so the test can cut it.
 /// Everything crossing it is kept in `wire`.
-async fn relay_to(mac: &Mac, machine: &Machine, origin: Origin, wire: &Arc<Mutex<Vec<u8>>>) -> Cut {
+async fn relay_to(mac: &Mac, machine: &Machine, agent: &str, wire: &Arc<Mutex<Vec<u8>>>) -> Cut {
     // Mac <-> tee <-> machine.
     let (mac_end, tee_mac) = UnixStream::pair().unwrap();
     let (tee_machine, machine_end) = UnixStream::pair().unwrap();
@@ -142,7 +143,7 @@ async fn relay_to(mac: &Mac, machine: &Machine, origin: Origin, wire: &Arc<Mutex
     let mac_end = tokio::net::UnixStream::from_std(mac_end).unwrap();
     let (read, write) = mac_end.into_split();
     let services = mac.services.clone();
-    let task = tokio::spawn(relay::serve_relay(services, origin, read, write));
+    let task = tokio::spawn(relay::serve_relay(services, agent.to_owned(), read, write));
     let hub = machine.hub.clone();
     let (reader, writer, closer) = (
         machine_end.try_clone().unwrap(),
@@ -316,12 +317,19 @@ fn find(haystack: &[u8], needle: &str) -> bool {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn tokens_never_leave_the_mac() {
+async fn a_token_never_leaves_the_host_that_holds_it() {
     let mac = Mac::start().await;
-    mac.sign_in().await;
+    // Signing in, as the app does it from wherever it is: all that crosses to
+    // it, or from it, is the page's address and where the page ended.
+    let auth = mac.services.connect("linear").await.unwrap();
+    let back = mac.fake.sign_in(&auth.url).await;
+    mac.services.complete("linear", &back).await.unwrap();
+    let mut crossed_in_signing_in = auth.url.clone().into_bytes();
+    crossed_in_signing_in.extend_from_slice(back.as_bytes());
+
     let machine = machine();
     let wire: Arc<Mutex<Vec<u8>>> = shared();
-    let cut = relay_to(&mac, &machine, Origin::Host("vps".into()), &wire).await;
+    let cut = relay_to(&mac, &machine, "quiet-amber-otter", &wire).await;
     let (socket, cache) = (machine.socket.clone(), machine.dir.path().join("cache"));
 
     // A full working life, across a refresh, a rotation, a failure and a
@@ -352,7 +360,11 @@ async fn tokens_never_leave_the_mac() {
     })
     .await;
     mac.fake.refuse_refresh("none");
-    mac.sign_in().await;
+    let auth = mac.services.connect("linear").await.unwrap();
+    let back = mac.fake.sign_in(&auth.url).await;
+    mac.services.complete("linear", &back).await.unwrap();
+    crossed_in_signing_in.extend_from_slice(auth.url.as_bytes());
+    crossed_in_signing_in.extend_from_slice(back.as_bytes());
     agent = blocking(move || {
         assert_eq!(text(&agent.call("stream_issues")), "streamed");
         agent
@@ -361,20 +373,26 @@ async fn tokens_never_leave_the_mac() {
     every_secret.extend(mac.secrets());
     assert!(every_secret.len() >= 6);
     assert!(every_secret.iter().all(|s| s.contains(SECRET_MARK)));
+    let verifiers = mac.fake.verifiers();
+    assert_eq!(verifiers.len(), 2, "both sign-ins brought one");
 
-    // What an agent's machine ever got: relay frames, the shim's stdout, and
-    // whatever landed on its disk.
+    // What ever left the broker: relay frames, a shim's stdout, what landed on
+    // a VM's disk, and what the app sees of a sign-in.
     let mut places: Vec<(String, Vec<u8>)> = vec![
         ("relay frames".to_owned(), wire.lock().unwrap().clone()),
         (
             "the shim's stdout".to_owned(),
             agent.stdout.lock().unwrap().clone(),
         ),
+        (
+            "what the app saw of signing in".to_owned(),
+            crossed_in_signing_in,
+        ),
     ];
     for (path, bytes) in all_files(machine.dir.path()) {
         places.push((path.display().to_string(), bytes));
     }
-    // And what stays on the Mac beside the Keychain: its state and its logs.
+    // And what stays on the host beside its login: its state and its logs.
     places.push((
         "audit lines".to_owned(),
         mac.audit.lock().unwrap().join("\n").into_bytes(),
@@ -394,12 +412,11 @@ async fn tokens_never_leave_the_mac() {
 
     for (place, bytes) in &places {
         assert!(!find(bytes, SECRET_MARK), "a secret is in {place}");
-        for secret in &every_secret {
+        for secret in every_secret.iter().chain(&verifiers) {
             assert!(!find(bytes, secret), "{secret} is in {place}");
         }
     }
-    // Requests never carried one either way: the client sent no Bearer, yet
-    // the service got one on every call.
+    // And the service did get one on every call, which no client ever sent.
     assert!(
         mac.fake
             .calls()
@@ -410,12 +427,12 @@ async fn tokens_never_leave_the_mac() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn the_mac_going_away_and_back_needs_nothing_from_the_agent() {
+async fn the_mac_going_away_and_back_needs_nothing_from_a_vms_agent() {
     let mac = Mac::start().await;
     mac.sign_in().await;
     let machine = machine();
     let wire: Arc<Mutex<Vec<u8>>> = shared();
-    // The Mac can't be reached as the session starts: tools load, calls say so.
+    // The relay isn't up as the session starts: tools load, calls say so.
     let (socket, cache) = (machine.socket.clone(), machine.dir.path().join("cache"));
     let mut agent = blocking(move || {
         let mut agent = Agent::start(&socket, &cache, Some("a"));
@@ -431,7 +448,7 @@ async fn the_mac_going_away_and_back_needs_nothing_from_the_agent() {
     .await;
 
     // The Mac dials: the same session has its tools and calls work.
-    let cut = relay_to(&mac, &machine, Origin::Host("vps".into()), &wire).await;
+    let cut = relay_to(&mac, &machine, "a", &wire).await;
     agent = blocking(move || {
         assert!(agent.tools_once_known().contains("create_issue"));
         assert_eq!(text(&agent.call("list_issues")), "issues on /mcp");
@@ -439,8 +456,8 @@ async fn the_mac_going_away_and_back_needs_nothing_from_the_agent() {
     })
     .await;
 
-    // It goes (a VM's snapshot, a pulled network): tools still list, calls
-    // say so, and the shim hasn't died.
+    // It goes, as a snapshot makes it: tools still list, calls say so, and the
+    // shim hasn't died.
     cut.cut();
     for _ in 0..500 {
         if !machine.hub.connected() {
@@ -460,7 +477,7 @@ async fn the_mac_going_away_and_back_needs_nothing_from_the_agent() {
     // Back, on a new relay. Its upstream session is the same one, since the
     // broker owns it per agent.
     let before = mac.fake.calls().pop().unwrap().session;
-    let cut = relay_to(&mac, &machine, Origin::Host("vps".into()), &wire).await;
+    let cut = relay_to(&mac, &machine, "a", &wire).await;
     agent = blocking(move || {
         assert_eq!(text(&agent.call("list_issues")), "issues on /mcp");
         agent
@@ -477,7 +494,7 @@ async fn a_lost_login_reads_clearly_and_reconnect_needs_no_agent_restart() {
     mac.sign_in().await;
     let machine = machine();
     let wire: Arc<Mutex<Vec<u8>>> = shared();
-    let cut = relay_to(&mac, &machine, Origin::Host("vps".into()), &wire).await;
+    let cut = relay_to(&mac, &machine, "a", &wire).await;
     let (socket, cache) = (machine.socket.clone(), machine.dir.path().join("cache"));
     let mut agent = blocking(move || {
         let mut agent = Agent::start(&socket, &cache, Some("a"));
@@ -511,27 +528,12 @@ async fn a_lost_login_reads_clearly_and_reconnect_needs_no_agent_restart() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn the_audit_log_says_whose_call_it_was() {
+async fn a_vms_calls_are_audited_as_its_agents_whatever_a_process_in_it_claims() {
     let mac = Mac::start().await;
     mac.sign_in().await;
-
-    // A host says which of its agents is calling, and it's kept as its word.
-    let host = machine();
     let wire: Arc<Mutex<Vec<u8>>> = shared();
-    let cut = relay_to(&mac, &host, Origin::Host("vps".into()), &wire).await;
-    let (socket, cache) = (host.socket.clone(), host.dir.path().join("cache"));
-    blocking(move || {
-        let mut agent = Agent::start(&socket, &cache, Some("quiet-amber-otter"));
-        assert_eq!(text(&agent.call("list_issues")), "issues on /mcp");
-        let mut anon = Agent::start(&socket, &cache, None);
-        assert_eq!(text(&anon.call("list_issues")), "issues on /mcp");
-    })
-    .await;
-    cut.cut();
-
-    // A VM's relay is one agent's: whatever a process in it claims, that's who.
     let vm = machine();
-    let cut = relay_to(&mac, &vm, Origin::Agent("brave-copper-lynx".into()), &wire).await;
+    let cut = relay_to(&mac, &vm, "brave-copper-lynx", &wire).await;
     let (socket, cache) = (vm.socket.clone(), vm.dir.path().join("cache"));
     blocking(move || {
         let mut agent = Agent::start(&socket, &cache, Some("someone-else"));
@@ -542,19 +544,196 @@ async fn the_audit_log_says_whose_call_it_was() {
 
     let audit = mac.audit.lock().unwrap().join("\n");
     assert!(
-        audit.contains("agent=vps:quiet-amber-otter service=linear"),
-        "{audit}"
-    );
-    assert!(audit.contains("agent=vps:? service=linear"), "{audit}");
-    assert!(
         audit.contains("agent=brave-copper-lynx service=linear"),
         "{audit}"
     );
     assert!(!audit.contains("someone-else"), "{audit}");
 }
 
+/// A Linux host: its own broker, its own login in a private file, and agents
+/// on its local socket. There's no Mac in this at all.
+struct Host {
+    fake: FakeService,
+    services: Arc<Services>,
+    socket: PathBuf,
+    logins: PathBuf,
+    audit: Arc<Mutex<Vec<String>>>,
+    dir: tempfile::TempDir,
+}
+
+impl Host {
+    async fn start(fake: &FakeService) -> Host {
+        let dir = tempfile::tempdir().unwrap();
+        let logins = dir.path().join("services");
+        let audit: Arc<Mutex<Vec<String>>> = shared();
+        let a = audit.clone();
+        let count = Arc::new(AtomicUsize::new(100));
+        let services = Services::new(
+            vec![fake.service()],
+            Arc::new(FileStore(logins.clone())),
+            dir.path().join("services.json"),
+            Deps {
+                clock: Arc::new(|| 1_000_000),
+                random: Arc::new(move || Ok([count.fetch_add(1, Ordering::SeqCst) as u8; 32])),
+                changed: Arc::new(|_| {}),
+                audit: Arc::new(move |l| a.lock().unwrap().push(l.to_owned())),
+                place: Place::LinuxHost,
+            },
+        );
+        let socket = dir.path().join("services.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let s = services.clone();
+        tokio::spawn(async move {
+            while let Ok((conn, _)) = listener.accept().await {
+                let admit: relay::Admit = Arc::new(|_, _| Ok(()));
+                tokio::spawn(relay::serve_local(s.clone(), conn, admit));
+            }
+        });
+        Host {
+            fake: fake.clone(),
+            services,
+            socket,
+            logins,
+            audit,
+            dir,
+        }
+    }
+
+    /// Signing in as the app drives it: the page comes from here, and the code
+    /// comes back here.
+    async fn sign_in(&self) {
+        let auth = self.services.connect("linear").await.unwrap();
+        let back = self.fake.sign_in(&auth.url).await;
+        self.services.complete("linear", &back).await.unwrap();
+    }
+
+    fn login(&self) -> vibe_services::Secret {
+        FileStore(self.logins.clone())
+            .load("linear")
+            .unwrap()
+            .expect("a login")
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
-async fn on_the_mac_a_shim_reaches_the_broker_with_no_relay_at_all() {
+async fn a_linux_host_serves_its_agents_on_its_own_login_and_survives_a_refresh() {
+    let fake = FakeService::start().await;
+    let host = Host::start(&fake).await;
+    host.sign_in().await;
+
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&host.logins), 0o700);
+    assert_eq!(mode(&host.logins.join("linear.login")), 0o600);
+
+    let (socket, cache) = (host.socket.clone(), host.dir.path().join("cache"));
+    let mut agent = blocking(move || {
+        let mut agent = Agent::start(&socket, &cache, Some("quiet-amber-otter"));
+        assert!(agent.tools_once_known().contains("list_issues"));
+        assert_eq!(text(&agent.call("list_issues")), "issues on /mcp");
+        agent
+    })
+    .await;
+    let before = host.login();
+
+    // Its token runs out, and it refreshes by itself: nobody else is involved.
+    fake.expire_access();
+    agent = blocking(move || {
+        assert_eq!(text(&agent.call("list_issues")), "issues on /mcp");
+        agent
+    })
+    .await;
+    let after = host.login();
+    assert_ne!(
+        after.refresh, before.refresh,
+        "it rotated, and kept the new one"
+    );
+    assert_eq!(fake.refreshes(), 1);
+    drop(agent);
+
+    // The same happens after a restart, from what's on disk.
+    let audit = host.audit.lock().unwrap().join("\n");
+    assert!(
+        audit.contains("agent=quiet-amber-otter service=linear"),
+        "{audit}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn each_host_holds_a_login_of_its_own_and_one_refreshing_cant_hurt_another() {
+    // The very thing a synced token would break: rotation on one kills the
+    // others. With grace off, a copy of a used refresh token would fail here.
+    let fake = FakeService::start().await;
+    fake.set_replay_grace(false);
+    let a = Host::start(&fake).await;
+    let b = Host::start(&fake).await;
+    a.sign_in().await;
+    b.sign_in().await;
+    assert_eq!(
+        fake.registrations(),
+        2,
+        "each registered a client of its own"
+    );
+    let (la, lb) = (a.login(), b.login());
+    assert_ne!(la.access, lb.access);
+    assert_ne!(la.refresh, lb.refresh);
+    assert_ne!(la.client_id, lb.client_id);
+
+    // Disconnecting one leaves the other.
+    b.services.disconnect("linear").await.unwrap();
+    assert_eq!(a.services.list().services[0].state, ServiceState::Connected);
+    assert!(a.login().refresh.is_some());
+    let (socket, cache) = (a.socket.clone(), a.dir.path().join("cache"));
+    blocking(move || {
+        let mut agent = Agent::start(&socket, &cache, Some("x"));
+        assert_eq!(text(&agent.call("list_issues")), "issues on /mcp");
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_personal_key_is_how_a_host_mends_itself_with_the_mac_away() {
+    let fake = FakeService::start().await;
+    let host = Host::start(&fake).await;
+    host.sign_in().await;
+    let (socket, cache) = (host.socket.clone(), host.dir.path().join("cache"));
+    let mut agent = blocking(move || {
+        let mut agent = Agent::start(&socket, &cache, Some("x"));
+        assert!(agent.tools_once_known().contains("list_issues"));
+        agent
+    })
+    .await;
+    fake.expire_access();
+    fake.refuse_refresh("invalid_grant");
+    agent = blocking(move || {
+        let lost = agent.call("list_issues");
+        assert!(
+            text(&lost).contains("needs reconnecting on this host"),
+            "{lost}"
+        );
+        assert!(
+            text(&lost).contains("vibe service set-key linear"),
+            "{lost}"
+        );
+        agent
+    })
+    .await;
+
+    host.services.connect_key("linear", API_KEY).await.unwrap();
+    assert_eq!(
+        host.services.list().services[0].state,
+        ServiceState::Connected
+    );
+    blocking(move || {
+        assert_eq!(text(&agent.call("list_issues")), "issues on /mcp");
+    })
+    .await;
+    assert_eq!(fake.calls().pop().unwrap().bearer.as_deref(), Some(API_KEY));
+    assert_eq!(host.login().refresh, None);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn on_a_host_a_shim_reaches_the_broker_with_no_relay_at_all() {
     let mac = Mac::start().await;
     mac.sign_in().await;
     let dir = tempfile::tempdir().unwrap();

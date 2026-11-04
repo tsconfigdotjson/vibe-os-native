@@ -392,6 +392,7 @@ async fn projects_with_agents_cannot_be_removed() {
                 created_at: 0,
                 compartment: "{}".into(),
                 starting: false,
+                shared_services: true,
             })
             .unwrap();
     }

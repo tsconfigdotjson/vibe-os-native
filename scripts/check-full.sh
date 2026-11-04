@@ -973,7 +973,8 @@ s_vm_cycle() {
   VIBE_VM_BIN="$ROOT/build/vibe-vm" VIBE_VM_GUEST="$ROOT/build/test-guest" VIBE_VM_MARKER="$marker" \
     VIBE_SHIM_BIN="$ROOT/target/debug/vibe-shim" \
     cargo test -p vibe-env --locked --test vm_cycle -- --test-threads=1 --nocapture
-  local required=(boot_save_restore three_vms_at_once guest_question_survives_sleep)
+  local required=(boot_save_restore three_vms_at_once guest_question_survives_sleep
+    guest_shim_reaches_the_broker_over_the_relay_across_a_sleep)
   if [ -n "${VIBE_CLAUDE_BIN:-}" ] && [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
     required+=(guest_claude_question_survives_sleep)
   else

@@ -65,6 +65,8 @@ x86_64 server called `vps-1` without `claude`, and no link comes up. Its
 `vibe doctor` finds git 2.50.1, `gh` logged in, git not yet using it, Claude
 Code 2.1.314 signed in, a Mac that sleeps after 10 minutes, and the Linux
 images on their way: Claude Code's layer in, base release 2 40% downloaded.
+Its login to Linear needs reconnecting, as the stand-in for Linear has forgotten
+its client, and has no tools, so nothing it does in the background adds events.
 The
 Rust replays build that world in a temp directory and put its path in place
 of `/Users/me`.
@@ -122,6 +124,25 @@ MCP's tools stand on: `projects.list`, `agents.list`, `agents.start`,
 `agents.messages`; anything else is `method_not_found`. Its result is that
 call's. On the external host the Mac goes by `mac`, so its agents are
 `mac:<ref>` to outside callers.
+
+**Shared MCP services.** Each host holds its own login to each service, in
+a broker every `vibed` runs, so `services.list`, `services.connect`,
+`services.complete`, `services.disconnect` and `services.set` take a `host`, and
+for another host go over its link. `services.connect` has that host register its
+client and make the PKCE verifier, which it keeps, and answers with the page for
+the app's web authentication session to open; `services.complete` takes the URL
+that session ended on, and that host makes the exchange. Only a code that's
+useless without the verifier crosses the link, and no token ever does.
+`services.connect_key` takes no `host`, so a personal key is only ever entered on
+the host it's for. `service.changed` says when a service's state, settings or
+tools change: `state` is its state and `message` its name, and a Linux host's
+comes onto the Mac's stream under its name. `ServiceInfo` holds nothing secret.
+In the examples, `http://services.example` is a stand-in for the service, on a
+port of its own; the Rust replays put its address in its place.
+
+**The shared services' own socket isn't this contract.** Every host's
+`run/.services.sock` is what `vibe mcp-proxy` reaches: one JSON line each way,
+then MCP's JSON-RPC, one message per line (`vibe_relay::local`).
 
 The methods MCP's `vibe_send`, `vibe_wait`, `vibe_read_output` and
 `vibe_read_messages` stand on are here too, as `agents.send`,

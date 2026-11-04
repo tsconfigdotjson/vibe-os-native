@@ -13,6 +13,9 @@ use std::sync::{Arc, Mutex};
 
 use vibe_guest::boot::Boot;
 use vibe_guest::proto::{CONTROL_PORT, ShareMount, TERMINAL_PORT};
+use vibe_relay::frame::VSOCK_PORT;
+use vibe_relay::hub::{Hub, Timing};
+use vibe_relay::local;
 
 use crate::USAGE;
 use serve::{Guest, bind_patiently, serve};
@@ -125,6 +128,7 @@ pub(crate) fn main(args: Vec<String>) -> ExitCode {
                 shares: setup.shares,
                 problems: Mutex::new(setup.problems),
                 network,
+                services: Hub::new(Box::new(|_, _| Ok(())), Timing::default()),
             };
             (guest, None)
         }
@@ -152,6 +156,7 @@ pub(crate) fn main(args: Vec<String>) -> ExitCode {
                 shares: test.shares,
                 problems: Mutex::new(Vec::new()),
                 network,
+                services: Hub::new(Box::new(|_, _| Ok(())), Timing::default()),
             };
             (guest, Some(test.vsock_dir))
         }
@@ -164,6 +169,7 @@ pub(crate) fn main(args: Vec<String>) -> ExitCode {
             serve::control as fn(&Guest, std::fs::File),
         ),
         (TERMINAL_PORT, "terminal", serve::terminal),
+        (VSOCK_PORT, "services", serve::services_relay),
     ] {
         let guest = guest.clone();
         let dir = unix_dir.clone();
@@ -174,6 +180,18 @@ pub(crate) fn main(args: Vec<String>) -> ExitCode {
             log!("can't start the {name} port: {e}");
         }
     }
+    // Shared MCP services: the socket agents' shims reach, and in a VM the
+    // program they run. It's the Mac that dials in to carry them.
+    let socket = match &unix_dir {
+        Some(dir) => dir.join("services.sock"),
+        None => PathBuf::from(local::GUEST_SOCKET),
+    };
+    if unix_dir.is_none()
+        && let Err(e) = serve::install_program(std::path::Path::new(local::GUEST_PROGRAM))
+    {
+        log!("can't install the shared services' program: {e}");
+    }
+    serve::serve_services_socket(guest.clone(), socket);
     // PID 1 never returns: the main thread reaps.
     session::reap(guest.agent.clone())
 }

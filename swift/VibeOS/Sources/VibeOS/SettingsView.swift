@@ -9,7 +9,7 @@ import VibeRPC
 /// is vibed's; nothing is kept here but the menu's own preferences. Fields
 /// save themselves.
 enum SettingsPane: String, CaseIterable, Identifiable {
-    case projects, keys, hosts, toolbox, limits, general
+    case projects, keys, hosts, services, toolbox, limits, general
 
     /// Where the last pane shown is kept, so Settings opens where it was
     /// and the menu can open it on a pane.
@@ -22,6 +22,7 @@ enum SettingsPane: String, CaseIterable, Identifiable {
         case .projects: "Projects"
         case .keys: "API Keys"
         case .hosts: "Hosts"
+        case .services: "Services"
         case .toolbox: "Linux Toolbox"
         case .limits: "Host Limits"
         case .general: "General"
@@ -33,6 +34,7 @@ enum SettingsPane: String, CaseIterable, Identifiable {
         case .projects: "folder.fill"
         case .keys: "key.fill"
         case .hosts: "server.rack"
+        case .services: "puzzlepiece.extension.fill"
         case .toolbox: "shippingbox.fill"
         case .limits: "gauge.with.dots.needle.67percent"
         case .general: "gearshape.fill"
@@ -44,6 +46,7 @@ enum SettingsPane: String, CaseIterable, Identifiable {
         case .projects: .blue
         case .keys: .orange
         case .hosts: .indigo
+        case .services: .purple
         case .toolbox: .brown
         case .limits: .green
         case .general: .gray
@@ -89,6 +92,7 @@ struct SettingsView: View {
                 }
             case .keys: KeysPane(model: model)
             case .hosts: HostsPane(model: model)
+            case .services: ServicesPane(model: model)
             case .toolbox: ToolboxPane(model: model)
             case .limits: LimitsPane(model: model, host: $place.limitsHost)
             case .general: GeneralPane()
@@ -530,6 +534,18 @@ struct ProfileRow: View {
                     }
                     .fixedSize()
                 }
+                Toggle(
+                    "Shared Services",
+                    isOn: Binding(
+                        get: { shown.sharedServicesOn },
+                        set: { on in
+                            var next = shown
+                            next.sharedServices = on ? nil : false
+                            pending = next
+                            Task { await update { $0.sharedServices = on } }
+                        })
+                )
+                .help("Whether agents started from this profile get the services in Settings → Services")
                 if shown.mode == .bypass {
                     Label(
                         shown.environment == .macos

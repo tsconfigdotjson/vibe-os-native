@@ -1,6 +1,5 @@
-//! The relay's framing: one connection the Mac opened, carrying every shim's
-//! conversation on that machine. The same over a VM's vsock port and over
-//! `ssh <host> vibe services`.
+//! The relay's framing: one connection the Mac opened to a VM's vsock port,
+//! carrying the conversation of every shim in that VM.
 //!
 //! A frame is a kind byte, a big-endian `u32` stream, a big-endian `u32`
 //! length and that many bytes. Both ends say [`Frame::Hello`] first. The far
@@ -38,8 +37,8 @@ pub enum Frame {
     Hello {
         protocol: u32,
     },
-    /// A shim wants `service`. `agent` is its agent's ref, if it said: for
-    /// the audit log, as a host's word is only a claim.
+    /// A shim wants `service`. `agent` is its agent's ref, if it said. A VM is
+    /// one agent's, so the Mac goes by which VM it dialed, not this.
     Open {
         stream: u32,
         service: String,

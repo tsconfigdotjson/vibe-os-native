@@ -21,6 +21,7 @@ pub mod projects;
 pub mod reach;
 pub mod remote;
 pub mod server;
+pub mod services;
 pub mod sessions;
 pub mod sleep;
 pub mod status;

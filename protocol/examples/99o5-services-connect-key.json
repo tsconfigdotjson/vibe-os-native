@@ -1,0 +1,42 @@
+{
+  "description": "Connects this host with a personal API key, checked with the service first. It takes no `host`: a key is entered on the host it's for, so it never crosses a link.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 9905,
+    "method": "services.connect_key",
+    "params": {
+      "service": "linear",
+      "key": "FAKESECRET-api-key"
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 9905,
+    "result": {
+      "auth": "api_key",
+      "denied_tools": [
+        "delete_issue"
+      ],
+      "enabled": true,
+      "name": "linear",
+      "read_only": true,
+      "state": "connected",
+      "title": "Linear",
+      "tools": 0
+    }
+  },
+  "events": [
+    {
+      "jsonrpc": "2.0",
+      "method": "events.event",
+      "params": {
+        "at": "2026-10-30T12:00:00Z",
+        "host": "local",
+        "kind": "service.changed",
+        "message": "linear",
+        "seq": 33,
+        "state": "connected"
+      }
+    }
+  ]
+}

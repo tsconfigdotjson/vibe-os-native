@@ -23,7 +23,7 @@ fn hub(admit: Admit, timing: Timing) -> (Hub, PathBuf, tempfile::TempDir) {
     std::thread::spawn(move || {
         for conn in listener.incoming() {
             let h = h.clone();
-            std::thread::spawn(move || h.serve(conn.unwrap(), true));
+            std::thread::spawn(move || h.serve(conn.unwrap()));
         }
     });
     (hub, socket, dir)
@@ -61,7 +61,7 @@ fn shim(
     let conn = UnixStream::connect(socket).unwrap();
     conn.set_read_timeout(Some(Duration::from_secs(20)))
         .unwrap();
-    let hello = Hello::Open {
+    let hello = Hello {
         service: "linear".into(),
         agent: agent.map(str::to_owned),
     };
@@ -263,41 +263,15 @@ fn the_hub_can_refuse_a_shim() {
 }
 
 #[test]
-fn a_relay_comes_in_through_the_local_socket_as_vibe_services_brings_it() {
+fn a_process_in_the_guest_cant_pose_as_the_relay() {
+    // A relay only ever comes in by vsock: the local socket takes shims alone.
     let (hub, socket, _dir) = hub(anyone(), Timing::default());
     let conn = UnixStream::connect(&socket).unwrap();
     conn.set_read_timeout(Some(Duration::from_secs(20)))
         .unwrap();
-    (&conn).write_all(Hello::Relay.line().as_bytes()).unwrap();
-    let mut reader = BufReader::new(conn.try_clone().unwrap());
+    (&conn).write_all(b"{\"relay\":1}\n").unwrap();
     let mut answer = String::new();
-    reader.read_line(&mut answer).unwrap();
-    assert_eq!(local::parse_answer(answer.trim_end().as_bytes()), Ok(()));
-    write_frame(&mut (&conn), &Frame::Hello { protocol: PROTOCOL }).unwrap();
-    assert_eq!(
-        read_frame(&mut reader).unwrap(),
-        Some(Frame::Hello { protocol: PROTOCOL })
-    );
-    for _ in 0..200 {
-        if hub.connected() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    let (_c, _r, answer) = shim(&socket, None);
-    assert_eq!(answer, Ok(()));
-}
-
-#[test]
-fn a_guests_own_processes_cant_pose_as_the_relay() {
-    let hub = Hub::new(anyone(), Timing::default());
-    let (client, server) = UnixStream::pair().unwrap();
-    client
-        .set_read_timeout(Some(Duration::from_secs(20)))
-        .unwrap();
-    std::thread::spawn(move || hub.serve(server, false));
-    (&client).write_all(Hello::Relay.line().as_bytes()).unwrap();
-    let mut answer = String::new();
-    BufReader::new(client).read_line(&mut answer).unwrap();
+    BufReader::new(conn).read_line(&mut answer).unwrap();
     assert!(local::parse_answer(answer.trim_end().as_bytes()).is_err());
+    assert!(!hub.connected());
 }

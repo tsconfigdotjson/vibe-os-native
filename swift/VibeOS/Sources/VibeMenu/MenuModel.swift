@@ -536,6 +536,8 @@ public final class MenuModel: ObservableObject {
             // A host's link came or went: its rows, and the header.
             settingsRevision += 1
             await refresh()
+        case .serviceChanged:
+            settingsRevision += 1
         }
     }
 

@@ -1,6 +1,6 @@
-//! How shims reach the broker. On the Mac they connect to a local socket; from
-//! a VM or a Linux host they come over a relay connection the Mac opened, many
-//! on one (`vibe_relay::frame`).
+//! How shims reach the broker. Those on this machine connect to a local socket;
+//! on a Mac, those in a VM come over a relay the Mac opened to its vsock port,
+//! many on one (`vibe_relay::frame`).
 
 use std::collections::HashMap;
 use std::io;
@@ -15,26 +15,7 @@ use vibe_relay::local::{self, Hello};
 
 use crate::broker::Services;
 
-/// Who's at the far end of a relay.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Origin {
-    /// One agent's VM: that's who's calling, whatever its frames claim.
-    Agent(String),
-    /// A Linux host, by the name it was added under. It says which of its
-    /// agents is calling, for the audit log.
-    Host(String),
-}
-
-impl Origin {
-    fn agent(&self, claimed: Option<&str>) -> String {
-        match self {
-            Origin::Agent(agent) => agent.clone(),
-            Origin::Host(host) => format!("{host}:{}", claimed.unwrap_or("?")),
-        }
-    }
-}
-
-/// How many shims a relay may have at once, so a host can't make the Mac hold
+/// How many shims a relay may have at once, so a VM can't make the Mac hold
 /// without limit.
 const MAX_STREAMS: usize = 256;
 
@@ -54,11 +35,12 @@ async fn read_frame(r: &mut (impl AsyncRead + Unpin)) -> io::Result<Option<Frame
     Frame::decode(&header, payload).map(Some)
 }
 
-/// Serves the broker's end of one relay until it ends. A relay opened as a new
-/// one replaces the old at the far end, which closes it.
+/// Serves the broker's end of `agent`'s VM's relay until it ends. A VM is one
+/// agent's, so that's who's calling, whatever its frames claim. A relay opened
+/// as a new one replaces the old at the far end, which closes it.
 pub async fn serve_relay(
     services: Arc<Services>,
-    origin: Origin,
+    agent: String,
     mut reader: impl AsyncRead + Unpin,
     mut writer: impl AsyncWrite + Unpin + Send + 'static,
 ) -> io::Result<()> {
@@ -99,9 +81,7 @@ pub async fn serve_relay(
         };
         match frame {
             Frame::Open {
-                stream,
-                service,
-                agent,
+                stream, service, ..
             } => {
                 streams.retain(|_, tx| !tx.is_closed());
                 let opened = if streams.len() >= MAX_STREAMS {
@@ -109,7 +89,7 @@ pub async fn serve_relay(
                 } else {
                     let (out, from_broker) = mpsc::channel::<Vec<u8>>(64);
                     services
-                        .open(&service, origin.agent(agent.as_deref()), out)
+                        .open(&service, agent.clone(), out)
                         .map(|tx| (tx, from_broker))
                 };
                 match opened {
@@ -168,21 +148,15 @@ pub async fn serve_relay(
 /// Says whether a shim may have what it asks for.
 pub type Admit = Arc<dyn Fn(&str, Option<&str>) -> Result<(), String> + Send + Sync>;
 
-/// Serves one client of the Mac's local socket: a shim, as there's no hub here.
-/// It takes no relay: the Mac is where relays end, not where they begin.
+/// Serves one shim on this machine's local socket.
 pub async fn serve_local(services: Arc<Services>, conn: UnixStream, admit: Admit) {
     let (read, mut write) = conn.into_split();
     let mut reader = BufReader::new(read);
     let Some(hello) = read_line(&mut reader).await else {
         return;
     };
-    let (service, agent) = match Hello::parse(&hello) {
-        Ok(Hello::Open { service, agent }) => (service, agent),
-        Ok(Hello::Relay) => {
-            let refused = local::answer(&Err("the Mac doesn't take a relay".into()));
-            let _ = write.write_all(refused.as_bytes()).await;
-            return;
-        }
+    let Hello { service, agent } = match Hello::parse(&hello) {
+        Ok(hello) => hello,
         Err(why) => {
             let _ = write.write_all(local::answer(&Err(why)).as_bytes()).await;
             return;

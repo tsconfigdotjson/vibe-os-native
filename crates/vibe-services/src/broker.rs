@@ -1,6 +1,7 @@
-//! The broker: the one holder of each service's login, and what every agent's
-//! calls pass through. It knows nothing of which kind of agent is calling:
-//! policy is on the service's own tool names, so it's the same for all.
+//! The broker: its host's one holder of each service's login, and what every
+//! call by that host's agents passes through. It knows nothing of which kind of
+//! agent is calling: policy is on the service's own tool names, so it's the same
+//! for all. Every `vibed` runs one for its own agents, and none needs another.
 //!
 //! **The lifecycle** (PRD: Shared MCP services). A service is `disconnected`,
 //! `connected`, `refreshing`, `needs_reconnect` (a refresh was refused) or
@@ -10,6 +11,11 @@
 //! auth fails, tools still list, from what was last seen, and calls get a tool
 //! error saying what to do. They work again after Reconnect, with nothing to
 //! do in the agent.
+//!
+//! **Signing in** is in two halves, so the app can drive the browser for any
+//! host: this host registers its client, makes the PKCE verifier and the state,
+//! and keeps them; the app opens the page; and this host makes the exchange
+//! with the code that comes back. Neither the verifier nor a token goes out.
 //!
 //! **Upstream sessions** belong here, one per (agent, service), so a shim that
 //! reconnects, or a VM that wakes, carries on. A session the service has
@@ -83,6 +89,15 @@ pub struct Deps {
     /// One line per call: agent, service, tool, outcome and time, and never
     /// its arguments.
     pub audit: Arc<dyn Fn(&str) + Send + Sync>,
+    /// Which kind of host this is, for what agents are told to do.
+    pub place: Place,
+}
+
+/// Where this broker runs, which is where its login gets mended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Place {
+    Mac,
+    LinuxHost,
 }
 
 impl fmt::Debug for Deps {
@@ -160,6 +175,7 @@ enum AuthFailure {
 /// One service: its login and how it stands.
 struct Conn {
     def: Service,
+    place: Place,
     /// The login as last read from, or written to, the store.
     secret: Mutex<Option<Secret>>,
     /// Whether `secret` has been read: a locked Keychain can make that wait.
@@ -191,25 +207,61 @@ impl Conn {
     }
 
     fn needs_reconnect_text(&self) -> String {
+        let title = &self.def.title;
+        match self.place {
+            Place::Mac => format!(
+                "{title} needs reconnecting on the Mac (VibeOS → Settings → Services → Reconnect)."
+            ),
+            Place::LinuxHost => format!(
+                "{title} needs reconnecting on this host (VibeOS → Settings → Services → Reconnect \
+                 on the Mac, or `vibe service set-key {}` here).",
+                self.def.name
+            ),
+        }
+    }
+
+    fn not_connected_text(&self) -> String {
+        let title = &self.def.title;
+        match self.place {
+            Place::Mac => format!(
+                "{title} isn't connected on the Mac (VibeOS → Settings → Services → Connect)."
+            ),
+            Place::LinuxHost => format!(
+                "{title} isn't connected on this host (VibeOS → Settings → Services → Connect on \
+                 the Mac, or `vibe service set-key {}` here).",
+                self.def.name
+            ),
+        }
+    }
+
+    fn off_text(&self) -> String {
+        let title = &self.def.title;
+        match self.place {
+            Place::Mac => {
+                format!("{title} is turned off on the Mac (VibeOS → Settings → Services).")
+            }
+            Place::LinuxHost => {
+                format!("{title} is turned off on this host (VibeOS → Settings → Services).")
+            }
+        }
+    }
+
+    fn unavailable_text(&self, why: &str) -> String {
+        let here = match self.place {
+            Place::Mac => "the Mac",
+            Place::LinuxHost => "this host",
+        };
         format!(
-            "{} needs reconnecting on the Mac (VibeOS → Settings → Services → Reconnect).",
+            "{} can't be reached from {here} now: {why}.",
             self.def.title
         )
     }
 
     fn failure_text(&self, failure: &AuthFailure) -> String {
         match failure {
-            AuthFailure::NotConnected => format!(
-                "{} isn't connected on the Mac (VibeOS → Settings → Services → Connect).",
-                self.def.title
-            ),
+            AuthFailure::NotConnected => self.not_connected_text(),
             AuthFailure::NeedsReconnect => self.needs_reconnect_text(),
-            AuthFailure::Unavailable(why) => {
-                format!(
-                    "{} can't be reached from the Mac now: {why}.",
-                    self.def.title
-                )
-            }
+            AuthFailure::Unavailable(why) => self.unavailable_text(why),
         }
     }
 
@@ -288,7 +340,7 @@ fn failed(message: impl Into<String>) -> ErrorObject {
 
 impl Services {
     /// Picks up from the state file and the store. Reads the store on this
-    /// thread: `security` answers at once, and a locked Keychain is only noted.
+    /// thread: it answers at once, and a locked Keychain is only noted.
     pub fn new(
         services: Vec<Service>,
         store: Arc<dyn SecretStore>,
@@ -326,6 +378,7 @@ impl Services {
                 };
                 Arc::new(Conn {
                     def,
+                    place: deps.place,
                     secret: Mutex::new(secret),
                     loaded: AtomicBool::new(loaded),
                     refreshing: tokio::sync::Mutex::new(()),
@@ -1243,19 +1296,18 @@ impl Services {
             started: Instant::now(),
             done: false,
         };
-        let title = &conn.def.title;
         if !lock(&conn.saved).enabled {
             audit.finish("off");
-            return Some(tool_error(
-                id,
-                &format!("{title} is turned off on the Mac (VibeOS → Settings → Services)."),
-            ));
+            return Some(tool_error(id, &conn.off_text()));
         }
         if conn.is_denied(tool) {
             audit.finish("denied");
             return Some(tool_error(
                 id,
-                &format!("{title}'s {tool} isn't allowed here (VibeOS → Settings → Services)."),
+                &format!(
+                    "{}'s {tool} isn't allowed here (VibeOS → Settings → Services).",
+                    conn.def.title
+                ),
             ));
         }
         let (sink, mut messages) = mpsc::channel::<Value>(16);

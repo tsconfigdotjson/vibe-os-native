@@ -52,7 +52,7 @@
     { "name": "toolbox.close", "params": "NoParams", "result": "ToolboxStatus" },
     { "name": "doctor.check", "params": "NoParams", "result": "DoctorReport" },
     { "name": "doctor.fix", "params": "DoctorFixParams", "result": "DoctorReport" },
-    { "name": "services.list", "params": "NoParams", "result": "ServiceList" },
+    { "name": "services.list", "params": "HostParams", "result": "ServiceList" },
     { "name": "services.connect", "params": "ServiceParams", "result": "ServiceAuthorization" },
     { "name": "services.complete", "params": "ServiceCompleteParams", "result": "ServiceInfo" },
     { "name": "services.connect_key", "params": "ServiceKeyParams", "result": "ServiceInfo" },
@@ -174,11 +174,11 @@
     "MessageList": ["messages"],
     "ServiceInfo": ["name", "title", "state", "auth", "enabled", "read_only", "denied_tools", "tools", "detail", "detail_at"],
     "ServiceList": ["services"],
-    "ServiceParams": ["service"],
+    "ServiceParams": ["host", "service"],
     "ServiceAuthorization": ["service", "url", "callback_scheme"],
-    "ServiceCompleteParams": ["service", "callback_url"],
+    "ServiceCompleteParams": ["host", "service", "callback_url"],
     "ServiceKeyParams": ["service", "key"],
-    "ServiceSetParams": ["service", "enabled", "read_only", "denied_tools"]
+    "ServiceSetParams": ["host", "service", "enabled", "read_only", "denied_tools"]
   },
   "optional": {
     "Request": ["id", "params"],
@@ -252,11 +252,11 @@
     "MessageList": [],
     "ServiceInfo": ["auth", "detail", "detail_at"],
     "ServiceList": [],
-    "ServiceParams": [],
+    "ServiceParams": ["host"],
     "ServiceAuthorization": [],
-    "ServiceCompleteParams": [],
+    "ServiceCompleteParams": ["host"],
     "ServiceKeyParams": [],
-    "ServiceSetParams": ["enabled", "read_only", "denied_tools"]
+    "ServiceSetParams": ["host", "enabled", "read_only", "denied_tools"]
   },
   "nested": {
     "HostList": { "hosts": "HostInfo" },

@@ -19,8 +19,7 @@ pub use crate::limits::HostLimits;
 pub use crate::model::{
     Activity, AgentState, Certainty, CheckId, CheckState, Environment, EventKind, GhState,
     HostLink, LoginTool, MessageRole, Mode, Model, Profile, ProjectSource, Reasoning, ServiceAuth,
-    ServiceState, SessionState,
-    StopReason, ToolboxAction, ToolboxState, TunnelState, WakeupKind,
+    ServiceState, SessionState, StopReason, ToolboxAction, ToolboxState, TunnelState, WakeupKind,
 };
 
 /// Bumped on any incompatible change to the contract. Clients send theirs in
@@ -1642,30 +1641,37 @@ pub struct MessageList {
     pub messages: Vec<Message>,
 }
 
-// Shared MCP services (PRD: Shared MCP services). The Mac holds their logins,
-// so these are served by the Mac alone.
+// Shared MCP services (PRD: Shared MCP services). Each host holds its own logins,
+// so these go to the host they name, over its link, and only ever say how it
+// stands. No token crosses a link: `services.connect` and `services.complete`
+// have the host do everything but the browser, and a personal key is entered on
+// the host it's for.
 
 method! {
     /// `services.list`: the supported services, and how each stands.
-    ServicesList = "services.list", NoParams => ServiceList
+    ServicesList = "services.list", HostParams => ServiceList
 }
 
 method! {
-    /// `services.connect`: the first half of connecting or reconnecting with
-    /// OAuth. Answers with the page for the app to open in a web
+    /// `services.connect`: the first half of connecting or reconnecting a host
+    /// with OAuth. That host registers its client and makes the PKCE verifier,
+    /// which it keeps, and answers with the page for the app to open in a web
     /// authentication session. What's connected stays as it is until
     /// `services.complete`, so a sign-in given up on loses nothing.
     ServicesConnect = "services.connect", ServiceParams => ServiceAuthorization
 }
 
 method! {
-    /// `services.complete`: the second half: the URL that session ended on.
-    /// `vibed` makes the exchange and keeps the tokens in the Keychain.
+    /// `services.complete`: the second half: the URL that session ended on. The
+    /// code in it is useless without the host's verifier; the host makes the
+    /// exchange and keeps the tokens.
     ServicesComplete = "services.complete", ServiceCompleteParams => ServiceInfo
 }
 
 method! {
-    /// `services.connect_key`: connects with a personal API key instead.
+    /// `services.connect_key`: connects this host with a personal API key
+    /// instead, which is how a host mends itself with the Mac away. It takes no
+    /// `host`, so a key never crosses a link.
     ServicesConnectKey = "services.connect_key", ServiceKeyParams => ServiceInfo
 }
 
@@ -1680,7 +1686,8 @@ method! {
     ServicesSet = "services.set", ServiceSetParams => ServiceInfo
 }
 
-/// One shared service. Nothing here is secret: tokens never leave `vibed`.
+/// One shared service, on one host. Nothing here is secret: a token never leaves
+/// the host that holds it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServiceInfo {
     /// Its name: `linear`. Its MCP server in an agent is `vibe-<name>`.
@@ -1715,6 +1722,8 @@ pub struct ServiceList {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServiceParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
     pub service: String,
 }
 
@@ -1731,6 +1740,8 @@ pub struct ServiceAuthorization {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServiceCompleteParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
     pub service: String,
     /// The URL the session ended on, as it was.
     pub callback_url: String,
@@ -1740,13 +1751,15 @@ pub struct ServiceCompleteParams {
 #[serde(deny_unknown_fields)]
 pub struct ServiceKeyParams {
     pub service: String,
-    /// The key, which goes to the Keychain and nowhere else.
+    /// The key, which goes to this host's store and nowhere else.
     pub key: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServiceSetParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
     pub service: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,

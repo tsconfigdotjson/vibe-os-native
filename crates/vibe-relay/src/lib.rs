@@ -1,23 +1,23 @@
 //! How an agent's MCP client reaches a shared service (PRD: Shared MCP
-//! services). It knows nothing of which agent is calling, or of tokens:
-//! those stay in the Mac's broker.
+//! services). It knows nothing of which agent is calling, or of tokens: those
+//! stay in the broker of the host the agent runs on.
 //!
 //! ```text
-//! MCP client ── stdio ── vibe mcp-proxy ── local socket ── hub ══ relay ══ broker
+//! macOS or Linux-host agent:  MCP client ── stdio ── vibe mcp-proxy ── local socket ── broker
+//! linux VM on a Mac:          MCP client ── stdio ── vibe mcp-proxy ── hub ══ vsock ══ broker
 //! ```
 //!
 //! - [`proxy`] is the shim: `vibe mcp-proxy <service>`. It answers the
-//!   handshake itself, so tools load and it never dies while the Mac is away.
-//! - [`local`] is what the shim says on the local socket: one hello line,
-//!   then JSON-RPC, one message per line.
-//! - [`hub`] gathers a machine's shims onto one relay: in `vibe-guest` for a
-//!   VM, in `vibed` on a Linux host. On the Mac the shim's socket reaches the
-//!   broker in-process, so there's no hub.
-//! - [`frame`] is the relay's framing, the same over a VM's vsock port and
-//!   over `ssh <host> vibe services`.
+//!   handshake itself, so tools load and it never dies while its broker is
+//!   away.
+//! - [`local`] is what the shim says on the local socket: one hello line, then
+//!   JSON-RPC, one message per line.
+//! - [`hub`] gathers a VM's shims onto one relay, in `vibe-guest`. Everywhere
+//!   else the local socket is `vibed`'s own, with the broker behind it.
+//! - [`frame`] is that relay's framing, over the VM's vsock port.
 //!
-//! The Mac always dials: the relay is carried by a connection the Mac opened,
-//! so nothing listens for a guest or a host to call in.
+//! The Mac dials the VM, so a guest's ports still only take connections from
+//! the host.
 
 pub mod frame;
 pub mod hub;

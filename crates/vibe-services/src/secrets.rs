@@ -1,11 +1,13 @@
-//! Where a service's login is kept: the Mac's Keychain, and nowhere else. One
-//! item per service, replaced whole, so a login is never half-written.
+//! Where a host keeps its login to a service: the Keychain on a Mac, a private
+//! file on a Linux host, in the same trust class as the `gh` and Claude logins
+//! already on that machine. One item per service, replaced whole, so a login is
+//! never half-written.
 
 use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::io::{self, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
@@ -189,45 +191,107 @@ impl SecretStore for Keychain {
     }
 }
 
-/// A private directory, one file per login, each written by rename. Only for
-/// tests, and only through a debug build's `VIBE_TEST_SERVICES_DIR`.
+/// How a Linux host keeps logins: a private directory that only `vibed`'s user
+/// can enter, one `0600` file per login. Each is replaced by rename, and synced
+/// before and after, so a crash leaves the old login or the new one whole, and
+/// once [`SecretStore::store`] returns the new one survives a power cut.
 #[derive(Debug, Clone)]
 pub struct FileStore(pub PathBuf);
 
 impl FileStore {
-    fn file(&self, service: &str) -> PathBuf {
-        self.0.join(format!("{service}.login"))
+    fn file(&self, service: &str) -> io::Result<PathBuf> {
+        // It's only ever a name from the registry, but it names a file.
+        if service.is_empty()
+            || !service
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("`{service}` can't name a login"),
+            ));
+        }
+        Ok(self.0.join(format!("{service}.login")))
+    }
+
+    /// The directory, made private if it's new, and refused if it's open to
+    /// anyone else, as a login in it wouldn't be private.
+    fn ensure_dir(&self) -> io::Result<()> {
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&self.0)?;
+        let mode = fs::metadata(&self.0)?.permissions().mode();
+        if mode & 0o077 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "{} is open to other users (mode {:o}); run `chmod 700` on it",
+                    self.0.display(),
+                    mode & 0o777
+                ),
+            ));
+        }
+        Ok(())
     }
 }
 
 impl SecretStore for FileStore {
     fn load(&self, service: &str) -> io::Result<Option<Secret>> {
-        match fs::read_to_string(self.file(service)) {
-            Ok(text) => decode(&text).map(Some),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e),
+        let file = self.file(service)?;
+        let meta = match fs::symlink_metadata(&file) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        if !meta.is_file() || meta.permissions().mode() & 0o077 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "{} must be a file only its owner can read; run `chmod 600` on it",
+                    file.display()
+                ),
+            ));
         }
+        decode(&fs::read_to_string(&file)?).map(Some)
     }
 
     fn store(&self, service: &str, secret: &Secret) -> io::Result<()> {
-        fs::create_dir_all(&self.0)?;
-        let file = self.file(service);
+        self.ensure_dir()?;
+        let file = self.file(service)?;
         let tmp = file.with_extension("new");
-        let mut f = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        f.write_all(encode(secret)?.as_bytes())?;
-        f.sync_all()?;
-        fs::rename(tmp, file)
+        // Whatever a crash left there isn't to be trusted, its mode included.
+        match fs::remove_file(&tmp) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+        let written = (|| {
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp)?;
+            f.write_all(encode(secret)?.as_bytes())?;
+            f.sync_all()?;
+            fs::rename(&tmp, &file)
+        })();
+        if written.is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+        written?;
+        // The rename itself must last too.
+        fs::File::open(&self.0)?.sync_all()
     }
 
     fn delete(&self, service: &str) -> io::Result<()> {
-        match fs::remove_file(self.file(service)) {
-            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
-            _ => Ok(()),
+        match fs::remove_file(self.file(service)?) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+        match fs::File::open(&self.0) {
+            Ok(dir) => dir.sync_all(),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
         }
     }
 }
@@ -287,23 +351,67 @@ mod tests {
         assert!(!shown.contains("\"r\""), "{shown}");
     }
 
+    fn mode(path: &std::path::Path) -> u32 {
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
     #[test]
     fn a_file_store_keeps_logins_private_and_whole() {
         let dir = tempfile::tempdir().unwrap();
-        let store = FileStore(dir.path().join("logins"));
+        let store = FileStore(dir.path().join("services"));
         assert_eq!(store.load("linear").unwrap(), None);
         store.store("linear", &secret("a")).unwrap();
         store.store("linear", &secret("b")).unwrap();
         assert_eq!(store.load("linear").unwrap(), Some(secret("b")));
-        use std::os::unix::fs::PermissionsExt;
-        let mode = fs::metadata(store.file("linear"))
+        assert_eq!(mode(&store.file("linear").unwrap()), 0o600);
+        assert_eq!(mode(&store.0), 0o700);
+        // Nothing's left beside it.
+        let names: Vec<_> = fs::read_dir(&store.0)
             .unwrap()
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o777, 0o600);
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["linear.login"]);
         store.delete("linear").unwrap();
         store.delete("linear").unwrap();
         assert_eq!(store.load("linear").unwrap(), None);
+    }
+
+    #[test]
+    fn a_crash_mid_write_leaves_the_old_login_and_no_loose_file_is_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileStore(dir.path().join("services"));
+        store.store("linear", &secret("old")).unwrap();
+        // What a crash leaves: half a new file, as it happens readable by all.
+        let tmp = store.file("linear").unwrap().with_extension("new");
+        fs::write(&tmp, "half a lo").unwrap();
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(store.load("linear").unwrap(), Some(secret("old")));
+        store.store("linear", &secret("new")).unwrap();
+        assert_eq!(store.load("linear").unwrap(), Some(secret("new")));
+        assert_eq!(mode(&store.file("linear").unwrap()), 0o600);
+    }
+
+    #[test]
+    fn a_file_store_wont_keep_or_read_a_login_others_can_reach() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileStore(dir.path().join("services"));
+        store.store("linear", &secret("a")).unwrap();
+        let file = store.file("linear").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+        let err = store.load("linear").unwrap_err();
+        assert!(err.to_string().contains("chmod 600"), "{err}");
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&store.0, fs::Permissions::from_mode(0o755)).unwrap();
+        let err = store.store("linear", &secret("b")).unwrap_err();
+        assert!(err.to_string().contains("chmod 700"), "{err}");
+    }
+
+    #[test]
+    fn a_file_stores_logins_are_only_ever_plainly_named() {
+        let store = FileStore(PathBuf::from("/nowhere"));
+        for bad in ["", "../x", "a/b", "a b", ".."] {
+            assert!(store.load(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

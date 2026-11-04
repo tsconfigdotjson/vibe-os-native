@@ -1,14 +1,14 @@
 //! The shim: `vibe mcp-proxy <service>`, an MCP server on stdio for an agent's
-//! client, which forwards tool calls to the Mac's broker.
+//! client, which forwards tool calls to its host's broker.
 //!
 //! It never exits while its client lives, and answers the handshake itself:
 //! `initialize` and `tools/list` come from here, from a catalog kept on disk,
-//! so tools load even when the Mac can't be reached as the session starts (a
-//! shim that forwarded them would leave the server failed for the whole
-//! session). Each call connects if it has to, and while the Mac is away gets a
-//! clear tool error, never a hang; the next call after it's back just works.
-//! When the catalog the Mac gives differs from the one on disk, the client is
-//! told with `notifications/tools/list_changed`.
+//! so tools load even when the broker can't be reached as the session starts
+//! (a shim that forwarded them would leave the server failed for the whole
+//! session). Each call connects if it has to, and while the broker is away gets
+//! a clear tool error, never a hang; the next call after it's back just works.
+//! When the catalog the broker gives differs from the one on disk, the client
+//! is told with `notifications/tools/list_changed`.
 //!
 //! stdout is the protocol channel, so nothing else is ever written there.
 
@@ -46,7 +46,7 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct Timing {
     /// How often the catalog is asked for while connected.
     pub poll_connected: Duration,
-    /// How often the Mac is tried while it's away.
+    /// How often the broker is tried while it's away.
     pub poll_away: Duration,
     /// With nothing on disk, how long a client's first `tools/list` waits for
     /// the live catalog before it's told there are no tools yet.
@@ -87,11 +87,11 @@ pub fn tool_error(id: &Value, text: &str) -> Value {
     })
 }
 
-/// What an agent reads when a service can't be reached from here.
+/// What an agent reads when its broker can't be reached.
 pub fn unavailable(service: &str, why: &str) -> String {
     format!(
         "VibeOS shared service '{service}' unavailable: {why}. It works again by itself once \
-         the Mac is back; nothing needs reconnecting."
+         that's back; nothing needs reconnecting."
     )
 }
 
@@ -133,7 +133,7 @@ struct Link {
 #[derive(Default)]
 struct State {
     catalog: Catalog,
-    /// The catalog has come from the Mac, not just from disk.
+    /// The catalog has come from the broker, not just from disk.
     live: bool,
     /// The client said `notifications/initialized`.
     ready: bool,
@@ -200,15 +200,15 @@ impl Shim {
         }
         let conn = UnixStream::connect(&self.config.socket).map_err(|e| {
             format!(
-                "Mac unreachable: nothing answers at {} ({e})",
+                "VibeOS isn't answering on this machine: nothing at {} ({e})",
                 self.config.socket.display()
             )
         })?;
-        let broke = |e: io::Error| format!("Mac unreachable: its connection broke ({e})");
+        let broke = |e: io::Error| format!("VibeOS's connection broke ({e})");
         conn.set_write_timeout(Some(WRITE_TIMEOUT)).map_err(broke)?;
         conn.set_read_timeout(Some(CONNECT_TIMEOUT))
             .map_err(broke)?;
-        let hello = Hello::Open {
+        let hello = Hello {
             service: self.config.service.clone(),
             agent: self.config.agent.clone(),
         };
@@ -216,7 +216,7 @@ impl Shim {
         let mut reader = BufReader::new(conn.try_clone().map_err(broke)?);
         let answer = read_line(&mut reader)
             .map_err(broke)?
-            .ok_or_else(|| "Mac unreachable: the connection closed".to_owned())?;
+            .ok_or_else(|| "VibeOS closed the connection".to_owned())?;
         local::parse_answer(&answer)?;
         conn.set_read_timeout(None).map_err(broke)?;
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
@@ -262,7 +262,7 @@ impl Shim {
                     if let Some(id) = call {
                         self.forget_call(id);
                     }
-                    last = format!("Mac unreachable: its connection broke ({e})");
+                    last = format!("VibeOS's connection broke ({e})");
                     let _ = l.writer.shutdown(std::net::Shutdown::Both);
                     *link = None;
                 }
@@ -306,7 +306,7 @@ impl Shim {
         };
         let text = unavailable(
             &self.config.service,
-            "Mac unreachable: the connection dropped during this call",
+            "VibeOS's connection dropped during this call",
         );
         for id in ids {
             let _ = self.write(&tool_error(&id, &text));
@@ -356,7 +356,7 @@ impl Shim {
         }
     }
 
-    /// Asks for the catalog on a timer, which is also how a Mac that's come
+    /// Asks for the catalog on a timer, which is also how a broker that's come
     /// back is noticed between calls.
     fn poll(self: Arc<Self>) {
         let mut due = Instant::now();
@@ -439,7 +439,7 @@ impl Shim {
         Ok(())
     }
 
-    /// The catalog to list. With nothing kept, the Mac gets a moment to give
+    /// The catalog to list. With nothing kept, the broker gets a moment to give
     /// its own, so a session starting now usually has its tools at once;
     /// `list_changed` covers the rest.
     fn catalog_for_list(self: &Arc<Self>) -> Catalog {

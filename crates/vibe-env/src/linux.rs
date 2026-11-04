@@ -121,7 +121,14 @@ pub trait Machine: Send + Sync + fmt::Debug {
     fn set_clock(&self, socket: &Path, now: SystemTime) -> Result<()>;
     /// Runs a command to completion in the guest, beside the agent's.
     fn run(&self, socket: &Path, run: &proto::Run) -> Result<proto::Ran>;
+    /// Dials a port in the guest, for the shared services' relay.
+    fn dial(&self, _socket: &Path, _port: u32) -> Result<std::os::unix::net::UnixStream> {
+        Err(EnvError::new("this machine can't dial its guest"))
+    }
 }
+
+/// How long dialing a port in the guest may take.
+const DIAL_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The real thing: `vibe-vm` and the guest behind it.
 #[derive(Debug, Clone)]
@@ -135,6 +142,11 @@ fn env_err(what: &str) -> impl FnOnce(guest::GuestError) -> EnvError + '_ {
 }
 
 impl Machine for Real {
+    fn dial(&self, socket: &Path, port: u32) -> Result<std::os::unix::net::UnixStream> {
+        vm::connect_within(socket, port, DIAL_TIMEOUT)
+            .map_err(|e| EnvError::new(format!("can't dial the guest: {e}")))
+    }
+
     fn create(&self, config: &Path) -> Result<()> {
         vm::create(&self.vibe_vm, config)
             .map(drop)
@@ -732,6 +744,20 @@ impl Compartment for LinuxVm {
             },
         )?;
         Ok(TerminalEnd::Vm { socket })
+    }
+
+    fn services_program(&self) -> Option<String> {
+        Some(vibe_relay::local::GUEST_PROGRAM.to_owned())
+    }
+
+    fn services_relay(&self, h: &Handle) -> Result<Option<std::os::unix::net::UnixStream>> {
+        let socket = self.socket(h);
+        if !self.machine.running(&socket) {
+            return Ok(None);
+        }
+        self.machine
+            .dial(&socket, vibe_relay::frame::VSOCK_PORT)
+            .map(Some)
     }
 
     fn processes(&self, h: &Handle) -> Result<Vec<Proc>> {

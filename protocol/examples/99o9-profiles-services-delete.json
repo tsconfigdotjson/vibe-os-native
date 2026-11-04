@@ -1,0 +1,38 @@
+{
+  "description": "Gone again.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 9909,
+    "method": "profiles.delete",
+    "params": {
+      "host": "local",
+      "project": "app",
+      "profile": "no-services"
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 9909,
+    "result": {
+      "environment": "linux",
+      "memory": 4294967296,
+      "mode": "auto",
+      "model": "opus",
+      "name": "no-services",
+      "reasoning": "high"
+    }
+  },
+  "events": [
+    {
+      "jsonrpc": "2.0",
+      "method": "events.event",
+      "params": {
+        "at": "2026-10-30T12:00:00Z",
+        "host": "local",
+        "kind": "profiles.changed",
+        "project": "app",
+        "seq": 36
+      }
+    }
+  ]
+}

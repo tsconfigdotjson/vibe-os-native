@@ -5,6 +5,7 @@ mod client;
 mod doctor;
 mod key;
 mod mcp;
+mod service;
 mod setup;
 mod setup_token;
 mod toolbox;
@@ -20,6 +21,7 @@ use vibe_core::paths;
 use vibe_core::rpc::{
     Hello, HelloParams, HostParams, PROTOCOL_VERSION, SessionInfo, SessionState, SessionsList,
 };
+use vibe_relay::{local, proxy};
 
 use crate::client::ClientError;
 
@@ -52,6 +54,17 @@ commands:
               command: a bridge to vibed's http://127.0.0.1:7878/mcp, with the
               API key in VIBE_API_KEY (--key KEY works too, but shows it to
               anyone who can run ps); --url URL for another endpoint
+  mcp-proxy SERVICE
+              a shared service over stdin and stdout, as agents' MCP clients
+              start it (vibe-linear, say). It goes through this host's vibed,
+              which holds this host's own login
+  service     how this host's shared services stand. Connect them in VibeOS on
+              the Mac, or with:
+  service set-key SERVICE
+              connect this host with a personal API key, read from the terminal
+              or stdin; how a host mends itself with the Mac away
+  service disconnect SERVICE
+              forget this host's login to a service
   key         list this host's API keys for MCP
   key create NAME  make an API key, and print it once
   key revoke NAME  revoke an API key
@@ -67,7 +80,7 @@ commands:
   profile list PROJECT  a project's profiles
   profile create PROJECT NAME [--environment linux|macos] [--model opus|sonnet]
               [--reasoning low|medium|high|xhigh|max] [--mode auto|bypass]
-              [--memory 4G]
+              [--memory 4G] [--shared-services on|off]
   profile set PROJECT PROFILE [--name NEW] [the same settings]
   profile delete PROJECT PROFILE
               project and profile take --host NAME for a Linux host this one
@@ -109,6 +122,10 @@ enum Command {
         url: Option<String>,
         key: Option<String>,
     },
+    McpProxy {
+        service: String,
+    },
+    Service(service::Command),
     Key(key::Command),
     Setup(setup::Command),
 }
@@ -146,6 +163,27 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
                 Command::Doctor { fix }
             }
             "rpc" => Command::Rpc,
+            "mcp-proxy" => Command::McpProxy {
+                service: iter
+                    .next()
+                    .ok_or("mcp-proxy needs a service, such as linear")?
+                    .clone(),
+            },
+            "service" => {
+                let mut words = Vec::new();
+                while let Some(w) = iter.next() {
+                    if w == "--socket" {
+                        socket = Some(PathBuf::from(iter.next().ok_or("--socket needs a path")?));
+                    } else if let Some(path) = w.strip_prefix("--socket=") {
+                        socket = Some(PathBuf::from(path));
+                    } else if w == "-h" || w == "--help" {
+                        return Ok(Args::Help);
+                    } else {
+                        words.push(w.clone());
+                    }
+                }
+                Command::Service(service::Command::parse(&words)?)
+            }
             "setup-token" => Command::SetupToken,
             "toolbox" => {
                 let sub = iter
@@ -276,6 +314,19 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if let Command::McpProxy { service } = &command {
+        let config = proxy::Config {
+            service: service.clone(),
+            socket: local::socket_beside(socket),
+            agent: local::agent_from_env(),
+            cache: local::cache_dir(),
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            timing: proxy::Timing::default(),
+        };
+        let ended = proxy::run(config, io::stdin().lock(), io::stdout());
+        // Its threads go with the process, whatever they're waiting on.
+        std::process::exit(i32::from(ended.is_err()));
+    }
     let result = match command {
         Command::Attach(agent) => {
             return match attach::attach(&socket, &agent) {
@@ -300,7 +351,18 @@ fn main() -> ExitCode {
             };
         }
         Command::Rpc => rpc(&socket),
-        Command::SetupToken | Command::Mcp { .. } => unreachable!("handled above"),
+        Command::SetupToken | Command::Mcp { .. } | Command::McpProxy { .. } => {
+            unreachable!("handled above")
+        }
+        Command::Service(command) => {
+            return match service::run(&socket, command) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("vibe: {e}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
         Command::Key(command) => {
             return match key::run(&socket, command, &default_mcp_url()) {
                 Ok(()) => ExitCode::SUCCESS,

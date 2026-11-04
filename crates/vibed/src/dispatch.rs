@@ -11,7 +11,8 @@ use vibe_core::rpc::{
     HostsList, HostsRemove, HostsUpgrade, Id, KeysCreate, KeysList, KeysRevoke, KeysSync,
     KeysVerify, LimitsGet, LimitsSet, McpGet, McpSet, Method, PROTOCOL_VERSION, ProfilesCreate,
     ProfilesDelete, ProfilesList, ProfilesUpdate, ProjectsAdd, ProjectsList, ProjectsRemove,
-    ProtocolMismatchData, Request, Response, SessionsAttach, SessionsList, Subscribed,
+    ProtocolMismatchData, Request, Response, ServicesComplete, ServicesConnect, ServicesConnectKey,
+    ServicesDisconnect, ServicesList, ServicesSet, SessionsAttach, SessionsList, Subscribed,
     ToolboxClose, ToolboxLoginsGet, ToolboxOpen, ToolboxRebuild, ToolboxStatusGet, ToolboxUpdate,
     TunnelPrepare,
 };
@@ -270,6 +271,24 @@ async fn call(
             encode_result(Ok(core.doctor().await))
         }
         DoctorFix::NAME => encode_result(core.doctor_fix(decode::<DoctorFix>(params)?).await),
+        ServicesList::NAME => encode_result(core.services_list(decode::<ServicesList>(params)?)),
+        ServicesConnect::NAME => encode_result(
+            core.services_connect(decode::<ServicesConnect>(params)?)
+                .await,
+        ),
+        ServicesComplete::NAME => encode_result(
+            core.services_complete(decode::<ServicesComplete>(params)?)
+                .await,
+        ),
+        ServicesConnectKey::NAME => encode_result(
+            core.services_connect_key(decode::<ServicesConnectKey>(params)?)
+                .await,
+        ),
+        ServicesDisconnect::NAME => encode_result(
+            core.services_disconnect(decode::<ServicesDisconnect>(params)?)
+                .await,
+        ),
+        ServicesSet::NAME => encode_result(core.services_set(decode::<ServicesSet>(params)?)),
         _ => Err(ErrorObject::new(
             ErrorCode::MethodNotFound,
             format!("Method not found: {method}"),

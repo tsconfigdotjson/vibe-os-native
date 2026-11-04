@@ -1,5 +1,5 @@
-//! A machine's end of the relay: every shim here, over the one connection the
-//! Mac opened. `vibe-guest` runs one in a VM, and `vibed` on a Linux host.
+//! A VM's end of the relay: every shim in it, over the one connection the Mac
+//! opened to its vsock port. `vibe-guest` runs it.
 //!
 //! A shim connects to the local socket and is given a stream on the relay,
 //! if there is one; if not, it's told so, and says so to its agent. When the
@@ -7,7 +7,7 @@
 //! call. A newer relay replaces an older one: after a VM's restore the old
 //! connection may never say it's gone.
 //!
-//! This runs on plain threads, one per connection, as `vibe-guest` does
+//! It runs on plain threads, one per connection, as `vibe-guest` does
 //! everything: shims are few and their messages small.
 
 use std::collections::HashMap;
@@ -261,9 +261,8 @@ impl Hub {
         Ok((id, writer, generation))
     }
 
-    /// Serves one client of the local socket until it goes: a shim, or if
-    /// `relays` lets it, `vibe services` with a relay.
-    pub fn serve(&self, conn: UnixStream, relays: bool) {
+    /// Serves one shim on the local socket until it goes.
+    pub fn serve(&self, conn: UnixStream) {
         if conn.set_read_timeout(Some(HELLO_TIMEOUT)).is_err() {
             return;
         }
@@ -280,27 +279,7 @@ impl Hub {
             Err(why) => {
                 let _ = (&conn).write_all(local::answer(&Err(why)).as_bytes());
             }
-            Ok(Hello::Relay) => {
-                if !relays {
-                    let why = "this socket doesn't take a relay".to_owned();
-                    let _ = (&conn).write_all(local::answer(&Err(why)).as_bytes());
-                    return;
-                }
-                if (&conn)
-                    .write_all(local::answer(&Ok(())).as_bytes())
-                    .is_err()
-                {
-                    return;
-                }
-                let Ok(writer) = conn.try_clone() else {
-                    return;
-                };
-                let closer = conn;
-                let _ = self.carry(reader, writer, move || {
-                    let _ = closer.shutdown(std::net::Shutdown::Both);
-                });
-            }
-            Ok(Hello::Open { service, agent }) => {
+            Ok(Hello { service, agent }) => {
                 self.serve_shim(conn, reader, &service, agent.as_deref());
             }
         }
@@ -361,24 +340,4 @@ fn close_streams(streams: HashMap<u32, UnixStream>) {
     for shim in streams.into_values() {
         let _ = shim.shutdown(std::net::Shutdown::Both);
     }
-}
-
-/// `vibe services`: the Mac's relay, carried from this process's stdin and
-/// stdout to the hub at `socket`, until either side ends.
-pub fn relay_stdio(socket: &std::path::Path) -> io::Result<()> {
-    let conn = UnixStream::connect(socket)?;
-    (&conn).write_all(Hello::Relay.line().as_bytes())?;
-    let mut reader = BufReader::new(conn.try_clone()?);
-    let line = read_line(&mut reader)?
-        .ok_or_else(|| io::Error::other("vibed closed the connection without an answer"))?;
-    local::parse_answer(&line).map_err(io::Error::other)?;
-    let mut up = conn.try_clone()?;
-    let upward = std::thread::spawn(move || {
-        let _ = io::copy(&mut io::stdin().lock(), &mut up);
-        let _ = up.shutdown(std::net::Shutdown::Both);
-    });
-    let copied = io::copy(&mut reader, &mut io::stdout().lock());
-    let _ = conn.shutdown(std::net::Shutdown::Both);
-    drop(upward);
-    copied.map(|_| ())
 }

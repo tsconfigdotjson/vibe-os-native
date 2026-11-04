@@ -1226,6 +1226,7 @@ mod tests {
             created_at: 5,
             compartment: r#"{"x":1}"#.into(),
             starting: true,
+            shared_services: true,
         }
     }
 

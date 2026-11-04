@@ -14,7 +14,7 @@ use vibe_core::model::{ServiceAuth, ServiceState};
 use vibe_core::rpc::{ServiceInfo, ServiceSetParams};
 use vibe_services::secrets::MemoryStore;
 use vibe_services::testing::{API_KEY, FakeService, SECRET_MARK};
-use vibe_services::{Deps, Secret, SecretStore, Services};
+use vibe_services::{Deps, Place, Secret, SecretStore, Services};
 
 const RECONNECT: &str =
     "Linear needs reconnecting on the Mac (VibeOS → Settings → Services → Reconnect).";
@@ -45,6 +45,7 @@ fn deps(
         }),
         changed: Arc::new(move |info| changes.lock().unwrap().push(info.clone())),
         audit: Arc::new(move |line| audit.lock().unwrap().push(line.to_owned())),
+        place: Place::Mac,
     }
 }
 
@@ -902,6 +903,40 @@ async fn a_tool_error_from_the_service_is_passed_on_as_it_is() {
     let answer = a.call("boom").await;
     assert!(is_error(&answer));
     assert_eq!(text(&answer), "it broke");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_linux_host_says_where_its_own_login_gets_mended() {
+    let fake = FakeService::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let store: Arc<dyn SecretStore> = Arc::new(MemoryStore::default());
+    let (now, audit, changes) = (Arc::default(), Arc::default(), Arc::default());
+    let services = Services::new(
+        vec![fake.service()],
+        store,
+        dir.path().join("services.json"),
+        Deps {
+            place: Place::LinuxHost,
+            ..deps(&now, &audit, &changes)
+        },
+    );
+    let mut a = Shim::open(&services, "a");
+    let not_yet = a.call("list_issues").await;
+    assert!(is_error(&not_yet));
+    assert_eq!(
+        text(&not_yet),
+        "Linear isn't connected on this host (VibeOS → Settings → Services → Connect on the Mac, \
+         or `vibe service set-key linear` here)."
+    );
+    services.connect_key("linear", API_KEY).await.unwrap();
+    fake.reject_all_tokens(true);
+    let lost = a.call("list_issues").await;
+    assert!(is_error(&lost));
+    assert_eq!(
+        text(&lost),
+        "Linear needs reconnecting on this host (VibeOS → Settings → Services → Reconnect on the \
+         Mac, or `vibe service set-key linear` here)."
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

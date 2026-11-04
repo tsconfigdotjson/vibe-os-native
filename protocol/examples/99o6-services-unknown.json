@@ -1,0 +1,19 @@
+{
+  "description": "A service nobody supports.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 9906,
+    "method": "services.disconnect",
+    "params": {
+      "service": "jira"
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 9906,
+    "error": {
+      "code": -32001,
+      "message": "VibeOS has no shared service jira"
+    }
+  }
+}

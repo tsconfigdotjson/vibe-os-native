@@ -17,8 +17,11 @@ use vibe_env::linux::{self, LinuxVm};
 use vibe_env::macos::Macos;
 use vibe_env::testing::{TestBackend, TestToolbox};
 use vibe_env::toolbox::Toolbox;
+use vibe_services::secrets::{FileStore, Keychain};
+use vibe_services::{Place, SecretStore, Service};
 use vibed::agents::Backends;
 use vibed::core::{Config, Core, DaemonInfo};
+use vibed::services::ServicesConfig;
 use vibed::{logging, server};
 
 const USAGE: &str = "\
@@ -58,6 +61,12 @@ environment:
                   the Linux builds of vibed, vibe and vibe-shim that Add Linux
                   host installs, as <dir>/<x86_64|aarch64>/<binary> (default:
                   linux/ beside vibed, or in the app's Resources)
+  VIBE_CLI        the vibe agents run the shared services' shim with (default:
+                  the one beside vibed, or on PATH)
+  VIBE_TEST_SERVICES_DIR, VIBE_TEST_SERVICES_UPSTREAM
+                  for tests only, in debug builds: keep shared services' logins
+                  in this directory whatever the OS, and find Linear's stand-in
+                  at this URL
   VIBE_EXTERNAL_PORT, VIBE_EXTERNAL_LISTEN, VIBE_ACME_DIRECTORY
                   for tests only: the port the external address is served
                   on (default 443), the one address it listens on (default
@@ -216,6 +225,10 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
             shared: Some(config.layout.run_dir()),
         });
     }
+    if let Some(vibe) = std::env::var_os("VIBE_CLI").filter(|v| !v.is_empty()) {
+        config.vibe_cli = vibe;
+    }
+    config.services = Some(services_config(&config.layout));
     if let Some(port) = env_text("VIBE_EXTERNAL_PORT") {
         match port.parse() {
             Ok(port) => config.external.port = port,
@@ -365,6 +378,9 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
     // External access: a Linux host's public endpoint; a Mac's tunnel, and
     // the socket it reaches, which checks every call's API key itself.
     core.spawn_external();
+    // Shared MCP services: this host's broker, and on a Mac, the relays it
+    // dials to its VMs.
+    let services = core.spawn_services();
     vibed::log!(
         "vibed {} listening on {}",
         env!("CARGO_PKG_VERSION"),
@@ -379,6 +395,9 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
     server::serve(listener, Arc::clone(&core), MAX_MESSAGE_BYTES, shutdown).await;
     core.stop_links();
     core.stop_external();
+    for task in services {
+        task.abort();
+    }
     mcp.abort();
     gh_checks.abort();
     status.abort();
@@ -412,6 +431,40 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
 /// the test backend and asks with `VIBE_TEST_SERVE_EXTERNAL=1`.
 fn serve_here(os: &str, test_backend: bool, stand_in: Option<&str>) -> bool {
     os == "linux" || (test_backend && stand_in == Some("1"))
+}
+
+/// Which services this host's broker offers, and where it keeps its own logins:
+/// the Keychain on a Mac, and on a Linux host a private file in its state
+/// directory. Only a debug build listens to the test variables, so a release
+/// can't be talked into keeping a login elsewhere or sending one to a stand-in.
+fn services_config(layout: &Layout) -> ServicesConfig {
+    let place = if cfg!(target_os = "macos") {
+        Place::Mac
+    } else {
+        Place::LinuxHost
+    };
+    let services = match env_text("VIBE_TEST_SERVICES_UPSTREAM").filter(|_| cfg!(debug_assertions))
+    {
+        Some(base) => {
+            vibed::log!("vibed: VIBE_TEST_SERVICES_UPSTREAM is set: Linear is at {base}");
+            vec![Service::linear_at(&base)]
+        }
+        None => vibe_services::supported(),
+    };
+    let test_dir = env_text("VIBE_TEST_SERVICES_DIR").filter(|_| cfg!(debug_assertions));
+    let store: Arc<dyn SecretStore> = match test_dir {
+        Some(dir) => {
+            vibed::log!("vibed: VIBE_TEST_SERVICES_DIR is set: logins are kept in {dir}");
+            Arc::new(FileStore(PathBuf::from(dir)))
+        }
+        None if place == Place::Mac => Arc::new(Keychain),
+        None => Arc::new(FileStore(layout.data_dir().join("services"))),
+    };
+    ServicesConfig {
+        services,
+        store,
+        place,
+    }
 }
 
 /// An environment variable's value, if it's set to text.

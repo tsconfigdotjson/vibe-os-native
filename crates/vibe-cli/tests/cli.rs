@@ -127,7 +127,7 @@ fn rpc_bridges_the_whole_contract() {
     let s = start_core(core, tempfile::tempdir().unwrap());
     let mut input = Vec::new();
     let mut expected = Vec::new();
-    for ex in common::examples(&golden.home) {
+    for ex in common::examples(&golden) {
         let Some(line) = ex.line else { continue };
         input.extend(line);
         input.push(b'\n');

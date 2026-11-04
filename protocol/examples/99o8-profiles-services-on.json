@@ -1,0 +1,39 @@
+{
+  "description": "Back on, for agents started from here on.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 9908,
+    "method": "profiles.update",
+    "params": {
+      "host": "local",
+      "project": "app",
+      "profile": "no-services",
+      "shared_services": true
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 9908,
+    "result": {
+      "environment": "linux",
+      "memory": 4294967296,
+      "mode": "auto",
+      "model": "opus",
+      "name": "no-services",
+      "reasoning": "high"
+    }
+  },
+  "events": [
+    {
+      "jsonrpc": "2.0",
+      "method": "events.event",
+      "params": {
+        "at": "2026-10-30T12:00:00Z",
+        "host": "local",
+        "kind": "profiles.changed",
+        "project": "app",
+        "seq": 35
+      }
+    }
+  ]
+}

@@ -1,0 +1,43 @@
+{
+  "description": "The second half: the URL that session ended on. The code in it is useless without the verifier, which never left the host. The host makes the exchange and keeps the tokens, which never leave it either.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 9903,
+    "method": "services.complete",
+    "params": {
+      "host": "local",
+      "service": "linear",
+      "callback_url": "vibeos://oauth/callback?code=golden-code&state=oKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr8&iss=http%3A%2F%2Fservices.example"
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 9903,
+    "result": {
+      "auth": "oauth",
+      "denied_tools": [
+        "delete_issue"
+      ],
+      "enabled": true,
+      "name": "linear",
+      "read_only": true,
+      "state": "connected",
+      "title": "Linear",
+      "tools": 0
+    }
+  },
+  "events": [
+    {
+      "jsonrpc": "2.0",
+      "method": "events.event",
+      "params": {
+        "at": "2026-10-30T12:00:00Z",
+        "host": "local",
+        "kind": "service.changed",
+        "message": "linear",
+        "seq": 31,
+        "state": "connected"
+      }
+    }
+  ]
+}

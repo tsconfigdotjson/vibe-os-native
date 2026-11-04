@@ -1,0 +1,49 @@
+{
+  "description": "Changes the settings given, on the host named. `enabled: false` is the kill switch.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 9901,
+    "method": "services.set",
+    "params": {
+      "host": "local",
+      "service": "linear",
+      "enabled": true,
+      "read_only": true,
+      "denied_tools": [
+        "delete_issue"
+      ]
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 9901,
+    "result": {
+      "auth": "oauth",
+      "denied_tools": [
+        "delete_issue"
+      ],
+      "detail": "Linear refused the refresh (invalid_client)",
+      "detail_at": "2026-10-30T12:00:00Z",
+      "enabled": true,
+      "name": "linear",
+      "read_only": true,
+      "state": "needs_reconnect",
+      "title": "Linear",
+      "tools": 0
+    }
+  },
+  "events": [
+    {
+      "jsonrpc": "2.0",
+      "method": "events.event",
+      "params": {
+        "at": "2026-10-30T12:00:00Z",
+        "host": "local",
+        "kind": "service.changed",
+        "message": "linear",
+        "seq": 30,
+        "state": "needs_reconnect"
+      }
+    }
+  ]
+}

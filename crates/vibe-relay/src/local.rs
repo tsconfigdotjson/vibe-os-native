@@ -1,6 +1,6 @@
 //! What's said on the local socket a machine's shims reach: `vibe-guest`'s in
-//! a VM, `run/.services.sock` under `vibed` on a host. It's one JSON line
-//! each way, then either JSON-RPC, one message per line, or relay frames.
+//! a VM, `run/.services.sock` under `vibed` on a host. It's one JSON line each
+//! way, then JSON-RPC, one message per line.
 
 use std::env;
 use std::ffi::OsString;
@@ -19,7 +19,7 @@ pub const GUEST_PROGRAM: &str = "/run/vibe/bin/vibe";
 /// so it can't be taken for a session's socket, nor a session's for it.
 pub const HOST_SOCKET_NAME: &str = ".services.sock";
 
-/// Overrides the socket, for the shim and `vibe services`.
+/// Overrides the socket, for the shim.
 pub const SOCKET_ENV: &str = "VIBE_SERVICES_SOCKET";
 
 /// Set in every agent: its ref, which the shim passes along for the audit log
@@ -29,41 +29,27 @@ pub const AGENT_ENV: &str = "VIBE_AGENT";
 /// Overrides where the shim keeps its catalog cache, a directory.
 pub const CACHE_ENV: &str = "VIBE_SERVICES_CACHE";
 
-/// What a client says first on the local socket.
+/// What a shim says first on the local socket: which service it wants, and
+/// which agent it's in, if it's in one.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Hello {
-    /// A shim wants a service.
-    Open {
-        service: String,
-        agent: Option<String>,
-    },
-    /// `vibe services`, the Mac's end of a Linux host's relay: from here on
-    /// the connection carries frames.
-    Relay,
+pub struct Hello {
+    pub service: String,
+    pub agent: Option<String>,
 }
 
 impl Hello {
     pub fn line(&self) -> String {
-        let v = match self {
-            Hello::Open { service, agent } => {
-                let mut v = json!({"open": service});
-                if let Some(agent) = agent {
-                    v["agent"] = json!(agent);
-                }
-                v
-            }
-            Hello::Relay => json!({"relay": crate::frame::PROTOCOL}),
-        };
+        let mut v = json!({"open": self.service});
+        if let Some(agent) = &self.agent {
+            v["agent"] = json!(agent);
+        }
         format!("{v}\n")
     }
 
     pub fn parse(line: &[u8]) -> Result<Hello, String> {
         let v: Value = serde_json::from_slice(line).map_err(|_| "that's not a hello")?;
-        if v.get("relay").is_some() {
-            return Ok(Hello::Relay);
-        }
         match v.get("open").and_then(Value::as_str) {
-            Some(service) => Ok(Hello::Open {
+            Some(service) => Ok(Hello {
                 service: service.to_owned(),
                 agent: v.get("agent").and_then(Value::as_str).map(str::to_owned),
             }),
@@ -95,8 +81,8 @@ pub fn parse_answer(line: &[u8]) -> Result<(), String> {
         .to_owned())
 }
 
-/// What the local socket says when this machine has no way to the Mac.
-pub const NO_RELAY: &str = "Mac unreachable: this machine has no connection to it now";
+/// What a VM's socket says when the Mac has no relay up to it.
+pub const NO_RELAY: &str = "Mac unreachable: this VM has no connection to it now";
 
 fn set(v: Option<OsString>) -> Option<OsString> {
     v.filter(|v| !v.is_empty())
@@ -137,15 +123,14 @@ mod tests {
     #[test]
     fn hellos_read_back() {
         for hello in [
-            Hello::Open {
+            Hello {
                 service: "linear".into(),
                 agent: Some("quiet-amber-otter".into()),
             },
-            Hello::Open {
+            Hello {
                 service: "linear".into(),
                 agent: None,
             },
-            Hello::Relay,
         ] {
             let line = hello.line();
             assert!(line.ends_with('\n'));
