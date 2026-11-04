@@ -862,17 +862,25 @@ fn guest_shim_reaches_the_broker_over_the_relay_across_a_sleep() {
     vm.boot_guest();
     let share = vm.share.to_string_lossy().into_owned();
 
-    // A shim started in the guest, its client a script fed from a file in the
-    // share, answering into another, so it lives across the sleep.
+    // A shim started in the guest, with a client that lives across the sleep: a
+    // script taking each message from a file of its own in the share, and answering
+    // into another. It opens a file for each, and holds none open across the sleep:
+    // that's `a_process_keeps_its_files_on_a_share_across_a_sleep`'s to say, and this
+    // is about the relay. It notes each message it's read, so that if an answer
+    // doesn't come, what's been read says on which side of the shim it stopped.
     let program = vibe_relay::local::GUEST_PROGRAM;
-    let input = vm.share.join("to-shim");
-    fs::write(&input, "").unwrap();
     let launch = vibe_guest::Launch {
         command: vec![
             "/bin/sh".into(),
             "-c".into(),
             format!(
-                "tail -f '{share}/to-shim' | {program} mcp-proxy linear > '{share}/from-shim' 2>&1"
+                "n=0; while :; do \
+                   f='{share}/to-shim.'$n; \
+                   if [ -e \"$f\" ] && cat \"$f\" 2>>'{share}/client-errors'; then \
+                     touch '{share}/read.'$n 2>>'{share}/client-errors'; n=$((n+1)); \
+                   else sleep 0.1; fi; \
+                 done | {program} mcp-proxy linear 2>&1 | \
+                 while IFS= read -r line; do printf '%s\\n' \"$line\" >> '{share}/from-shim'; done"
             ),
         ],
         env: [
@@ -891,9 +899,13 @@ fn guest_shim_reaches_the_broker_over_the_relay_across_a_sleep() {
         time_ms: Some(vibe_guest::millis(std::time::SystemTime::now())),
     };
     vibe_guest::launch(&vm.socket, &launch).unwrap();
+    let said = std::sync::atomic::AtomicUsize::new(0);
     let say = |m: serde_json::Value| {
-        let mut f = fs::OpenOptions::new().append(true).open(&input).unwrap();
-        writeln!(f, "{m}").unwrap();
+        let n = said.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // Whole when it appears: the script reads it as soon as it's there.
+        let tmp = vm.share.join(format!("new-to-shim.{n}"));
+        fs::write(&tmp, format!("{m}\n")).unwrap();
+        fs::rename(&tmp, vm.share.join(format!("to-shim.{n}"))).unwrap();
     };
     // Waits for the shim's answer to `id`.
     let answer = |id: i64| -> serde_json::Value {
@@ -909,7 +921,17 @@ fn guest_shim_reaches_the_broker_over_the_relay_across_a_sleep() {
             }
             thread::sleep(Duration::from_millis(100));
         }
-        panic!("no answer to {id}\n{}", vm.logs());
+        let sent = said.load(std::sync::atomic::Ordering::SeqCst);
+        let read = (0..sent)
+            .filter(|n| vm.share.join(format!("read.{n}")).exists())
+            .count();
+        panic!(
+            "no answer to {id}: the client read {read} of the {sent} messages sent\n\
+             what the shim said: {}\nthe client's errors: {}\n{}",
+            fs::read_to_string(vm.share.join("from-shim")).unwrap_or_default(),
+            fs::read_to_string(vm.share.join("client-errors")).unwrap_or_default(),
+            vm.logs()
+        );
     };
     let call = |id: i64| serde_json::json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"name": "list_issues"}});
 
@@ -972,6 +994,116 @@ fn guest_shim_reaches_the_broker_over_the_relay_across_a_sleep() {
     assert_eq!(answer(4)["result"]["content"][0]["text"], "from the Mac");
     vm.stop();
     mark("guest_shim_reaches_the_broker_over_the_relay_across_a_sleep");
+}
+
+/// What a process in the VM has open on a share still works after a sleep, as
+/// "exactly where it was" says: a file it's writing, one it's following as it grows,
+/// and its working directory, all there for every agent, whose worktree is a share.
+/// The spike only showed that a file opened after a restore is fresh. This is what
+/// happens to one opened before: read to its end, grown on the Mac after the restore,
+/// and then read again, by the shell and by a real `tail -f`.
+#[test]
+fn a_process_keeps_its_files_on_a_share_across_a_sleep() {
+    let Some(g) = guest("a_process_keeps_its_files_on_a_share_across_a_sleep") else {
+        return;
+    };
+    let root = short_tempdir();
+    let vm = TestVm::create_as(
+        &g,
+        root.path(),
+        "held",
+        1024 * MIB,
+        root.path().join("held.vm"),
+        &Kind::VibeGuest { claude: None },
+    );
+    vm.boot_guest();
+    let share = vm.share.to_string_lossy().into_owned();
+    fs::create_dir(vm.share.join("sub")).unwrap();
+    fs::write(vm.share.join("follow"), "line one\n").unwrap();
+    let script = format!(
+        r#"
+note() {{ echo "$1" >> '{share}/progress'; }}
+exec 3>>'{share}/held-out' 4<'{share}/follow'
+tail -f '{share}/follow' > /tmp/tailed 2> /tmp/tail-errors &
+echo before >&3
+read -r first <&4
+read -r none <&4
+touch '{share}/ready'
+while [ ! -e '{share}/go' ]; do sleep 0.1; done
+note awake
+if echo after >&3 2>>'{share}/errors'; then w=ok; else w=failed; fi
+note wrote
+r=failed; i=0
+while [ $i -lt 100 ]; do
+  if read -r line <&4 2>>'{share}/errors' && [ -n "$line" ]; then r=$line; break; fi
+  i=$((i+1)); sleep 0.1
+done
+note read
+t=failed; i=0
+while [ $i -lt 100 ]; do
+  if grep -q 'line two' /tmp/tailed; then t=ok; break; fi
+  i=$((i+1)); sleep 0.1
+done
+cat /tmp/tail-errors >> '{share}/errors'
+note tailed
+if ls . >/dev/null 2>>'{share}/errors'; then c=ok; else c=failed; fi
+printf 'write=%s read=%s tail=%s cwd=%s\n' "$w" "$r" "$t" "$c" > '{share}/new-result'
+mv '{share}/new-result' '{share}/result'
+"#
+    );
+    let launch = vibe_guest::Launch {
+        command: vec!["/bin/sh".into(), "-c".into(), script],
+        env: Default::default(),
+        cwd: Some(format!("{share}/sub")),
+        size: None,
+        time_ms: Some(vibe_guest::millis(std::time::SystemTime::now())),
+    };
+    vibe_guest::launch(&vm.socket, &launch).unwrap();
+    let said = |name: &str| fs::read_to_string(vm.share.join(name)).unwrap_or_default();
+    let appears = |name: &str| {
+        let deadline = Instant::now() + Duration::from_secs(40);
+        while !vm.share.join(name).exists() {
+            assert!(
+                Instant::now() < deadline,
+                "no {name} from the guest, which got as far as: {:?}\nerrors: {}\n{}",
+                said("progress"),
+                said("errors"),
+                vm.logs()
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+    };
+    appears("ready");
+
+    let frozen = vibe_guest::freeze(&vm.socket).unwrap();
+    vm.sleep_down_to(None, Some(vibe_guest::balloon_floor(frozen.memory)));
+    vm.restore_guest();
+    let thawed = vibe_guest::thaw(&vm.socket, std::time::SystemTime::now(), None).unwrap();
+    eprintln!("thawed: {thawed:?}");
+
+    let mut grown = fs::OpenOptions::new()
+        .append(true)
+        .open(vm.share.join("follow"))
+        .unwrap();
+    writeln!(grown, "line two").unwrap();
+    drop(grown);
+    fs::write(vm.share.join("go"), "").unwrap();
+    appears("result");
+    let result = said("result");
+    eprintln!(
+        "files held across a sleep: {result}errors: {}",
+        said("errors")
+    );
+    assert_eq!(
+        result,
+        "write=ok read=line two tail=ok cwd=ok\n",
+        "errors: {}\n{}",
+        said("errors"),
+        vm.logs()
+    );
+    assert_eq!(said("held-out"), "before\nafter\n");
+    vm.stop();
+    mark("a_process_keeps_its_files_on_a_share_across_a_sleep");
 }
 
 fn shim_binary() -> PathBuf {
