@@ -7,6 +7,7 @@ truth for that contract. Both implementations are tested against it:
 | File | What it pins |
 | --- | --- |
 | `vibed-rpc.json` | Protocol version, framing, socket paths, the methods with their param and result types, the notifications the daemon sends, the error codes, the enums and their values, the exact field names of every type, which fields may be absent, and which fields hold other types (`nested`) |
+| `pi-models.json` | What a Pi profile's model may be: names accepted and refused. vibed's `validate_pi_model` and Swift's `isValidPiModel` each test against this list |
 | `examples/*.json` | Golden exchanges: a `request` (or a malformed `request_raw` line), the exact `response` (`null` for none) and any `events` the daemon sends after it; or a `notification` the daemon sends unasked |
 
 The checks:

@@ -4,7 +4,8 @@
 # PI_CODING_AGENT_SESSION_DIR, from the first user message on, so a session
 # nobody has asked anything has no file. The same --session-id finds the same file, so
 # one flag starts and resumes. What it was started with goes beside its
-# sessions, in `<dir>.args` and `<dir>.env`, for tests to look at.
+# sessions, in `<dir>.args` and `<dir>.env`, for tests to look at. A model whose
+# name starts `no-such` is one it won't take, so it says so and exits, as Pi does.
 #
 # The prompt's words:
 #   wait N     takes N seconds to get going, with nothing on disk at all
@@ -20,13 +21,15 @@
 # is drawn as Pi's is: what was said, then an editor between two rules and a
 # footer, and its spinner set in a rule while a turn runs.
 if [ "$1" = auth ]; then
-  # `pi auth check --model <provider/id> --json`, from its login file.
+  # `pi auth check --model <model> --json`, from its login file.
   model=
   while [ $# -gt 0 ]; do
     case $1 in --model) model=$2; shift 2 ;; *) shift ;; esac
   done
   provider=${model%%/*}
-  # As Pi says of a model it doesn't know, loading no extensions for this.
+  # As Pi says of a model it doesn't know, loading no extensions for this, and
+  # of every bare id, which this command doesn't resolve.
+  case $model in */*) ;; *) provider=unknown ;; esac
   case $provider in
     unknown)
       printf '{"status":"invalid","provider":"%s","reason":"invalid_state"}\n' "$model"
@@ -47,7 +50,14 @@ while [ $# -gt 0 ]; do
   case $1 in
     --session-id) id=$2; shift 2 ;;
     -e) extension=$2; shift 2 ;;
-    --model|--thinking) shift 2 ;;
+    --model)
+      # As Pi does with one it won't take: says why, and draws nothing.
+      case $2 in no-such*)
+        printf 'Error: Model "%s" not found. Use --list-models to see available models.\n' "$2" >&2
+        exit 1
+      esac
+      shift 2 ;;
+    --thinking) shift 2 ;;
     --approve) shift ;;
     --) shift; prompt=$*; break ;;
     *) shift ;;

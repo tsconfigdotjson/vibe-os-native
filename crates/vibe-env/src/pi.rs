@@ -357,7 +357,8 @@ impl PiHome {
     /// (`vibe_status::pi_error_on_screen`). A key in `pi.env` counts for the
     /// provider it's for, and any other line for nothing. Only a provider Pi
     /// names a key for can be said to lack one: an extension's, or one that can
-    /// sign in from what's around it, is left to try.
+    /// sign in from what's around it, is left to try. A bare id names no provider,
+    /// so it's asked of as no model is: Pi works out whose it is.
     pub fn login_missing(
         &self,
         model: Option<&str>,
@@ -892,6 +893,28 @@ mod tests {
         )
         .unwrap();
         assert_eq!(home.login_missing(model, &[]), None);
+    }
+
+    #[test]
+    fn a_bare_id_names_no_provider_so_any_login_will_do_to_try() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = PiHome::at(tmp.path().to_owned(), tmp.path().join("s"));
+        let bare = Some("deepseek-v4.1-flash");
+        assert!(
+            home.login_missing(bare, &[])
+                .unwrap()
+                .contains("any provider")
+        );
+        assert_eq!(
+            home.login_missing(bare, &pairs(&[("OPENCODE_API_KEY", "k")])),
+            None
+        );
+        fs::write(
+            tmp.path().join("auth.json"),
+            r#"{"opencode":{"type":"api_key","key":"k"}}"#,
+        )
+        .unwrap();
+        assert_eq!(home.login_missing(bare, &[]), None);
     }
 
     #[test]

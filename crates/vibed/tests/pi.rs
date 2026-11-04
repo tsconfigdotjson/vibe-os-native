@@ -1361,6 +1361,107 @@ async fn a_profile_moves_between_agents_and_environments_on_the_owners_word() {
     assert_eq!(saved.agent, AgentKind::Claude);
 }
 
+/// The Model field takes anything that's safe to pass on, and Pi gets it as it is.
+#[tokio::test]
+async fn a_bare_model_id_saves_and_goes_to_pi_as_it_is() {
+    let w = world().await;
+    w.sign_in();
+    let saved = w
+        .core
+        .update_profile(ProfileUpdateParams {
+            project: "app".into(),
+            profile: "pi-linux".into(),
+            pi_model: Some("deepseek-v4.1-flash".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(saved.pi_model.as_deref(), Some("deepseek-v4.1-flash"));
+    let a = w.start("hello").await;
+    let r = a.agent.clone();
+    let args = w.started_with(&r, "args");
+    let args: Vec<&str> = args.lines().collect();
+    let at = args.iter().position(|a| *a == "--model").unwrap();
+    assert_eq!(args[at + 1], "deepseek-v4.1-flash", "{args:?}");
+    w.wait_screen(&r, "Working on: hello").await;
+    w.delete(&r).await;
+}
+
+/// A model Pi won't take is Pi's to refuse, and the app says what it said, in place
+/// of an agent that just reads as exited.
+#[tokio::test]
+async fn a_model_pi_wont_take_is_said_in_pis_words() {
+    let w = world().await;
+    w.sign_in();
+    w.core
+        .update_profile(ProfileUpdateParams {
+            project: "app".into(),
+            profile: "pi-linux".into(),
+            pi_model: Some("no-such-model".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    let a = w.start("hello").await;
+    let r = a.agent.clone();
+    let socket = w.layout.session_socket(&r);
+    wait_until("it to exit", || {
+        !socket.exists()
+            && w.layout
+                .agent_dir(&r)
+                .join(vibe_core::shim::RECORD_FILE)
+                .is_file()
+    });
+    let list = w.core.agents(HostParams { host: None }).await.unwrap();
+    let agent = list.agents.iter().find(|x| x.agent == r).unwrap();
+    assert_eq!(agent.state, AgentState::Exited);
+    assert_eq!(agent.status.activity, Activity::Errored);
+    let said = agent.status.error.clone().unwrap_or_default();
+    assert!(said.contains("Model \"no-such-model\" not found"), "{said}");
+    assert!(!said.contains("--list-models"), "{said}");
+
+    // Put right, the next session runs, and nothing of that stays.
+    w.core
+        .update_profile(ProfileUpdateParams {
+            project: "app".into(),
+            profile: "pi-linux".into(),
+            pi_model: Some("mock/mock-model".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    let b = w.start("hello again").await;
+    w.wait_for(&b.agent, Activity::Done).await;
+    let list = w.core.agents(HostParams { host: None }).await.unwrap();
+    let agent = list.agents.iter().find(|x| x.agent == b.agent).unwrap();
+    assert_eq!(agent.status.error, None);
+    w.delete(&r).await;
+    w.delete(&b.agent).await;
+}
+
+/// `pi auth check` says `invalid` of every bare id. That isn't a refusal, so with a
+/// login Pi gets to try, and with none at all it's said that there's none.
+#[tokio::test]
+async fn a_bare_model_id_with_no_login_says_so_at_the_start() {
+    let w = world().await;
+    w.core
+        .update_profile(ProfileUpdateParams {
+            project: "app".into(),
+            profile: "pi-linux".into(),
+            pi_model: Some("deepseek-v4.1-flash".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    let e = w
+        .core
+        .start_agent(AgentStartParams {
+            project: "app".into(),
+            profile: "pi-linux".into(),
+            prompt: "hello".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert!(e.message.contains("any provider"), "{}", e.message);
+}
+
 #[tokio::test]
 async fn pi_status_names_providers_and_never_what_they_hold() {
     let w = world().await;

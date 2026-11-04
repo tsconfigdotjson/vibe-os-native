@@ -92,10 +92,42 @@ impl Core {
             .await
             .unwrap_or_else(Status::unknown);
         if a.agent == AgentKind::Pi {
-            self.pi_read_status(a, debounce, status).await.0
+            let status = self.pi_read_status(a, debounce, status).await.0;
+            match self.pi_gave_up_with(a).await {
+                Some(error) => status.failed_on_screen(error),
+                None => status,
+            }
         } else {
             status
         }
+    }
+
+    /// What Pi said as it gave up on `a`, if that's how its session ended: with a
+    /// model it won't take, say, it's gone before it writes or draws anything, and
+    /// this is all that says why. Pi has the last word on what a model is (PRD:
+    /// Profiles), so this is how it's heard. A new session makes it old news.
+    async fn pi_gave_up_with(&self, a: &AgentRecord) -> Option<String> {
+        if a.state == AgentState::Asleep
+            || self.is_busy(&a.agent_ref)
+            || !self
+                .layout
+                .agent_dir(&a.agent_ref)
+                .join(vibe_core::shim::RECORD_FILE)
+                .is_file()
+            || self.session_runs(&a.agent_ref).await
+        {
+            return None;
+        }
+        let (layout, agent_ref) = (self.layout.clone(), a.agent_ref.clone());
+        let record =
+            tokio::task::spawn_blocking(move || crate::sessions::read_record(&layout, &agent_ref))
+                .await
+                .ok()??;
+        // Ended on its own and not well: not told to go, and not a quit.
+        if record.exit.code.unwrap_or(0) == 0 {
+            return None;
+        }
+        vibe_status::pi_error_at_exit(&record.output.screen)
     }
 
     /// When the last thing typed to `a` was, if its transcript has shown nothing

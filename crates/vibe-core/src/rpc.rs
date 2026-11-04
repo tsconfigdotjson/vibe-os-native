@@ -1083,7 +1083,7 @@ pub struct ProfileCreateParams {
     /// Which coding agent it runs; Claude unless it says.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent: Option<AgentKind>,
-    /// A Pi profile's model, as `provider/id`.
+    /// A Pi profile's model, as Pi is to be given it: `provider/id` or a bare id.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pi_model: Option<String>,
 }
@@ -1119,8 +1119,8 @@ pub struct ProfileUpdateParams {
     /// its Pi model.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent: Option<AgentKind>,
-    /// A Pi profile's model, as `provider/id`; empty clears it, for Pi's own
-    /// default.
+    /// A Pi profile's model, as Pi is to be given it: `provider/id` or a bare id;
+    /// empty clears it, for Pi's own default.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pi_model: Option<String>,
 }

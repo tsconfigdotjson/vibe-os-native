@@ -82,7 +82,7 @@ commands:
   profile create PROJECT NAME [--environment linux|macos] [--model opus|sonnet]
               [--reasoning low|medium|high|xhigh|max] [--mode auto|bypass]
               [--memory 4G] [--shared-services on|off] [--agent claude|pi]
-              [--pi-model PROVIDER/ID]
+              [--pi-model MODEL]
   profile set PROJECT PROFILE [--name NEW] [the same settings]
   profile delete PROJECT PROFILE
               project and profile take --host NAME for a Linux host this one
