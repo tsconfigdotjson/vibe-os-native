@@ -1,5 +1,5 @@
 {
-  "description": "The second half: the URL that session ended on. The code in it is useless without the verifier, which never left the host. The host makes the exchange and keeps the tokens, which never leave it either.",
+  "description": "The second half: the URL that session ended on. The code in it is useless without the verifier, which never left the host. The host makes the exchange and keeps the tokens, and owns the login from here on; any other host that did is told to forget its own.",
   "request": {
     "jsonrpc": "2.0",
     "id": 9903,
@@ -14,7 +14,7 @@
     "jsonrpc": "2.0",
     "id": 9903,
     "result": {
-      "auth": "oauth",
+      "access_until": "2026-10-31T12:00:00Z",
       "auto_allow": true,
       "denied_tools": [
         "delete_issue"
@@ -22,9 +22,11 @@
       "enabled": true,
       "name": "linear",
       "read_only": true,
+      "role": "owner",
       "state": "connected",
       "title": "Linear",
-      "tools": 0
+      "tools": 0,
+      "wants_token": false
     }
   },
   "events": [
@@ -37,6 +39,18 @@
         "kind": "service.changed",
         "message": "linear",
         "seq": 31,
+        "state": "connected"
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "events.event",
+      "params": {
+        "at": "2026-10-30T12:00:00Z",
+        "host": "local",
+        "kind": "service.changed",
+        "message": "linear",
+        "seq": 32,
         "state": "connected"
       }
     }

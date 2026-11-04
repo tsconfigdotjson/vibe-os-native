@@ -1,5 +1,5 @@
 {
-  "description": "The first half of connecting or reconnecting. The host named registers its client and makes the PKCE verifier, which it keeps, and gives the page for the app to open. What's connected stays as it is until the second half.",
+  "description": "The first half of connecting or reconnecting, on the host that's to own the login. It registers its client and makes the PKCE verifier, which it keeps, and gives the page for the app to open. What's connected stays as it is until the second half.",
   "request": {
     "jsonrpc": "2.0",
     "id": 9902,

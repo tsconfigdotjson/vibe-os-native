@@ -1,0 +1,19 @@
+{
+  "description": "A host with no login, asked for its token, says so.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 9911,
+    "method": "services.token",
+    "params": {
+      "service": "linear"
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 9911,
+    "result": {
+      "service": "linear",
+      "state": "disconnected"
+    }
+  }
+}

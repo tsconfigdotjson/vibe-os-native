@@ -386,8 +386,10 @@ impl Core {
                 e.message
             );
         }
+        self.services_host_leaving(&p.host).await;
         self.store().remove_host(&p.host).map_err(store_error)?;
         lock(&self.links).remove(&p.host);
+        self.services_wake.notify_one();
         link.stop();
         self.sync_tunnel();
         crate::log!(

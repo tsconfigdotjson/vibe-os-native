@@ -15,7 +15,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::oneshot;
-use vibe_core::model::{LoginTool, ServiceAuth};
+use vibe_core::model::LoginTool;
 use vibe_core::paths::Layout;
 use vibe_core::rpc::Login;
 use vibe_core::units::GIB;
@@ -375,6 +375,7 @@ impl Golden {
             services: vec![fake.service()],
             store: self.logins.clone(),
             place: vibe_services::Place::Mac,
+            token_wait: std::time::Duration::from_millis(100),
         });
         config.label = "mac-mini".into();
         config.gh = self.gh.clone().into();
@@ -439,9 +440,9 @@ impl Golden {
         fake.set_tools(Vec::new());
         fake.accept_code("golden-code");
         let secret = Secret {
-            auth: ServiceAuth::Oauth,
             access: "FAKESECRET-golden-access".into(),
             refresh: Some("FAKESECRET-golden-refresh".into()),
+            obtained_at: None,
             expires_at: None,
             client_id: Some("forgotten-client".into()),
             token_endpoint: Some(format!("{}/token", fake.base)),
@@ -455,7 +456,7 @@ impl Golden {
             dir.join("services.json"),
             serde_json::json!({"linear": {
                 "state": "needs_reconnect",
-                "auth": "oauth",
+                "role": "owner",
                 "detail": "Linear refused the refresh (invalid_client)",
                 "detail_at": GOLDEN_NOW,
                 "client_stale": true,

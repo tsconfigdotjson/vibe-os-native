@@ -125,20 +125,25 @@ MCP's tools stand on: `projects.list`, `agents.list`, `agents.start`,
 call's. On the external host the Mac goes by `mac`, so its agents are
 `mac:<ref>` to outside callers.
 
-**Shared MCP services.** Each host holds its own login to each service, in
-a broker every `vibed` runs, so `services.list`, `services.connect`,
-`services.complete`, `services.disconnect` and `services.set` take a `host`, and
-for another host go over its link. `services.connect` has that host register its
-client and make the PKCE verifier, which it keeps, and answers with the page for
-the app's web authentication session to open; `services.complete` takes the URL
-that session ended on, and that host makes the exchange. Only a code that's
-useless without the verifier crosses the link, and no token ever does.
-`services.connect_key` takes no `host`, so a personal key is only ever entered on
-the host it's for. `services.audit` gives the last calls agents on that host made
-to its services, which stay there. If `services.set` can't keep a setting, nothing
-changes and it says so. `service.changed` says when a service's state, settings or
-tools change: `state` is its state and `message` its name, and a Linux host's
-comes onto the Mac's stream under its name. `ServiceInfo` holds nothing secret.
+**Shared MCP services.** There's one login per install for each service, held by
+one owning host, and a broker on every `vibed`. `services.overview` gives each
+service's one connection: who owns it, and how every host stands with it.
+`services.list` and `services.set` take a `host`, and go to it over its link, as
+each host has its own settings. `services.connect` goes to the host that's to own
+the login: it registers the client and makes the PKCE verifier, which it keeps, and
+answers with the page for the app's web authentication session to open.
+`services.complete` takes the URL that session ended on, and that host makes the
+exchange, which makes it the owner; any host that was is told to forget its login.
+Only a code that's useless without the verifier crosses the link for that, and the
+refresh token never does. `services.disconnect` forgets the login wherever it is.
+`services.token` and `services.follow` are how the Mac carries an access token from
+the owning host to each other host. They go only between `vibed`s and can't be
+called through the tunnel or the public endpoint, and the app never calls them.
+`services.audit` gives the last calls agents on that host made to its services,
+which stay there. If `services.set` can't keep a setting, nothing changes and it
+says so. `service.changed` says when a service's state, settings or tools change:
+`state` is its state and `message` its name, and a Linux host's comes onto the
+Mac's stream under its name. `ServiceInfo` holds nothing secret.
 In the examples, `http://services.example` is a stand-in for the service, on a
 port of its own; the Rust replays put its address in its place.
 

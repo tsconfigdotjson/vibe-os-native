@@ -1,5 +1,5 @@
 {
-  "description": "Forgets the host's login, there and, where it can, at the service. Its tools go from every agent there.",
+  "description": "Forgets the one login, at its owning host and, where it can, at the service, and every other host is told to forget its access token. Its tools go from every agent.",
   "request": {
     "jsonrpc": "2.0",
     "id": 9904,
@@ -20,9 +20,11 @@
       "enabled": true,
       "name": "linear",
       "read_only": true,
+      "role": "follower",
       "state": "disconnected",
       "title": "Linear",
-      "tools": 0
+      "tools": 0,
+      "wants_token": false
     }
   },
   "events": [
@@ -34,7 +36,7 @@
         "host": "local",
         "kind": "service.changed",
         "message": "linear",
-        "seq": 32,
+        "seq": 33,
         "state": "disconnected"
       }
     }

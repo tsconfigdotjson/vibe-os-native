@@ -1120,7 +1120,7 @@ async fn signing_in_on_the_mac_lands_at_the_owner_and_no_refresh_token_or_verifi
     let event = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             let e = events.recv().await.unwrap();
-            if e.kind == vibe_core::model::EventKind::ServiceChanged {
+            if e.kind == vibe_core::model::EventKind::ServiceChanged && e.host == "vps" {
                 return e;
             }
         }
@@ -1266,17 +1266,6 @@ async fn with_the_mac_gone_a_hosts_agent_lists_calls_and_survives_a_refresh() {
     );
 }
 
-/// How long something given by way of the Mac may take.
-async fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
-    for _ in 0..1000 {
-        if done() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("timed out waiting for {what}");
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn the_mac_as_a_follower_serves_its_agents_and_a_401_gets_it_a_new_token() {
     let fake = FakeService::start().await;
@@ -1393,7 +1382,10 @@ async fn disconnecting_forgets_it_everywhere_and_an_owner_away_is_told_when_its_
         p.logins.load("linear").unwrap().is_none()
     })
     .await;
-    assert_eq!(fake.revocations(), [refresh]);
+    wait_for("the service to be told", || {
+        fake.revocations() == [refresh.clone()]
+    })
+    .await;
     assert_eq!(p.host.service().state, ServiceState::Disconnected);
     assert_eq!(p.mac.service().state, ServiceState::Disconnected);
 }
@@ -1488,6 +1480,37 @@ async fn a_second_linux_host_gets_its_token_by_way_of_the_mac() {
     })
     .await;
     assert_eq!(fake.refreshes(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn removing_the_host_that_owns_it_leaves_it_to_be_signed_in_again() {
+    let fake = FakeService::start().await;
+    let p = pair(&fake).await;
+    p.connect_host().await;
+    p.mac_following().await;
+
+    let refresh = p.logins.load("linear").unwrap().unwrap().refresh.unwrap();
+    p.mac
+        .core
+        .remove_host(vibe_core::rpc::HostNameParams { host: "vps".into() })
+        .await
+        .unwrap();
+    // It runs on by itself, and keeps nothing of this install's.
+    assert_eq!(p.logins.load("linear").unwrap(), None);
+    assert_eq!(fake.revocations(), [refresh]);
+    wait_for("the Mac to forget", || {
+        p.mac_logins.load("linear").unwrap().is_none()
+    })
+    .await;
+    assert_eq!(p.mac.service().state, ServiceState::Disconnected);
+    let overview = rpc(&p.mac.core, "services.overview", json!({})).await;
+    let one = &overview["result"]["services"][0];
+    assert_eq!(one["owner"], LOCAL_HOST, "{overview}");
+    assert_eq!(one["signed_in"], false, "{overview}");
+
+    // Signing in here is all it takes.
+    p.mac.sign_in_here().await;
+    assert_eq!(p.mac.service().role, ServiceRole::Owner);
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -135,6 +135,9 @@ impl Core {
         p: ServiceCompleteParams,
     ) -> Result<ServiceInfo, ErrorObject> {
         let broker = self.broker()?;
+        // No tokens are given out until this is recorded: going by where the login
+        // was, that would take it straight back off the new owner.
+        let _settled = self.services_given.lock().await;
         let (host, info) = match p.host.as_deref().and_then(|h| self.link(h)) {
             Some(link) => (
                 link.name.clone(),
@@ -161,6 +164,7 @@ impl Core {
                 format!("VibeOS has no shared service {}", p.service),
             )
         })?;
+        let _settled = self.services_given.lock().await;
         match assigned.as_deref().and_then(|h| self.link(h)) {
             Some(link) => {
                 let params = ServiceParams {
@@ -183,7 +187,10 @@ impl Core {
                 broker.disconnect(&p.service).await?;
             }
         }
-        broker.release(&p.service);
+        // Only for whoever gives out tokens: a Linux host has no one to tell.
+        if !crate::core::lock(&self.links).is_empty() {
+            broker.release(&p.service);
+        }
         self.services_wake.notify_one();
         broker
             .info_of(&p.service)
@@ -202,6 +209,39 @@ impl Core {
         p: ServiceFollowParams,
     ) -> Result<ServiceInfo, ErrorObject> {
         self.broker()?.follow(p).await
+    }
+
+    /// A host is being removed from this install, and goes on running by itself:
+    /// it's to keep none of this install's logins or tokens, if it can be told.
+    pub(crate) async fn services_host_leaving(&self, host: &str) {
+        let (Some(broker), Some(link)) = (self.services.as_ref(), self.link(host)) else {
+            return;
+        };
+        let _settled = self.services_given.lock().await;
+        for service in broker.names() {
+            let owner = broker.assignment(&service).and_then(|(a, _)| a);
+            let told = if owner.as_deref() == Some(host) {
+                broker.release(&service);
+                let params = ServiceParams {
+                    host: None,
+                    service: service.clone(),
+                };
+                answer_soon(self.forward_typed::<ServicesDisconnect>(&link, &params)).await
+            } else {
+                let params = ServiceFollowParams {
+                    service: service.clone(),
+                    owner: None,
+                    state: ServiceState::Disconnected,
+                    access: None,
+                    expires_at: None,
+                    detail: None,
+                };
+                answer_soon(self.forward_typed::<ServicesFollow>(&link, &params)).await
+            };
+            if let Err(e) = told {
+                crate::log!("vibed: can't tell {host} to forget {service}: {}", e.message);
+            }
+        }
     }
 
     /// Each service's one connection, as the app shows it.
@@ -267,13 +307,17 @@ impl Core {
     }
 
     /// Who holds a login that's yet to be made: a linked Linux host, as it's
-    /// always on, the first by name that's up; if there's none, this one.
+    /// always on, the first by name that's up, or else just the first, as a link
+    /// that's flapping is no reason to put it somewhere for good. With no linked
+    /// host, this one.
     pub(crate) fn default_owner(&self) -> String {
-        let mut up: Vec<String> = self.up_links().iter().map(|l| l.name.clone()).collect();
-        up.sort();
-        up.into_iter()
-            .next()
-            .unwrap_or_else(|| LOCAL_HOST.to_owned())
+        let links = crate::core::lock(&self.links);
+        let mut hosts: Vec<(bool, &String)> =
+            links.values().map(|l| (!l.connected(), &l.name)).collect();
+        hosts.sort();
+        hosts
+            .first()
+            .map_or_else(|| LOCAL_HOST.to_owned(), |(_, name)| (*name).clone())
     }
 
     fn up_links(&self) -> Vec<Arc<Link>> {
@@ -345,9 +389,28 @@ impl Core {
         lists: &HashMap<String, ServiceList>,
         given: &mut GivenTokens,
     ) {
-        let Some((mut assigned, released)) = broker.assignment(service) else {
+        let Some((mut assigned, mut released)) = broker.assignment(service) else {
             return;
         };
+        let (no_links, owner_removed) = {
+            let all = crate::core::lock(&self.links);
+            let removed = assigned
+                .as_deref()
+                .is_some_and(|host| host != LOCAL_HOST && !all.contains_key(host));
+            (all.is_empty(), removed)
+        };
+        // Its owner's gone from this install, and its login with it.
+        if owner_removed {
+            broker.release(service);
+            assigned = None;
+            released = true;
+        }
+        // A Linux host has no links: it's only ever told, by the Mac, and what it
+        // was told stands. A Mac with none has nobody to give anything to, unless
+        // it's just lost the host it was following.
+        if no_links && !released {
+            return;
+        }
         let info_at = |host: &str| -> Option<ServiceInfo> {
             if host == LOCAL_HOST {
                 return broker.info_of(service);
@@ -456,7 +519,12 @@ impl Core {
                 continue;
             };
             match told {
-                Ok(_) => {
+                Ok(info) => {
+                    // It's had that token turned down already, as this hadn't
+                    // known. Now it does, so the owner can be told at once.
+                    if info.wants_token && !given.contains_key(&key) {
+                        self.services_wake.notify_one();
+                    }
                     given.insert(key, now_given);
                 }
                 Err(e) => {

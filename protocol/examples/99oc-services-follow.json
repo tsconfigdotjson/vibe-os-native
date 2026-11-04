@@ -1,0 +1,52 @@
+{
+  "description": "Makes this host a follower of a login another host owns, which the Mac sends. Any login it held is forgotten first, there and at the service. `access` and `expires_at` are the token to use, kept in this host's store. `state` is how the login stands at its owner: here it needs reconnecting, so agents are told that whatever the token. There's no way to send a refresh token this way.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 9912,
+    "method": "services.follow",
+    "params": {
+      "service": "linear",
+      "owner": "vps-1",
+      "state": "needs_reconnect",
+      "access": "FAKESECRET-a-token",
+      "expires_at": 1793448000,
+      "detail": "Linear refused the refresh (invalid_grant)"
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 9912,
+    "result": {
+      "access_until": "2026-10-31T12:00:00Z",
+      "auto_allow": true,
+      "denied_tools": [
+        "delete_issue"
+      ],
+      "detail": "Linear refused the refresh (invalid_grant)",
+      "detail_at": "2026-10-30T12:00:00Z",
+      "enabled": true,
+      "name": "linear",
+      "owner": "vps-1",
+      "read_only": true,
+      "role": "follower",
+      "state": "needs_reconnect",
+      "title": "Linear",
+      "tools": 0,
+      "wants_token": false
+    }
+  },
+  "events": [
+    {
+      "jsonrpc": "2.0",
+      "method": "events.event",
+      "params": {
+        "at": "2026-10-30T12:00:00Z",
+        "host": "local",
+        "kind": "service.changed",
+        "message": "linear",
+        "seq": 37,
+        "state": "needs_reconnect"
+      }
+    }
+  ]
+}

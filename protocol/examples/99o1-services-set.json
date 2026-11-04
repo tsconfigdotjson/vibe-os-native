@@ -19,7 +19,6 @@
     "jsonrpc": "2.0",
     "id": 9901,
     "result": {
-      "auth": "oauth",
       "auto_allow": true,
       "denied_tools": [
         "delete_issue"
@@ -29,9 +28,11 @@
       "enabled": true,
       "name": "linear",
       "read_only": true,
+      "role": "owner",
       "state": "needs_reconnect",
       "title": "Linear",
-      "tools": 0
+      "tools": 0,
+      "wants_token": false
     }
   },
   "events": [
