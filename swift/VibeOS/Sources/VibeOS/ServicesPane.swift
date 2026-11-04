@@ -4,36 +4,24 @@ import SwiftUI
 import VibeMenu
 import VibeRPC
 
-/// Settings → Services (PRD: Shared MCP services): one row per host for each
-/// service, as each host holds a login of its own, so its agents keep working
-/// whatever's happening to any other host, this Mac included. This app only ever
-/// does the browser's part: the host makes the verifier and the exchange, and
-/// no token comes here, even for this Mac's own.
+/// Settings → Services (PRD: Shared MCP services): one login per install for each
+/// service, on the host that owns it, with a row saying how every host stands.
+/// This app only ever does the browser's part: the owner makes the verifier and
+/// the exchange, and its refresh token never comes here, even when the owner's a
+/// Linux host and this Mac uses the access token it's given.
 struct ServicesPane: View {
     @ObservedObject var model: MenuModel
-    /// What each host last said, by host; `failures` why one didn't answer.
-    @State private var lists: [String: [ServiceInfo]] = [:]
-    @State private var failures: [String: String] = [:]
-
-    /// The services known, from whichever host answered first: they're the
-    /// same set on all.
-    private var services: [ServiceInfo] {
-        for host in model.hosts {
-            if let list = lists[host.name], !list.isEmpty { return list }
-        }
-        return []
-    }
+    @State private var services: [ServiceOverview] = []
+    @State private var failure: String?
 
     var body: some View {
         Form {
             if services.isEmpty {
                 Section {
-                    if failures.isEmpty {
-                        Working(text: "Asking each host…")
+                    if let failure {
+                        ErrorText(error: failure)
                     } else {
-                        ForEach(failures.sorted(by: { $0.key < $1.key }), id: \.key) { host, why in
-                            ErrorText(error: "\(host): \(why)")
-                        }
+                        Working(text: "Asking each host…")
                     }
                 }
             }
@@ -53,11 +41,10 @@ struct ServicesPane: View {
             }
             ForEach(services, id: \.name) { service in
                 Section {
-                    ForEach(model.hosts, id: \.name) { host in
+                    ServiceConnectionRow(model: model, service: service, changed: { await load() })
+                    ForEach(service.hosts, id: \.host) { host in
                         ServiceHostRow(
-                            model: model, host: host, service: service.name,
-                            info: lists[host.name]?.first { $0.name == service.name },
-                            failure: failures[host.name],
+                            model: model, host: host, service: service.name, title: service.title,
                             changed: { await load() })
                     }
                 } header: {
@@ -71,7 +58,7 @@ struct ServicesPane: View {
         .navigationTitle("Services")
         // What each host says now: a refresh or a lost login happens out of
         // sight, and a host's link comes and goes.
-        .task(id: model.hosts.map(\.name)) {
+        .task {
             repeat {
                 await model.refreshToolbox()
                 await load()
@@ -80,123 +67,95 @@ struct ServicesPane: View {
         }
     }
 
-    private func footer(_ service: ServiceInfo) -> String {
-        "Every agent can use \(service.title), unless its profile has shared services off. Each host signs in "
-            + "for itself, so its agents go on working while this Mac is away; its token stays on that host. Calls "
-            + "that write go through each agent's own permission prompts, and any agent in bypass mode, or that "
-            + "doesn't prompt, can act in \(service.title) as you."
+    private func footer(_ service: ServiceOverview) -> String {
+        "Every agent can use \(service.title), unless its profile has shared services off. There's one login, on the "
+            + "host that owns it, and only that host can renew it. Other hosts use a short-lived access token it gives "
+            + "them by way of this Mac, so with this Mac away they go on until theirs runs out. Calls that write go "
+            + "through each agent's own permission prompts, and any agent in bypass mode, or that doesn't prompt, can "
+            + "act in \(service.title) as you."
     }
 
-    /// Asks every host whose link is up, all at once: one that's slow to answer
-    /// doesn't hold up what the rest say.
     private func load() async {
-        let model = self.model
-        await withTaskGroup(of: (String, [ServiceInfo]?, String?).self) { group in
-            for host in model.hosts where host.link != .down {
-                let name = host.name
-                group.addTask { @MainActor in
-                    do {
-                        let list = try await model.call(ServicesList.self, HostParams(host: name), timeout: 20)
-                        return (name, list.services, nil)
-                    } catch {
-                        return (name, nil, serviceFailure(error, host: name))
-                    }
-                }
-            }
-            for await (name, services, failure) in group {
-                if let services { lists[name] = services }
-                failures[name] = failure
-            }
-        }
-        for host in model.hosts where host.link == .down {
-            failures[host.name] = sentence(host.detail ?? "its link is down; it reconnects on its own")
+        do {
+            services = try await model.call(ServicesOverview.self, NoParams(), timeout: 20).services
+            failure = nil
+        } catch {
+            failure = describe(error)
         }
     }
 }
 
-/// One host's standing with one service, and what can be done about it.
-private struct ServiceHostRow: View {
+/// The name a host goes by here.
+@MainActor
+private func hostLabel(_ host: String, model: MenuModel) -> String {
+    guard host == "local" else { return host }
+    let label = model.hosts.first { $0.link == .local }?.label ?? "This Mac"
+    return "\(label) (this Mac)"
+}
+
+/// The one connection: how it stands, who owns it, and signing in.
+private struct ServiceConnectionRow: View {
     @ObservedObject var model: MenuModel
-    let host: HostInfo
-    let service: String
-    let info: ServiceInfo?
-    let failure: String?
+    let service: ServiceOverview
     let changed: () async -> Void
 
     @State private var working: String?
     @State private var error: String?
-    @State private var expanded = false
-    @State private var askingForKey = false
-    @State private var showingCalls = false
     @StateObject private var signIn = WebSignIn()
 
-    private var local: Bool { host.link == .local }
-    private var reachable: Bool { host.link != .down }
-    private var hostLabel: String { local ? "\(host.label) (this Mac)" : host.name }
-
-    var body: some View {
-        DisclosureGroup(isExpanded: $expanded) {
-            if let info { settings(info).padding(.leading, 36) }
-        } label: {
-            summary
-        }
-        .sheet(isPresented: $askingForKey) {
-            ServiceKeySheet(model: model, service: service, title: info?.title ?? service) {
-                await changed()
-            }
-        }
+    private var status: ServiceConnection { ServiceConnection(service) }
+    private var ownerLabel: String { hostLabel(service.owner, model: model) }
+    /// Where the login could go instead: any host that's answering.
+    private var elsewhere: [String] {
+        service.hosts.filter { $0.reachable && $0.host != service.owner }.map(\.host)
     }
 
-    private var summary: some View {
-        let status = info.map(ServiceSummary.init)
-        return HStack(spacing: 10) {
-            IconTile(symbol: local ? "laptopcomputer" : "server.rack", color: local ? .blue : .indigo, size: 26)
+    var body: some View {
+        HStack(spacing: 10) {
+            IconTile(symbol: "person.badge.key.fill", color: .purple, size: 26)
             VStack(alignment: .leading, spacing: 2) {
-                Text(hostLabel)
                 HStack(spacing: 4) {
-                    if let status {
-                        Circle().fill(color(status.tone)).frame(width: 6, height: 6)
-                        Text(status.status)
-                        if let note = status.note { Text("· \(note)") }
-                    } else if let failure, !reachable || info == nil {
-                        Text(failure).lineLimit(2)
-                    }
+                    Circle().fill(toneColor(status.tone)).frame(width: 6, height: 6)
+                    Text(status.status)
                 }
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                if let detail = status?.detail {
+                Text(service.signedIn ? "Login on \(ownerLabel)" : "Signing in keeps the login on \(ownerLabel)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if let detail = status.detail {
                     Text(detail)
                         .font(.caption)
-                        .foregroundStyle(status?.tone == .needsYou ? Palette.trouble : Color.secondary)
+                        .foregroundStyle(status.tone == .needsYou ? Palette.trouble : Color.secondary)
                         .fixedSize(horizontal: false, vertical: true)
-                }
-                if !reachable && info != nil, let failure {
-                    Text("Unavailable: \(failure)").font(.caption).foregroundStyle(.secondary)
                 }
                 ErrorText(error: error)
             }
             Spacer(minLength: 0)
             if let working {
                 Working(text: working)
-            } else if reachable, let status {
+            } else {
                 if let wanted = status.signIn {
-                    Button(wanted == .reconnect ? "Reconnect" : "Connect") { Task { await connect() } }
-                        .accessibilityLabel(
-                            "\(wanted == .reconnect ? "Reconnect" : "Connect") \(info?.title ?? service) on \(hostLabel)")
+                    Button(wanted == .reconnect ? "Reconnect" : "Connect") {
+                        Task { await connect(on: service.owner) }
+                    }
+                    .accessibilityLabel("\(wanted == .reconnect ? "Reconnect" : "Connect") \(service.title)")
                 }
-                actions(status)
+                actions
             }
         }
         .accessibilityElement(children: .contain)
     }
 
-    private func actions(_ status: ServiceSummary) -> some View {
+    private var actions: some View {
         Menu {
             if status.signIn == nil {
-                Button("Reconnect") { Task { await connect() } }
+                Button("Reconnect") { Task { await connect(on: service.owner) } }
             }
-            if local {
-                Button("Use a Personal API Key…") { askingForKey = true }
+            if !elsewhere.isEmpty {
+                Menu(service.signedIn ? "Move Login To" : "Keep Login On") {
+                    ForEach(elsewhere, id: \.self) { host in
+                        Button(hostLabel(host, model: model)) { Task { await move(to: host) } }
+                    }
+                }
             }
             if status.canDisconnect {
                 Divider()
@@ -209,8 +168,122 @@ private struct ServiceHostRow: View {
         .buttonStyle(.borderless)
         .menuIndicator(.hidden)
         .fixedSize()
-        .help("More for \(hostLabel)")
-        .accessibilityLabel("Actions for \(hostLabel)")
+        .help("More for \(service.title)")
+        .accessibilityLabel("Actions for \(service.title)")
+    }
+
+    private func move(to host: String) async {
+        if service.signedIn {
+            guard
+                confirm(
+                    "Move \(service.title)'s login to \(hostLabel(host, model: model))?",
+                    detail: "You'll sign in again in your browser. The login on \(ownerLabel) is then forgotten, and "
+                        + "every other host uses the new one. That works even if \(ownerLabel) is away: it's told "
+                        + "when it's next reachable.",
+                    action: "Sign In")
+            else { return }
+        }
+        await connect(on: host)
+    }
+
+    /// Connect or Reconnect: `host` says where to sign in, this app shows it, and
+    /// what the page ends on goes back to `host`, which is then the owner.
+    /// Whatever's connected now stays until that works.
+    private func connect(on host: String) async {
+        working = "Signing in…"
+        error = nil
+        defer { working = nil }
+        do {
+            let page = try await model.call(
+                ServicesConnect.self, ServiceParams(host: host, service: service.name), timeout: 90)
+            guard let url = URL(string: page.url) else {
+                error = "\(hostLabel(host, model: model)) gave a page that can't be opened"
+                return
+            }
+            let back = try await signIn.run(url: url, scheme: page.callbackScheme)
+            _ = try await model.call(
+                ServicesComplete.self,
+                ServiceCompleteParams(host: host, service: service.name, callbackUrl: back.absoluteString),
+                timeout: 90)
+            await changed()
+        } catch let e as ASWebAuthenticationSessionError where e.code == .canceledLogin {
+            // Given up on: nothing's changed, and that's nothing to report.
+        } catch {
+            self.error = describe(error)
+        }
+    }
+
+    private func disconnect() async {
+        guard
+            confirm(
+                "Disconnect \(service.title)?",
+                detail: "Every host's agents lose its tools until it's connected again.",
+                action: "Disconnect")
+        else { return }
+        working = "Disconnecting…"
+        defer { working = nil }
+        do {
+            _ = try await model.call(ServicesDisconnect.self, ServiceParams(service: service.name), timeout: 60)
+            error = nil
+            await changed()
+        } catch {
+            self.error = describe(error)
+        }
+    }
+}
+
+/// One host's standing with a service, and its own settings for it.
+private struct ServiceHostRow: View {
+    @ObservedObject var model: MenuModel
+    let host: ServiceHost
+    let service: String
+    let title: String
+    let changed: () async -> Void
+
+    @State private var error: String?
+    @State private var expanded = false
+    @State private var showingCalls = false
+
+    private var local: Bool { host.host == "local" }
+    private var label: String { hostLabel(host.host, model: model) }
+
+    var body: some View {
+        DisclosureGroup(isExpanded: $expanded) {
+            if let info = host.service { settings(info).padding(.leading, 36) }
+        } label: {
+            summary
+        }
+    }
+
+    private var summary: some View {
+        let status = host.service.map(ServiceSummary.init)
+        return HStack(spacing: 10) {
+            IconTile(symbol: local ? "laptopcomputer" : "server.rack", color: local ? .blue : .indigo, size: 26)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(label)
+                HStack(spacing: 4) {
+                    if let status {
+                        Circle().fill(toneColor(status.tone)).frame(width: 6, height: 6)
+                        Text(status.status)
+                        if let note = status.note { Text("· \(note)") }
+                    } else {
+                        Text("Not answering. If its link is up, it may need updating: Settings → Hosts → Update vibed.")
+                            .lineLimit(2)
+                    }
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                if let detail = status?.detail, host.service?.role == .follower {
+                    Text(detail)
+                        .font(.caption)
+                        .foregroundStyle(status?.tone == .needsYou ? Palette.trouble : Color.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                ErrorText(error: error)
+            }
+            Spacer(minLength: 0)
+        }
+        .accessibilityElement(children: .contain)
     }
 
     private func settings(_ info: ServiceInfo) -> some View {
@@ -218,7 +291,7 @@ private struct ServiceHostRow: View {
             Toggle(
                 "On for agents here",
                 isOn: Binding(get: { info.enabled }, set: { on in Task { await change { $0.enabled = on } } }))
-            .help("Off, no agent on \(hostLabel) sees \(info.title)'s tools or can call them")
+            .help("Off, no agent on \(label) sees \(info.title)'s tools or can call them")
             Toggle(
                 "Read-only",
                 isOn: Binding(get: { info.readOnly }, set: { on in Task { await change { $0.readOnly = on } } }))
@@ -239,83 +312,17 @@ private struct ServiceHostRow: View {
             }
             LabeledContent("Recent calls") {
                 Button("Show…") { showingCalls = true }
-                    .help("The last calls agents on \(hostLabel) made, with no arguments or tokens")
+                    .help("The last calls agents on \(label) made, with no arguments or tokens")
             }
             .sheet(isPresented: $showingCalls) {
-                ServiceCallsSheet(model: model, host: host.name, hostLabel: hostLabel)
+                ServiceCallsSheet(model: model, host: host.host, hostLabel: label)
             }
-            if !local {
-                LabeledContent("With this Mac away") {
-                    HStack(spacing: 8) {
-                        Text(setKeyCommand(service: service)).font(.callout.monospaced()).textSelection(.enabled)
-                        CopyButton(title: "Copy", text: setKeyCommand(service: service))
-                            .labelStyle(.iconOnly)
-                            .buttonStyle(.borderless)
-                    }
-                }
-                .help("In a shell on \(host.name): connects it with a personal API key, which stays there")
-            }
-        }
-    }
-
-    private func color(_ tone: ServiceSummary.Tone) -> Color {
-        switch tone {
-        case .good: Palette.signal
-        case .working: Palette.attention
-        case .needsYou: Palette.trouble
-        case .off: Palette.rest
-        }
-    }
-
-    /// Connect or Reconnect: the host says where to sign in, this app shows it,
-    /// and what the page ends on goes back to the host. Whatever's connected
-    /// now stays until that works.
-    private func connect() async {
-        working = "Signing in…"
-        error = nil
-        defer { working = nil }
-        do {
-            let page = try await model.call(
-                ServicesConnect.self, ServiceParams(host: host.name, service: service), timeout: 90)
-            guard let url = URL(string: page.url) else {
-                error = "\(hostLabel) gave a page that can't be opened"
-                return
-            }
-            let back = try await signIn.run(url: url, scheme: page.callbackScheme)
-            _ = try await model.call(
-                ServicesComplete.self,
-                ServiceCompleteParams(host: host.name, service: service, callbackUrl: back.absoluteString),
-                timeout: 90)
-            await changed()
-        } catch let e as ASWebAuthenticationSessionError where e.code == .canceledLogin {
-            // Given up on: nothing's changed, and that's nothing to report.
-        } catch {
-            self.error = describe(error)
-        }
-    }
-
-    private func disconnect() async {
-        guard
-            confirm(
-                "Disconnect \(info?.title ?? service) on \(hostLabel)?",
-                detail: "Agents there lose its tools until it's connected again. Other hosts keep theirs.",
-                action: "Disconnect")
-        else { return }
-        working = "Disconnecting…"
-        defer { working = nil }
-        do {
-            _ = try await model.call(
-                ServicesDisconnect.self, ServiceParams(host: host.name, service: service), timeout: 60)
-            error = nil
-            await changed()
-        } catch {
-            self.error = describe(error)
         }
     }
 
     @discardableResult
     private func change(_ edit: (inout ServiceSetParams) -> Void) async -> Bool {
-        var params = ServiceSetParams(host: host.name, service: service)
+        var params = ServiceSetParams(host: host.host, service: service)
         edit(&params)
         do {
             _ = try await model.call(ServicesSet.self, params, timeout: 20)
@@ -326,6 +333,15 @@ private struct ServiceHostRow: View {
             self.error = describe(error)
             return false
         }
+    }
+}
+
+private func toneColor(_ tone: ServiceTone) -> Color {
+    switch tone {
+    case .good: Palette.signal
+    case .working: Palette.attention
+    case .needsYou: Palette.trouble
+    case .off: Palette.rest
     }
 }
 
@@ -371,56 +387,6 @@ private struct ServiceCallsSheet: View {
             } catch {
                 self.error = serviceFailure(error, host: host)
             }
-        }
-    }
-}
-
-/// A personal API key for this Mac's own login. There's no such thing for a
-/// Linux host from here: its key goes in on that host, so it never crosses the
-/// link.
-private struct ServiceKeySheet: View {
-    @ObservedObject var model: MenuModel
-    let service: String
-    let title: String
-    let done: () async -> Void
-    @Environment(\.dismiss) private var dismiss
-    @State private var key = ""
-    @State private var working = false
-    @State private var error: String?
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("Connect \(title) with an API Key").font(.headline)
-            Text("It's checked with \(title), then kept in this Mac's Keychain. It's used instead of signing in.")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-            SecureField("Personal API key", text: $key)
-                .textFieldStyle(.roundedBorder)
-                .frame(minWidth: 340)
-            ErrorText(error: error)
-            HStack {
-                Spacer()
-                Button("Cancel", role: .cancel) { dismiss() }
-                    .keyboardShortcut(.cancelAction)
-                Button("Connect") { Task { await connect() } }
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || working)
-            }
-        }
-        .padding(20)
-    }
-
-    private func connect() async {
-        working = true
-        defer { working = false }
-        do {
-            _ = try await model.call(ServicesConnectKey.self, ServiceKeyParams(service: service, key: key), timeout: 90)
-            key = ""
-            await done()
-            dismiss()
-        } catch {
-            self.error = describe(error)
         }
     }
 }

@@ -66,7 +66,9 @@ public enum VibeRPC {
         ServicesList.name,
         ServicesConnect.name,
         ServicesComplete.name,
-        ServicesConnectKey.name,
+        ServicesToken.name,
+        ServicesFollow.name,
+        ServicesOverview.name,
         ServicesDisconnect.name,
         ServicesSet.name,
         ServicesAudit.name,
@@ -437,19 +439,23 @@ public enum EventKind: String, Codable, CaseIterable, Hashable, Sendable {
     case serviceChanged = "service.changed"
 }
 
-/// Where a shared service stands, on the host that holds its login.
+/// Where a shared service stands.
 public enum ServiceState: String, Codable, CaseIterable, Hashable, Sendable {
     case disconnected, connected, refreshing
+    /// A follower whose token is no good, and whose owner can't be reached.
+    case ownerUnreachable = "owner_unreachable"
     /// A refresh was refused: only connecting again helps.
     case needsReconnect = "needs_reconnect"
-    /// The service turned down a freshly refreshed token, or a key.
+    /// The service turned down a freshly refreshed token.
     case revoked
 }
 
-/// How a shared service was connected.
-public enum ServiceAuth: String, Codable, CaseIterable, Hashable, Sendable {
-    case oauth
-    case apiKey = "api_key"
+/// A host's part in a service's one login.
+public enum ServiceRole: String, Codable, CaseIterable, Hashable, Sendable {
+    /// It holds the refresh token, and it alone ever refreshes.
+    case owner
+    /// It holds only an access token, given to it by way of the Mac.
+    case follower
 }
 
 /// How vibed reaches a host: `local` for itself, else whether its link is up.
@@ -1973,9 +1979,7 @@ public struct DoctorFixParams: Codable, Hashable, Sendable {
 
 // MARK: Shared MCP services
 
-/// The supported services, and how each stands on the host named. A host holds
-/// its own logins, so these go to it over its link, and only ever say how it
-/// stands; no token crosses.
+/// The supported services, and how each stands on the host named.
 public enum ServicesList: RPCMethod {
     public typealias Params = HostParams
     public typealias Result = ServiceList
@@ -1999,12 +2003,26 @@ public enum ServicesComplete: RPCMethod {
     public static let name = "services.complete"
 }
 
-/// Connects this host with a personal API key. It takes no `host`: a key never
-/// crosses a link.
-public enum ServicesConnectKey: RPCMethod {
-    public typealias Params = ServiceKeyParams
+/// The owner's access token, which the Mac asks for on the other hosts' behalf.
+/// The app never calls this.
+public enum ServicesToken: RPCMethod {
+    public typealias Params = ServiceTokenParams
+    public typealias Result = ServiceAccess
+    public static let name = "services.token"
+}
+
+/// Makes a host a follower of a login. The app never calls this.
+public enum ServicesFollow: RPCMethod {
+    public typealias Params = ServiceFollowParams
     public typealias Result = ServiceInfo
-    public static let name = "services.connect_key"
+    public static let name = "services.follow"
+}
+
+/// Each service's one connection: who owns it, and how every host stands with it.
+public enum ServicesOverview: RPCMethod {
+    public typealias Params = NoParams
+    public typealias Result = ServiceOverviewList
+    public static let name = "services.overview"
 }
 
 public enum ServicesDisconnect: RPCMethod {
@@ -2031,7 +2049,14 @@ public struct ServiceInfo: Codable, Hashable, Sendable {
     public var name: String
     public var title: String
     public var state: ServiceState
-    public var auth: ServiceAuth?
+    /// This host's part in the login.
+    public var role: ServiceRole
+    /// Who owns the login, for people, if it's another host.
+    public var owner: String?
+    /// When this host's access token runs out, if it has one and that's known.
+    public var accessUntil: String?
+    /// A follower whose token was refused or ran out, waiting to be given another.
+    public var wantsToken: Bool?
     /// Off, every agent's calls are refused: the kill switch.
     public var enabled: Bool
     public var readOnly: Bool
@@ -2046,14 +2071,17 @@ public struct ServiceInfo: Codable, Hashable, Sendable {
     public var detailAt: String?
 
     public init(
-        name: String, title: String, state: ServiceState, auth: ServiceAuth? = nil, enabled: Bool = true,
-        readOnly: Bool = false, deniedTools: [String] = [], autoAllow: Bool = false, tools: Int = 0,
+        name: String, title: String, state: ServiceState, role: ServiceRole = .follower, owner: String? = nil,
+        accessUntil: String? = nil, wantsToken: Bool? = nil, enabled: Bool = true, readOnly: Bool = false, deniedTools: [String] = [], autoAllow: Bool = false, tools: Int = 0,
         detail: String? = nil, detailAt: String? = nil
     ) {
         self.name = name
         self.title = title
         self.state = state
-        self.auth = auth
+        self.role = role
+        self.owner = owner
+        self.accessUntil = accessUntil
+        self.wantsToken = wantsToken
         self.enabled = enabled
         self.readOnly = readOnly
         self.deniedTools = deniedTools
@@ -2064,7 +2092,10 @@ public struct ServiceInfo: Codable, Hashable, Sendable {
     }
 
     public enum CodingKeys: String, CodingKey, CaseIterable {
-        case name, title, state, auth, enabled
+        case name, title, state, role, owner
+        case accessUntil = "access_until"
+        case wantsToken = "wants_token"
+        case enabled
         case readOnly = "read_only"
         case deniedTools = "denied_tools"
         case autoAllow = "auto_allow"
@@ -2125,17 +2156,106 @@ public struct ServiceCompleteParams: Codable, Hashable, Sendable {
     }
 }
 
-public struct ServiceKeyParams: Codable, Hashable, Sendable {
+public struct ServiceTokenParams: Codable, Hashable, Sendable {
     public var service: String
-    public var key: String
+    public var rejected: String?
 
-    public init(service: String, key: String) {
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case service, rejected
+    }
+}
+
+public struct ServiceAccess: Codable, Hashable, Sendable {
+    public var service: String
+    public var state: ServiceState
+    public var access: String?
+    public var expiresAt: Int?
+    public var detail: String?
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case service, state, access
+        case expiresAt = "expires_at"
+        case detail
+    }
+}
+
+public struct ServiceFollowParams: Codable, Hashable, Sendable {
+    public var service: String
+    public var owner: String?
+    public var state: ServiceState
+    public var access: String?
+    public var expiresAt: Int?
+    public var detail: String?
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case service, owner, state, access
+        case expiresAt = "expires_at"
+        case detail
+    }
+}
+
+/// How one host stands with a service.
+public struct ServiceHost: Codable, Hashable, Sendable {
+    /// The host's name; `local` is this Mac.
+    public var host: String
+    /// Whether it answered just now.
+    public var reachable: Bool
+    /// What it says, if it answered.
+    public var service: ServiceInfo?
+
+    public init(host: String, reachable: Bool, service: ServiceInfo? = nil) {
+        self.host = host
+        self.reachable = reachable
         self.service = service
-        self.key = key
     }
 
     public enum CodingKeys: String, CodingKey, CaseIterable {
-        case service, key
+        case host, reachable, service
+    }
+}
+
+/// A service's one connection, as this install sees it.
+public struct ServiceOverview: Codable, Hashable, Sendable {
+    public var name: String
+    public var title: String
+    /// How the login stands, as its owner last said.
+    public var state: ServiceState
+    /// The host that holds the login, or would at the next sign-in.
+    public var owner: String
+    /// Whether it holds it yet.
+    public var signedIn: Bool
+    public var detail: String?
+    public var detailAt: String?
+    public var hosts: [ServiceHost]
+
+    public init(
+        name: String, title: String, state: ServiceState, owner: String, signedIn: Bool, detail: String? = nil,
+        detailAt: String? = nil, hosts: [ServiceHost] = []
+    ) {
+        self.name = name
+        self.title = title
+        self.state = state
+        self.owner = owner
+        self.signedIn = signedIn
+        self.detail = detail
+        self.detailAt = detailAt
+        self.hosts = hosts
+    }
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case name, title, state, owner
+        case signedIn = "signed_in"
+        case detail
+        case detailAt = "detail_at"
+        case hosts
+    }
+}
+
+public struct ServiceOverviewList: Codable, Hashable, Sendable {
+    public var services: [ServiceOverview]
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case services
     }
 }
 

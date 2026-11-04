@@ -5,47 +5,71 @@ import Testing
 import VibeRPC
 
 private func service(
-    _ state: ServiceState, auth: ServiceAuth? = .oauth, enabled: Bool = true, readOnly: Bool = false,
-    denied: [String] = [], tools: Int = 3, detail: String? = nil, at: String? = nil
+    _ state: ServiceState, role: ServiceRole = .follower, owner: String? = nil, until: String? = nil,
+    enabled: Bool = true, readOnly: Bool = false, denied: [String] = [], tools: Int = 3, detail: String? = nil,
+    at: String? = nil
 ) -> ServiceInfo {
     ServiceInfo(
-        name: "linear", title: "Linear", state: state, auth: auth, enabled: enabled, readOnly: readOnly,
-        deniedTools: denied, tools: tools, detail: detail, detailAt: at)
+        name: "linear", title: "Linear", state: state, role: role, owner: owner, accessUntil: until, enabled: enabled,
+        readOnly: readOnly, deniedTools: denied, tools: tools, detail: detail, detailAt: at)
+}
+
+private func connection(_ state: ServiceState, signedIn: Bool = true, detail: String? = nil) -> ServiceConnection {
+    ServiceConnection(
+        ServiceOverview(name: "linear", title: "Linear", state: state, owner: "vps", signedIn: signedIn, detail: detail))
 }
 
 struct ServicesTests {
-    @Test func everyStateSaysWhereItStandsAndWhatToDo() {
-        let off = ServiceSummary(service(.disconnected, auth: nil, tools: 0))
+    @Test func theOneConnectionSaysWhereItStandsAndWhatToDo() {
+        let off = connection(.disconnected, signedIn: false)
         #expect(off.status == "Not connected")
         #expect(off.tone == .off)
         #expect(off.signIn == .connect)
         #expect(!off.canDisconnect)
-        #expect(off.note == nil)
 
-        let on = ServiceSummary(service(.connected))
+        let on = connection(.connected)
         #expect(on.status == "Connected")
         #expect(on.tone == .good)
         #expect(on.signIn == nil)
         #expect(on.canDisconnect)
-        #expect(on.note == "3 tools")
 
-        #expect(ServiceSummary(service(.connected, auth: .apiKey)).status == "Connected with an API key")
-
-        let refreshing = ServiceSummary(service(.refreshing))
-        #expect(refreshing.tone == .working)
-        #expect(refreshing.signIn == nil)
+        #expect(connection(.refreshing).tone == .working)
+        #expect(connection(.refreshing).signIn == nil)
+        // It's the owner that's away: signing in again wouldn't help, unless it's
+        // moved, which is a choice of its own.
+        #expect(connection(.ownerUnreachable).signIn == nil)
+        #expect(connection(.ownerUnreachable).canDisconnect)
 
         for state in [ServiceState.needsReconnect, .revoked] {
-            let lost = ServiceSummary(service(state))
+            let lost = connection(state)
             #expect(lost.tone == .needsYou)
             #expect(lost.signIn == .reconnect)
             #expect(lost.canDisconnect)
         }
     }
 
+    @Test func eachHostSaysWhatItHas() {
+        #expect(ServiceSummary(service(.connected, role: .owner)).status == "Holds the login")
+        #expect(ServiceSummary(service(.connected, owner: "vps")).status == "Has access")
+        let until = "2026-11-05T00:00:00Z"
+        #expect(ServiceSummary(service(.connected, owner: "vps", until: until)).status.hasPrefix("Has access until "))
+        #expect(ServiceSummary(service(.connected, role: .owner, until: until)).status.hasPrefix("Holds the login · access until "))
+        let away = ServiceSummary(service(.ownerUnreachable, owner: "vps"))
+        #expect(away.status == "No current access: can't reach vps")
+        #expect(away.tone == .needsYou)
+        #expect(ServiceSummary(service(.disconnected, tools: 0)).status == "No access")
+        #expect(ServiceSummary(service(.disconnected, tools: 0)).note == nil)
+        #expect(ServiceSummary(service(.connected)).note == "3 tools")
+    }
+
+    @Test func aTimeThatCantBeReadIsShownAsItWas() {
+        #expect(serviceTime("soon") == "soon")
+        #expect(serviceTime("2026-11-04T00:00:00Z") != "2026-11-04T00:00:00Z")
+    }
+
     @Test func theLastErrorSaysWhen() {
         let lost = ServiceSummary(service(.needsReconnect, detail: "It refused", at: "2026-11-04T00:00:00Z"))
-        #expect(lost.detail == "It refused (2026-11-04T00:00:00Z)")
+        #expect(lost.detail == "It refused (\(serviceTime("2026-11-04T00:00:00Z")))")
         #expect(ServiceSummary(service(.connected)).detail == nil)
     }
 
@@ -79,10 +103,6 @@ struct ServicesTests {
         #expect(!servicesNeedRebuild(try toolbox(#""base":2,"newest_base":2"#)))
         let old = try toolbox(#""template":1,"home":1,"base":2,"newest_base":3"#)
         #expect(ToolboxSummary(old).notes.contains { $0.contains("no shared services") })
-    }
-
-    @Test func aKeyIsSetOnTheHostItsFor() {
-        #expect(setKeyCommand(service: "linear") == "vibe service set-key linear")
     }
 
     @Test func aProfileHasThemOnUnlessItSaysOtherwise() throws {
