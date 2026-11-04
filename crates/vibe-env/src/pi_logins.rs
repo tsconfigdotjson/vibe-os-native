@@ -389,8 +389,9 @@ fn strings_of(value: &Value, out: &mut Vec<String>) {
 /// Copilot token's `proxy-ep` for where to send every request, finding it with
 /// the unanchored `/proxy-ep=([^;]+)/` (`github-copilot.ts`). So everything that
 /// expression could find, in any string of the login, has to be a host of
-/// Copilot's, whole, or of the enterprise the owner's own login says it's with,
-/// `enterprise`, which a refresh can't change.
+/// Copilot's, whole, or under `enterprise`, the domain a login the owner signed in
+/// to from the toolbox says it's with ([`owners_enterprise`]). No agent has a say in
+/// that: its first sign-in can't name one, and a refresh can't change one.
 fn leads_elsewhere(entry: &Value, enterprise: Option<&str>) -> bool {
     let mut texts = Vec::new();
     strings_of(entry, &mut texts);
@@ -411,6 +412,45 @@ fn copilot_host(host: &str) -> bool {
                 .chars()
                 .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '-')
     })
+}
+
+/// The enterprise to trust for a refresh of `name`: what its login in the store says,
+/// only if it's the owner's own login and not one an agent offered, and only if it's
+/// a domain with a dot in it, so it can't be `com` and take in all of `evil.com`.
+fn owners_enterprise<'a>(
+    name: &str,
+    store: &'a Map<String, Value>,
+    offered: &BTreeMap<String, String>,
+) -> Option<&'a str> {
+    if offered.contains_key(name) {
+        return None;
+    }
+    store
+        .get(name)?
+        .get("enterpriseUrl")?
+        .as_str()
+        .filter(|domain| {
+            domain.split('.').filter(|label| !label.is_empty()).count() >= 2
+                && !domain.starts_with('.')
+                && !domain.ends_with('.')
+        })
+}
+
+/// Whether a login's field says where it goes by its name alone, whatever its
+/// value looks like: an enterprise named `corp` is as good as a URL.
+fn field_names_a_place(field: &str) -> bool {
+    let field = field.to_ascii_lowercase();
+    [
+        "url",
+        "uri",
+        "domain",
+        "host",
+        "endpoint",
+        "enterprise",
+        "gateway",
+    ]
+    .iter()
+    .any(|word| field.contains(word))
 }
 
 /// Whether `host` is the enterprise's, as a GitHub Enterprise login's proxy is, in
@@ -585,13 +625,11 @@ impl Broker {
         new: &Value,
         store: &Map<String, Value>,
         own_keys: Option<&BTreeSet<String>>,
+        offered: &BTreeMap<String, String>,
         now_ms: u64,
     ) -> Verdict {
         let refuse = |why: &str| Verdict::Refuse(why.to_owned());
-        let enterprise = store
-            .get(name)
-            .and_then(|have| have["enterpriseUrl"].as_str());
-        if leads_elsewhere(new, enterprise) {
+        if leads_elsewhere(new, owners_enterprise(name, store, offered)) {
             return refuse("it would send requests somewhere of its own");
         }
         if serde_json::to_string(new).map_or(usize::MAX, |t| t.len()) > MAX_AGENT_ENTRY {
@@ -626,9 +664,10 @@ impl Broker {
             }
             // What a first sign-in says of where it goes could send others
             // anywhere: Cloudflare's account and gateway, Copilot's enterprise.
-            let says_where = identity(new)
-                .iter()
-                .any(|(field, value)| field != "type" && (field == "env" || names_a_place(value)));
+            let says_where = identity(new).iter().any(|(field, value)| {
+                field != "type"
+                    && (field == "env" || field_names_a_place(field) || names_a_place(value))
+            });
             return if says_where {
                 refuse("it says where its requests go")
             } else {
@@ -745,7 +784,7 @@ impl Broker {
             let verdict = if copy.owner {
                 Verdict::Take
             } else {
-                self.judge(name, new, &store, own_keys.as_ref(), now_ms)
+                self.judge(name, new, &store, own_keys.as_ref(), &offered, now_ms)
             };
             match verdict {
                 Verdict::Take => {

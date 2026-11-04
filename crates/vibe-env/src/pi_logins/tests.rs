@@ -959,6 +959,136 @@ fn a_refresh_of_an_enterprises_login_stays_with_that_enterprise() {
     assert!(w.done(&a).refused.contains_key("github-copilot"));
 }
 
+/// B1, the reviewer's PoC: an agent names an "enterprise" with no dot in its first
+/// sign-in, then refreshes to any host under it, reaching every other VM.
+#[test]
+fn an_agent_cant_name_an_enterprise_of_its_own() {
+    let login = |access: &str, enterprise: &str, expires: u64| {
+        format!(
+            r#"{{"github-copilot":{{"type":"oauth","refresh":"r","access":"{access}","expires":{expires},"enterpriseUrl":"{enterprise}"}}}}"#
+        )
+    };
+    for (enterprise, host) in [
+        ("com", "evil.com"),
+        ("example", "attacker.example"),
+        ("evil", "x.evil"),
+        ("evil.example", "x.evil.example"),
+        ("", "evil.example"),
+    ] {
+        let w = world();
+        let (hostile, other) = (w.copy("hostile"), w.copy("other"));
+        w.done(&hostile);
+        w.done(&other);
+        write(&hostile, &login("tid=1", enterprise, NOW + 1));
+        let report = w.done(&hostile);
+        assert!(
+            report.refused.contains_key("github-copilot"),
+            "{enterprise:?}: {report:?}"
+        );
+        assert!(report.first.is_empty(), "{enterprise:?}: {report:?}");
+        assert!(w.stored().is_empty(), "{enterprise:?}");
+        write(
+            &hostile,
+            &login(&format!("tid=1;proxy-ep={host}"), enterprise, NOW + 2),
+        );
+        assert!(w.done(&hostile).taken.is_empty(), "{enterprise:?}");
+        w.done(&other);
+        assert!(
+            !held(&other).contains_key("github-copilot"),
+            "{enterprise:?}"
+        );
+    }
+    // By another name for the same thing, or with no dot in a plain field.
+    for field in [
+        "enterpriseDomain",
+        "baseUrl",
+        "apiHost",
+        "gatewayId",
+        "endpoint",
+    ] {
+        let w = world();
+        let a = w.copy("a");
+        write(
+            &a,
+            &format!(
+                r#"{{"p":{{"type":"oauth","refresh":"r","access":"a","expires":{},"{field}":"evil"}}}}"#,
+                NOW + 1
+            ),
+        );
+        assert!(w.done(&a).refused.contains_key("p"), "{field}");
+    }
+    // What isn't about a place still goes through, as a Codex login's account does.
+    let w = world();
+    let a = w.copy("a");
+    write(
+        &a,
+        &format!(
+            r#"{{"openai-codex":{{"type":"oauth","refresh":"r","access":"a","expires":{},"accountId":"acct-1"}}}}"#,
+            NOW + 1
+        ),
+    );
+    assert_eq!(w.done(&a).first, ["openai-codex"]);
+}
+
+/// B1: the enterprise a refresh is held to has to be the owner's, and a domain.
+#[test]
+fn only_the_owners_own_enterprise_is_trusted() {
+    let login = |host: &str, enterprise: &str, expires: u64| {
+        format!(
+            r#"{{"github-copilot":{{"type":"oauth","refresh":"r","access":"tid=1;proxy-ep={host}","expires":{expires},"enterpriseUrl":"{enterprise}"}}}}"#
+        )
+    };
+    // In the store and listed as an agent's, however it got there: not trusted.
+    let w = world();
+    let a = w.copy("a");
+    fs::create_dir_all(w.broker.store_dir()).unwrap();
+    fs::write(
+        w.store_path(),
+        login(
+            "proxy.individual.githubcopilot.com",
+            "corp.ghe.com",
+            NOW + 1,
+        ),
+    )
+    .unwrap();
+    fs::write(
+        w.broker.store_dir().join(OFFERED_FILE),
+        r#"{"github-copilot":"hostile"}"#,
+    )
+    .unwrap();
+    w.done(&a);
+    write(&a, &login("x.corp.ghe.com", "corp.ghe.com", NOW + 2));
+    assert!(w.done(&a).refused.contains_key("github-copilot"));
+    // Copilot's own hosts are still fine for it.
+    write(
+        &a,
+        &login(
+            "proxy.individual.githubcopilot.com",
+            "corp.ghe.com",
+            NOW + 3,
+        ),
+    );
+    assert_eq!(w.done(&a).taken, ["github-copilot"]);
+    // The owner's, with no dot in it, isn't a domain to trust anything under.
+    let w = world();
+    w.owner_signs_in(&login("proxy.individual.githubcopilot.com", "com", NOW + 1));
+    let a = w.copy("a");
+    w.done(&a);
+    write(&a, &login("evil.com", "com", NOW + 2));
+    assert!(w.done(&a).refused.contains_key("github-copilot"));
+    // The owner signing in to it themselves makes it theirs.
+    let w = world();
+    let a = w.copy("a");
+    write(&a, r#"{"github-copilot":{"type":"api_key","key":"k"}}"#);
+    assert_eq!(w.done(&a).first, ["github-copilot"]);
+    assert!(w.broker.offered().contains_key("github-copilot"));
+    w.owner_signs_in(&login("x.corp.ghe.com", "corp.ghe.com", NOW + 1));
+    assert!(!w.broker.offered().contains_key("github-copilot"));
+    w.done(&a);
+    write(&a, &login("y.corp.ghe.com", "corp.ghe.com", NOW + 2));
+    assert_eq!(w.done(&a).taken, ["github-copilot"]);
+}
+
 /// F4: a name that's only odd isn't passed on either, and isn't an alarm.
 #[test]
 fn an_odd_name_is_told_of_calmly_and_goes_no_further() {
