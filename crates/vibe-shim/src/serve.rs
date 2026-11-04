@@ -47,6 +47,12 @@ const HANGUP_GRACE: Duration = Duration::from_secs(5);
 /// further behind is sent a fresh redraw instead.
 const BACKLOG: usize = 256;
 
+/// Chunks of what the terminal says waiting to go through the screen. Few: a
+/// command that writes faster than they're read is held up by its terminal, as
+/// on any terminal, rather than building up work the shim has to get through,
+/// which a command's end would then have to wait for.
+const OUTPUT_QUEUE: usize = 8;
+
 /// Input chunks waiting for a command that isn't reading, such as one that's
 /// stopped. Past this, input is dropped rather than held.
 const INPUT_BACKLOG: usize = 1024;
@@ -432,6 +438,12 @@ pub(crate) async fn run(
     child_pid: u32,
 ) -> io::Result<Option<SessionExit>> {
     let (events_tx, mut events) = mpsc::channel::<Event>(256);
+    // What the terminal says, in order, on a lane of its own: it's read after
+    // everything else that's waiting, so a flood of output can't hold up a
+    // request, a signal or a client. Taking each chunk through the screen is
+    // slow enough that requests behind a queue of them take seconds, and `vibed`
+    // takes a shim that slow to answer for a broken one.
+    let (output_tx, mut output) = mpsc::channel::<Event>(OUTPUT_QUEUE);
     let (input_tx, input_rx) = std::sync::mpsc::sync_channel(INPUT_BACKLOG);
     // Keep a PTY's master open for the resize ioctl until the end.
     let (end_kind, _master) = match end {
@@ -439,7 +451,7 @@ pub(crate) async fn run(
             let master_fd = master.as_raw_fd();
             {
                 let reader = master.try_clone()?;
-                let tx = events_tx.clone();
+                let tx = output_tx.clone();
                 std::thread::Builder::new()
                     .name("pty-read".into())
                     .spawn(move || read_pty(reader, tx))?;
@@ -474,7 +486,7 @@ pub(crate) async fn run(
         TerminalEnd::Guest(stream) => {
             {
                 let reader = stream.try_clone()?;
-                let tx = events_tx.clone();
+                let tx = output_tx.clone();
                 std::thread::Builder::new()
                     .name("guest-read".into())
                     .spawn(move || read_guest(reader, tx))?;
@@ -525,40 +537,66 @@ pub(crate) async fn run(
                 None => std::future::pending().await,
             }
         };
-        tokio::select! {
-            event = events.recv() => match event {
-                Some(Event::Exited(exit)) => break Some(exit),
-                Some(Event::PtyClosed) => pty_closed = true,
-                Some(Event::Gone(why)) => {
-                    log!("{why}; the command goes on in the guest");
-                    break None;
-                }
-                Some(event) => state.handle(event),
-                None => unreachable!("the loop holds a sender"),
-            },
-            accepted = listener.accept() => match accepted {
-                Ok((stream, _)) => {
-                    tasks.spawn(connection(stream, events_tx.clone(), welcome.clone()));
-                }
-                Err(e) => {
-                    log!("accept failed: {e}");
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-            },
+        // In this order, with the terminal's output last (see `output`).
+        let event = tokio::select! {
+            biased;
             // Being asked to stop hangs up on the command, as closing a
             // terminal window would; it then exits as usual. A guest's
             // command isn't the shim's to end: it goes on in the VM, and
             // `child_pid` is a pid there, not here.
-            _ = term.recv() => if guest { break stop_leaving_guest() } else { hang_up(child_pid, &mut kill_at) },
-            _ = int.recv() => if guest { break stop_leaving_guest() } else { hang_up(child_pid, &mut kill_at) },
+            _ = term.recv() => {
+                if guest { break stop_leaving_guest() }
+                hang_up(child_pid, &mut kill_at);
+                continue;
+            }
+            _ = int.recv() => {
+                if guest { break stop_leaving_guest() }
+                hang_up(child_pid, &mut kill_at);
+                continue;
+            }
             // We have no terminal of our own to lose; this is someone's kill.
-            _ = hup.recv() => if guest { break stop_leaving_guest() } else { hang_up(child_pid, &mut kill_at) },
+            _ = hup.recv() => {
+                if guest { break stop_leaving_guest() }
+                hang_up(child_pid, &mut kill_at);
+                continue;
+            }
             () = kill_timer => {
                 log!("the command ignored SIGHUP; killing it");
                 kill_group(child_pid, libc::SIGKILL);
                 kill_at = None;
+                continue;
             }
-            Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
+            event = events.recv() => event,
+            accepted = listener.accept() => {
+                match accepted {
+                    Ok((stream, _)) => {
+                        tasks.spawn(connection(stream, events_tx.clone(), welcome.clone()));
+                    }
+                    Err(e) => {
+                        log!("accept failed: {e}");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
+                continue;
+            }
+            Some(_) = tasks.join_next(), if !tasks.is_empty() => continue,
+            event = output.recv() => event,
+        };
+        match event.expect("the loop holds a sender of each") {
+            Event::Exited(exit) => break Some(exit),
+            Event::PtyClosed => pty_closed = true,
+            Event::Gone(why) => {
+                log!("{why}; the command goes on in the guest");
+                break None;
+            }
+            event => {
+                state.handle(event);
+                // This runtime has one thread, shared with the connections,
+                // which only run when this loop waits. With output always
+                // ready it wouldn't, so a client could be heard only now and
+                // then.
+                tokio::task::yield_now().await;
+            }
         }
     };
 
@@ -578,11 +616,19 @@ pub(crate) async fn run(
     // exited to someone asking.
     let drained = pty_closed
         || tokio::time::timeout(DRAIN_TIMEOUT, async {
-            while let Some(event) = events.recv().await {
-                match event {
+            loop {
+                let event = tokio::select! {
+                    biased;
+                    event = events.recv() => event,
+                    event = output.recv() => event,
+                };
+                match event.expect("the loop holds a sender of each") {
                     Event::PtyClosed => return,
                     Event::Exited(_) | Event::Gone(_) => {}
-                    event => state.handle(event),
+                    event => {
+                        state.handle(event);
+                        tokio::task::yield_now().await;
+                    }
                 }
             }
         })
@@ -607,6 +653,8 @@ pub(crate) async fn run(
     // send the end to their terminals.
     drop(events);
     drop(events_tx);
+    drop(output);
+    drop(output_tx);
     let _ = tokio::time::timeout(GOODBYE_TIMEOUT, async {
         while tasks.join_next().await.is_some() {}
     })

@@ -353,6 +353,40 @@ fn a_command_that_ignores_the_hangup_is_killed() {
     assert_eq!(exit.signal.as_deref(), Some("SIGKILL"));
 }
 
+/// A command flooding its terminal, with a client that's stopped reading as a
+/// window does when it closes, can't keep the shim from answering: `vibed` asks a
+/// shim how it is before it does anything to a session, gives it 5 s, and takes
+/// one slower than that for broken. The middle of several asks, so a slow moment
+/// on a busy machine doesn't count against it.
+#[test]
+fn a_flood_of_output_doesnt_hold_up_requests() {
+    let shim = Shim::start(&["yes", "spam"]);
+    let stalled = shim.attach(Some(Size { rows: 24, cols: 80 }));
+    // Long enough for a backlog, if one builds up.
+    std::thread::sleep(Duration::from_secs(2));
+    let mut asks = Vec::new();
+    for _ in 0..5 {
+        let started = Instant::now();
+        shim.control().status().unwrap();
+        asks.push(started.elapsed());
+    }
+    asks.sort();
+    assert!(asks[2] < Duration::from_secs(1), "{asks:?}");
+
+    // And it's ended promptly, for all the output on its way: this allows for the
+    // 2 s the stalled client is given to receive the end.
+    let started = Instant::now();
+    // SAFETY: a signal to the shim this test started.
+    unsafe { libc::kill(shim.pid, libc::SIGTERM) };
+    assert_eq!(shim.record().exit.signal.as_deref(), Some("SIGHUP"));
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "{:?}",
+        started.elapsed()
+    );
+    drop(stalled);
+}
+
 /// Asks the shell its terminal's size, through client `via`.
 fn stty_size(via: &mut Attach) -> String {
     // The shell works out the marker, so only its answer contains it: the
