@@ -20,7 +20,7 @@ use vibe_env::toolbox::Toolbox;
 use vibe_services::secrets::{FileStore, Keychain};
 use vibe_services::{Place, SecretStore, Service};
 use vibed::agents::Backends;
-use vibed::core::{Config, Core, DaemonInfo};
+use vibed::core::{Config, Core, DaemonInfo, StateLock};
 use vibed::services::ServicesConfig;
 use vibed::{logging, server};
 
@@ -209,9 +209,17 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
     // the socket can always stop the daemon cleanly.
     let mut term = signal(SignalKind::terminate())?;
     let mut int = signal(SignalKind::interrupt())?;
+    // Another vibed on this socket is the likelier story, and takes no waiting.
+    if vibe_core::socket::lock_held(&path) {
+        return Err(server::BindError::AlreadyRunning { path }.into());
+    }
+    // The state first: a vibed refused for another's state must bind nothing, as
+    // anything that connects takes a socket to mean a vibed that's running.
+    let state_lock = StateLock::take(&layout)?;
     let (listener, guard) = server::bind(&path)?;
     let listener = UnixListener::from_std(listener)?;
     let mut config = Config::new(DaemonInfo::current(), layout);
+    config.state_lock = Some(state_lock);
     if let Some(gh) = std::env::var_os("VIBE_GH").filter(|v| !v.is_empty()) {
         config.gh = gh;
     }

@@ -56,7 +56,7 @@ You need rustup; on a Mac, also Xcode 26 or its command line tools.
 cargo build                     # everything in the workspace
 cargo test
 target/debug/vibed &            # the hello-world daemon on its default socket
-target/debug/vibe hello         # vibed 0.1.0 · protocol 1 · macos/aarch64 · pid …
+target/debug/vibe hello         # vibed 0.1.0 · protocol 2 · macos/aarch64 · pid …
 cargo build -p vibe-guest --target aarch64-unknown-linux-musl
 
 scripts/sign-macos.sh           # build/VibeOS.app and build/vibe-vm, ad hoc signed

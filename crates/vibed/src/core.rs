@@ -128,6 +128,9 @@ pub struct Config {
     /// This host's broker for shared services. None by default, so nothing
     /// reaches a Keychain or a real service unless `vibed`'s `main` asks.
     pub services: Option<crate::services::ServicesConfig>,
+    /// The state lock, if it's already held: `vibed` takes it before its socket
+    /// exists. None has [`Core::open`] take it.
+    pub state_lock: Option<StateLock>,
 }
 
 impl std::fmt::Debug for Config {
@@ -184,6 +187,7 @@ impl Config {
             linux_images: None,
             vibe_cli: find_vibe(std::env::current_exe().ok().as_deref()),
             services: None,
+            state_lock: None,
             info,
         }
     }
@@ -290,9 +294,67 @@ impl std::error::Error for OpenError {}
 /// Events kept for a subscriber that's slow to read them.
 const EVENT_BACKLOG: usize = 1024;
 
-/// How long `Core::open` waits for the state lock before it takes it for
+/// How long [`StateLock::take`] waits for the state lock before it takes it for
 /// another `vibed`'s.
 const LOCK_PATIENCE: Duration = Duration::from_secs(3);
+
+/// One `vibed` per state directory, for as long as this is held. `vibed` takes it
+/// before it binds anything, so a second one is refused with nothing to show for
+/// it, and a client that can connect knows the state is that `vibed`'s.
+#[derive(Debug)]
+pub struct StateLock {
+    _file: File,
+}
+
+impl StateLock {
+    /// Makes the state directory if need be, and takes its lock.
+    pub fn take(layout: &Layout) -> Result<StateLock, OpenError> {
+        let dir = layout.data_dir();
+        DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir)
+            .map_err(|source| OpenError::Io {
+                what: "create",
+                path: dir.clone(),
+                source,
+            })?;
+        make_private(&dir)?;
+        let lock_path = dir.join("vibed.lock");
+        let state_lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .mode(0o600)
+            .open(&lock_path)
+            .map_err(|source| OpenError::Io {
+                what: "open",
+                path: lock_path.clone(),
+                source,
+            })?;
+        // A vibed that just stopped may not have let go yet in every
+        // process: a child forked before it closed the lock, and not yet
+        // replaced by its program, holds the lock too until it is. So the
+        // lock gets a moment before it counts as another vibed's.
+        let deadline = std::time::Instant::now() + LOCK_PATIENCE;
+        loop {
+            match state_lock.try_lock() {
+                Ok(()) => return Ok(StateLock { _file: state_lock }),
+                Err(TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(TryLockError::WouldBlock) => return Err(OpenError::AlreadyRunning { dir }),
+                Err(TryLockError::Error(source)) => {
+                    return Err(OpenError::Io {
+                        what: "lock",
+                        path: lock_path,
+                        source,
+                    });
+                }
+            }
+        }
+    }
+}
 
 #[derive(Debug)]
 struct EventBus {
@@ -432,7 +494,7 @@ pub struct Core {
         Mutex<Option<(tokio::task::JoinHandle<()>, vibe_core::socket::SocketGuard)>>,
     /// On a Mac, when a host last came through the tunnel.
     pub(crate) tunnel_seen: Mutex<Option<std::time::Instant>>,
-    _state_lock: File,
+    _state_lock: StateLock,
 }
 
 impl std::fmt::Debug for Core {
@@ -481,51 +543,11 @@ impl Core {
     /// Opens the state directory, private to this user, and the registry in
     /// it, and records this host. Only one `vibed` may use a state directory
     /// at a time.
-    pub fn open(config: Config) -> Result<Core, OpenError> {
-        let dir = config.layout.data_dir();
-        DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&dir)
-            .map_err(|source| OpenError::Io {
-                what: "create",
-                path: dir.clone(),
-                source,
-            })?;
-        make_private(&dir)?;
-        let lock_path = dir.join("vibed.lock");
-        let state_lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .mode(0o600)
-            .open(&lock_path)
-            .map_err(|source| OpenError::Io {
-                what: "open",
-                path: lock_path.clone(),
-                source,
-            })?;
-        // A vibed that just stopped may not have let go yet in every
-        // process: a child forked before it closed the lock, and not yet
-        // replaced by its program, holds the lock too until it is. So the
-        // lock gets a moment before it counts as another vibed's.
-        let deadline = std::time::Instant::now() + LOCK_PATIENCE;
-        loop {
-            match state_lock.try_lock() {
-                Ok(()) => break,
-                Err(TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                Err(TryLockError::WouldBlock) => return Err(OpenError::AlreadyRunning { dir }),
-                Err(TryLockError::Error(source)) => {
-                    return Err(OpenError::Io {
-                        what: "lock",
-                        path: lock_path,
-                        source,
-                    });
-                }
-            }
-        }
+    pub fn open(mut config: Config) -> Result<Core, OpenError> {
+        let state_lock = match config.state_lock.take() {
+            Some(held) => held,
+            None => StateLock::take(&config.layout)?,
+        };
         let heard_at_start = (config.clock)();
         let mut store = Store::open(&config.layout.db()).map_err(OpenError::Store)?;
         store
