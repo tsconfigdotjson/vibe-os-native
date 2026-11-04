@@ -86,7 +86,11 @@ while True:
 /// `ExitOnForwardFailure` does when it can't. While
 /// `<hosts>/<destination>.d/down` exists, it can't connect, and what it
 /// carries is dropped.
-fn fake_ssh(hosts: &Path) -> PathBuf {
+///
+/// A relay outlives whatever starts it, so this takes the test's [`Watch`], which only
+/// [`bounded`] makes, and which ends it however the test goes.
+fn fake_ssh(watch: &Watch, hosts: &Path) -> PathBuf {
+    watch.owns(hosts);
     fs::write(hosts.join("relay.py"), RELAY).unwrap();
     let ssh = hosts.join("ssh");
     write_exe(
@@ -470,7 +474,7 @@ impl InFiles for Command {
 const DEADLINE: Duration = Duration::from_secs(6 * 60);
 
 /// What a test here tells [`bounded`] about itself.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct Watch {
     /// The test's temporary directories, by name, which are in the command line of
     /// what it starts that lasts: a shim, a relay, a host's `vibed`. What's left goes
@@ -511,7 +515,10 @@ fn unique_name(dir: &Path) -> String {
 /// Runs `test`, failing it if it takes longer than `within` rather than waiting on
 /// it forever, and says how far it got.
 fn bounded(within: Duration, test: impl FnOnce(&Watch) + Send + 'static) {
-    let watch = Watch::default();
+    let watch = Watch {
+        dirs: Arc::default(),
+        at: Arc::default(),
+    };
     let (finished, ended) = mpsc::channel::<()>();
     let running = {
         let watch = watch.clone();
@@ -588,6 +595,78 @@ fn a_stuck_test_fails_by_its_deadline() {
     })
     .unwrap_err();
     assert_eq!(panicked.downcast_ref::<&str>(), Some(&"its own failure"));
+}
+
+/// The relays running out of `hosts`.
+fn relays_of(hosts: &str) -> Vec<String> {
+    let found = Command::new("pgrep")
+        .args(["-f", &format!("{hosts}/relay.py")])
+        .in_files()
+        .unwrap();
+    String::from_utf8_lossy(&found.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// A real relay from `ssh -R`, started the way a tunnel starts one, is gone when the
+/// test that made it is, whether it passed or failed (#67). The relay's seen running
+/// first, so this can't pass by not finding one.
+#[test]
+fn a_test_leaves_no_relay_behind_however_it_ends() {
+    for fails in [false, true] {
+        let hosts = common::short_tempdir();
+        let name = unique_name(hosts.path());
+        let path = hosts.path().to_owned();
+        let looking_for = name.clone();
+        let ended = std::panic::catch_unwind(move || {
+            bounded(Duration::from_secs(60), move |watch| {
+                let ssh = fake_ssh(watch, &path);
+                fs::create_dir_all(path.join("me@vps")).unwrap();
+                fs::create_dir_all(path.join("me@vps.d/bin")).unwrap();
+                fs::write(path.join("me@vps.d/env"), "").unwrap();
+                let end = path.join("forwarded.sock");
+                // Past the relay's start, and the stand-in's tidying up after it.
+                let up = path.join("up");
+                let mut started = Command::new(&ssh);
+                started
+                    .arg("-R")
+                    .arg(format!(
+                        "{}:{}",
+                        end.display(),
+                        path.join("here.sock").display()
+                    ))
+                    .args(["me@vps", &format!("touch '{}'; sleep 30", up.display())])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+                // Left running on purpose, as a tunnel is, and reaped when it goes.
+                let mut tunnel = started.spawn().unwrap();
+                std::thread::spawn(move || tunnel.wait());
+                wait_for("the relay", Duration::from_secs(20), || up.exists());
+                assert!(!relays_of(&looking_for).is_empty(), "no relay to end");
+                assert!(!fails, "forced, with the relay up");
+            });
+        });
+        match ended {
+            Ok(()) => assert!(!fails),
+            // This failure, with the relay up, and not one before it started.
+            Err(panicked) => {
+                let said = panicked
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or(panicked.downcast_ref::<&str>().copied())
+                    .unwrap_or_default();
+                assert!(
+                    fails && said.contains("forced, with the relay up"),
+                    "{said}"
+                );
+            }
+        }
+        wait_for("the relay to go", Duration::from_secs(5), || {
+            relays_of(&name).is_empty()
+        });
+    }
 }
 
 fn wait_for(what: &str, within: Duration, mut done: impl FnMut() -> bool) {
@@ -697,8 +776,7 @@ fn a_linux_host_added_over_ssh_runs_agents_the_mac_drives_body(watch: &Watch) {
     let golden = common::Golden::new();
     let hosts = common::short_tempdir();
     watch.owns(golden.dir.path());
-    watch.owns(hosts.path());
-    let ssh = fake_ssh(hosts.path());
+    let ssh = fake_ssh(watch, hosts.path());
     let host = FakeHost::new(hosts.path(), "me@vps", &golden.claude);
     let mac = mac(&golden, &ssh, bundle(golden.dir.path()));
 
@@ -1023,8 +1101,7 @@ fn a_linux_host_that_owns_a_login_serves_and_refreshes_alone_with_the_mac_gone_b
     let golden = common::Golden::new();
     let hosts = common::short_tempdir();
     watch.owns(golden.dir.path());
-    watch.owns(hosts.path());
-    let ssh = fake_ssh(hosts.path());
+    let ssh = fake_ssh(watch, hosts.path());
     let host = FakeHost::new(hosts.path(), "me@vps", &golden.claude);
     let fake = FakeService::start_detached();
     // Its vibed finds its stand-in for Linear; a debug build's only.
@@ -1192,8 +1269,7 @@ fn an_unreachable_server_is_refused_with_why_body(watch: &Watch) {
     let golden = common::Golden::new();
     let hosts = common::short_tempdir();
     watch.owns(golden.dir.path());
-    watch.owns(hosts.path());
-    let ssh = fake_ssh(hosts.path());
+    let ssh = fake_ssh(watch, hosts.path());
     let mac = mac(&golden, &ssh, bundle(golden.dir.path()));
     let out = vibe(&mac.socket, &["host", "add", "vps", "me@nowhere"]);
     assert!(!out.status.success());
@@ -1404,8 +1480,7 @@ fn external_access_through_a_linux_host_body(watch: &Watch) {
     let golden = common::Golden::new();
     let hosts = common::short_tempdir();
     watch.owns(golden.dir.path());
-    watch.owns(hosts.path());
-    let ssh = fake_ssh(hosts.path());
+    let ssh = fake_ssh(watch, hosts.path());
     let host = FakeHost::new(hosts.path(), "me@vps", &golden.claude);
     let port = free_port().port();
     let ca = host.serve_publicly(port, "vps.test");
@@ -1647,8 +1722,7 @@ fn external_access_answers_with_the_mac_asleep_or_stopped_body(watch: &Watch) {
     let golden = common::Golden::new();
     let hosts = common::short_tempdir();
     watch.owns(golden.dir.path());
-    watch.owns(hosts.path());
-    let ssh = fake_ssh(hosts.path());
+    let ssh = fake_ssh(watch, hosts.path());
     let host = FakeHost::new(hosts.path(), "me@vps", &golden.claude);
     let port = free_port().port();
     let ca = host.serve_publicly(port, "vps.test");
