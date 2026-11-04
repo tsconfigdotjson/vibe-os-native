@@ -168,8 +168,8 @@
 #     sleeps, and carries on its conversation after the wake, with Claude
 #     Code's managed layer downloaded from downloads.claude.ai
 #     (crates/vibed/tests/linux_vm.rs). It needs the Claude token: from
-#     CLAUDE_CODE_OAUTH_TOKEN, or what `vibe setup-token` kept in the
-#     Keychain. Then the toolbox: gcloud and a login made in it reach a new
+#     CLAUDE_CODE_OAUTH_TOKEN, or with VIBE_CHECK_KEYCHAIN_TOKEN=1, what
+#     `vibe setup-token` kept in the Keychain (see claude_token). Then the toolbox: gcloud and a login made in it reach a new
 #     agent, See logins names the logins its save found in the real guest
 #     (gh, git, an SSH key), an agent asleep on the old template restores,
 #     and [update] and
@@ -765,12 +765,32 @@ s_mcp() {
 # Real Claude Code through `vibe mcp-proxy` and a broker, to a stand-in for the
 # service: it spends a model call, so only here. The rest of shared services is in
 # the test step, and in a real VM in the vm-cycle step.
+# claude_token: sets $token to the Claude token a real Claude in a check signs in
+# with: CLAUDE_CODE_OAUTH_TOKEN, or with VIBE_CHECK_KEYCHAIN_TOKEN=1, what `vibe
+# setup-token` kept. That's the only time a check reads the login Keychain, and only
+# when asked to. Never the owner's own Claude login, which is in it too.
+claude_token() {
+  token=${CLAUDE_CODE_OAUTH_TOKEN:-}
+  [ -z "$token" ] || return 0
+  if [ "${VIBE_CHECK_KEYCHAIN_TOKEN:-}" != 1 ]; then
+    echo "no Claude token: set CLAUDE_CODE_OAUTH_TOKEN, or VIBE_CHECK_KEYCHAIN_TOKEN=1 to read what \`vibe setup-token\` kept"
+    return 1
+  fi
+  token=$(security find-generic-password -s VibeOS -a claude-setup-token -w 2>/dev/null) || {
+    echo "no Claude token: run \`VIBE_LOGIN_KEYCHAIN=allow target/debug/vibe setup-token\` or set CLAUDE_CODE_OAUTH_TOKEN"
+    return 1
+  }
+}
+
 s_services_claude() {
+  local token
   if ! command -v claude >/dev/null; then
     echo "no claude on PATH"
     return $NOT_APPLICABLE
   fi
-  VIBE_TEST_REAL_CLAUDE=1 cargo test -p vibe-cli --locked --test services -- --nocapture
+  claude_token || return 1
+  CLAUDE_CODE_OAUTH_TOKEN="$token" VIBE_TEST_REAL_CLAUDE=1 \
+    cargo test -p vibe-cli --locked --test services -- --nocapture
 }
 
 s_macos_governor() {
@@ -1035,17 +1055,12 @@ s_vm_cycle() {
 s_base_image() { scripts/base-image.sh build/base-image; }
 
 s_linux_vm() {
-  local marker="$WORK/linux-marker" t token=${CLAUDE_CODE_OAUTH_TOKEN:-}
+  local marker="$WORK/linux-marker" t token
   if [ "$(sysctl -n kern.hv_vmm_present 2>/dev/null || echo 0)" = 1 ]; then
     echo "this Mac is a VM, so it can't run linux agents"
     return $NOT_APPLICABLE
   fi
-  if [ -z "$token" ]; then
-    token=$(security find-generic-password -s VibeOS -a claude-setup-token -w 2>/dev/null) || {
-      echo "no Claude token: run \`target/debug/vibe setup-token\` or set CLAUDE_CODE_OAUTH_TOKEN"
-      return 1
-    }
-  fi
+  claude_token || return 1
   rm -rf "$marker"
   cargo test -p vibe-env --locked --test linux_conformance --no-run
   cargo test -p vibed --locked --test linux_vm --no-run

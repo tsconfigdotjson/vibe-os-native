@@ -75,9 +75,9 @@ release is published, build one and point `vibed` at it:
 
 ```sh
 scripts/base-image.sh           # build/base-image/base-3: kernel, initrd, Debian image
-target/debug/vibe setup-token   # the Claude login for linux agents
+VIBE_LOGIN_KEYCHAIN=allow target/debug/vibe setup-token   # the Claude login for linux agents
 target/debug/vibe pi            # Pi: what's installed, and who it's signed in to
-VIBE_BASE_RELEASES=file://$PWD/build/base-image target/debug/vibed
+VIBE_LOGIN_KEYCHAIN=allow VIBE_BASE_RELEASES=file://$PWD/build/base-image target/debug/vibed
 ```
 
 Pi is pinned (`vibe_env::pi_release::PINNED`). Moving the pin means looking again

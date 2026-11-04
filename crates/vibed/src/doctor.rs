@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use vibe_core::keychain;
 use vibe_core::model::{CheckId, CheckState, GhState};
 use vibe_core::rpc::{
     DoctorCheck, DoctorFixParams, DoctorReport, ErrorCode, ErrorObject, GhStatus,
@@ -249,9 +250,9 @@ impl HostChecks for Machine {
     }
 
     fn claude_login(&self) -> Result<String, String> {
-        if cfg!(target_os = "macos") {
+        if cfg!(target_os = "macos") && keychain::login_open() {
             let (ok, _) = self.run(&[
-                "/usr/bin/security",
+                keychain::SECURITY,
                 "find-generic-password",
                 "-s",
                 CLAUDE_KEYCHAIN_SERVICE,

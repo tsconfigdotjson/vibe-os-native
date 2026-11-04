@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use tokio::net::UnixListener;
 use tokio::signal::unix::{SignalKind, signal};
+use vibe_core::keychain;
 use vibe_core::model::Environment;
 use vibe_core::paths::{self, Layout};
 use vibe_core::rpc::MAX_MESSAGE_BYTES;
@@ -67,6 +68,13 @@ environment:
                   for tests only, in debug builds: keep shared services' logins
                   in this directory whatever the OS, and find Linear's stand-in
                   at this URL
+  VIBE_TEST_HOST_BROKER
+                  for tests only, in debug builds: 1 has this vibed's broker
+                  behave as a Linux host's, whatever the OS
+  VIBE_LOGIN_KEYCHAIN
+                  never keeps this vibed out of the login Keychain; allow lets
+                  one outside an app bundle in, which is otherwise kept out so
+                  that no test reaches it
   VIBE_EXTERNAL_PORT, VIBE_EXTERNAL_LISTEN, VIBE_ACME_DIRECTORY
                   for tests only: the port the external address is served
                   on (default 443), the one address it listens on (default
@@ -459,8 +467,14 @@ fn serve_here(os: &str, test_backend: bool, stand_in: Option<&str>) -> bool {
 /// the Keychain on a Mac, and on a Linux host a private file in its state
 /// directory. Only a debug build listens to the test variables, so a release
 /// can't be talked into keeping a login elsewhere or sending one to a stand-in.
+/// And a debug build kept out of the login Keychain (`vibe_core::keychain`) keeps
+/// them as a Linux host does, in its own state directory, where a test can look.
+/// A release kept out reports the Keychain's refusal: one can't be talked into
+/// keeping a login in a file.
 fn services_config(layout: &Layout) -> ServicesConfig {
-    let place = if cfg!(target_os = "macos") {
+    let stand_in_host =
+        cfg!(debug_assertions) && env_text("VIBE_TEST_HOST_BROKER").as_deref() == Some("1");
+    let place = if cfg!(target_os = "macos") && !stand_in_host {
         Place::Mac
     } else {
         Place::LinuxHost
@@ -479,8 +493,21 @@ fn services_config(layout: &Layout) -> ServicesConfig {
             vibed::log!("vibed: VIBE_TEST_SERVICES_DIR is set: logins are kept in {dir}");
             Arc::new(FileStore(PathBuf::from(dir)))
         }
-        None if place == Place::Mac => Arc::new(Keychain::default()),
-        None => Arc::new(FileStore(layout.data_dir().join("services"))),
+        None if place == Place::Mac && (!cfg!(debug_assertions) || keychain::login_open()) => {
+            Arc::new(Keychain::default())
+        }
+        None => {
+            let dir = layout.data_dir().join("services");
+            if place == Place::Mac {
+                vibed::log!(
+                    "vibed: this debug build stays out of the login Keychain: logins are kept in \
+                     {} ({}=allow lets it in)",
+                    dir.display(),
+                    keychain::GUARD_ENV
+                );
+            }
+            Arc::new(FileStore(dir))
+        }
     };
     ServicesConfig {
         services,

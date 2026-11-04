@@ -4,7 +4,7 @@
 //! model usage, so it runs only when asked:
 //!
 //! ```text
-//! VIBE_TEST_REAL_CLAUDE=1 cargo test -p vibe-cli --test services -- --nocapture
+//! VIBE_TEST_REAL_CLAUDE=1 CLAUDE_CODE_OAUTH_TOKEN=… cargo test -p vibe-cli --test services -- --nocapture
 //! ```
 //!
 //! scripts/check-full.sh does, where there's a `claude`. Without either, it
@@ -75,7 +75,14 @@ async fn real_claude_calls_a_shared_service_through_the_shim() {
     });
 
     // As a launch offers it, with the one allow rule a test needs to go without
-    // a prompt. There's no --strict-mcp-config: the owner's servers load too.
+    // a prompt. Signed in by token, in a home of its own: never the owner's login,
+    // which on a Mac is in the Keychain.
+    let token = std::env::var("CLAUDE_CODE_OAUTH_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty())
+        .expect("CLAUDE_CODE_OAUTH_TOKEN: this signs in with a token, never the owner's login");
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
     let config = serde_json::json!({"mcpServers": {"vibe-linear": {
         "type": "stdio",
         "command": VIBE,
@@ -92,6 +99,8 @@ async fn real_claude_calls_a_shared_service_through_the_shim() {
             .args(["--mcp-config", &config])
             .args(["--allowedTools", "mcp__vibe-linear__*"])
             .current_dir(&cwd)
+            .env("HOME", &home)
+            .env("CLAUDE_CODE_OAUTH_TOKEN", &token)
             .env("VIBE_SERVICES_SOCKET", cwd.join("services.sock"))
             .env("VIBE_SERVICES_CACHE", &cache)
             .env("VIBE_AGENT", "real-claude")

@@ -248,7 +248,7 @@ esac
         fs::write(
             d.join("env"),
             format!(
-                "export VIBE_TEST_BACKEND='{}' VIBE_GH='{}'\n",
+                "export VIBE_TEST_HOST_BROKER=1 VIBE_TEST_BACKEND='{}' VIBE_GH='{}'\n",
                 claude.display(),
                 tools.join("gh").display()
             ),
