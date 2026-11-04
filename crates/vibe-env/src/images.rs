@@ -55,8 +55,16 @@ pub const MANAGED_BIN: &str = "opt/vibeos/bin";
 
 /// The base release this build of VibeOS boots: a new app release may ship
 /// a new one (PRD: Base image updates). 2 has the `vibe-guest` the toolbox
-/// needs (`vibe.home`, `vibe.sudo`, `seal`) and `sudo`.
-pub const BASE_RELEASE: u32 = 2;
+/// needs (`vibe.home`, `vibe.sudo`, `seal`) and `sudo`; 3, the one shared MCP
+/// services need. `.github/workflows/release.yml` reads this, and publishes a
+/// release that isn't out yet when a version is tagged.
+pub const BASE_RELEASE: u32 = 3;
+
+/// The first base release whose `vibe-guest` serves shared MCP services. A
+/// template built on an older one keeps booting that one's guest until it's
+/// rebuilt. What's asked at a launch is the running guest itself; this is only
+/// for telling the owner.
+pub const SERVICES_BASE: u32 = 3;
 
 /// Where base releases are published, each in `base-<n>/`, as
 /// `scripts/base-image.sh` makes them.

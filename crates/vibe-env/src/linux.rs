@@ -750,9 +750,23 @@ impl Compartment for LinuxVm {
         Some(vibe_relay::local::GUEST_PROGRAM.to_owned())
     }
 
+    fn services_unsupported(&self, h: &Handle) -> Result<Option<String>> {
+        // What counts is the guest this VM really runs: a template built on an
+        // older base goes on booting that base's.
+        self.ensure_running(h)?;
+        let status = self.machine.status(&self.socket(h))?;
+        Ok((!status.services).then(|| {
+            format!(
+                "its VM's guest, vibe-guest {}, is too old for shared services: Rebuild Template \
+                 in Settings → Linux Toolbox moves new agents to a base image that has them",
+                status.version
+            )
+        }))
+    }
+
     fn services_relay(&self, h: &Handle) -> Result<Option<std::os::unix::net::UnixStream>> {
         let socket = self.socket(h);
-        if !self.machine.running(&socket) {
+        if !self.machine.running(&socket) || !self.machine.status(&socket)?.services {
             return Ok(None);
         }
         self.machine

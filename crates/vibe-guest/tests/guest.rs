@@ -879,4 +879,14 @@ mod services {
         let _mac = dial(&guest);
         assert_eq!(guest.ok(json!({"op": "status"}))["ok"], true);
     }
+
+    #[test]
+    fn its_status_says_it_serves_shared_services() {
+        // What the Mac goes by, as an older guest doesn't say at all.
+        let guest = Guest::start("services-status", false, &[]);
+        wait_for_socket(&guest);
+        wait_until("it to say so", || {
+            guest.ok(json!({"op": "status"}))["services"] == true
+        });
+    }
 }

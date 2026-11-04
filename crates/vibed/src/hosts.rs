@@ -53,6 +53,7 @@ pub const FORWARDED: &[&str] = &[
     "services.complete",
     "services.disconnect",
     "services.set",
+    "services.audit",
     "sessions.list",
     "sessions.attach",
     "agents.start",

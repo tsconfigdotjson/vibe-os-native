@@ -183,6 +183,8 @@ let swiftTypes: [String: Set<String>] = [
     "ServiceCompleteParams": keys(ServiceCompleteParams.CodingKeys.self),
     "ServiceKeyParams": keys(ServiceKeyParams.CodingKeys.self),
     "ServiceSetParams": keys(ServiceSetParams.CodingKeys.self),
+    "ServiceAuditEntry": keys(ServiceAuditEntry.CodingKeys.self),
+    "ServiceAuditList": keys(ServiceAuditList.CodingKeys.self),
 ]
 
 /// The index's enums, from the Swift ones.
@@ -282,6 +284,7 @@ func methodChecks() -> [String: MethodCheck] {
         check(ServicesConnectKey.self),
         check(ServicesDisconnect.self),
         check(ServicesSet.self),
+        check(ServicesAudit.self),
     ])
 }
 

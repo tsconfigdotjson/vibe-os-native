@@ -8,6 +8,10 @@ public enum VibeRPC {
     /// Sent in `daemon.hello`; vibed refuses any other.
     public static let protocolVersion = 1
     public static let jsonrpc = "2.0"
+    /// The first Linux base image whose guest serves shared MCP services
+    /// (`vibe_env::images::SERVICES_BASE`). A template built on an older one
+    /// keeps booting that one until it's rebuilt.
+    public static let sharedServicesBase = 3
     /// The longest message, newline excluded, either side accepts.
     public static let maxMessageBytes = 16 * 1024 * 1024
     /// Overrides the socket path.
@@ -65,6 +69,7 @@ public enum VibeRPC {
         ServicesConnectKey.name,
         ServicesDisconnect.name,
         ServicesSet.name,
+        ServicesAudit.name,
     ]
     /// Every notification vibed sends.
     public static let notifications = [EventNotice.name]
@@ -2014,6 +2019,13 @@ public enum ServicesSet: RPCMethod {
     public static let name = "services.set"
 }
 
+/// The last calls agents on the host named made to its services, oldest first.
+public enum ServicesAudit: RPCMethod {
+    public typealias Params = HostParams
+    public typealias Result = ServiceAuditList
+    public static let name = "services.audit"
+}
+
 /// One shared service, on one host. Nothing here is secret.
 public struct ServiceInfo: Codable, Hashable, Sendable {
     public var name: String
@@ -2024,6 +2036,9 @@ public struct ServiceInfo: Codable, Hashable, Sendable {
     public var enabled: Bool
     public var readOnly: Bool
     public var deniedTools: [String]
+    /// Claude Code runs its tools without asking, for agents started from here
+    /// on. Off, its own permission prompts govern them.
+    public var autoAllow: Bool
     /// How many tools agents see.
     public var tools: Int
     /// The last thing that went wrong, for people, and when.
@@ -2032,8 +2047,8 @@ public struct ServiceInfo: Codable, Hashable, Sendable {
 
     public init(
         name: String, title: String, state: ServiceState, auth: ServiceAuth? = nil, enabled: Bool = true,
-        readOnly: Bool = false, deniedTools: [String] = [], tools: Int = 0, detail: String? = nil,
-        detailAt: String? = nil
+        readOnly: Bool = false, deniedTools: [String] = [], autoAllow: Bool = false, tools: Int = 0,
+        detail: String? = nil, detailAt: String? = nil
     ) {
         self.name = name
         self.title = title
@@ -2042,6 +2057,7 @@ public struct ServiceInfo: Codable, Hashable, Sendable {
         self.enabled = enabled
         self.readOnly = readOnly
         self.deniedTools = deniedTools
+        self.autoAllow = autoAllow
         self.tools = tools
         self.detail = detail
         self.detailAt = detailAt
@@ -2051,6 +2067,7 @@ public struct ServiceInfo: Codable, Hashable, Sendable {
         case name, title, state, auth, enabled
         case readOnly = "read_only"
         case deniedTools = "denied_tools"
+        case autoAllow = "auto_allow"
         case tools, detail
         case detailAt = "detail_at"
     }
@@ -2128,21 +2145,47 @@ public struct ServiceSetParams: Codable, Hashable, Sendable {
     public var enabled: Bool?
     public var readOnly: Bool?
     public var deniedTools: [String]?
+    public var autoAllow: Bool?
 
     public init(
         host: String? = nil, service: String, enabled: Bool? = nil, readOnly: Bool? = nil,
-        deniedTools: [String]? = nil
+        deniedTools: [String]? = nil, autoAllow: Bool? = nil
     ) {
         self.host = host
         self.service = service
         self.enabled = enabled
         self.readOnly = readOnly
         self.deniedTools = deniedTools
+        self.autoAllow = autoAllow
     }
 
     public enum CodingKeys: String, CodingKey, CaseIterable {
         case host, service, enabled
         case readOnly = "read_only"
         case deniedTools = "denied_tools"
+        case autoAllow = "auto_allow"
+    }
+}
+
+/// One call an agent made to a service. Never its arguments or a token.
+public struct ServiceAuditEntry: Codable, Hashable, Sendable {
+    public var at: String
+    public var agent: String
+    public var service: String
+    public var tool: String
+    public var outcome: String
+    /// How long it took, in milliseconds.
+    public var ms: Int
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case at, agent, service, tool, outcome, ms
+    }
+}
+
+public struct ServiceAuditList: Codable, Hashable, Sendable {
+    public var entries: [ServiceAuditEntry]
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case entries
     }
 }

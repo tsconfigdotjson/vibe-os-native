@@ -61,6 +61,26 @@ struct ServicesTests {
         #expect(parseToolNames("") == [])
     }
 
+    @Test func anOlderHostIsToldToUpdate() {
+        let old = VibedClientError.rpc(RPCError(code: RPCErrorCode.methodNotFound.rawValue, message: "Method not found: services.list"))
+        #expect(serviceFailure(old, host: "vps") == "vps needs updating for shared services: Settings → Hosts → Update vibed.")
+        let other = VibedClientError.rpc(RPCError(code: RPCErrorCode.hostUnavailable.rawValue, message: "vps is unavailable"))
+        #expect(serviceFailure(other, host: "vps") == "vps is unavailable")
+    }
+
+    @Test func rebuildingIsOnlySuggestedWhenItWouldHelp() throws {
+        func toolbox(_ fields: String) throws -> ToolboxStatus {
+            try JSONDecoder().decode(ToolboxStatus.self, from: Data(#"{"state":"closed",\#(fields)}"#.utf8))
+        }
+        #expect(!servicesNeedRebuild(nil))
+        #expect(!servicesNeedRebuild(try toolbox(#""base":3,"newest_base":3"#)))
+        #expect(servicesNeedRebuild(try toolbox(#""base":2,"newest_base":3"#)))
+        // The base that has them isn't down yet: a rebuild would change nothing.
+        #expect(!servicesNeedRebuild(try toolbox(#""base":2,"newest_base":2"#)))
+        let old = try toolbox(#""template":1,"home":1,"base":2,"newest_base":3"#)
+        #expect(ToolboxSummary(old).notes.contains { $0.contains("no shared services") })
+    }
+
     @Test func aKeyIsSetOnTheHostItsFor() {
         #expect(setKeyCommand(service: "linear") == "vibe service set-key linear")
     }

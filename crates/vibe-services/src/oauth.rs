@@ -210,8 +210,8 @@ impl std::fmt::Debug for TokenSet {
 /// Why a token endpoint gave nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TokenError {
-    /// It said no: an OAuth error code such as `invalid_grant`, and what it
-    /// said of it. Asking again won't help.
+    /// It said no to the login itself: `invalid_grant`, `invalid_client` or
+    /// `unauthorized_client`, and what it said of it. Asking again won't help.
     Refused { code: String, detail: String },
     /// It couldn't be asked, or it failed: asking again later may help.
     Unavailable(String),
@@ -243,15 +243,25 @@ pub(crate) async fn token(
         .map_err(TokenError::Unavailable)?;
     let v: Value = serde_json::from_slice(&text).unwrap_or(Value::Null);
     if let (400 | 401, Some(code)) = (status, v["error"].as_str()) {
-        return Err(TokenError::Refused {
-            code: code.to_owned(),
-            detail: v["error_description"]
-                .as_str()
-                .unwrap_or_default()
-                .chars()
-                .take(200)
-                .collect(),
-        });
+        let detail: String = v["error_description"]
+            .as_str()
+            .unwrap_or_default()
+            .chars()
+            .take(200)
+            .collect();
+        // Only these mean the login itself is no good. Anything else, such as
+        // `temporarily_unavailable` or `server_error`, may pass by itself, and
+        // needn't send the owner off to sign in again.
+        if matches!(
+            code,
+            "invalid_grant" | "invalid_client" | "unauthorized_client"
+        ) {
+            return Err(TokenError::Refused {
+                code: code.to_owned(),
+                detail,
+            });
+        }
+        return Err(TokenError::Unavailable(format!("it said {code}")));
     }
     if status != 200 {
         return Err(TokenError::Unavailable(format!("it answered {status}")));

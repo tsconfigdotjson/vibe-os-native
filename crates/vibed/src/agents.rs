@@ -942,8 +942,16 @@ impl Core {
         prompt: Option<&str>,
         resume: bool,
     ) -> Result<(), ErrorObject> {
-        let services = self.shared_services(backend, record);
-        let offered = injection(AgentKind::Claude, services.as_deref());
+        let mut services = self.shared_services(backend, record);
+        if services.is_some() {
+            let (b, h) = (Arc::clone(backend), handle.clone());
+            if let Some(why) = blocking(move || b.services_unsupported(&h)).await? {
+                crate::log!("vibed: {} gets no shared services: {why}", record.agent_ref);
+                services = None;
+            }
+        }
+        let auto_allowed = self.services_auto_allowed();
+        let offered = injection(AgentKind::Claude, services.as_deref(), &auto_allowed);
         let mut env = agent_env();
         env.push((local::AGENT_ENV.to_owned(), record.agent_ref.clone()));
         if services.is_some() {

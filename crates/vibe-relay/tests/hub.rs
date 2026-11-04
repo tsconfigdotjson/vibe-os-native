@@ -275,3 +275,55 @@ fn a_process_in_the_guest_cant_pose_as_the_relay() {
     assert!(local::parse_answer(answer.trim_end().as_bytes()).is_err());
     assert!(!hub.connected());
 }
+
+/// A relay's writer that takes its hello, then is stuck for as long as a send
+/// timeout would let it be.
+struct Stuck(usize);
+
+impl Write for Stuck {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 += 1;
+        if self.0 > 1 {
+            std::thread::sleep(Duration::from_secs(2));
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn a_stuck_relay_doesnt_stop_the_hub_answering() {
+    let timing = Timing {
+        ping_every: Duration::from_millis(20),
+        dead_after: Duration::from_secs(60),
+    };
+    let hub = Hub::new(anyone(), timing);
+    let (here, there) = UnixStream::pair().unwrap();
+    let h = hub.clone();
+    std::thread::spawn(move || {
+        let _ = h.carry(there, Stuck(0), || {});
+    });
+    let mut here = here;
+    write_frame(&mut here, &Frame::Hello { protocol: PROTOCOL }).unwrap();
+    for _ in 0..200 {
+        if hub.connected() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(hub.connected());
+    // The watchdog's ping is stuck in its write by now, and not holding the state.
+    std::thread::sleep(Duration::from_millis(100));
+    let started = std::time::Instant::now();
+    for _ in 0..50 {
+        assert!(hub.connected());
+    }
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "{:?}",
+        started.elapsed()
+    );
+}

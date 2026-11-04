@@ -64,8 +64,31 @@ public struct ServiceSummary: Equatable, Sendable {
         if !service.deniedTools.isEmpty {
             notes.append(service.deniedTools.count == 1 ? "1 tool denied" : "\(service.deniedTools.count) tools denied")
         }
+        if service.autoAllow { notes.append("Runs without asking") }
         note = notes.isEmpty ? nil : notes.joined(separator: " · ")
     }
+}
+
+/// What Settings says when a host can't say how its services stand. One running
+/// an older vibed doesn't know these calls, which isn't for an owner to decode.
+public func serviceFailure(_ error: any Error, host: String) -> String {
+    if let client = error as? VibedClientError, case .rpc(let rpc) = client,
+        rpc.code == RPCErrorCode.methodNotFound.rawValue
+    {
+        return "\(host) needs updating for shared services: Settings → Hosts → Update vibed."
+    }
+    return describe(error)
+}
+
+/// Whether this Mac's Linux agents can't have shared services until Rebuild
+/// Template: its template is on a base image from before them, and one that has
+/// them is installed for it to move to. Until that's downloaded, a rebuild
+/// wouldn't help.
+public func servicesNeedRebuild(_ toolbox: ToolboxStatus?) -> Bool {
+    guard let toolbox, toolbox.state != .unavailable, let base = toolbox.base,
+        let newest = toolbox.newestBase
+    else { return false }
+    return base < VibeRPC.sharedServicesBase && newest >= VibeRPC.sharedServicesBase
 }
 
 /// The denied tools as they're typed: names, separated by commas or spaces.

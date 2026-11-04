@@ -14,6 +14,7 @@
     "id": 9905,
     "result": {
       "auth": "api_key",
+      "auto_allow": true,
       "denied_tools": [
         "delete_issue"
       ],

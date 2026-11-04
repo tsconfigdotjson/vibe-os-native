@@ -65,6 +65,8 @@ commands:
               or stdin; how a host mends itself with the Mac away
   service disconnect SERVICE
               forget this host's login to a service
+  service audit
+              the last calls this host's agents made to its services
   key         list this host's API keys for MCP
   key create NAME  make an API key, and print it once
   key revoke NAME  revoke an API key

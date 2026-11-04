@@ -77,6 +77,15 @@ struct Inner {
     token_outage: bool,
     held_answers: HashMap<String, oneshot::Sender<Value>>,
     hold_streams: bool,
+    /// Tokens are turned down and API keys aren't.
+    reject_oauth: bool,
+    /// Its streams stay open after their answers, as a server's may.
+    linger_streams: bool,
+    lingering: Vec<mpsc::Sender<Bytes>>,
+    /// What it tells clients at `initialize`.
+    instructions: Option<String>,
+    /// A refused refresh's description repeats the token it was given.
+    echo_refresh: bool,
 }
 
 /// The stand-in, serving until it's dropped.
@@ -124,6 +133,7 @@ fn tools() -> Vec<Value> {
         tool("ask_user", "Asks the client something, then answers."),
         tool("boom", "Always fails, as a tool."),
         tool("no_answer", "Closes its stream without answering."),
+        tool("accepts_only", "Says 202 to a request, and never answers."),
     ]
 }
 
@@ -344,6 +354,27 @@ impl FakeService {
         self.state().token_outage = out;
     }
 
+    /// Only OAuth tokens are turned down, as when a login's revoked while a
+    /// personal key is good.
+    pub fn reject_oauth_tokens(&self, reject: bool) {
+        self.state().reject_oauth = reject;
+    }
+
+    /// Its event streams, `initialize`'s too, stay open after their answers.
+    pub fn linger_streams(&self) {
+        self.state().linger_streams = true;
+    }
+
+    pub fn set_instructions(&self, text: &str) {
+        self.state().instructions = Some(text.to_owned());
+    }
+
+    /// A refused refresh's description repeats the token, as a careless server's
+    /// might.
+    pub fn echo_refresh_in_errors(&self) {
+        self.state().echo_refresh = true;
+    }
+
     /// `stream_issues` waits after its first event, until [`Self::release`].
     pub fn hold_streams(&self) {
         self.state().hold_streams = true;
@@ -542,6 +573,12 @@ async fn token(inner: &Mutex<Inner>, base: &str, body: &[u8]) -> Response<Channe
             let mut state = lock(inner);
             state.refreshes += 1;
             if let Some(code) = state.refuse_refresh.clone() {
+                if state.echo_refresh {
+                    return json_reply(
+                        400,
+                        json!({"error": code, "error_description": format!("no to {}", get("refresh_token"))}),
+                    );
+                }
                 return oauth_error(&code);
             }
             if !state.clients.contains(&get("client_id")) {
@@ -596,7 +633,7 @@ async fn mcp(
     let authorized = !state.reject_all
         && bearer
             .as_deref()
-            .is_some_and(|b| b == API_KEY || state.access.contains(b));
+            .is_some_and(|b| b == API_KEY || (!state.reject_oauth && state.access.contains(b)));
     let known_session = session.as_ref().is_some_and(|s| state.sessions.contains(s));
     let status = if !authorized {
         401
@@ -639,13 +676,20 @@ async fn mcp(
             state.next += 1;
             let new_session = format!("fake-session-{}", state.next);
             state.sessions.insert(new_session.clone());
-            let answer = result(json!({
+            let mut answer = json!({
                 "protocolVersion": "2025-06-18",
                 "capabilities": {"tools": {"listChanged": true}},
                 "serverInfo": {"name": "fake-linear", "version": "1"},
-            }));
+            });
+            if let Some(i) = &state.instructions {
+                answer["instructions"] = json!(i);
+            }
+            let answer = result(answer);
             let (tx, rx) = mpsc::channel(1);
             let _ = tx.try_send(event(&answer));
+            if state.linger_streams {
+                state.lingering.push(tx);
+            }
             Response::builder()
                 .status(200)
                 .header("Content-Type", "text/event-stream")
@@ -694,6 +738,7 @@ async fn mcp(
                 ),
                 "stream_issues" => {
                     let hold = state.hold_streams;
+                    let linger = state.linger_streams;
                     let done = result(text("streamed".into()));
                     let progress = json!({
                         "jsonrpc": "2.0",
@@ -709,6 +754,9 @@ async fn mcp(
                             release.notified().await;
                         }
                         let _ = tx.send(event(&done)).await;
+                        if linger {
+                            std::future::pending::<()>().await;
+                        }
                     });
                     Response::builder()
                         .status(200)
@@ -744,6 +792,7 @@ async fn mcp(
                         .expect("a stream")
                 }
                 "no_answer" => whole(200, "text/event-stream", ": nothing\n\n".into()),
+                "accepts_only" => whole(202, "text/plain", String::new()),
                 other => json_reply(
                     200,
                     json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32602, "message": format!("no tool {other}")}}),

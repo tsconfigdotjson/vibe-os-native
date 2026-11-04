@@ -11,7 +11,8 @@
       "read_only": true,
       "denied_tools": [
         "delete_issue"
-      ]
+      ],
+      "auto_allow": true
     }
   },
   "response": {
@@ -19,6 +20,7 @@
     "id": 9901,
     "result": {
       "auth": "oauth",
+      "auto_allow": true,
       "denied_tools": [
         "delete_issue"
       ],

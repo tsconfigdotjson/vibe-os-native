@@ -13,6 +13,7 @@
     "jsonrpc": "2.0",
     "id": 9904,
     "result": {
+      "auto_allow": true,
       "denied_tools": [
         "delete_issue"
       ],

@@ -457,7 +457,7 @@ fn services_config(layout: &Layout) -> ServicesConfig {
             vibed::log!("vibed: VIBE_TEST_SERVICES_DIR is set: logins are kept in {dir}");
             Arc::new(FileStore(PathBuf::from(dir)))
         }
-        None if place == Place::Mac => Arc::new(Keychain),
+        None if place == Place::Mac => Arc::new(Keychain::default()),
         None => Arc::new(FileStore(layout.data_dir().join("services"))),
     };
     ServicesConfig {

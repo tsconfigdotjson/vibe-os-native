@@ -278,6 +278,11 @@ public struct ToolboxSummary: Equatable, Sendable {
         if let newest = status.newestBase, newest > (status.base ?? 0) {
             notes.append("Base \(newest) is installed. Rebuild Template moves to it.")
         }
+        if servicesNeedRebuild(status) {
+            notes.append(
+                "Linux agents have no shared services until the template is on base \(VibeRPC.sharedServicesBase): "
+                    + "Rebuild Template.")
+        }
         if let last = status.last {
             let what: String
             switch last.action {

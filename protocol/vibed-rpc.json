@@ -57,7 +57,8 @@
     { "name": "services.complete", "params": "ServiceCompleteParams", "result": "ServiceInfo" },
     { "name": "services.connect_key", "params": "ServiceKeyParams", "result": "ServiceInfo" },
     { "name": "services.disconnect", "params": "ServiceParams", "result": "ServiceInfo" },
-    { "name": "services.set", "params": "ServiceSetParams", "result": "ServiceInfo" }
+    { "name": "services.set", "params": "ServiceSetParams", "result": "ServiceInfo" },
+    { "name": "services.audit", "params": "HostParams", "result": "ServiceAuditList" }
   ],
   "notifications": [
     { "name": "events.event", "params": "Event" }
@@ -172,13 +173,15 @@
     "AgentMessagesParams": ["host", "ref", "last"],
     "Message": ["role", "text", "at"],
     "MessageList": ["messages"],
-    "ServiceInfo": ["name", "title", "state", "auth", "enabled", "read_only", "denied_tools", "tools", "detail", "detail_at"],
+    "ServiceInfo": ["name", "title", "state", "auth", "enabled", "read_only", "denied_tools", "auto_allow", "tools", "detail", "detail_at"],
     "ServiceList": ["services"],
     "ServiceParams": ["host", "service"],
     "ServiceAuthorization": ["service", "url", "callback_scheme"],
     "ServiceCompleteParams": ["host", "service", "callback_url"],
     "ServiceKeyParams": ["service", "key"],
-    "ServiceSetParams": ["host", "service", "enabled", "read_only", "denied_tools"]
+    "ServiceSetParams": ["host", "service", "enabled", "read_only", "denied_tools", "auto_allow"],
+    "ServiceAuditEntry": ["at", "agent", "service", "tool", "outcome", "ms"],
+    "ServiceAuditList": ["entries"]
   },
   "optional": {
     "Request": ["id", "params"],
@@ -256,7 +259,9 @@
     "ServiceAuthorization": [],
     "ServiceCompleteParams": ["host"],
     "ServiceKeyParams": [],
-    "ServiceSetParams": ["host", "enabled", "read_only", "denied_tools"]
+    "ServiceSetParams": ["host", "enabled", "read_only", "denied_tools", "auto_allow"],
+    "ServiceAuditEntry": [],
+    "ServiceAuditList": []
   },
   "nested": {
     "HostList": { "hosts": "HostInfo" },
@@ -278,6 +283,7 @@
     "HostInstall": { "host": "HostInfo" },
     "KeySyncParams": { "keys": "KeyHash" },
     "MessageList": { "messages": "Message" },
-    "ServiceList": { "services": "ServiceInfo" }
+    "ServiceList": { "services": "ServiceInfo" },
+    "ServiceAuditList": { "entries": "ServiceAuditEntry" }
   }
 }

@@ -148,7 +148,7 @@ names! {
 }
 
 names! {
-    /// Where a shared service stands, on the Mac that holds its login.
+    /// Where a shared service stands, on the host that holds its login.
     ServiceState {
         /// Never connected, or disconnected on purpose.
         Disconnected = "disconnected",

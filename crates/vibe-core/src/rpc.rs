@@ -386,6 +386,7 @@ pub const METHODS: &[&str] = &[
     ServicesConnectKey::NAME,
     ServicesDisconnect::NAME,
     ServicesSet::NAME,
+    ServicesAudit::NAME,
 ];
 
 /// Every notification the daemon sends.
@@ -1682,8 +1683,15 @@ method! {
 }
 
 method! {
-    /// `services.set`: changes the settings given.
+    /// `services.set`: changes the settings given. If they can't be kept,
+    /// nothing changes and it says so.
     ServicesSet = "services.set", ServiceSetParams => ServiceInfo
+}
+
+method! {
+    /// `services.audit`: the last calls agents on that host made to its services,
+    /// oldest first. Never arguments or tokens.
+    ServicesAudit = "services.audit", HostParams => ServiceAuditList
 }
 
 /// One shared service, on one host. Nothing here is secret: a token never leaves
@@ -1704,6 +1712,9 @@ pub struct ServiceInfo {
     pub read_only: bool,
     /// Tools no agent may list or call, by their names at the service.
     pub denied_tools: Vec<String>,
+    /// Claude Code runs its tools without asking, for agents started from here
+    /// on. Off, its own permission prompts govern them.
+    pub auto_allow: bool,
     /// How many tools agents see.
     pub tools: u32,
     /// The last thing that went wrong, for people.
@@ -1737,7 +1748,8 @@ pub struct ServiceAuthorization {
     pub callback_scheme: String,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+// By hand, below: it holds a sign-in's code.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServiceCompleteParams {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1747,12 +1759,30 @@ pub struct ServiceCompleteParams {
     pub callback_url: String,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+impl fmt::Debug for ServiceCompleteParams {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ServiceCompleteParams")
+            .field("host", &self.host)
+            .field("service", &self.service)
+            .finish_non_exhaustive()
+    }
+}
+
+// By hand, below: it holds a personal key.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServiceKeyParams {
     pub service: String,
     /// The key, which goes to this host's store and nowhere else.
     pub key: String,
+}
+
+impl fmt::Debug for ServiceKeyParams {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ServiceKeyParams")
+            .field("service", &self.service)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1767,6 +1797,29 @@ pub struct ServiceSetParams {
     pub read_only: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub denied_tools: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_allow: Option<bool>,
+}
+
+/// One call an agent made to a service. Never its arguments or a token.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceAuditEntry {
+    pub at: String,
+    /// The agent's ref, as far as its host could tell.
+    pub agent: String,
+    pub service: String,
+    /// The tool, by its name at the service.
+    pub tool: String,
+    /// How it ended: `ok`, `tool_error`, `denied`, `off`, `invalid`,
+    /// `not_connected`, `needs_reconnect`, `unavailable` or `cancelled`.
+    pub outcome: String,
+    /// How long it took, in milliseconds.
+    pub ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceAuditList {
+    pub entries: Vec<ServiceAuditEntry>,
 }
 
 #[cfg(test)]

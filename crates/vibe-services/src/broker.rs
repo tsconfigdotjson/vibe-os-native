@@ -7,7 +7,10 @@
 //! `connected`, `refreshing`, `needs_reconnect` (a refresh was refused) or
 //! `revoked` (a freshly refreshed token, or a key, was turned down). Refreshes
 //! go one at a time per service, and a rotated token is persisted **before**
-//! it's used: a crash between the two can't strand a used refresh token. When
+//! it's used. A refresh runs on a task of its own that its callers wait on, so
+//! a shim going away can't cut one short: only a real crash can come between the
+//! service rotating a token and the write, and then the old token is what's
+//! kept, and is replayed within the service's replay grace. When
 //! auth fails, tools still list, from what was last seen, and calls get a tool
 //! error saying what to do. They work again after Reconnect, with nothing to
 //! do in the agent.
@@ -23,14 +26,14 @@
 //!
 //! Nothing secret leaves: not to a shim, a log, the state file or an error.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::fs;
-use std::io;
+use std::io::{self, BufRead, Write as _};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use http::Method;
@@ -40,7 +43,8 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use vibe_core::model::{ServiceAuth, ServiceState};
 use vibe_core::rpc::{
-    ErrorCode, ErrorObject, ServiceAuthorization, ServiceInfo, ServiceList, ServiceSetParams,
+    ErrorCode, ErrorObject, ServiceAuditEntry, ServiceAuditList, ServiceAuthorization, ServiceInfo,
+    ServiceList, ServiceSetParams,
 };
 use vibe_core::time::rfc3339;
 use vibe_relay::MAX_MESSAGE;
@@ -77,6 +81,15 @@ const CATALOG_AGENT: &str = "(catalog)";
 /// How many pages of tools a catalog may have, should a service never stop.
 const MAX_PAGES: usize = 50;
 
+/// How many of one shim's messages may be under way at once. It may have many
+/// calls out, but no shim can make the broker hold without limit.
+const MAX_IN_FLIGHT: usize = 32;
+
+/// The audit entries kept to show, and how big their file gets before the older
+/// half of its life is set aside.
+const AUDIT_KEPT: usize = 500;
+const AUDIT_FILE_MAX: u64 = 5 << 20;
+
 /// What the broker needs from the daemon around it.
 #[derive(Clone)]
 pub struct Deps {
@@ -100,6 +113,16 @@ pub enum Place {
     LinuxHost,
 }
 
+impl Place {
+    /// Where its logins are, for people.
+    fn store(self) -> &'static str {
+        match self {
+            Place::Mac => "the Keychain",
+            Place::LinuxHost => "this host's login file",
+        }
+    }
+}
+
 impl fmt::Debug for Deps {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Deps").finish_non_exhaustive()
@@ -119,6 +142,10 @@ struct Saved {
     read_only: bool,
     #[serde(default)]
     denied_tools: Vec<String>,
+    /// Claude Code runs its tools without asking, for agents started from here
+    /// on. Off by default, so its own prompts govern writes.
+    #[serde(default)]
+    auto_allow: bool,
     #[serde(default = "disconnected")]
     state: ServiceState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -151,6 +178,7 @@ impl Default for Saved {
             enabled: true,
             read_only: false,
             denied_tools: Vec::new(),
+            auto_allow: false,
             state: ServiceState::Disconnected,
             auth: None,
             detail: None,
@@ -166,9 +194,9 @@ impl Default for Saved {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AuthFailure {
     NotConnected,
-    /// Only the owner can fix it, on the Mac.
+    /// Only the owner can fix it, signing this host in again.
     NeedsReconnect,
-    /// It may pass: the service or the Keychain can't be reached.
+    /// It may pass: the service or this host's login store can't be reached.
     Unavailable(String),
 }
 
@@ -308,6 +336,8 @@ enum CallError {
 
 /// What the broker serves: every supported service.
 pub struct Services {
+    /// Itself, for what must outlive whoever asked for it: a refresh.
+    me: Weak<Services>,
     conns: Vec<Arc<Conn>>,
     http: Http,
     store: Arc<dyn SecretStore>,
@@ -317,6 +347,10 @@ pub struct Services {
     deps: Deps,
     sessions: Mutex<HashMap<(String, String), Arc<SessionCell>>>,
     pending: Mutex<HashMap<String, Pending>>,
+    /// The last calls, for the app, and where they're kept: on this host, as
+    /// its calls are its own.
+    audit: Mutex<VecDeque<ServiceAuditEntry>>,
+    audit_file: PathBuf,
 }
 
 impl fmt::Debug for Services {
@@ -339,18 +373,29 @@ fn failed(message: impl Into<String>) -> ErrorObject {
 }
 
 impl Services {
-    /// Picks up from the state file and the store. Reads the store on this
-    /// thread: it answers at once, and a locked Keychain is only noted.
+    /// Picks up from the state file. Logins are read later, never here, as
+    /// `security` may take its time and a daemon must serve its socket first:
+    /// [`Services::load_logins`] in the background, or on first use.
+    ///
+    /// A state file that can't be read has lost the owner's policy: its denied
+    /// tools and read-only choices. So every service starts turned off and says
+    /// why, rather than quietly coming up with no policy at all.
     pub fn new(
         services: Vec<Service>,
         store: Arc<dyn SecretStore>,
         state_file: PathBuf,
         deps: Deps,
     ) -> Arc<Services> {
-        let mut all: HashMap<String, Saved> = fs::read(&state_file)
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default();
+        let (mut all, unreadable) = read_state(&state_file);
+        if let Some(why) = &unreadable {
+            (deps.audit)(&format!(
+                "services: {} can't be read ({why}): every service is off until it's turned on",
+                state_file.display()
+            ));
+        }
+        let audit_file = state_file.with_file_name("services-audit.log");
+        let audit = read_audit(&audit_file);
+        let now = (deps.clock)();
         let conns = services
             .into_iter()
             .map(|def| {
@@ -359,28 +404,20 @@ impl Services {
                 if saved.state == ServiceState::Refreshing {
                     saved.state = ServiceState::Connected;
                 }
-                let (secret, loaded) = match store.load(&def.name) {
-                    Ok(secret) => {
-                        match (&secret, saved.state) {
-                            (None, _) => {
-                                saved.state = ServiceState::Disconnected;
-                                saved.auth = None;
-                            }
-                            (Some(s), ServiceState::Disconnected) => {
-                                saved.state = ServiceState::Connected;
-                                saved.auth = Some(s.auth);
-                            }
-                            (Some(s), _) => saved.auth = Some(s.auth),
-                        }
-                        (secret, true)
-                    }
-                    Err(_) => (None, false),
-                };
+                if unreadable.is_some() {
+                    saved.enabled = false;
+                    saved.detail = Some(format!(
+                        "This host's settings for {} couldn't be read, so its read-only and denied \
+                         tools choices are lost. It's off until you turn it on.",
+                        def.title
+                    ));
+                    saved.detail_at = Some(now);
+                }
                 Arc::new(Conn {
                     def,
                     place: deps.place,
-                    secret: Mutex::new(secret),
-                    loaded: AtomicBool::new(loaded),
+                    secret: Mutex::new(None),
+                    loaded: AtomicBool::new(false),
                     refreshing: tokio::sync::Mutex::new(()),
                     saved: Mutex::new(saved),
                     catalog_read: Mutex::new(None),
@@ -388,7 +425,8 @@ impl Services {
                 })
             })
             .collect();
-        Arc::new(Services {
+        Arc::new_cyclic(|me| Services {
+            me: me.clone(),
             conns,
             http: Http::new(),
             store,
@@ -397,7 +435,51 @@ impl Services {
             deps,
             sessions: Mutex::default(),
             pending: Mutex::default(),
+            audit: Mutex::new(audit),
+            audit_file,
         })
+    }
+
+    /// Reads every login, so what's shown is right before anything's asked of
+    /// it. It's fine for this to fail: each is tried again as it's needed.
+    pub async fn load_logins(&self) {
+        for conn in &self.conns {
+            let _ = self.load_secret(conn).await;
+        }
+    }
+
+    /// The last calls to this host's services, oldest first.
+    pub fn audit(&self) -> ServiceAuditList {
+        ServiceAuditList {
+            entries: lock(&self.audit).iter().cloned().collect(),
+        }
+    }
+
+    fn record_call(&self, entry: ServiceAuditEntry) {
+        (self.deps.audit)(&format!(
+            "services: agent={} service={} tool={} outcome={} ms={}",
+            entry.agent, entry.service, entry.tool, entry.outcome, entry.ms
+        ));
+        if let Err(e) = append_audit(&self.audit_file, &entry) {
+            (self.deps.audit)(&format!(
+                "services: can't keep the audit line in {}: {e}",
+                self.audit_file.display()
+            ));
+        }
+        let mut kept = lock(&self.audit);
+        if kept.len() >= AUDIT_KEPT {
+            kept.pop_front();
+        }
+        kept.push_back(entry);
+    }
+
+    /// Whether Claude Code's agents are to run `service`'s tools unasked.
+    pub fn auto_allowed(&self) -> Vec<String> {
+        self.conns
+            .iter()
+            .filter(|c| lock(&c.saved).auto_allow)
+            .map(|c| c.def.name.clone())
+            .collect()
     }
 
     fn conn(&self, service: &str) -> Option<&Arc<Conn>> {
@@ -418,6 +500,7 @@ impl Services {
             enabled: saved.enabled,
             read_only: saved.read_only,
             denied_tools: saved.denied_tools.clone(),
+            auto_allow: saved.auto_allow,
             tools: if saved.state == ServiceState::Disconnected || !saved.enabled {
                 0
             } else {
@@ -432,37 +515,41 @@ impl Services {
         }
     }
 
-    /// Keeps the state file. Failing to is noted, not fatal: only settings and
-    /// the last catalog are at stake, and the login's in the store.
-    fn persist(&self) {
+    /// Keeps the state file, whole and durably: it's the owner's policy, so a
+    /// crash must leave the old one or the new one, and never half of either.
+    fn persist(&self) -> io::Result<()> {
         let _one = lock(&self.state_lock);
         let all: HashMap<&str, Saved> = self
             .conns
             .iter()
             .map(|c| (c.def.name.as_str(), lock(&c.saved).clone()))
             .collect();
-        let Ok(bytes) = serde_json::to_vec_pretty(&all) else {
-            return;
-        };
+        let bytes = serde_json::to_vec_pretty(&all).map_err(io::Error::other)?;
         let tmp = self.state_file.with_extension("new");
-        let written = fs::OpenOptions::new()
+        let mut f = fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .mode(0o600)
-            .open(&tmp)
-            .and_then(|mut f| io::Write::write_all(&mut f, &bytes))
-            .and_then(|()| fs::rename(&tmp, &self.state_file));
-        if let Err(e) = written {
+            .open(&tmp)?;
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+        fs::rename(&tmp, &self.state_file)?;
+        if let Some(dir) = self.state_file.parent() {
+            fs::File::open(dir)?.sync_all()?;
+        }
+        Ok(())
+    }
+
+    fn changed(&self, conn: &Conn) {
+        // Only what the service last said is at stake here, not a choice of the
+        // owner's, which `set` keeps for itself. It's written again next time.
+        if let Err(e) = self.persist() {
             (self.deps.audit)(&format!(
                 "services: can't keep {}: {e}",
                 self.state_file.display()
             ));
         }
-    }
-
-    fn changed(&self, conn: &Conn) {
-        self.persist();
         (self.deps.changed)(&self.info(conn));
     }
 
@@ -481,14 +568,23 @@ impl Services {
 
     /// Text for people, with no token in it, whatever a service said.
     fn scrub(&self, conn: &Conn, text: &str) -> String {
-        let mut text: String = text.chars().take(300).collect();
+        self.scrub_also(conn, text, &[])
+    }
+
+    /// The same, with `also` taken out too: what a sign-in has in hand. Taken
+    /// out first and cut short after, so a cut can't leave part of one behind.
+    fn scrub_also(&self, conn: &Conn, text: &str, also: &[&str]) -> String {
+        let mut text = text.to_owned();
         if let Some(secret) = &*lock(&conn.secret) {
             text = text.replace(&secret.access, "[redacted]");
             if let Some(r) = &secret.refresh {
                 text = text.replace(r, "[redacted]");
             }
         }
-        text
+        for secret in also.iter().filter(|s| !s.is_empty()) {
+            text = text.replace(secret, "[redacted]");
+        }
+        text.chars().take(300).collect()
     }
 
     fn note(&self, conn: &Conn, state: ServiceState, detail: Option<String>) {
@@ -521,16 +617,35 @@ impl Services {
         let md = oauth::discover(&self.http, &conn.def.endpoint)
             .await
             .map_err(|e| failed(format!("Can't start signing in to {}: {e}", conn.def.title)))?;
-        let stale = lock(&conn.saved).client_stale;
+        let (stale, lost) = {
+            let saved = lock(&conn.saved);
+            (
+                saved.client_stale,
+                matches!(
+                    saved.state,
+                    ServiceState::NeedsReconnect | ServiceState::Revoked
+                ),
+            )
+        };
+        // A sign-in given up on leaves a client that's still good, and this
+        // shouldn't make another each time the button's pressed.
+        let abandoned = lock(&self.pending)
+            .get(service)
+            .filter(|p| p.at.elapsed() < PENDING_FOR)
+            .map(|p| p.client_id.clone());
         let known = self
             .load_secret(conn)
             .await
             .ok()
             .flatten()
             .and_then(|s| s.client_id);
-        let client_id = match known.filter(|_| !stale) {
-            Some(id) => id,
-            None => oauth::register(&self.http, &md).await.map_err(|e| {
+        // Reconnecting starts afresh: the client that lost its login may be why.
+        let client_id = match (
+            abandoned.filter(|_| !stale),
+            known.filter(|_| !stale && !lost),
+        ) {
+            (Some(id), _) | (None, Some(id)) => id,
+            (None, None) => oauth::register(&self.http, &md).await.map_err(|e| {
                 failed(format!("Can't start signing in to {}: {e}", conn.def.title))
             })?,
         };
@@ -614,11 +729,17 @@ impl Services {
             }
             _ => {}
         }
+        let in_hand = [
+            pending.verifier.as_str(),
+            pending.state.as_str(),
+            get("code").unwrap_or_default(),
+        ];
         if let Some(error) = get("error") {
             let said = get("error_description").unwrap_or(error);
-            return Err(failed(format!(
-                "{title} didn't sign you in: {}",
-                said.chars().take(200).collect::<String>()
+            return Err(failed(self.scrub_also(
+                conn,
+                &format!("{title} didn't sign you in: {said}"),
+                &in_hand,
             )));
         }
         let code = get("code").ok_or_else(|| invalid("that sign-in gave no code"))?;
@@ -646,12 +767,18 @@ impl Services {
                 } else {
                     format!(": {detail}")
                 };
-                return Err(failed(format!(
-                    "{title} refused the sign-in ({code}){tail}; start again"
+                return Err(failed(self.scrub_also(
+                    conn,
+                    &format!("{title} refused the sign-in ({code}){tail}; start again"),
+                    &in_hand,
                 )));
             }
             Err(TokenError::Unavailable(why)) => {
-                return Err(failed(format!("Can't finish signing in to {title}: {why}")));
+                return Err(failed(self.scrub_also(
+                    conn,
+                    &format!("Can't finish signing in to {title}: {why}"),
+                    &in_hand,
+                )));
             }
         };
         let now = (self.deps.clock)();
@@ -783,23 +910,38 @@ impl Services {
                 conn.def.title
             )));
         }
-        let was_read_only = lock(&conn.saved).read_only;
-        self.update(conn, |s| {
+        let before = {
+            let mut saved = lock(&conn.saved);
+            let before = saved.clone();
             if let Some(enabled) = p.enabled {
-                s.enabled = enabled;
+                saved.enabled = enabled;
             }
             if let Some(read_only) = p.read_only {
-                s.read_only = read_only;
+                saved.read_only = read_only;
             }
             if let Some(denied) = p.denied_tools {
-                s.denied_tools = denied;
+                saved.denied_tools = denied;
             }
-        });
+            if let Some(auto_allow) = p.auto_allow {
+                saved.auto_allow = auto_allow;
+            }
+            before
+        };
+        // A choice of the owner's that won't last isn't made: a denied tool
+        // mustn't come back with the next restart, unsaid.
+        if let Err(e) = self.persist() {
+            *lock(&conn.saved) = before;
+            return Err(failed(format!(
+                "Can't keep {}'s settings, so nothing changed: {e}",
+                conn.def.title
+            )));
+        }
         // Another endpoint: its sessions and its tools aren't these.
-        if lock(&conn.saved).read_only != was_read_only {
+        if lock(&conn.saved).read_only != before.read_only {
             self.forget_sessions(&p.service);
             *lock(&conn.catalog_read) = None;
         }
+        (self.deps.changed)(&self.info(conn));
         Ok(self.info(conn))
     }
 
@@ -816,6 +958,20 @@ impl Services {
             .map_err(io::Error::other)??;
         *lock(&conn.secret) = secret.clone();
         conn.loaded.store(true, Ordering::Relaxed);
+        // Whatever the state file says, the login's the truth of whether
+        // there is one.
+        self.update(conn, |saved| match &secret {
+            None => {
+                saved.state = ServiceState::Disconnected;
+                saved.auth = None;
+            }
+            Some(s) => {
+                saved.auth = Some(s.auth);
+                if saved.state == ServiceState::Disconnected {
+                    saved.state = ServiceState::Connected;
+                }
+            }
+        });
         Ok(secret)
     }
 
@@ -831,12 +987,32 @@ impl Services {
     /// A token to call with: the current one, or a refreshed one if it's
     /// running out or `rejected` is what's current. One refresh at a time:
     /// whoever waits gets what it made.
+    ///
+    /// On a task of its own, which callers only wait on: a call's task ends when
+    /// its shim goes, and a refresh cut short there would lose a token the
+    /// service has already rotated.
     async fn access(&self, conn: &Conn, rejected: Option<&str>) -> Result<String, AuthFailure> {
+        let unavailable =
+            |why: &str| AuthFailure::Unavailable(format!("this broker is stopping ({why})"));
+        let me = self.me.upgrade().ok_or_else(|| unavailable("it's gone"))?;
+        let conn = self
+            .conn(&conn.def.name)
+            .cloned()
+            .ok_or(AuthFailure::NotConnected)?;
+        let rejected = rejected.map(str::to_owned);
+        tokio::spawn(async move { me.access_now(&conn, rejected.as_deref()).await })
+            .await
+            .map_err(|e| unavailable(&e.to_string()))?
+    }
+
+    async fn access_now(&self, conn: &Conn, rejected: Option<&str>) -> Result<String, AuthFailure> {
         let _one = conn.refreshing.lock().await;
         let secret = self
             .load_secret(conn)
             .await
-            .map_err(|e| AuthFailure::Unavailable(format!("the Keychain can't be read ({e})")))?
+            .map_err(|e| {
+                AuthFailure::Unavailable(format!("{} can't be read ({e})", conn.place.store()))
+            })?
             .ok_or(AuthFailure::NotConnected)?;
         let state = lock(&conn.saved).state;
         if matches!(state, ServiceState::NeedsReconnect | ServiceState::Revoked) {
@@ -923,9 +1099,9 @@ impl Services {
             expires_at: tokens.expires_in.map(|s| now + s),
             ..secret
         };
-        // Write, then use. If this fails or never returns, the new token is
-        // never used, and the next attempt replays the old refresh token, which
-        // a service that rotates takes within its replay grace.
+        // Write, then use. If the write fails, or a crash comes first, the new
+        // token is never used, and the next attempt replays the old refresh
+        // token, which a service that rotates takes within its replay grace.
         if let Err(e) = self.write_secret(conn, rotated.clone()).await {
             let why = format!("can't keep the refreshed login ({e})");
             self.note(conn, ServiceState::Connected, Some(why.clone()));
@@ -1023,6 +1199,14 @@ impl Services {
             .and_then(Value::as_str)
             .ok_or_else(|| Rejected::Other("it didn't agree a protocol".into()))?
             .to_owned();
+        // What the service tells its clients, for the shim to tell its own.
+        let instructions = answer
+            .pointer("/result/instructions")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        if instructions.is_some() {
+            self.update(conn, |s| s.instructions = instructions);
+        }
         let session = UpstreamSession { id, protocol };
         let ready = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
         let reply = self
@@ -1074,7 +1258,13 @@ impl Services {
                         }
                         Err(Rejected::Token) => {
                             if refused_before {
-                                return Err(self.turned_down(conn));
+                                match self.turned_down(conn, &token) {
+                                    Some(e) => return Err(e),
+                                    None => {
+                                        rejected = None;
+                                        continue;
+                                    }
+                                }
                             }
                             rejected = Some(token);
                             continue;
@@ -1092,9 +1282,13 @@ impl Services {
             match reply.status {
                 401 => {
                     if refused_before {
-                        return Err(self.turned_down(conn));
+                        match self.turned_down(conn, &token) {
+                            Some(e) => return Err(e),
+                            None => rejected = None,
+                        }
+                    } else {
+                        rejected = Some(token);
                     }
-                    rejected = Some(token);
                 }
                 404 if session.id.is_some() && !session_retried => {
                     session_retried = true;
@@ -1112,7 +1306,14 @@ impl Services {
                         ))
                     };
                 }
-                202 | 204 => return Ok(()),
+                // Fine for what wants no answer. A request does, and without
+                // this its client would wait for one for ever.
+                202 | 204 if request_id.is_none() => return Ok(()),
+                202 | 204 => {
+                    return Err(CallError::Unavailable(
+                        "it took the call but said it won't answer".into(),
+                    ));
+                }
                 status => {
                     return Err(CallError::Unavailable(format!("it answered {status}")));
                 }
@@ -1122,8 +1323,16 @@ impl Services {
     }
 
     /// A token fresh from the service was turned down by it: the owner revoked
-    /// access there.
-    fn turned_down(&self, conn: &Conn) -> CallError {
+    /// access there. Unless it's no longer the login in use, as when a Reconnect
+    /// came meanwhile: then it says nothing of that login, and `None` says to go
+    /// again with the one there is now.
+    fn turned_down(&self, conn: &Conn, token: &str) -> Option<CallError> {
+        let current = lock(&conn.secret)
+            .as_ref()
+            .is_some_and(|s| s.access == token);
+        if !current {
+            return None;
+        }
         self.note(
             conn,
             ServiceState::Revoked,
@@ -1132,7 +1341,7 @@ impl Services {
                 conn.def.title
             )),
         );
-        CallError::Auth(AuthFailure::NeedsReconnect)
+        Some(CallError::Auth(AuthFailure::NeedsReconnect))
     }
 
     // ---- The catalog.
@@ -1141,6 +1350,7 @@ impl Services {
     /// last seen when the service can't say, so they still list with auth
     /// failing or the service away.
     async fn catalog(&self, conn: &Conn) -> Value {
+        let _ = self.load_secret(conn).await;
         let (state, enabled) = {
             let saved = lock(&conn.saved);
             (saved.state, saved.enabled)
@@ -1228,6 +1438,21 @@ impl Services {
                         let Ok(message) = serde_json::from_slice::<Value>(&line) else {
                             continue;
                         };
+                        if calls.len() >= MAX_IN_FLIGHT {
+                            if let Some(id) = message.get("id").filter(|_| message.get("method").is_some()) {
+                                let error = json!({"code": -32000, "message": format!(
+                                    "Too many calls under way on this connection (at most {MAX_IN_FLIGHT}); try again shortly"
+                                )});
+                                // Off this loop: it must go on reading, to notice the
+                                // shim going, however slowly that shim reads.
+                                let _ = out.try_send(
+                                    json!({"jsonrpc": "2.0", "id": id, "error": error})
+                                        .to_string()
+                                        .into_bytes(),
+                                );
+                            }
+                            continue;
+                        }
                         let (services, conn, agent, out) =
                             (services.clone(), conn.clone(), agent.clone(), out.clone());
                         calls.spawn(async move {
@@ -1241,36 +1466,69 @@ impl Services {
         Ok(tx)
     }
 
+    /// Handles one message from a shim. It fails closed: only the two requests
+    /// offered, a client's real answer and `notifications/*` go anywhere. All
+    /// else is refused, as nothing else may reach the service with this host's
+    /// token on it past the policy and audit below, batches and id-less calls
+    /// included.
     async fn handle(&self, conn: &Conn, agent: &str, message: Value, out: &mpsc::Sender<Vec<u8>>) {
-        let id = message.get("id").cloned();
-        match (message.get("method").and_then(Value::as_str), &id) {
-            (Some("tools/list"), Some(id)) => {
-                let result = self.catalog(conn).await;
-                send(out, json!({"jsonrpc": "2.0", "id": id, "result": result})).await;
-            }
-            (Some("tools/call"), Some(id)) => {
-                if let Some(answer) = self.call(conn, agent, id, &message, out).await {
-                    send(out, answer).await;
-                }
-            }
-            (Some(method), Some(id)) => {
-                let text = format!("Method not found: {method}");
-                let error = json!({"code": -32601, "message": text});
-                send(out, json!({"jsonrpc": "2.0", "id": id, "error": error})).await;
-            }
-            // A client's answer, or a notification such as a cancel.
-            _ => {
-                if lock(&conn.saved).enabled {
-                    let (sink, mut messages) = mpsc::channel::<Value>(16);
-                    let forward = async {
-                        while let Some(m) = messages.recv().await {
-                            send(out, m).await;
-                        }
-                    };
-                    let _ = tokio::join!(self.exchange(conn, agent, &message, sink), forward);
-                }
-            }
+        let refuse = |code: i64, text: &str, id: Option<&Value>| {
+            let error = json!({"code": code, "message": text});
+            json!({"jsonrpc": "2.0", "id": id.unwrap_or(&Value::Null), "error": error})
+        };
+        if !message.is_object() {
+            send(out, refuse(-32600, "Invalid Request", None)).await;
+            return;
         }
+        let id = message.get("id");
+        match (message.get("method"), id) {
+            (Some(Value::String(method)), Some(id)) => match method.as_str() {
+                "tools/list" => {
+                    let result = self.catalog(conn).await;
+                    send(out, json!({"jsonrpc": "2.0", "id": id, "result": result})).await;
+                }
+                "tools/call" => {
+                    if let Some(answer) = self.call(conn, agent, id, &message, out).await {
+                        send(out, answer).await;
+                    }
+                }
+                other => {
+                    let text = format!("Method not found: {other}");
+                    send(out, refuse(-32601, &text, Some(id))).await;
+                }
+            },
+            // A notification, which is all a request with no id may be.
+            (Some(Value::String(method)), None) if method.starts_with("notifications/") => {
+                self.forward(conn, agent, &message, out).await;
+            }
+            // A client's answer to something the service asked it.
+            (None, Some(_))
+                if message.get("result").is_some() || message.get("error").is_some() =>
+            {
+                self.forward(conn, agent, &message, out).await;
+            }
+            _ => send(out, refuse(-32600, "Invalid Request", id)).await,
+        }
+    }
+
+    /// Sends the service something that wants no answer of its own.
+    async fn forward(
+        &self,
+        conn: &Conn,
+        agent: &str,
+        message: &Value,
+        out: &mpsc::Sender<Vec<u8>>,
+    ) {
+        if !lock(&conn.saved).enabled {
+            return;
+        }
+        let (sink, mut messages) = mpsc::channel::<Value>(16);
+        let passing = async {
+            while let Some(m) = messages.recv().await {
+                send(out, m).await;
+            }
+        };
+        let _ = tokio::join!(self.exchange(conn, agent, message, sink), passing);
     }
 
     /// Makes one tool call: the answer to send if it hasn't been. Its audit
@@ -1284,17 +1542,21 @@ impl Services {
         message: &Value,
         out: &mpsc::Sender<Vec<u8>>,
     ) -> Option<Value> {
-        let tool = message
-            .pointer("/params/name")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
+        let name = message.pointer("/params/name").and_then(Value::as_str);
+        let tool = name.unwrap_or_default();
         let mut audit = Audit {
-            write: &self.deps.audit,
+            services: self,
             agent,
             service: &conn.def.name,
             tool,
             started: Instant::now(),
             done: false,
+        };
+        // A policy on names can't judge a call that doesn't have one.
+        let Some(_) = name else {
+            audit.finish("invalid");
+            let error = json!({"code": -32602, "message": "A tool call needs the tool's name"});
+            return Some(json!({"jsonrpc": "2.0", "id": id, "error": error}));
         };
         if !lock(&conn.saved).enabled {
             audit.finish("off");
@@ -1351,7 +1613,7 @@ impl Services {
 /// One tool call's audit line: agent, service, tool, outcome and time, and
 /// never its arguments. Exactly one, however the call ends.
 struct Audit<'a> {
-    write: &'a Arc<dyn Fn(&str) + Send + Sync>,
+    services: &'a Services,
     agent: &'a str,
     service: &'a str,
     tool: &'a str,
@@ -1364,13 +1626,14 @@ impl Audit<'_> {
         if std::mem::replace(&mut self.done, true) {
             return;
         }
-        (self.write)(&format!(
-            "services: agent={} service={} tool={} outcome={outcome} ms={}",
-            printable(self.agent),
-            self.service,
-            printable(self.tool),
-            self.started.elapsed().as_millis()
-        ));
+        self.services.record_call(ServiceAuditEntry {
+            at: rfc3339((self.services.deps.clock)()),
+            agent: printable(self.agent),
+            service: self.service.to_owned(),
+            tool: printable(self.tool),
+            outcome: outcome.to_owned(),
+            ms: self.started.elapsed().as_millis() as u64,
+        });
     }
 }
 
@@ -1378,6 +1641,57 @@ impl Drop for Audit<'_> {
     fn drop(&mut self) {
         self.finish("cancelled");
     }
+}
+
+/// What's in the state file, and why it can't be used if it can't. A file that's
+/// simply not there yet is no trouble: nothing's been chosen.
+fn read_state(path: &std::path::Path) -> (HashMap<String, Saved>, Option<String>) {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return (HashMap::new(), None),
+        Err(e) => return (HashMap::new(), Some(e.to_string())),
+    };
+    match serde_json::from_slice(&bytes) {
+        Ok(all) => (all, None),
+        Err(e) => {
+            // Kept to look at, as the next write replaces it. Nothing's secret.
+            let _ = fs::rename(path, path.with_extension("corrupt"));
+            (HashMap::new(), Some(e.to_string()))
+        }
+    }
+}
+
+/// The last entries of the audit file.
+fn read_audit(path: &std::path::Path) -> VecDeque<ServiceAuditEntry> {
+    let mut kept = VecDeque::new();
+    let Ok(file) = fs::File::open(path) else {
+        return kept;
+    };
+    for line in io::BufReader::new(file).lines().map_while(Result::ok) {
+        if let Ok(entry) = serde_json::from_str(&line) {
+            if kept.len() >= AUDIT_KEPT {
+                kept.pop_front();
+            }
+            kept.push_back(entry);
+        }
+    }
+    kept
+}
+
+/// Adds an entry to the audit file, setting it aside once it's big. It's on this
+/// host alone, as its calls are its own, and holds no argument or token.
+fn append_audit(path: &std::path::Path, entry: &ServiceAuditEntry) -> io::Result<()> {
+    if fs::metadata(path).is_ok_and(|m| m.len() > AUDIT_FILE_MAX) {
+        fs::rename(path, path.with_extension("log.1"))?;
+    }
+    let mut line = serde_json::to_vec(entry).map_err(io::Error::other)?;
+    line.push(b'\n');
+    fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)?
+        .write_all(&line)
 }
 
 /// Gives a shim a message. It's gone if this fails, and that's all right.
@@ -1436,8 +1750,10 @@ async fn read_messages(
         if m.get("method").is_none() && m.get("id") == request {
             answered = true;
         }
-        // Whoever was waiting has gone: reading on would be for nobody.
-        sink.send(m).await.is_ok()
+        // Whoever was waiting has gone: reading on would be for nobody. Nor is
+        // anything to come after the answer, whatever the stream is left doing,
+        // and what's waiting on this mustn't wait on that.
+        sink.send(m).await.is_ok() && !answered
     };
     let stream = reply
         .header("content-type")

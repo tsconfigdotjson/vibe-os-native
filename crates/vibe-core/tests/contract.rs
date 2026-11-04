@@ -226,6 +226,8 @@ fn rust_types() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
         entry::<ServiceCompleteParams>(),
         entry::<ServiceKeyParams>(),
         entry::<ServiceSetParams>(),
+        entry::<ServiceAuditEntry>(),
+        entry::<ServiceAuditList>(),
     ])
 }
 
@@ -312,6 +314,7 @@ fn rust_methods() -> BTreeMap<&'static str, MethodTypes> {
         method::<ServicesConnectKey>(),
         method::<ServicesDisconnect>(),
         method::<ServicesSet>(),
+        method::<ServicesAudit>(),
     ])
 }
 

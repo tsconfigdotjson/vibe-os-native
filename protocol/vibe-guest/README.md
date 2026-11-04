@@ -134,6 +134,11 @@ that many bytes, at most 16 MiB.
 | `ping` | 4 | guest → Mac | |
 | `pong` | 5 | Mac → guest | |
 
+The control port's `status` says `services: true` once all this is up. An older
+guest doesn't say at all, and the Mac then offers its agent nothing and dials
+nothing: a VM boots its base image's guest, and a template stays on the base it
+was built on. It takes base release 3 or later.
+
 Inside the VM, `vibe-guest` serves `/run/vibe/services.sock` (`0666`, as `vibe`
 must reach it): a shim's one JSON line, `{"open":"linear","agent":…}`, and its
 answer, `{"ok":true}` or `{"ok":false,"error":…}`, then JSON-RPC, one message per

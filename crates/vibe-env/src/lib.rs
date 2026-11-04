@@ -314,9 +314,16 @@ pub trait Compartment {
         None
     }
 
+    /// Why an agent starting now can't have the shared services here, if it
+    /// can't, for a compartment whose machine may be too old to serve them. It's
+    /// asked at a launch, so a VM may be booted by it.
+    fn services_unsupported(&self, _h: &Handle) -> Result<Option<String>> {
+        Ok(None)
+    }
+
     /// Dials the shared services' relay into a compartment that's a machine of
     /// its own, while it runs: the host's end of a connection the guest's hub
-    /// takes. `None` if it isn't running.
+    /// takes. `None` if it isn't running, or its guest doesn't serve them.
     fn services_relay(&self, _h: &Handle) -> Result<Option<std::os::unix::net::UnixStream>> {
         Ok(None)
     }

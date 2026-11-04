@@ -31,6 +31,9 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 /// seconds more (`session::Conn`).
 const SHIM_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// How long one write to the Mac's relay may block.
+const RELAY_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// How long a poweroff gives the agent to end before it's killed.
 const POWEROFF_GRACE: Duration = Duration::from_secs(3);
 
@@ -52,6 +55,9 @@ pub(crate) struct Guest {
     pub(crate) network: Arc<Mutex<Option<Network>>>,
     /// The shims in this VM, and the relay the Mac opens to carry them.
     pub(crate) services: vibe_relay::hub::Hub,
+    /// Its socket's up and its program's there, so the status says it serves
+    /// them, and the Mac offers them to the agent.
+    pub(crate) services_ready: std::sync::atomic::AtomicBool,
 }
 
 /// A vsock listener, or a Unix one standing in for it in tests.
@@ -183,6 +189,12 @@ pub(crate) fn services_relay(guest: &Guest, conn: File) {
     let (Ok(reader), Ok(closer)) = (conn.try_clone(), conn.try_clone()) else {
         return;
     };
+    // A Mac that's stopped reading mustn't hold up every shim here for longer
+    // than this. It's no help for reads, which wait for as long as it's quiet.
+    if let Err(e) = set_timeouts(conn.as_raw_fd(), None, Some(RELAY_WRITE_TIMEOUT)) {
+        log!("services: the Mac's relay: {e}");
+        return;
+    }
     log!("services: the Mac's relay is up");
     let ended = guest.services.carry(reader, conn, move || {
         // SAFETY: shutdown on a descriptor the closure owns.
@@ -195,8 +207,8 @@ pub(crate) fn services_relay(guest: &Guest, conn: File) {
 }
 
 /// Serves the socket agents' shims reach, on a thread of its own. It's for `vibe`
-/// as well as root, and only ever reaches this VM's relay.
-pub(crate) fn serve_services_socket(guest: Arc<Guest>, path: PathBuf) {
+/// as well as root, and only ever reaches this VM's relay. Says whether it could.
+pub(crate) fn serve_services_socket(guest: Arc<Guest>, path: PathBuf) -> bool {
     let bound = (|| {
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir)?;
@@ -210,7 +222,7 @@ pub(crate) fn serve_services_socket(guest: Arc<Guest>, path: PathBuf) {
         Ok(l) => l,
         Err(e) => {
             log!("can't serve {}: {e}", path.display());
-            return;
+            return false;
         }
     };
     let accepting = std::thread::Builder::new()
@@ -228,7 +240,9 @@ pub(crate) fn serve_services_socket(guest: Arc<Guest>, path: PathBuf) {
         });
     if let Err(e) = accepting {
         log!("can't serve {}: {e}", path.display());
+        return false;
     }
+    true
 }
 
 /// Copies this program to `path`, for agents to run as `vibe`. The initrd it
@@ -352,6 +366,9 @@ fn status(guest: &Guest) -> Status {
         layers: guest.layers.clone(),
         shares: guest.shares.clone(),
         problems: lock(&guest.problems).clone(),
+        services: guest
+            .services_ready
+            .load(std::sync::atomic::Ordering::Relaxed),
     }
 }
 

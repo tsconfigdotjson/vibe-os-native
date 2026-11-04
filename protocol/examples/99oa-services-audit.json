@@ -1,0 +1,27 @@
+{
+  "description": "The last calls agents on the host named made to its services, oldest first. Never arguments or tokens.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 9910,
+    "method": "services.audit",
+    "params": {
+      "host": "local"
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 9910,
+    "result": {
+      "entries": [
+        {
+          "agent": "dark-mode-review",
+          "at": "2026-10-30T11:59:00Z",
+          "ms": 42,
+          "outcome": "ok",
+          "service": "linear",
+          "tool": "list_issues"
+        }
+      ]
+    }
+  }
+}

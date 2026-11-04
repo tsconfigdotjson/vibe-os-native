@@ -343,6 +343,10 @@ pub struct Status {
     /// that wouldn't mount.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub problems: Vec<String>,
+    /// It serves shared MCP services: its socket's up, and agents have its
+    /// program to run the shim with. An older guest doesn't say, so it's false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub services: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

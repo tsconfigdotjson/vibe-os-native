@@ -9,6 +9,7 @@ mod sys;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use vibe_guest::boot::Boot;
@@ -129,6 +130,7 @@ pub(crate) fn main(args: Vec<String>) -> ExitCode {
                 problems: Mutex::new(setup.problems),
                 network,
                 services: Hub::new(Box::new(|_, _| Ok(())), Timing::default()),
+                services_ready: AtomicBool::new(false),
             };
             (guest, None)
         }
@@ -157,6 +159,7 @@ pub(crate) fn main(args: Vec<String>) -> ExitCode {
                 problems: Mutex::new(Vec::new()),
                 network,
                 services: Hub::new(Box::new(|_, _| Ok(())), Timing::default()),
+                services_ready: AtomicBool::new(false),
             };
             (guest, Some(test.vsock_dir))
         }
@@ -186,12 +189,19 @@ pub(crate) fn main(args: Vec<String>) -> ExitCode {
         Some(dir) => dir.join("services.sock"),
         None => PathBuf::from(local::GUEST_SOCKET),
     };
-    if unix_dir.is_none()
-        && let Err(e) = serve::install_program(std::path::Path::new(local::GUEST_PROGRAM))
-    {
+    let program = if unix_dir.is_some() {
+        Ok(())
+    } else {
+        serve::install_program(std::path::Path::new(local::GUEST_PROGRAM))
+    };
+    if let Err(e) = &program {
         log!("can't install the shared services' program: {e}");
     }
-    serve::serve_services_socket(guest.clone(), socket);
+    // Only if all's well does the status say so, and the Mac offer them.
+    let serving = serve::serve_services_socket(guest.clone(), socket);
+    guest
+        .services_ready
+        .store(program.is_ok() && serving, Ordering::Relaxed);
     // PID 1 never returns: the main thread reaps.
     session::reap(guest.agent.clone())
 }

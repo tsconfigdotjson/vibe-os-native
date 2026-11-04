@@ -6,11 +6,12 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use vibe_core::model::ServiceAuth;
@@ -78,15 +79,42 @@ const NOT_FOUND: i32 = 44;
 /// `security -i` reads lines of at most 4 KB. The tokens seen in practice are
 /// far shorter; a longer one is refused here rather than cut short there.
 const MAX_LINE: usize = 4000;
+/// How long a call to `security` may take.
+const SECURITY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The login Keychain, through `/usr/bin/security`, for writing and reading
 /// alike, so the item's access list lets `vibed` read it without a prompt. A
 /// login never goes on a command line: `security -i` reads the command that
-/// stores it from a pipe.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Keychain;
+/// stores it from a pipe. Every call has a time limit, as a locked Keychain can
+/// leave one waiting on someone who isn't there.
+#[derive(Debug, Clone)]
+pub struct Keychain {
+    program: PathBuf,
+    timeout: Duration,
+}
+
+impl Default for Keychain {
+    fn default() -> Self {
+        Keychain {
+            program: PathBuf::from(SECURITY),
+            timeout: SECURITY_TIMEOUT,
+        }
+    }
+}
+
+/// What a `security` run came to.
+struct Ran {
+    code: Option<i32>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
 
 impl Keychain {
+    /// Another `security`, with another limit: for tests.
+    pub fn with_program(program: PathBuf, timeout: Duration) -> Keychain {
+        Keychain { program, timeout }
+    }
+
     fn account(service: &str) -> io::Result<String> {
         if service.is_empty()
             || !service
@@ -101,31 +129,88 @@ impl Keychain {
         Ok(format!("service-{service}"))
     }
 
-    fn security() -> Command {
-        let mut c = Command::new(SECURITY);
-        c.stdin(Stdio::null()).stdout(Stdio::piped());
-        c.stderr(Stdio::piped());
-        c
+    /// Runs `security` with `args`, giving it `input`, for at most the limit.
+    fn run(&self, args: &[&str], input: Option<&[u8]>) -> io::Result<Ran> {
+        let mut child = Command::new(&self.program)
+            .args(args)
+            .stdin(if input.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        if let Some(input) = input {
+            // Under a pipe's buffer, so this can't block on a stuck `security`.
+            let mut stdin = child.stdin.take().expect("piped");
+            stdin.write_all(input)?;
+        }
+        let drain = |pipe: Option<Box<dyn Read + Send>>| {
+            std::thread::spawn(move || {
+                let mut out = Vec::new();
+                if let Some(mut pipe) = pipe {
+                    let _ = pipe.read_to_end(&mut out);
+                }
+                out
+            })
+        };
+        let stdout = drain(
+            child
+                .stdout
+                .take()
+                .map(|p| Box::new(p) as Box<dyn Read + Send>),
+        );
+        let stderr = drain(
+            child
+                .stderr
+                .take()
+                .map(|p| Box::new(p) as Box<dyn Read + Send>),
+        );
+        let deadline = Instant::now() + self.timeout;
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "security didn't answer in {}s (is the Keychain locked?)",
+                        self.timeout.as_secs()
+                    ),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        Ok(Ran {
+            code: status.code(),
+            stdout: stdout.join().unwrap_or_default(),
+            stderr: stderr.join().unwrap_or_default(),
+        })
     }
 }
 
 impl SecretStore for Keychain {
     fn load(&self, service: &str) -> io::Result<Option<Secret>> {
         let account = Keychain::account(service)?;
-        let out = Keychain::security()
-            .args([
+        let out = self.run(
+            &[
                 "find-generic-password",
                 "-s",
                 KEYCHAIN_SERVICE,
                 "-a",
                 &account,
                 "-w",
-            ])
-            .output()?;
-        if out.status.code() == Some(NOT_FOUND) {
+            ],
+            None,
+        )?;
+        if out.code == Some(NOT_FOUND) {
             return Ok(None);
         }
-        if !out.status.success() {
+        if out.code != Some(0) {
             return Err(io::Error::other(format!(
                 "security can't read {service}'s login: {}",
                 String::from_utf8_lossy(&out.stderr).trim()
@@ -148,20 +233,9 @@ impl SecretStore for Keychain {
                 format!("{service}'s login is too long for the Keychain through security"),
             ));
         }
-        let mut child = Command::new(SECURITY)
-            .arg("-i")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
-        child
-            .stdin
-            .take()
-            .expect("piped")
-            .write_all(line.as_bytes())?;
         // `security -i` exits 0 whatever its commands did: what it kept is the
         // proof. What it said isn't repeated, as it may quote the command.
-        child.wait()?;
+        self.run(&["-i"], Some(line.as_bytes()))?;
         if self.load(service)?.as_ref() != Some(secret) {
             return Err(io::Error::other(format!(
                 "the Keychain didn't keep {service}'s login"
@@ -172,16 +246,17 @@ impl SecretStore for Keychain {
 
     fn delete(&self, service: &str) -> io::Result<()> {
         let account = Keychain::account(service)?;
-        let out = Keychain::security()
-            .args([
+        let out = self.run(
+            &[
                 "delete-generic-password",
                 "-s",
                 KEYCHAIN_SERVICE,
                 "-a",
                 &account,
-            ])
-            .output()?;
-        if out.status.success() || out.status.code() == Some(NOT_FOUND) {
+            ],
+            None,
+        )?;
+        if out.code == Some(0) || out.code == Some(NOT_FOUND) {
             return Ok(());
         }
         Err(io::Error::other(format!(
@@ -428,13 +503,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_security_that_hangs_is_given_up_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("security");
+        let tmp = program.with_extension("new");
+        fs::write(&tmp, "#!/bin/sh\nexec sleep 60\n").unwrap();
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::rename(&tmp, &program).unwrap();
+        let store = Keychain::with_program(program, Duration::from_millis(200));
+        let started = Instant::now();
+        let err = store.load("linear").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
+        assert!(err.to_string().contains("locked"), "{err}");
+        assert!(store.store("linear", &secret("a")).is_err());
+        assert!(store.delete("linear").is_err());
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn security_saying_there_is_no_item_is_no_login() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("security");
+        let tmp = program.with_extension("new");
+        fs::write(&tmp, "#!/bin/sh\nexit 44\n").unwrap();
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::rename(&tmp, &program).unwrap();
+        let store = Keychain::with_program(program, Duration::from_secs(10));
+        assert_eq!(store.load("linear").unwrap(), None);
+        store.delete("linear").unwrap();
+    }
+
     // Only a Mac has a Keychain. A long login, near what `security -i` takes,
     // so a limit lower than thought shows up here, not at a user's refresh.
     #[cfg(target_os = "macos")]
     #[test]
     fn the_keychain_keeps_a_login_whole() {
         let name = format!("test-{}", std::process::id());
-        let store = Keychain;
+        let store = Keychain::default();
         let long = "x".repeat(2800);
         store.store(&name, &secret(&long)).unwrap();
         let kept = store.load(&name);

@@ -25,8 +25,9 @@ use tokio::net::UnixStream;
 use tokio::task::JoinHandle;
 use vibe_core::model::{AgentKind, AgentState, LOCAL_HOST};
 use vibe_core::rpc::{
-    ErrorCode, ErrorObject, HostParams, ServiceAuthorization, ServiceCompleteParams, ServiceInfo,
-    ServiceKeyParams, ServiceList, ServiceParams, ServiceSetParams,
+    ErrorCode, ErrorObject, HostParams, ServiceAuditList, ServiceAuthorization,
+    ServiceCompleteParams, ServiceInfo, ServiceKeyParams, ServiceList, ServiceParams,
+    ServiceSetParams,
 };
 use vibe_core::store::{AgentRecord, StoreError};
 use vibe_env::Backend;
@@ -127,19 +128,44 @@ impl Core {
         self.broker()?.set(p)
     }
 
+    pub fn services_audit(&self, p: HostParams) -> Result<ServiceAuditList, ErrorObject> {
+        self.host(p.host.as_deref())?;
+        Ok(self.broker()?.audit())
+    }
+
+    /// Whether `record`'s agent gets the shared services at its next launch: what
+    /// its profile says now, or if that's gone, what it said at the start.
+    pub(crate) fn services_on(&self, record: &AgentRecord) -> bool {
+        match self
+            .store()
+            .profile(&record.host, &record.project, &record.profile)
+        {
+            Ok(profile) => profile.shared_services,
+            Err(_) => record.shared_services,
+        }
+    }
+
     /// What to offer `record`'s agent: the same JSON whichever kind it is, or
-    /// nothing if its profile has them off.
+    /// nothing if its profile has them off or there's no broker here.
     pub fn shared_services(
         &self,
         backend: &Arc<dyn Backend>,
         record: &AgentRecord,
     ) -> Option<String> {
-        record.shared_services.then(|| {
+        (self.services.is_some() && self.services_on(record)).then(|| {
             let program = backend
                 .services_program()
                 .unwrap_or_else(|| self.vibe_cli.to_string_lossy().into_owned());
             servers_json(&program, &supported_names())
         })
+    }
+
+    /// The services the owner has chosen to run without Claude Code asking.
+    pub(crate) fn services_auto_allowed(&self) -> Vec<String> {
+        self.services
+            .as_ref()
+            .map(|b| b.auto_allowed())
+            .unwrap_or_default()
     }
 
     /// The local socket, when the agent's on this machine rather than in a VM
@@ -167,13 +193,16 @@ impl Core {
         let Some(agent) = agent else {
             return Ok(());
         };
-        match self.store().agent(LOCAL_HOST, agent) {
-            Ok(a) if !a.shared_services => {
-                Err("shared services are off for this agent's profile".to_owned())
-            }
+        let record = match self.store().agent(LOCAL_HOST, agent) {
+            Ok(record) => record,
             // One this host doesn't know of isn't an agent of a profile.
-            Ok(_) | Err(StoreError::NotFound(_)) => Ok(()),
-            Err(e) => Err(e.to_string()),
+            Err(StoreError::NotFound(_)) => return Ok(()),
+            Err(e) => return Err(e.to_string()),
+        };
+        if self.services_on(&record) {
+            Ok(())
+        } else {
+            Err("shared services are off for this agent's profile".to_owned())
         }
     }
 
@@ -200,6 +229,10 @@ impl Core {
         }
         let core = Arc::downgrade(self);
         tasks.push(tokio::spawn(async move { keep_relays(core).await }));
+        // In the background, as a locked Keychain can take a while to say so.
+        if let Some(broker) = self.services.clone() {
+            tasks.push(tokio::spawn(async move { broker.load_logins().await }));
+        }
         tasks
     }
 }
@@ -248,19 +281,34 @@ pub struct Injection {
 ///
 /// - Claude Code takes them per launch with `--mcp-config`, which adds to the
 ///   owner's own servers rather than replacing them. No `--strict-mcp-config`,
-///   and no allow rule, so Claude's permission prompts still govern writes.
-/// - Pi takes them through an extension that registers each for the session:
-///   its backend adds `-e <that extension>`, and the extension reads
-///   [`SERVICES_ENV`].
-pub fn injection(kind: AgentKind, servers: Option<&str>) -> Injection {
+///   and no allow rule unless the owner opted in, per service, so by default
+///   Claude's permission prompts still govern writes.
+/// - Pi, once #52 wires it, takes them through an extension that registers each
+///   for the session: its backend adds `-e <that extension>`, and the extension
+///   reads [`SERVICES_ENV`].
+///
+/// `auto_allowed` are the services the owner chose to run unasked. It's for
+/// Claude Code alone: a Pi agent is never asked anyway.
+pub fn injection(kind: AgentKind, servers: Option<&str>, auto_allowed: &[String]) -> Injection {
     let Some(servers) = servers else {
         return Injection::default();
     };
     match kind {
-        AgentKind::Claude => Injection {
-            args: vec!["--mcp-config".to_owned(), servers.to_owned()],
-            env: Vec::new(),
-        },
+        AgentKind::Claude => {
+            let mut args = vec!["--mcp-config".to_owned(), servers.to_owned()];
+            if !auto_allowed.is_empty() {
+                args.push("--allowedTools".to_owned());
+                args.extend(
+                    auto_allowed
+                        .iter()
+                        .map(|s| format!("mcp__{}__*", vibe_relay::server_name(s))),
+                );
+            }
+            Injection {
+                args,
+                env: Vec::new(),
+            }
+        }
         AgentKind::Pi => Injection {
             args: Vec::new(),
             env: vec![(SERVICES_ENV.to_owned(), servers.to_owned())],
@@ -371,7 +419,7 @@ async fn keep_vm_relays(core: &Core, broker: &Arc<Services>, vms: &mut HashMap<S
         .iter()
         // A start included, so its agent has its tools from the first.
         .filter(|a| {
-            a.shared_services && !matches!(a.state, AgentState::Asleep | AgentState::Exited)
+            !matches!(a.state, AgentState::Asleep | AgentState::Exited) && core.services_on(a)
         })
         .collect();
     vms.retain(|r, _| wanted.iter().any(|a| &a.agent_ref == r));
@@ -444,14 +492,14 @@ mod tests {
     fn claude_gets_a_flag_and_pi_an_environment_variable_from_the_same_json() {
         let json = linear();
         assert_eq!(
-            injection(AgentKind::Claude, Some(&json)),
+            injection(AgentKind::Claude, Some(&json), &[]),
             Injection {
                 args: vec!["--mcp-config".to_owned(), json.clone()],
                 env: Vec::new(),
             }
         );
         assert_eq!(
-            injection(AgentKind::Pi, Some(&json)),
+            injection(AgentKind::Pi, Some(&json), &["linear".to_owned()]),
             Injection {
                 args: Vec::new(),
                 env: vec![("VIBE_SERVICES".to_owned(), json.clone())],
@@ -462,7 +510,10 @@ mod tests {
     #[test]
     fn off_means_nothing_for_any_kind() {
         for kind in AgentKind::ALL {
-            assert_eq!(injection(*kind, None), Injection::default());
+            assert_eq!(
+                injection(*kind, None, &["linear".to_owned()]),
+                Injection::default()
+            );
         }
     }
 
@@ -474,8 +525,14 @@ mod tests {
     #[test]
     fn claudes_own_servers_keep_loading() {
         // Nothing here may make Claude ignore the owner's servers.
-        let i = injection(AgentKind::Claude, Some(&linear()));
+        let i = injection(AgentKind::Claude, Some(&linear()), &[]);
         assert!(!i.args.iter().any(|a| a == "--strict-mcp-config"));
         assert!(!i.args.iter().any(|a| a.contains("allowedTools")));
+    }
+
+    #[test]
+    fn a_service_runs_unasked_only_if_the_owner_opted_in() {
+        let i = injection(AgentKind::Claude, Some(&linear()), &["linear".to_owned()]);
+        assert_eq!(i.args[2..], ["--allowedTools", "mcp__vibe-linear__*"]);
     }
 }

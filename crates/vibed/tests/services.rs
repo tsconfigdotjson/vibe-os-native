@@ -41,6 +41,8 @@ struct Seen {
     launches: Arc<Mutex<Vec<vibe_env::Launch>>>,
     vm: Option<PathBuf>,
     relays: Arc<Mutex<usize>>,
+    /// Its guest says it's too old for shared services.
+    old_guest: bool,
 }
 
 impl vibe_env::Compartment for Seen {
@@ -76,8 +78,11 @@ impl vibe_env::Compartment for Seen {
             .as_ref()
             .map(|_| vibe_relay::local::GUEST_PROGRAM.to_owned())
     }
+    fn services_unsupported(&self, _: &vibe_env::Handle) -> vibe_env::Result<Option<String>> {
+        Ok(self.old_guest.then(|| "its guest is too old".to_owned()))
+    }
     fn services_relay(&self, _: &vibe_env::Handle) -> vibe_env::Result<Option<UnixStream>> {
-        let Some(dir) = &self.vm else {
+        let Some(dir) = self.vm.as_ref().filter(|_| !self.old_guest) else {
             return Ok(None);
         };
         let port = dir.join(vibe_relay::frame::VSOCK_PORT.to_string());
@@ -121,6 +126,7 @@ struct Node {
     launches: Arc<Mutex<Vec<vibe_env::Launch>>>,
     relays: Arc<Mutex<usize>>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
+    layout: Layout,
 }
 
 impl Drop for Node {
@@ -138,6 +144,17 @@ async fn node(
     vm: Option<PathBuf>,
     change: impl FnOnce(&mut Config),
 ) -> Node {
+    node_with(fake, place, store, vm, false, change).await
+}
+
+async fn node_with(
+    fake: &FakeService,
+    place: Place,
+    store: Arc<dyn SecretStore>,
+    vm: Option<PathBuf>,
+    old_guest: bool,
+    change: impl FnOnce(&mut Config),
+) -> Node {
     let golden = Golden::new();
     let mut config = golden.config();
     let launches: Arc<Mutex<Vec<vibe_env::Launch>>> = Arc::default();
@@ -147,6 +164,7 @@ async fn node(
         launches: launches.clone(),
         vm,
         relays: relays.clone(),
+        old_guest,
     }));
     config.services = Some(ServicesConfig {
         services: vec![fake.service()],
@@ -164,6 +182,7 @@ async fn node(
         config.toolbox = None;
     }
     change(&mut config);
+    let layout = config.layout.clone();
     let core = Arc::new(Core::open(config).unwrap());
     core.add_project(ProjectAddParams {
         path: Some(golden.home.join("src/app").to_str().unwrap().into()),
@@ -179,6 +198,7 @@ async fn node(
         launches,
         relays,
         tasks,
+        layout,
     }
 }
 
@@ -305,6 +325,151 @@ async fn every_profile_offers_the_services_per_launch_until_it_is_switched_off()
         text(&refused).contains("off for this agent's profile"),
         "{refused}"
     );
+}
+
+/// Ends an agent's session, as Claude exiting does.
+fn end_session(n: &Node, agent: &str) {
+    let status = vibe_core::shim::connect(
+        &n.layout.session_socket(agent),
+        &vibe_core::shim::control_hello("test"),
+        Duration::from_secs(10),
+    )
+    .unwrap()
+    .status()
+    .unwrap();
+    vibe_env::tree::SessionTree::new(status.pid).end(Duration::from_secs(5));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn switching_a_profile_off_takes_them_from_its_agents_next_launch() {
+    let fake = FakeService::start().await;
+    let n = node(
+        &fake,
+        Place::Mac,
+        Arc::new(MemoryStore::default()),
+        None,
+        |_| {},
+    )
+    .await;
+    let a = n
+        .core
+        .start_agent(start("on", "software-eng-linux"))
+        .await
+        .unwrap();
+    assert!(offered(n.launches.lock().unwrap().last().unwrap()).is_some());
+    let socket = n.core.services_socket();
+
+    // Off, with the agent running: its next connection is refused at once...
+    n.core
+        .update_profile(ProfileUpdateParams {
+            project: "app".into(),
+            profile: "software-eng-linux".into(),
+            shared_services: Some(false),
+            ..Default::default()
+        })
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (cache, agent) = (dir.path().to_owned(), a.agent.clone());
+    let refused = {
+        let socket = socket.clone();
+        blocking(move || Shim::start(&socket, &cache, Some(&agent)).call("list_issues")).await
+    };
+    assert!(
+        text(&refused).contains("off for this agent's profile"),
+        "{refused}"
+    );
+
+    // ...and when it's next launched, by a resume, it isn't offered them.
+    let before = n.launches.lock().unwrap().len();
+    end_session(&n, &a.agent);
+    n.core.resume_agent(None, &a.agent).await.unwrap();
+    let launches = n.launches.lock().unwrap().clone();
+    assert!(launches.len() > before, "it launched again");
+    let last = launches.last().unwrap();
+    assert!(last.args.iter().any(|x| x == "--resume"), "{:?}", last.args);
+    assert_eq!(offered(last), None, "{:?}", last.args);
+
+    // Back on, the same again.
+    n.core
+        .update_profile(ProfileUpdateParams {
+            project: "app".into(),
+            profile: "software-eng-linux".into(),
+            shared_services: Some(true),
+            ..Default::default()
+        })
+        .unwrap();
+    let before = n.launches.lock().unwrap().len();
+    end_session(&n, &a.agent);
+    n.core.resume_agent(None, &a.agent).await.unwrap();
+    let launches = n.launches.lock().unwrap().clone();
+    assert!(launches.len() > before);
+    assert!(offered(launches.last().unwrap()).is_some());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_older_guest_is_offered_nothing_and_gets_no_relay() {
+    // As a template built on an older base goes on booting: it hasn't the port,
+    // the socket or the program, so offering them would only break the session.
+    let fake = FakeService::start().await;
+    let guest = Guest::start();
+    let n = node_with(
+        &fake,
+        Place::Mac,
+        Arc::new(MemoryStore::default()),
+        Some(guest.dir.path().to_owned()),
+        true,
+        |_| {},
+    )
+    .await;
+    n.core
+        .start_agent(start("old", "software-eng-linux"))
+        .await
+        .unwrap();
+    let launch = n.launches.lock().unwrap().last().unwrap().clone();
+    assert_eq!(offered(&launch), None, "{:?}", launch.args);
+    assert_eq!(env_of(&launch, "VIBE_SERVICES_SOCKET"), None);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(*n.relays.lock().unwrap(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn claude_runs_a_service_unasked_only_if_the_owner_opted_in() {
+    let fake = FakeService::start().await;
+    let n = node(
+        &fake,
+        Place::Mac,
+        Arc::new(MemoryStore::default()),
+        None,
+        |_| {},
+    )
+    .await;
+    n.core
+        .start_agent(start("default", "software-eng-linux"))
+        .await
+        .unwrap();
+    let launch = n.launches.lock().unwrap().last().unwrap().clone();
+    assert!(!launch.args.iter().any(|a| a == "--allowedTools"));
+
+    n.core
+        .services_set(vibe_core::rpc::ServiceSetParams {
+            service: "linear".into(),
+            auto_allow: Some(true),
+            ..Default::default()
+        })
+        .unwrap();
+    n.core
+        .start_agent(start("opted in", "software-eng-linux"))
+        .await
+        .unwrap();
+    let launch = n.launches.lock().unwrap().last().unwrap().clone();
+    let at = launch
+        .args
+        .iter()
+        .position(|a| a == "--allowedTools")
+        .unwrap();
+    assert_eq!(launch.args[at + 1], "mcp__vibe-linear__*");
+    // A flag follows at once, as it takes as many values as it can find.
+    assert!(launch.args[at + 2].starts_with("--"), "{:?}", launch.args);
 }
 
 // ---- Shims.

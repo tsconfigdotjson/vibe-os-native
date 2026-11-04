@@ -15,6 +15,7 @@
       "services": [
         {
           "auth": "oauth",
+          "auto_allow": false,
           "denied_tools": [],
           "detail": "Linear refused the refresh (invalid_client)",
           "detail_at": "2026-10-30T12:00:00Z",

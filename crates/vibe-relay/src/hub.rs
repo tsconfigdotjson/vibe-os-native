@@ -105,20 +105,25 @@ impl Hub {
                     let Some(state) = watched.upgrade() else {
                         return;
                     };
-                    let mut state = lock(&state);
-                    let Some(carrier) = &state.carrier else {
-                        continue;
-                    };
-                    if carrier.last_heard.elapsed() >= timing.dead_after {
-                        if let Some(dead) = state.carrier.take() {
-                            (dead.close)();
-                            close_streams(dead.streams);
+                    let writer = {
+                        let mut state = lock(&state);
+                        let Some(carrier) = &state.carrier else {
+                            continue;
+                        };
+                        if carrier.last_heard.elapsed() >= timing.dead_after {
+                            if let Some(dead) = state.carrier.take() {
+                                (dead.close)();
+                                close_streams(dead.streams);
+                            }
+                            continue;
                         }
-                        continue;
-                    }
-                    // Never wait on a relay that's stuck: its silence is what
-                    // ends it.
-                    if let Ok(mut w) = carrier.writer.try_lock() {
+                        carrier.writer.clone()
+                    };
+                    // With nothing held that a shim needs. And never waiting on
+                    // a relay that's stuck, whose silence is what ends it: a
+                    // write's stuck only as long as its connection's send
+                    // timeout, which `carry`'s caller sets.
+                    if let Ok(mut w) = writer.try_lock() {
                         let _ = write_frame(&mut *w, &Frame::Ping);
                     }
                 }
@@ -132,7 +137,8 @@ impl Hub {
     }
 
     /// Carries the relay on this connection until it ends, replacing any
-    /// other. `close` must make the connection's reads end.
+    /// other. `close` must make the connection's reads end, and `writer` should
+    /// have a send timeout, or a Mac that's stopped reading holds up every shim.
     pub fn carry(
         &self,
         mut reader: impl Read,

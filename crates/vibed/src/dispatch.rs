@@ -11,10 +11,10 @@ use vibe_core::rpc::{
     HostsList, HostsRemove, HostsUpgrade, Id, KeysCreate, KeysList, KeysRevoke, KeysSync,
     KeysVerify, LimitsGet, LimitsSet, McpGet, McpSet, Method, PROTOCOL_VERSION, ProfilesCreate,
     ProfilesDelete, ProfilesList, ProfilesUpdate, ProjectsAdd, ProjectsList, ProjectsRemove,
-    ProtocolMismatchData, Request, Response, ServicesComplete, ServicesConnect, ServicesConnectKey,
-    ServicesDisconnect, ServicesList, ServicesSet, SessionsAttach, SessionsList, Subscribed,
-    ToolboxClose, ToolboxLoginsGet, ToolboxOpen, ToolboxRebuild, ToolboxStatusGet, ToolboxUpdate,
-    TunnelPrepare,
+    ProtocolMismatchData, Request, Response, ServicesAudit, ServicesComplete, ServicesConnect,
+    ServicesConnectKey, ServicesDisconnect, ServicesList, ServicesSet, SessionsAttach,
+    SessionsList, Subscribed, ToolboxClose, ToolboxLoginsGet, ToolboxOpen, ToolboxRebuild,
+    ToolboxStatusGet, ToolboxUpdate, TunnelPrepare,
 };
 
 use crate::core::Core;
@@ -289,6 +289,7 @@ async fn call(
                 .await,
         ),
         ServicesSet::NAME => encode_result(core.services_set(decode::<ServicesSet>(params)?)),
+        ServicesAudit::NAME => encode_result(core.services_audit(decode::<ServicesAudit>(params)?)),
         _ => Err(ErrorObject::new(
             ErrorCode::MethodNotFound,
             format!("Method not found: {method}"),

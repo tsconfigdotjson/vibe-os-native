@@ -16,6 +16,9 @@ use vibe_services::secrets::MemoryStore;
 use vibe_services::testing::{API_KEY, FakeService, SECRET_MARK};
 use vibe_services::{Deps, Place, Secret, SecretStore, Services};
 
+/// The stand-in's tools.
+const TOOLS: usize = 7;
+
 const RECONNECT: &str =
     "Linear needs reconnecting on the Mac (VibeOS → Settings → Services → Reconnect).";
 
@@ -470,7 +473,7 @@ async fn a_crash_before_the_write_strands_nothing() {
     w.sign_in().await;
     let mut a = w.agent("a");
     // The catalog's read, so nothing else is after a refresh just now.
-    assert_eq!(a.tools().await.len(), 6);
+    assert_eq!(a.tools().await.len(), TOOLS);
     let kept = w.secret();
     w.fake.expire_access();
     store.fail.store(true, Ordering::SeqCst);
@@ -541,7 +544,7 @@ async fn invalid_grant_needs_reconnecting_and_reconnect_needs_no_agent_restart()
     let w = World::new().await;
     w.sign_in().await;
     let mut a = w.agent("a");
-    assert_eq!(a.tools().await.len(), 6);
+    assert_eq!(a.tools().await.len(), TOOLS);
     w.fake.expire_access();
     w.fake.refuse_refresh("invalid_grant");
 
@@ -557,7 +560,7 @@ async fn invalid_grant_needs_reconnecting_and_reconnect_needs_no_agent_restart()
     assert_eq!(info.detail_at.as_deref(), Some("1970-01-12T13:46:40Z"));
 
     // Tools still list, and it doesn't keep bothering the service.
-    assert_eq!(a.tools().await.len(), 6);
+    assert_eq!(a.tools().await.len(), TOOLS);
     let refreshes = w.fake.refreshes();
     assert_eq!(text(&a.call("list_issues").await), RECONNECT);
     assert_eq!(w.fake.refreshes(), refreshes);
@@ -571,7 +574,8 @@ async fn invalid_grant_needs_reconnecting_and_reconnect_needs_no_agent_restart()
     assert_eq!(info.detail_at, None);
     let answer = a.call("list_issues").await;
     assert_eq!(text(&answer), "issues on /mcp", "{answer}");
-    assert_eq!(w.fake.registrations(), 1, "its client was still good");
+    // Reconnecting starts afresh, as the client may be what was wrong.
+    assert_eq!(w.fake.registrations(), 2);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -607,7 +611,7 @@ async fn a_token_turned_down_after_a_fresh_refresh_means_revoked() {
     let w = World::new().await;
     w.sign_in().await;
     let mut a = w.agent("a");
-    assert_eq!(a.tools().await.len(), 6);
+    assert_eq!(a.tools().await.len(), TOOLS);
     w.fake.reject_all_tokens(true);
     let answer = a.call("list_issues").await;
     assert!(is_error(&answer), "{answer}");
@@ -619,7 +623,7 @@ async fn a_token_turned_down_after_a_fresh_refresh_means_revoked() {
         info.detail.as_deref().unwrap().contains("revoked"),
         "{info:?}"
     );
-    assert_eq!(a.tools().await.len(), 6, "tools still list");
+    assert_eq!(a.tools().await.len(), TOOLS, "tools still list");
 
     w.fake.reject_all_tokens(false);
     assert_eq!(w.sign_in().await.state, ServiceState::Connected);
@@ -702,7 +706,7 @@ async fn disconnecting_forgets_the_login_and_tells_the_service() {
     w.sign_in().await;
     let refresh = w.secret().refresh.unwrap();
     let mut a = w.agent("a");
-    assert_eq!(a.tools().await.len(), 6);
+    assert_eq!(a.tools().await.len(), TOOLS);
     let info = w.services.disconnect("linear").await.unwrap();
     assert_eq!(info.state, ServiceState::Disconnected);
     assert_eq!(info.auth, None);
@@ -870,11 +874,11 @@ async fn tools_are_kept_for_when_the_service_is_away() {
     let w = World::new().await;
     w.sign_in().await;
     let mut a = w.agent("a");
-    assert_eq!(a.tools().await.len(), 6);
+    assert_eq!(a.tools().await.len(), TOOLS);
     let services = w.restarted();
     w.fake.reject_all_tokens(true);
     let mut a = Shim::open(&services, "a");
-    assert_eq!(a.tools().await.len(), 6);
+    assert_eq!(a.tools().await.len(), TOOLS);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -977,4 +981,439 @@ async fn an_outage_at_refresh_is_no_reason_to_reconnect() {
     w.fake.token_outage(false);
     assert_eq!(text(&a.call("list_issues").await), "issues on /mcp");
     assert_eq!(w.info().detail, None);
+}
+
+// ---- What a review found.
+
+/// Sends something as it is, and returns whatever comes back to it.
+async fn raw(a: &mut Shim, message: Value) -> Value {
+    a.send(message).await;
+    a.recv().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_shim_going_away_mid_refresh_cant_lose_the_rotated_token() {
+    let w = World::new().await;
+    w.sign_in().await;
+    // With no replay grace, a used token lost here could never be recovered.
+    w.fake.set_replay_grace(false);
+    let before = w.secret();
+    w.fake.expire_access();
+    w.fake.slow_refreshes(Duration::from_millis(300));
+
+    let a = w.agent("a");
+    a.send(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "list_issues"}}))
+        .await;
+    // The refresh is under way at the service, and the shim goes.
+    for _ in 0..500 {
+        if w.info().state == ServiceState::Refreshing {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(w.info().state, ServiceState::Refreshing);
+    drop(a);
+
+    // It finishes all the same, and what it got is kept.
+    for _ in 0..500 {
+        if w.info().state == ServiceState::Connected {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        w.info().state,
+        ServiceState::Connected,
+        "not stuck refreshing"
+    );
+    assert_ne!(
+        w.secret().refresh,
+        before.refresh,
+        "the rotated token was kept"
+    );
+    assert_eq!(w.fake.refreshes(), 1);
+
+    // And the next shim uses it, with no refresh of its own.
+    let mut b = w.agent("b");
+    assert_eq!(text(&b.call("list_issues").await), "issues on /mcp");
+    assert_eq!(w.fake.refreshes(), 1);
+    assert_eq!(
+        w.fake.calls().pop().unwrap().bearer,
+        Some(w.secret().access)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn nothing_gets_past_the_policy_and_audit_by_how_its_shaped() {
+    let w = World::new().await;
+    w.sign_in().await;
+    w.services
+        .set(ServiceSetParams {
+            service: "linear".into(),
+            denied_tools: Some(vec!["create_issue".into()]),
+            ..ServiceSetParams::default()
+        })
+        .unwrap();
+    let mut a = w.agent("a");
+    a.call("list_issues").await;
+    let (seen, audited) = (w.fake.seen().len(), w.audit.lock().unwrap().len());
+    let denied = json!({"name": "create_issue", "arguments": {}});
+
+    // A denied tool with no id, which a catch-all would send on with the Bearer.
+    let answer = raw(
+        &mut a,
+        json!({"jsonrpc": "2.0", "method": "tools/call", "params": denied}),
+    )
+    .await;
+    assert_eq!(answer["error"]["code"], -32600, "{answer}");
+    // In a batch.
+    let batch = json!([{"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": denied}]);
+    let answer = raw(&mut a, batch).await;
+    assert_eq!(answer["error"]["code"], -32600, "{answer}");
+    // An id with no method, which isn't an answer to anything.
+    let answer = raw(&mut a, json!({"jsonrpc": "2.0", "id": 6, "params": denied})).await;
+    assert_eq!(answer["error"]["code"], -32600, "{answer}");
+    // A method that isn't a word.
+    let answer = raw(&mut a, json!({"jsonrpc": "2.0", "id": 7, "method": 1})).await;
+    assert_eq!(answer["error"]["code"], -32600, "{answer}");
+    // A notification only by its lack of an id.
+    let answer = raw(
+        &mut a,
+        json!({"jsonrpc": "2.0", "method": "resources/read", "params": {}}),
+    )
+    .await;
+    assert_eq!(answer["error"]["code"], -32600, "{answer}");
+    // Requests nothing offers.
+    let answer = raw(
+        &mut a,
+        json!({"jsonrpc": "2.0", "id": 8, "method": "resources/list"}),
+    )
+    .await;
+    assert_eq!(answer["error"]["code"], -32601, "{answer}");
+    assert_eq!(w.fake.seen().len(), seen, "none of it reached the service");
+    assert_eq!(w.audit.lock().unwrap().len(), audited);
+
+    // A call with no name can't be judged, so it doesn't go, and it's audited.
+    let answer = a.ask("tools/call", json!({"arguments": {}})).await;
+    assert_eq!(answer["error"]["code"], -32602, "{answer}");
+    assert_eq!(w.fake.seen().len(), seen);
+    assert!(
+        w.audit
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .contains("outcome=invalid")
+    );
+
+    // What's meant to pass still does.
+    a.send(
+        json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 1}}),
+    )
+    .await;
+    for _ in 0..500 {
+        if w.fake
+            .seen()
+            .iter()
+            .any(|s| s.method == "notifications/cancelled")
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        w.fake
+            .seen()
+            .iter()
+            .any(|s| s.method == "notifications/cancelled")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn only_a_refusal_of_the_login_itself_means_reconnecting() {
+    let w = World::new().await;
+    w.sign_in().await;
+    let mut a = w.agent("a");
+    w.fake.expire_access();
+    for passing in ["temporarily_unavailable", "server_error", "slow_down"] {
+        w.fake.refuse_refresh(passing);
+        let answer = a.call("list_issues").await;
+        assert!(is_error(&answer), "{answer}");
+        assert!(text(&answer).contains(passing), "{answer}");
+        assert_ne!(text(&answer), RECONNECT);
+        assert_eq!(w.info().state, ServiceState::Connected, "{passing}");
+    }
+    for fatal in ["invalid_grant", "invalid_client", "unauthorized_client"] {
+        let w = World::new().await;
+        w.sign_in().await;
+        let mut a = w.agent("a");
+        w.fake.expire_access();
+        w.fake.refuse_refresh(fatal);
+        assert_eq!(text(&a.call("list_issues").await), RECONNECT, "{fatal}");
+        assert_eq!(w.info().state, ServiceState::NeedsReconnect, "{fatal}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_corrupt_state_file_starts_every_service_off_and_says_why() {
+    let w = World::new().await;
+    w.sign_in().await;
+    w.services
+        .set(ServiceSetParams {
+            service: "linear".into(),
+            denied_tools: Some(vec!["create_issue".into()]),
+            ..ServiceSetParams::default()
+        })
+        .unwrap();
+    std::fs::write(&w.state_file, "{ half a file").unwrap();
+
+    let services = w.restarted();
+    let info = services.list().services.remove(0);
+    assert!(!info.enabled, "it can't have quietly lost its policy");
+    assert!(
+        info.detail.as_deref().unwrap().contains("couldn't be read"),
+        "{info:?}"
+    );
+    let mut a = Shim::open(&services, "a");
+    assert_eq!(a.tools().await.len(), 0);
+    let off = a.call("create_issue").await;
+    assert!(is_error(&off) && text(&off).contains("turned off"), "{off}");
+    assert_eq!(
+        std::fs::read_to_string(w.state_file.with_extension("corrupt")).unwrap(),
+        "{ half a file"
+    );
+    assert!(
+        w.audit
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.contains("can't be read"))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_setting_that_cant_be_kept_isnt_made() {
+    let w = World::new().await;
+    w.sign_in().await;
+    // Where the file's written first is taken, so the write can't happen.
+    let blocker = w.state_file.with_extension("new");
+    for _ in 0..500 {
+        // The background read of its tools may be writing there just now.
+        if std::fs::create_dir(&blocker).is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(blocker.is_dir());
+    let err = w
+        .services
+        .set(ServiceSetParams {
+            service: "linear".into(),
+            denied_tools: Some(vec!["create_issue".into()]),
+            ..ServiceSetParams::default()
+        })
+        .unwrap_err();
+    assert!(err.message.contains("nothing changed"), "{err:?}");
+    assert!(w.info().denied_tools.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stream_left_open_after_its_answer_holds_nothing_up() {
+    let w = World::new().await;
+    w.fake.linger_streams();
+    w.sign_in().await;
+    let mut a = w.agent("a");
+    // Both `initialize`, which holds its agent's session cell, and a call.
+    let answer = tokio::time::timeout(Duration::from_secs(15), a.call("stream_issues"))
+        .await
+        .expect("it doesn't wait for the stream's end");
+    assert_eq!(text(&answer), "streamed");
+    // And the catalog, whose gate would hold up every other agent.
+    let tools = tokio::time::timeout(Duration::from_secs(15), a.tools())
+        .await
+        .unwrap();
+    assert_eq!(tools.len(), TOOLS);
+}
+
+#[derive(Debug, Default)]
+struct Counting {
+    inner: MemoryStore,
+    loads: AtomicUsize,
+}
+
+impl SecretStore for Counting {
+    fn load(&self, service: &str) -> io::Result<Option<Secret>> {
+        self.loads.fetch_add(1, Ordering::SeqCst);
+        self.inner.load(service)
+    }
+    fn store(&self, service: &str, secret: &Secret) -> io::Result<()> {
+        self.inner.store(service, secret)
+    }
+    fn delete(&self, service: &str) -> io::Result<()> {
+        self.inner.delete(service)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn starting_doesnt_wait_on_the_store() {
+    let store = Arc::new(Counting::default());
+    let w = World::start(store.clone()).await;
+    assert_eq!(store.loads.load(Ordering::SeqCst), 0, "not while starting");
+    // What's there comes to light once it's read.
+    store
+        .inner
+        .store("linear", &{
+            let mut s = secret_like();
+            s.client_id = None;
+            s
+        })
+        .unwrap();
+    assert_eq!(w.info().state, ServiceState::Disconnected);
+    w.services.load_logins().await;
+    assert_eq!(store.loads.load(Ordering::SeqCst), 1);
+    assert_eq!(w.info().state, ServiceState::Connected);
+}
+
+fn secret_like() -> Secret {
+    Secret {
+        auth: ServiceAuth::ApiKey,
+        access: API_KEY.into(),
+        refresh: None,
+        expires_at: None,
+        client_id: None,
+        token_endpoint: None,
+        revocation_endpoint: None,
+        scopes: Vec::new(),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sign_in_given_up_on_doesnt_register_another_client_each_time() {
+    let w = World::new().await;
+    for _ in 0..3 {
+        w.services.connect("linear").await.unwrap();
+    }
+    assert_eq!(w.fake.registrations(), 1);
+    let auth = w.services.connect("linear").await.unwrap();
+    let back = w.fake.sign_in(&auth.url).await;
+    w.services.complete("linear", &back).await.unwrap();
+    assert_eq!(w.fake.registrations(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn one_shim_cant_have_without_limit_under_way() {
+    let w = World::new().await;
+    w.sign_in().await;
+    let mut a = w.agent("a");
+    a.tools().await;
+    w.fake.hold_streams();
+    for id in 0..40 {
+        a.send(json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"name": "stream_issues"}}))
+            .await;
+    }
+    let mut refused = 0;
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while refused == 0 && std::time::Instant::now() < deadline {
+        if a.recv().await["error"]["code"] == -32000 {
+            refused += 1;
+        }
+    }
+    assert!(refused >= 1, "the ones over the limit were told so");
+    w.fake.release();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_only_accepted_doesnt_leave_the_agent_waiting() {
+    let w = World::new().await;
+    w.sign_in().await;
+    let mut a = w.agent("a");
+    let answer = a.call("accepts_only").await;
+    assert!(is_error(&answer), "{answer}");
+    assert!(text(&answer).contains("won't answer"), "{answer}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_service_repeating_a_token_in_its_error_doesnt_get_it_shown() {
+    let w = World::new().await;
+    w.sign_in().await;
+    let refresh = w.secret().refresh.unwrap();
+    w.fake.echo_refresh_in_errors();
+    w.fake.expire_access();
+    w.fake.refuse_refresh("invalid_grant");
+    let mut a = w.agent("a");
+    a.call("list_issues").await;
+    let detail = w.info().detail.unwrap();
+    assert!(detail.contains("[redacted]"), "{detail}");
+    assert!(!detail.contains(&refresh), "{detail}");
+    assert!(!detail.contains(SECRET_MARK), "{detail}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_token_turned_down_after_the_login_changed_says_nothing_of_the_new_one() {
+    let w = World::new().await;
+    w.sign_in().await;
+    let mut a = w.agent("a");
+    a.call("list_issues").await;
+    // A call finds its token refused, and is refreshing, while the owner connects
+    // with a key. The refreshed token's refused too, but it's no longer the login.
+    w.fake.reject_oauth_tokens(true);
+    w.fake.slow_refreshes(Duration::from_millis(300));
+    let calling = tokio::spawn(async move { a.call("list_issues").await });
+    for _ in 0..500 {
+        if w.info().state == ServiceState::Refreshing {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    w.services.connect_key("linear", API_KEY).await.unwrap();
+    let answer = calling.await.unwrap();
+    assert_eq!(text(&answer), "issues on /mcp", "{answer}");
+    assert_eq!(w.info().state, ServiceState::Connected);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn what_a_service_tells_clients_reaches_them() {
+    let w = World::new().await;
+    w.fake.set_instructions("Be kind to the issues.");
+    w.sign_in().await;
+    let mut a = w.agent("a");
+    let list = a.ask("tools/list", json!({})).await;
+    assert_eq!(
+        list["result"]["instructions"], "Be kind to the issues.",
+        "{list}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_last_calls_can_be_read_back_and_outlast_a_restart() {
+    let w = World::new().await;
+    w.sign_in().await;
+    let mut a = w.agent("vps:quiet");
+    a.call("list_issues").await;
+    let entries = w.services.audit().entries;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].agent, "vps:quiet");
+    assert_eq!(entries[0].tool, "list_issues");
+    assert_eq!(entries[0].outcome, "ok");
+    assert_eq!(w.restarted().audit().entries, entries);
+    let kept = std::fs::read_to_string(w.state_file.with_file_name("services-audit.log")).unwrap();
+    assert!(!kept.contains(SECRET_MARK), "{kept}");
+    assert!(!kept.contains("an-argument"), "{kept}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn running_unasked_is_a_choice_per_service() {
+    let w = World::new().await;
+    assert!(w.services.auto_allowed().is_empty());
+    let info = w
+        .services
+        .set(ServiceSetParams {
+            service: "linear".into(),
+            auto_allow: Some(true),
+            ..ServiceSetParams::default()
+        })
+        .unwrap();
+    assert!(info.auto_allow);
+    assert_eq!(w.services.auto_allowed(), ["linear"]);
+    assert_eq!(w.restarted().auto_allowed(), ["linear"]);
 }

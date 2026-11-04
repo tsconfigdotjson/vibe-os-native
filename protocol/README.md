@@ -134,7 +134,9 @@ the app's web authentication session to open; `services.complete` takes the URL
 that session ended on, and that host makes the exchange. Only a code that's
 useless without the verifier crosses the link, and no token ever does.
 `services.connect_key` takes no `host`, so a personal key is only ever entered on
-the host it's for. `service.changed` says when a service's state, settings or
+the host it's for. `services.audit` gives the last calls agents on that host made
+to its services, which stay there. If `services.set` can't keep a setting, nothing
+changes and it says so. `service.changed` says when a service's state, settings or
 tools change: `state` is its state and `message` its name, and a Linux host's
 comes onto the Mac's stream under its name. `ServiceInfo` holds nothing secret.
 In the examples, `http://services.example` is a stand-in for the service, on a

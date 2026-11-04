@@ -463,6 +463,21 @@ impl Golden {
             .to_string(),
         )
         .unwrap();
+        fs::write(
+            dir.join("services-audit.log"),
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "at": "2026-10-30T11:59:00Z",
+                    "agent": "dark-mode-review",
+                    "service": "linear",
+                    "tool": "list_issues",
+                    "outcome": "ok",
+                    "ms": 42,
+                })
+            ),
+        )
+        .unwrap();
         self.service = Some(fake);
     }
 }

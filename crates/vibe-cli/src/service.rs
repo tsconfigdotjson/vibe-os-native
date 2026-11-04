@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use vibe_core::rpc::{
-    HostParams, ServiceInfo, ServiceKeyParams, ServiceParams, ServicesConnectKey,
+    HostParams, ServiceInfo, ServiceKeyParams, ServiceParams, ServicesAudit, ServicesConnectKey,
     ServicesDisconnect, ServicesList,
 };
 
@@ -24,6 +24,7 @@ const TIMEOUT: Duration = Duration::from_secs(90);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Command {
     List,
+    Audit,
     SetKey(String),
     Disconnect(String),
 }
@@ -34,6 +35,7 @@ impl Command {
         match words {
             [] => Ok(Command::List),
             [w] if w == "list" || w == "ls" || w == "status" => Ok(Command::List),
+            [w] if w == "audit" => Ok(Command::Audit),
             [w, name] if w == "set-key" => Ok(Command::SetKey(name.clone())),
             [w, name] if w == "disconnect" => Ok(Command::Disconnect(name.clone())),
             [w] if w == "set-key" || w == "disconnect" => {
@@ -44,7 +46,7 @@ impl Command {
                  stdin, so it stays off command lines"
                     .into(),
             ),
-            _ => Err("service takes list, set-key SERVICE or disconnect SERVICE".into()),
+            _ => Err("service takes list, audit, set-key SERVICE or disconnect SERVICE".into()),
         }
     }
 }
@@ -102,6 +104,16 @@ pub(crate) fn run(socket: &Path, command: Command) -> Result<(), String> {
                 println!("{}", describe(s));
             }
         }
+        Command::Audit => {
+            let list = client::call::<ServicesAudit>(socket, &HostParams::default(), TIMEOUT)
+                .map_err(|e| e.to_string())?;
+            for e in &list.entries {
+                println!(
+                    "{}  {}  {} {}  {}  {}ms",
+                    e.at, e.agent, e.service, e.tool, e.outcome, e.ms
+                );
+            }
+        }
         Command::SetKey(service) => {
             let key = read_key()?;
             let params = ServiceKeyParams { service, key };
@@ -135,6 +147,7 @@ mod tests {
     fn words() {
         assert_eq!(parse(&[]), Ok(Command::List));
         assert_eq!(parse(&["status"]), Ok(Command::List));
+        assert_eq!(parse(&["audit"]), Ok(Command::Audit));
         assert_eq!(
             parse(&["set-key", "linear"]),
             Ok(Command::SetKey("linear".into()))
@@ -164,6 +177,7 @@ mod tests {
             enabled: true,
             read_only: true,
             denied_tools: Vec::new(),
+            auto_allow: false,
             tools: 1,
             detail: Some("Linear refused the refresh (invalid_grant)".into()),
             detail_at: Some("2026-11-04T00:00:00Z".into()),

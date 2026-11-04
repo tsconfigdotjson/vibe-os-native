@@ -37,6 +37,20 @@ struct ServicesPane: View {
                     }
                 }
             }
+            if servicesNeedRebuild(model.toolbox) {
+                Section {
+                    Label(
+                        "Linux agents on this Mac have no shared services yet: the Linux template is on an older "
+                            + "base image, and they need base \(VibeRPC.sharedServicesBase). macOS agents have them now.",
+                        systemImage: "exclamationmark.triangle"
+                    )
+                    .foregroundStyle(Palette.attention)
+                    .fixedSize(horizontal: false, vertical: true)
+                    Button("Rebuild Template") { model.runInTerminal(["toolbox", "rebuild"], exec: false) }
+                        .disabled(model.toolbox?.state != .closed)
+                        .help("Replays toolbox.toml onto the newest base image, in Terminal")
+                }
+            }
             ForEach(services, id: \.name) { service in
                 Section {
                     ForEach(model.hosts, id: \.name) { host in
@@ -59,6 +73,7 @@ struct ServicesPane: View {
         // sight, and a host's link comes and goes.
         .task(id: model.hosts.map(\.name)) {
             repeat {
+                await model.refreshToolbox()
                 await load()
                 try? await Task.sleep(for: .seconds(3))
             } while !Task.isCancelled
@@ -84,7 +99,7 @@ struct ServicesPane: View {
                         let list = try await model.call(ServicesList.self, HostParams(host: name), timeout: 20)
                         return (name, list.services, nil)
                     } catch {
-                        return (name, nil, describe(error))
+                        return (name, nil, serviceFailure(error, host: name))
                     }
                 }
             }
@@ -112,6 +127,7 @@ private struct ServiceHostRow: View {
     @State private var error: String?
     @State private var expanded = false
     @State private var askingForKey = false
+    @State private var showingCalls = false
     @StateObject private var signIn = WebSignIn()
 
     private var local: Bool { host.link == .local }
@@ -207,6 +223,11 @@ private struct ServiceHostRow: View {
                 "Read-only",
                 isOn: Binding(get: { info.readOnly }, set: { on in Task { await change { $0.readOnly = on } } }))
             .help("Agents reach \(info.title)'s read-only endpoint")
+            Toggle(
+                "Run tools without asking",
+                isOn: Binding(get: { info.autoAllow }, set: { on in Task { await change { $0.autoAllow = on } } }))
+            .help("Claude Code agents started from here on run \(info.title)'s tools, writes included, with no "
+                + "permission prompt. Off, its prompts govern them.")
             LabeledContent("Denied tools") {
                 CommitField(
                     title: "Denied tools", value: info.deniedTools.joined(separator: ", "), width: 260,
@@ -215,6 +236,13 @@ private struct ServiceHostRow: View {
                 ) { text in
                     await change { $0.deniedTools = parseToolNames(text) }
                 }
+            }
+            LabeledContent("Recent calls") {
+                Button("Show…") { showingCalls = true }
+                    .help("The last calls agents on \(hostLabel) made, with no arguments or tokens")
+            }
+            .sheet(isPresented: $showingCalls) {
+                ServiceCallsSheet(model: model, host: host.name, hostLabel: hostLabel)
             }
             if !local {
                 LabeledContent("With this Mac away") {
@@ -297,6 +325,52 @@ private struct ServiceHostRow: View {
         } catch {
             self.error = describe(error)
             return false
+        }
+    }
+}
+
+/// The last calls agents on a host made to its services, newest first. They're
+/// kept on that host, as its calls are its own, and hold no argument or token.
+private struct ServiceCallsSheet: View {
+    @ObservedObject var model: MenuModel
+    let host: String
+    let hostLabel: String
+    @Environment(\.dismiss) private var dismiss
+    @State private var entries: [ServiceAuditEntry]?
+    @State private var error: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Recent Calls on \(hostLabel)").font(.headline)
+            if let entries, !entries.isEmpty {
+                List(Array(entries.reversed().enumerated()), id: \.offset) { _, entry in
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("\(entry.service) · \(entry.tool)")
+                        Text("\(entry.agent) · \(entry.outcome) · \(entry.ms) ms · \(entry.at)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .frame(minWidth: 460, minHeight: 280)
+            } else if entries != nil {
+                Text("No agent here has called a service yet.").foregroundStyle(.secondary)
+            } else if error == nil {
+                Working(text: "Asking \(hostLabel)…")
+            }
+            ErrorText(error: error)
+            HStack {
+                Spacer()
+                Button("Done") { dismiss() }
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(20)
+        .task {
+            do {
+                entries = try await model.call(ServicesAudit.self, HostParams(host: host), timeout: 20).entries
+            } catch {
+                self.error = serviceFailure(error, host: host)
+            }
         }
     }
 }

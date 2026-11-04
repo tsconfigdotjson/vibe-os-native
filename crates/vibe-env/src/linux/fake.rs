@@ -26,6 +26,8 @@ pub(crate) struct Vm {
     pub(crate) config: PathBuf,
     /// Whether the host has set the guest's clock since it booted.
     pub(crate) clock_set: bool,
+    /// Its guest is older than shared services.
+    pub(crate) old_guest: bool,
 }
 
 #[derive(Default)]
@@ -118,6 +120,7 @@ impl Fake {
             "version": env!("CARGO_PKG_VERSION"),
             "boot_id": "b",
             "uptime_ms": 10,
+            "services": !vm.old_guest,
             "state": match vm.session {
                 None => "idle",
                 Some(None) => "running",
