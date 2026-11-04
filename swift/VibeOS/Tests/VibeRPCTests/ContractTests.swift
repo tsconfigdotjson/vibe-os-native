@@ -376,7 +376,7 @@ let swiftErrorData: [RPCErrorCode: String] = [.protocolMismatch: "ProtocolMismat
 
     @Test func piModelsAreDecidedAsVibedDecidesThem() throws {
         let cases = try #require(
-            loadJSON(protocolDir.appendingPathComponent("pi-models.json")) as? [String: Any])
+            try loadJSON(protocolDir.appendingPathComponent("pi-models.json")) as? [String: Any])
         let accepted = try #require(cases["accepted"] as? [String])
         let refused = try #require(cases["refused"] as? [String])
         #expect(!accepted.isEmpty && !refused.isEmpty)

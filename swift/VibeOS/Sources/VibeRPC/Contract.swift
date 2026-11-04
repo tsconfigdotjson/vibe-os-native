@@ -399,7 +399,9 @@ public enum PiTarget: String, Codable, CaseIterable, Hashable, Sendable {
 /// it doesn't know it. vibed's `validate_pi_model` is the same rule, and
 /// `protocol/pi-models.json` holds both to it.
 public func isValidPiModel(_ model: String) -> Bool {
-    guard !model.isEmpty, model.utf8.count <= 200, !model.hasPrefix("-") else { return false }
+    // By byte, not `hasPrefix`, which compares whole characters: `-` with a combining
+    // mark on it still starts with a `-` to anyone reading the argument.
+    guard let first = model.utf8.first, first != UInt8(ascii: "-"), model.utf8.count <= 200 else { return false }
     return model.unicodeScalars.allSatisfy { scalar in
         !scalar.properties.isWhitespace && scalar.properties.generalCategory != .control
             && !"'\"`$\\".unicodeScalars.contains(scalar)

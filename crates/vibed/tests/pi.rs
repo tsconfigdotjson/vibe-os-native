@@ -1417,8 +1417,30 @@ async fn a_model_pi_wont_take_is_said_in_pis_words() {
     let said = agent.status.error.clone().unwrap_or_default();
     assert!(said.contains("Model \"no-such-model\" not found"), "{said}");
     assert!(!said.contains("--list-models"), "{said}");
+    assert!(said.contains("start a new agent"), "{said}");
 
-    // Put right, the next session runs, and nothing of that stays.
+    // A wait on it ends, and clicking it says the same as its row.
+    let check = w.core.check_agent(None, &r, false).await.unwrap();
+    assert_eq!(check.state, AgentState::Exited);
+    assert_eq!(check.activity, Activity::Errored);
+    assert!(check.answered, "{check:?}");
+    let e = w
+        .core
+        .attach_session(vibe_core::rpc::SessionParams {
+            host: None,
+            agent: r.clone(),
+        })
+        .await
+        .unwrap_err();
+    assert!(e.message.contains("exited with code 1"), "{}", e.message);
+    assert!(
+        e.message.contains("Model \"no-such-model\" not found"),
+        "{}",
+        e.message
+    );
+
+    // It keeps the model it started with, so a resume says the same again, with
+    // the profile put right or not.
     w.core
         .update_profile(ProfileUpdateParams {
             project: "app".into(),
@@ -1427,6 +1449,19 @@ async fn a_model_pi_wont_take_is_said_in_pis_words() {
             ..Default::default()
         })
         .unwrap();
+    w.core.resume_agent(None, &r).await.unwrap();
+    wait_until("it to exit again", || {
+        !socket.exists()
+            && w.layout
+                .agent_dir(&r)
+                .join(vibe_core::shim::RECORD_FILE)
+                .is_file()
+    });
+    let list = w.core.agents(HostParams { host: None }).await.unwrap();
+    let agent = list.agents.iter().find(|x| x.agent == r).unwrap();
+    assert_eq!(agent.status.activity, Activity::Errored);
+
+    // A new agent has the profile as it is now, and nothing of that stays.
     let b = w.start("hello again").await;
     w.wait_for(&b.agent, Activity::Done).await;
     let list = w.core.agents(HostParams { host: None }).await.unwrap();

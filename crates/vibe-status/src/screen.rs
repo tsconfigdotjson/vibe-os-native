@@ -110,16 +110,20 @@ pub fn pi_error_at_exit(screen: &str) -> Option<String> {
         }
     }
     let message = message.strip_prefix("Error: ")?;
-    let words = match message.find(" Use --") {
-        Some(at) => &message[..at],
-        None => message,
-    };
+    // Where a terminal broke the line, the space on either side of `Use` may have gone.
+    let words = message
+        .match_indices("Use")
+        .find(|(at, _)| message[at + 3..].trim_start().starts_with("--"))
+        .map_or(message, |(at, _)| &message[..at]);
     let words = vibe_core::model::clean_alert(words.trim());
     if words.is_empty() {
         return None;
     }
     Some(if words.starts_with("Model \"") {
-        format!("{words} Set this profile's model to one Pi has, written as provider/id.")
+        format!(
+            "{words} Set this profile's model to one Pi has, written as provider/id, then start \
+             a new agent: this one keeps the model it started with."
+        )
     } else {
         words
     })
@@ -229,7 +233,8 @@ mod tests {
             pi_error_at_exit(&format!("{WARNING}\n{NOT_FOUND}\n\n\n")).as_deref(),
             Some(
                 "Model \"no-such-model\" not found. Set this profile's model to one Pi has, \
-                 written as provider/id."
+                 written as provider/id, then start a new agent: this one keeps the model it \
+                 started with."
             )
         );
         assert_eq!(
@@ -238,7 +243,8 @@ mod tests {
                 "Model \"deepseek-v4.1-flash\" is ambiguous across providers: \
                  opencode-go/deepseek-v4.1-flash, opencode/deepseek-v4.1-flash. More than one \
                  matching provider is authenticated. Set this profile's model to one Pi has, \
-                 written as provider/id."
+                 written as provider/id, then start a new agent: this one keeps the model it \
+                 started with."
             )
         );
         // Not about a model: only Pi's words.
@@ -264,6 +270,26 @@ mod tests {
                 "{width}"
             );
         }
+    }
+
+    /// As read off the real Pi through the real shim, at 80 columns, with the model
+    /// long enough to put the wrap either side of `Use`.
+    #[test]
+    fn what_to_type_goes_wherever_the_terminal_broke_the_line() {
+        for screen in [
+            "Error: Model \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" not found. Use\n\
+             --list-models to see available models.\n",
+            "Error: Model \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" not found.\n\
+             Use --list-models to see available models.\n",
+        ] {
+            let said = pi_error_at_exit(screen).unwrap();
+            assert!(!said.contains("--list-models"), "{said}");
+            assert!(!said.contains("Use"), "{said}");
+            assert!(said.contains("not found."), "{said}");
+        }
+        // A model named with the word is left alone.
+        let said = pi_error_at_exit("Error: Model \"Use-it\" not found.").unwrap();
+        assert!(said.contains("Use-it"), "{said}");
     }
 
     #[test]

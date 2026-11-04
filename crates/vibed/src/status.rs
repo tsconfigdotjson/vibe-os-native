@@ -92,11 +92,7 @@ impl Core {
             .await
             .unwrap_or_else(Status::unknown);
         if a.agent == AgentKind::Pi {
-            let status = self.pi_read_status(a, debounce, status).await.0;
-            match self.pi_gave_up_with(a).await {
-                Some(error) => status.failed_on_screen(error),
-                None => status,
-            }
+            self.pi_read_status(a, debounce, status).await.0
         } else {
             status
         }
@@ -150,13 +146,17 @@ impl Core {
     /// It writes nothing on a resume, so a turn left open from before stays open
     /// there. And a turn that fails before it starts, for want of a login, writes
     /// nothing and shows only on its screen. Either would read as it did before:
-    /// busy for ever, or a send that never got an answer.
+    /// busy for ever, or a send that never got an answer. And one that gave up
+    /// before it drew anything has only what it left behind to say why.
     pub(crate) async fn pi_read_status(
         &self,
         a: &mut AgentRecord,
         debounce: Duration,
         status: Status,
     ) -> (Status, bool) {
+        if let Some(error) = self.pi_gave_up_with(a).await {
+            return (status.failed_on_screen(error), true);
+        }
         let sent = self.pi_unanswered_send(a, debounce).await;
         if !status.open_turn() && sent.is_none() {
             return (status, false);

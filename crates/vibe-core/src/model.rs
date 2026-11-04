@@ -535,7 +535,7 @@ pub fn validate_pi_model(model: &str) -> Result<(), String> {
     } else {
         Err(format!(
             "`{}` isn't a Pi model: it can't be empty, start with -, have spaces or any of \
-             ' \" ` $ \\ in it, or run past {MAX_PI_MODEL_BYTES} characters",
+             ' \" ` $ \\ in it, or run past {MAX_PI_MODEL_BYTES} bytes",
             clean_alert(model)
         ))
     }
