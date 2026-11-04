@@ -1,6 +1,6 @@
 [package]
 name = "vibe-services"
-description = "Shared MCP services: the broker every vibed runs for its own agents, its OAuth lifecycle, and the login each host holds for itself"
+description = "Shared MCP services: the broker every vibed runs for its own agents, the OAuth lifecycle, and the one login per install"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

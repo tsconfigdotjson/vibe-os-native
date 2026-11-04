@@ -364,7 +364,7 @@ pub struct Core {
     events: Arc<EventBus>,
     /// The `vibe` agents here run the shared services' shim with.
     pub(crate) vibe_cli: OsString,
-    /// This host's broker for shared services, which holds its own logins.
+    /// This host's broker for shared services.
     pub(crate) services: Option<Arc<vibe_services::Services>>,
     /// Wakes the look at what each service's followers have been given.
     pub(crate) services_wake: Arc<tokio::sync::Notify>,

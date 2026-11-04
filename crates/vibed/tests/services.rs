@@ -17,7 +17,7 @@ use std::time::Duration;
 use common::{Golden, TestServer, serve, workspace_bin};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader as TokioBufReader};
-use vibe_core::model::{ServiceRole, LOCAL_HOST, ServiceState};
+use vibe_core::model::{LOCAL_HOST, ServiceRole, ServiceState};
 use vibe_core::paths::Layout;
 use vibe_core::rpc::{
     AgentStartParams, HostAddParams, MAX_MESSAGE_BYTES, ProfileUpdateParams, ProjectAddParams,
@@ -1104,7 +1104,10 @@ async fn signing_in_on_the_mac_lands_at_the_owner_and_no_refresh_token_or_verifi
     assert_eq!(hosts.len(), 2);
     assert_eq!(hosts[0]["host"], LOCAL_HOST);
     assert_eq!(hosts[0]["service"]["role"], "follower");
-    assert!(hosts[0]["service"]["access_until"].is_string(), "{overview}");
+    assert!(
+        hosts[0]["service"]["access_until"].is_string(),
+        "{overview}"
+    );
     assert_eq!(hosts[1]["host"], "vps");
     assert_eq!(hosts[1]["reachable"], true);
     assert_eq!(hosts[1]["service"]["role"], "owner");
@@ -1163,10 +1166,17 @@ async fn signing_in_on_the_mac_lands_at_the_owner_and_no_refresh_token_or_verifi
     // verifier makes useless, and access tokens, as it now may.
     assert!(find(&wire, "services.complete"), "the tap saw the link");
     assert!(find(&wire, "fake-code-"), "the code crosses, as it may");
-    assert!(find(&wire, &rotated.access), "access tokens cross, as they may");
+    assert!(
+        find(&wire, &rotated.access),
+        "access tokens cross, as they may"
+    );
     let app_saw = format!("{url} {back}").into_bytes();
     let shim_said = shim.read.clone();
-    for (place, bytes) in [("the link", &wire), ("the app", &app_saw), ("the shim", &shim_said)] {
+    for (place, bytes) in [
+        ("the link", &wire),
+        ("the app", &app_saw),
+        ("the shim", &shim_said),
+    ] {
         for secret in &never {
             assert!(!find(bytes, secret), "{secret} is in {place}");
         }
@@ -1298,14 +1308,20 @@ async fn the_mac_as_a_follower_serves_its_agents_and_a_401_gets_it_a_new_token()
     })
     .await;
     assert_eq!(fake.refreshes(), 1, "at the owner");
-    assert_ne!(p.logins.load("linear").unwrap().unwrap().refresh, first.refresh);
+    assert_ne!(
+        p.logins.load("linear").unwrap().unwrap().refresh,
+        first.refresh
+    );
     p.mac_following().await;
     assert_eq!(p.mac_logins.load("linear").unwrap().unwrap().refresh, None);
 
     // With the owner away, the token it has serves until it's refused or runs
     // out, and then the agent's told why, and the tools still list.
     p.tapped.cut();
-    wait_for("the link to go", || !p.mac.core.link("vps").unwrap().connected()).await;
+    wait_for("the link to go", || {
+        !p.mac.core.link("vps").unwrap().connected()
+    })
+    .await;
     shim = blocking(move || {
         assert_eq!(text(&shim.call("list_issues")), "issues on /mcp");
         shim
@@ -1320,7 +1336,11 @@ async fn the_mac_as_a_follower_serves_its_agents_and_a_401_gets_it_a_new_token()
     })
     .await;
     assert_eq!(p.mac.service().state, ServiceState::OwnerUnreachable);
-    assert_eq!(fake.refreshes(), 1, "the Mac can't, and the owner wasn't asked");
+    assert_eq!(
+        fake.refreshes(),
+        1,
+        "the Mac can't, and the owner wasn't asked"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1366,8 +1386,16 @@ async fn disconnecting_forgets_it_everywhere_and_an_owner_away_is_told_when_its_
 
     // With the owner out of reach: the Mac forgets at once.
     p.tapped.cut();
-    wait_for("the link to go", || !p.mac.core.link("vps").unwrap().connected()).await;
-    let done = rpc(&p.mac.core, "services.disconnect", json!({"service": "linear"})).await;
+    wait_for("the link to go", || {
+        !p.mac.core.link("vps").unwrap().connected()
+    })
+    .await;
+    let done = rpc(
+        &p.mac.core,
+        "services.disconnect",
+        json!({"service": "linear"}),
+    )
+    .await;
     assert!(done["result"].is_object(), "{done}");
     wait_for("the Mac to forget", || {
         p.mac_logins.load("linear").unwrap().is_none()

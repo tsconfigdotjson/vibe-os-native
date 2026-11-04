@@ -635,12 +635,9 @@ async fn mcp(
     let id = message.get("id").cloned().unwrap_or(Value::Null);
     let mut state = lock(inner);
     let authorized = !state.reject_all
-        && bearer
-            .as_deref()
-            .is_some_and(|b| {
-                state.access.contains(b)
-                    && (!state.reject_old_logins || state.signed_in.contains(b))
-            });
+        && bearer.as_deref().is_some_and(|b| {
+            state.access.contains(b) && (!state.reject_old_logins || state.signed_in.contains(b))
+        });
     let known_session = session.as_ref().is_some_and(|s| state.sessions.contains(s));
     let status = if !authorized {
         401

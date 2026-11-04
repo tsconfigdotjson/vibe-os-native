@@ -433,7 +433,7 @@ fn serve_here(os: &str, test_backend: bool, stand_in: Option<&str>) -> bool {
     os == "linux" || (test_backend && stand_in == Some("1"))
 }
 
-/// Which services this host's broker offers, and where it keeps its own logins:
+/// Which services this host's broker offers, and where it keeps what it holds:
 /// the Keychain on a Mac, and on a Linux host a private file in its state
 /// directory. Only a debug build listens to the test variables, so a release
 /// can't be talked into keeping a login elsewhere or sending one to a stand-in.

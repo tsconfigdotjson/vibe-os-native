@@ -8,8 +8,11 @@
 //!   Only how they're offered differs by [`AgentKind`].
 //! - **The local socket**, `run/.services.sock`. Every `vibed` serves it with
 //!   its own broker, so a Linux host's agents need no Mac, and agents on a Mac
-//!   use the Mac's. The Mac is only ever where the browser is: a host's login
-//!   is that host's own (`services.*` take a `host`, and go over its link).
+//!   use the Mac's.
+//! - **One login.** Each service has one, held by one owning host. Signing in
+//!   goes to that host, with the Mac only where the browser is. Links are a star,
+//!   so the Mac carries the owner's access token to every other host
+//!   ([`Core::give_tokens`]).
 //! - **VMs.** A `linux` VM has a socket of its own, in `vibe-guest`. The Mac
 //!   dials each awake one's vsock port with a relay to the Mac's broker; nothing
 //!   listens for a guest to call in.
@@ -25,11 +28,10 @@ use tokio::net::UnixStream;
 use tokio::task::JoinHandle;
 use vibe_core::model::{AgentKind, AgentState, LOCAL_HOST, ServiceRole, ServiceState};
 use vibe_core::rpc::{
-    ErrorCode, ErrorObject, HostParams, ServiceAccess, ServiceAuditList,
-    ServiceAuthorization, ServiceCompleteParams, ServiceFollowParams, ServiceHost, ServiceInfo,
-    ServiceList, ServiceOverview, ServiceOverviewList, ServiceParams, ServiceSetParams,
-    ServiceTokenParams, ServicesComplete, ServicesDisconnect, ServicesFollow, ServicesList,
-    ServicesToken,
+    ErrorCode, ErrorObject, HostParams, ServiceAccess, ServiceAuditList, ServiceAuthorization,
+    ServiceCompleteParams, ServiceFollowParams, ServiceHost, ServiceInfo, ServiceList,
+    ServiceOverview, ServiceOverviewList, ServiceParams, ServiceSetParams, ServiceTokenParams,
+    ServicesComplete, ServicesDisconnect, ServicesFollow, ServicesList, ServicesToken,
 };
 use vibe_core::store::{AgentRecord, StoreError};
 use vibe_env::Backend;
@@ -171,8 +173,8 @@ impl Core {
                     host: None,
                     service: p.service.clone(),
                 };
-                if let Err(e) = answer_soon(self.forward_typed::<ServicesDisconnect>(&link, &params))
-                    .await
+                if let Err(e) =
+                    answer_soon(self.forward_typed::<ServicesDisconnect>(&link, &params)).await
                 {
                     crate::log!(
                         "vibed: can't disconnect {} on {} yet: {}",
@@ -201,7 +203,9 @@ impl Core {
         &self,
         p: ServiceTokenParams,
     ) -> Result<ServiceAccess, ErrorObject> {
-        self.broker()?.token(&p.service, p.rejected.as_deref()).await
+        self.broker()?
+            .token(&p.service, p.rejected.as_deref())
+            .await
     }
 
     pub async fn services_follow(
@@ -239,7 +243,10 @@ impl Core {
                 answer_soon(self.forward_typed::<ServicesFollow>(&link, &params)).await
             };
             if let Err(e) = told {
-                crate::log!("vibed: can't tell {host} to forget {service}: {}", e.message);
+                crate::log!(
+                    "vibed: can't tell {host} to forget {service}: {}",
+                    e.message
+                );
             }
         }
     }
@@ -260,8 +267,7 @@ impl Core {
                 reachable: true,
                 service: Some(mine.clone()),
             }];
-            let mut names: Vec<String> =
-                crate::core::lock(&self.links).keys().cloned().collect();
+            let mut names: Vec<String> = crate::core::lock(&self.links).keys().cloned().collect();
             names.sort();
             for host in names {
                 let service = lists
@@ -371,9 +377,7 @@ impl Core {
         let mut given = self.services_given.lock().await;
         // A link that went down may have missed anything: all's given again once
         // it's back.
-        given.retain(|(host, _), _| {
-            host == LOCAL_HOST || links.iter().any(|l| &l.name == host)
-        });
+        given.retain(|(host, _), _| host == LOCAL_HOST || links.iter().any(|l| &l.name == host));
         let lists = self.service_lists(&links).await;
         for service in broker.names() {
             self.give_token(&broker, &service, &links, &lists, &mut given)

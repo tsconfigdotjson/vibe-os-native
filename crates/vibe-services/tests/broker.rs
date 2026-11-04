@@ -1988,7 +1988,11 @@ async fn only_the_owner_gives_out_tokens_and_never_a_refresh_token() {
     f.given_by(&w.services, None).await;
 
     let refused = f.services.token("linear", None).await.unwrap_err();
-    assert!(refused.message.contains("doesn't own"), "{}", refused.message);
+    assert!(
+        refused.message.contains("doesn't own"),
+        "{}",
+        refused.message
+    );
     let refused = f.services.disconnect("linear").await.unwrap_err();
     assert!(refused.message.contains("vps-1"), "{}", refused.message);
     assert!(f.store.load("linear").unwrap().is_some());

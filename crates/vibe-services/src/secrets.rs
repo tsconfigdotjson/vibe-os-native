@@ -1,6 +1,7 @@
-//! Where a host keeps its login to a service: the Keychain on a Mac, a private
-//! file on a Linux host, in the same trust class as the `gh` and Claude logins
-//! already on that machine. One item per service, replaced whole, so a login is
+//! Where a host keeps what it holds of a service's login, the whole of it on the
+//! host that owns it and an access token on any other: the Keychain on a Mac, a
+//! private file on a Linux host, in the same trust class as the `gh` and Claude
+//! logins already on that machine. One item per service, replaced whole, so it's
 //! never half-written.
 
 use std::collections::HashMap;

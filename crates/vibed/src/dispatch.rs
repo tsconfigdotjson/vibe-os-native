@@ -13,8 +13,8 @@ use vibe_core::rpc::{
     ProfilesDelete, ProfilesList, ProfilesUpdate, ProjectsAdd, ProjectsList, ProjectsRemove,
     ProtocolMismatchData, Request, Response, ServicesAudit, ServicesComplete, ServicesConnect,
     ServicesDisconnect, ServicesFollow, ServicesList, ServicesOverview, ServicesSet, ServicesToken,
-    SessionsAttach, SessionsList, Subscribed, ToolboxClose, ToolboxLoginsGet, ToolboxOpen, ToolboxRebuild,
-    ToolboxStatusGet, ToolboxUpdate, TunnelPrepare,
+    SessionsAttach, SessionsList, Subscribed, ToolboxClose, ToolboxLoginsGet, ToolboxOpen,
+    ToolboxRebuild, ToolboxStatusGet, ToolboxUpdate, TunnelPrepare,
 };
 
 use crate::core::Core;
@@ -283,9 +283,10 @@ async fn call(
         ServicesToken::NAME => {
             encode_result(core.services_token(decode::<ServicesToken>(params)?).await)
         }
-        ServicesFollow::NAME => {
-            encode_result(core.services_follow(decode::<ServicesFollow>(params)?).await)
-        }
+        ServicesFollow::NAME => encode_result(
+            core.services_follow(decode::<ServicesFollow>(params)?)
+                .await,
+        ),
         ServicesOverview::NAME => {
             decode::<ServicesOverview>(params)?;
             encode_result(core.services_overview().await)

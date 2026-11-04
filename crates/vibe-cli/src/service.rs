@@ -40,10 +40,9 @@ impl Command {
             [w] if w == "disconnect" || w == "on" || w == "off" => {
                 Err(format!("service {w} needs a service, such as linear"))
             }
-            _ => {
-                Err("service takes list, audit, on SERVICE, off SERVICE or disconnect SERVICE"
-                    .into())
-            }
+            _ => Err(
+                "service takes list, audit, on SERVICE, off SERVICE or disconnect SERVICE".into(),
+            ),
         }
     }
 }

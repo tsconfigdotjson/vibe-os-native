@@ -1,11 +1,17 @@
-//! The broker: its host's one holder of each service's login, and what every
-//! call by that host's agents passes through. It knows nothing of which kind of
-//! agent is calling: policy is on the service's own tool names, so it's the same
-//! for all. Every `vibed` runs one for its own agents, and none needs another.
+//! The broker: what every call by its host's agents passes through. It knows
+//! nothing of which kind of agent is calling: policy is on the service's own tool
+//! names, so it's the same for all. Every `vibed` runs one for its own agents.
+//!
+//! **One login, one owner.** Each service has one login per install. The broker
+//! on the owning host holds its refresh token, and alone refreshes. Any other is
+//! a follower: it holds an access token it was given, with nothing to renew it
+//! with, and when that's no good it says it wants another and waits a moment
+//! ([`Services::follow`], [`Services::token`]; the Mac carries them).
 //!
 //! **The lifecycle** (PRD: Shared MCP services). A service is `disconnected`,
-//! `connected`, `refreshing`, `needs_reconnect` (a refresh was refused) or
-//! `revoked` (a freshly refreshed token, or a key, was turned down). Refreshes
+//! `connected`, `refreshing`, `owner_unreachable` (a follower with no good token
+//! and no way to get one now), `needs_reconnect` (a refresh was refused) or
+//! `revoked` (a freshly refreshed token was turned down). Refreshes
 //! go one at a time per service, and a rotated token is persisted **before**
 //! it's used. A refresh runs on a task of its own that its callers wait on, so
 //! a shim going away can't cut one short: only a real crash can come between the
@@ -15,16 +21,17 @@
 //! error saying what to do. They work again after Reconnect, with nothing to
 //! do in the agent.
 //!
-//! **Signing in** is in two halves, so the app can drive the browser for any
-//! host: this host registers its client, makes the PKCE verifier and the state,
-//! and keeps them; the app opens the page; and this host makes the exchange
-//! with the code that comes back. Neither the verifier nor a token goes out.
+//! **Signing in** is in two halves, so the app can drive the browser for the
+//! owning host: it registers its client, makes the PKCE verifier and the state,
+//! and keeps them; the app opens the page; and it makes the exchange with the code
+//! that comes back. Neither the verifier nor the refresh token ever goes out.
 //!
 //! **Upstream sessions** belong here, one per (agent, service), so a shim that
 //! reconnects, or a VM that wakes, carries on. A session the service has
 //! forgotten (404) is made again and the call retried.
 //!
-//! Nothing secret leaves: not to a shim, a log, the state file or an error.
+//! Nothing secret reaches a shim, a log, the state file or an error. Only an
+//! access token ever leaves, to the Mac, and only by [`Services::token`].
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
@@ -118,7 +125,7 @@ pub struct Deps {
     pub token_wait: Duration,
 }
 
-/// Where this broker runs, which is where its login gets mended.
+/// Where this broker runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Place {
     Mac,
@@ -1163,10 +1170,7 @@ impl Services {
             let saved = lock(&conn.saved);
             (saved.state, saved.owner.clone())
         };
-        if matches!(
-            state,
-            ServiceState::NeedsReconnect | ServiceState::Revoked
-        ) {
+        if matches!(state, ServiceState::NeedsReconnect | ServiceState::Revoked) {
             return Some(Err(AuthFailure::NeedsReconnect));
         }
         let held = lock(&conn.secret).clone();

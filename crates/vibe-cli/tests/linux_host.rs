@@ -361,6 +361,32 @@ struct Mac {
 }
 
 fn mac(golden: &common::Golden, ssh: &Path, bundle: PathBuf) -> Mac {
+    mac_with(golden, ssh, bundle, None)
+}
+
+/// A Mac whose broker goes to `fake`, keeping what it's given in `logins`.
+fn mac_with_services(
+    golden: &common::Golden,
+    ssh: &Path,
+    bundle: PathBuf,
+    fake: &FakeService,
+    logins: &FileStore,
+) -> Mac {
+    let services = vibed::services::ServicesConfig {
+        services: vec![fake.service()],
+        store: Arc::new(logins.clone()),
+        place: vibe_services::Place::Mac,
+        token_wait: Duration::from_secs(1),
+    };
+    mac_with(golden, ssh, bundle, Some(services))
+}
+
+fn mac_with(
+    golden: &common::Golden,
+    ssh: &Path,
+    bundle: PathBuf,
+    services: Option<vibed::services::ServicesConfig>,
+) -> Mac {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -382,11 +408,15 @@ fn mac(golden: &common::Golden, ssh: &Path, bundle: PathBuf) -> Mac {
         max_backoff: Duration::from_secs(1),
         ..Timing::default()
     };
+    if services.is_some() {
+        config.services = services;
+    }
     let core = Arc::new(Core::open(config).unwrap());
     {
         let _in = rt.enter();
         core.spawn_links();
         core.spawn_external();
+        drop(core.spawn_services());
     }
     let listener = rt
         .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
@@ -855,7 +885,9 @@ fn a_linux_host_that_owns_a_login_serves_and_refreshes_alone_with_the_mac_gone()
         fake.base
     ));
     fs::write(&env, setup).unwrap();
-    let mac = mac(&golden, &ssh, bundle(golden.dir.path()));
+    let on_the_mac = FileStore(golden.dir.path().join("mac-services"));
+    let carried = bundle(golden.dir.path());
+    let mac = mac_with_services(&golden, &ssh, carried.clone(), &fake, &on_the_mac);
 
     ok(vibe(&mac.socket, &["host", "add", "vps", "me@vps"]));
     wait_for("the link", Duration::from_secs(30), || {
@@ -901,24 +933,17 @@ fn a_linux_host_that_owns_a_login_serves_and_refreshes_alone_with_the_mac_gone()
         None,
         "nothing of a token in the clear on the Mac"
     );
-    let on_the_mac = FileStore(
-        Layout::new(golden.home.as_path(), std::env::consts::OS)
-            .data_dir()
-            .join("services"),
-    );
     wait_for("the Mac to follow", Duration::from_secs(30), || {
-        on_the_mac.load("linear").unwrap().is_some()
+        ok(vibe(&mac.socket, &["service"])).starts_with("linear  connected  login on vps")
     });
     assert_eq!(on_the_mac.load("linear").unwrap().unwrap().refresh, None);
-    let mac_says = ok(vibe(&mac.socket, &["service"]));
-    assert!(
-        mac_says.starts_with("linear  connected  login on vps"),
-        "{mac_says}"
-    );
 
     // Its own CLI sees it's here.
     let status = ok(on_host(&host).arg("service").output().unwrap());
-    assert!(status.starts_with("linear  connected  login here"), "{status}");
+    assert!(
+        status.starts_with("linear  connected  login here"),
+        "{status}"
+    );
 
     // An agent on the host, on the real shim.
     let mut shim = HostShim::start(&host, "quiet-amber-otter");
@@ -979,7 +1004,7 @@ fn a_linux_host_that_owns_a_login_serves_and_refreshes_alone_with_the_mac_gone()
     // The Mac's back, and Reconnect there lands at the owner, in the browser and
     // back: the agent goes on with no restart.
     fs::remove_file(host.d.join("down")).unwrap();
-    let mac = self::mac(&golden, &ssh, bundle(golden.dir.path()));
+    let mac = mac_with_services(&golden, &ssh, carried, &fake, &on_the_mac);
     wait_for("the link again", Duration::from_secs(30), || {
         ok(vibe(&mac.socket, &["host"]))
             .lines()

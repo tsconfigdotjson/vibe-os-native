@@ -1,10 +1,10 @@
 //! Shared MCP services (PRD: Shared MCP services). Every `vibed` runs this
-//! broker for its own agents, and holds its own login to each service, so a
-//! Linux host's agents keep their services while the Mac is off. A token never
-//! leaves the host that holds it. Services rotate refresh tokens, so one login
-//! is never copied to several hosts: each signs in for itself. The app can
-//! drive that from the Mac, as the host keeps the PKCE verifier and does the
-//! exchange itself, and only a code that's useless without it crosses the link.
+//! broker for its own agents. There's one login per install to each service,
+//! held by one owning host, and it alone refreshes: services rotate refresh
+//! tokens, so two hosts refreshing one login would break it. Every other host
+//! follows, using a short-lived access token the owner gives it by way of the
+//! Mac. The app drives signing in from the Mac, as the owner keeps the PKCE
+//! verifier and does the exchange itself, and a refresh token never leaves it.
 //!
 //! - [`registry`]: the curated set, Linear first.
 //! - [`secrets`]: where a login is kept: the Keychain on a Mac, a private file
