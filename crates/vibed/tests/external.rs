@@ -48,6 +48,8 @@ struct Wires {
     /// Nothing gets through, but nothing ends either, and new connections are
     /// still accepted: a Mac asleep, with sshd none the wiser.
     frozen: watch::Sender<bool>,
+    /// Every call that's gone into a tunnel, by its method, oldest first.
+    heard: Arc<Mutex<Vec<String>>>,
     /// What a Mac says back through a tunnel goes nowhere, while what's sent to
     /// it arrives: a call that's done there, with the host never hearing so.
     replies_lost: Arc<AtomicBool>,
@@ -65,6 +67,7 @@ impl Wires {
             sockets: Mutex::new(HashMap::new()),
             up: watch::channel(true).0,
             frozen: watch::channel(false).0,
+            heard: Arc::default(),
             replies_lost: Arc::new(AtomicBool::new(false)),
             hang_up: watch::channel(0).0,
             tunnels: Mutex::new(0),
@@ -96,11 +99,15 @@ async fn pump(
     mut up: watch::Receiver<bool>,
     mut frozen: watch::Receiver<bool>,
     b_lost: Arc<AtomicBool>,
+    heard: Option<Arc<Mutex<Vec<String>>>>,
 ) {
     let (mut ar, mut aw) = a.into_split();
     let (mut br, mut bw) = b.into_split();
     let mut x = vec![0u8; 1 << 16];
     let mut y = vec![0u8; 1 << 16];
+    // Its end closed: what's on the way still gets there, as with ssh, which closes the
+    // other end only once that's done with too.
+    let mut a_done = false;
     loop {
         if !*up.borrow_and_update() {
             return;
@@ -115,14 +122,27 @@ async fn pump(
         tokio::select! {
             _ = up.changed() => {}
             _ = frozen.changed() => {}
-            n = ar.read(&mut x) => match n {
-                Ok(0) | Err(_) => return,
-                Ok(n) => if bw.write_all(&x[..n]).await.is_err() { return },
+            n = ar.read(&mut x), if !a_done => match n {
+                Ok(0) | Err(_) => {
+                    a_done = true;
+                    let _ = bw.shutdown().await;
+                }
+                Ok(n) => {
+                    if let Some(heard) = &heard {
+                        for line in String::from_utf8_lossy(&x[..n]).lines() {
+                            let call: Value = serde_json::from_str(line).unwrap_or_default();
+                            if let Some(method) = call["params"]["method"].as_str() {
+                                heard.lock().unwrap().push(method.to_owned());
+                            }
+                        }
+                    }
+                    if bw.write_all(&x[..n]).await.is_err() { return }
+                }
             },
             n = br.read(&mut y) => match n {
                 Ok(0) | Err(_) => return,
                 Ok(_) if b_lost.load(Ordering::SeqCst) => {}
-                Ok(n) => if aw.write_all(&y[..n]).await.is_err() { return },
+                Ok(n) => if aw.write_all(&y[..n]).await.is_err() && !a_done { return },
             },
         }
     }
@@ -148,7 +168,7 @@ impl Remote for Wires {
             let mut hang_up = self.hang_up.subscribe();
             tokio::spawn(async move {
                 tokio::select! {
-                    () = pump(host, theirs, up, frozen, Arc::new(AtomicBool::new(false))) => {}
+                    () = pump(host, theirs, up, frozen, Arc::new(AtomicBool::new(false)), None) => {}
                     _ = hang_up.changed() => {}
                 }
             });
@@ -200,6 +220,7 @@ impl Remote for Wires {
             let pumps = self.up.clone();
             let frozen = self.frozen.clone();
             let replies_lost = Arc::clone(&self.replies_lost);
+            let heard = Arc::clone(&self.heard);
             Ok(TunnelChild {
                 ended: Box::pin(async move {
                     loop {
@@ -213,6 +234,7 @@ impl Remote for Wires {
                                     pumps.subscribe(),
                                     frozen.subscribe(),
                                     Arc::clone(&replies_lost),
+                                    Some(Arc::clone(&heard)),
                                 ));
                             }
                             _ = up.changed() => {
@@ -231,7 +253,7 @@ impl Remote for Wires {
 fn quick() -> Timing {
     Timing {
         ping_every: Duration::from_millis(200),
-        ping_timeout: Duration::from_millis(600),
+        ping_timeout: Duration::from_secs(3),
         connect_timeout: Duration::from_secs(5),
         min_backoff: Duration::from_millis(50),
         max_backoff: Duration::from_millis(300),
@@ -550,6 +572,17 @@ impl World {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         panic!("the tunnel never came back");
+    }
+
+    /// Waits until a look at the tunnel has failed.
+    async fn tunnel_down(&self) {
+        for _ in 0..1500 {
+            if self.host.hosts().unwrap().hosts[0].tunnel != Some(TunnelState::Up) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("the tunnel never went down");
     }
 
     /// Whether `what` comes up in a listing within a few seconds.
@@ -985,6 +1018,21 @@ async fn a_send_delivered_with_its_reply_lost_arrives_once_when_retried() {
     assert_eq!(times(&mut c, "only once").await, 2, "a new send");
 }
 
+/// What the tunnel's socket answers a call with, having first said it has it.
+async fn answer_from(r: &mut BufReader<UnixStream>) -> Value {
+    loop {
+        let mut out = String::new();
+        tokio::io::AsyncBufReadExt::read_line(r, &mut out)
+            .await
+            .unwrap();
+        let line: Value = serde_json::from_str(&out).unwrap();
+        if line.get("id").is_some() {
+            return line;
+        }
+        assert_eq!(line["method"], vibe_core::rpc::CALL_ACCEPTED, "{line}");
+    }
+}
+
 /// The Mac sleeps with a send on its way: the caller is told nobody knows, and when
 /// the Mac wakes it lands. A retry with the id it was given types nothing more.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1016,7 +1064,8 @@ async fn a_send_held_up_by_a_sleeping_mac_lands_once_when_retried() {
     assert!(failed.contains("check vibe_read_messages"), "{failed}");
     assert!(failed.contains("request_id \"mine\""), "{failed}");
 
-    // Now the look has failed, a new one is known not to have gone.
+    // Once a look has failed, a new one is known not to have gone.
+    w.tunnel_down().await;
     let refused = c
         .fails("vibe_send", json!({"agent": agent, "text": "not this"}))
         .await;
@@ -1045,6 +1094,99 @@ async fn a_send_held_up_by_a_sleeping_mac_lands_once_when_retried() {
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
     assert_eq!(times(&mut c, "not this").await, 0);
+}
+
+/// Rule 7 and rule 5: a listing is one call to the Mac, with its memory; a ref this
+/// host has makes none at all; and one on the Mac that this key started needs no lookup.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_mac_is_only_asked_what_only_it_can_say() {
+    let w = world(limits()).await;
+    w.turn_on().await;
+    let key = w.key("laptop");
+    w.pushed(&key).await;
+    let mut c = w.client(&key);
+    c.call(
+        "vibe_start_agent",
+        json!({"project": "app", "profile": "software-eng-linux", "prompt": "talk",
+               "host": "local", "name": "here"}),
+    )
+    .await;
+    c.call("vibe_wait", json!({"agents": "here", "timeout": 60}))
+        .await;
+    c.call(
+        "vibe_start_agent",
+        json!({"project": "app", "profile": "software-eng-mac", "prompt": "talk",
+               "host": "mac", "name": "there"}),
+    )
+    .await;
+
+    let heard = || std::mem::take(&mut *w.wires.heard.lock().unwrap());
+    heard();
+
+    // A ref on the Mac that this key started goes straight there, no listing first.
+    c.call("vibe_wait", json!({"agents": "there", "timeout": 60}))
+        .await;
+    let calls = heard();
+    assert!(!calls.contains(&"agents.list".to_owned()), "{calls:?}");
+    assert!(calls.contains(&"agents.check".to_owned()), "{calls:?}");
+
+    // A ref this host has makes no call to the Mac at all.
+    c.call("vibe_read_output", json!({"agent": "here"})).await;
+    c.call("vibe_read_messages", json!({"agent": "here", "last": 1}))
+        .await;
+    c.call("vibe_send", json!({"agent": "here", "text": "hello"}))
+        .await;
+    c.call("vibe_wait", json!({"agents": "here", "timeout": 60}))
+        .await;
+    assert_eq!(heard(), Vec::<String>::new());
+
+    // A listing is one call, and the Mac's memory comes with it.
+    let listed = c.call("vibe_list_agents", json!({})).await;
+    assert!(listed.contains("mac:there"), "{listed}");
+    assert!(listed.contains("mac: "), "its memory: {listed}");
+    assert!(listed.contains("memory in use"), "{listed}");
+    let calls = heard();
+    assert_eq!(calls, ["agents.list"], "and no hosts.list");
+
+    // Deleted from here, it's forgotten: it's a lookup again, and it's not there.
+    c.call(
+        "vibe_delete_agent",
+        json!({"agent": "there", "force": true}),
+    )
+    .await;
+    heard();
+    let gone = c.fails("vibe_read_output", json!({"agent": "there"})).await;
+    assert!(
+        gone.contains("no agent") || gone.contains("not found"),
+        "{gone}"
+    );
+    assert!(heard().contains(&"agents.list".to_owned()));
+
+    // While the Mac can't answer, its memory is left out of the listing.
+    w.wires.freeze(true);
+    let listed = c.call("vibe_list_agents", json!({})).await;
+    assert!(!listed.contains("mac: "), "{listed}");
+}
+
+/// Rule 5, with the Mac asleep: a ref this key started there is known to be there, so
+/// it says so at once, rather than that it can't be found.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_ref_started_on_the_mac_is_known_while_the_mac_sleeps() {
+    let w = world(limits()).await;
+    w.turn_on().await;
+    let key = w.key("laptop");
+    w.pushed(&key).await;
+    let mut c = w.client(&key);
+    c.call(
+        "vibe_start_agent",
+        json!({"project": "app", "profile": "software-eng-mac", "prompt": "talk",
+               "host": "mac", "name": "there"}),
+    )
+    .await;
+    w.wires.freeze(true);
+    let failed = c.fails("vibe_read_output", json!({"agent": "there"})).await;
+    assert!(failed.contains("mac is unavailable"), "{failed}");
+    assert!(!failed.contains("isn't on any host"), "{failed}");
 }
 
 /// A start held in a frozen tunnel: reported unknown. It runs if the Mac wakes in time,
@@ -1189,11 +1331,7 @@ async fn a_change_too_old_when_it_reaches_the_mac_doesnt_run() {
         let mut s = UnixStream::connect(&socket).await.unwrap();
         s.write_all(format!("{line}\n").as_bytes()).await.unwrap();
         let mut r = BufReader::new(s);
-        let mut out = String::new();
-        tokio::io::AsyncBufReadExt::read_line(&mut r, &mut out)
-            .await
-            .unwrap();
-        serde_json::from_str::<Value>(&out).unwrap()
+        answer_from(&mut r).await
     };
     let r = send("too late", 61).await;
     assert_eq!(r["error"]["code"], ErrorCode::Conflict.code(), "{r}");
@@ -1208,11 +1346,7 @@ async fn a_change_too_old_when_it_reaches_the_mac_doesnt_run() {
         let mut s = UnixStream::connect(&socket).await.unwrap();
         s.write_all(format!("{line}\n").as_bytes()).await.unwrap();
         let mut r = BufReader::new(s);
-        let mut out = String::new();
-        tokio::io::AsyncBufReadExt::read_line(&mut r, &mut out)
-            .await
-            .unwrap();
-        serde_json::from_str::<Value>(&out).unwrap()
+        answer_from(&mut r).await
     };
     for (method, params) in [
         (
@@ -1444,11 +1578,7 @@ async fn the_mac_checks_every_key_itself() {
             let mut s = UnixStream::connect(&socket).await.unwrap();
             s.write_all(format!("{line}\n").as_bytes()).await.unwrap();
             let mut r = BufReader::new(s);
-            let mut out = String::new();
-            tokio::io::AsyncBufReadExt::read_line(&mut r, &mut out)
-                .await
-                .unwrap();
-            serde_json::from_str::<Value>(&out).unwrap()
+            answer_from(&mut r).await
         }
     };
     let call = |key: &str, method: &str, params: Value| {

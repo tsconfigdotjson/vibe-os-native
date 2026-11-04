@@ -140,6 +140,7 @@ fn rpc_bridges_the_whole_contract() {
             input.extend(format!("{hello}\n").into_bytes());
             let mut answer = expected[0].clone();
             answer["id"] = "link".into();
+            answer["result"][vibe_core::rpc::ACCEPTS_CALLS] = true.into();
             expected.push(answer);
         }
         let Some(line) = ex.line else { continue };

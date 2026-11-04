@@ -487,6 +487,22 @@ impl Core {
         }
     }
 
+    /// Adds an agent to those kept of `link`'s host, as its start just said, so a
+    /// bare ref finds it before the event's refresh does.
+    pub(crate) fn note_kept_agent(&self, link: &Link, agent: &Agent) {
+        let mut agents = self.kept_agents(link);
+        agents.retain(|a| a.agent != agent.agent);
+        agents.push(agent.clone());
+        self.keep_agents(link, &agents);
+    }
+
+    /// Takes an agent from those kept of `link`'s host, as its delete just said.
+    pub(crate) fn forget_kept_agent(&self, link: &Link, agent: &str) {
+        let mut agents = self.kept_agents(link);
+        agents.retain(|a| a.agent != agent);
+        self.keep_agents(link, &agents);
+    }
+
     /// Changes one kept agent of `link`'s host, as an event says.
     fn change_kept_agent(&self, link: &Link, agent: &str, change: impl FnOnce(&mut Agent)) {
         let mut agents = self.kept_agents(link);

@@ -28,6 +28,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::task::JoinHandle;
 use vibe_core::model::{LOCAL_HOST, TunnelState};
+use vibe_core::rpc::{ACCEPTS_CALLS, AgentsList, accepted_frame};
 use vibe_core::rpc::{
     ErrorCode, ErrorObject, Hello, HelloParams, HostsList, Id, Method, NoParams, Request, Response,
     TUNNEL_METHODS, TunnelCall, TunnelCallParams, TunnelPrepare,
@@ -129,7 +130,19 @@ fn hello(core: &Core, params: Option<Value>) -> Result<Value, ErrorObject> {
     let p: HelloParams = decode(params)?;
     *lock(&core.tunnel_seen) = Some(Instant::now());
     let r = crate::dispatch::hello(core.info(), p)?;
-    Ok(serde_json::to_value(r).expect("hello serializes"))
+    let mut answer = serde_json::to_value(r).expect("hello serializes");
+    answer[ACCEPTS_CALLS] = json!(true);
+    Ok(answer)
+}
+
+/// This Mac's memory, as its row among the hosts has it.
+fn own_memory(core: &Core) -> Option<vibe_core::rpc::MemoryUse> {
+    core.hosts()
+        .ok()?
+        .hosts
+        .into_iter()
+        .find(|h| h.name == LOCAL_HOST)?
+        .memory
 }
 
 async fn tunnel_call(core: &Core, params: Option<Value>) -> Result<Value, ErrorObject> {
@@ -197,6 +210,12 @@ async fn tunnel_call(core: &Core, params: Option<Value>) -> Result<Value, ErrorO
         ));
     }
     let mut answer = crate::dispatch::call_here(core, &p.method, Value::Object(params)).await?;
+    // Its memory comes with its agents, so a listing needs one call and not two.
+    if p.method == AgentsList::NAME
+        && let Some(memory) = own_memory(core)
+    {
+        answer["memory"] = serde_json::to_value(memory).expect("memory serializes");
+    }
     // This Mac's own row only: the hosts linked to it aren't the tunnel's
     // to see.
     if p.method == HostsList::NAME
@@ -233,6 +252,16 @@ async fn connection(core: Arc<Core>, stream: UnixStream) {
             return;
         }
         line.pop();
+        // At once: a call can run for a long time, and whoever sent it is waiting to
+        // hear that this end is here at all.
+        if let Some(frame) = accepted_frame(&line, |m| m == TunnelCall::NAME)
+            && write
+                .write_all(format!("{frame}\n").as_bytes())
+                .await
+                .is_err()
+        {
+            return;
+        }
         if let Some(r) = tunnel_message(&core, &line).await
             && write.write_all(format!("{r}\n").as_bytes()).await.is_err()
         {

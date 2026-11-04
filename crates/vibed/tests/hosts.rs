@@ -187,11 +187,16 @@ async fn world() -> World {
 
 /// [`world`], with the Linux host's config changed by `change`.
 async fn world_with(change: impl FnOnce(&mut vibed::core::Config)) -> World {
+    world_timed(quick(), change).await
+}
+
+/// [`world_with`], with the Mac's link timed by `timing`.
+async fn world_timed(timing: Timing, change: impl FnOnce(&mut vibed::core::Config)) -> World {
     let wires = Wires::new();
     let mac_world = Golden::new();
     let mut config = mac_world.config();
     config.remote = Arc::clone(&wires) as Arc<dyn Remote>;
-    config.link_timing = quick();
+    config.link_timing = timing;
     let mac = Arc::new(Core::open(config).unwrap());
     mac.spawn_links();
 
@@ -288,6 +293,101 @@ async fn rpc(core: &Core, method: &str, params: Value) -> Value {
     .await
     .unwrap();
     serde_json::from_str(&reply).unwrap()
+}
+
+/// A host's link stays up by its pings here, so what catches it is the deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_that_doesnt_take_a_call_fails_it_at_the_accept_deadline() {
+    let w = world_timed(
+        Timing {
+            ping_timeout: Duration::from_secs(120),
+            ..quick()
+        },
+        |_| {},
+    )
+    .await;
+    w.add_host().await;
+    w.link().await;
+    let t = Target {
+        host: "vps".into(),
+        agent: "nobody".into(),
+    };
+    // The channel's made, and it's said it takes these.
+    let unknown = Daemon::check(&*w.mac, &caller(), &t, false)
+        .await
+        .unwrap_err();
+    assert_eq!(unknown.code, ErrorCode::NotFound.code(), "{unknown:?}");
+
+    w.wires.freeze();
+    let begun = std::time::Instant::now();
+    let failed = Daemon::send(
+        &*w.mac,
+        &caller(),
+        &t,
+        Input::Keys(vec!["y".into()]),
+        "frozen-1",
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        begun.elapsed() < Duration::from_secs(8),
+        "{:?}",
+        begun.elapsed()
+    );
+    assert_eq!(failed.code, ErrorCode::HostUnavailable.code(), "{failed:?}");
+    assert!(failed.is_outcome_unknown(), "{failed:?}");
+    assert!(
+        failed.message.contains("didn't take agents.send"),
+        "{failed:?}"
+    );
+    w.wires.plug_in();
+}
+
+/// Rule 5 on the Mac's side: an agent's added or deleted on a host, whoever by, and
+/// the link's events say so, with no listing asked for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hosts_events_tell_the_mac_where_a_ref_is() {
+    let w = world().await;
+    w.add_host().await;
+    w.link().await;
+    w.host_project().await;
+    let known = |name: &str| Daemon::known_hosts(&*w.mac, &caller(), name);
+    let started = w
+        .host
+        .start_agent(AgentStartParams {
+            project: "app".into(),
+            profile: "software-eng-linux".into(),
+            prompt: "talk".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let mut found = false;
+    for _ in 0..500 {
+        if known(&started.agent) == ["vps"] {
+            found = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(found, "the event told it");
+    w.host
+        .delete_agent(vibe_core::rpc::AgentDeleteParams {
+            host: None,
+            agent: started.agent.clone(),
+            force: Some(true),
+        })
+        .await
+        .unwrap();
+    let mut gone = false;
+    for _ in 0..500 {
+        if known(&started.agent).is_empty() {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(gone, "and its delete too");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

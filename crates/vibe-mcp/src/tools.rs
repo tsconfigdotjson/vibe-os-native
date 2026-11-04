@@ -784,13 +784,16 @@ impl<D: Daemon> Server<D> {
         let mut agents = Vec::new();
         let mut unreachable = Vec::new();
         let caller = c.clone();
-        let (answers, memory) = tokio::join!(
-            self.ask_all(&hosts, move |d, h| {
+        let answers = self
+            .ask_all(&hosts, move |d, h| {
                 let c = caller.clone();
                 async move { d.agents(&c, &h).await }
-            }),
-            self.daemon.memory(c)
-        );
+            })
+            .await;
+        // After them: another host's can come with its agents.
+        let memory = tokio::time::timeout(self.daemon.peer_deadline(), self.daemon.memory(c))
+            .await
+            .unwrap_or_default();
         for (h, answer) in answers {
             match answer {
                 Ok(list) => agents.extend(list),

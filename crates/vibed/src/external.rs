@@ -15,7 +15,7 @@
 //! On the Mac, `hosts.external` records which Linux host is the external
 //! address (one at most), tells the host, and keeps the tunnel to it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -26,6 +26,7 @@ use tokio::io::BufReader;
 use tokio::net::{TcpListener, UnixStream};
 use tokio::task::JoinHandle;
 use vibe_core::model::{EventKind, LOCAL_HOST, MAC_HOST, TunnelState, validate_domain};
+use vibe_core::rpc::{ACCEPTS_CALLS, MemoryUse};
 use vibe_core::rpc::{
     Agent, ErrorCode, ErrorObject, HostExternalParams, HostInfo, HostsExternal, Method, Project,
     TunnelPrepared,
@@ -34,7 +35,7 @@ use vibe_mcp::public::{Limiter, Limits};
 
 use crate::acme::{self, Certs, Disk};
 use crate::core::{Core, error, invalid, lock, store_error};
-use crate::remote::Channel;
+use crate::remote::{ACCEPT_WITHIN, Channel};
 
 /// The port the public endpoint listens on: 443, which Let's Encrypt's
 /// TLS-ALPN-01 challenge comes to.
@@ -114,6 +115,9 @@ pub(crate) struct MacPeer {
     up: AtomicBool,
     /// Looks that have failed in a row.
     misses: AtomicU32,
+    /// Whether the Mac's `vibed` is one that sends `call.accepted`, as its hello
+    /// says, and gives its memory with its agents. An older one does neither.
+    accepts_calls: AtomicBool,
     idle: Mutex<Vec<(Channel, Instant)>>,
     /// Calls to the Mac at once, fewer than its tunnel socket serves, so
     /// one is always left for the look that says it's there.
@@ -125,6 +129,11 @@ pub(crate) struct MacPeer {
     /// The Mac's projects as each key last listed them, likewise: a project
     /// there is still there while the Mac is away.
     projects_seen: Mutex<HashMap<String, Vec<String>>>,
+    /// Refs each key has seen answer since its last listing, as a start's did, so a
+    /// bare ref goes straight there.
+    refs_seen: Mutex<HashMap<String, HashSet<String>>>,
+    /// The Mac's memory as it came with each key's last listing.
+    memory_seen: Mutex<HashMap<String, MemoryUse>>,
 }
 
 /// How long a call waits its turn at the Mac, as stuck calls mustn't queue new
@@ -210,10 +219,13 @@ impl MacPeer {
             socket,
             up: AtomicBool::new(false),
             misses: AtomicU32::new(0),
+            accepts_calls: AtomicBool::new(false),
             idle: Mutex::new(Vec::new()),
             calls: tokio::sync::Semaphore::new(MAX_CALLS),
             seen: Mutex::new(HashMap::new()),
             projects_seen: Mutex::new(HashMap::new()),
+            refs_seen: Mutex::new(HashMap::new()),
+            memory_seen: Mutex::new(HashMap::new()),
         }
     }
 
@@ -225,8 +237,7 @@ impl MacPeer {
     /// anew or external access goes off.
     pub(crate) fn reset(&self) {
         lock(&self.idle).clear();
-        lock(&self.seen).clear();
-        lock(&self.projects_seen).clear();
+        self.forget_all();
         self.up.store(false, Ordering::SeqCst);
         self.misses.store(GONE_AFTER, Ordering::SeqCst);
     }
@@ -259,19 +270,27 @@ impl MacPeer {
     pub(crate) async fn probe(&self) -> bool {
         let hello = async {
             let mut c = self.dial().await.ok()?;
-            c.call(
-                vibe_core::rpc::Hello::NAME,
-                json!({"client": "vibed tunnel probe", "protocol": vibe_core::rpc::PROTOCOL_VERSION}),
-            )
-            .await
-            .ok()?
-            .ok()
+            let answer = c
+                .call(
+                    vibe_core::rpc::Hello::NAME,
+                    json!({"client": "vibed tunnel probe", "protocol": vibe_core::rpc::PROTOCOL_VERSION}),
+                )
+                .await
+                .ok()?
+                .ok()?;
+            Some(answer)
         };
-        let up = tokio::time::timeout(Duration::from_secs(5), hello)
+        let answer = tokio::time::timeout(Duration::from_secs(5), hello)
             .await
             .ok()
-            .flatten()
-            .is_some();
+            .flatten();
+        if let Some(answer) = &answer {
+            self.accepts_calls.store(
+                answer.get(ACCEPTS_CALLS) == Some(&Value::Bool(true)),
+                Ordering::SeqCst,
+            );
+        }
+        let up = answer.is_some();
         self.note_look(up);
         up
     }
@@ -342,8 +361,16 @@ impl MacPeer {
                     Err(_) => return Err(not_sent(method, "its tunnel is down")),
                 },
             };
-            let waiting =
-                tokio::time::timeout(timeout, channel.call("tunnel.call", message.clone()));
+            let accepting = self.accepts_calls.load(Ordering::SeqCst);
+            let waiting = tokio::time::timeout(timeout, async {
+                if accepting {
+                    channel
+                        .call_accepted("tunnel.call", message.clone(), ACCEPT_WITHIN)
+                        .await
+                } else {
+                    channel.call("tunnel.call", message.clone()).await
+                }
+            });
             let answer = tokio::select! {
                 answer = waiting => answer,
                 () = self.found_gone() => return Err(lost(method, "it stopped answering")),
@@ -354,6 +381,10 @@ impl MacPeer {
                         method,
                         &format!("it didn't answer {method} in {} s", timeout.as_secs()),
                     ));
+                }
+                // Nothing's known of it: what's kept may be fine, and the Mac not.
+                Ok(Err(e)) if e.kind() == std::io::ErrorKind::TimedOut => {
+                    return Err(lost(method, &format!("{e}").replace("tunnel.call", method)));
                 }
                 Ok(Err(_)) if !fresh => continue,
                 Ok(Err(e)) => return Err(lost(method, &format!("its tunnel failed: {e}"))),
@@ -405,8 +436,72 @@ impl MacPeer {
             .is_some_and(|names| names.iter().any(|n| n == project))
     }
 
+    /// Whether the Mac is one that gives its memory with its agents.
+    pub(crate) fn accepts_calls(&self) -> bool {
+        self.accepts_calls.load(Ordering::SeqCst)
+    }
+
+    /// Keeps the memory that came with `key`'s listing, or forgets it, if that
+    /// listing couldn't be had.
+    pub(crate) fn saw_memory(&self, key: &str, memory: Option<MemoryUse>) {
+        let mut seen = lock(&self.memory_seen);
+        let k = vibe_core::keys::hash(key);
+        match memory {
+            Some(memory) => {
+                if !seen.contains_key(&k) && seen.len() >= MAX_SEEN {
+                    seen.clear();
+                }
+                seen.insert(k, memory);
+            }
+            None => {
+                seen.remove(&k);
+            }
+        }
+    }
+
+    /// The memory that came with `key`'s last listing.
+    pub(crate) fn memory_seen(&self, key: &str) -> Option<MemoryUse> {
+        lock(&self.memory_seen)
+            .get(&vibe_core::keys::hash(key))
+            .cloned()
+    }
+
+    /// Notes that `agent` is on the Mac, as `key` has just seen it answer.
+    pub(crate) fn note_ref(&self, key: &str, agent: &str) {
+        let mut seen = lock(&self.refs_seen);
+        let k = vibe_core::keys::hash(key);
+        if !seen.contains_key(&k) && seen.len() >= MAX_SEEN {
+            seen.clear();
+        }
+        seen.entry(k).or_default().insert(agent.to_owned());
+    }
+
+    /// Notes that `agent` is gone from the Mac, as `key` has just seen.
+    pub(crate) fn forget_ref(&self, key: &str, agent: &str) {
+        let k = vibe_core::keys::hash(key);
+        if let Some(refs) = lock(&self.refs_seen).get_mut(&k) {
+            refs.remove(agent);
+        }
+        if let Some((_, agents)) = lock(&self.seen).get_mut(&k) {
+            agents.retain(|a| a.agent != agent);
+        }
+    }
+
+    /// Whether `key` knows of `agent` on the Mac, from a listing or anything since.
+    pub(crate) fn knows_ref(&self, key: &str, agent: &str) -> bool {
+        let k = vibe_core::keys::hash(key);
+        lock(&self.refs_seen)
+            .get(&k)
+            .is_some_and(|refs| refs.contains(agent))
+            || lock(&self.seen)
+                .get(&k)
+                .is_some_and(|(_, agents)| agents.iter().any(|a| a.agent == agent))
+    }
+
     /// Keeps what `key` last listed of the Mac's agents.
     pub(crate) fn saw(&self, key: &str, agents: &[Agent]) {
+        // That's all of them now: what was noted since is in it, or has gone.
+        lock(&self.refs_seen).remove(&vibe_core::keys::hash(key));
         let mut seen = lock(&self.seen);
         let k = vibe_core::keys::hash(key);
         if !seen.contains_key(&k) && seen.len() >= MAX_SEEN {
@@ -420,12 +515,16 @@ impl MacPeer {
         let k = vibe_core::keys::hash(key);
         lock(&self.seen).remove(&k);
         lock(&self.projects_seen).remove(&k);
+        lock(&self.refs_seen).remove(&k);
+        lock(&self.memory_seen).remove(&k);
     }
 
     /// Forgets what every key listed, as when the keys change.
     pub(crate) fn forget_all(&self) {
         lock(&self.seen).clear();
         lock(&self.projects_seen).clear();
+        lock(&self.refs_seen).clear();
+        lock(&self.memory_seen).clear();
     }
 
     /// What `key` last listed of the Mac's agents, if it listed them.
@@ -982,6 +1081,138 @@ mod tests {
                 .await
                 .unwrap_err()
         })
+    }
+
+    /// A tunnel's end that answers a hello saying what it does, and a call after
+    /// `taking`, having said it has it if it does that at all.
+    fn answering_end(dir: &std::path::Path, accepts: bool, taking: Duration) -> PathBuf {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let path = dir.join("answering.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut stream = BufReader::new(stream);
+                    let mut line = String::new();
+                    while stream.read_line(&mut line).await.unwrap_or(0) > 0 {
+                        let call: Value = serde_json::from_str(&line).unwrap();
+                        line.clear();
+                        let say = |v: Value| format!("{v}\n").into_bytes();
+                        let result = if call["method"] == "tunnel.call" {
+                            if accepts {
+                                let frame = json!({"jsonrpc": "2.0",
+                                    "method": vibe_core::rpc::CALL_ACCEPTED,
+                                    "params": {"id": call["id"]}});
+                                let bytes = say(frame);
+                                stream.get_mut().write_all(&bytes).await.unwrap();
+                            }
+                            tokio::time::sleep(taking).await;
+                            json!({"done": true})
+                        } else if accepts {
+                            json!({"daemon": "vibed", (ACCEPTS_CALLS): true})
+                        } else {
+                            json!({"daemon": "vibed"})
+                        };
+                        let bytes =
+                            say(json!({"jsonrpc": "2.0", "id": call["id"], "result": result}));
+                        stream.get_mut().write_all(&bytes).await.unwrap();
+                    }
+                });
+            }
+        });
+        path
+    }
+
+    #[tokio::test]
+    async fn a_mac_that_takes_a_connection_and_says_nothing_fails_at_the_accept_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let peer = MacPeer::new(silent_end(dir.path()));
+        peer.note_look(true);
+        peer.accepts_calls.store(true, Ordering::SeqCst);
+        for (method, check) in [
+            ("agents.start", "check vibe_list_agents"),
+            ("agents.delete", "check vibe_list_agents"),
+            ("agents.send", "check vibe_read_messages"),
+        ] {
+            let begun = Instant::now();
+            // Its own timeout is an hour, and no look at the tunnel has failed.
+            let e = peer
+                .call("vk_x", method, json!({}), LONG)
+                .await
+                .unwrap_err();
+            assert!(begun.elapsed() < ACCEPT_WITHIN + Duration::from_secs(3));
+            assert_eq!(e.code, ErrorCode::HostUnavailable.code());
+            assert!(e.is_outcome_unknown(), "{}", e.message);
+            assert!(
+                e.message.contains(&format!("didn't take {method} in 5 s")),
+                "{}",
+                e.message
+            );
+            assert!(e.message.contains(check), "{}", e.message);
+        }
+        // A read: nothing unknown of it, just nobody there.
+        let e = peer
+            .call("vk_x", "agents.output", json!({}), LONG)
+            .await
+            .unwrap_err();
+        assert!(!e.is_outcome_unknown());
+        assert!(
+            e.message.contains("didn't take agents.output"),
+            "{}",
+            e.message
+        );
+        assert!(peer.is_up(), "only a look says it's gone");
+        assert_eq!(peer.calls.available_permits(), MAX_CALLS);
+    }
+
+    #[tokio::test]
+    async fn a_call_the_mac_has_taken_may_run_past_the_accept_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let taking = ACCEPT_WITHIN + Duration::from_secs(1);
+        let peer = MacPeer::new(answering_end(dir.path(), true, taking));
+        assert!(peer.probe().await);
+        assert!(peer.accepts_calls(), "its hello says so");
+        let answer = peer.call("vk_x", "agents.start", json!({}), LONG).await;
+        assert_eq!(answer.unwrap()["done"], true);
+    }
+
+    #[tokio::test]
+    async fn an_older_mac_with_no_accepted_isnt_held_to_the_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let taking = ACCEPT_WITHIN + Duration::from_secs(1);
+        let peer = MacPeer::new(answering_end(dir.path(), false, taking));
+        assert!(peer.probe().await);
+        assert!(!peer.accepts_calls(), "its hello doesn't say so");
+        let answer = peer.call("vk_x", "agents.start", json!({}), LONG).await;
+        assert_eq!(answer.unwrap()["done"], true);
+    }
+
+    #[test]
+    fn a_ref_seen_answering_is_known_until_its_gone_or_a_listing_says_otherwise() {
+        let dir = tempfile::tempdir().unwrap();
+        let peer = MacPeer::new(dir.path().join(TUNNEL_END));
+        assert!(!peer.knows_ref("vk_a", "new"));
+        peer.note_ref("vk_a", "new");
+        assert!(peer.knows_ref("vk_a", "new"));
+        assert!(
+            !peer.knows_ref("vk_b", "new"),
+            "another key knows nothing of it"
+        );
+
+        // A listing is all of them.
+        peer.saw("vk_a", &[]);
+        assert!(!peer.knows_ref("vk_a", "new"));
+
+        peer.note_ref("vk_a", "new");
+        peer.forget_ref("vk_a", "new");
+        assert!(!peer.knows_ref("vk_a", "new"));
+
+        peer.note_ref("vk_a", "new");
+        peer.forget("vk_a");
+        assert!(!peer.knows_ref("vk_a", "new"));
+        peer.note_ref("vk_a", "new");
+        peer.forget_all();
+        assert!(!peer.knows_ref("vk_a", "new"));
     }
 
     #[tokio::test]

@@ -14,12 +14,13 @@ use serde_json::{Value, json};
 use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
 use vibe_core::model::{HostLink, LOCAL_HOST};
+use vibe_core::rpc::ACCEPTS_CALLS;
 use vibe_core::rpc::{
     ErrorCode, ErrorObject, Event, Hello, HostInfo, HostList, HostsList, Method, PROTOCOL_VERSION,
 };
 
 use crate::core::{Core, error, lock};
-use crate::remote::Channel;
+use crate::remote::{ACCEPT_WITHIN, Channel};
 
 /// How often the host is pinged (with `hosts.list`, whose answer also says
 /// whether it serves MCP).
@@ -102,6 +103,8 @@ pub struct Link {
     pub(crate) keys_stale: AtomicBool,
     /// The projects it last listed, as it still has them while it's away.
     pub(crate) projects_seen: Mutex<Vec<String>>,
+    /// Whether its `vibed` sends [`vibe_core::rpc::CALL_ACCEPTED`].
+    accepts_calls: AtomicBool,
 }
 
 impl std::fmt::Debug for Link {
@@ -164,6 +167,7 @@ impl Link {
             refresh_wanted: AtomicBool::new(false),
             keys_stale: AtomicBool::new(false),
             projects_seen: Mutex::new(Vec::new()),
+            accepts_calls: AtomicBool::new(false),
         }
     }
 
@@ -307,15 +311,23 @@ impl Link {
             // A new channel says it's a link's, so the host closes it once
             // it's quiet, as it would be left by a pulled network.
             if fresh {
-                channel
+                let hello = channel
                     .call(
                         Hello::NAME,
                         json!({"client": format!("{LINK_CALLS} {}", core.label()), "protocol": PROTOCOL_VERSION}),
                     )
                     .await?
                     .map_err(|e| std::io::Error::other(e.message))?;
+                self.accepts_calls.store(
+                    hello.get(ACCEPTS_CALLS) == Some(&Value::Bool(true)),
+                    Ordering::SeqCst,
+                );
             }
-            channel.call(method, params).await
+            if self.accepts_calls.load(Ordering::SeqCst) {
+                channel.call_accepted(method, params, ACCEPT_WITHIN).await
+            } else {
+                channel.call(method, params).await
+            }
         };
         let answer = tokio::select! {
             a = tokio::time::timeout(timeout, exchange) => a,
