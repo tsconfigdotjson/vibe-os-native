@@ -50,7 +50,7 @@ sha256_of() {
 
 # fetch_zig <dir>: puts zig in <dir>, whole or not at all. A tarball that isn't
 # the one named here is never unpacked. It's a subshell for a trap of its own, which
-# leaves the caller's alone: its temp dir goes however it ends, an interrupt included.
+# leaves the caller's alone: its temp dir goes on a failure or an interrupt too.
 fetch_zig() (
   dir=$1
   platform=$(zig_platform)

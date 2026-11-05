@@ -67,7 +67,7 @@ sha256() {
 # 1. vibe-guest, PID 1: a static arm64 binary.
 rustup target add "$TARGET" >/dev/null
 cargo build -p vibe-guest --locked --release --target "$TARGET"
-cp "target/$TARGET/release/vibe-guest" "$WORK/vibe-guest"
+cp "${CARGO_TARGET_DIR:-target}/$TARGET/release/vibe-guest" "$WORK/vibe-guest"
 
 # 2. The kernel and mke2fs, in a builder of this machine's architecture.
 case $(uname -m) in

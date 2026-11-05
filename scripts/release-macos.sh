@@ -14,8 +14,8 @@
 #
 #   scripts/release-macos.sh [--out DIR] [--tag vX.Y.Z]
 #
-# The first run on a machine also needs the network and a few more minutes, to
-# fetch zig and build cargo-zigbuild for the Linux builds (scripts/zig-tools.sh).
+# Without zig and cargo-zigbuild on PATH, the first run on a machine also needs the
+# network and a few more minutes, to get them for the Linux builds (scripts/zig-tools.sh).
 #
 # What it does depends on what it's given, so a build with none of the
 # secrets still works, ad hoc signed, for trying on this Mac:
