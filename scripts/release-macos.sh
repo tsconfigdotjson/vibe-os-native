@@ -14,6 +14,9 @@
 #
 #   scripts/release-macos.sh [--out DIR] [--tag vX.Y.Z]
 #
+# Without zig and cargo-zigbuild on PATH, the first run on a machine also needs the
+# network and a few more minutes, to get them for the Linux builds (scripts/zig-tools.sh).
+#
 # What it does depends on what it's given, so a build with none of the
 # secrets still works, ad hoc signed, for trying on this Mac:
 #
@@ -114,7 +117,7 @@ say "VibeOS $VERSION: $( [ -n "$IDENTITY" ] && echo "Developer ID" || echo "ad h
 # The Rust binaries, for Apple Silicon.
 rustup target add "$TARGET" >/dev/null
 cargo build --locked --release --target "$TARGET" -p vibed -p vibe-cli -p vibe-shim
-RUST=target/$TARGET/release
+RUST=${CARGO_TARGET_DIR:-target}/$TARGET/release
 
 # The Linux builds Add Linux Host installs.
 scripts/host-bundle.sh --out "$WORK/host-bundle"
