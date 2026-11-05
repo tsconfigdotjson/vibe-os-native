@@ -51,7 +51,8 @@ struct ServicesTests {
     @Test func eachHostSaysWhatItHas() {
         #expect(ServiceSummary(service(.connected, role: .owner)).status == "Holds the login")
         #expect(ServiceSummary(service(.connected, owner: "vps")).status == "Has access")
-        let until = "2026-11-05T00:00:00Z"
+        // Always tomorrow: a summary reads the clock, and one that's run out says so instead.
+        let until = ISO8601DateFormatter().string(from: Date().addingTimeInterval(24 * 60 * 60))
         #expect(ServiceSummary(service(.connected, owner: "vps", until: until)).status.hasPrefix("Has access until "))
         #expect(ServiceSummary(service(.connected, role: .owner, until: until)).status.hasPrefix("Holds the login · access until "))
         let away = ServiceSummary(service(.ownerUnreachable, owner: "vps"))
