@@ -419,6 +419,8 @@ pub struct Core {
     pub(crate) pi_installing: tokio::sync::Mutex<()>,
     /// Why Pi couldn't be installed, the last time.
     pub(crate) pi_install_failures: Mutex<crate::pi::PiFailures>,
+    /// The template's moving to a new base by itself.
+    pub(crate) toolbox_moving: std::sync::atomic::AtomicBool,
     /// `sudo -n` was tried for port 443. A refused try is in the server's logs, and
     /// can mail its admin, so once a run is enough.
     pub(crate) port_grant_tried: std::sync::atomic::AtomicBool,
@@ -644,6 +646,7 @@ impl Core {
             pi_setup: crate::pi_setup::PiSetup::default(),
             pi_installing: tokio::sync::Mutex::new(()),
             pi_install_failures: Mutex::default(),
+            toolbox_moving: std::sync::atomic::AtomicBool::new(false),
             port_grant_tried: std::sync::atomic::AtomicBool::new(false),
             admitting: tokio::sync::Mutex::new(()),
             starting: Mutex::new(0),

@@ -815,6 +815,11 @@ fn examples_cover_the_contract() {
         if ty == "KeyList" {
             seen_keys.insert("pending_on");
         }
+        // Only a template that couldn't move by itself says so; vibed's own tests
+        // cover it.
+        if ty == "ToolboxStatus" {
+            seen_keys.insert("rebuild_held");
+        }
         // Only a download that fails says so; vibed's own tests cover it.
         if ty == "PiStatus" {
             seen_keys.insert("error");

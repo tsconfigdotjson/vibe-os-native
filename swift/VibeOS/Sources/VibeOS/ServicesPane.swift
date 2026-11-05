@@ -29,14 +29,12 @@ struct ServicesPane: View {
                 Section {
                     Label(
                         "Linux agents on this Mac have no shared services yet: the Linux template is on an older "
-                            + "base image, and they need base \(VibeRPC.sharedServicesBase). macOS agents have them now.",
+                            + "base image, and they need base \(VibeRPC.sharedServicesBase). Settings → Linux Toolbox "
+                            + "says how its move there is going. macOS agents have them now.",
                         systemImage: "exclamationmark.triangle"
                     )
                     .foregroundStyle(Palette.attention)
                     .fixedSize(horizontal: false, vertical: true)
-                    Button("Rebuild Template") { model.runInTerminal(["toolbox", "rebuild"], exec: false) }
-                        .disabled(model.toolbox?.state != .closed)
-                        .help("Replays toolbox.toml onto the newest base image, in Terminal")
                 }
             }
             ForEach(services, id: \.name) { service in

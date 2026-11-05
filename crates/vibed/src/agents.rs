@@ -580,7 +580,10 @@ impl Core {
         if !matches!(
             toolbox,
             vibe_core::model::ToolboxState::Closed | vibe_core::model::ToolboxState::Unavailable
-        ) {
+        ) && !self
+            .toolbox_moving
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
             awake.push(vibe_env::toolbox::TOOLBOX_REF.to_owned());
         }
         for a in agents {

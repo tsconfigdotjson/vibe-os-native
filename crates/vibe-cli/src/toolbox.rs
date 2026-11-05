@@ -468,10 +468,12 @@ pub(crate) fn describe_status(s: &ToolboxStatus) -> String {
     );
     match (s.base, s.newest_base) {
         (Some(b), Some(n)) if n > b => {
-            let _ = writeln!(
-                out,
-                "base      {b}; base {n} is installed: `vibe toolbox rebuild` moves the template to it"
-            );
+            let how = if s.rebuild_held.is_empty() {
+                "VibeOS moves the template to it by itself"
+            } else {
+                "the template is waiting"
+            };
+            let _ = writeln!(out, "base      {b}; base {n} is installed, and {how}");
         }
         (Some(b), _) => {
             let _ = writeln!(out, "base      {b}");
@@ -479,6 +481,14 @@ pub(crate) fn describe_status(s: &ToolboxStatus) -> String {
         (None, _) => {
             let _ = writeln!(out, "base      not downloaded yet");
         }
+    }
+    if !s.rebuild_held.is_empty() {
+        let _ = writeln!(
+            out,
+            "waiting   moving would lose what toolbox.toml doesn't cover: {}. `vibe toolbox \
+             rebuild` moves it anyway",
+            s.rebuild_held.join(", ")
+        );
     }
     if let Some(run) = &s.last {
         let text = describe_run(run).replace('\n', "\n          ");
@@ -498,6 +508,7 @@ mod tests {
             home: Some(2),
             base: Some(1),
             newest_base: Some(1),
+            rebuild_held: Vec::new(),
             last: None,
             clients: None,
         }
@@ -577,7 +588,7 @@ mod tests {
         });
         let text = describe_status(&s);
         assert!(
-            text.contains("base 2 is installed: `vibe toolbox rebuild`"),
+            text.contains("base 2 is installed, and VibeOS moves the template"),
             "{text}"
         );
         assert!(
@@ -606,6 +617,7 @@ mod tests {
             home: None,
             base: None,
             newest_base: None,
+            rebuild_held: Vec::new(),
             last: None,
             clients: None,
         };

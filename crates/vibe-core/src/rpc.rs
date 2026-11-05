@@ -692,10 +692,11 @@ method! {
 }
 
 method! {
-    /// `toolbox.rebuild`: **Rebuild template**. Boots the newest base image,
-    /// replays `toolbox.toml`'s recipe into a fresh template, and lists
-    /// what the old template has that the recipe doesn't cover. The Linux
-    /// home carries over.
+    /// `toolbox.rebuild`: moves the template to the newest base image now, whatever
+    /// that loses: `vibed` does it by itself when it'd lose nothing. Boots the newest
+    /// base image, replays `toolbox.toml`'s recipe into a fresh template, and lists
+    /// what the old template has that the recipe doesn't cover. The Linux home
+    /// carries over.
     ToolboxRebuild = "toolbox.rebuild", NoParams => ToolboxRun
 }
 
@@ -1853,10 +1854,15 @@ pub struct ToolboxStatus {
     /// on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base: Option<u32>,
-    /// The newest base release installed. Newer than `base`, the template
-    /// wants a rebuild.
+    /// The newest base release installed. Newer than `base`, `vibed` moves the
+    /// template to it by itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub newest_base: Option<u32>,
+    /// What moving there would lose, which the owner installed by hand and neither
+    /// the recipe nor VibeOS can put back, so it's waiting for them: `toolbox.rebuild`
+    /// moves it anyway.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rebuild_held: Vec<String>,
     /// The last shell, update or rebuild to finish.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last: Option<ToolboxRun>,

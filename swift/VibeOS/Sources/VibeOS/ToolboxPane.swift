@@ -72,10 +72,18 @@ struct ToolboxPane: View {
             logInsSection
             Section {
                 HStack {
-                    // In Terminal, as it can take many minutes and says how it goes.
-                    Button("Rebuild Template") { model.runInTerminal(["toolbox", "rebuild"], exec: false) }
-                        .disabled(model.toolbox?.state != .closed)
-                        .help("Replays toolbox.toml onto the newest base image, in Terminal")
+                    // VibeOS moves the template by itself. This is for when that would
+                    // lose something, or to apply toolbox.toml now. In Terminal, as it
+                    // can take many minutes and says how it goes.
+                    if !(model.toolbox?.rebuildHeld ?? []).isEmpty {
+                        Button("Move and Open Shell") { model.moveTemplateAndOpenShell() }
+                            .disabled(model.toolbox?.state != .closed)
+                            .help("Moves the template to the new base image, then opens the shell to put back what it lacks")
+                    } else {
+                        Button("Rebuild from toolbox.toml", action: rebuild)
+                            .disabled(model.toolbox?.state != .closed)
+                            .help("Makes a fresh template on the newest base image from toolbox.toml, in Terminal")
+                    }
                     Spacer()
                     if summary.closable || model.toolboxClosing {
                         Button("Save & Close", action: saveAndClose)
@@ -90,6 +98,14 @@ struct ToolboxPane: View {
             }
         }
         .formStyle(.grouped)
+    }
+
+    /// Always asks: what's in the template and not in toolbox.toml may not come along.
+    private func rebuild() {
+        let detail = "New Linux agents get a fresh template on the newest base image, from toolbox.toml. VibeOS "
+            + "puts back the Debian and npm packages you installed by hand; anything else it can't, and it says what."
+        guard confirm("Rebuild the template?", detail: detail, action: "Rebuild") else { return }
+        model.runInTerminal(["toolbox", "rebuild"], exec: false)
     }
 
     /// Always asks: a detached shell is how a long install is left running,

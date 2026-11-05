@@ -372,11 +372,18 @@ public final class MenuModel: ObservableObject {
     }
 
     /// Runs `vibe <words>` in a new Terminal window, where it can take as
-    /// long as it needs and show how it goes, as Rebuild Template and Log
+    /// long as it needs and show how it goes, as a rebuild and Log
     /// In to Claude do. With `exec`, the window's shell becomes it. `words`
     /// are shell words, as `Attacher.vibeCommand` takes them.
     public func runInTerminal(_ words: [String], exec: Bool) {
         runCommandInTerminal((exec ? "exec " : "") + attacher.vibeCommand(words))
+    }
+
+    /// What moves the template to a new base image when VibeOS couldn't by itself, as
+    /// that loses what was installed by hand: then the shell, to put it back.
+    public func moveTemplateAndOpenShell() {
+        runCommandInTerminal(
+            attacher.vibeCommand(["toolbox", "rebuild"]) + " && exec " + attacher.vibeCommand(["toolbox"]))
     }
 
     /// Runs a shell command line in a new Terminal window, in the owner's
