@@ -760,6 +760,26 @@ fn walk_examples() -> Seen {
     seen
 }
 
+/// `call.accepted` is a frame ahead of an answer, not one of the session's exchanges or
+/// an event, so its example is apart from theirs. It's held to what a peer really sends.
+#[test]
+fn the_call_accepted_example_is_what_a_peer_sends() {
+    let example = read_json(&protocol_dir().join("examples/frames/call-accepted.json"));
+    let line = example["request"].to_string();
+    let frame = vibe_core::rpc::accepted_frame(line.as_bytes(), |m| {
+        m == <vibe_core::rpc::TunnelCall as vibe_core::rpc::Method>::NAME
+    })
+    .expect("a tunnel call gets the frame");
+    let frame: Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(frame, example["frame"]);
+    assert_eq!(frame["method"], vibe_core::rpc::CALL_ACCEPTED);
+    // The call it's for has the shape the tunnel takes.
+    serde_json::from_value::<vibe_core::rpc::TunnelCallParams>(
+        example["request"]["params"].clone(),
+    )
+    .unwrap();
+}
+
 #[test]
 fn examples_round_trip_through_the_types() {
     walk_examples();

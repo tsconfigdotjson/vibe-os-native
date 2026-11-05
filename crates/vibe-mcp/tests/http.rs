@@ -55,6 +55,9 @@ struct Fake {
     history: Mutex<Option<Vec<String>>>,
     /// `vps` takes every listing and never answers, as a host stalling would.
     stuck: AtomicBool,
+    /// Memory comes just after the deadline, as from a Mac too old to send it with its
+    /// agents that the daemon has just given up on.
+    late_memory: AtomicBool,
     /// Checks of an agent, by their count, that find its host's link down.
     link_down: Mutex<HashMap<String, std::ops::RangeInclusive<u32>>>,
 }
@@ -166,6 +169,21 @@ impl Daemon for Fake {
             hosts.push("vps2".to_owned());
         }
         Ok(hosts)
+    }
+
+    async fn memory(&self, _c: &Caller) -> Vec<(String, vibe_core::rpc::MemoryUse)> {
+        if !self.late_memory.load(Ordering::SeqCst) {
+            return Vec::new();
+        }
+        tokio::time::sleep(self.peer_deadline() + Duration::from_millis(50)).await;
+        let memory = vibe_core::rpc::MemoryUse {
+            total: 8 << 30,
+            used: 2 << 30,
+            swap_total: 0,
+            swap_used: 0,
+            pressure: None,
+        };
+        vec![("local".to_owned(), memory)]
     }
 
     async fn projects(&self, _c: &Caller, host: &str) -> Result<Vec<Project>, ErrorObject> {
@@ -659,6 +677,17 @@ async fn agents_on_every_host_filtered() {
         e.starts_with("state must be one of busy, idle, question"),
         "{e}"
     );
+}
+
+/// #63: a daemon that's given up on an older Mac right at the deadline still has this
+/// host's own memory to say, so the listing isn't to give up on it first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn memory_just_past_the_deadline_isnt_lost() {
+    let (fake, mut c) = client().await;
+    fake.late_memory.store(true, Ordering::SeqCst);
+    let r = c.call("vibe_list_agents", json!({})).await;
+    let t = text(&r);
+    assert!(t.contains("local: 2G of 8G memory in use"), "{t}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
