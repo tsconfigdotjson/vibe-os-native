@@ -1,10 +1,12 @@
 //! The `vibe-shim` binary: a real terminal, real commands, real clients.
 
 use std::io::{self, Read};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use vibe_core::rpc::SessionExit;
@@ -272,6 +274,37 @@ fn attach_detach_and_reattach_a_long_running_shell() {
     let mut c = shim.attach(None);
     c.expect("two-4");
     assert!(shim.log().contains("detached"), "{}", shim.log());
+}
+
+/// A Mac makes a pipe in two steps, so a shim started between them inherits the write
+/// end. It's gone by the time the shim is up: whoever's reading that pipe would otherwise
+/// wait for as long as the agent lasts.
+#[test]
+fn a_descriptor_it_inherited_is_kept_by_neither_the_shim_nor_its_command() {
+    let (mut reader, writer) = std::io::pipe().unwrap();
+    let dir = tmp();
+    let mut cmd = shim_command(dir.path(), &[], &["sleep", "60"]);
+    let fd = writer.as_raw_fd();
+    // SAFETY: only dup2, which is async-signal-safe, after the fork. This copy stays
+    // open across the exec, and only this shim gets it.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::dup2(fd, 40) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let shim = Shim::launched(dir, cmd);
+    drop(writer);
+    let (ended, end) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = ended.send(reader.read_to_end(&mut Vec::new()));
+    });
+    end.recv_timeout(WAIT)
+        .expect("the pipe is still held open")
+        .unwrap();
+    assert!(shim.alive(), "{}", shim.log());
 }
 
 #[test]

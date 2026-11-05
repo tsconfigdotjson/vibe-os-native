@@ -19,7 +19,7 @@ mod serve;
 use std::ffi::OsString;
 use std::fs::{DirBuilder, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
@@ -228,9 +228,31 @@ fn check(rc: libc::c_int) -> io::Result<libc::c_int> {
     }
 }
 
+/// Closes what this process was left with beyond its standard streams, as nothing
+/// is handed down to a shim on purpose. It and its command outlive whoever started
+/// them, and a Mac makes a pipe in two steps, so a shim `vibed` starts between them
+/// inherits the write end of a pipe some other call is reading: that call would wait
+/// for as long as the agent lasts.
+fn close_inherited() {
+    let Ok(open) = std::fs::read_dir("/dev/fd") else {
+        return;
+    };
+    let fds: Vec<RawFd> = open
+        .flatten()
+        .filter_map(|fd| fd.file_name().to_str()?.parse().ok())
+        .filter(|fd| *fd > libc::STDERR_FILENO)
+        .collect();
+    for fd in fds {
+        // SAFETY: nothing here owns these, with no other thread, and nothing opened
+        // yet. The one the listing was read through has gone, and this finds that.
+        unsafe { libc::close(fd) };
+    }
+}
+
 /// Binds the socket, forks the shim, and reports whether its command
 /// started. Runs before any thread exists, so forking is safe.
 fn start(options: Options) -> Result<ExitCode, String> {
+    close_inherited();
     REF.set(options.agent.clone()).expect("set once");
     DirBuilder::new()
         .recursive(true)
