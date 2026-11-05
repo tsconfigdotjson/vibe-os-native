@@ -1197,6 +1197,77 @@ async fn a_send_just_after_a_start_is_submitted() {
     w.core.delete_agent(delete(&a.agent, true)).await.unwrap();
 }
 
+/// A question that comes up while a send waits for a start is looked for again,
+/// or the text would be pasted into its menu.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_question_that_comes_up_during_the_wait_for_a_start_stops_the_text() {
+    let w = world().await;
+    let late = w.golden.claude.with_file_name("claude-late");
+    fs::rename(&w.golden.claude, &late).unwrap();
+    // No question yet when the send first looks.
+    common::write_script(
+        &w.golden.claude,
+        &format!("#!/bin/sh\nsleep 1\nexec '{}' \"$@\"\n", late.display()),
+    );
+    let a = w.core.start_agent(start("pick a question")).await.unwrap();
+    let e = w
+        .core
+        .send_input(
+            None,
+            &a.agent,
+            vibe_mcp::Input::Text {
+                text: "blue".into(),
+                submit: true,
+                force: false,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(e.message.contains("is waiting on a question"), "{e:?}");
+    let screen = w.core.agent_output(None, &a.agent, None).await.unwrap();
+    assert!(screen.screen.contains("Red or blue?"), "{}", screen.screen);
+    assert!(!screen.screen.contains("blue\n"), "{}", screen.screen);
+    w.core.delete_agent(delete(&a.agent, true)).await.unwrap();
+}
+
+/// A program that never comes up isn't typed to and called a success: the send's
+/// Enter would be a newline in text never submitted, with no answer ever coming.
+/// It says so, and a caller who's looked can type anyway.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_send_to_a_program_that_never_comes_up_says_nothing_was_sent() {
+    let w = world().await;
+    let got = w.project.with_file_name("what-it-read");
+    // Draws nothing, and turns nothing on.
+    common::write_script(
+        &w.golden.claude,
+        &format!("#!/bin/sh\nexec cat >'{}'\n", got.display()),
+    );
+    let a = w.core.start_agent(start("hello")).await.unwrap();
+    let send = || {
+        w.core.send_input(
+            None,
+            &a.agent,
+            vibe_mcp::Input::Text {
+                text: "after a start".into(),
+                submit: true,
+                force: false,
+            },
+        )
+    };
+    let e = send().await.unwrap_err();
+    assert_eq!(e.code, vibe_core::rpc::ErrorCode::Conflict.code(), "{e:?}");
+    assert!(e.message.contains("nothing was sent"), "{e:?}");
+    let read = || fs::read_to_string(&got).unwrap_or_default();
+    assert_eq!(read(), "");
+    let begun = std::time::Instant::now();
+    send().await.unwrap();
+    assert!(begun.elapsed() < Duration::from_secs(10), "it waited again");
+    common::wait_until("it to read what was sent", || {
+        read().contains("after a start")
+    });
+    w.core.delete_agent(delete(&a.agent, true)).await.unwrap();
+}
+
 #[tokio::test]
 async fn git_maintenance_runs_only_while_a_project_is_quiet() {
     let w = world().await;

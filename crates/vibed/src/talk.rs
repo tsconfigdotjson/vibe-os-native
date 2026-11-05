@@ -373,8 +373,8 @@ impl Core {
         let mut just_started = false;
         if woke {
             self.resume_agent(Some(&host), agent_ref).await?;
-            just_started = self.wait_started(agent_ref, &socket).await;
             crate::log!("vibed: {agent_ref} was {state}, and a send woke it");
+            just_started = self.wait_started(agent_ref, &socket).await?;
             // Asleep or paused, it read as that; woken where it was, it may
             // be on a question. One resumed with `--resume` has lost any
             // question it had (PRD: Going to sleep), whatever its
@@ -388,8 +388,18 @@ impl Core {
                 return Err(on_a_question(agent_ref, " It was woken first."));
             }
         }
-        // Started moments ago, by a resume or a start that came before this.
-        just_started |= self.wait_started(agent_ref, &socket).await;
+        // Started moments ago, by a resume or a start that came before this. The
+        // look for a question came before the wait, and one may have come up since.
+        if self.wait_started(agent_ref, &socket).await? {
+            just_started = true;
+            let mut record = self.named(Some(&host), agent_ref)?;
+            let status = self.agent_status(&mut record, debounce).await;
+            if let Input::Text { force: false, .. } = &input
+                && self.observed_state(&record, &status).await == AgentState::Question
+            {
+                return Err(on_a_question(agent_ref, ""));
+            }
+        }
         // Where its transcript is now: the answer to this send is what
         // comes after. It's kept only once the send is in, so a send that
         // failed leaves the wait on the one before.
@@ -468,15 +478,25 @@ impl Core {
     /// until it's up: typed to before that, what's typed waits in a terminal that
     /// isn't raw yet, so its Enter arrives as a newline in the text and nothing is
     /// submitted. A frozen program thawed is where it was, and isn't waited for.
-    async fn wait_started(&self, agent_ref: &str, socket: &Path) -> bool {
+    /// Says whether it waited, and fails if the program still isn't up: only the
+    /// first send is held to that, so another types, for a caller who's looked.
+    async fn wait_started(&self, agent_ref: &str, socket: &Path) -> Result<bool, ErrorObject> {
         let started = lock(&self.started_at).remove(agent_ref);
-        match started.and_then(|at| READY_WITHIN.checked_sub(at.elapsed())) {
-            Some(left) => {
-                wait_ready(socket, left).await;
-                true
-            }
-            None => false,
+        let Some(left) = started.and_then(|at| READY_WITHIN.checked_sub(at.elapsed())) else {
+            return Ok(false);
+        };
+        if !wait_ready(socket, left).await {
+            return Err(error(
+                ErrorCode::Conflict,
+                format!(
+                    "{agent_ref} hasn't come up {}s after it started, so nothing was sent. See \
+                     what it shows with vibe_read_output; a send from now on is typed without \
+                     waiting",
+                    READY_WITHIN.as_secs()
+                ),
+            ));
         }
+        Ok(true)
     }
 
     /// Where `agent_ref` is, and whether it has answered its last send
@@ -719,27 +739,31 @@ impl Core {
     }
 }
 
-/// Waits for a Claude just started to be ready for input: it has turned
+/// Waits for a program just started to be ready for input: it has turned
 /// on bracketed paste, or its screen has drawn something and stayed still
-/// for [`SETTLE`]. Gives up after `within`, and at once if its session ends.
-async fn wait_ready(socket: &Path, within: Duration) {
+/// for [`SETTLE`]. Looks at least once. False if `within` passes first; if its
+/// session ends the wait's over at once, and what comes next finds that out.
+async fn wait_ready(socket: &Path, within: Duration) -> bool {
     let begun = Instant::now();
     let mut last: Option<(String, Instant)> = None;
-    while begun.elapsed() < within {
+    loop {
         let s = socket.to_owned();
         let Ok(Ok(out)) = tokio::task::spawn_blocking(move || screen_now(&s)).await else {
-            return;
+            return true;
         };
         if out.bracketed_paste {
-            return;
+            return true;
         }
         match &last {
             Some((screen, since)) if *screen == out.screen => {
                 if !screen.trim().is_empty() && since.elapsed() >= SETTLE {
-                    return;
+                    return true;
                 }
             }
             _ => last = Some((out.screen, Instant::now())),
+        }
+        if begun.elapsed() >= within {
+            return false;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
