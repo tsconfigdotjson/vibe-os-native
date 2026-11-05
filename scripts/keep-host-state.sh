@@ -162,7 +162,7 @@ put_back() {
   done
   for k in $now_keys; do
     case " $was_keys " in *" $k "*) continue ;; esac
-    line=$(ssh_to "$vibe key" | grep -F "  $k…  made " | sed -n 1p)
+    line=$(ssh_to "$vibe key" | grep -F "  ${k}…  made " | sed -n 1p)
     name=${line%%  "$k"…*}
     case " $test_keys " in
       *" $name "*)
