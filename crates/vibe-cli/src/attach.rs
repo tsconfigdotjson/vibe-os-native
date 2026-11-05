@@ -12,8 +12,8 @@ use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::{Duration, Instant};
 
 use vibe_core::model::validate_ref;
 use vibe_core::paths::Layout;
@@ -34,6 +34,11 @@ const DETACH_KITTY: [&[u8]; 2] = [b"\x1b[92;5u", b"\x1b[92;5:1u"];
 /// cursor keys and keypad, and the kitty keyboard protocol.
 const RESET: &str =
     "\x1b[0m\x1b[?25h\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1l\x1b>\x1b[<u";
+
+/// How long, after a hangup, a terminal may take to finish what's being written
+/// to it and take the goodbye. One that isn't reading then goes without: what
+/// comes next, such as saving the toolbox, doesn't wait for it.
+const GOODBYE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug)]
 pub(crate) enum AttachError {
@@ -478,38 +483,83 @@ pub(crate) fn attach_to(found: &SessionAttach) -> Result<End, AttachError> {
         Ok(raw) => raw,
         Err(e) => return raw_mode_failed(e, is_tty(libc::STDIN_FILENO)),
     };
-    if to_terminal(format!("\x1b]0;{}\x07", found.title).as_bytes()).is_err() {
-        return Ok(terminal_gone());
+
+    let (notes, noted) = mpsc::channel();
+    spawn_keys(stream.try_clone()?, writer.clone(), notes.clone());
+    spawn_signals(signals, stream.try_clone()?, writer, notes.clone());
+    let agent = agent.to_owned();
+    let title = found.title.clone();
+    // On a thread of its own, as a write to a terminal that isn't reading
+    // blocks for as long as it isn't, and a hangup can come while it does.
+    std::thread::spawn(move || {
+        let end = show_session(&stream, &agent, &title);
+        let _ = notes.send(Note::Finished(end));
+    });
+    let end = wait_for_end(&noted);
+    drop(raw);
+    Ok(end)
+}
+
+/// What an attachment's threads tell [`attach_to`].
+enum Note {
+    /// This end has stopped the stream: see [`stopped`].
+    Stopped,
+    /// Everything has been shown, with the goodbye.
+    Finished(End),
+}
+
+/// How the attachment ended. Only a hangup goes on without the terminal: after
+/// a detach it's still in use, if slow, and is owed its goodbye and its modes put
+/// back, however long that takes.
+fn wait_for_end(notes: &mpsc::Receiver<Note>) -> End {
+    loop {
+        match notes.recv() {
+            Ok(Note::Finished(end)) => return end,
+            Ok(Note::Stopped) if stopped() == End::HungUp || hung_up() => break,
+            Ok(Note::Stopped) => {}
+            Err(_) => return stopped(),
+        }
     }
+    let deadline = Instant::now() + GOODBYE_TIMEOUT;
+    while let Ok(note) = notes.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        if let Note::Finished(end) = note {
+            return end;
+        }
+    }
+    stopped()
+}
 
-    spawn_keys(stream.try_clone()?, writer.clone());
-    spawn_signals(signals, stream.try_clone()?, writer);
-
+/// Names the window, shows the session until its stream ends, and says how it
+/// ended. This is all that writes to the terminal while attached.
+fn show_session(stream: &UnixStream, agent: &str, title: &str) -> End {
     let mut filter = Filter::default();
     let mut out = Vec::new();
-    let mut reading = &stream;
-    let end = loop {
-        let frame = match shim::read_frame(&mut reading) {
-            Ok(Some(f)) => f,
-            Ok(None) | Err(_) => break stopped(),
-        };
-        match frame.kind {
-            FrameKind::Output => {
-                out.clear();
-                filter.feed(&frame.payload, &mut out);
-                if to_terminal(&out).is_err() {
-                    break terminal_gone();
+    let mut reading = stream;
+    let end = if to_terminal(format!("\x1b]0;{title}\x07").as_bytes()).is_err() {
+        terminal_gone()
+    } else {
+        loop {
+            let frame = match shim::read_frame(&mut reading) {
+                Ok(Some(f)) => f,
+                Ok(None) | Err(_) => break stopped(),
+            };
+            match frame.kind {
+                FrameKind::Output => {
+                    out.clear();
+                    filter.feed(&frame.payload, &mut out);
+                    if to_terminal(&out).is_err() {
+                        break terminal_gone();
+                    }
                 }
+                FrameKind::Exit => match frame.decode() {
+                    Ok(exit) => break End::Exited(exit),
+                    Err(_) => break End::Lost,
+                },
+                _ => {}
             }
-            FrameKind::Exit => match frame.decode() {
-                Ok(exit) => break End::Exited(exit),
-                Err(_) => break End::Lost,
-            },
-            _ => {}
         }
     };
     let _ = stream.shutdown(Shutdown::Both);
-    drop(raw);
     let leave_alternate = if filter.alternate { "\x1b[?1049l" } else { "" };
     let said = match &end {
         End::Detached | End::HungUp => format!("detached from {agent}"),
@@ -522,13 +572,13 @@ pub(crate) fn attach_to(found: &SessionAttach) -> Result<End, AttachError> {
     };
     // After a hangup the terminal is gone; saying goodbye is best effort.
     let _ = to_terminal(format!("{RESET}{leave_alternate}\r\n[{said}]\r\n").as_bytes());
-    Ok(end)
+    end
 }
 
 /// Sends what's typed to the session, until `Ctrl-\` or the end of input.
 /// A raw terminal has no end of input of its own (`Ctrl-D` is a key like
 /// any other), so its end is the terminal going away: a hangup.
-fn spawn_keys(stream: UnixStream, writer: Arc<Mutex<UnixStream>>) {
+fn spawn_keys(stream: UnixStream, writer: Arc<Mutex<UnixStream>>, notes: mpsc::Sender<Note>) {
     std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
         let by = loop {
@@ -570,6 +620,7 @@ fn spawn_keys(stream: UnixStream, writer: Arc<Mutex<UnixStream>>) {
         };
         stop(by);
         let _ = stream.shutdown(Shutdown::Both);
+        let _ = notes.send(Note::Stopped);
     });
 }
 
@@ -588,8 +639,16 @@ pub(crate) fn split_detach(typed: &[u8]) -> (&[u8], bool) {
     }
 }
 
-/// Passes size changes on, and ends the attachment on a polite kill.
-fn spawn_signals(mut signals: std::fs::File, stream: UnixStream, writer: Arc<Mutex<UnixStream>>) {
+/// Passes size changes on, and ends the attachment on a polite kill. It listens
+/// to the end, whatever else has happened: nothing else hears a hangup, which can
+/// still come after a detach, or after the shim has given up on this client while
+/// the terminal isn't reading.
+fn spawn_signals(
+    mut signals: std::fs::File,
+    stream: UnixStream,
+    writer: Arc<Mutex<UnixStream>>,
+    notes: mpsc::Sender<Note>,
+) {
     use std::io::Read;
     std::thread::spawn(move || {
         let mut byte = [0u8; 1];
@@ -598,9 +657,7 @@ fn spawn_signals(mut signals: std::fs::File, stream: UnixStream, writer: Arc<Mut
                 let Some(size) = window_size() else { continue };
                 let frame = Frame::json(FrameKind::Resize, &size);
                 let mut w = writer.lock().unwrap_or_else(|e| e.into_inner());
-                if shim::write_frame(&mut *w, &frame).is_err() {
-                    return;
-                }
+                let _ = shim::write_frame(&mut *w, &frame);
             } else {
                 // A hangup is told apart, for `vibe toolbox`; any other
                 // polite kill is a detach.
@@ -611,7 +668,7 @@ fn spawn_signals(mut signals: std::fs::File, stream: UnixStream, writer: Arc<Mut
                 };
                 stop(by);
                 let _ = stream.shutdown(Shutdown::Both);
-                return;
+                let _ = notes.send(Note::Stopped);
             }
         }
     });

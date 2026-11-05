@@ -20,7 +20,7 @@ use vibe_core::rpc::SessionExit;
 use vibe_core::shim::{
     self, Frame, FrameKind, Hello, PROTOCOL, Record, Reply, Request, Role, Size, control_hello,
 };
-use vibe_env::guest::{self as driver, GuestState, Launch, TermSize};
+use vibe_env::guest::{self as driver, GuestState, Launch, TermSize, proto::Run};
 
 const SHIM: &str = env!("CARGO_BIN_EXE_vibe-shim");
 const WAIT: Duration = Duration::from_secs(20);
@@ -428,6 +428,57 @@ fn a_linux_agents_terminal_is_held_in_the_guest_and_outlives_its_shims() {
     let fifth = vm.shim("fifth");
     fifth.wait_gone();
     assert_eq!(fifth.record().map(|r| r.exit.code), Some(Some(4)));
+}
+
+/// What Save & Close does to a real toolbox's shell (`Toolbox::hang_up`) while
+/// that shell floods its terminal, with one terminal that has been reading and one
+/// stuck: the `kill` runs in the guest within the time it gets there, the guest
+/// keeps the shim, and the shim says how the shell ended, which is what `vibed`
+/// waits for to save (#69).
+#[test]
+fn a_hang_up_in_the_guest_ends_a_shell_flooding_its_terminal() {
+    let vm = Vm::start();
+    let pid = vm.launch_shell();
+    let shim = vm.shim("flood");
+    let _stuck = shim.attach(None);
+    let mut a = shim.attach(None);
+    // There's always more to read, and a timeout in mid-frame would lose its place.
+    a.stream.set_read_timeout(Some(WAIT)).unwrap();
+    a.type_line("while :; do echo spam; done");
+    a.expect("spam\r\nspam");
+    let flooding = Instant::now();
+    while flooding.elapsed() < Duration::from_secs(2) {
+        assert!(a.pump(), "the shim closed: {}", shim.log());
+    }
+    assert_eq!(shim.status().clients.len(), 2);
+
+    let ran = driver::run(
+        &vm.socket,
+        &Run {
+            command: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "kill -s HUP -- \"-$1\"".into(),
+                "hang-up".into(),
+                pid.to_string(),
+            ],
+            env: Default::default(),
+            cwd: None,
+            timeout_ms: 5000,
+        },
+    )
+    .unwrap();
+    assert_eq!(ran.code, Some(0), "{ran:?}");
+    a.expect_close();
+    assert_eq!(a.exit.and_then(|e| e.signal).as_deref(), Some("SIGHUP"));
+    shim.wait_gone();
+    assert_eq!(
+        shim.record().map(|r| r.exit.signal),
+        Some(Some("SIGHUP".to_owned())),
+        "{}",
+        shim.log()
+    );
+    assert_eq!(vm.state(), GuestState::Exited);
 }
 
 #[test]
