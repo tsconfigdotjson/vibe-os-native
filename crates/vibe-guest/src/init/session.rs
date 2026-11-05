@@ -563,12 +563,19 @@ impl Agent {
         })
     }
 
-    /// Called by the reaper for every child it collects.
-    pub(crate) fn reaped(self: &Arc<Self>, pid: u32, status: libc::c_int) {
-        if let Some(run) = lock(&self.runs).remove(&pid) {
-            let _ = run.send(status);
-            return;
-        }
+    /// Called by the reaper for every child it collects: tells a run it has
+    /// ended, and says whether this was one.
+    fn run_reaped(&self, pid: u32, status: libc::c_int) -> bool {
+        let Some(run) = lock(&self.runs).remove(&pid) else {
+            return false;
+        };
+        let _ = run.send(status);
+        true
+    }
+
+    /// A child that wasn't a run: the command, if it's the command's pid. This
+    /// waits for the state, so it isn't done on the reaper's own thread.
+    fn reaped(self: &Arc<Self>, pid: u32, status: libc::c_int) {
         let mut state = lock(&self.state);
         let Some(s) = state.session.as_mut() else {
             return;
@@ -1049,6 +1056,22 @@ pub(crate) fn reap(agent: Arc<Agent>) -> ! {
         tv_sec: 1,
         tv_nsec: 0,
     };
+    // The state can be held for `SEND_TIMEOUT` by a write to a stalled shim. A
+    // run's end mustn't wait for that, or its time runs out with it already over.
+    let (others, reaped) = mpsc::channel();
+    let started = {
+        let agent = agent.clone();
+        std::thread::Builder::new()
+            .name("reaped".into())
+            .spawn(move || {
+                for (pid, status) in reaped {
+                    agent.reaped(pid, status);
+                }
+            })
+    };
+    if let Err(e) = started {
+        log!("can't start the reaper's other thread, so it does without: {e}");
+    }
     loop {
         // SAFETY: waits for SIGCHLD, which is blocked, or a second; either
         // way the loop below reaps whatever is there.
@@ -1067,7 +1090,11 @@ pub(crate) fn reap(agent: Arc<Agent>) -> ! {
             }
         }
         for (pid, status) in gone {
-            agent.reaped(pid, status);
+            if !agent.run_reaped(pid, status)
+                && let Err(mpsc::SendError((pid, status))) = others.send((pid, status))
+            {
+                agent.reaped(pid, status);
+            }
         }
     }
 }

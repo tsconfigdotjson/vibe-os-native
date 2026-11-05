@@ -4,7 +4,8 @@
 //! toolbox reaches agents, and See logins says which logins it holds,
 //! found as the save looked in the real guest), `sudo` in the toolbox and
 //! nowhere else,
-//! `[update]`, and **Rebuild template** with what it doesn't cover. It
+//! `[update]`, **Rebuild template** with what it doesn't cover, and **Save &
+//! Close** with `yes` running. It
 //! boots the base image `scripts/base-image.sh` built, with Claude Code's
 //! managed layer downloaded the way `vibed` does it; the agents here run a
 //! stand-in, as the conformance suite does, so it needs no Claude login.
@@ -24,6 +25,7 @@ mod common;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use common::{Golden, workspace_bin};
@@ -31,7 +33,7 @@ use vibe_core::limits::HostLimits;
 use vibe_core::model::{Environment, LoginTool, ToolboxState};
 use vibe_core::paths::Layout;
 use vibe_core::rpc::{Login, NoParams};
-use vibe_core::shim::{self, Frame, FrameKind, control_hello};
+use vibe_core::shim::{self, Frame, FrameKind, Hello, PROTOCOL, Role, control_hello};
 use vibe_env::guest::{self, proto};
 use vibe_env::images::Images;
 use vibe_env::linux::{LinuxVm, Real, TokenSource};
@@ -39,6 +41,7 @@ use vibe_env::toolbox::{TOOLBOX_REF, Toolbox};
 use vibe_env::{AgentSpec, Compartment, Handle, Launch, Limits, Run, Sleeper, Woke, vm};
 use vibed::agents::Backends;
 use vibed::core::{Config, Core, DaemonInfo};
+use vibed::sessions::{self, Probe};
 
 fn absolute(path: PathBuf) -> PathBuf {
     if path.is_absolute() {
@@ -151,6 +154,99 @@ impl World {
             );
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
+    }
+
+    /// Opens the toolbox shell, leaves `yes` running in it over the real vsock,
+    /// with one terminal reading it and one stuck, and has Save & Close end it
+    /// (#69). What's written just before reaches the saved home, and no shim stays.
+    async fn save_and_close_with_yes_running(&self) -> (u32, u32) {
+        let before = self.core.toolbox_status(NoParams {}).await.unwrap();
+        let attach = self
+            .core
+            .open_toolbox(NoParams {})
+            .await
+            .unwrap_or_else(|e| panic!("open: {e}\n{}", self.logs(TOOLBOX_REF)));
+        let socket = Path::new(&attach.socket);
+        let terminal = |client: &str| {
+            let hello = Hello {
+                protocol: PROTOCOL,
+                role: Role::Attach,
+                client: client.into(),
+                tty: None,
+                size: None,
+            };
+            shim::connect(socket, &hello, Duration::from_secs(10))
+                .unwrap()
+                .stream
+        };
+        let _stuck = terminal("stuck");
+        let mut reading = terminal("reading");
+        reading
+            .set_read_timeout(Some(Duration::from_secs(120)))
+            .unwrap();
+        let mut reader = reading.try_clone().unwrap();
+        let flooding = Arc::new(AtomicBool::new(false));
+        let seen = flooding.clone();
+        let ended = std::thread::spawn(move || {
+            while let Ok(Some(frame)) = shim::read_frame(&mut reader) {
+                match frame.kind {
+                    FrameKind::Output if frame.payload.windows(4).any(|w| w == b"y\r\ny") => {
+                        seen.store(true, Ordering::SeqCst);
+                    }
+                    FrameKind::Exit => return true,
+                    _ => {}
+                }
+            }
+            false
+        });
+        let typed = "echo saved-under-a-flood > ~/flooded; yes\r";
+        shim::write_frame(&mut reading, &Frame::new(FrameKind::Input, typed)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !flooding.load(Ordering::SeqCst) {
+            assert!(
+                Instant::now() < deadline,
+                "yes never ran\n{}",
+                self.logs(TOOLBOX_REF)
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let Probe::Running(shim) = sessions::probe(socket).await else {
+            panic!("the shim isn't answering\n{}", self.logs(TOOLBOX_REF));
+        };
+
+        let closed = tokio::time::timeout(
+            Duration::from_secs(300),
+            self.core.close_toolbox(NoParams {}),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("Save & Close hung\n{}", self.logs(TOOLBOX_REF)))
+        .unwrap_or_else(|e| panic!("Save & Close: {e}\n{}", self.logs(TOOLBOX_REF)));
+        assert_eq!(closed.state, ToolboxState::Closed);
+        assert_eq!(closed.last.as_ref().unwrap().error, None);
+        assert_eq!(
+            closed.template.unwrap(),
+            before.template.unwrap() + 1,
+            "{closed:?}"
+        );
+        assert_eq!(closed.home.unwrap(), before.home.unwrap() + 1, "{closed:?}");
+        assert!(
+            ended.join().unwrap(),
+            "the terminal never saw the shell end"
+        );
+        // Its socket went first: it gives a stuck client a moment after that.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while std::process::Command::new("kill")
+            .args(["-0", &shim.pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+        {
+            assert!(Instant::now() < deadline, "the shim {} stayed", shim.pid);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        (closed.template.unwrap(), closed.home.unwrap())
     }
 
     fn spec(&self, r: &str) -> AgentSpec {
@@ -425,8 +521,15 @@ async fn new_agents_get_what_the_toolbox_installed_and_sleeping_ones_keep_theirs
         "the rebuilt template has the recipe, and the home carried over:\n{out}"
     );
 
+    // 7. Save & Close with `yes` running saves as an exit does.
+    let (t5, _) = w.save_and_close_with_yes_running().await;
+    assert_eq!(t5, 5);
+    let flooded = w.agent("steady-flint-crane");
+    let (ok, out) = w.in_agent(&flooded, "cat ~/flooded");
+    assert!(ok && out.contains("saved-under-a-flood"), "{out}");
+
     // Nothing is left behind.
-    for h in [&old, &new, &rebuilt] {
+    for h in [&old, &new, &rebuilt, &flooded] {
         w.backend.delete(h).unwrap();
     }
     supervisor.abort();
@@ -435,6 +538,7 @@ async fn new_agents_get_what_the_toolbox_installed_and_sleeping_ones_keep_theirs
         "quiet-amber-otter",
         "brave-copper-lynx",
         "calm-silver-heron",
+        "steady-flint-crane",
     ] {
         assert!(!vm::lock_held(&layout.vm_socket(r)));
     }
