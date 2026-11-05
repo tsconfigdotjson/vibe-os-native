@@ -44,9 +44,11 @@ public func piProviderToSignIn(for model: String, in providers: [PiProvider]) ->
     return providers.first { $0.id == name && !$0.signedIn && !$0.ambient && ($0.oauth || $0.apiKey) }
 }
 
-/// Whether Pi has nobody to answer with at all, as far as its list can tell.
+/// Whether Pi has nobody to answer with at all, as far as its list can tell. What can
+/// sign in from what's around it doesn't count: vibed refuses a start on no model with
+/// only that, and it's in every list.
 public func piHasNoLogin(_ providers: [PiProvider]) -> Bool {
-    !providers.isEmpty && !providers.contains { $0.signedIn || $0.ambient }
+    !providers.isEmpty && !providers.contains { $0.signedIn }
 }
 
 /// Pi's providers and models with `query` in their names, signed-in providers first as

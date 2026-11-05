@@ -171,7 +171,13 @@ fn read_said(said: &Value) -> Option<Said> {
             .map(Said::Catalog),
         "prompt_over" => Some(Said::PromptOver),
         "done" => Some(Said::Done),
-        "failed" => Some(Said::Failed(text(&said["message"])?)),
+        // Pi's message for a failed exchange runs on into a stack, which says nothing
+        // to anyone reading this.
+        "failed" => {
+            let message = said["message"].as_str()?;
+            let message = message.split("; stack=").next().unwrap_or(message);
+            Some(Said::Failed(clean_alert(message)))
+        }
         "event" => match said["type"].as_str()? {
             "auth_url" => {
                 let url = said["url"].as_str()?;
@@ -239,6 +245,13 @@ pub fn url_can_be_opened(url: &str) -> bool {
         && !url.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
+/// The sign-in pages of Pi 1.5 that come back to loopback and take where they ended
+/// as an answer (`auth/oauth/`, in its source): check them when the pin moves. Only
+/// these are ever listened for on a Mac for another host: a host's word is all there
+/// is for a page, and one that wasn't well could otherwise have a Mac catch a code
+/// meant for some other program that signs in the same way.
+const PAGES_THAT_COME_BACK: &[&str] = &["claude.ai", "auth.openai.com", "openrouter.ai"];
+
 /// Where a browser login means to come back to on the machine the browser is on: a
 /// loopback address and a path. Pi's listening for it on the machine it runs on,
 /// which is only the same one on a Mac.
@@ -247,17 +260,59 @@ pub struct Redirect {
     pub host: String,
     pub port: u16,
     pub path: String,
+    /// What the page will say it's answering, if it says. Nothing else can know it.
+    pub state: Option<String>,
 }
 
-/// The [`Redirect`] a sign-in page's address names, if it names one on loopback.
+impl Redirect {
+    /// Whether a browser's request for `target` is this page's answer. Pi's own
+    /// listener ignores what isn't, but one wrong answer to its question ends a
+    /// sign-in, so what any other page or program on the Mac sends goes no further.
+    pub fn is_answered_by(&self, target: &str) -> bool {
+        let Some((path, query)) = target.split_once('?') else {
+            return false;
+        };
+        if path != self.path || target.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return false;
+        }
+        let said = |wanted: &str| {
+            query.split('&').find_map(|pair| {
+                let (name, value) = pair.split_once('=')?;
+                (name == wanted).then_some(value)
+            })
+        };
+        if said("code").is_none() && said("error").is_none() {
+            return false;
+        }
+        match &self.state {
+            None => true,
+            Some(state) => said("state").and_then(percent_decoded).as_ref() == Some(state),
+        }
+    }
+}
+
+/// The host of an `https` address, if that's all it's plainly naming.
+fn page_host(page: &str) -> Option<String> {
+    let rest = page.get(8..).filter(|_| url_can_be_opened(page))?;
+    let host = rest.split(['/', '?', '#']).next()?;
+    (!host.contains(['@', ':'])).then(|| host.to_ascii_lowercase())
+}
+
+/// The [`Redirect`] a sign-in page's address names, if it's one of Pi's and names one
+/// on loopback.
 pub fn redirect_of(page: &str) -> Option<Redirect> {
+    if !PAGES_THAT_COME_BACK.contains(&page_host(page)?.as_str()) {
+        return None;
+    }
     let (_, query) = page.split_once('?')?;
     let query = query.split('#').next()?;
-    let target = query.split('&').find_map(|pair| {
-        let (name, value) = pair.split_once('=')?;
-        matches!(name, "redirect_uri" | "callback_url").then_some(value)
-    })?;
-    let target = percent_decoded(target)?;
+    let param = |wanted: &[&str]| {
+        query.split('&').find_map(|pair| {
+            let (name, value) = pair.split_once('=')?;
+            wanted.contains(&name).then_some(value)
+        })
+    };
+    let target = percent_decoded(param(&["redirect_uri", "callback_url"])?)?;
     let rest = target.strip_prefix("http://")?;
     let (authority, path) = match rest.find('/') {
         Some(at) => rest.split_at(at),
@@ -271,6 +326,10 @@ pub fn redirect_of(page: &str) -> Option<Redirect> {
         host: host.to_owned(),
         port: port.parse().ok().filter(|p| *p != 0)?,
         path: path.split('?').next()?.to_owned(),
+        state: match param(&["state"]) {
+            Some(state) => Some(percent_decoded(state)?),
+            None => None,
+        },
     })
 }
 
@@ -492,12 +551,13 @@ mod tests {
         assert_eq!(
             redirect_of(
                 "https://claude.ai/oauth/authorize?code=true&redirect_uri=\
-                 http%3A%2F%2Flocalhost%3A53692%2Fcallback&state=s"
+                 http%3A%2F%2Flocalhost%3A53692%2Fcallback&state=s%2F1"
             ),
             Some(Redirect {
                 host: "localhost".into(),
                 port: 53692,
                 path: "/callback".into(),
+                state: Some("s/1".into()),
             })
         );
         assert_eq!(
@@ -509,20 +569,80 @@ mod tests {
                 host: "127.0.0.1".into(),
                 port: 38517,
                 path: "/oauth/callback/1ad3".into(),
+                state: None,
             })
         );
         for page in [
-            "https://x.example/auth",
-            "https://x.example/auth?state=s",
-            "https://x.example/auth?redirect_uri=https%3A%2F%2Fapp.example%2Fcb",
-            "https://x.example/auth?redirect_uri=http%3A%2F%2Fevil.example%3A80%2Fcb",
-            "https://x.example/auth?redirect_uri=http%3A%2F%2Flocalhost%2Fcb",
-            "https://x.example/auth?redirect_uri=http%3A%2F%2Flocalhost%3A0%2Fcb",
-            "https://x.example/auth?redirect_uri=http%3A%2F%2Flocalhost%3Azz%2Fcb",
-            "https://x.example/auth?redirect_uri=%ZZ",
+            "https://claude.ai/auth",
+            "https://claude.ai/auth?state=s",
+            "https://claude.ai/auth?redirect_uri=https%3A%2F%2Fapp.example%2Fcb",
+            "https://claude.ai/auth?redirect_uri=http%3A%2F%2Fevil.example%3A80%2Fcb",
+            "https://claude.ai/auth?redirect_uri=http%3A%2F%2Flocalhost%2Fcb",
+            "https://claude.ai/auth?redirect_uri=http%3A%2F%2Flocalhost%3A0%2Fcb",
+            "https://claude.ai/auth?redirect_uri=http%3A%2F%2Flocalhost%3Azz%2Fcb",
+            "https://claude.ai/auth?redirect_uri=%ZZ",
         ] {
             assert_eq!(redirect_of(page), None, "{page}");
         }
+    }
+
+    #[test]
+    fn only_pis_own_pages_are_ever_listened_for() {
+        let back = "?redirect_uri=http%3A%2F%2Flocalhost%3A8085%2Fcb&state=s";
+        assert!(redirect_of(&format!("https://auth.openai.com/x{back}")).is_some());
+        assert!(redirect_of(&format!("https://CLAUDE.AI/x{back}")).is_some());
+        for host in [
+            "accounts.google.com",
+            "claude.ai.evil.example",
+            "evil.example",
+            "claude.ai@evil.example",
+            "claude.ai:443",
+        ] {
+            let page = format!("https://{host}/o/oauth2/auth{back}");
+            assert_eq!(redirect_of(&page), None, "{page}");
+        }
+    }
+
+    #[test]
+    fn only_that_pages_own_answer_counts() {
+        let redirect = Redirect {
+            host: "localhost".into(),
+            port: 53692,
+            path: "/callback".into(),
+            state: Some("the/state".into()),
+        };
+        assert!(redirect.is_answered_by("/callback?code=abc&state=the%2Fstate"));
+        assert!(redirect.is_answered_by("/callback?state=the/state&error=access_denied"));
+        for other in [
+            "/callback",
+            "/callback?code=abc",
+            "/callback?code=abc&state=another",
+            "/callback?state=the/state",
+            "/favicon.ico",
+            "/other?code=abc&state=the/state",
+            "/callback/x?code=abc&state=the/state",
+            "/callback?code=a b&state=the/state",
+        ] {
+            assert!(!redirect.is_answered_by(other), "{other}");
+        }
+        // A page that names no state has only its path, which it made up for this.
+        let open = Redirect {
+            state: None,
+            ..redirect
+        };
+        assert!(open.is_answered_by("/callback?code=abc"));
+        assert!(!open.is_answered_by("/callback?nothing=abc"));
+    }
+
+    #[test]
+    fn a_failure_is_said_without_its_stack() {
+        assert_eq!(
+            read_line(&notify(json!({
+                "vibe": "failed",
+                "message": "Token exchange failed. url=https://x; stack=Error: at y\n at z",
+            }))),
+            Some(Said::Failed("Token exchange failed. url=https://x".into()))
+        );
     }
 
     #[test]

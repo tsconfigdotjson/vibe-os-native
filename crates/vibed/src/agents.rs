@@ -1008,10 +1008,16 @@ impl Core {
         let provider = model
             .and_then(|m| m.split_once('/'))
             .map(|(provider, _)| provider);
-        let how = match provider {
-            Some(p) => format!("Sign in to {p} in the VibeOS app, in Settings → Agents"),
-            None => "Sign in to one in the VibeOS app, in Settings → Agents".to_owned(),
+        let at_a_terminal = if vm {
+            "in `vibe toolbox`, `pi` and /login"
+        } else {
+            "`pi` and /login"
         };
+        let who = provider.unwrap_or("one");
+        let how = format!(
+            "Sign in to {who} in the VibeOS app, in Settings → Agents (at a terminal, \
+             {at_a_terminal})"
+        );
         let shared = if vm {
             "Every linux Pi agent gets that one login"
         } else {

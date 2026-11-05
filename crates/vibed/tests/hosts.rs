@@ -327,6 +327,13 @@ async fn a_hosts_browser_login_comes_back_through_the_macs_loopback() {
         )
         .await;
     assert_eq!(page["result"]["prompt"]["kind"], "manual_code", "{page}");
+    let state = page["result"]["url"]
+        .as_str()
+        .unwrap()
+        .rsplit_once("state=")
+        .unwrap()
+        .1
+        .to_owned();
 
     /// One request to the Mac's loopback, as a browser makes it.
     async fn browse(port: u16, target: &str) -> String {
@@ -344,7 +351,13 @@ async fn a_hosts_browser_login_comes_back_through_the_macs_loopback() {
     // What isn't that sign-in's answer doesn't end it.
     assert!(browse(port, "/favicon.ico").await.contains("404"));
     assert!(browse(port, "/callback?nothing=1").await.contains("404"));
-    let got = browse(port, "/callback?code=good&state=s").await;
+    assert!(
+        browse(port, "/callback?code=x&state=not-it")
+            .await
+            .contains("404")
+    );
+    assert!(browse(port, "/callback?code=x").await.contains("404"));
+    let got = browse(port, &format!("/callback?code=good&state={state}")).await;
     assert!(got.contains("You can close this tab"), "{got}");
     let auth = std::fs::read_to_string(own.join("auth.json")).unwrap();
     assert!(auth.contains("code=good"), "{auth}");

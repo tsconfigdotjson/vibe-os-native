@@ -37,6 +37,11 @@ private let piList = [
     #expect(piProviderToSignIn(for: "mine/own", in: piList) == nil)
     #expect(!piHasNoLogin(piList))
     #expect(piHasNoLogin([PiProvider(id: "a", name: "A", signedIn: false)]))
+    #expect(
+        piHasNoLogin([
+            PiProvider(id: "a", name: "A", signedIn: false),
+            PiProvider(id: "amazon-bedrock", name: "Amazon Bedrock", signedIn: false, ambient: true),
+        ]), "every real list has one of those")
     #expect(!piHasNoLogin([]), "no list says nothing")
 }
 

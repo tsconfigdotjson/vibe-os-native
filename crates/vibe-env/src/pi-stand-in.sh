@@ -71,6 +71,7 @@ if [ "$1" = --mode ] && [ "$2" = rpc ]; then
     [ -n "$rest" ] && rest=",$rest"
     case $2 in
       oauth) entry=$(printf '{"type":"oauth","access":"%s","refresh":"r","expires":4102444800000}' "$3") ;;
+      odd) entry='{"type":"api_key","key":"k","more":1}' ;;
       *) entry=$(printf '{"type":"api_key","key":"%s"}' "$3") ;;
     esac
     printf '{"%s":%s%s}' "$1" "$entry" "$rest" >"$dir/auth.json.new"
@@ -112,6 +113,9 @@ if [ "$1" = --mode ] && [ "$2" = rpc ]; then
               ask p1 '{"vibe":"prompt","type":"secret","message":"API key"}'
               if [ "$answer" = refused ]; then
                 say '{"vibe":"failed","message":"That key was refused"}'
+              elif [ "$answer" = odd-shape ]; then
+                sign_in "$provider" odd
+                say '{"vibe":"done"}'
               else
                 sign_in "$provider" api_key "$answer"
                 say '{"vibe":"event","type":"progress","message":"Getting its models…"}'
@@ -128,7 +132,7 @@ if [ "$1" = --mode ] && [ "$2" = rpc ]; then
               else
                 say '{"vibe":"event","type":"progress","message":"Listening for the callback"}'
                 port=$(cat "$dir/redirect-port" 2>/dev/null || echo 53692)
-                say '{"vibe":"event","type":"auth_url","url":"https://auth.example/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A'"$port"'%2Fcallback","instructions":"Complete sign-in in your browser."}'
+                say '{"vibe":"event","type":"auth_url","url":"https://claude.ai/oauth/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A'"$port"'%2Fcallback&state=the-state","instructions":"Complete sign-in in your browser."}'
                 ask p3 '{"vibe":"prompt","type":"manual_code","message":"Paste the redirect URL here:","placeholder":"http://localhost/callback"}'
                 case $answer in
                   *code=good*)

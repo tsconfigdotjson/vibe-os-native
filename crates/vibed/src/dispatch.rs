@@ -173,12 +173,12 @@ async fn call(
         if !params.is_object() {
             return Err(invalid_params("params must be an object"));
         }
-        let answer = core.forward(&link, method, params).await?;
+        let answer = core.forward(&link, method, params).await;
         // A sign-in on a host may need its browser's return caught here.
         if method.starts_with("pi.login.") {
-            core.pi_login_forwarded(&link, &answer);
+            core.pi_login_forwarded(&link, method, answer.as_ref().ok());
         }
-        return Ok(answer);
+        return answer;
     }
     match method {
         Hello::NAME => {

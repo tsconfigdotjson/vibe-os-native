@@ -29,7 +29,7 @@
       "seq": 6,
       "state": "running",
       "target": "native",
-      "url": "https://auth.example/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A53692%2Fcallback"
+      "url": "https://claude.ai/oauth/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A53692%2Fcallback&state=the-state"
     }
   }
 }

@@ -14,8 +14,9 @@
 //! **A browser on another machine.** A login for a Linux host opens its page on the
 //! Mac, and the page comes back to `localhost` there, not to Pi. The Mac's `vibed`
 //! listens at that address on loopback for as long as the sign-in lasts, and passes
-//! what arrives on as the address the owner would otherwise paste. Pi checks it just
-//! the same.
+//! on that page's own answer, by its `state`, as the address the owner would otherwise
+//! paste. It does so only for pages Pi is known to use
+//! ([`vibe_env::pi_setup::redirect_of`]), as all it knows of a page is the host's word.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -30,8 +31,8 @@ use tokio::sync::{mpsc, watch};
 use vibe_core::model::{LOCAL_HOST, PiLoginState, PiPromptKind, PiTarget};
 use vibe_core::paths::Layout;
 use vibe_core::rpc::{
-    ErrorCode, ErrorObject, PiLogin, PiLoginAnswer, PiLoginAnswerParams, PiLoginGet,
-    PiLoginGetParams, PiLoginParams, PiLoginStartParams, PiModels, PiModelsParams,
+    ErrorCode, ErrorObject, Method, PiLogin, PiLoginAnswer, PiLoginAnswerParams, PiLoginCancel,
+    PiLoginGet, PiLoginGetParams, PiLoginParams, PiLoginStartParams, PiModels, PiModelsParams,
 };
 use vibe_env::pi;
 use vibe_env::pi_logins::{self, Broker, Synced};
@@ -52,6 +53,9 @@ const SETTLE: Duration = Duration::from_secs(30);
 
 /// How long after a page to open a question about it may follow.
 const SETTLE_AFTER_PAGE: Duration = Duration::from_secs(1);
+
+/// How often it's looked at whether anyone's still watching a sign-in.
+const IDLE_LOOK: Duration = Duration::from_secs(5);
 
 /// How long `pi.login.get` waits on a sign-in that hasn't changed.
 const LONG_POLL: Duration = Duration::from_secs(20);
@@ -85,6 +89,26 @@ pub struct PiSetup {
 struct Login {
     state: watch::Sender<PiLogin>,
     commands: mpsc::Sender<Told>,
+    heard: Heard,
+}
+
+/// When a client was last heard of. With nobody watching, a sign-in's given up on: an
+/// app that quit part way shouldn't leave Pi holding its port for half an hour.
+#[derive(Clone)]
+struct Heard(Arc<Mutex<Instant>>);
+
+impl Heard {
+    fn now() -> Heard {
+        Heard(Arc::new(Mutex::new(Instant::now())))
+    }
+
+    fn again(&self) {
+        *lock(&self.0) = Instant::now();
+    }
+
+    fn silent_for(&self) -> Duration {
+        lock(&self.0).elapsed()
+    }
 }
 
 enum Told {
@@ -95,6 +119,7 @@ enum Told {
 struct Catcher {
     login: String,
     port: u16,
+    heard: Heard,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -390,6 +415,8 @@ impl Core {
         }
         let target = self.pi_target(p.target);
         let _one_at_a_time = self.pi_setup.starting.lock().await;
+        // Whatever's listening for another host's browser wants a port Pi may want.
+        *lock(&self.pi_setup.catcher) = None;
         // There's one at a time, and a port for its browser to come back to.
         let previous = lock(&self.pi_setup.login).take();
         if let Some(previous) = previous {
@@ -440,9 +467,11 @@ impl Core {
             error: None,
         });
         let (commands, commanded) = mpsc::channel(4);
+        let heard = Heard::now();
         *lock(&self.pi_setup.login) = Some(Login {
             state: state.clone(),
             commands,
+            heard: heard.clone(),
         });
         let finish = match target {
             PiTarget::Native => None,
@@ -458,25 +487,38 @@ impl Core {
             scratch,
             finish,
             publish,
+            heard: heard.clone(),
+            idle: self.pi_login_idle,
         }));
-        Ok(settled(watching, 0).await)
+        let now = settled(watching, 0).await;
+        heard.again();
+        Ok(now)
     }
 
-    fn pi_login_of(&self, id: &str) -> Result<watch::Sender<PiLogin>, ErrorObject> {
+    /// The sign-in `id` names, whoever's asking having just been heard from.
+    fn pi_login_of(
+        &self,
+        id: &str,
+    ) -> Result<(watch::Sender<PiLogin>, mpsc::Sender<Told>, Heard), ErrorObject> {
         lock(&self.pi_setup.login)
             .as_ref()
             .filter(|l| l.state.borrow().id == id)
-            .map(|l| l.state.clone())
+            .map(|l| {
+                l.heard.again();
+                (l.state.clone(), l.commands.clone(), l.heard.clone())
+            })
             .ok_or_else(|| error(ErrorCode::NotFound, "that sign-in is over"))
     }
 
     /// `pi.login.get`.
     pub async fn pi_login_get(&self, p: PiLoginGetParams) -> Result<PiLogin, ErrorObject> {
         self.host(p.host.as_deref())?;
-        let mut state = self.pi_login_of(&p.id)?.subscribe();
+        let (state, _, heard) = self.pi_login_of(&p.id)?;
+        let mut state = state.subscribe();
         if let Some(seen) = p.seen {
             let _ = tokio::time::timeout(LONG_POLL, state.wait_for(|s| s.seq != seen)).await;
         }
+        heard.again();
         let now = state.borrow().clone();
         Ok(now)
     }
@@ -487,10 +529,7 @@ impl Core {
         if p.value.len() > MAX_ANSWER {
             return Err(error(ErrorCode::InvalidParams, "that answer is too long"));
         }
-        let state = self.pi_login_of(&p.id)?;
-        let commands = lock(&self.pi_setup.login)
-            .as_ref()
-            .map(|l| l.commands.clone());
+        let (state, commands, heard) = self.pi_login_of(&p.id)?;
         let moved_on = || {
             error(
                 ErrorCode::Conflict,
@@ -513,6 +552,20 @@ impl Core {
                 ));
                 return false;
             }
+            // For VMs it could only be refused once Pi's saved it, and Pi on this Mac
+            // runs a `!command` as soon as it has. It stays asked.
+            if prompt.kind == PiPromptKind::Secret
+                && now.target == PiTarget::Vm
+                && let Err(why) = pi_logins::plain_key(&p.value)
+            {
+                taken = Err(error(
+                    ErrorCode::InvalidParams,
+                    format!(
+                        "that can't be given to Linux agents, as it {why}: give the key itself"
+                    ),
+                ));
+                return false;
+            }
             now.prompt = None;
             now.seq += 1;
             true
@@ -524,22 +577,18 @@ impl Core {
             id: p.prompt,
             value: p.value,
         };
-        if let Some(commands) = commands {
-            let _ = commands.send(answer).await;
-        }
-        Ok(settled(watching, seq).await)
+        let _ = commands.send(answer).await;
+        let now = settled(watching, seq).await;
+        heard.again();
+        Ok(now)
     }
 
     /// `pi.login.cancel`.
     pub async fn pi_login_cancel(&self, p: PiLoginParams) -> Result<PiLogin, ErrorObject> {
         self.host(p.host.as_deref())?;
-        let mut state = self.pi_login_of(&p.id)?.subscribe();
-        let commands = lock(&self.pi_setup.login)
-            .as_ref()
-            .map(|l| l.commands.clone());
-        if let Some(commands) = commands {
-            let _ = commands.send(Told::Cancel).await;
-        }
+        let (state, commands, _) = self.pi_login_of(&p.id)?;
+        let mut state = state.subscribe();
+        let _ = commands.send(Told::Cancel).await;
         let _ = tokio::time::timeout(
             EXIT_GRACE + SETTLE_AFTER_PAGE,
             state.wait_for(|s| s.state != PiLoginState::Running),
@@ -552,12 +601,23 @@ impl Core {
     /// Hears what a host said of a sign-in in a call this one forwarded. A page that
     /// comes back to loopback, with a question waiting for where it ended, is the
     /// cue to listen here for the browser (see the top of this file). If that port's
-    /// taken the question's still there to be answered by hand.
-    pub(crate) fn pi_login_forwarded(&self, link: &Link, value: &Value) {
+    /// taken the question's still there to be answered by hand. A cancel that didn't
+    /// get through is the owner's word all the same, and any other that didn't leaves
+    /// it to run out of being heard from.
+    pub(crate) fn pi_login_forwarded(&self, link: &Link, method: &str, value: Option<&Value>) {
+        let mut catcher = lock(&self.pi_setup.catcher);
+        let Some(value) = value else {
+            if method == PiLoginCancel::NAME {
+                *catcher = None;
+            }
+            return;
+        };
         let Ok(login) = serde_json::from_value::<PiLogin>(value.clone()) else {
             return;
         };
-        let mut catcher = lock(&self.pi_setup.catcher);
+        if let Some(c) = catcher.as_ref().filter(|c| c.login == login.id) {
+            c.heard.again();
+        }
         if login.state != PiLoginState::Running {
             if catcher.as_ref().is_some_and(|c| c.login == login.id) {
                 *catcher = None;
@@ -574,10 +634,9 @@ impl Core {
         else {
             return;
         };
-        if catcher
-            .as_ref()
-            .is_some_and(|c| c.login == login.id && c.port == redirect.port)
-        {
+        if catcher.as_ref().is_some_and(|c| {
+            c.login == login.id && c.port == redirect.port && !c.task.is_finished()
+        }) {
             return;
         }
         // Before the new one takes its port, the old one lets go of it.
@@ -593,16 +652,19 @@ impl Core {
             }
         };
         let port = redirect.port;
+        let heard = Heard::now();
         let task = runtime.spawn(catch_redirect(
             listener,
             redirect,
             login.id.clone(),
             link.name.clone(),
             me.clone(),
+            (heard.clone(), self.pi_login_idle),
         ));
         *catcher = Some(Catcher {
             login: login.id,
             port,
+            heard,
             task,
         });
     }
@@ -681,6 +743,9 @@ struct Run {
     /// Where it goes once it's made, for one made away from where it's used.
     finish: Option<Broker>,
     publish: Box<dyn Fn() + Send + Sync>,
+    /// When a client was last heard of, and how long it can be silent.
+    heard: Heard,
+    idle: Duration,
 }
 
 /// How a sign-in ended.
@@ -756,8 +821,14 @@ async fn drive(mut run: Run) {
 async fn talk(run: &mut Run) -> Ended {
     let limit = tokio::time::sleep(LOGIN_LIMIT);
     tokio::pin!(limit);
+    let mut looks = tokio::time::interval(IDLE_LOOK.min(run.idle));
     loop {
         tokio::select! {
+            _ = looks.tick() => {
+                if run.heard.silent_for() > run.idle {
+                    return Ended::Cancelled;
+                }
+            }
             line = run.lines.next_line() => {
                 let Ok(Some(line)) = line else {
                     return Ended::Failed("Pi stopped before it finished signing in".to_owned());
@@ -809,46 +880,60 @@ fn hear(state: &watch::Sender<PiLogin>, said: Said) {
 
 /// Puts what a sign-in for `linux` agents left, in a directory made for it, in the
 /// store they get theirs from: it's the owner's, as one in the toolbox is, and held
-/// to the same rule of being plain. One that isn't, such as a key typed as a
-/// `!command`, says so and goes nowhere.
+/// to the same rule of being plain. It's only done once the store holds what this
+/// sign-in made: a login that's already there says nothing about this one.
 fn sign_in_lands(broker: &Broker, dir: &Path, state: &Path, provider: &str) -> Result<(), String> {
-    let copy = pi_logins::sign_in_copy(dir, state);
     let failed = |why: String| Err(format!("that login can't be given to your agents: {why}"));
+    let made = pi::read_plain_file(&dir.join("auth.json"))
+        .ok()
+        .flatten()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|mut all| all.get_mut(provider).map(Value::take));
+    let Some(made) = made else {
+        return failed("Pi left no login for it".to_owned());
+    };
+    if let Err(why) = pi_logins::plain_login(provider, &made) {
+        return failed(why);
+    }
+    let copy = pi_logins::sign_in_copy(dir, state);
     match broker.sync(&copy, pi_logins::now_ms()) {
         Err(e) => failed(e.to_string()),
         Ok(Synced::Busy) => failed("its file was locked".to_owned()),
         Ok(Synced::Gone) => failed("its directory went".to_owned()),
         Ok(Synced::Quarantined(why)) => failed(why),
-        Ok(Synced::Done(report)) => {
-            if let Some(why) = report.bad.get(provider) {
-                return failed(why.clone());
-            }
-            match broker.read_store() {
-                Ok(store) if store.contains_key(provider) => Ok(()),
-                Ok(_) => failed("it didn't reach the store".to_owned()),
-                Err(e) => failed(e.to_string()),
-            }
-        }
+        Ok(Synced::Done(_)) => match broker.read_store() {
+            Ok(store) if store.get(provider) == Some(&made) => Ok(()),
+            Ok(_) => failed("it didn't reach the store".to_owned()),
+            Err(e) => failed(e.to_string()),
+        },
     }
 }
 
 /// Listens at where a browser means to come back to, until it does, and passes that
-/// on. Only a request for that path with an OAuth answer in it counts, so nothing
-/// else on this Mac can end it, and what it can say Pi checks. It lasts no longer
-/// than a sign-in can.
+/// on. Only that page's own answer counts ([`Redirect::is_answered_by`]), so nothing
+/// else on this Mac can end the sign-in. It lasts no longer than a sign-in can, and
+/// lets go of its port once nobody's been heard from.
 async fn catch_redirect(
     listener: TcpListener,
     redirect: Redirect,
     login: String,
     host: String,
     core: Weak<Core>,
+    (heard, idle): (Heard, Duration),
 ) {
     let until = tokio::time::sleep(LOGIN_LIMIT);
     tokio::pin!(until);
+    let mut looks = tokio::time::interval(IDLE_LOOK.min(idle));
     loop {
         let accepted = tokio::select! {
             accepted = listener.accept() => accepted,
             () = &mut until => return,
+            _ = looks.tick() => {
+                if heard.silent_for() > idle {
+                    return;
+                }
+                continue;
+            }
         };
         let Ok((mut stream, _)) = accepted else {
             continue;
@@ -857,7 +942,7 @@ async fn catch_redirect(
             .await
             .ok()
             .flatten();
-        let Some(target) = target.filter(|t| is_the_redirect(t, &redirect)) else {
+        let Some(target) = target.filter(|t| redirect.is_answered_by(t)) else {
             let _ = respond(&mut stream, "404 Not Found", "Nothing here.").await;
             continue;
         };
@@ -892,18 +977,6 @@ async fn read_target(stream: &mut TcpStream) -> Option<String> {
     (words.next()? == "GET").then(|| words.next().map(str::to_owned))?
 }
 
-/// Whether `target` is where a browser came back to, with an answer in it.
-fn is_the_redirect(target: &str, redirect: &Redirect) -> bool {
-    let Some((path, query)) = target.split_once('?') else {
-        return false;
-    };
-    path == redirect.path
-        && query
-            .split('&')
-            .any(|pair| matches!(pair.split_once('=').map(|(n, _)| n), Some("code" | "error")))
-        && !target.chars().any(|c| c.is_whitespace() || c.is_control())
-}
-
 async fn respond(stream: &mut TcpStream, status: &str, text: &str) -> std::io::Result<()> {
     let body = format!(
         "<!doctype html><meta charset=utf-8><title>VibeOS</title><p>{}</p>",
@@ -924,27 +997,6 @@ async fn respond(stream: &mut TcpStream, status: &str, text: &str) -> std::io::R
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn only_the_redirect_with_an_answer_counts() {
-        let redirect = Redirect {
-            host: "localhost".into(),
-            port: 53692,
-            path: "/callback".into(),
-        };
-        assert!(is_the_redirect("/callback?code=abc&state=s", &redirect));
-        assert!(is_the_redirect("/callback?error=access_denied", &redirect));
-        for other in [
-            "/callback",
-            "/callback?state=s",
-            "/favicon.ico",
-            "/other?code=abc",
-            "/callback/x?code=abc",
-            "/callback?code=a b",
-        ] {
-            assert!(!is_the_redirect(other, &redirect), "{other}");
-        }
-    }
 
     async fn request(port: u16, text: &str) -> String {
         let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();

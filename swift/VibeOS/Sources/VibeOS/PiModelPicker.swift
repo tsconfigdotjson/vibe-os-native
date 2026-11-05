@@ -262,6 +262,12 @@ struct PiModelPicker: View {
     }
 }
 
+/// Whether a sign-in's sheet has gone, for what comes back after: a view's own state
+/// can't be asked once it has.
+@MainActor private final class SheetLife {
+    var closed = false
+}
+
 /// Pi's own sign-in, in the app (PRD: Who gets which credentials): who to sign in to,
 /// how, and then whatever Pi asks. Pi does the signing in, and vibed carries its
 /// questions here. A key typed here goes to Pi and isn't kept.
@@ -279,7 +285,10 @@ struct PiSignInSheet: View {
     @State private var error: String?
     @State private var text = ""
     @State private var opened: Set<String> = []
-    @State private var pasting = false
+    @State private var life = SheetLife()
+
+    /// Pi on this Mac is this Mac's word. A host's page opens on a click, by its domain.
+    private var opensItself: Bool { request.host == VibeRPC.localHost }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -364,7 +373,7 @@ struct PiSignInSheet: View {
     @ViewBuilder private func loginView(_ login: PiLogin) -> some View {
         switch login.state {
         case .done:
-            Label("Signed in. Pi's models for \(provider?.name ?? login.provider) are in the list now.", systemImage: "checkmark.circle.fill")
+            Label("Signed in to \(provider?.name ?? login.provider).", systemImage: "checkmark.circle.fill")
                 .foregroundStyle(Palette.signal)
         case .cancelled:
             Text("That was given up on.").foregroundStyle(.secondary)
@@ -399,49 +408,64 @@ struct PiSignInSheet: View {
             Working(text: login.progress ?? "Pi's on it…")
         } else {
             Working(text: "Waiting for you to finish there…")
+            // Nothing's asking for where it ended, so only Pi's listener can hear that,
+            // and that's on the host.
+            if !opensItself && login.code == nil {
+                Text(
+                    "If the page ends somewhere that won't load, this way can't finish from another machine. "
+                        + "Cancel and choose a device code, if it offers one."
+                )
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            }
         }
+    }
+
+    /// A button for a page: its domain, as that's where it goes.
+    private func openButton(_ url: String) -> some View {
+        Button("Open \(URL(string: url)?.host ?? "the Page")") { openPage(url) }
+            .help(url)
     }
 
     private func pageView(_ url: String, _ login: PiLogin) -> some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("Your browser has opened a page to sign in. Finish there, and VibeOS takes it from here.")
+            Text(login.instructions ?? "Finish signing in on that page, in your browser.")
                 .fixedSize(horizontal: false, vertical: true)
-            Button("Open It Again") { openPage(url) }
+            openButton(url)
         }
     }
 
     private func codeView(_ code: String, _ login: PiLogin) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("Enter this code on the page your browser opened.")
+            Text("Enter this code on the page.")
             HStack(spacing: 10) {
                 Text(code)
                     .font(.system(.title2, design: .monospaced).weight(.semibold))
                     .textSelection(.enabled)
                 Button("Copy") { WorktreeActions.copy(code) }
             }
-            if let url = login.url { Button("Open the Page Again") { openPage(url) } }
+            if let url = login.url { openButton(url) }
         }
     }
 
-    /// Where a browser ended, for when nothing could bring that back by itself.
+    /// Where a browser ended or the code it showed, in Pi's words. A browser that gets
+    /// back by itself makes this unneeded, and it goes.
     private func pasteView(_ prompt: PiLoginPrompt, _ login: PiLogin) -> some View {
-        DisclosureGroup("Did the page end somewhere that won't load, or show a code?", isExpanded: $pasting) {
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Paste its address, or the code, here.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                HStack {
-                    TextField(prompt.placeholder ?? "", text: $text)
-                        .textFieldStyle(.roundedBorder)
-                        .autocorrectionDisabled()
-                        .onSubmit { submit(prompt, login) }
-                    Button("Continue") { submit(prompt, login) }
-                        .disabled(text.isEmpty || working != nil)
-                }
+        VStack(alignment: .leading, spacing: 6) {
+            Text(prompt.message)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack {
+                TextField(prompt.placeholder ?? "", text: $text)
+                    .textFieldStyle(.roundedBorder)
+                    .autocorrectionDisabled()
+                    .onSubmit { submit(prompt, login) }
+                Button("Continue") { submit(prompt, login) }
+                    .disabled(text.isEmpty || working != nil)
             }
-            .padding(.top, 4)
         }
-        .font(.callout)
     }
 
     @ViewBuilder private func question(_ prompt: PiLoginPrompt, _ login: PiLogin) -> some View {
@@ -513,7 +537,6 @@ struct PiSignInSheet: View {
         working = "Starting Pi…"
         error = nil
         opened = []
-        pasting = false
         defer { working = nil }
         do {
             let params = PiLoginStartParams(
@@ -538,28 +561,36 @@ struct PiSignInSheet: View {
         }
     }
 
-    /// Hears how it stands as it changes, for as long as it's going.
+    /// Hears how it stands as it changes, for as long as it's going. A link that
+    /// drops a call is no end to a sign-in: only vibed saying it's gone is.
     private func follow() async {
         while !Task.isCancelled, let now = login, now.state == .running {
             do {
                 let params = PiLoginGetParams(host: request.host, id: now.id, seen: now.seq)
                 let next = try await model.call(PiLoginGet.self, params, timeout: 60)
                 guard !Task.isCancelled else { return }
+                error = nil
                 take(next)
             } catch {
                 guard !Task.isCancelled else { return }
                 self.error = describe(error)
-                return
+                if case VibedClientError.rpc(let rpc) = error, rpc.code == RPCErrorCode.notFound.rawValue { return }
+                try? await Task.sleep(for: .seconds(2))
             }
         }
     }
 
     /// The newest word on it: an answer and a wait can each come back with one.
     private func take(_ next: PiLogin) {
+        // Closed while it was starting: nobody's here for it.
+        if life.closed {
+            if next.state == .running { cancel(next.id) }
+            return
+        }
         if let now = login, now.id == next.id, now.seq > next.seq { return }
         let wasDone = login?.id == next.id && login?.state == .done
         login = next
-        if let url = next.url, opened.insert(url).inserted { openPage(url) }
+        if opensItself, let url = next.url, opened.insert(url).inserted { openPage(url) }
         if next.state == .done && !wasDone { finished() }
     }
 
@@ -571,9 +602,14 @@ struct PiSignInSheet: View {
     }
 
     private func giveUp() {
+        life.closed = true
         text = ""
         guard let login, login.state == .running else { return }
-        let (client, params) = (model, PiLoginParams(host: request.host, id: login.id))
+        cancel(login.id)
+    }
+
+    private func cancel(_ id: String) {
+        let (client, params) = (model, PiLoginParams(host: request.host, id: id))
         Task { _ = try? await client.call(PiLoginCancel.self, params, timeout: 30) }
     }
 }

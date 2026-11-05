@@ -305,22 +305,115 @@ async fn a_key_for_linux_agents_lands_in_the_store_and_goes_through_its_rules() 
     let opencode = list.providers.iter().find(|p| p.id == "opencode");
     assert!(opencode.unwrap().signed_in);
 
-    // A key that would run something on a VM goes nowhere, and says so.
+    // A key that would run something isn't even given to Pi, which on this Mac would
+    // run it as soon as it's saved. It stays asked, for the key itself.
     let login = w
         .core
         .pi_login_start(start("deepseek", PiLoginMethod::ApiKey, PiTarget::Vm))
         .await
         .unwrap();
-    let refused = w
+    for bad in ["!cat ~/.secret-key", "$HOME"] {
+        let e = w
+            .core
+            .pi_login_answer(answer(&login, bad))
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, ErrorCode::InvalidParams.code(), "{bad}");
+    }
+    let done = w
+        .core
+        .pi_login_answer(answer(&login, "sk-plain"))
+        .await
+        .unwrap();
+    assert_eq!(done.state, PiLoginState::Done, "{:?}", done.error);
+    assert!(w.store_auth().contains("sk-plain"));
+
+    // On the owner's own Pi it's theirs to do, as it is in `/login`.
+    let login = w
+        .core
+        .pi_login_start(start("xai", PiLoginMethod::ApiKey, PiTarget::Native))
+        .await
+        .unwrap();
+    let done = w
         .core
         .pi_login_answer(answer(&login, "!cat ~/.secret-key"))
         .await
         .unwrap();
+    assert_eq!(done.state, PiLoginState::Done);
+}
+
+/// A new sign-in only says it worked once the store holds it: one already there for
+/// that provider isn't this one.
+#[tokio::test]
+async fn signing_in_again_with_what_cant_be_shared_says_so_and_keeps_the_old_one() {
+    let w = world().await;
+    let login = w
+        .core
+        .pi_login_start(start("opencode", PiLoginMethod::ApiKey, PiTarget::Vm))
+        .await
+        .unwrap();
+    w.core
+        .pi_login_answer(answer(&login, "sk-first"))
+        .await
+        .unwrap();
+    assert!(w.store_auth().contains("sk-first"));
+    let again = w
+        .core
+        .pi_login_start(start("opencode", PiLoginMethod::ApiKey, PiTarget::Vm))
+        .await
+        .unwrap();
+    let refused = w
+        .core
+        .pi_login_answer(answer(&again, "odd-shape"))
+        .await
+        .unwrap();
     assert_eq!(refused.state, PiLoginState::Failed);
-    let why = refused.error.unwrap();
-    assert!(why.contains("run a command"), "{why}");
-    assert!(!w.store_auth().contains("deepseek"), "{}", w.store_auth());
+    assert!(refused.error.unwrap().contains("more than a key"));
+    assert!(w.store_auth().contains("sk-first"), "{}", w.store_auth());
     w.no_scratch_left();
+    // And a good one goes through what's there.
+    let third = w
+        .core
+        .pi_login_start(start("opencode", PiLoginMethod::ApiKey, PiTarget::Vm))
+        .await
+        .unwrap();
+    let done = w
+        .core
+        .pi_login_answer(answer(&third, "sk-second"))
+        .await
+        .unwrap();
+    assert_eq!(done.state, PiLoginState::Done, "{:?}", done.error);
+    assert!(w.store_auth().contains("sk-second"), "{}", w.store_auth());
+    assert!(!w.store_auth().contains("sk-first"));
+}
+
+#[tokio::test]
+async fn one_nobody_is_watching_is_given_up_on() {
+    let w = world_with(|config| config.pi_login_idle = std::time::Duration::from_millis(200));
+    let login = w
+        .core
+        .pi_login_start(start("opencode", PiLoginMethod::ApiKey, PiTarget::Vm))
+        .await
+        .unwrap();
+    // Pi's own ending frees what it held, so a wait with no client asking is the test.
+    let root = w.layout.data_dir().join(".pi-setup");
+    for _ in 0..500 {
+        if fs::read_dir(&root).map_or(true, |mut d| d.next().is_none()) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    w.no_scratch_left();
+    let over = w
+        .core
+        .pi_login_get(PiLoginGetParams {
+            host: None,
+            id: login.id,
+            seen: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(over.state, PiLoginState::Cancelled);
 }
 
 #[tokio::test]
