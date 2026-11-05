@@ -20,7 +20,8 @@ pub use crate::model::{
     Activity, AdminNeed, AgentKind, AgentState, Certainty, CheckId, CheckState, Environment,
     EventKind, GhState, HostLink, LoginTool, MessageRole, Mode, Model, PiLoginMethod, PiLoginState,
     PiPromptKind, PiTarget, Profile, ProjectSource, Reasoning, ServiceRole, ServiceState,
-    SessionState, StopReason, ToolboxAction, ToolboxState, TunnelState, WakeupKind,
+    SessionState, SignInState, SignInWhat, StopReason, ToolboxAction, ToolboxState, TunnelState,
+    WakeupKind,
 };
 
 /// Bumped on any incompatible change to the contract. Clients send theirs in
@@ -358,6 +359,10 @@ pub const METHODS: &[&str] = &[
     HostsAdd::NAME,
     HostsUpgrade::NAME,
     HostsAdmin::NAME,
+    SignInStart::NAME,
+    SignInGet::NAME,
+    SignInAnswer::NAME,
+    SignInCancel::NAME,
     HostsRemove::NAME,
     HostsExternal::NAME,
     TunnelPrepare::NAME,
@@ -489,6 +494,27 @@ method! {
     /// it runs another, and checks its tools again, now. A host runs behind by
     /// itself for no longer than it takes to reach it, so this is **Retry**.
     HostsUpgrade = "hosts.upgrade", HostNameParams => HostInstall
+}
+
+method! {
+    /// `signin.start`: the one click for a sign-in: starts the provider's own flow on
+    /// the host, and says what it wants of a person.
+    SignInStart = "signin.start", SignInStartParams => SignIn
+}
+
+method! {
+    /// `signin.get`: how a sign-in stands, once it's moved on from `seen`.
+    SignInGet = "signin.get", SignInGetParams => SignIn
+}
+
+method! {
+    /// `signin.answer`: gives a sign-in the code its page showed.
+    SignInAnswer = "signin.answer", SignInAnswerParams => SignIn
+}
+
+method! {
+    /// `signin.cancel`: gives up on a sign-in.
+    SignInCancel = "signin.cancel", SignInParams => SignIn
 }
 
 method! {
@@ -911,10 +937,24 @@ pub struct HostInfo {
         deserialize_with = "known_admin_needs"
     )]
     pub needs_admin: Vec<AdminNeed>,
+    /// What this host still needs signing in to, as far as it can tell: `github` and
+    /// `claude`, each one click, on `signin.start`.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "known_sign_ins"
+    )]
+    pub sign_ins: Vec<SignInWhat>,
     /// Why upgrading this Linux host's `vibed` failed, the last time this Mac tried.
     /// It tries again by itself; `hosts.upgrade` is **Retry**.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upgrade_error: Option<String>,
+}
+
+/// The sign-ins this build knows of those a host names.
+fn known_sign_ins<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<SignInWhat>, D::Error> {
+    let names = <Vec<String> as Deserialize>::deserialize(d)?;
+    Ok(names.iter().filter_map(|n| n.parse().ok()).collect())
 }
 
 /// The needs this build knows of those a host names.
@@ -1070,6 +1110,82 @@ pub struct HostInstall {
     /// What the owner should know, in sentences: such as that lingering
     /// couldn't be turned on, and how to.
     pub notes: Vec<String>,
+}
+
+/// `signin.start`'s params.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignInStartParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    pub what: SignInWhat,
+}
+
+/// `signin.cancel`'s params.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignInParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    pub id: String,
+}
+
+/// `signin.get`'s params.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignInGetParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    pub id: String,
+    /// The `seq` last seen: it answers once there's newer, or after a while.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seen: Option<u64>,
+}
+
+/// `signin.answer`'s params.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignInAnswerParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    pub id: String,
+    /// The code the page showed.
+    pub value: String,
+}
+
+impl std::fmt::Debug for SignInAnswerParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SignInAnswerParams")
+            .field("host", &self.host)
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// How a sign-in stands.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignIn {
+    pub id: String,
+    pub host: String,
+    pub what: SignInWhat,
+    /// Goes up with each change.
+    pub seq: u64,
+    pub state: SignInState,
+    /// The page to open on the Mac, always `https`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// The code to enter at that page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    /// That page shows a code to bring back, for `signin.answer`.
+    #[serde(default)]
+    pub asks_for_code: bool,
+    /// The flow opens the browser itself, as it's on the Mac.
+    #[serde(default)]
+    pub opens_itself: bool,
+    /// Why it failed, in words.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// `hosts.admin`'s answer.

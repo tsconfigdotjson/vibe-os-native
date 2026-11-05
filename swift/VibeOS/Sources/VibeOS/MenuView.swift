@@ -619,6 +619,9 @@ struct EmptyMenuView: View {
                 model.setupMayHaveChanged()
             }
         case .openToolbox: Task { await model.openToolbox() }
+        case .signIn(let what):
+            model.signInRequest = SignInRequest(what: what)
+            show(WindowID.signIn, with: openWindow)
         case .projects: showSettings(.projects, with: openWindow)
         case .keys: showSettings(.keys, with: openWindow)
         }

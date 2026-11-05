@@ -1136,6 +1136,11 @@ struct HostsPane: View {
                         host: host, updating: updating == host.name,
                         upgrade: { Task { await upgrade(host.name) } },
                         allow: { Task { await model.allowOnHost(host.name) } },
+                        signIn: { what in
+                            model.signInRequest = SignInRequest(
+                                host: host.link == .local ? nil : host.name, what: what)
+                            show(WindowID.signIn, with: openWindow)
+                        },
                         remove: { Task { await remove(host.name) } })
                 }
                 Button("Add Linux Host…") { show(WindowID.addHost, with: openWindow) }
@@ -1319,6 +1324,7 @@ struct HostRow: View {
     let updating: Bool
     let upgrade: () -> Void
     let allow: () -> Void
+    let signIn: (SignInWhat) -> Void
     let remove: () -> Void
 
     var body: some View {
@@ -1343,10 +1349,10 @@ struct HostRow: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 if !host.missing.isEmpty {
-                    Label("Still needs \(host.missing.joined(separator: ", ")) on the server", systemImage: "wrench.and.screwdriver")
+                    Label("VibeOS is installing \(host.missing.joined(separator: ", ")) there", systemImage: "wrench.and.screwdriver")
                         .font(.caption)
                         .foregroundStyle(Palette.attention)
-                        .help("Install it on \(host.name), then log in there: gh auth login, and claude with /login. Pi, if you'll run it, signs in here, from Settings → Agents.")
+                        .help("VibeOS installs it by itself")
                 }
                 if let needs = host.needsAdmin, !needs.isEmpty {
                     Label(adminNeedsText(needs, host: host.name), systemImage: "lock")
@@ -1365,6 +1371,10 @@ struct HostRow: View {
             if updating {
                 Working(text: "Updating…")
             } else if !local {
+                ForEach(host.signIns ?? [], id: \.self) { what in
+                    Button(what == .github ? "Sign In to GitHub…" : "Sign In to Claude…") { signIn(what) }
+                        .help("Opens the page in your browser. That's all it asks.")
+                }
                 if let needs = host.needsAdmin, !needs.isEmpty {
                     Button("Allow…", action: allow)
                         .help("Opens Terminal, where sudo on \(host.name) asks for its password. VibeOS never sees it.")
@@ -1397,6 +1407,7 @@ private func adminNeedsText(_ needs: [AdminNeed], host: String) -> String {
         switch need {
         case .linger: "keep vibed running while you're logged out"
         case .port443: "serve the external address on port 443"
+        case .git: "install git, which its agents need"
         }
     }
     return "\(host) needs your password once to \(what.joined(separator: " and "))"

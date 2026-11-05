@@ -244,6 +244,10 @@ case "$1 $2" in
   echo "  ✓ Logged in to github.com account me (keyring)"
   echo "  - Token: gho_************************************"
   ;;
+"auth login")
+  # Waiting for a person, for as long as an example takes.
+  exec sleep 30
+  ;;
 "repo clone")
   name=${{3#*/}}
   if [ -d "{remotes}/$name" ]; then
@@ -287,6 +291,7 @@ pub fn golden_checks() -> vibed::doctor::FixedChecks {
         system_sleep: Ok(Some(10)),
         linger: std::sync::Mutex::new(Ok(None)),
         enable_linger: Ok(()),
+        installs_tools: false,
     }
 }
 

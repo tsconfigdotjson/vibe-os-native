@@ -63,6 +63,9 @@ pub trait HostChecks: Send + Sync + fmt::Debug {
     /// was said if none works. What it tries that an admin may see in a log, it
     /// tries once a run.
     fn enable_linger(&self) -> Result<(), String>;
+    /// Whether VibeOS may install what's missing here. Only for this user's own home:
+    /// a `HOME` that isn't, as in a test, is no place to go downloading to.
+    fn installs_tools(&self) -> bool;
 }
 
 /// Where systemd keeps who lingers: an empty file named for each user.
@@ -346,6 +349,10 @@ impl HostChecks for Machine {
         Ok(Some(l.dir.join(&l.user).exists()))
     }
 
+    fn installs_tools(&self) -> bool {
+        self.own_home()
+    }
+
     fn enable_linger(&self) -> Result<(), String> {
         let Some(l) = self.lingers() else {
             return Ok(());
@@ -379,6 +386,13 @@ impl HostChecks for Machine {
             "loginctl enable-linger was refused: {}",
             first_line(&said)
         ))
+    }
+}
+
+impl Machine {
+    /// Whether this is this user's real home.
+    fn own_home(&self) -> bool {
+        passwd_entry().is_some_and(|(_, home)| home == self.home)
     }
 }
 
@@ -421,6 +435,8 @@ pub struct FixedChecks {
     pub linger: Mutex<Result<Option<bool>, String>>,
     /// What turning lingering on does: `Ok` turns it on.
     pub enable_linger: Result<(), String>,
+    /// [`HostChecks::installs_tools`].
+    pub installs_tools: bool,
 }
 
 impl HostChecks for FixedChecks {
@@ -452,6 +468,9 @@ impl HostChecks for FixedChecks {
     }
     fn linger(&self) -> Result<Option<bool>, String> {
         lock(&self.linger).clone()
+    }
+    fn installs_tools(&self) -> bool {
+        self.installs_tools
     }
     fn enable_linger(&self) -> Result<(), String> {
         if self.enable_linger.is_ok() {
@@ -587,6 +606,11 @@ pub(crate) struct Found {
     linger: Result<Option<bool>, String>,
 }
 
+/// What only a person can do about a login, and where the one click is. A host on its
+/// own, with no Mac to click on, has its provider's own command: there's nothing else.
+const SIGN_IN_HINT: &str = "One click in VibeOS: its setup on the Mac, or Settings → Hosts for a \
+                            Linux host. A host with no Mac signs in with the tool's own login.";
+
 /// The checks, in [`CheckId`]'s order, from what was found.
 fn report(
     found: Found,
@@ -595,12 +619,13 @@ fn report(
     linux: Option<DoctorCheck>,
     mac: bool,
     pi_wanted: &PiWanted,
+    tools: &crate::tool_install::ToolsNow,
 ) -> DoctorReport {
     let mut checks = Vec::new();
     let install_git = if mac {
-        "Install Apple's Command Line Tools: run `xcode-select --install` in Terminal."
+        "It takes Apple's Command Line Tools, and VibeOS's setup has a button for them."
     } else {
-        "Install git with this server's package manager."
+        "VibeOS installs it by itself if it can, or Settings → Hosts has a button for it."
     };
     checks.push(match &found.git {
         Ok(version) => pass(
@@ -621,20 +646,12 @@ fn report(
                 None => "GitHub's gh is logged in to github.com".to_owned(),
             },
         ),
-        GhState::NotInstalled => fail(
-            CheckId::Gh,
-            "GitHub's gh isn't installed",
-            "Install gh from https://cli.github.com, then run `gh auth login` in Terminal.",
-        ),
-        GhState::LoggedOut => fail(
-            CheckId::Gh,
-            "GitHub's gh isn't logged in",
-            "Run `gh auth login` in Terminal.",
-        ),
+        GhState::NotInstalled => tools.gh.check(CheckId::Gh, "GitHub's gh"),
+        GhState::LoggedOut => fail(CheckId::Gh, "GitHub's gh isn't logged in", SIGN_IN_HINT),
         GhState::Unknown | GhState::Error => fail(
             CheckId::Gh,
             gh.detail.as_deref().unwrap_or("gh auth status failed"),
-            "Run `gh auth status` in Terminal to see why.",
+            "VibeOS looks again every hour, and whenever the doctor asks.",
         ),
     });
     // VibeOS's to set up, so it only needs the owner if that fails. The doctor has
@@ -676,24 +693,20 @@ fn report(
                 path.display()
             ),
         ),
-        Err(why) => fail(
-            CheckId::Claude,
-            why,
-            "Install Claude Code (claude.com/claude-code), then check `claude` runs in Terminal.",
-        ),
+        Err(why) => tools.claude.check_or(CheckId::Claude, "Claude Code", why),
     });
     checks.push(match (&found.claude, &found.claude_login) {
-        (Err(_), _) => fail(
-            CheckId::ClaudeLogin,
-            "Claude Code can sign in once it's installed",
-            "Install Claude Code first.",
-        ),
+        (Err(_), _) => DoctorCheck {
+            state: CheckState::Optional,
+            hint: None,
+            ..fail(
+                CheckId::ClaudeLogin,
+                "Claude Code can sign in once it's installed",
+                "",
+            )
+        },
         (Ok(_), Ok(how)) => pass(CheckId::ClaudeLogin, how),
-        (Ok(_), Err(why)) => fail(
-            CheckId::ClaudeLogin,
-            why,
-            "Run `claude` in Terminal and sign in with /login.",
-        ),
+        (Ok(_), Err(why)) => fail(CheckId::ClaudeLogin, why, SIGN_IN_HINT),
     });
     match &found.system_sleep {
         Ok(None) => {}
@@ -705,13 +718,13 @@ fn report(
                 if *minutes == 1 { "" } else { "s" }
             ),
             "In System Settings → Energy, turn on Prevent automatic sleeping when the display is \
-             off (on a laptop, in Battery → Options, on power adapter); or run `sudo pmset -c \
-             sleep 0` in Terminal.",
+             off (on a laptop, in Battery → Options, on power adapter). VibeOS's setup has a button \
+             for it too.",
         )),
         Err(why) => checks.push(fail(
             CheckId::Power,
             why,
-            "Run `pmset -g` in Terminal to see this Mac's sleep settings.",
+            "VibeOS looks again whenever the doctor asks.",
         )),
     }
     // VibeOS's to set up, and it has tried by now. What it can't do without a
@@ -825,6 +838,7 @@ impl Core {
         let logged_in = gh.state == GhState::LoggedIn;
         let program = self.gh_program().await;
         let pi_wanted = self.pi_wanted().await;
+        let tools = self.tools_now().await;
         let found = tokio::task::spawn_blocking(move || {
             let found = cached.unwrap_or_else(|| {
                 let git = checks.git();
@@ -863,6 +877,7 @@ impl Core {
             linux,
             self.info().os == "macos",
             &pi_wanted,
+            &tools,
         );
         self.say_how_the_template_stands(&mut report);
         report
@@ -926,7 +941,7 @@ impl Core {
                 if gh.state != GhState::LoggedIn {
                     return Err(error(
                         ErrorCode::InvalidParams,
-                        "Invalid params: gh_git needs gh logged in first: run `gh auth login`"
+                        "Invalid params: gh_git needs gh logged in first: sign in from VibeOS"
                             .to_owned(),
                     ));
                 }
@@ -937,6 +952,9 @@ impl Core {
                     .map_err(|e| error(ErrorCode::CommandFailed, e))?;
                 crate::log!("vibed: git now asks gh for GitHub's credentials (gh auth setup-git)");
                 *lock(&self.doctor_found) = None;
+            }
+            CheckId::Gh | CheckId::Claude if self.tool_try_again(p.check).await => {
+                return Ok(self.doctor().await);
             }
             CheckId::Linger => {
                 let checks = Arc::clone(&self.checks);
@@ -1061,7 +1079,15 @@ mod tests {
         linux: Option<DoctorCheck>,
         mac: bool,
     ) -> DoctorReport {
-        super::report(found, gh, tailscale, linux, mac, &PiWanted::No)
+        super::report(
+            found,
+            gh,
+            tailscale,
+            linux,
+            mac,
+            &PiWanted::No,
+            &Default::default(),
+        )
     }
 
     fn logged_in() -> GhStatus {
@@ -1119,7 +1145,10 @@ mod tests {
             checked_at: None,
         };
         let r = report(fresh, &gh, &[], None, true);
-        for c in r.checks[..6].iter().filter(|c| c.id != CheckId::GhGit) {
+        // Claude's login waits for Claude, as git using gh does for gh: one thing to
+        // do, not two.
+        let waits = [CheckId::GhGit, CheckId::ClaudeLogin];
+        for c in r.checks[..6].iter().filter(|c| !waits.contains(&c.id)) {
             assert_eq!(c.state, CheckState::Fail, "{c:?}");
             assert!(c.hint.as_deref().is_some_and(|h| h.ends_with('.')), "{c:?}");
             assert!(c.detail.ends_with('.'), "{c:?}");
@@ -1129,7 +1158,7 @@ mod tests {
                 .hint
                 .as_deref()
                 .unwrap()
-                .contains("xcode-select --install")
+                .contains("Command Line Tools")
         );
         assert!(r.checks[5].detail.contains("10 minutes"));
 
@@ -1181,6 +1210,7 @@ mod tests {
             system_sleep: Ok(None),
             linger: Mutex::new(Ok(None)),
             enable_linger: Ok(()),
+            installs_tools: false,
         };
         assert_eq!(git_through_gh(&checks, tmp.path().as_os_str()), Ok(true));
     }
@@ -1235,6 +1265,7 @@ mod tests {
             None,
             false,
             &PiWanted::Installing,
+            &Default::default(),
         );
         let pi = installing.checks.last().unwrap();
         assert_eq!(pi.state, CheckState::Working);
@@ -1247,6 +1278,7 @@ mod tests {
             None,
             false,
             &PiWanted::Failed("the network is down".into()),
+            &Default::default(),
         );
         let pi = failed.checks.last().unwrap();
         assert_eq!((pi.state, pi.fixable), (CheckState::Fail, true));
@@ -1263,13 +1295,22 @@ mod tests {
             None,
             false,
             &PiWanted::Failed("the network is down".into()),
+            &Default::default(),
         );
         assert_eq!(failed.checks.last().unwrap().state, CheckState::Fail);
 
         // One that's there and doesn't run isn't called something VibeOS will fix.
         let mut broken = found();
         broken.pi = Err("pi --version failed: bad".into());
-        let r = super::report(broken, &logged_in(), &[], None, false, &PiWanted::Present);
+        let r = super::report(
+            broken,
+            &logged_in(),
+            &[],
+            None,
+            false,
+            &PiWanted::Present,
+            &Default::default(),
+        );
         let pi = r.checks.last().unwrap();
         assert_eq!((pi.state, pi.fixable), (CheckState::Fail, false));
         assert!(pi.detail.contains("pi --version failed"), "{pi:?}");

@@ -356,7 +356,7 @@ public struct LoginsSummary: Equatable, Sendable {
         }
         switch (logins.home, logins.logins) {
         case (nil, _):
-            headline = "No Linux home yet. Log in to what agents need in the shell, then exit to save."
+            headline = "No Linux home yet. Sign in here, or in the shell for anything else, and it's kept."
         case (let home?, nil):
             headline = "VibeOS couldn't tell which logins Linux home \(home) holds. Open the shell and exit it "
                 + "to look again."
@@ -709,6 +709,8 @@ public enum SetupAction: Equatable, Sendable {
     case allowTerminal
     /// Has vibed fix a doctor check (`doctor.fix`).
     case fix(CheckId)
+    /// Signs in, with one click: the provider's own flow, and its page in the browser.
+    case signIn(SignInWhat)
     /// Runs a command line in Terminal, in the owner's own shell.
     case terminal(String)
     /// Runs `vibe <words>` in Terminal, as its shell.
@@ -883,11 +885,11 @@ public struct SetupProgress: Equatable, Sendable {
                     detail: linuxGitHub
                         ? "Linux agents start logged in to GitHub."
                         : ready
-                            ? "A Linux shell in Terminal. Log in to GitHub (gh auth login) and install what agents "
-                                + "need, then exit to save."
-                            : "Once Linux is downloaded: a shell to log Linux agents in to GitHub.",
+                            ? "One click, in your browser. Open Shell in Settings → Linux Toolbox installs anything "
+                                + "else agents need."
+                            : "Once Linux is downloaded: signs Linux agents in to GitHub.",
                     status: linuxGitHub ? .done : .todo,
-                    action: linuxGitHub || !ready ? nil : .openToolbox, actionTitle: "Open Shell"))
+                    action: linuxGitHub || !ready ? nil : .signIn(.toolboxGithub), actionTitle: "Sign In…"))
         }
         steps.append(
             Step(
@@ -976,19 +978,27 @@ public struct SetupProgress: Equatable, Sendable {
             step.action = .installCommandLineTools
             step.actionTitle = "Install…"
         case .gh:
-            step.action = ghInstalled ? .terminal("gh auth login") : .open("https://cli.github.com")
-            step.actionTitle = ghInstalled ? "Log In…" : "Get gh"
+            if check.fixable {
+                // VibeOS installs it by itself, and this is its Try Again.
+                step.action = .fix(.gh)
+                step.actionTitle = "Try Again"
+            } else if ghInstalled {
+                step.action = .signIn(.github)
+                step.actionTitle = "Sign In…"
+            }
         case .ghGit:
             if check.fixable {
                 step.action = .fix(.ghGit)
                 step.actionTitle = "Try Again"
             }
         case .claude:
-            step.action = .open("https://claude.com/claude-code")
-            step.actionTitle = "Get Claude Code"
+            if check.fixable {
+                step.action = .fix(.claude)
+                step.actionTitle = "Try Again"
+            }
         case .claudeLogin:
             if claudeReady {
-                step.action = .terminal("claude")
+                step.action = .signIn(.claude)
                 step.actionTitle = "Sign In…"
             }
         case .power:
@@ -1020,12 +1030,12 @@ public struct SetupProgress: Equatable, Sendable {
         case .git: return "Agents' worktrees need git, from Apple's Command Line Tools."
         case .gh:
             return ghInstalled
-                ? "Log in once, in Terminal, so agents can clone, push and open pull requests."
-                : "GitHub's command line tool, for cloning, pushing and pull requests."
+                ? "One click, in your browser, so agents can clone, push and open pull requests."
+                : check.detail
         case .ghGit:
             return check.fixable ? check.detail : "Once gh is logged in."
-        case .claude: return "macos agents run your own Claude Code."
-        case .claudeLogin: return claudeReady ? "Sign in once, in Terminal, with /login." : "Once Claude Code is installed."
+        case .claude: return check.detail
+        case .claudeLogin: return claudeReady ? "One click, in your browser." : "Once Claude Code is installed."
         case .power: return "Agents can't answer while this Mac sleeps. Turning it off asks for your password."
         case .tailscale: return "Lets your other machines reach MCP here."
         case .linger, .linux, .pi: return check.detail
@@ -1167,8 +1177,8 @@ public func headerAlerts(gh: GhStatus?, hosts: [HostInfo]) -> [HeaderAlert] {
     }
     let ghAlert: (String, String)?
     switch gh?.state {
-    case .loggedOut?: ghAlert = ("GitHub CLI is logged out", "Agents on this Mac push with it. Run gh auth login.")
-    case .notInstalled?: ghAlert = ("GitHub CLI isn't installed", "Agents on this Mac push with it. Install gh.")
+    case .loggedOut?: ghAlert = ("GitHub CLI is logged out", "Agents on this Mac push with it. Sign in from Settings → Hosts.")
+    case .notInstalled?: ghAlert = ("GitHub CLI isn't installed", "Agents on this Mac push with it. VibeOS is installing it.")
     case .error?: ghAlert = ("Can't check the GitHub login", "gh auth status didn't answer.")
     case .loggedIn?, .unknown?, nil: ghAlert = nil
     }

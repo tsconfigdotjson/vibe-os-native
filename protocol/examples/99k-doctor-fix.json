@@ -40,7 +40,7 @@
           "id": "power",
           "state": "fail",
           "detail": "This Mac sleeps after 10 minutes idle, and agents stop answering while it sleeps.",
-          "hint": "In System Settings → Energy, turn on Prevent automatic sleeping when the display is off (on a laptop, in Battery → Options, on power adapter); or run `sudo pmset -c sleep 0` in Terminal.",
+          "hint": "In System Settings → Energy, turn on Prevent automatic sleeping when the display is off (on a laptop, in Battery → Options, on power adapter). VibeOS's setup has a button for it too.",
           "fixable": false
         },
         {

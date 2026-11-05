@@ -216,7 +216,7 @@ struct AddedHost: View {
                 Label {
                     VStack(alignment: .leading, spacing: 3) {
                         Text("Still needed on \(host.name): \(host.missing.joined(separator: ", "))")
-                        Text("Install them on the server, then log in there: gh auth login, and claude with /login.")
+                        Text("VibeOS installs them by itself. Sign in with one click in Settings → Hosts.")
                             .font(.callout)
                             .foregroundStyle(.secondary)
                     }

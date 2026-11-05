@@ -781,8 +781,8 @@ impl Cgroups {
             .find(|c| is_executable(c))
             .ok_or_else(|| {
                 EnvError::new(format!(
-                    "can't find claude on this server's PATH ({}). Install Claude Code here, \
-                     then run `claude` and `/login` once",
+                    "can't find claude on this server's PATH ({}). VibeOS installs it by itself: try again in \
+                     a moment, and Settings → Hosts signs in with one click",
                     self.path
                 ))
             })

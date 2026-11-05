@@ -5,6 +5,19 @@ import VibeRPC
 /// What the menu shows, all of it from vibed: the app keeps no state of its
 /// own (PRD: Architecture). vibed's events keep it current as they happen;
 /// a slower poll refreshes what events don't carry, such as memory use.
+/// A sign-in the owner asked for: `what`, on `host`, or on this Mac.
+public struct SignInRequest: Hashable, Sendable {
+    public var host: String?
+    public var what: SignInWhat
+    /// Each click is a new one, even for the same thing.
+    public var attempt = UUID()
+
+    public init(host: String? = nil, what: SignInWhat) {
+        self.host = host
+        self.what = what
+    }
+}
+
 @MainActor
 public final class MenuModel: ObservableObject {
     public enum Connection: Equatable, Sendable {
@@ -450,6 +463,9 @@ public final class MenuModel: ObservableObject {
         await refresh()
         return installed
     }
+
+    /// What the sign-in window is for: `what`, on `host` or on this Mac.
+    @Published public var signInRequest: SignInRequest?
 
     /// The one button for what a Linux host needs sudo for: a Terminal over ssh,
     /// where sudo asks for its password. VibeOS never sees the password.

@@ -1,0 +1,25 @@
+{
+  "description": "Giving up on it ends the flow.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 9963,
+    "method": "signin.cancel",
+    "params": {
+      "host": "local",
+      "id": "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf"
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 9963,
+    "result": {
+      "asks_for_code": false,
+      "host": "local",
+      "id": "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf",
+      "opens_itself": false,
+      "seq": 1,
+      "state": "cancelled",
+      "what": "github"
+    }
+  }
+}

@@ -417,6 +417,7 @@ impl Store {
                         .filter_map(|n| n.parse().ok())
                         .collect(),
                     upgrade_error: None,
+                    sign_ins: Vec::new(),
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
@@ -1612,6 +1613,7 @@ mod tests {
                 memory: None,
                 needs_admin: vec![],
                 upgrade_error: None,
+                sign_ins: vec![],
             }]
         );
         assert!(s.has_host("local").unwrap());
@@ -1640,6 +1642,7 @@ mod tests {
             memory: None,
             needs_admin: vec![],
             upgrade_error: None,
+            sign_ins: vec![],
         }
     }
 

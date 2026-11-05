@@ -26,6 +26,7 @@ enum WindowID {
     static let newAgent = "new-agent"
     static let settings = "settings"
     static let addHost = "add-linux-host"
+    static let signIn = "sign-in"
 }
 
 /// The menu bar app: UI only, holding no state. Everything it shows comes
@@ -61,6 +62,12 @@ struct VibeOSApp: App {
 
         Window("Add Linux Host", id: WindowID.addHost) {
             AddHostView(model: model)
+        }
+        .windowResizability(.contentSize)
+        .defaultLaunchBehavior(.suppressed)
+
+        Window("Sign In", id: WindowID.signIn) {
+            SignInView(model: model)
         }
         .windowResizability(.contentSize)
         .defaultLaunchBehavior(.suppressed)

@@ -325,14 +325,14 @@ public final class FixtureDaemon: DaemonConnection, @unchecked Sendable {
             return [
                 check(
                     .git, .fail, "git needs Apple's Command Line Tools, which aren't installed.",
-                    hint: "Install Apple's Command Line Tools: run `xcode-select --install` in Terminal."),
+                    hint: "It takes Apple's Command Line Tools, and VibeOS's setup has a button for them."),
                 check(
                     .gh, .fail, "GitHub's gh isn't installed.",
-                    hint: "Install gh from https://cli.github.com, then run `gh auth login` in Terminal."),
+                    hint: "VibeOS installs it by itself."),
                 check(.ghGit, .optional, "VibeOS has git use gh for GitHub as soon as gh is logged in."),
                 check(
                     .claude, .fail, "claude isn't on your login shell's PATH.",
-                    hint: "Install Claude Code (claude.com/claude-code), then check `claude` runs in Terminal."),
+                    hint: "VibeOS installs it by itself."),
                 check(
                     .claudeLogin, .fail, "Claude Code can sign in once it's installed.",
                     hint: "Install Claude Code first."),

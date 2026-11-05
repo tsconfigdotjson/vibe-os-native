@@ -283,6 +283,10 @@ pub trait ToolboxHost: Send + Sync + fmt::Debug {
     /// The logins the newest Linux home holds, as noted when it was saved,
     /// and whether linux agents have a Claude login. Boots nothing.
     fn logins(&self) -> ToolboxLogins;
+    /// Gives the Linux home `token`, a login to GitHub got by the owner's own browser
+    /// sign-in, by `gh`'s own way of being given one, and keeps the next version of
+    /// it. The template stays as it is.
+    fn log_in_to_github(&self, token: &str) -> Result<Saved>;
 }
 
 /// The toolbox in a VM, on `vibe-vm` and `vibe-guest`.
@@ -1266,6 +1270,85 @@ impl ToolboxHost for Toolbox {
             template: Some(template?),
             home: None,
             uncovered,
+        })
+    }
+
+    fn log_in_to_github(&self, token: &str) -> Result<Saved> {
+        let _busy = self.take()?;
+        if self.machine.running(&self.socket()) || self.opened().is_some() {
+            return Err(err(
+                "the toolbox shell is open: exit it first, and you can sign in from here",
+            ));
+        }
+        self.refuse_if_unsaved("sign-in")?;
+        remove_file(&self.run_log())?;
+        let host = self.host_limits()?;
+        let base = self.current_base()?;
+        let source = |kind: Kind| match self.images.newest_of(kind) {
+            Some((_, path)) => Source::Clone(path),
+            None => Source::Blank(host.vm_disk),
+        };
+        let plan = Plan {
+            layers: self.managed_layer(),
+            template: Some(source(Kind::Template)),
+            home: Some(source(Kind::Home)),
+            claude: false,
+            base,
+        };
+        let result = (|| -> Result<u32> {
+            self.boot(&plan, &host)?;
+            let ran = self.machine.run(
+                &self.socket(),
+                &proto::Run {
+                    command: vec![
+                        "/bin/bash".into(),
+                        "-c".into(),
+                        "printf %s \"$VIBE_GH_TOKEN\" | gh auth login --hostname github.com \
+                         --with-token && gh auth setup-git --hostname github.com"
+                            .into(),
+                    ],
+                    env: [("VIBE_GH_TOKEN".to_owned(), token.to_owned())]
+                        .into_iter()
+                        .collect(),
+                    cwd: Some(GUEST_HOME.into()),
+                    timeout_ms: LOGINS_TIMEOUT.as_millis() as u64 * 12,
+                },
+            )?;
+            if ran.code != Some(0) {
+                return Err(err(format!(
+                    "gh in the toolbox wouldn't take it: {}",
+                    output_tail(&ran.output)
+                )));
+            }
+            let logins = self
+                .run(
+                    "the look at the Linux home's logins",
+                    vec![
+                        "/bin/bash".into(),
+                        "-c".into(),
+                        LOGINS.into(),
+                        "logins".into(),
+                        GUEST_HOME.into(),
+                    ],
+                    LOGINS_TIMEOUT,
+                )
+                .map(|out| parse_logins(&out))
+                .ok();
+            self.seal_and_power_off(&["template", "home"])?;
+            let (home, _) = self
+                .images
+                .keep_home(&self.working(Kind::Home), logins.as_deref())?;
+            Ok(home)
+        })();
+        match &result {
+            Ok(_) => self.clean()?,
+            Err(_) => {
+                let _ = self.stop_and_clean();
+            }
+        }
+        Ok(Saved {
+            home: Some(result.map_err(|e| err(format!("{e}; nothing was kept")))?),
+            ..Saved::default()
         })
     }
 

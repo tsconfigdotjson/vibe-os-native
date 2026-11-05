@@ -1,0 +1,26 @@
+{
+  "description": "The code a page showed. Never logged, nor kept.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 9962,
+    "method": "signin.answer",
+    "params": {
+      "host": "local",
+      "id": "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf",
+      "value": "abc123"
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 9962,
+    "result": {
+      "asks_for_code": false,
+      "host": "local",
+      "id": "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf",
+      "opens_itself": false,
+      "seq": 0,
+      "state": "running",
+      "what": "github"
+    }
+  }
+}

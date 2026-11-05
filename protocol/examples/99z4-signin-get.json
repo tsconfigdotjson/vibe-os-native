@@ -1,0 +1,26 @@
+{
+  "description": "How it stands, once it's moved on from `seen`, or after a while if it hasn't.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 9961,
+    "method": "signin.get",
+    "params": {
+      "host": "local",
+      "id": "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf",
+      "seen": 1
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 9961,
+    "result": {
+      "asks_for_code": false,
+      "host": "local",
+      "id": "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf",
+      "opens_itself": false,
+      "seq": 0,
+      "state": "running",
+      "what": "github"
+    }
+  }
+}

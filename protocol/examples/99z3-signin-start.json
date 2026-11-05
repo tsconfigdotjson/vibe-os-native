@@ -1,0 +1,25 @@
+{
+  "description": "The one click for a sign-in: vibed runs the provider's own flow on the host that's to have the login. `gh auth login --web` or `claude auth login` says what it wants: `url` is the page to open on the Mac, `code` is what to enter there, and `asks_for_code` means the page shows a code to bring back. Here it hasn't said anything yet.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 9960,
+    "method": "signin.start",
+    "params": {
+      "host": "local",
+      "what": "github"
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 9960,
+    "result": {
+      "asks_for_code": false,
+      "host": "local",
+      "id": "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf",
+      "opens_itself": false,
+      "seq": 0,
+      "state": "running",
+      "what": "github"
+    }
+  }
+}

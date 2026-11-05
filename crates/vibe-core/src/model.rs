@@ -404,11 +404,29 @@ names! {
 }
 
 names! {
+    /// What can be signed in to from the app: `github` and `claude`, on the host that's
+    /// to have the login; `toolbox_github` and `toolbox_claude`, for a Mac's linux
+    /// agents.
+    SignInWhat {
+        Github = "github",
+        Claude = "claude",
+        ToolboxGithub = "toolbox_github",
+        ToolboxClaude = "toolbox_claude",
+    }
+}
+
+names! {
+    /// How a sign-in stands.
+    SignInState { Running = "running", Done = "done", Failed = "failed", Cancelled = "cancelled" }
+}
+
+names! {
     /// What a Linux host needs someone with `sudo` there to allow, once, because
     /// VibeOS tried every way it has without a password and none worked:
     /// `linger`, `vibed` staying up while the owner's logged out; `port_443`,
-    /// the external address's port.
-    AdminNeed { Linger = "linger", Port443 = "port_443" }
+    /// the external address's port; `git`, which agents can't do without and only a
+    /// package manager can install.
+    AdminNeed { Linger = "linger", Port443 = "port_443", Git = "git" }
 }
 
 names! {

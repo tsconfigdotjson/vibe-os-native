@@ -271,13 +271,13 @@ impl Macos {
         let path = self.path();
         let legacy = self.home.join(".claude/local");
         std::env::split_paths(&path)
-            .chain([legacy])
+            .chain([self.home.join(".local/bin"), legacy])
             .map(|d| d.join("claude"))
             .find(|c| is_executable(c))
             .ok_or_else(|| {
                 EnvError::new(format!(
                     "can't find claude for macos agents: it isn't on your login shell's PATH \
-                     ({path}). Install Claude Code, or check `claude` runs in Terminal"
+                     ({path}). VibeOS installs it by itself: try again in a moment"
                 ))
             })
     }
