@@ -187,6 +187,7 @@ struct GlyphSheet: View {
                 BrandMark(lit: 3, size: 72)
                 BrandMark(lit: 0, size: 72)
                 BrandMark(lit: 3, size: 72, night: false)
+                AppMark(size: 72)
             }
             Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 8) {
                 GridRow {
