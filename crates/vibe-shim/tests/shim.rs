@@ -2,6 +2,7 @@
 
 use std::io::{self, Read};
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -52,7 +53,36 @@ impl Shim {
 
     fn start_with(extra: &[&str], command: &[&str]) -> Shim {
         let dir = tmp();
-        let out = shim_command(dir.path(), extra, command).output().unwrap();
+        let cmd = shim_command(dir.path(), extra, command);
+        Shim::launched(dir, cmd)
+    }
+
+    /// As [`Shim::start`], allowed `files` descriptors, its command too.
+    fn start_limited(files: libc::rlim_t, command: &[&str]) -> Shim {
+        let dir = tmp();
+        let mut cmd = shim_command(dir.path(), &[], command);
+        // SAFETY: only setrlimit, which is async-signal-safe, after the fork.
+        unsafe {
+            cmd.pre_exec(move || {
+                let mut limit = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                limit.rlim_cur = files;
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        Shim::launched(dir, cmd)
+    }
+
+    fn launched(dir: tempfile::TempDir, mut cmd: Command) -> Shim {
+        let out = cmd.output().unwrap();
         assert!(
             out.status.success(),
             "vibe-shim failed: {}",
@@ -386,6 +416,105 @@ fn a_flood_of_output_doesnt_hold_up_requests() {
         started.elapsed()
     );
     drop(stalled);
+}
+
+/// A command that's told the test it has set its terminal raw, then stops, so
+/// nothing reads its input until the test says.
+fn stopped_on_a_raw_terminal(then: &str) -> Vec<String> {
+    ["sh", "-c"]
+        .map(String::from)
+        .into_iter()
+        .chain([format!("stty raw -echo; echo ready; kill -STOP $$; {then}")])
+        .collect()
+}
+
+/// Lets a command from [`stopped_on_a_raw_terminal`] go on, once it has stopped.
+fn carry_on(shim: &Shim) {
+    let pid = shim.control().status().unwrap().child_pid.to_string();
+    wait_until("the command to stop", || {
+        Command::new("ps")
+            .args(["-o", "state=", "-p", &pid])
+            .output()
+            .is_ok_and(|out| out.stdout.starts_with(b"T"))
+    });
+    // SAFETY: a signal to the command this test started.
+    unsafe { libc::kill(pid.parse().unwrap(), libc::SIGCONT) };
+}
+
+/// A paste comes in as `vibe attach` reads it from a terminal, 4 KB at a time,
+/// and it all waits for a command that's busy. What's been read makes room again:
+/// the two together are more than may wait at once.
+#[test]
+fn a_big_paste_waits_for_a_command_that_isnt_reading() {
+    const PASTE: usize = 20 << 20;
+    let read = format!("head -c {PASTE} | wc -c");
+    let command = stopped_on_a_raw_terminal(&format!("{read}; {read}"));
+    let command: Vec<&str> = command.iter().map(String::as_str).collect();
+    let shim = Shim::start(&command);
+    let mut a = shim.attach(None);
+    a.expect("ready");
+    for _ in 0..PASTE / 4096 {
+        a.send(FrameKind::Input, &[b'x'; 4096]);
+    }
+    carry_on(&shim);
+    a.expect(&PASTE.to_string());
+    a.clear();
+    for _ in 0..PASTE / 4096 {
+        a.send(FrameKind::Input, &[b'x'; 4096]);
+    }
+    a.expect(&PASTE.to_string());
+    assert!(!shim.log().contains("input"), "{}", shim.log());
+}
+
+/// There's a limit to what waits, and past it what's lost is said once, with how
+/// much, however many chunks it comes to.
+#[test]
+fn input_past_the_limit_is_dropped_and_said_so_once() {
+    let command = stopped_on_a_raw_terminal("cat >/dev/null");
+    let command: Vec<&str> = command.iter().map(String::as_str).collect();
+    let shim = Shim::start(&command);
+    let mut a = shim.attach(None);
+    a.expect("ready");
+    let chunk = vec![b'x'; 1 << 20];
+    for _ in 0..40 {
+        a.send(FrameKind::Input, &chunk);
+    }
+    wait_until("the drop to be logged", || {
+        shim.log().contains("isn't reading its input")
+    });
+    // Something small still fits, and ends the run of drops.
+    wait_until("the total to be logged", || {
+        a.send(FrameKind::Input, b"x");
+        std::thread::sleep(Duration::from_millis(20));
+        shim.log().contains("bytes of input")
+    });
+    let log = shim.log();
+    assert_eq!(log.matches("isn't reading its input").count(), 1, "{log}");
+    assert_eq!(log.matches("bytes of input").count(), 1, "{log}");
+}
+
+/// A shim out of descriptors can't take on clients, and its listener stays ready
+/// to fail again; the ones it has go on seeing the command's output.
+#[test]
+fn running_out_of_descriptors_doesnt_stop_the_output() {
+    let shim = Shim::start_limited(32, &["sh"]);
+    let mut a = shim.attach(None);
+    let hello = Frame::json(FrameKind::Hello, &control_hello("test"));
+    let mut waiting = Vec::new();
+    for _ in 0..64 {
+        let mut stream = UnixStream::connect(&shim.socket).unwrap();
+        shim::write_frame(&mut stream, &hello).unwrap();
+        waiting.push(stream);
+    }
+    wait_until("the descriptors to run out", || {
+        shim.log().contains("accept failed")
+    });
+    a.type_line("echo answer-$((40 + 2))");
+    a.expect("answer-42");
+
+    // And when there are descriptors again, it takes on clients again.
+    drop(waiting);
+    assert_eq!(shim.control().status().unwrap().clients.len(), 1);
 }
 
 /// Asks the shell its terminal's size, through client `via`.

@@ -78,9 +78,10 @@ impl Conn {
         Conn { id, client, stream }
     }
 
-    /// Sends a frame whole within [`SEND_TIMEOUT`], or fails: output and
-    /// the state wait on it, so a shim that drains slowly is as gone as one
-    /// that stopped. Each write blocks at most the socket's send timeout.
+    /// Sends a frame whole, or fails once it's been [`SEND_TIMEOUT`] at it, plus
+    /// the write under way, which blocks at most the socket's send timeout.
+    /// Output and the state wait on it, so a shim that takes that long over a
+    /// frame is as gone as one that stopped.
     fn send(&self, frame: &Frame) -> io::Result<()> {
         let bytes = frame.encode();
         let deadline = Instant::now() + SEND_TIMEOUT;
@@ -95,7 +96,13 @@ impl Conn {
             match (&self.stream).write(&bytes[sent..]) {
                 Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
                 Ok(n) => sent += n,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                // `WouldBlock` is the socket's send timeout, with nothing
+                // taken: only the deadline says the shim has gone.
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                    ) => {}
                 Err(e) => return Err(e),
             }
         }
@@ -421,7 +428,7 @@ impl Agent {
         s.screen.process(bytes);
         // Written with the lock held, so output, a redraw and the exit
         // reach the shim in order. A shim that stops reading is dropped
-        // after the socket's send timeout.
+        // after `SEND_TIMEOUT`.
         if let Some(conn) = s.conn.clone()
             && let Err(e) = conn.send_output(bytes)
         {
