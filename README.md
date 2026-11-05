@@ -106,9 +106,9 @@ API key, and the Mac keeps an SSH tunnel to it, so nothing opens on the Mac.
 target/debug/vibe host external vps vps.example.com   # or Settings → Hosts → Use as External Address
 ```
 
-The server gets its certificate from Let's Encrypt on port 443, which
-`vibed`, running as you, may use once the server allows it (as root:
-`echo 'net.ipv4.ip_unprivileged_port_start=443' | sudo tee /etc/sysctl.d/60-vibeos.conf && sudo sysctl --system`).
+The server gets its certificate from Let's Encrypt on port 443. `vibed`, running
+as you, gets that port by itself with passwordless `sudo`; otherwise **Allow…** in
+Settings → Hosts asks for the server's password once. Nothing's run by hand.
 
 `VIBE_SOCKET` (or `--socket`) points `vibed`, `vibe` and the app at another
 socket. The app's rows attach Terminal with `/usr/local/bin/vibe`, or

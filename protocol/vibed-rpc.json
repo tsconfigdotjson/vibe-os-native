@@ -107,7 +107,7 @@
     "ToolboxAction": ["shell", "update", "rebuild"],
     "LoginTool": ["gh", "gcloud", "git", "ssh"],
     "CheckId": ["git", "gh", "gh_git", "claude", "claude_login", "power", "linger", "tailscale", "linux", "pi"],
-    "AdminNeed": ["linger"],
+    "AdminNeed": ["linger", "port_443"],
     "CheckState": ["pass", "fail", "optional", "working"],
     "MessageRole": ["user", "assistant", "tool"]
   },

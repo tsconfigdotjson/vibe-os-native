@@ -308,6 +308,15 @@ async fn world(limits: Limits) -> World {
 
 /// [`world`], with the Mac's link and tunnel timed by `timing`.
 async fn world_timed(limits: Limits, timing: Timing) -> World {
+    world_external(limits, timing, |_| {}).await
+}
+
+/// [`world_timed`], with how the host serves it changed by `change`.
+async fn world_external(
+    limits: Limits,
+    timing: Timing,
+    change: impl FnOnce(&mut ExternalConfig),
+) -> World {
     let wires = Wires::new();
     let mac_world = Golden::new();
     let mut config = mac_world.config();
@@ -324,7 +333,7 @@ async fn world_timed(limits: Limits, timing: Timing) -> World {
     let (cert_pem, key_pem, cert) = certificate(certs.path());
     let port = free_port();
     let host_world = Golden::new();
-    let external = ExternalConfig {
+    let mut external = ExternalConfig {
         serve_here: true,
         port,
         // Loopback only: the tests open nothing to the network.
@@ -334,6 +343,7 @@ async fn world_timed(limits: Limits, timing: Timing) -> World {
         limits,
         ..ExternalConfig::default()
     };
+    change(&mut external);
     let (host, server) = open_host(&host_world, &external, &wires).await;
     let w = World {
         mac,
@@ -478,7 +488,8 @@ impl World {
         }
     }
 
-    async fn turn_on(&self) {
+    /// Turns it on, and says nothing of how that goes.
+    async fn ask_for_it(&self) {
         let on = rpc(
             &self.mac,
             "hosts.external",
@@ -487,6 +498,10 @@ impl World {
         .await;
         assert_eq!(on["result"]["external"], true, "{on}");
         assert_eq!(on["result"]["url"], format!("https://{DOMAIN}/mcp"));
+    }
+
+    async fn turn_on(&self) {
+        self.ask_for_it().await;
         self.wait("the tunnel", |h| h.tunnel == Some(TunnelState::Up))
             .await;
     }
@@ -1987,4 +2002,173 @@ async fn the_challenge_handshake_gets_the_challenge_and_nothing_else() {
         .connect(ServerName::try_from("other.test").unwrap(), tcp)
         .await;
     assert!(r.is_err());
+}
+
+/// #74: port 443 with nothing run by hand. A kernel that keeps the port from `vibed`
+/// is got round by the root-owned helper; these use the real helper, on a port of
+/// the test's, with the kernel's refusal stood in for.
+#[cfg(target_os = "linux")]
+mod port_443 {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use vibe_core::model::AdminNeed;
+    use vibe_core::rpc::HostNameParams;
+
+    /// `sudo` for these, in a directory first on a `PATH`.
+    fn sudo(dir: &std::path::Path, body: &str) -> std::ffi::OsString {
+        let script = dir.join("sudo");
+        fs::write(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        format!("{}:/usr/bin:/bin", dir.display()).into()
+    }
+
+    async fn served(w: &World) -> u16 {
+        w.client("vk_wrong")
+            .request("tools/list", json!({}))
+            .await
+            .status
+    }
+
+    #[tokio::test]
+    async fn a_helper_in_place_serves_the_port_with_nobody_asked() {
+        let helper = common::workspace_bin("vibe-bind");
+        let w = world_external(Limits::default(), quick(), |e| {
+            e.deny_direct = true;
+            e.listen = None;
+            e.bind_helper = helper;
+        })
+        .await;
+        w.turn_on().await;
+        w.wait("nothing wrong", |h| {
+            h.external_detail.is_none() && h.needs_admin.is_empty()
+        })
+        .await;
+        assert_eq!(served(&w).await, 401);
+    }
+
+    #[tokio::test]
+    async fn passwordless_sudo_puts_it_in_place_with_nobody_asked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let installed = tmp.path().join("lib/vibe-bind-1");
+        let log = tmp.path().join("sudo-log");
+        // As `sudo -n sh -c <grant> sh <source> <group> <sum> <helper>` does, but as
+        // this user: only ever asked with `-n`, and holding it to nothing.
+        let path = sudo(
+            tmp.path(),
+            &format!(
+                "echo \"$1 $2\" >> {log}\n[ \"$1\" = -n ] || exit 9\nshift\ncase \"$5\" in *vibe-bind*) \
+                 mkdir -p \"$(dirname \"$8\")\" && cp \"$5\" \"$8\" ;; esac\nexit 0",
+                log = log.display()
+            ),
+        );
+        let (source, target) = (common::workspace_bin("vibe-bind"), installed.clone());
+        let w = world_external(Limits::default(), quick(), |e| {
+            e.deny_direct = true;
+            e.listen = None;
+            e.bind_helper = target;
+            e.bind_source = Some(source);
+            e.bind_path = Some(path);
+        })
+        .await;
+        w.turn_on().await;
+        w.wait("nothing wrong", |h| {
+            h.external_detail.is_none() && h.needs_admin.is_empty()
+        })
+        .await;
+        assert!(installed.is_file());
+        assert_eq!(served(&w).await, 401);
+    }
+
+    #[tokio::test]
+    async fn refused_everywhere_it_takes_one_button_and_then_just_works() {
+        let tmp = tempfile::tempdir().unwrap();
+        let installed = tmp.path().join("lib/vibe-bind-1");
+        let log = tmp.path().join("sudo-log");
+        let path = sudo(
+            tmp.path(),
+            &format!(
+                "printf '%s\\n' \"$1\" >> {log}\necho 'sudo: a password is required' >&2\nexit 1",
+                log = log.display()
+            ),
+        );
+        let (source, target) = (common::workspace_bin("vibe-bind"), installed.clone());
+        let helper = source.clone();
+        let w = world_external(Limits::default(), quick(), |e| {
+            e.deny_direct = true;
+            e.listen = None;
+            e.bind_helper = target;
+            e.bind_source = Some(source);
+            e.bind_path = Some(path);
+        })
+        .await;
+        w.ask_for_it().await;
+        w.wait("the need to reach the Mac", |h| {
+            h.needs_admin == [AdminNeed::Port443]
+        })
+        .await;
+        let detail = w.vps().external_detail.unwrap();
+        assert!(detail.contains("Allow…"), "{detail}");
+        assert!(!detail.contains("sysctl"), "{detail}");
+        // A button, from what the Mac knows.
+        let line = w
+            .mac
+            .host_admin(HostNameParams { host: "vps".into() })
+            .unwrap()
+            .command;
+        assert!(line.contains("ssh -t me@vps.example.com"), "{line}");
+        assert!(line.ends_with(" | base64 -d | sh'"), "{line}");
+        // sudo was tried once, however long it's been waiting, and a refusal is no
+        // reason to try the wider way.
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        let tries = fs::read_to_string(&log).unwrap();
+        assert_eq!(tries.lines().collect::<Vec<_>>(), ["-n"], "{tries}");
+
+        // The button's been pressed: it's in place. Nobody else does anything.
+        fs::create_dir_all(installed.parent().unwrap()).unwrap();
+        fs::copy(helper, &installed).unwrap();
+        w.wait("the port", |h| {
+            h.external_detail.is_none() && h.needs_admin.is_empty()
+        })
+        .await;
+        assert_eq!(served(&w).await, 401);
+    }
+
+    #[tokio::test]
+    async fn another_program_on_the_port_is_no_use_of_the_button() {
+        let holder = std::net::TcpListener::bind(("::", 0))
+            .or_else(|_| std::net::TcpListener::bind(("0.0.0.0", 0)))
+            .unwrap();
+        let port = holder.local_addr().unwrap().port();
+        // No helper yet, and the kernel refusing as it does a port that's taken: it
+        // still isn't sudo's to help, and sudo isn't asked.
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("sudo-log");
+        let path = sudo(
+            tmp.path(),
+            &format!("printf x >> {}\nexit 1", log.display()),
+        );
+        let (nowhere, source) = (
+            tmp.path().join("no-helper"),
+            common::workspace_bin("vibe-bind"),
+        );
+        let w = world_external(Limits::default(), quick(), |e| {
+            e.deny_direct = true;
+            e.listen = None;
+            e.port = port;
+            e.bind_helper = nowhere;
+            e.bind_source = Some(source);
+            e.bind_path = Some(path);
+        })
+        .await;
+        w.ask_for_it().await;
+        w.wait("what's wrong", |h| {
+            h.external_detail
+                .as_deref()
+                .is_some_and(|d| d.contains("another program"))
+        })
+        .await;
+        assert_eq!(w.vps().needs_admin, []);
+        assert!(!log.exists(), "sudo was asked");
+    }
 }

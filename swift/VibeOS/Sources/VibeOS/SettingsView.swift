@@ -1343,6 +1343,7 @@ private func adminNeedsText(_ needs: [AdminNeed], host: String) -> String {
     let what = needs.map { need -> String in
         switch need {
         case .linger: "keep vibed running while you're logged out"
+        case .port443: "serve the external address on port 443"
         }
     }
     return "\(host) needs your password once to \(what.joined(separator: " and "))"

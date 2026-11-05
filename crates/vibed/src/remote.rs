@@ -42,7 +42,7 @@ pub const HOST_VIBE: &str = ".local/lib/vibeos/vibe";
 pub const HOST_ATTACH_VIBE: &str = HOST_VIBE;
 
 /// What an install puts on a Linux host, from the bundle for its CPU.
-pub const BINARIES: [&str; 3] = ["vibed", "vibe", "vibe-shim"];
+pub const BINARIES: [&str; 4] = ["vibed", "vibe", "vibe-shim", "vibe-bind"];
 
 /// The tools a Linux host's agents need, which the owner installs and logs
 /// in to on the server (PRD: Adding a Linux host).
@@ -115,22 +115,38 @@ pub trait Remote: Send + Sync + fmt::Debug {
     /// once it has stopped answering: the next command makes a new one.
     fn drop_shared(&self, _address: &str) {}
 
+    /// The SHA-256 of the build of `vibe-bind` this VibeOS installs, for each CPU a
+    /// host may have: `x86_64` and `aarch64`. What a root-owned copy of it is held to.
+    fn bind_sums(&self) -> Vec<(&'static str, String)> {
+        Vec::new()
+    }
+
     /// The command a terminal here runs to do what `needs` take on `address`, with
     /// `sudo` asking for its password there. What each takes is written here,
     /// never given by the host, and the password goes to `sudo` alone.
     fn admin_line(&self, address: &str, needs: &[AdminNeed]) -> String {
-        let mut steps: Vec<&str> = needs
-            .iter()
-            .map(|need| match need {
-                AdminNeed::Linger => "sudo loginctl enable-linger \"$(id -un)\"",
-            })
-            .collect();
-        steps.push("echo \"VibeOS: done. You can close this window.\"");
-        // Through `sh`, as the login shell there may be one that reads this otherwise.
+        let mut script = String::new();
+        for need in needs {
+            let step = match need {
+                AdminNeed::Linger => "sudo loginctl enable-linger \"$(id -un)\"\n".to_owned(),
+                AdminNeed::Port443 => port_443_step(&self.bind_sums()),
+            };
+            script.push_str(&format!(
+                "{{\n{step}}} || {{\n  echo \"VibeOS: that didn't work, for the reason above. Try \
+                 again from Settings when it's put right.\"\n  exit 1\n}}\n"
+            ));
+        }
+        script.push_str("echo \"VibeOS: done. You can close this window.\"\n");
+        // Encoded, and piped to `sh`, as the login shell there can be one that reads
+        // quotes and newlines otherwise, such as csh or fish. `sudo` asks on the
+        // terminal, not on this pipe.
         format!(
             "ssh -t {} {}",
             shell_quote(address),
-            shell_quote(&format!("sh -c {}", shell_quote(&steps.join(" && "))))
+            shell_quote(&format!(
+                "echo {} | base64 -d | sh",
+                base64(script.as_bytes())
+            ))
         )
     }
 
@@ -743,6 +759,19 @@ impl Default for Ssh {
 }
 
 impl Remote for Ssh {
+    fn bind_sums(&self) -> Vec<(&'static str, String)> {
+        let Some(bundle) = &self.bundle else {
+            return Vec::new();
+        };
+        ["x86_64", "aarch64"]
+            .into_iter()
+            .filter_map(|arch| {
+                let bytes = std::fs::read(bundle.join(arch).join(crate::bind_helper::SOURCE));
+                Some((arch, sha256_hex(&bytes.ok()?)))
+            })
+            .collect()
+    }
+
     fn dial<'a>(&'a self, address: &'a str) -> BoxFuture<'a, Result<Channel, String>> {
         self.dial_over(address, false)
     }
@@ -978,7 +1007,7 @@ echo "arch=$(uname -m)"
 echo "label=$(hostname 2>/dev/null || uname -n)"
 echo "home=$HOME"
 lib="$HOME/.local/lib/vibeos"
-for f in vibed vibe vibe-shim; do
+for f in vibed vibe vibe-shim vibe-bind; do
   if [ -f "$lib/$f" ] && command -v sha256sum >/dev/null 2>&1; then
     echo "sum.$f=$(sha256sum "$lib/$f" | cut -d ' ' -f 1)"
   fi
@@ -991,6 +1020,56 @@ fi
 login_path=$("${SHELL:-/bin/sh}" -lc 'printenv PATH' </dev/null 2>/dev/null | tail -n 1)
 echo "path=${login_path:-$PATH}"
 "#;
+
+/// `bytes` in standard base64: only letters, digits, `+`, `/` and `=`.
+fn base64(bytes: &[u8]) -> String {
+    const LETTERS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = chunk.iter().fold(0u32, |n, b| (n << 8) | u32::from(*b)) << (8 * (3 - chunk.len()));
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(LETTERS[(n >> (18 - 6 * i)) as usize & 63] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// What gets port 443 usable on a server, with `sudo`'s prompt: the helper, held to
+/// this VibeOS's own sum for the server's CPU. With no sum for it, it stops: nothing
+/// unchecked is made privileged, and that's no reason to go the wider way.
+fn port_443_step(sums: &[(&'static str, String)]) -> String {
+    let want = |arch: &str| {
+        sums.iter()
+            .find(|(a, _)| *a == arch)
+            .map_or("", |(_, sum)| sum.as_str())
+            .to_owned()
+    };
+    let grant = crate::bind_helper::grant_lines(
+        "sudo",
+        &format!("\"$HOME/{HOST_LIB}/{}\"", crate::bind_helper::SOURCE),
+        "\"$want\"",
+        std::path::Path::new(crate::bind_helper::HELPER),
+    );
+    format!(
+        "case \"$(uname -m)\" in\n\
+           x86_64|amd64) want={} ;;\n\
+           aarch64|arm64) want={} ;;\n\
+           *) want= ;;\n\
+         esac\n\
+         if [ -z \"$want\" ]; then\n\
+           echo \"This VibeOS has no build of vibe-bind for this server.\" >&2\n\
+           false\n\
+         else\n\
+           {grant}\
+         fi\n",
+        shell_quote(&want("x86_64")),
+        shell_quote(&want("aarch64")),
+    )
+}
 
 /// The `PATH` `vibed` runs with on the server: the owner's login shell's,
 /// where `claude` and `gh` are, with `~/.local/bin`, where Claude Code's
@@ -1238,6 +1317,55 @@ mod tests {
         assert_eq!(shell_quote(""), "''");
     }
 
+    /// A real shell here, and one standing in for the server's, with stand-ins for
+    /// `ssh` and `sudo`. Says what `sudo` was asked, and what came of it.
+    fn run_admin_line(line: &str, sudo_body: &str) -> (std::process::Output, String) {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let write = |name: &str, body: &str| {
+            let p = tmp.path().join(name);
+            std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        write("ssh", "shift 2\nexec /bin/sh -c \"$*\"");
+        write(
+            "sudo",
+            &format!(
+                "printf '%s\\n' \"$*\" >> {}/asked\n{sudo_body}",
+                tmp.path().display()
+            ),
+        );
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(line)
+            .env("PATH", format!("{}:/usr/bin:/bin", tmp.path().display()))
+            .output()
+            .unwrap();
+        let asked = std::fs::read_to_string(tmp.path().join("asked")).unwrap_or_default();
+        (out, asked)
+    }
+
+    #[test]
+    fn base64_is_what_base64_reads() {
+        for text in ["", "a", "ab", "abc", "abcd", "it's \"quoted\"\nand long"] {
+            let mut child = std::process::Command::new("base64")
+                .arg("-d")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(base64(text.as_bytes()).as_bytes())
+                .unwrap();
+            let out = child.wait_with_output().unwrap();
+            assert_eq!(String::from_utf8(out.stdout).unwrap(), text);
+        }
+    }
+
     #[test]
     fn an_admin_line_is_ssh_and_sudo_and_nothing_a_host_said() {
         let ssh = Ssh {
@@ -1246,34 +1374,22 @@ mod tests {
             shared: None,
         };
         let line = ssh.admin_line("me@vps", &[AdminNeed::Linger]);
-        assert!(line.starts_with("ssh -t me@vps 'sh -c "), "{line}");
+        let inner = line
+            .strip_prefix("ssh -t me@vps 'echo ")
+            .and_then(|l| l.strip_suffix(" | base64 -d | sh'"))
+            .unwrap_or_else(|| panic!("{line}"));
+        // What any login shell reads the same: no quotes or newlines of its own.
+        assert!(
+            inner
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "+/=".contains(c)),
+            "{inner}"
+        );
         // A destination with anything odd in it can't reach the shell here.
         let odd = ssh.admin_line("me@vps; rm -rf ~", &[AdminNeed::Linger]);
-        assert!(
-            odd.starts_with("ssh -t 'me@vps; rm -rf ~' 'sh -c "),
-            "{odd}"
-        );
+        assert!(odd.starts_with("ssh -t 'me@vps; rm -rf ~' 'echo "), "{odd}");
 
-        // Run for real, by a shell here and one standing in for the server's: sudo
-        // is asked for just that, for this user.
-        let tmp = tempfile::tempdir().unwrap();
-        let write = |name: &str, body: &str| {
-            use std::os::unix::fs::PermissionsExt;
-            let p = tmp.path().join(name);
-            std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
-        };
-        write("ssh", "shift 2\nexec /bin/sh -c \"$*\"");
-        write(
-            "sudo",
-            &format!("printf '%s\\n' \"$*\" > {}/asked", tmp.path().display()),
-        );
-        let out = std::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg(&line)
-            .env("PATH", format!("{}:/usr/bin:/bin", tmp.path().display()))
-            .output()
-            .unwrap();
+        let (out, asked) = run_admin_line(&line, "exit 0");
         assert!(out.status.success(), "{out:?}");
         assert!(String::from_utf8_lossy(&out.stdout).contains("VibeOS: done"));
         let me = String::from_utf8(
@@ -1284,10 +1400,61 @@ mod tests {
                 .stdout,
         )
         .unwrap();
-        assert_eq!(
-            std::fs::read_to_string(tmp.path().join("asked")).unwrap(),
-            format!("loginctl enable-linger {me}")
-        );
+        assert_eq!(asked, format!("loginctl enable-linger {me}"));
+
+        // Refused: not called done, and it fails.
+        let (out, _) = run_admin_line(&line, "exit 1");
+        assert!(!out.status.success(), "{out:?}");
+        let said = String::from_utf8_lossy(&out.stdout);
+        assert!(!said.contains("done"), "{said}");
+        assert!(said.contains("didn't work"), "{said}");
+    }
+
+    /// The port's step, on stand-ins: the helper first, with this CPU's sum, and
+    /// never the wider way for a `sudo` that refused or a CPU with no build.
+    #[test]
+    fn the_port_step_holds_the_helper_to_its_sum_and_goes_no_wider_than_it_must() {
+        struct Summed(Vec<(&'static str, String)>);
+        impl std::fmt::Debug for Summed {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("Summed")
+            }
+        }
+        impl Remote for Summed {
+            fn dial<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Result<Channel, String>> {
+                Box::pin(async { Err(String::new()) })
+            }
+            fn install<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Result<Installed, String>> {
+                Box::pin(async { Err(String::new()) })
+            }
+            fn bind_sums(&self) -> Vec<(&'static str, String)> {
+                self.0.clone()
+            }
+        }
+        let sums = vec![("x86_64", "a".repeat(64)), ("aarch64", "b".repeat(64))];
+        let line = Summed(sums).admin_line("me@vps", &[AdminNeed::Port443]);
+        let (out, asked) = run_admin_line(&line, "exit 1");
+        assert!(!out.status.success(), "{out:?}");
+        // Only the one try: not the fallback, for a password refused.
+        let mut lines = asked.split("\n").filter(|l| l.starts_with("sh -c "));
+        assert!(lines.next().is_some(), "{asked}");
+        assert!(lines.next().is_none(), "{asked}");
+        assert!(asked.contains("/.local/lib/vibeos/vibe-bind "), "{asked}");
+        let sum = if cfg!(target_arch = "x86_64") {
+            "a"
+        } else {
+            "b"
+        }
+        .repeat(64);
+        assert!(asked.contains(&sum), "{asked}");
+        assert!(asked.contains(crate::bind_helper::HELPER), "{asked}");
+
+        // No build for it: sudo isn't asked at all.
+        let bare = Summed(Vec::new()).admin_line("me@vps", &[AdminNeed::Port443]);
+        let (out, asked) = run_admin_line(&bare, "exit 0");
+        assert!(!out.status.success(), "{out:?}");
+        assert_eq!(asked, "");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("no build of vibe-bind"));
     }
 
     #[test]

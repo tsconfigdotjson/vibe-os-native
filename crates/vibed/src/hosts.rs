@@ -223,6 +223,9 @@ impl Core {
         if self.checks.linger() == Ok(Some(false)) {
             needs.push(AdminNeed::Linger);
         }
+        if self.port_denied() {
+            needs.push(AdminNeed::Port443);
+        }
         needs
     }
 

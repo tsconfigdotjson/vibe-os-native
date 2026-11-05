@@ -576,9 +576,10 @@ public enum CheckId: String, Codable, CaseIterable, Hashable, Sendable {
 
 /// What a Linux host needs someone with sudo there to allow, once, as VibeOS
 /// tried every way it has without a password: `linger`, vibed staying up while
-/// the owner's logged out.
+/// the owner's logged out; `port443`, the external address's port.
 public enum AdminNeed: String, Codable, CaseIterable, Hashable, Sendable {
     case linger
+    case port443 = "port_443"
 }
 
 /// How a doctor check went: `pass`; `fail`, which needs the owner;

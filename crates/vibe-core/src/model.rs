@@ -387,8 +387,9 @@ names! {
 names! {
     /// What a Linux host needs someone with `sudo` there to allow, once, because
     /// VibeOS tried every way it has without a password and none worked:
-    /// `linger`, `vibed` staying up while the owner's logged out.
-    AdminNeed { Linger = "linger" }
+    /// `linger`, `vibed` staying up while the owner's logged out; `port_443`,
+    /// the external address's port.
+    AdminNeed { Linger = "linger", Port443 = "port_443" }
 }
 
 names! {

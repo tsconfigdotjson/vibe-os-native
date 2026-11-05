@@ -12,7 +12,7 @@
     "jsonrpc": "2.0",
     "id": 9951,
     "result": {
-      "command": "ssh -t refuses@strict.example.com 'sh -c '\\''sudo loginctl enable-linger \"$(id -un)\" && echo \"VibeOS: done. You can close this window.\"'\\'''"
+      "command": "ssh -t refuses@strict.example.com 'echo ewpzdWRvIGxvZ2luY3RsIGVuYWJsZS1saW5nZXIgIiQoaWQgLXVuKSIKfSB8fCB7CiAgZWNobyAiVmliZU9TOiB0aGF0IGRpZG4ndCB3b3JrLCBmb3IgdGhlIHJlYXNvbiBhYm92ZS4gVHJ5IGFnYWluIGZyb20gU2V0dGluZ3Mgd2hlbiBpdCdzIHB1dCByaWdodC4iCiAgZXhpdCAxCn0KZWNobyAiVmliZU9TOiBkb25lLiBZb3UgY2FuIGNsb3NlIHRoaXMgd2luZG93LiIK | base64 -d | sh'"
     }
   }
 }

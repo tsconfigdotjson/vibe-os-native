@@ -1202,10 +1202,10 @@ async fn what_a_host_needs_sudo_for_is_one_line_from_the_mac_and_goes_when_its_d
     let params = || HostNameParams { host: "vps".into() };
     let line = w.mac.host_admin(params()).unwrap().command;
     assert!(
-        line.starts_with("ssh -t me@vps.example.com 'sh -c "),
+        line.starts_with("ssh -t me@vps.example.com 'echo "),
         "{line}"
     );
-    assert!(line.contains("sudo loginctl enable-linger"), "{line}");
+    assert!(line.ends_with(" | base64 -d | sh'"), "{line}");
 
     // The host's doctor asks nothing the host could do, and names the button.
     let report = w.host.doctor().await;

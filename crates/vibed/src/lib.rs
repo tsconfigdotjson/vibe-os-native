@@ -3,6 +3,7 @@
 
 pub mod acme;
 pub mod agents;
+pub mod bind_helper;
 pub mod core;
 pub mod dispatch;
 pub mod doctor;
