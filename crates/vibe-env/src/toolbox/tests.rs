@@ -904,6 +904,240 @@ fn a_github_login_takes_an_ssh_origin_over_https_with_it() {
     );
 }
 
+/// A Linux home of its own, with the real git and a stand-in for `gh` that's signed in
+/// or not, and writes what the real one's `setup-git` does.
+struct GuestHome {
+    dir: tempfile::TempDir,
+    path: String,
+}
+
+impl GuestHome {
+    fn new(signed_in: bool) -> GuestHome {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        let gh = bin.join("gh");
+        let token = if signed_in {
+            "echo gho_secret"
+        } else {
+            "exit 1"
+        };
+        fs::write(
+            &gh,
+            format!(
+                "#!/bin/sh\necho \"$*\" >>\"$HOME/gh-calls\"\ncase \"$2\" in\n\
+                 token) {token} ;;\n\
+                 setup-git) git config --global --add credential.https://github.com.helper '' &&\n\
+                 git config --global --add credential.https://github.com.helper '!gh auth git-credential' ;;\n\
+                 esac\n"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        GuestHome { dir, path }
+    }
+
+    fn command(&self, program: &str) -> std::process::Command {
+        let mut c = std::process::Command::new(program);
+        c.current_dir(self.dir.path())
+            .env("HOME", self.dir.path())
+            .env("PATH", &self.path)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("GIT_CONFIG_GLOBAL")
+            .stdin(std::process::Stdio::null());
+        c
+    }
+
+    fn see_to_github(&self) {
+        let out = self
+            .command("bash")
+            .args(["-c", GITHUB_OVER_HTTPS])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        assert!(
+            !String::from_utf8_lossy(&out.stdout).contains("gho_secret"),
+            "the login isn't said"
+        );
+    }
+
+    fn git(&self, args: &[&str]) -> String {
+        let out = self.command("git").args(args).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    }
+
+    fn url_of(&self, origin: &str) -> String {
+        self.git(&["ls-remote", "--get-url", origin])
+    }
+
+    fn gets_https(&self) -> bool {
+        self.url_of("git@github.com:me/web.git") == "https://github.com/me/web.git"
+            && self.url_of("ssh://git@github.com/me/web.git") == "https://github.com/me/web.git"
+    }
+
+    fn config(&self) -> Option<String> {
+        fs::read_to_string(self.dir.path().join(".gitconfig")).ok()
+    }
+
+    fn file(&self, name: &str) {
+        let path = self.dir.path().join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, "x").unwrap();
+    }
+}
+
+#[test]
+fn a_home_signed_in_by_hand_reaches_github_as_a_button_one_does() {
+    let home = GuestHome::new(true);
+    home.see_to_github();
+    assert!(home.gets_https());
+    assert_eq!(
+        home.git(&[
+            "config",
+            "--global",
+            "--get-all",
+            "credential.https://github.com.helper",
+        ])
+        .lines()
+        .last(),
+        Some("!gh auth git-credential"),
+        "and git has the login to push with"
+    );
+    // Another host's isn't GitHub's to answer for, nor an HTTPS `origin` to change.
+    assert_eq!(
+        home.url_of("git@gitlab.com:me/web.git"),
+        "git@gitlab.com:me/web.git"
+    );
+    assert_eq!(
+        home.url_of("https://github.com/me/web.git"),
+        "https://github.com/me/web.git"
+    );
+    // Each launch finds it done, and writes nothing.
+    let once = home.config();
+    fs::remove_file(home.dir.path().join("gh-calls")).unwrap();
+    home.see_to_github();
+    assert_eq!(home.config(), once);
+    assert!(!home.dir.path().join("gh-calls").exists(), "nor asks gh");
+}
+
+#[test]
+fn what_seeing_to_github_finds_of_the_owners_stays() {
+    // A home the button signed in has it all already.
+    let button = GuestHome::new(true);
+    let status = button
+        .command("bash")
+        .args(["-c", GH_LOGIN])
+        .env("VIBE_GH_TOKEN", "gho_secret")
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let once = button.config();
+    button.see_to_github();
+    assert_eq!(
+        button.config(),
+        once,
+        "the button's rewrite is the same one"
+    );
+
+    // A helper of the owner's own for GitHub is what pushes.
+    let helper = GuestHome::new(true);
+    helper.git(&[
+        "config",
+        "--global",
+        "credential.https://github.com.helper",
+        "store",
+    ]);
+    helper.see_to_github();
+    assert!(helper.gets_https());
+    assert_eq!(
+        helper.git(&[
+            "config",
+            "--global",
+            "--get-all",
+            "credential.https://github.com.helper",
+        ]),
+        "store"
+    );
+
+    // A rewrite of the owner's own goes where they said, and the other form still
+    // gets one.
+    let rewrite = GuestHome::new(true);
+    rewrite.git(&[
+        "config",
+        "--global",
+        "url.https://mirror.example/.insteadOf",
+        "git@github.com:",
+    ]);
+    rewrite.see_to_github();
+    assert_eq!(
+        rewrite.url_of("git@github.com:me/web.git"),
+        "https://mirror.example/me/web.git"
+    );
+    assert_eq!(
+        rewrite.url_of("ssh://git@github.com/me/web.git"),
+        "https://github.com/me/web.git"
+    );
+
+    // Something else under the same key isn't taken for it.
+    let other = GuestHome::new(true);
+    other.git(&[
+        "config",
+        "--global",
+        "url.https://github.com/.insteadOf",
+        "gh:",
+    ]);
+    other.see_to_github();
+    assert!(other.gets_https());
+    assert_eq!(
+        other.url_of("gh:me/web.git"),
+        "https://github.com/me/web.git"
+    );
+}
+
+#[test]
+fn a_home_that_may_mean_ssh_or_has_no_login_is_left_alone() {
+    // Signed out: nothing to push with either way.
+    let signed_out = GuestHome::new(false);
+    signed_out.see_to_github();
+    assert_eq!(signed_out.config(), None);
+    assert_eq!(
+        signed_out.url_of("git@github.com:me/web.git"),
+        "git@github.com:me/web.git"
+    );
+
+    // A key, whatever it's called, or a config that may name one elsewhere.
+    for file in [".ssh/id_ed25519", ".ssh/work", ".ssh/config"] {
+        let home = GuestHome::new(true);
+        home.file(file);
+        home.see_to_github();
+        assert_eq!(home.config(), None, "{file}");
+        assert_eq!(
+            home.url_of("git@github.com:me/web.git"),
+            "git@github.com:me/web.git",
+            "{file}"
+        );
+    }
+
+    // What SSH leaves behind on its own says nothing of a way to log in.
+    let home = GuestHome::new(true);
+    for file in [
+        ".ssh/known_hosts",
+        ".ssh/known_hosts.old",
+        ".ssh/authorized_keys",
+        ".ssh/stray.pub",
+    ] {
+        home.file(file);
+    }
+    home.see_to_github();
+    assert!(home.gets_https());
+}
+
 #[test]
 fn updates_wait_for_the_network_and_give_up_saying_so() {
     let s = Setup::new();

@@ -129,6 +129,36 @@ gh auth setup-git --hostname github.com &&
 git config --global --replace-all url.https://github.com/.insteadOf git@github.com: '^git@github\.com:$' &&
 git config --global --replace-all url.https://github.com/.insteadOf ssh://git@github.com/ '^ssh://git@github\.com/$'"#;
 
+/// Has git in a VM's home reach GitHub over HTTPS with `gh`'s login, as [`GH_LOGIN`] does,
+/// for a home that was signed in some other way or before that did: a hand's `gh auth
+/// login`, say, which no button is left to redo, as it shows as signed in. It's run as
+/// each agent's VM comes up, on that agent's own copy of the home, so neither the
+/// home's image nor the project's config changes, and an agent still on an older home
+/// has it too.
+///
+/// It stands back wherever SSH may be what the owner meant: with a key or an SSH config
+/// in `~/.ssh`, or no login for `gh` to give. Without those SSH to GitHub can't work, so
+/// no `origin` needs looking at: one that's HTTPS isn't rewritten, and only an SSH one
+/// is helped. A rewrite already there, the owner's own included, is left, and so is a
+/// helper of the owner's for GitHub. With nothing to do, it writes nothing, and asks
+/// nothing of the network.
+pub(crate) const GITHUB_OVER_HTTPS: &str = r#"for k in "$HOME"/.ssh/*; do
+  [ -f "$k" ] || continue
+  case ${k##*/} in *.pub | known_hosts* | authorized_keys*) continue ;; esac
+  exit 0
+done
+missing=
+for form in git@github.com: ssh://git@github.com/; do
+  [ "$(git ls-remote --get-url "${form}r")" = "${form}r" ] && missing="$missing $form"
+done
+[ -n "$missing" ] || exit 0
+gh auth token --hostname github.com >/dev/null 2>&1 || exit 0
+git config --get-all credential.https://github.com.helper | grep -q . ||
+  gh auth setup-git --hostname github.com || exit 1
+for form in $missing; do
+  git config --global --add url.https://github.com/.insteadOf "$form" || exit 1
+done"#;
+
 /// How long the look at the Linux home's logins may take: it reads a few
 /// small files.
 const LOGINS_TIMEOUT: Duration = Duration::from_secs(5);
