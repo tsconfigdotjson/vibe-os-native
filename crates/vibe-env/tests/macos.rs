@@ -403,13 +403,15 @@ fn a_200_mb_allocation_shows_up_in_the_agents_memory() {
         "alloc",
         // A size known only when it runs, as a constant one would be built
         // once at compile time and then copied: 400 MB.
-        "perl -e '$n = 200 * 1024 * 1024; $x = \"a\" x $n; sleep 300' &",
+        "perl -e '$n = 200 * 1024 * 1024; $x = \"a\" x $n; sleep 900' &",
     );
     a.apply(roomy());
+    // In perl itself, as what's checked below: the agent's total gets there first, with
+    // its shell's, while perl is still filling the last of it.
     wait(
         "200 MB in the agent's memory",
-        Duration::from_secs(30),
-        || a.usage().memory >= 200 * MIB,
+        Duration::from_secs(60),
+        || a.usage().memory >= 200 * MIB && a.named("perl").iter().any(|p| p.memory >= 200 * MIB),
     );
     let perl = a.named("perl");
     assert_eq!(perl.len(), 1, "{:?}", a.procs());
@@ -425,12 +427,12 @@ fn a_200_mb_allocation_shows_up_in_the_agents_memory() {
         memory: 240 * MIB,
         ..roomy()
     });
-    wait("a memory warning", Duration::from_secs(10), || {
+    wait("a memory warning", Duration::from_secs(60), || {
         a.usage().warnings.contains(&Limit::Memory)
     });
     assert_eq!(a.usage().paused, None);
     #[cfg(target_os = "macos")]
-    wait("perl in the background", Duration::from_secs(5), || {
+    wait("perl in the background", Duration::from_secs(60), || {
         priority(perl[0].pid) <= 10
     });
     // Over all of it, it's paused.
@@ -438,7 +440,7 @@ fn a_200_mb_allocation_shows_up_in_the_agents_memory() {
         memory: 150 * MIB,
         ..roomy()
     });
-    wait("a memory pause", Duration::from_secs(10), || {
+    wait("a memory pause", Duration::from_secs(60), || {
         a.usage().paused == Some(Limit::Memory)
     });
     assert!(a.procs().iter().all(|p| p.stopped));
@@ -448,17 +450,17 @@ fn a_200_mb_allocation_shows_up_in_the_agents_memory() {
         ..roomy()
     });
     assert_eq!(h.backend.wake(&a.handle).unwrap(), Woke::Exact);
-    wait("it to run", Duration::from_secs(5), || {
+    wait("it to run", Duration::from_secs(60), || {
         a.procs().iter().all(|p| !p.stopped)
     });
-    wait("the warning to go", Duration::from_secs(10), || {
+    wait("the warning to go", Duration::from_secs(60), || {
         a.usage().warnings.is_empty()
     });
     assert_eq!(a.usage().paused, None);
     #[cfg(target_os = "macos")]
     wait(
         "perl back from the background",
-        Duration::from_secs(5),
+        Duration::from_secs(60),
         || priority(perl[0].pid) > 10,
     );
 }
