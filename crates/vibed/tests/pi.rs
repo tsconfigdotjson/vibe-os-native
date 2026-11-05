@@ -921,6 +921,37 @@ async fn a_send_to_a_pi_still_starting_is_taken_in_the_end() {
     w.delete(&a.agent).await;
 }
 
+/// A Pi too slow for a send's wait refuses it, and is still starting when its editor
+/// comes up: the send made once it has is pressed again until it's taken, as the
+/// first would have been.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_send_after_a_pi_was_too_slow_for_the_wait_is_taken_in_the_end() {
+    let w = world().await;
+    w.sign_in();
+    let pi = w.golden.claude.with_file_name("pi");
+    common::write_script(
+        &pi,
+        &PI_STILL_STARTING.replace("begun = time.time()", "time.sleep(31)\nbegun = time.time()"),
+    );
+    let got = pi.with_file_name("pi.got");
+    let a = w.start("hello").await;
+    let input = || vibe_mcp::Input::Text {
+        text: "after a start".into(),
+        submit: true,
+        force: false,
+    };
+    let e = w
+        .core
+        .send_input(None, &a.agent, input())
+        .await
+        .unwrap_err();
+    assert!(e.message.contains("nothing was sent"), "{e:?}");
+    w.wait_screen(&a.agent, "\u{2500}\u{2500}\u{2500}").await;
+    w.core.send_input(None, &a.agent, input()).await.unwrap();
+    assert_eq!(fs::read_to_string(&got).unwrap(), "after a start\n");
+    w.delete(&a.agent).await;
+}
+
 /// B1: a login Pi really writes, beside a bad one, in the same file: the good one
 /// goes on, the bad one doesn't, and the owner hears which.
 #[tokio::test]
