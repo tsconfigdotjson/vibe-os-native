@@ -291,6 +291,9 @@ public final class FixtureDaemon: DaemonConnection, @unchecked Sendable {
         let gh = check(.gh, .pass, "GitHub's gh is logged in to github.com as octocat.")
         let claude = check(.claude, .pass, "Claude Code 2.1.314 is at /Users/me/.local/bin/claude.")
         let login = check(.claudeLogin, .pass, "Claude Code is signed in, with its login in your Keychain.")
+        // Only a Linux host's: no Mac's vibed says it. It's here so the canned report
+        // has every check the contract does, and the welcome leaves it out.
+        let linger = check(.linger, .pass, "vibed runs while you're logged out, and starts again after a reboot.")
         let tailscale = check(.tailscale, .pass, "Tailscale is up, at 100.101.102.103; Settings can serve MCP there too.")
         let linux = check(.linux, .pass, "Linux base image 2 and Claude Code 2.1.314 are ready for linux agents.")
         // The doctor's last check, as `vibed` says it. Only agents whose profile
@@ -303,7 +306,7 @@ public final class FixtureDaemon: DaemonConnection, @unchecked Sendable {
         case .busy, .quiet, .offline:
             return [
                 git, gh, check(.ghGit, .pass, "git asks gh for GitHub's credentials."), claude, login,
-                check(.power, .pass, "This Mac never sleeps on its own."), tailscale, linux, piInstalled,
+                check(.power, .pass, "This Mac never sleeps on its own."), linger, tailscale, linux, piInstalled,
             ]
         case .firstRun:
             var downloading = check(.linux, .working, "Downloading the Linux base image.")
@@ -313,6 +316,7 @@ public final class FixtureDaemon: DaemonConnection, @unchecked Sendable {
                 check(
                     .power, .fail, "This Mac sleeps after 10 minutes idle, and agents stop answering while it sleeps.",
                     hint: "In System Settings → Energy, turn on Prevent automatic sleeping when the display is off."),
+                linger,
                 tailscale,
                 downloading,
                 noPi,
@@ -333,6 +337,7 @@ public final class FixtureDaemon: DaemonConnection, @unchecked Sendable {
                     .claudeLogin, .fail, "Claude Code can sign in once it's installed.",
                     hint: "Install Claude Code first."),
                 check(.power, .pass, "This Mac never sleeps on its own."),
+                linger,
                 check(
                     .tailscale, .optional,
                     "Tailscale isn't running. It's optional: it lets your other machines reach MCP here.",

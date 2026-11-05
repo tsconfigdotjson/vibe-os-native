@@ -851,9 +851,10 @@ public struct SetupProgress: Equatable, Sendable {
         if let command = commandStep { steps.append(command) }
         // Pi is optional and VibeOS installs it once a profile runs it, so the
         // welcome doesn't bring it up: Settings → Agents has it. Nor git using gh
-        // while gh isn't logged in: vibed sets that up itself once it is.
+        // while gh isn't logged in: vibed sets that up itself once it is. Nor
+        // lingering, which is a Linux host's, and this welcome is about the Mac.
         let machine = doctor.filter {
-            $0.id != .linux && $0.id != .pi && !($0.id == .ghGit && $0.state == .optional)
+            $0.id != .linux && $0.id != .pi && $0.id != .linger && !($0.id == .ghGit && $0.state == .optional)
         }
         for check in machine {
             steps.append(step(for: check))
