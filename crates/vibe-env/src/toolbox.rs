@@ -139,9 +139,10 @@ git config --global --replace-all url.https://github.com/.insteadOf ssh://git@gi
 /// changes in it from then on.
 ///
 /// It stands back where SSH may work: `core.sshCommand` is set, or `~/.ssh` has a key or
-/// a config and either that config has its own way with host keys or GitHub's is known.
-/// With no host key, an agent can't answer SSH's question, so nothing SSH was doing is
-/// lost. What this put there before comes out again then. No `origin` needs looking at:
+/// a config and either that config has its own way with host keys, or may in a file it
+/// includes, or GitHub's is known. With no host key, an agent can't answer SSH's question,
+/// so nothing SSH was doing is lost. An agent that has this keeps it if SSH comes to work
+/// in the home later, and goes on pushing with the login. No `origin` needs looking at:
 /// an HTTPS one isn't rewritten, and only an SSH one is helped. With `gh` signed out it
 /// does nothing. A rewrite already there, the owner's own included, is left, and so is any
 /// helper git has for GitHub. With nothing to do, it writes nothing. It never needs the
@@ -152,21 +153,17 @@ ssh_may_work() {
   for k in "$HOME"/.ssh/*; do
     [ -f "$k" ] || continue
     case ${k##*/} in *.pub | known_hosts* | authorized_keys*) continue ;; esac
-    grep -qsiE 'stricthostkeychecking|userknownhostsfile' "$HOME/.ssh/config" && return 0
-    for host in github.com '[ssh.github.com]:443'; do
-      ssh-keygen -F "$host" -f "$HOME/.ssh/known_hosts" 2>/dev/null | grep -q . && return 0
+    grep -qsiE 'stricthostkeychecking|userknownhostsfile|^[[:space:]]*include' "$HOME/.ssh/config" && return 0
+    for known in known_hosts known_hosts2; do
+      for host in github.com '[ssh.github.com]:443'; do
+        ssh-keygen -F "$host" -f "$HOME/.ssh/$known" 2>/dev/null | grep -q . && return 0
+      done
     done
     return 1
   done
   return 1
 }
-if ssh_may_work; then
-  if [ -f "$config" ]; then
-    git config --file "$config" --unset-all url.https://github.com/.insteadOf '^git@github\.com:$'
-    git config --file "$config" --unset-all url.https://github.com/.insteadOf '^ssh://git@github\.com/$'
-  fi
-  exit 0
-fi
+ssh_may_work && exit 0
 missing=
 for form in git@github.com: ssh://git@github.com/; do
   [ "$(git ls-remote --get-url "${form}r")" = "${form}r" ] && missing="$missing $form"

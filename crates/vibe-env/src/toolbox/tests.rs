@@ -1221,6 +1221,22 @@ fn a_home_where_ssh_may_work_stays_on_it() {
         assert!(home.stays_on_ssh(), "{line}");
     }
 
+    // Nor one that may do so in a file it includes.
+    let home = GuestHome::new(true);
+    home.write(".ssh/config", "Include ~/.ssh/hosts/*\n");
+    home.see_to_github();
+    assert!(home.stays_on_ssh());
+
+    // GitHub's host key in the other file SSH looks in.
+    let home = GuestHome::new(true);
+    home.write(".ssh/id_ed25519", "x");
+    home.write(
+        ".ssh/known_hosts2",
+        &format!("github.com {GITHUB_HOST_KEY}\n"),
+    );
+    home.see_to_github();
+    assert!(home.stays_on_ssh());
+
     // A command of the owner's own needs nothing in `~/.ssh` at all.
     let home = GuestHome::new(true);
     home.git(&[
@@ -1259,24 +1275,20 @@ fn what_ssh_leaves_lying_about_doesnt_keep_a_home_from_pushing() {
     assert!(home.gets_https());
 }
 
+/// Taking it out would have to tell what this wrote from the same lines of the button's
+/// or the owner's, and it still pushes.
 #[test]
-fn a_home_that_comes_to_use_ssh_goes_back_to_it() {
+fn an_agent_keeps_its_way_to_github_when_its_home_comes_to_use_ssh() {
     let home = GuestHome::new(true);
-    // Beside something of the owner's in the same file.
-    home.write(".config/git/config", "[user]\n\tname = Me\n");
     home.see_to_github();
     assert!(home.gets_https());
-
+    let once = home.read(".config/git/config");
     home.write(".ssh/id_ed25519", "x");
     home.knows_github();
     home.see_to_github();
-    assert!(home.stays_on_ssh());
-    assert_eq!(home.git(&["config", "user.name"]), "Me");
-
-    // And again, with nothing to take out.
-    let once = home.read(".config/git/config");
-    home.see_to_github();
     assert_eq!(home.read(".config/git/config"), once);
+    assert!(home.gets_https());
+    assert_eq!(home.login(), "gho_secret");
 }
 
 #[test]
