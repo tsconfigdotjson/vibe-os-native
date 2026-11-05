@@ -224,7 +224,9 @@ impl Core {
         debounce: Duration,
         f: impl FnOnce(&Tail, Timestamp) -> T + Send + 'static,
     ) -> Option<T> {
-        let home = Core::handle_of(a).ok()?.home;
+        let handle = Core::handle_of(a).ok()?;
+        let start_prompt = handle.agent_dir.join(crate::agents::START_PROMPT);
+        let home = handle.home;
         let worktree = PathBuf::from(&a.worktree);
         let tail = Arc::clone(
             lock(&self.tails)
@@ -248,6 +250,11 @@ impl Core {
             }
             t.set_idle_debounce(debounce);
             t.poll();
+            // There's a transcript to resume now, by the test a restart goes by. If this
+            // fails, it's kept for no more than a restart whose transcript has gone.
+            if start_prompt.exists() && home.has_transcript(&worktree, t.session_id()) {
+                let _ = std::fs::remove_file(&start_prompt);
+            }
             (f(&t, now), t.session_id().to_owned())
         })
         .await

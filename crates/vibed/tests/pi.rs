@@ -695,13 +695,57 @@ async fn a_turn_left_open_before_a_resume_is_over() {
         w.wait_for(&r, Activity::Done).await;
         w.delete(&r).await;
     }
-    // One that never got as far as a transcript is simply at rest.
+    // One only ever told one of Pi's own commands has nothing to go back to: it's
+    // simply at rest, and that command isn't done again.
+    for prompt in ["/model", "!touch ran-again"] {
+        let a = w.start(prompt).await;
+        w.started_with(&a.agent, "args");
+        end_its_session(&w, &a.agent).await;
+        fs::remove_file(args_file(&w, &a.agent)).unwrap();
+        w.core.resume_agent(None, &a.agent).await.unwrap();
+        let args = w.started_with(&a.agent, "args");
+        assert!(!args.lines().any(|l| l == "--"), "{prompt}: {args}");
+        w.wait_for(&a.agent, Activity::Done).await;
+        w.delete(&a.agent).await;
+    }
+}
+
+fn args_file(w: &World, r: &str) -> PathBuf {
+    w.layout
+        .agent_dir(r)
+        .join(format!("{}.args", vibe_env::pi::VM_SESSIONS))
+}
+
+/// Dead before its first message, as with no login yet, it has no transcript and no
+/// answer: it comes back on what it was asked. Once it's written, that's not asked again.
+#[tokio::test]
+async fn a_restart_before_its_first_message_has_its_prompt() {
+    let w = world().await;
+    w.sign_in();
     let a = w.start("nologin").await;
-    w.wait_for(&a.agent, Activity::Errored).await;
-    end_its_session(&w, &a.agent).await;
-    w.core.resume_agent(None, &a.agent).await.unwrap();
-    w.wait_for(&a.agent, Activity::Done).await;
-    w.delete(&a.agent).await;
+    let r = a.agent.clone();
+    w.wait_for(&r, Activity::Errored).await;
+    end_its_session(&w, &r).await;
+    fs::remove_file(args_file(&w, &r)).unwrap();
+    w.core.resume_agent(None, &r).await.unwrap();
+    let args = w.started_with(&r, "args");
+    let args: Vec<&str> = args.lines().collect();
+    assert_eq!(args[..2], ["--session-id", a.session_id.as_str()]);
+    assert!(args.ends_with(&["--", "nologin"]), "{args:?}");
+    // It's on the prompt, so it isn't the rest a resume with nothing to do is.
+    w.wait_for(&r, Activity::Errored).await;
+    w.delete(&r).await;
+
+    let a = w.start("hello").await;
+    let r = a.agent.clone();
+    w.wait_for(&r, Activity::Done).await;
+    assert!(!w.layout.agent_dir(&r).join("start-prompt").exists());
+    end_its_session(&w, &r).await;
+    fs::remove_file(args_file(&w, &r)).unwrap();
+    w.core.resume_agent(None, &r).await.unwrap();
+    let args = w.started_with(&r, "args");
+    assert!(!args.lines().any(|l| l == "--"), "{args}");
+    w.delete(&r).await;
 }
 
 /// The toolbox's `/login` lands in its own copy; `vibed` takes it to the store and

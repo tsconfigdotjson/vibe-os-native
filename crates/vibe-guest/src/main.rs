@@ -17,7 +17,6 @@
 
 #[cfg(target_os = "linux")]
 mod init;
-mod services_only;
 
 use std::process::ExitCode;
 
@@ -26,7 +25,6 @@ use vibe_relay::{local, proxy};
 const USAGE: &str = "\
 usage: vibe-guest            as PID 1 of a linux VM
        vibe-guest --vsock-dir DIR [--cgroup DIR] [--share TAG:PATH]...
-       vibe-guest --vsock-dir DIR --services-only
        vibe mcp-proxy SERVICE
 
 The second form is for tests: it serves the guest's ports as Unix sockets
@@ -35,10 +33,7 @@ them with the cgroup DIR (one it may write to) if given, and waits for the
 directories of --share after a thaw. It mounts nothing. Its shared services
 socket is DIR/services.sock.
 
-The third is for tests on any OS: only those shared services, serving
-DIR/services.sock and the relay's DIR/<port>.
-
-The fourth is an agent's shared MCP service over stdin and stdout, through this
+The third is an agent's shared MCP service over stdin and stdout, through this
 VM's relay to the Mac (or vibe-guest mcp-proxy SERVICE, for tests; the socket is
 $VIBE_SERVICES_SOCKET, or /run/vibe/services.sock).";
 
@@ -84,10 +79,6 @@ fn main() -> ExitCode {
     if matches!(args.first().map(String::as_str), Some("--help" | "-h")) {
         println!("{USAGE}");
         return ExitCode::SUCCESS;
-    }
-    // Never as PID 1, which mustn't return: only ever a test's ordinary process.
-    if std::process::id() != 1 && args.iter().any(|a| a == "--services-only") {
-        return services_only::main(&args);
     }
     #[cfg(target_os = "linux")]
     {

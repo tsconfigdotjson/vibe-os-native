@@ -31,6 +31,8 @@ use crate::{
 /// arguments, writes a line to the transcript where Claude would, and then
 /// does what the prompt's words say:
 ///
+/// - `vanish`: the first time, exits having written nothing, as Claude can
+///   before its first answer;
 /// - `question`: asks "Red or blue?" and waits for the answer, writing
 ///   its prompt, an `AskUserQuestion`, the answer and its reply to the
 ///   transcript as Claude Code does, and then each line it's sent as a

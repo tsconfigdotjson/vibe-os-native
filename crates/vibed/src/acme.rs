@@ -240,7 +240,7 @@ pub struct Disk {
 }
 
 /// Writes `bytes` to `path` whole, readable by the owner only.
-fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let tmp = path.with_extension("new");
     let mut f = fs::OpenOptions::new()
         .create(true)

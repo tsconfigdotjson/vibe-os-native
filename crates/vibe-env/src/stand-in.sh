@@ -16,6 +16,9 @@ cwd=$(pwd -P)
 dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/$(printf '%s' "$cwd" | tr -c 'A-Za-z0-9' '-')"
 mkdir -p "$dir"
 transcript="$dir/$id.jsonl"
+case " $prompt " in *" vanish "*)
+  if [ ! -e "$dir/.vanished" ]; then : >"$dir/.vanished"; exit 1; fi
+esac
 printf '{"type":"user","sessionId":"%s","cwd":"%s","resumed":%s}\n' "$id" "$cwd" "$resumed" >>"$transcript"
 # record <type> <message> [<more fields>]: an entry as Claude Code writes
 # one, now. Its milliseconds count entries, so no two have the same time, as

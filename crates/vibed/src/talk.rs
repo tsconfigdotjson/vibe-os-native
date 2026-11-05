@@ -792,7 +792,7 @@ const PI_COMMANDS_WITH_WORDS: &[&str] = &[
 ///
 /// A paste gets to Pi's editor with its tabs as four spaces and its other control
 /// characters gone (`editor.ts`), so that's what's looked at.
-fn pi_takes_itself(text: &str) -> bool {
+pub(crate) fn pi_takes_itself(text: &str) -> bool {
     let text: String = text
         .replace('\t', "    ")
         .chars()
