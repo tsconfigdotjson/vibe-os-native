@@ -1232,17 +1232,23 @@ async fn git_maintenance_clears_only_a_stale_lock() {
     commit_loose_objects(&w.project);
     let loose = || loose_objects(&w.project);
     let lock = w.project.join(".git/objects/maintenance.lock");
-    let backdate = || {
-        let at = std::time::SystemTime::now() - Duration::from_secs(11 * 60);
+    let date = |at: std::time::SystemTime| {
         let f = fs::OpenOptions::new().write(true).open(&lock).unwrap();
         f.set_modified(at).unwrap();
     };
+    let backdate = || date(std::time::SystemTime::now() - Duration::from_secs(11 * 60));
 
     // A new one could be a run that's under way, and git stops at it.
     fs::write(&lock, "").unwrap();
     w.core.maintain_if_quiet("local", "app", &w.project).await;
     assert!(lock.exists(), "a new lock stays");
     assert!(loose() > 1, "git stops at a lock");
+
+    // So could one a little ahead of now, from a clock that's a little ahead.
+    date(std::time::SystemTime::now() + Duration::from_secs(60));
+    w.core.maintain_if_quiet("local", "app", &w.project).await;
+    assert!(lock.exists(), "a lock a little ahead stays");
+    assert!(loose() > 1, "git stops at that too");
 
     // One older than the timeout goes, found from a linked checkout too.
     let linked = w.project.with_file_name("linked");
@@ -1268,12 +1274,21 @@ async fn git_maintenance_clears_only_a_stale_lock() {
     w.core.maintain_if_quiet("local", "app", &w.project).await;
     assert!(!lock.exists(), "a stale lock goes");
     assert_eq!(loose(), 0, "and the repo is packed");
+
+    // One dated further ahead than the timeout is no run under way, as a clock
+    // set back leaves it, and it would stop git for good.
+    fs::write(&lock, "").unwrap();
+    date(std::time::SystemTime::now() + Duration::from_secs(11 * 60));
+    w.core.maintain_if_quiet("local", "app", &w.project).await;
+    assert!(!lock.exists(), "a lock far ahead goes");
 }
 
 /// Item 2 of #69. Agents get `gc.auto=0`, as they leave gc to `vibed`. A `vibed` started
 /// from an agent's terminal has that too, and it mustn't turn its own gc off. So: the
 /// git_maintenance tests, in a process of their own, with what an agent has in its
-/// environment. `cargo test` clears these for every test, which is why this sets them.
+/// environment, and with the same setting the way `git -c` hands it on, as either
+/// alone turns gc off. `cargo test` clears these for every test, which is why this
+/// sets them.
 #[test]
 fn an_agents_git_settings_dont_turn_off_git_maintenance() {
     let mut run = std::process::Command::new(std::env::current_exe().unwrap());
@@ -1289,7 +1304,8 @@ fn an_agents_git_settings_dont_turn_off_git_maintenance() {
     .env("GIT_CONFIG_KEY_1", "gc.auto")
     .env("GIT_CONFIG_VALUE_1", "0")
     .env("GIT_CONFIG_KEY_2", "maintenance.auto")
-    .env("GIT_CONFIG_VALUE_2", "false");
+    .env("GIT_CONFIG_VALUE_2", "false")
+    .env("GIT_CONFIG_PARAMETERS", "'gc.auto'='0'");
     let out = common::output_in_files(&mut run).unwrap();
     let said = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "{said}");
