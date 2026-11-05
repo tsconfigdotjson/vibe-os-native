@@ -700,6 +700,86 @@ async fn the_host_reports_its_memory_and_warns_when_it_is_short() {
     );
 }
 
+/// What a shim was told to run, by its running shim.
+fn command_of(w: &World, r: &str) -> Vec<String> {
+    shim::connect(
+        &w.layout.session_socket(r),
+        &control_hello("test"),
+        Duration::from_secs(10),
+    )
+    .unwrap()
+    .status()
+    .unwrap()
+    .command
+}
+
+/// Dead before its first answer, it has nothing to resume: it starts again on what it
+/// was asked. Once there's a transcript that's over, even if the transcript goes.
+#[tokio::test]
+async fn a_restart_with_no_transcript_starts_on_its_prompt() {
+    let w = world().await;
+    let a = w.core.start_agent(start("vanish hello")).await.unwrap();
+    let r = a.agent.clone();
+    let socket = w.layout.session_socket(&r);
+    wait_until("it to die", || !socket.exists());
+    let transcript = w
+        .claude(&r)
+        .transcript(Path::new(&a.worktree), &a.session_id);
+    assert!(!transcript.exists());
+
+    let back = w.core.resume_agent(None, &r).await.unwrap();
+    assert_eq!(back.session_id, a.session_id);
+    w.wait_screen(&r, "Working on: vanish hello");
+    let command = command_of(&w, &r);
+    assert!(command.iter().any(|c| c == "--session-id"), "{command:?}");
+    assert!(command.iter().any(|c| c == "vanish hello"), "{command:?}");
+
+    // Written, the session's what it goes on from, and the prompt isn't kept.
+    wait_until("its transcript", || transcript.is_file());
+    w.list().await;
+    assert!(!w.layout.agent_dir(&r).join("start-prompt").exists());
+    w.session(&r).end(Duration::from_secs(5));
+    w.core.resume_agent(None, &r).await.unwrap();
+    w.wait_screen(&r, &format!("Resumed {}.", a.session_id));
+    let command = command_of(&w, &r);
+    assert!(!command.iter().any(|c| c == "vanish hello"), "{command:?}");
+
+    // Long after, its transcript cleaned away: no old task goes off again.
+    w.session(&r).end(Duration::from_secs(5));
+    fs::remove_file(&transcript).unwrap();
+    w.core.resume_agent(None, &r).await.unwrap();
+    let command = command_of(&w, &r);
+    assert!(command.iter().any(|c| c == "--session-id"), "{command:?}");
+    assert!(!command.iter().any(|c| c == "vanish hello"), "{command:?}");
+    w.core.delete_agent(delete(&r, false)).await.unwrap();
+}
+
+/// A send is what brings an exited one back. It's given what it was asked, and the
+/// send comes after that.
+#[tokio::test]
+async fn a_send_to_one_with_no_transcript_comes_after_its_prompt() {
+    let w = world().await;
+    let a = w.core.start_agent(start("vanish talk hi")).await.unwrap();
+    let r = a.agent.clone();
+    let socket = w.layout.session_socket(&r);
+    wait_until("it to die", || !socket.exists());
+    w.core
+        .send_input(
+            None,
+            &r,
+            vibe_mcp::Input::Text {
+                text: "and this".into(),
+                submit: true,
+                force: false,
+            },
+        )
+        .await
+        .unwrap();
+    w.wait_screen(&r, "Working on: vanish talk hi");
+    w.wait_screen(&r, "> and this");
+    w.core.delete_agent(delete(&r, false)).await.unwrap();
+}
+
 #[tokio::test]
 async fn an_exited_agent_resumes_its_session() {
     let w = world().await;

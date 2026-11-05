@@ -68,6 +68,13 @@ pub const SETUP_SCRIPT: &str = ".vibe/setup.sh";
 /// Where its output is kept, in the agent's directory.
 pub const SETUP_LOG: &str = "setup.log";
 
+/// In an agent's directory, the prompt it started on, for as long as it has no
+/// transcript: dead before then, it starts again on it, and doesn't come back idle
+/// with what it was asked gone. Its transcript has it from there on, and a transcript
+/// lost later must not set an old task going again, so it goes as soon as there's one
+/// ([`Core::with_tail`]).
+pub(crate) const START_PROMPT: &str = "start-prompt";
+
 /// What git is set to in every agent: a first `git push` sets up its
 /// branch's upstream, and git never collects garbage on its own, as several
 /// agents share one `.git`; `vibed` runs `git maintenance` instead.
@@ -211,6 +218,35 @@ pub fn agent_args(
             a.reasoning.as_str(),
             prompt,
         ),
+    }
+}
+
+/// Keeps `prompt` to start `a` on again, if it dies with no transcript. What Pi does
+/// itself writes no transcript at all, so a `!` command would run at every restart for
+/// as long as nobody asked it anything: that's not kept. Not being able to keep it costs
+/// no more than that: it's said in the log, and the agent starts.
+fn keep_start_prompt(a: &AgentRecord, handle: &Handle, prompt: &str) {
+    if a.agent == AgentKind::Pi && crate::talk::pi_takes_itself(prompt) {
+        return;
+    }
+    let path = handle.agent_dir.join(START_PROMPT);
+    // Whole or not at all, as the host going down is what this is kept for, and part
+    // of a prompt would be a different task.
+    if let Err(e) = crate::acme::write_private(&path, prompt.as_bytes()) {
+        crate::log!("vibed: can't keep {}: {e}", path.display());
+    }
+}
+
+/// The prompt to start `handle`'s agent on again, if there's one kept.
+fn kept_start_prompt(handle: &Handle) -> Option<String> {
+    let path = handle.agent_dir.join(START_PROMPT);
+    match fs::read_to_string(&path) {
+        Ok(prompt) => Some(prompt),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => {
+            crate::log!("vibed: can't read {}: {e}", path.display());
+            None
+        }
     }
 }
 
@@ -910,6 +946,7 @@ impl Core {
         // 5. The agent, on the prompt, held by a shim and to its limits. If a
         // shim started and a later step failed, the undo must end its
         // session, so it gets the handle as the launch left it.
+        keep_start_prompt(&record, &handle, &p.prompt);
         let launched = self
             .launch(backend, &mut handle, &record, Some(&p.prompt), false)
             .await;
@@ -1453,17 +1490,22 @@ impl Core {
         let _ = remove_session_files(&self.layout.session_socket(agent_ref));
         let worktree = PathBuf::from(&record.worktree);
         // A session with no transcript has nothing to resume, so it starts
-        // again under the same id: Claude's before its first answer, Pi's
-        // before its first message.
+        // again under the same id, on the prompt it never got to: Claude's
+        // before its first answer, Pi's before its first message.
         let resume = handle.home.has_transcript(&worktree, &record.session_id);
-        self.launch(&backend, &mut handle, &record, None, resume)
+        let prompt = if resume {
+            None
+        } else {
+            kept_start_prompt(&handle)
+        };
+        self.launch(&backend, &mut handle, &record, prompt.as_deref(), resume)
             .await?;
         crate::log!(
             "vibed: {agent_ref} {}",
-            if resume {
-                "resumed its session"
-            } else {
-                "had no transcript, so it started again"
+            match (resume, &prompt) {
+                (true, _) => "resumed its session",
+                (false, Some(_)) => "had no transcript, so it started again on its prompt",
+                (false, None) => "had no transcript, so it started again",
             }
         );
         let status = self.agent_status(&mut record, self.idle_debounce()).await;

@@ -1,14 +1,14 @@
 //! Shared MCP services in the daemon: how agents are offered them, a Mac's
 //! relays to its VMs through a real `vibe-guest`, on a Mac only the part of it
-//! that carries services (`--services-only`), and a Linux host's own
-//! broker, its sign-in driven from a Mac over a tapped link. A stand-in plays
+//! that carries services (`vibe_relay`'s hub, on threads here), and a Linux host's
+//! own broker, its sign-in driven from a Mac over a tapped link. A stand-in plays
 //! the service; nothing reaches a real one.
 
 mod common;
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -694,7 +694,43 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
 /// The guest, on Unix sockets standing in for its vsock ports.
 struct Guest {
     dir: tempfile::TempDir,
-    child: Child,
+    /// The whole guest, as a process; with none, the services alone, here.
+    child: Option<Child>,
+}
+
+/// Serves the guest's shared services from this process, until it ends, and with no
+/// agent, no mounts and no other port, which only Linux can do. What carries a service
+/// is the real thing, the hub; this only takes connections to it, as the guest does.
+fn serve_services_alone(dir: &Path) {
+    /// How long one write to the Mac's relay may block, as in the whole guest.
+    const RELAY_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+    let hub =
+        vibe_relay::hub::Hub::new(Box::new(|_, _| Ok(())), vibe_relay::hub::Timing::default());
+    let shims = UnixListener::bind(dir.join("services.sock")).unwrap();
+    let relays = UnixListener::bind(dir.join(vibe_relay::frame::VSOCK_PORT.to_string())).unwrap();
+    {
+        let hub = hub.clone();
+        std::thread::spawn(move || {
+            for conn in shims.incoming().flatten() {
+                let hub = hub.clone();
+                std::thread::spawn(move || hub.serve(conn));
+            }
+        });
+    }
+    std::thread::spawn(move || {
+        for conn in relays.incoming().flatten() {
+            let hub = hub.clone();
+            std::thread::spawn(move || {
+                let reader = conn.try_clone().unwrap();
+                let closer = conn.try_clone().unwrap();
+                conn.set_write_timeout(Some(RELAY_WRITE_TIMEOUT)).unwrap();
+                let _ = hub.carry(reader, conn, move || {
+                    let _ = closer.shutdown(std::net::Shutdown::Both);
+                });
+            });
+        }
+    });
 }
 
 impl Guest {
@@ -706,24 +742,34 @@ impl Guest {
 
     fn start_as(services_only: bool) -> Guest {
         let dir = tempfile::tempdir().unwrap();
+        if services_only {
+            serve_services_alone(dir.path());
+            return Guest { dir, child: None };
+        }
         let child = Command::new(workspace_bin("vibe-guest"))
             .arg("--vsock-dir")
             .arg(dir.path())
-            .args(services_only.then_some("--services-only"))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
         // Dropped, it ends the child, however this goes.
-        let guest = Guest { dir, child };
+        let mut guest = Guest {
+            dir,
+            child: Some(child),
+        };
         let port = guest
             .dir
             .path()
             .join(vibe_relay::frame::VSOCK_PORT.to_string());
-        for _ in 0..500 {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while Instant::now() < deadline {
             if port.exists() && guest.dir.path().join("services.sock").exists() {
                 return guest;
+            }
+            if let Some(ended) = guest.child.as_mut().unwrap().try_wait().unwrap() {
+                panic!("the guest ended before it served its ports: {ended}");
             }
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -757,8 +803,10 @@ impl Guest {
 
 impl Drop for Guest {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Some(child) = &mut self.child {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
