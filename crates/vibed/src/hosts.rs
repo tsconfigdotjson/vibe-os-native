@@ -17,8 +17,8 @@ use vibe_core::model::{
 };
 use vibe_core::rpc::{
     Agent, AgentList, AgentsList, ApiKey, ErrorCode, ErrorObject, HostAddParams, HostAdmin,
-    HostExternalParams, HostInfo, HostInstall, HostList, HostNameParams, HostsExternal, KeyList,
-    KeySyncParams, KeysList, KeysSync, Method, NoParams,
+    HostInfo, HostInstall, HostList, HostNameParams, KeyList, KeySyncParams, KeysList, KeysSync,
+    Method, NoParams,
 };
 use vibe_core::time::parse_rfc3339;
 
@@ -198,15 +198,50 @@ impl Core {
     /// host says first (port 443, Let's Encrypt), as that's what to fix;
     /// then the tunnel's trouble.
     fn describe_external(&self, h: &mut HostInfo, link: &Link) {
+        let reported = link.reported();
         if !h.external {
+            // Not this Mac's choice, and the host's own business: only said, and
+            // what would use it, or turn on again what this Mac had.
+            let last = self.store().host_external_chosen(&h.name).ok().flatten();
+            let seen = self.store().host_external_seen(&h.name).ok().flatten();
+            let serves = link.reported_domain().or_else(|| seen.clone());
+            h.external_note = reported.and_then(|o| match (o.external, o.url) {
+                (true, Some(url)) => Some(format!(
+                    "{} serves {url} on its own; this Mac isn't using it",
+                    h.name
+                )),
+                _ => o.external_note.or_else(|| {
+                    // Turned off before a host kept who did it.
+                    last.as_ref().map(|d| {
+                        format!(
+                            "{} no longer serves https://{d}/mcp, and doesn't say who turned \
+                             it off; turn it on again to serve it",
+                            h.name
+                        )
+                    })
+                }),
+            });
+            if !link.connected()
+                && let Some(d) = &seen
+            {
+                h.external_note = Some(format!(
+                    "{} last said it serves https://{d}/mcp on its own; its link is down",
+                    h.name
+                ));
+            }
+            h.external_last = last.filter(|_| serves.is_none());
+            h.external_serves = serves;
             return;
         }
         let view = self.tunnel_view(&h.name);
         h.tunnel = Some(view.as_ref().map_or(TunnelState::Down, |v| v.state));
-        let reported = link.reported();
         let theirs = reported.as_ref().and_then(|o| o.external_detail.clone());
-        let pending = (link.connected() && link.reported_domain().is_none())
-            .then(|| format!("{} hasn't started serving it yet", h.name));
+        let refused = lock(&link.external_refused).clone();
+        let pending =
+            (link.connected() && link.reported_domain().is_none()).then(|| match refused {
+                Some(why) => format!("{} refused to serve it: {why}", h.name),
+                None => format!("{} hasn't taken this Mac's request yet", h.name),
+            });
         let down = (!link.connected())
             .then(|| format!("{}'s link is down: it serves it once it's back", h.name));
         h.external_detail = theirs
@@ -317,6 +352,10 @@ impl Core {
             detail: None,
             url: None,
             tunnel: None,
+            external_changed_at: None,
+            external_note: None,
+            external_serves: None,
+            external_last: None,
             external_detail: None,
             memory: None,
             needs_admin: installed.needs_admin.clone(),
@@ -466,51 +505,56 @@ impl Core {
     pub async fn remove_host(&self, p: HostNameParams) -> Result<HostInfo, ErrorObject> {
         let link = self.linux_host(&p.host)?;
         let info = self.host_info(&p.host)?;
-        // Forgotten while its link is down, it would serve the external
-        // address on, with every key it has, and never hear otherwise.
-        if info.external && !link.connected() {
-            return Err(error(
+        // It may serve publicly, with the keys this Mac pushed. Forgotten with those still
+        // there, a revoke here could never reach it, so it has to be told first. If it's
+        // gone for good, asking it to stop while it's away says it needn't be heard from.
+        let seen = self
+            .store()
+            .host_external_seen(&p.host)
+            .map_err(store_error)?;
+        let public = info.external || seen.is_some() || link.reported_domain().is_some();
+        let cant_tell = |why: String| {
+            error(
                 ErrorCode::Conflict,
                 format!(
-                    "{} is the external address and its link is down: remove it once it's back, \
-                     so it stops serving publicly",
+                    "{} may serve publicly with this Mac's API keys and {why}, so they'd go on \
+                     working there: remove it once it's back. If it's gone for good, stop its \
+                     external address here first",
                     p.host
                 ),
-            ));
+            )
+        };
+        if public && !link.connected() {
+            return Err(cant_tell("its link is down".into()));
         }
         // The keys this Mac pushed there stop working there: once it's
         // forgotten, a revoke here would never reach it.
+        let from = self.install_id()?;
         if link.connected()
             && let Err(e) = self
-                .forward_typed::<KeysSync>(&link, &KeySyncParams { keys: Vec::new() })
+                .forward_typed::<KeysSync>(
+                    &link,
+                    &KeySyncParams {
+                        keys: Vec::new(),
+                        from: Some(from),
+                    },
+                )
                 .await
         {
+            if public {
+                return Err(cant_tell(format!(
+                    "it wouldn't take them off: {}",
+                    e.message
+                )));
+            }
             crate::log!(
                 "vibed: can't take this Mac's keys off {}: {}; revoke them there with vibe key",
                 link.name,
                 e.message
             );
         }
-        // Nor is it the external address any more: it stops serving it.
-        if info.external
-            && link.connected()
-            && let Err(e) = self
-                .forward_typed::<HostsExternal>(
-                    &link,
-                    &HostExternalParams {
-                        host: None,
-                        on: false,
-                        domain: None,
-                    },
-                )
-                .await
-        {
-            crate::log!(
-                "vibed: can't stop {} serving the external address: {}",
-                link.name,
-                e.message
-            );
-        }
+        // Its external address is its own. If it has one it goes on serving it, with
+        // whatever keys it still has; stopping that is asked for by name.
         self.services_host_leaving(&p.host).await;
         self.store().remove_host(&p.host).map_err(store_error)?;
         lock(&self.links).remove(&p.host);
@@ -697,6 +741,10 @@ impl Core {
             detail: None,
             url: None,
             tunnel: None,
+            external_changed_at: None,
+            external_note: None,
+            external_serves: None,
+            external_last: None,
             external_detail: None,
             memory: None,
             needs_admin: Vec::new(),
@@ -824,17 +872,34 @@ impl Core {
     pub(crate) fn push_keys_to(&self, link: &Arc<Link>) {
         let link = Arc::clone(link);
         self.in_background(|core| async move {
-            let keys = match core.store().key_hashes() {
-                Ok(keys) => keys,
-                Err(e) => {
+            // Waits its turn, then reads the list, so the last to go is the latest.
+            let _one_at_a_time = link.keys_pushing.lock().await;
+            let keys = core.store().key_hashes();
+            let (keys, from) = match (keys, core.install_id()) {
+                (Ok(keys), Ok(from)) => (keys, from),
+                (Err(e), _) => {
                     crate::log!("vibed: can't read the keys to push: {e}");
+                    link.keys_stale.store(true, Ordering::SeqCst);
+                    return;
+                }
+                (_, Err(e)) => {
+                    crate::log!(
+                        "vibed: can't say which Mac the keys are from: {}",
+                        e.message
+                    );
                     link.keys_stale.store(true, Ordering::SeqCst);
                     return;
                 }
             };
             let n = keys.len();
             match core
-                .forward_typed::<KeysSync>(&link, &KeySyncParams { keys })
+                .forward_typed::<KeysSync>(
+                    &link,
+                    &KeySyncParams {
+                        keys,
+                        from: Some(from),
+                    },
+                )
                 .await
             {
                 Ok(there) => {
@@ -949,7 +1014,7 @@ impl Core {
             }
         }
         self.store()
-            .sync_pushed_keys(&p.keys)
+            .sync_pushed_keys(p.from.as_deref().unwrap_or_default(), &p.keys)
             .map_err(store_error)?;
         // What keys saw of the Mac's agents goes with them.
         self.peer.forget_all();

@@ -1155,6 +1155,10 @@ struct HostsPane: View {
                     if let host = model.externalHost {
                         ExternalAddressRows(host: host)
                     }
+                    ForEach(linuxHosts.filter { !$0.external && $0.externalNote != nil }, id: \.name) {
+                        host in
+                        externalNoteRow(host)
+                    }
                 } header: {
                     Text("External Address")
                 } footer: {
@@ -1203,12 +1207,60 @@ struct HostsPane: View {
             })
     }
 
+    /// A host's external address that this Mac isn't using: why, and the fix.
+    private func externalNoteRow(_ host: HostInfo) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(sentence(host.externalNote ?? ""))
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 8) {
+                if let serves = host.externalServes {
+                    Button("Use It") { Task { await turnOnExternal(host, domain: serves) } }
+                    Button("Stop Serving") { Task { await stopServing(host) } }
+                } else if let last = host.externalLast {
+                    Button("Turn On Again") { Task { await turnOnExternal(host, domain: last) } }
+                } else {
+                    Button("Turn On") { externalFor = host }
+                }
+            }
+        }
+    }
+
+    private func turnOnExternal(_ host: HostInfo, domain: String) async {
+        do {
+            _ = try await model.setExternal(host.name, domain: domain)
+            error = nil
+        } catch {
+            self.error = describe(error)
+        }
+    }
+
+    private func stopServing(_ host: HostInfo) async {
+        guard
+            confirm(
+                "Stop \(host.name) serving publicly?",
+                detail: "MCP clients outside lose their way in to \(host.name), though this Mac "
+                    + "isn't using it, and another Mac may be. It stays off until someone turns "
+                    + "it on again.",
+                action: "Stop Serving")
+        else { return }
+        do {
+            _ = try await model.setExternal(host.name, domain: nil)
+            error = nil
+        } catch {
+            self.error = describe(error)
+        }
+    }
+
     private func turnOffExternal(_ host: HostInfo) async {
         guard
             confirm(
                 "Stop using \(host.name) as the external address?",
                 detail: "MCP clients outside lose their way in, to every agent on \(host.name) and on this Mac. "
-                    + "The tunnel closes and \(host.name) stops listening publicly. Keys stay as they are.",
+                    + "The tunnel closes and \(host.name) stops listening publicly, until someone turns it on "
+                    + "again. Nothing else turns it off. Keys stay as they are.",
                 action: "Stop Using")
         else { return }
         do {
@@ -1234,8 +1286,9 @@ struct HostsPane: View {
         guard
             confirm(
                 "Remove \(name)?",
-                detail: "This Mac forgets it and its agents. Nothing changes on the server: vibed and its agents "
-                    + "run on there, with their own MCP, and you can add it again later.",
+                detail: "This Mac forgets it and its agents, and its API keys stop working there. Otherwise nothing "
+                    + "changes on the server: vibed and its agents run on there, with their own MCP and any external "
+                    + "address it serves, and you can add it again later.",
                 action: "Remove")
         else { return }
         do {

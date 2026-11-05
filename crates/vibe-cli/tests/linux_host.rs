@@ -968,6 +968,87 @@ fn a_linux_host_added_over_ssh_runs_agents_the_mac_drives_body(watch: &Watch) {
     drop(mac.rt);
 }
 
+/// A real host's state is only safe under `scripts/keep-host-state.sh`, as a test's Mac
+/// changes it: check-full.sh runs these under it, and they refuse to run otherwise.
+fn the_real_hosts_state_is_kept() {
+    assert!(
+        std::env::var_os("VIBE_TEST_HOST_STATE_KEPT").is_some(),
+        "run this through scripts/keep-host-state.sh, which puts the real host back as it was"
+    );
+}
+
+/// This process's `ssh`es matching `pattern`: never the real Mac's to the same host,
+/// which may be running beside this test.
+fn my_ssh(pattern: &str) -> String {
+    let found = Command::new("pgrep")
+        .args(["-P", &std::process::id().to_string(), "-f", pattern])
+        .in_files()
+        .unwrap();
+    String::from_utf8(found.stdout).unwrap()
+}
+
+/// The process of the connection `golden`'s Mac shares to `dest`, from what it says itself.
+/// That's the one to stop to hang the connection: the link's own `ssh` hands its ends over
+/// to it, so stopping that stops nothing, and answers go on coming.
+fn shared_connection(golden: &common::Golden, dest: &str) -> String {
+    let remote = vibed::remote::Ssh {
+        program: "ssh".into(),
+        bundle: None,
+        shared: Some(golden.config().layout.run_dir()),
+    };
+    let check = Command::new("ssh")
+        .args(remote.sharing(dest))
+        .args(["-O", "check", "--", dest])
+        .in_files()
+        .unwrap();
+    let said = String::from_utf8_lossy(&check.stderr).into_owned();
+    connection_pid(&said).unwrap_or_else(|| panic!("no shared connection to {dest}: {said}"))
+}
+
+/// The pid in what `ssh -O check` says: `Master running (pid=1234)`.
+fn connection_pid(said: &str) -> Option<String> {
+    let pid = said.split("(pid=").nth(1)?.split(')').next()?;
+    (!pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit())).then(|| pid.to_owned())
+}
+
+#[test]
+fn a_shared_connections_pid_is_read_from_what_ssh_says() {
+    assert_eq!(
+        connection_pid("Master running (pid=1234)\r\n").as_deref(),
+        Some("1234")
+    );
+    assert_eq!(connection_pid("Control socket connect: No such file"), None);
+}
+
+/// Waits for `name`'s link to go down, seen as it happens.
+fn wait_for_link_down(
+    mac: &Mac,
+    mut events: tokio::sync::broadcast::Receiver<vibe_core::rpc::Event>,
+    name: &str,
+    within: Duration,
+) {
+    use tokio::sync::broadcast::error::RecvError;
+    mac.rt.block_on(async {
+        tokio::time::timeout(within, async {
+            loop {
+                match events.recv().await {
+                    Ok(e)
+                        if e.kind == vibe_core::model::EventKind::HostLink
+                            && e.host == name
+                            && e.state.as_deref() == Some("down") =>
+                    {
+                        return;
+                    }
+                    Ok(_) | Err(RecvError::Lagged(_)) => {}
+                    Err(RecvError::Closed) => panic!("the Mac's events ended"),
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {name}'s link to go down"));
+    });
+}
+
 /// One JSON-RPC call on the Mac, as the app makes it.
 fn on_mac(mac: &Mac, method: &str, params: Value) -> Value {
     let line = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).to_string();
@@ -1308,6 +1389,7 @@ fn an_unreachable_server_is_refused_with_why_body(watch: &Watch) {
 #[test]
 #[ignore = "needs a real Linux server: VIBE_TEST_LINUX_HOST and VIBE_HOST_BUNDLE"]
 fn real_linux_host() {
+    the_real_hosts_state_is_kept();
     let dest = std::env::var("VIBE_TEST_LINUX_HOST")
         .ok()
         .filter(|d| !d.is_empty())
@@ -1345,7 +1427,7 @@ fn real_linux_host() {
         let started = mcp.call(
             "vibe_start_agent",
             json!({"project": project, "profile": "software-eng-linux", "prompt": "Say hi",
-                   "host": "testhost"}),
+                   "host": "testhost", "name": "real-host-test"}),
         );
         eprintln!("{started}");
         assert!(started.contains("testhost:"), "{started}");
@@ -1354,25 +1436,17 @@ fn real_linux_host() {
             all.contains(&format!("ssh -t {dest} .local/lib/vibeos/vibe attach")),
             "{all}"
         );
+        mcp.call(
+            "vibe_delete_agent",
+            json!({"agent": "testhost:real-host-test", "force": true}),
+        );
     }
-    // A hung connection: stop the link's ssh, as a pulled cable would.
-    let pids = String::from_utf8(
-        Command::new("pgrep")
-            .args(["-f", &format!("ssh .*{dest} .local/lib/vibeos/vibe rpc")])
-            .in_files()
-            .unwrap()
-            .stdout,
-    )
-    .unwrap();
-    for pid in pids.split_whitespace() {
-        let _ = Command::new("kill").args(["-STOP", pid]).status();
-    }
-    wait_for("the link to go down", Duration::from_secs(60), || {
-        link_is("  down")
-    });
-    for pid in pids.split_whitespace() {
-        let _ = Command::new("kill").args(["-KILL", pid]).status();
-    }
+    // A hung connection, as a pulled cable would make it.
+    let (_, events) = mac.core.subscribe();
+    let connection = shared_connection(&golden, &dest);
+    let _ = Command::new("kill").args(["-STOP", &connection]).status();
+    wait_for_link_down(&mac, events, "testhost", Duration::from_secs(60));
+    let _ = Command::new("kill").args(["-KILL", &connection]).status();
     wait_for("the link to come back", Duration::from_secs(90), || {
         link_is("  connected")
     });
@@ -1885,6 +1959,156 @@ fn external_access_answers_with_the_mac_asleep_or_stopped_body(watch: &Watch) {
     every_local_tool_answers_promptly(&mut c, "stopped");
 }
 
+/// `scripts/keep-host-state.sh`, against a real `vibed` on a stand-in host, doing what a
+/// real-host test does to it: however what it runs ends, the external address is as it
+/// was, and it says so if it can't be; and a key gone is a failure. Issue #100.
+#[test]
+fn a_hosts_state_is_kept_however_the_test_ends() {
+    bounded(DEADLINE, a_hosts_state_is_kept_body);
+}
+
+fn a_hosts_state_is_kept_body(watch: &Watch) {
+    let golden = common::Golden::new();
+    let hosts = common::short_tempdir();
+    watch.owns(golden.dir.path());
+    let ssh = fake_ssh(watch, hosts.path());
+    let host = FakeHost::new(hosts.path(), "me@vps", &golden.claude);
+    let port = free_port().port();
+    let ca = host.serve_publicly(port, "vps.test");
+    let mac = mac(&golden, &ssh, bundle(golden.dir.path()));
+    ok(vibe(&mac.socket, &["host", "add", "vps", "me@vps"]));
+    wait_for("the link", Duration::from_secs(30), || {
+        ok(vibe(&mac.socket, &["host"]))
+            .lines()
+            .any(|l| l.starts_with("vps  ") && l.contains("  connected"))
+    });
+    let socket = host.socket();
+    let key = mac
+        .core
+        .create_key(KeyCreateParams {
+            name: "real".into(),
+        })
+        .unwrap();
+    wait_for("the key pushed", Duration::from_secs(20), || {
+        ok(vibe(&socket, &["key"])).contains("real")
+    });
+    let prefix = key.key.prefix.clone();
+    let host_vibe = host.home.join(".local/lib/vibeos/vibe");
+    // Serving, as the host we mustn't break is, and asked for on the host itself.
+    let on_there = |args: &[&str]| ok(on_host(&host).args(args).output().unwrap());
+    on_there(&["host", "external", "local", "vps.test"]);
+    let domain_there = || {
+        ok(on_host(&host).arg("host").output().unwrap())
+            .lines()
+            .find(|l| l.starts_with("local "))
+            .unwrap()
+            .contains("external address https://vps.test/mcp")
+    };
+    assert!(domain_there());
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/keep-host-state.sh");
+    let keep = || {
+        let mut c = Command::new(&script);
+        c.arg("me@vps")
+            .arg("--")
+            .env("VIBE_SSH", &ssh)
+            .env("KEEP_HOST_URL", format!("https://vps.test:{port}/mcp"))
+            .env(
+                "KEEP_HOST_CURL_ARGS",
+                format!(
+                    "--cacert {} --resolve vps.test:{port}:127.0.0.1",
+                    ca.display()
+                ),
+            )
+            .env_remove("VIBE_SOCKET");
+        c
+    };
+    let off = format!(
+        "HOME={} {} host external local off",
+        host.home.display(),
+        host_vibe.display()
+    );
+    let run = |command: &str| keep().args(["/bin/sh", "-c", command]).in_files().unwrap();
+    let said = |o: &Output| {
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        )
+    };
+
+    // It's switched off, and all's well otherwise: it's put back.
+    let out = run(&format!("[ -n \"$VIBE_TEST_HOST_STATE_KEPT\" ] && {off}"));
+    assert!(out.status.success(), "{}", said(&out));
+    assert!(said(&out).contains("is as it was"), "{}", said(&out));
+    assert!(domain_there(), "{}", said(&out));
+
+    // It's switched off, and what's run fails: put back, and its failure is kept.
+    let out = run(&format!("{off}; exit 7"));
+    assert_eq!(out.status.code(), Some(7), "{}", said(&out));
+    assert!(domain_there(), "{}", said(&out));
+
+    // It's stopped midway, by a signal, as a person would, and then again, impatiently.
+    // The second, during the putting back, doesn't stop that.
+    let marker = hosts.path().join("off-now");
+    let mut stopped = keep();
+    stopped
+        .args([
+            "/bin/sh",
+            "-c",
+            &format!("{off}; touch {}; sleep 600", marker.display()),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = stopped.spawn().unwrap();
+    // Nobody reading what it says, as with a `| tee` that has gone.
+    drop(child.stdout.take());
+    wait_for("it to switch it off", Duration::from_secs(30), || {
+        marker.exists()
+    });
+    assert!(!domain_there());
+    // SAFETY: signals to the script this test started.
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    std::thread::sleep(Duration::from_millis(50));
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    let ended = child.wait().unwrap();
+    assert_eq!(ended.code(), Some(143));
+    assert!(domain_there());
+
+    // What a real test leaves behind of its own, if it failed before tidying up, goes.
+    let on_host_vibe = format!("HOME={} {}", host.home.display(), host_vibe.display());
+    let out = run(&format!("{on_host_vibe} key create external-test"));
+    assert!(out.status.success(), "{}", said(&out));
+    assert!(!ok(vibe(&socket, &["key"])).contains("external-test"));
+
+    // A key it doesn't recognize is left, as it could be anyone's, and said.
+    let out = run(&format!("{on_host_vibe} key create someone-else"));
+    assert!(!out.status.success(), "{}", said(&out));
+    assert!(said(&out).contains("someone-else"), "{}", said(&out));
+    ok(vibe(&socket, &["key", "revoke", "someone-else"]));
+
+    // A key gone can't be put back, but it's not let pass.
+    let out = run(&format!("{on_host_vibe} key revoke real"));
+    assert!(!out.status.success(), "{}", said(&out));
+    assert!(
+        said(&out).contains(&format!("lost the API key {prefix}")),
+        "{}",
+        said(&out)
+    );
+
+    // If it can't tell how the host is, it runs nothing.
+    let ran = hosts.path().join("ran");
+    let out = Command::new(&script)
+        .args(["me@nowhere", "--", "touch"])
+        .arg(&ran)
+        .env("VIBE_SSH", &ssh)
+        .in_files()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(said(&out).contains("nothing was run"), "{}", said(&out));
+    assert!(!ran.exists());
+    drop(mac.rt);
+}
+
 /// External access through a real server (`VIBE_TEST_LINUX_HOST`, with the
 /// Linux builds in `VIBE_HOST_BUNDLE`) at a public name pointing at it
 /// (`VIBE_TEST_EXTERNAL_DOMAIN`), with a real certificate from Let's
@@ -1896,6 +2120,7 @@ fn external_access_answers_with_the_mac_asleep_or_stopped_body(watch: &Watch) {
 #[test]
 #[ignore = "needs a real Linux server with a public name: VIBE_TEST_LINUX_HOST, VIBE_HOST_BUNDLE and VIBE_TEST_EXTERNAL_DOMAIN"]
 fn real_external_access() {
+    the_real_hosts_state_is_kept();
     let need = |name: &str| {
         std::env::var(name)
             .ok()
@@ -1980,11 +2205,7 @@ fn real_external_access() {
     // with a Mac asleep: the server goes on answering, with the Mac's agents as last
     // seen, and has them back when it resumes.
     c.call("vibe_list_agents", json!({}));
-    let pgrep = Command::new("pgrep")
-        .args(["-f", "ssh .*-R .*mac\\.sock"])
-        .in_files()
-        .unwrap();
-    let tunnel = String::from_utf8_lossy(&pgrep.stdout).trim().to_owned();
+    let tunnel = my_ssh("ssh .*-R .*mac\\.sock").trim().to_owned();
     assert!(!tunnel.is_empty(), "the Mac's ssh -R isn't running");
     let signal = |which: &str| {
         for pid in tunnel.lines() {
@@ -2041,9 +2262,29 @@ fn real_external_access() {
     wait_for("the revoke", Duration::from_secs(60), || {
         c.request("tools/list", json!({})).0 == 401
     });
-    ok(vibe(&mac.socket, &["host", "external", "testhost", "off"]));
+    // Forgetting the host, and then the Mac being gone altogether, leaves it serving.
+    // A revoked key is still an answer from it, over real TLS, so needs no key to work.
+    // This test never turns it off: a real Mac may be using it, and if it was off before,
+    // keep-host-state.sh turns it off again. (A renewal can't be asked for on a real
+    // server: Let's Encrypt's certificates renew at day 60.)
     ok(vibe(&mac.socket, &["host", "remove", "testhost"]));
     drop(mac.rt);
+    assert_eq!(
+        c.request("tools/list", json!({})).0,
+        401,
+        "it stopped serving"
+    );
+    let restart = Command::new("ssh")
+        .args(["-o", "BatchMode=yes", "--", &dest])
+        .arg("systemctl --user restart vibed.service")
+        .in_files()
+        .unwrap();
+    assert!(restart.status.success(), "{restart:?}");
+    wait_for(
+        "it to serve after a restart",
+        Duration::from_secs(120),
+        || c.request("tools/list", json!({})).0 == 401,
+    );
 }
 
 /// #74: lingering is VibeOS's to turn on: as the user, then with passwordless sudo,

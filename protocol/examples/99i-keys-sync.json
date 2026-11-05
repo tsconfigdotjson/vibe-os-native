@@ -1,10 +1,11 @@
 {
-  "description": "What a Mac sends each Linux host it's linked to when the link comes up and whenever a key is made or revoked: every key it has, by its hash, never the key. They replace the keys it pushed before, so a revoke reaches the host at once; the host's own keys, from `vibe key create`, stay. Pushed keys show as `pushed`, and are revoked on the Mac.",
+  "description": "What a Mac sends each Linux host it's linked to when the link comes up and whenever a key is made or revoked: every key it has, by its hash, never the key. They replace the keys that Mac pushed before, and no other Mac's, so a revoke reaches the host at once; the host's own keys, from `vibe key create`, stay. Pushed keys show as `pushed`, and are revoked on the Mac.",
   "request": {
     "jsonrpc": "2.0",
     "id": 997,
     "method": "keys.sync",
     "params": {
+      "from": "6b1f0c5e7a3d4f29",
       "keys": [
         {
           "name": "laptop Claude Code",

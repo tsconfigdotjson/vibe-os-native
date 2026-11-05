@@ -820,6 +820,14 @@ fn examples_cover_the_contract() {
         if ty == "ToolboxStatus" {
             seen_keys.insert("rebuild_held");
         }
+        // Only a Linux host says when its external address changed and who turned it
+        // off, and only a linked one's Mac passes that on; vibed's own tests cover it.
+        if ty == "HostInfo" {
+            seen_keys.insert("external_changed_at");
+            seen_keys.insert("external_note");
+            seen_keys.insert("external_serves");
+            seen_keys.insert("external_last");
+        }
         // Only a download that fails says so; vibed's own tests cover it.
         if ty == "PiStatus" {
             seen_keys.insert("error");

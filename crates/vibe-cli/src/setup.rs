@@ -462,6 +462,9 @@ pub(crate) fn describe_host(h: &HostInfo) -> String {
     if let Some(why) = &h.upgrade_error {
         out.push_str(&format!("  upgrading it failed: {why}"));
     }
+    if let Some(note) = &h.external_note {
+        out.push_str(&format!("  ({note})"));
+    }
     if h.external {
         out.push_str("  external address");
         if let Some(url) = &h.url {
@@ -696,6 +699,7 @@ pub(crate) fn run(socket: &Path, command: Command) -> Result<(), String> {
                 host: Some(host),
                 on: domain.is_some(),
                 domain,
+                by: Some("this host's `vibe`".into()),
             };
             let h = client::call::<HostsExternal>(socket, &params, TIMEOUT).map_err(e)?;
             println!("{}", describe_host(&h));
@@ -905,6 +909,10 @@ mod tests {
             detail: Some("it stopped answering".into()),
             url: None,
             tunnel: None,
+            external_changed_at: None,
+            external_note: None,
+            external_serves: None,
+            external_last: None,
             external_detail: None,
             memory: None,
             needs_admin: vec![],

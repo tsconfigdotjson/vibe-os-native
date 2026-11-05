@@ -158,6 +158,21 @@ const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE hosts ADD COLUMN needs_admin TEXT NOT NULL DEFAULT '';
     ",
+    // 9: a host shared by more than one Mac, and an external address that's the
+    // host's own (#100). Which Mac pushed each key, so that one replaces only its
+    // own, with '' for what came from a Mac too old to say. This install's id, for
+    // saying so. On a Mac, when the choice it couldn't deliver yet was made. On a
+    // Linux host's own row, when its external address changed and who asked.
+    "
+    ALTER TABLE pushed_keys ADD COLUMN source TEXT NOT NULL DEFAULT '';
+    ALTER TABLE revoked_pushed_keys ADD COLUMN source TEXT NOT NULL DEFAULT '';
+    CREATE TABLE install (id TEXT NOT NULL) STRICT;
+    ALTER TABLE hosts ADD COLUMN external_asked_at INTEGER;
+    ALTER TABLE hosts ADD COLUMN external_changed_at INTEGER;
+    ALTER TABLE hosts ADD COLUMN external_changed_by TEXT;
+    ALTER TABLE hosts ADD COLUMN external_chosen TEXT;
+    ALTER TABLE hosts ADD COLUMN external_seen TEXT;
+    ",
 ];
 
 /// The schema version this build reads and writes.
@@ -390,6 +405,10 @@ impl Store {
                     detail: None,
                     url: external.as_deref().map(external_url),
                     tunnel: None,
+                    external_changed_at: None,
+                    external_note: None,
+                    external_serves: None,
+                    external_last: None,
                     external_detail: None,
                     memory: None,
                     // Any this build doesn't know are left out.
@@ -507,6 +526,108 @@ impl Store {
             })
             .optional()?
             .ok_or_else(|| StoreError::NotFound(format!("no host named {name}")))
+    }
+
+    /// On a Mac, when the choice for `name` that hasn't reached it yet was made.
+    pub fn host_external_asked(&self, name: &str) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT external_asked_at FROM hosts WHERE name = ?1",
+                [name],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// On a Mac, notes that the choice for `name` is waiting to reach it, since `at`,
+    /// or with `None` that it has nothing waiting.
+    pub fn set_host_external_asked(&mut self, name: &str, at: Option<i64>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE hosts SET external_asked_at = ?2 WHERE name = ?1",
+            params![name, at],
+        )?;
+        Ok(())
+    }
+
+    /// On a Mac, the name someone chose for `name`'s external address that it has since
+    /// stopped serving, to go back to if it serves that name again.
+    pub fn host_external_chosen(&self, name: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT external_chosen FROM hosts WHERE name = ?1",
+                [name],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// On a Mac, notes or with `None` clears what [`Self::host_external_chosen`] says.
+    pub fn set_host_external_chosen(&mut self, name: &str, domain: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE hosts SET external_chosen = ?2 WHERE name = ?1",
+            params![name, domain],
+        )?;
+        Ok(())
+    }
+
+    /// On a Mac, the name `name` last said it serves, known while its link is down.
+    pub fn host_external_seen(&self, name: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT external_seen FROM hosts WHERE name = ?1",
+                [name],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// On a Mac, notes what [`Self::host_external_seen`] says.
+    pub fn set_host_external_seen(&mut self, name: &str, domain: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE hosts SET external_seen = ?2 WHERE name = ?1",
+            params![name, domain],
+        )?;
+        Ok(())
+    }
+
+    /// On a Mac, forgets every such name: someone has chosen afresh.
+    pub fn clear_host_external_chosen(&mut self) -> Result<()> {
+        self.conn
+            .execute("UPDATE hosts SET external_chosen = NULL", [])?;
+        Ok(())
+    }
+
+    /// On a Linux host, when its external address last changed and who asked.
+    pub fn host_external_changed(&self, name: &str) -> Result<Option<(i64, Option<String>)>> {
+        let row: Option<(Option<i64>, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT external_changed_at, external_changed_by FROM hosts WHERE name = ?1",
+                [name],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        Ok(row.and_then(|(at, by)| at.map(|at| (at, by))))
+    }
+
+    /// On a Linux host, notes when its external address changed and who asked.
+    pub fn set_host_external_changed(
+        &mut self,
+        name: &str,
+        at: i64,
+        by: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE hosts SET external_changed_at = ?2, external_changed_by = ?3 WHERE name = ?1",
+            params![name, at, by],
+        )?;
+        Ok(())
     }
 
     /// Records that `name` is the external address at `domain`, or with
@@ -1001,15 +1122,34 @@ impl Store {
         Ok(keys)
     }
 
-    /// Replaces every pushed key with `keys`, all at once. A key that stays
-    /// keeps when it was last used here.
-    pub fn sync_pushed_keys(&mut self, keys: &[KeyHash]) -> Result<()> {
+    /// Replaces the keys `source` pushed with `keys`, all at once, leaving what any
+    /// other Mac pushed. A key that stays keeps when it was last used here.
+    ///
+    /// What came from a Mac too old to say, source `''`, is adopted by the Mac that
+    /// pushes the same hash: that's the Mac it was, so the rest of what it pushed then
+    /// goes too, as it would have. A Mac that shares none of them isn't that one, and
+    /// takes nothing from it.
+    pub fn sync_pushed_keys(&mut self, source: &str, keys: &[KeyHash]) -> Result<()> {
         let tx = self.conn.transaction()?;
         let hashes: Vec<&str> = keys.iter().map(|k| k.hash.as_str()).collect();
+        // Whether this is the Mac that pushed what has no source.
+        let mut scope = vec![source];
+        if !source.is_empty() {
+            let mut stmt = tx.prepare("SELECT hash FROM pushed_keys WHERE source = ''")?;
+            let shares = stmt
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+                .iter()
+                .any(|h| hashes.contains(&h.as_str()));
+            if shares {
+                scope.push("");
+            }
+        }
         let mut kept = std::collections::HashMap::new();
-        {
-            let mut stmt = tx.prepare("SELECT hash, last_used_at FROM pushed_keys")?;
-            for row in stmt.query_map([], |r| {
+        for source in &scope {
+            let mut stmt =
+                tx.prepare("SELECT hash, last_used_at FROM pushed_keys WHERE source = ?1")?;
+            for row in stmt.query_map([source], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?))
             })? {
                 let (hash, used) = row?;
@@ -1017,14 +1157,14 @@ impl Store {
                     kept.insert(hash, used);
                 }
             }
+            tx.execute("DELETE FROM pushed_keys WHERE source = ?1", [source])?;
         }
-        tx.execute("DELETE FROM pushed_keys", [])?;
         // Revoked here, and so it stays. One the Mac has stopped pushing needn't be
         // remembered: no key comes back with the same hash but by chance.
         let mut revoked = std::collections::HashSet::new();
-        {
-            let mut stmt = tx.prepare("SELECT hash FROM revoked_pushed_keys")?;
-            for row in stmt.query_map([], |r| r.get::<_, String>(0))? {
+        for from in &scope {
+            let mut stmt = tx.prepare("SELECT hash FROM revoked_pushed_keys WHERE source = ?1")?;
+            for row in stmt.query_map([from], |r| r.get::<_, String>(0))? {
                 let hash = row?;
                 if hashes.contains(&hash.as_str()) {
                     revoked.insert(hash);
@@ -1033,17 +1173,35 @@ impl Store {
                 }
             }
         }
+        // Anyone's revoked: pushing it again from here doesn't bring it back.
+        for k in &hashes {
+            let gone: bool = tx.query_row(
+                "SELECT EXISTS (SELECT 1 FROM revoked_pushed_keys WHERE hash = ?1)",
+                [k],
+                |r| r.get(0),
+            )?;
+            if gone {
+                revoked.insert((*k).to_owned());
+            }
+        }
+        for from in scope.iter().filter(|f| f.is_empty()) {
+            tx.execute(
+                "UPDATE revoked_pushed_keys SET source = ?1 WHERE source = ?2",
+                params![source, from],
+            )?;
+        }
         for k in keys.iter().filter(|k| !revoked.contains(&k.hash)) {
             tx.execute(
-                "INSERT INTO pushed_keys (name, hash, prefix, created_at, last_used_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
+                "INSERT INTO pushed_keys (name, hash, prefix, created_at, last_used_at, source)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT (hash) DO NOTHING",
                 params![
                     k.name,
                     k.hash,
                     k.prefix,
                     k.created_at,
-                    kept.get(&k.hash).copied().flatten()
+                    kept.get(&k.hash).copied().flatten(),
+                    source
                 ],
             )?;
         }
@@ -1051,22 +1209,60 @@ impl Store {
         Ok(())
     }
 
+    /// This install's id, made the first time it's asked for: what a Mac tells a host
+    /// its keys are from.
+    pub fn install_id(&mut self, make: impl FnOnce() -> String) -> Result<String> {
+        let tx = self.conn.transaction()?;
+        let found: Option<String> = tx
+            .query_row("SELECT id FROM install", [], |r| r.get(0))
+            .optional()?;
+        let id = match found {
+            Some(id) => id,
+            None => {
+                let id = make();
+                tx.execute("INSERT INTO install (id) VALUES (?1)", [&id])?;
+                id
+            }
+        };
+        tx.commit()?;
+        Ok(id)
+    }
+
     /// The pushed key `name`, gone for good on this host, if there is one.
     fn revoke_pushed_key(&mut self, name: &str) -> Result<Option<ApiKey>> {
         let tx = self.conn.transaction()?;
+        // Two Macs can each have a key of one name, and a guess could be the wrong one.
+        let matching: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM pushed_keys WHERE name = ?1 OR prefix = ?1",
+            [name],
+            |r| r.get(0),
+        )?;
+        if matching > 1 {
+            return Err(StoreError::Conflict(format!(
+                "more than one key is called {name}: revoke one by the prefix `vibe key` shows"
+            )));
+        }
         let found = tx
             .query_row(
-                &format!("SELECT {PUSHED_KEY_COLUMNS}, hash FROM pushed_keys WHERE name = ?1"),
+                &format!(
+                    "SELECT {PUSHED_KEY_COLUMNS}, hash, source FROM pushed_keys WHERE name = ?1 OR prefix = ?1"
+                ),
                 [name],
-                |r| Ok((pushed_key_row(r)?, r.get::<_, String>("hash")?)),
+                |r| {
+                    Ok((
+                        pushed_key_row(r)?,
+                        r.get::<_, String>("hash")?,
+                        r.get::<_, String>("source")?,
+                    ))
+                },
             )
             .optional()?;
-        let Some((key, hash)) = found else {
+        let Some((key, hash, source)) = found else {
             return Ok(None);
         };
         tx.execute(
-            "INSERT OR IGNORE INTO revoked_pushed_keys (hash) VALUES (?1)",
-            [&hash],
+            "INSERT OR IGNORE INTO revoked_pushed_keys (hash, source) VALUES (?1, ?2)",
+            params![hash, source],
         )?;
         tx.execute("DELETE FROM pushed_keys WHERE hash = ?1", [&hash])?;
         tx.commit()?;
@@ -1090,7 +1286,19 @@ impl Store {
     pub fn revoke_key(&mut self, name: &str) -> Result<ApiKey> {
         let key = match self.key(name) {
             Err(StoreError::NotFound(m)) => {
-                return self.revoke_pushed_key(name)?.ok_or(StoreError::NotFound(m));
+                if let Some(pushed) = self.revoke_pushed_key(name)? {
+                    return Ok(pushed);
+                }
+                let own: Option<String> = self
+                    .conn
+                    .query_row("SELECT name FROM api_keys WHERE prefix = ?1", [name], |r| {
+                        r.get(0)
+                    })
+                    .optional()?;
+                return match own {
+                    Some(own) => self.revoke_key(&own),
+                    None => Err(StoreError::NotFound(m)),
+                };
             }
             other => other?,
         };
@@ -1396,6 +1604,10 @@ mod tests {
                 detail: None,
                 url: None,
                 tunnel: None,
+                external_changed_at: None,
+                external_note: None,
+                external_serves: None,
+                external_last: None,
                 external_detail: None,
                 memory: None,
                 needs_admin: vec![],
@@ -1420,6 +1632,10 @@ mod tests {
             detail: None,
             url: None,
             tunnel: None,
+            external_changed_at: None,
+            external_note: None,
+            external_serves: None,
+            external_last: None,
             external_detail: None,
             memory: None,
             needs_admin: vec![],
@@ -1509,6 +1725,103 @@ mod tests {
         assert!(matches!(s.host_agents("vps"), Err(StoreError::NotFound(_))));
     }
 
+    fn pushed(name: &str, hash: &str) -> KeyHash {
+        KeyHash {
+            name: name.into(),
+            prefix: format!("vk_{name}"),
+            hash: hash.into(),
+            created_at: "2026-10-30T12:00:00Z".into(),
+        }
+    }
+
+    fn pushed_names(s: &Store) -> Vec<String> {
+        let mut names: Vec<String> = s.keys().unwrap().into_iter().map(|k| k.name).collect();
+        names.sort();
+        names
+    }
+
+    /// A host can be shared: one Mac's pushes, and the empty one when it's forgotten,
+    /// are about its own keys.
+    #[test]
+    fn a_mac_replaces_only_the_keys_it_pushed() {
+        let mut s = store();
+        s.sync_pushed_keys("real", &[pushed("laptop", "h1"), pushed("ci", "h2")])
+            .unwrap();
+        s.sync_pushed_keys("test", &[pushed("test", "h3")]).unwrap();
+        assert_eq!(pushed_names(&s), ["ci", "laptop", "test"]);
+        s.sync_pushed_keys("test", &[]).unwrap();
+        assert_eq!(pushed_names(&s), ["ci", "laptop"]);
+        // Its own are still replaced whole, so a revoke on the Mac reaches here.
+        s.sync_pushed_keys("real", &[pushed("laptop", "h1")])
+            .unwrap();
+        assert_eq!(pushed_names(&s), ["laptop"]);
+    }
+
+    /// What's revoked here stays revoked, and one Mac's push doesn't forget what was
+    /// revoked of another's.
+    #[test]
+    fn a_macs_push_doesnt_forget_what_was_revoked_of_anothers() {
+        let mut s = store();
+        s.sync_pushed_keys("real", &[pushed("laptop", "h1"), pushed("ci", "h2")])
+            .unwrap();
+        s.revoke_pushed_key("ci").unwrap().unwrap();
+        s.sync_pushed_keys("test", &[pushed("test", "h3")]).unwrap();
+        s.sync_pushed_keys("real", &[pushed("laptop", "h1"), pushed("ci", "h2")])
+            .unwrap();
+        assert_eq!(pushed_names(&s), ["laptop", "test"]);
+    }
+
+    /// What a Mac pushed before they said who they were. A new Mac that shares none of
+    /// it, as a test's has, takes nothing from it. The Mac that pushed it, upgraded, is
+    /// known by a key they share, and then the rest goes, as a push always did: it's
+    /// what it revoked while the host was away.
+    #[test]
+    fn keys_from_before_macs_said_who_they_were() {
+        let mut s = store();
+        s.sync_pushed_keys("", &[pushed("laptop", "h1"), pushed("revoked", "h2")])
+            .unwrap();
+        s.sync_pushed_keys("test", &[pushed("test", "h3")]).unwrap();
+        assert_eq!(pushed_names(&s), ["laptop", "revoked", "test"]);
+        s.sync_pushed_keys("test", &[]).unwrap();
+        assert_eq!(pushed_names(&s), ["laptop", "revoked"]);
+        s.sync_pushed_keys("real", &[pushed("laptop", "h1")])
+            .unwrap();
+        assert_eq!(pushed_names(&s), ["laptop"]);
+        s.sync_pushed_keys("test", &[]).unwrap();
+        assert_eq!(pushed_names(&s), ["laptop"], "it's the real Mac's now");
+    }
+
+    /// Two Macs can each have a key of one name: a name alone won't revoke either, as a
+    /// guess could cut off the wrong Mac, and the prefix will.
+    #[test]
+    fn a_name_two_macs_use_is_refused_and_a_prefix_revokes() {
+        let mut s = store();
+        let mut one = pushed("laptop", "h1");
+        one.prefix = "vk_one".into();
+        let mut two = pushed("laptop", "h2");
+        two.prefix = "vk_two".into();
+        s.sync_pushed_keys("real", &[one]).unwrap();
+        s.sync_pushed_keys("other", &[two]).unwrap();
+        assert!(matches!(
+            s.revoke_key("laptop"),
+            Err(StoreError::Conflict(_))
+        ));
+        assert_eq!(s.revoke_key("vk_two").unwrap().prefix, "vk_two");
+        assert_eq!(s.revoke_key("laptop").unwrap().prefix, "vk_one");
+        assert!(matches!(
+            s.revoke_key("vk_one"),
+            Err(StoreError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn an_install_has_one_id() {
+        let mut s = store();
+        let id = s.install_id(|| "first".into()).unwrap();
+        assert_eq!(id, "first");
+        assert_eq!(s.install_id(|| "second".into()).unwrap(), "first");
+    }
+
     #[test]
     fn a_pushed_key_revoked_here_stays_revoked_whatever_is_pushed_next() {
         let mut s = store();
@@ -1518,7 +1831,7 @@ mod tests {
             hash: hash.into(),
             created_at: "2026-10-30T12:00:00Z".into(),
         };
-        s.sync_pushed_keys(&[pushed("laptop", "h1"), pushed("ci", "h2")])
+        s.sync_pushed_keys("mac", &[pushed("laptop", "h1"), pushed("ci", "h2")])
             .unwrap();
         let gone = s.revoke_key("laptop").unwrap();
         assert!(gone.pushed);
@@ -1526,14 +1839,14 @@ mod tests {
         assert!(s.use_key("h2", 10).unwrap().is_some(), "only that one");
 
         // The Mac doesn't know, and pushes it again.
-        s.sync_pushed_keys(&[pushed("laptop", "h1"), pushed("ci", "h2")])
+        s.sync_pushed_keys("mac", &[pushed("laptop", "h1"), pushed("ci", "h2")])
             .unwrap();
         assert_eq!(s.use_key("h1", 20).unwrap(), None);
         let names: Vec<_> = s.keys().unwrap().into_iter().map(|k| k.name).collect();
         assert_eq!(names, ["ci"]);
 
         // A new key of the same name is another key.
-        s.sync_pushed_keys(&[pushed("laptop", "h3"), pushed("ci", "h2")])
+        s.sync_pushed_keys("mac", &[pushed("laptop", "h3"), pushed("ci", "h2")])
             .unwrap();
         assert!(s.use_key("h3", 30).unwrap().is_some());
 
@@ -1555,7 +1868,7 @@ mod tests {
             hash: hash.into(),
             created_at: "2026-10-30T12:00:00Z".into(),
         };
-        s.sync_pushed_keys(&[pushed("laptop", "h1"), pushed("ci", "h2")])
+        s.sync_pushed_keys("mac", &[pushed("laptop", "h1"), pushed("ci", "h2")])
             .unwrap();
         let keys = s.keys().unwrap();
         let shown: Vec<_> = keys.iter().map(|k| (k.name.as_str(), k.pushed)).collect();
@@ -1577,7 +1890,8 @@ mod tests {
         assert!(matches!(s.revoke_key("nope"), Err(StoreError::NotFound(_))));
 
         // The next push replaces them all; a key kept keeps its last use.
-        s.sync_pushed_keys(&[pushed("laptop", "h1")]).unwrap();
+        s.sync_pushed_keys("mac", &[pushed("laptop", "h1")])
+            .unwrap();
         assert_eq!(s.use_key("h2", 30).unwrap(), None, "dropped from the push");
         let laptop = s
             .keys()
@@ -1586,7 +1900,7 @@ mod tests {
             .find(|k| k.name == "laptop")
             .unwrap();
         assert_eq!(laptop.last_used_at.as_deref(), Some("1970-01-01T00:00:20Z"));
-        s.sync_pushed_keys(&[]).unwrap();
+        s.sync_pushed_keys("mac", &[]).unwrap();
         assert_eq!(s.keys().unwrap().len(), 1);
         assert!(
             s.use_key("h0", 40).unwrap().is_some(),
