@@ -31,23 +31,41 @@ const WAIT: Duration = Duration::from_secs(20);
 struct World {
     layout: Layout,
     socket: PathBuf,
+    reaper: Child,
     _guard: SocketGuard,
     _rt: tokio::runtime::Runtime,
     _dir: tempfile::TempDir,
 }
 
-/// A toolbox test that fails leaves its shim behind otherwise, with its shell
-/// still at whatever it was running, spinning for as long as the machine is up.
-/// Found by its command line, as a shim whose output nobody reads may not answer
-/// on its socket, whose path is this world's alone. The shell goes with its
-/// terminal.
+/// A test that fails leaves its shims behind otherwise, with their shells still
+/// at whatever they were running, spinning for as long as the machine is up. A
+/// process of its own ends them when this one's end of a pipe closes, which it
+/// does however this ends, a `SIGKILL` included. Found by the command line, as a
+/// shim whose output nobody reads may not answer on its socket, whose path is
+/// this world's alone. The shells go with their terminals.
+fn reaper(layout: &Layout) -> Child {
+    Command::new("sh")
+        .args([
+            "-c",
+            "trap '' HUP INT TERM; cat >/dev/null; exec pkill -KILL -f \"$SHIMS\"",
+        ])
+        // Not in its arguments, or it would be found among them.
+        .env("SHIMS", format!("socket {}/", layout.run_dir().display()))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap()
+}
+
 impl Drop for World {
     fn drop(&mut self) {
-        let socket = self.layout.session_socket("toolbox");
-        let _ = Command::new("pkill")
-            .args(["-KILL", "-f"])
-            .arg(format!("socket {}", socket.display()))
-            .status();
+        drop(self.reaper.stdin.take());
+        // Not forever, should a process started just then have inherited the pipe.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && !matches!(self.reaper.try_wait(), Ok(Some(_)) | Err(_)) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 }
 
@@ -70,6 +88,7 @@ fn world() -> World {
         server::serve(listener, core, MAX_MESSAGE_BYTES, std::future::pending()).await;
     });
     World {
+        reaper: reaper(&layout),
         layout,
         socket,
         _guard: guard,
@@ -171,13 +190,24 @@ impl Term {
             });
         }
         let child = cmd.spawn().unwrap();
-        let master = File::from(master);
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let mut reader = master.try_clone().unwrap();
-        let sink = seen.clone();
-        let stall = Arc::new(AtomicBool::new(false));
-        let stalled = stall.clone();
-        let reader = std::thread::spawn(move || {
+        let mut term = Term {
+            master: Some(File::from(master)),
+            slave: Some(slave),
+            child,
+            seen: Arc::new(Mutex::new(Vec::new())),
+            stall: Arc::new(AtomicBool::new(false)),
+            reader: None,
+        };
+        term.start_reading();
+        term
+    }
+
+    fn start_reading(&mut self) {
+        let mut reader = self.master().try_clone().unwrap();
+        let sink = self.seen.clone();
+        let stalled = self.stall.clone();
+        stalled.store(false, Ordering::SeqCst);
+        self.reader = Some(std::thread::spawn(move || {
             let mut buf = [0u8; 4096];
             while let Ok(n) = reader.read(&mut buf) {
                 if n == 0 {
@@ -188,15 +218,7 @@ impl Term {
                     break;
                 }
             }
-        });
-        Term {
-            master: Some(master),
-            slave: Some(slave),
-            child,
-            seen,
-            stall,
-            reader: Some(reader),
-        }
+        }));
     }
 
     fn master(&self) -> &File {
@@ -210,9 +232,19 @@ impl Term {
     /// write fails as its `SIGHUP` arrives. Needs output running: the
     /// reader stops only once a read returns.
     fn close_window_while_writing(&mut self) {
+        self.stop_reading();
+        self.close_window();
+    }
+
+    /// Stops reading while the program is still writing, so it blocks with the
+    /// terminal's buffer full, as with a window that's stuck or about to close.
+    fn stop_reading(&mut self) {
         self.stall.store(true, Ordering::SeqCst);
         self.reader.take().unwrap().join().unwrap();
         std::thread::sleep(Duration::from_millis(500));
+    }
+
+    fn close_window(&mut self) {
         self.master = None;
         self.slave = None;
     }
@@ -587,6 +619,7 @@ fn toolbox_world_with(
         server::serve(listener, core, MAX_MESSAGE_BYTES, std::future::pending()).await;
     });
     World {
+        reaper: reaper(&layout),
         layout,
         socket,
         _guard: guard,
@@ -750,6 +783,79 @@ fn a_real_close_with_output_running_saves_the_toolbox() {
         let text = String::from_utf8_lossy(&out.stdout).into_owned();
         assert!(text.starts_with("state     closed\n"), "{text}");
     }
+}
+
+/// A window can hang up before it closes, or without closing at all, with
+/// `vibe` blocked writing to a terminal nobody reads: the hangup is still heard,
+/// and saves. The terminal stays open until the save is seen, so nothing but the
+/// `SIGHUP` can have told `vibe`.
+#[test]
+fn a_hangup_on_a_terminal_not_reading_saves_the_toolbox() {
+    let w = toolbox_world();
+    let mut cmd = w.vibe();
+    cmd.arg("toolbox");
+    let mut term = Term::spawn(cmd, Size { rows: 24, cols: 80 });
+    term.attached();
+    term.type_line("while :; do echo spam; done");
+    term.expect("spam\r\nspam");
+    term.stop_reading();
+    // SAFETY: a signal to the process this test started.
+    unsafe { libc::kill(term.child.id() as libc::pid_t, libc::SIGHUP) };
+    let template = w.layout.linux_dir().join("template-1.img");
+    wait_until("the save", || template.exists());
+    // Only now: a Mac's exit waits for a terminal to drain.
+    term.close_window();
+    assert_eq!(term.wait(), Some(0));
+    let out = w.vibe().args(["toolbox", "status"]).output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(text.starts_with("state     closed\n"), "{text}");
+}
+
+/// The shim gives up on a terminal that isn't reading, and then a resize fails to
+/// reach it: a hangup after that is heard all the same.
+#[test]
+fn a_hangup_after_the_shim_gave_up_on_the_terminal_saves_the_toolbox() {
+    let w = toolbox_world();
+    let mut cmd = w.vibe();
+    cmd.arg("toolbox");
+    let mut term = Term::spawn(cmd, Size { rows: 24, cols: 80 });
+    term.attached();
+    term.type_line("while :; do echo spam; done");
+    term.expect("spam\r\nspam");
+    term.stop_reading();
+    // Past the 30 s a shim gives a client that stops reading.
+    std::thread::sleep(Duration::from_secs(33));
+    // The first is taken, as the shim's reading end goes only on its next frame.
+    term.resize(Size { rows: 25, cols: 81 });
+    std::thread::sleep(Duration::from_millis(500));
+    term.resize(Size { rows: 26, cols: 82 });
+    std::thread::sleep(Duration::from_millis(500));
+    // SAFETY: a signal to the process this test started.
+    unsafe { libc::kill(term.child.id() as libc::pid_t, libc::SIGHUP) };
+    let template = w.layout.linux_dir().join("template-1.img");
+    wait_until("the save", || template.exists());
+    term.close_window();
+    assert_eq!(term.wait(), Some(0));
+}
+
+/// A detach isn't a hangup: however long a slow terminal takes, `vibe` waits to put
+/// it back as it found it, rather than leave it on the alternate screen.
+#[test]
+fn a_detach_waits_for_a_terminal_slow_to_read() {
+    let w = world();
+    let _shim = w.shell();
+    let mut term = w.attach("quiet-amber-otter", Size { rows: 24, cols: 80 });
+    term.attached();
+    term.type_line("printf '\\033[?1049h'; while :; do echo spam; done");
+    term.expect("spam\r\nspam");
+    term.stop_reading();
+    term.type_bytes(b"\x1c");
+    // Longer than a hangup would wait for it.
+    std::thread::sleep(Duration::from_secs(4));
+    term.start_reading();
+    assert_eq!(term.wait(), Some(0));
+    // Together, as the redraw on attaching says the first of these as well.
+    term.expect("\x1b[?1049l\r\n[detached from quiet-amber-otter]");
 }
 
 /// An agent's window closing for real, with output running, is a detach:
