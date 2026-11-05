@@ -694,6 +694,37 @@ async fn a_real_pi_decides_what_a_model_is() {
     assert!(said.contains("Model \"no-such-model\" not found"), "{said}");
     assert!(!said.contains("--list-models"), "{said}");
 
+    // A send wakes it, it gives up again, and the send says what Pi said.
+    let record = w
+        .layout
+        .agent_dir(&nosuch)
+        .join(vibe_core::shim::RECORD_FILE);
+    let before = std::fs::metadata(&record).unwrap().modified().unwrap();
+    let refused = w
+        .core
+        .send_input(
+            None,
+            &nosuch,
+            vibe_mcp::Input::Text {
+                text: "are you there?".into(),
+                submit: true,
+                force: false,
+            },
+        )
+        .await
+        .unwrap_err()
+        .message;
+    assert!(refused.contains("nothing was sent"), "{refused}");
+    assert!(
+        refused.contains("Model \"no-such-model\" not found"),
+        "{refused}"
+    );
+    assert!(!refused.contains("os error"), "{refused}");
+    assert_ne!(
+        std::fs::metadata(&record).unwrap().modified().unwrap(),
+        before
+    );
+
     for agent in [bare, nosuch] {
         w.core
             .delete_agent(AgentDeleteParams {

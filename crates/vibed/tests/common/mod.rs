@@ -876,6 +876,7 @@ pub fn write_record(
             at: at.into(),
         },
         output: Default::default(),
+        cols: None,
     };
     let dir = layout.agent_dir(agent);
     fs::create_dir_all(&dir).unwrap();

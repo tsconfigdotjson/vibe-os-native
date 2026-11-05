@@ -397,13 +397,24 @@ impl Core {
         let s = socket.clone();
         let screen = tokio::task::spawn_blocking(move || screen_now(&s))
             .await
-            .map_err(|e| error(ErrorCode::InternalError, format!("Internal error: {e}")))?
-            .map_err(|e| {
-                error(
+            .map_err(|e| error(ErrorCode::InternalError, format!("Internal error: {e}")))?;
+        let screen = match screen {
+            Ok(screen) => screen,
+            Err(e) => {
+                // A Pi that gave up again as it was woken has said why.
+                let said = match self.named(Some(&host), agent_ref) {
+                    Ok(now) if now.agent == vibe_core::model::AgentKind::Pi => {
+                        self.pi_gave_up_with(&now).await
+                    }
+                    _ => None,
+                };
+                let why = said.unwrap_or_else(|| e.to_string());
+                return Err(error(
                     ErrorCode::Conflict,
-                    format!("{agent_ref} isn't running, so nothing was sent: {e}"),
-                )
-            })?;
+                    format!("{agent_ref} isn't running, so nothing was sent: {why}"),
+                ));
+            }
+        };
         let chunks = chunks_of(&input, screen.bracketed_paste);
         typing_began.store(true, Ordering::SeqCst);
         let s = socket.clone();

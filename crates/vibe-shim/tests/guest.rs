@@ -413,6 +413,9 @@ fn a_linux_agents_terminal_is_held_in_the_guest_and_outlives_its_shims() {
     assert_eq!(d.exit.as_ref().and_then(|e| e.code), Some(4));
     fourth.wait_gone();
     let record = fourth.record().expect("a record of the end");
+    // The width is the guest's terminal's, as the first shim's client left it, and
+    // not where it started: that's what wrapped what's on its screen.
+    assert_eq!(record.cols, Some(70));
     assert_eq!(
         (record.exit.code, record.command),
         (Some(4), vec!["sh".to_owned()])

@@ -294,6 +294,7 @@ impl State {
             started_at: rfc3339(self.session.started_at),
             exit: exit.clone(),
             output: self.screen.output(None, usize::MAX),
+            cols: Some(self.size.cols),
         };
         let path = self.session.state_dir.join(shim::RECORD_FILE);
         let tmp = path.with_extension("json.tmp");
