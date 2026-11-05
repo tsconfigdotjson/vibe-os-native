@@ -92,7 +92,7 @@ case "$1 $2" in
 "auth git-credential")
   exit 0 ;;
 "api meta")
-  if [ -f "$WORLD/network-down" ] || [ -f "$WORLD/bad-token" ] || [ ! -f "$WORLD/logged-in" ]; then
+  if [ -f "$WORLD/network-down" ] || [ -f "$WORLD/bad-token" ] || [ -f "$WORLD/meta-down" ] || [ ! -f "$WORLD/logged-in" ]; then
     echo 'gh: Requires authentication (HTTP 401)' >&2
     exit 1
   fi
@@ -556,7 +556,7 @@ async fn a_key_github_has_dropped_is_not_pinned_by_a_build_still_carrying_it() {
 #[tokio::test]
 async fn no_answer_from_github_pins_nothing_and_the_clone_goes_on() {
     let w = fresh_host("ssh", true);
-    fs::write(w.world.join("published-keys"), "").unwrap();
+    fs::write(w.world.join("meta-down"), "").unwrap();
     let project = w.add().await.unwrap();
     assert_eq!(w.known_hosts(), "");
     assert_eq!(w.origin(&project.path), "https://github.com/me/web.git");

@@ -234,6 +234,17 @@ impl Machine {
     }
 }
 
+impl Machine {
+    /// The credential helpers git's global config has for `key`. Exit 1 is "not set",
+    /// which is an answer too. Whatever a failure printed is git's complaint, not a
+    /// helper, as of a `.gitconfig` it can't read: that's none, and `gh auth setup-git`
+    /// then meets the same trouble and says so.
+    fn git_helpers(&self, git: &str, key: &str) -> Result<String, String> {
+        let (read, text) = self.run(&[git, "config", "--global", "--get-all", key])?;
+        Ok(if read { text } else { String::new() })
+    }
+}
+
 impl HostChecks for Machine {
     fn find(&self, name: &str) -> Option<PathBuf> {
         self.which(name)
@@ -252,8 +263,7 @@ impl HostChecks for Machine {
         let git = git.to_string_lossy();
         let mut helpers = String::new();
         for key in [GITHUB_HELPER, "credential.helper"] {
-            // Exit 1 is "not set", which is an answer too.
-            let (_, text) = self.run(&[&git, "config", "--global", "--get-all", key])?;
+            let text = self.git_helpers(&git, key)?;
             // A way of its own for GitHub alone is the owner's, and `gh auth setup-git`
             // would replace it, so it counts.
             if key == GITHUB_HELPER && is_owners_helper(&text) {
@@ -269,9 +279,8 @@ impl HostChecks for Machine {
         let Ok(git) = self.git_program() else {
             return false;
         };
-        let git = git.to_string_lossy();
-        self.run(&[&git, "config", "--global", "--get-all", GITHUB_HELPER])
-            .is_ok_and(|(_, text)| is_owners_helper(&text))
+        self.git_helpers(&git.to_string_lossy(), GITHUB_HELPER)
+            .is_ok_and(|text| is_owners_helper(&text))
     }
 
     fn setup_git(&self, gh: &OsStr) -> Result<(), String> {
@@ -1262,6 +1271,32 @@ mod tests {
             r.checks[2]
         );
         assert!(!r.checks[2].detail.contains("asks gh"), "{:?}", r.checks[2]);
+    }
+
+    /// The real git, on a `.gitconfig` it can't read: what it complains isn't a helper of
+    /// the owner's, so nothing passes on the strength of it, and what's wrong gets said.
+    #[test]
+    fn a_gitconfig_git_cant_read_is_not_a_helper_of_the_owners() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (home, bin) = (tmp.path().join("home"), tmp.path().join("bin"));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        let gh = script(&bin, "gh", "echo 'fatal: bad config line 1' >&2; exit 1");
+        let path = std::env::var("PATH").unwrap_or_default();
+        let machine = Machine::new(&home).with_path(&path);
+        let config = home.join(".gitconfig");
+        for broken in [true, false] {
+            if broken {
+                std::fs::write(&config, "[not a section\n").unwrap();
+            } else {
+                std::fs::remove_file(&config).unwrap();
+                std::fs::create_dir(&config).unwrap();
+            }
+            assert_eq!(machine.git_uses_gh(), Ok(false));
+            assert!(!machine.owners_github_helper());
+            let said = git_through_gh(&machine, gh.as_os_str()).unwrap_err();
+            assert!(said.contains("bad config"), "{said}");
+        }
     }
 
     /// Run together, `gh auth setup-git` fails on git's lock on its config, as real gh

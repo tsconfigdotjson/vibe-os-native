@@ -121,8 +121,9 @@ exit 0"#;
 /// agent shares its project's `.git`, whose `origin` may well be SSH, as the Mac's clone
 /// is, and that login is what it has to push with (PRD: Key user flows, Finish): the
 /// Linux home has no SSH key unless one's been put there, nor a known GitHub host key. So
-/// git goes to GitHub over HTTPS here, whatever the `origin`, and only here: the project's
-/// config isn't touched. Run again, it changes nothing, and leaves other values be.
+/// git goes to GitHub over HTTPS here, for an `origin` in either of the usual SSH forms,
+/// and only here: the project's config isn't touched. Run again, it changes nothing, and
+/// leaves other values be.
 pub(crate) const GH_LOGIN: &str = r#"printf %s "$VIBE_GH_TOKEN" | gh auth login --hostname github.com --with-token &&
 gh auth setup-git --hostname github.com &&
 git config --global --replace-all url.https://github.com/.insteadOf git@github.com: '^git@github\.com:$' &&

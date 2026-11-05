@@ -843,6 +843,7 @@ fn a_github_login_takes_an_ssh_origin_over_https_with_it() {
             .env("HOME", tmp.path())
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env_remove("XDG_CONFIG_HOME")
+            .env_remove("GIT_CONFIG_GLOBAL")
             .output()
             .unwrap();
         String::from_utf8_lossy(&out.stdout).trim().to_owned()
@@ -862,6 +863,7 @@ fn a_github_login_takes_an_ssh_origin_over_https_with_it() {
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("VIBE_GH_TOKEN", "gho_secret")
             .env_remove("XDG_CONFIG_HOME")
+            .env_remove("GIT_CONFIG_GLOBAL")
             .stdin(std::process::Stdio::null())
             .status()
             .unwrap();
