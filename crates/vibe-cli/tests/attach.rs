@@ -786,8 +786,8 @@ fn a_real_close_with_output_running_saves_the_toolbox() {
 }
 
 /// `yes`, with a terminal attached: closing the window saves, and so does Save &
-/// Close, which is `vibe toolbox close` here and the button in Settings. The shell
-/// has to pass the hang-up on, as job control has `yes` in a group of its own.
+/// Close, which is `vibe toolbox close` here and the button in Settings. Job control
+/// has `yes` in a group of its own, out of reach of the `kill`: it ends with the shell.
 #[test]
 fn closing_with_yes_running_saves_the_toolbox() {
     let w = toolbox_world();

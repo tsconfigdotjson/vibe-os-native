@@ -448,8 +448,8 @@ fn a_hang_up_in_the_guest_ends_a_shell_flooding_its_terminal() {
 }
 
 /// The same with what a toolbox has: a login `bash`, whose job control puts `yes`
-/// in a group of its own, out of reach of the `kill`, so the shell has to pass the
-/// hang-up on. This terminal is a Linux one on a Mac too: it's in the guest.
+/// in a group of its own, out of reach of the `kill`, so it can only end with the
+/// shell. This terminal is a Linux one on a Mac too: it's in the guest.
 #[test]
 fn a_hang_up_in_the_guest_ends_a_login_bash_running_yes() {
     hang_up_on_a_flood(&["/bin/bash", "-l"], "yes", "y\r\ny");

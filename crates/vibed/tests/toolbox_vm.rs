@@ -234,12 +234,18 @@ impl World {
             ended.join().unwrap(),
             "the terminal never saw the shell end"
         );
-        let left = std::process::Command::new("kill")
+        // Its socket went first: it gives a stuck client a moment after that.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while std::process::Command::new("kill")
             .args(["-0", &shim.pid.to_string()])
             .stderr(std::process::Stdio::null())
             .status()
-            .unwrap();
-        assert!(!left.success(), "the shim {} stayed", shim.pid);
+            .unwrap()
+            .success()
+        {
+            assert!(Instant::now() < deadline, "the shim {} stayed", shim.pid);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         (closed.template.unwrap(), closed.home.unwrap())
     }
 
