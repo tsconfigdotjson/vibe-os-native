@@ -104,7 +104,8 @@ commands:
   host add NAME SSH-DESTINATION
               install vibed on a Linux host over SSH (as Add Linux Host…
               does) and link it, as NAME
-  host upgrade NAME    install this build's vibed there, if it runs another
+  host upgrade NAME    install this build's vibed there now, unless it runs a newer
+                       one; it happens by itself, so this is to try again sooner
   host remove NAME     forget a Linux host; it runs on there, on its own
   host external NAME DOMAIN
               make a Linux host the external address: it serves

@@ -459,6 +459,9 @@ pub(crate) fn describe_host(h: &HostInfo) -> String {
     if !h.needs_admin.is_empty() {
         out.push_str("  needs sudo there once: Settings → Hosts has the button");
     }
+    if let Some(why) = &h.upgrade_error {
+        out.push_str(&format!("  upgrading it failed: {why}"));
+    }
     if h.external {
         out.push_str("  external address");
         if let Some(url) = &h.url {
@@ -905,6 +908,7 @@ mod tests {
             external_detail: None,
             memory: None,
             needs_admin: vec![],
+            upgrade_error: None,
         };
         assert_eq!(
             describe_host(&h),

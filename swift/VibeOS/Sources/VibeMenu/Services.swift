@@ -129,7 +129,7 @@ public func serviceFailure(_ error: any Error, host: String) -> String {
     if let client = error as? VibedClientError, case .rpc(let rpc) = client,
         rpc.code == RPCErrorCode.methodNotFound.rawValue
     {
-        return "\(host) needs updating for shared services: Settings → Hosts → Update vibed."
+        return "\(host) needs updating for shared services, which VibeOS does by itself: Settings → Hosts says how that's going."
     }
     return describe(error)
 }

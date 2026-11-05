@@ -100,7 +100,7 @@ struct ServicesTests {
 
     @Test func anOlderHostIsToldToUpdate() {
         let old = VibedClientError.rpc(RPCError(code: RPCErrorCode.methodNotFound.rawValue, message: "Method not found: services.list"))
-        #expect(serviceFailure(old, host: "vps") == "vps needs updating for shared services: Settings → Hosts → Update vibed.")
+        #expect(serviceFailure(old, host: "vps") == "vps needs updating for shared services, which VibeOS does by itself: Settings → Hosts says how that's going.")
         let other = VibedClientError.rpc(RPCError(code: RPCErrorCode.hostUnavailable.rawValue, message: "vps is unavailable"))
         #expect(serviceFailure(other, host: "vps") == "vps is unavailable")
     }

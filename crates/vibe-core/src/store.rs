@@ -397,6 +397,7 @@ impl Store {
                         .iter()
                         .filter_map(|n| n.parse().ok())
                         .collect(),
+                    upgrade_error: None,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
@@ -1398,6 +1399,7 @@ mod tests {
                 external_detail: None,
                 memory: None,
                 needs_admin: vec![],
+                upgrade_error: None,
             }]
         );
         assert!(s.has_host("local").unwrap());
@@ -1421,6 +1423,7 @@ mod tests {
             external_detail: None,
             memory: None,
             needs_admin: vec![],
+            upgrade_error: None,
         }
     }
 
