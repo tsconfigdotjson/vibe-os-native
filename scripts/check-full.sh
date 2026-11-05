@@ -27,7 +27,9 @@
 #     rest with nothing attached it falls asleep on vibed's own watch once
 #     a 1 s idle_debounce has passed, and a send wakes it to answer its
 #     question; a delete is refused while a commit is unpushed, and once
-#     it's pushed, leaves nothing behind but the branch
+#     it's pushed, leaves nothing of it behind but the branch. run/ then holds
+#     vibed's own .services.sock, for agents yet to start, and once vibed stops
+#     only its lock stays
 #   - sleep, wake and admission (#6, #47), one scripted scenario on every
 #     backend (crates/vibed/tests/sleep.rs): idle -> asleep once the
 #     debounce has passed; a send, and an attach, wake it; a start past
@@ -340,13 +342,15 @@ stop_vibed() {
 # left_behind <run> <dir>...: what's in these folders, and in <run> if it's a
 # run/. The shared services' socket isn't an agent's: it's vibed's own, there for
 # as long as vibed is, for agents yet to start. So it's the one thing a running
-# vibed may have there, and has to.
+# vibed may have there, and has to. A folder it can't look through is reported
+# too, as a step's `left=$(...)` would otherwise end there with nothing said.
 left_behind() {
   local run=$1
   shift
   [ -S "$run/.services.sock" ] || echo "no $run/.services.sock while vibed is up"
   find "$@" "$run" -mindepth 1 \
-    ! -path "$run/.services.sock" ! -path "$run/.services.sock.lock" 2>/dev/null
+    ! -path "$run/.services.sock" ! -path "$run/.services.sock.lock" 2>&1 ||
+    echo "find couldn't look through all of it"
 }
 
 # services_socket_gone <run>: vibed takes it with it, and only its lock stays.
@@ -656,7 +660,7 @@ s_agents() {
   expect '"state":"exited"' "the deleted agent"
   [ ! -e "$worktree" ] || { echo "the worktree is left"; return 1; }
   [ ! -e "$home/VibeOS/agents/$ref" ] || { echo "its directory is left"; return 1; }
-  # Nothing of it in VibeOS's folders, nor a socket or lock in run/.
+  # Nothing of it in VibeOS's folders, nor a socket or lock of its in run/.
   left=$(left_behind "$run" "$home/VibeOS/worktrees" "$home/VibeOS/agents")
   [ -z "$left" ] || { echo "left behind: $left"; return 1; }
   git -C "$repo" rev-parse --verify --quiet "refs/heads/$ref" >/dev/null || { echo "the branch went"; return 1; }
