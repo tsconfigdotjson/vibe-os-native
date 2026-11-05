@@ -1263,7 +1263,6 @@ public struct HostNameParams: Codable, Hashable, Sendable {
     }
 }
 
-/// How an install over SSH went.
 public struct SignInStartParams: Codable, Hashable, Sendable {
     public var host: String?
     public var what: SignInWhat
@@ -1342,13 +1341,17 @@ public struct SignIn: Codable, Hashable, Sendable {
     public var asksForCode: Bool
     /// The flow opens the browser itself, as it's on the Mac.
     public var opensItself: Bool
-    /// Why it failed, in words.
+    /// It's been approved, and the login's on its way to where it goes: it can't be
+    /// given up on now.
+    public var finishing: Bool
+    /// Why it failed, or why what was just given it wasn't taken, in words.
     public var error: String?
 
     public enum CodingKeys: String, CodingKey, CaseIterable {
         case id, host, what, seq, state, url, code
         case asksForCode = "asks_for_code"
         case opensItself = "opens_itself"
+        case finishing
         case error
     }
 }
@@ -1364,6 +1367,7 @@ public struct HostAdmin: Codable, Hashable, Sendable {
     }
 }
 
+/// How an install over SSH went.
 public struct HostInstall: Codable, Hashable, Sendable {
     public var host: HostInfo
     /// Whether it changed what the server runs.

@@ -1178,12 +1178,13 @@ pub struct SignIn {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
     /// That page shows a code to bring back, for `signin.answer`.
-    #[serde(default)]
     pub asks_for_code: bool,
     /// The flow opens the browser itself, as it's on the Mac.
-    #[serde(default)]
     pub opens_itself: bool,
-    /// Why it failed, in words.
+    /// It's been approved, and the login's on its way to where it goes: it can't be
+    /// given up on now.
+    pub finishing: bool,
+    /// Why it failed, or why what was just given it wasn't taken, in words.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }

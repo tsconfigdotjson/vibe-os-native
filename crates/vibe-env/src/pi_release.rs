@@ -274,7 +274,9 @@ pub(crate) fn check_link(link: &Path, root: &Path) -> Result<()> {
         Err(e) => Err(err(format!("look at {}: {e}", link.display()))),
         Ok(_) => {
             let ours = fs::read_link(link).is_ok_and(|to| to.starts_with(root));
-            if ours {
+            // A link to nothing isn't anyone's tool: what it was is gone.
+            let dangling = fs::metadata(link).is_err();
+            if ours || dangling {
                 Ok(())
             } else {
                 Err(err(format!(

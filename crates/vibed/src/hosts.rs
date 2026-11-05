@@ -273,15 +273,15 @@ impl Core {
 
     /// What this host still needs signing in to, as far as it can cheaply tell, as
     /// `hosts.list` is asked with every ping: `gh`'s login as its hourly check last
-    /// found, and whether Claude Code has its login.
+    /// found, and Claude Code's as last looked at. Not one that isn't here yet: there's
+    /// nothing to sign in with.
     fn sign_ins_needed(&self) -> Vec<vibe_core::model::SignInWhat> {
         use vibe_core::model::{GhState, SignInWhat};
         let mut needed = Vec::new();
         if lock(&self.gh_status).state == GhState::LoggedOut {
             needed.push(SignInWhat::Github);
         }
-        // Only where looking is a file: a Mac asks its Keychain, and its doctor says.
-        if self.info().os == "linux" && self.checks.claude_login().is_err() {
+        if self.claude_signed_out.load(Ordering::SeqCst) {
             needed.push(SignInWhat::Claude);
         }
         needed
@@ -297,7 +297,7 @@ impl Core {
         if self.port_denied() {
             needs.push(AdminNeed::Port443);
         }
-        if self.git_needs_admin.load(Ordering::SeqCst) {
+        if self.git_waits_for_admin() {
             needs.push(AdminNeed::Git);
         }
         needs

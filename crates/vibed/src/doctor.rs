@@ -66,6 +66,9 @@ pub trait HostChecks: Send + Sync + fmt::Debug {
     /// Whether VibeOS may install what's missing here. Only for this user's own home:
     /// a `HOME` that isn't, as in a test, is no place to go downloading to.
     fn installs_tools(&self) -> bool;
+    /// Whether a `claude` is here at all, whether or not it runs. One that doesn't is
+    /// the owner's to look at: VibeOS doesn't put another beside it.
+    fn claude_found(&self) -> bool;
 }
 
 /// Where systemd keeps who lingers: an empty file named for each user.
@@ -353,6 +356,12 @@ impl HostChecks for Machine {
         self.own_home()
     }
 
+    fn claude_found(&self) -> bool {
+        self.claude.is_some()
+            || self.which("claude").is_some()
+            || self.home.join(".claude/local/claude").is_file()
+    }
+
     fn enable_linger(&self) -> Result<(), String> {
         let Some(l) = self.lingers() else {
             return Ok(());
@@ -471,6 +480,9 @@ impl HostChecks for FixedChecks {
     }
     fn installs_tools(&self) -> bool {
         self.installs_tools
+    }
+    fn claude_found(&self) -> bool {
+        self.claude.is_ok()
     }
     fn enable_linger(&self) -> Result<(), String> {
         if self.enable_linger.is_ok() {
@@ -608,8 +620,8 @@ pub(crate) struct Found {
 
 /// What only a person can do about a login, and where the one click is. A host on its
 /// own, with no Mac to click on, has its provider's own command: there's nothing else.
-const SIGN_IN_HINT: &str = "One click in VibeOS: its setup on the Mac, or Settings → Hosts for a \
-                            Linux host. A host with no Mac signs in with the tool's own login.";
+const SIGN_IN_HINT: &str = "One click in VibeOS: Settings → Hosts. A host with no Mac signs in \
+                            with the tool's own login.";
 
 /// The checks, in [`CheckId`]'s order, from what was found.
 fn report(
@@ -870,6 +882,10 @@ impl Core {
             }
             Err(e) => (Self::found_failed(&e.to_string()), None),
         };
+        self.claude_signed_out.store(
+            found.claude.is_ok() && found.claude_login.is_err(),
+            std::sync::atomic::Ordering::SeqCst,
+        );
         let mut report = report(
             found,
             &gh,
@@ -953,6 +969,7 @@ impl Core {
                 crate::log!("vibed: git now asks gh for GitHub's credentials (gh auth setup-git)");
                 *lock(&self.doctor_found) = None;
             }
+            // In the background, as a download can outlast whoever asked.
             CheckId::Gh | CheckId::Claude if self.tool_try_again(p.check).await => {
                 return Ok(self.doctor().await);
             }

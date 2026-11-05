@@ -14,6 +14,7 @@
     "id": 9960,
     "result": {
       "asks_for_code": false,
+      "finishing": false,
       "host": "local",
       "id": "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf",
       "opens_itself": false,

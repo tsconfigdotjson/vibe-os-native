@@ -1,15 +1,18 @@
 //! Installing what a host's agents need and don't have, for nobody to have to:
 //! GitHub's `gh` and Claude Code, each from its publisher's own releases, each checked
-//! against the sums published with it, under VibeOS's data directory and linked from
-//! `~/.local/bin`. No root, and never over something that isn't VibeOS's: one of the
-//! owner's on the `PATH` is used as it is, and this isn't called at all.
+//! against the sums published with it, linked from `~/.local/bin`. `gh` goes under
+//! VibeOS's data directory. Claude Code installs itself from the checked build, as its
+//! own installer has it do, so it goes on updating itself as ever. No root, and never
+//! over something that isn't VibeOS's: one of the owner's on the `PATH` is used as it
+//! is, and this isn't called at all.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
-use crate::images::{self, ImageError, Result, fetch_bounded, sha256_file};
+use crate::images::{self, ImageError, Result, fetch, fetch_bounded, sha256_file};
 use crate::pi_release::{check_link, point_link};
 
 /// Where GitHub publishes `gh`.
@@ -36,7 +39,15 @@ fn gh_build_here() -> Option<(&'static str, &'static str)> {
 
 /// What Claude Code's releases call the build for this machine.
 fn claude_build_here() -> Option<&'static str> {
+    // Alpine and the like: the usual build wouldn't run.
+    let musl = cfg!(target_os = "linux")
+        && fs::read_dir("/lib").is_ok_and(|dir| {
+            dir.flatten()
+                .any(|e| e.file_name().to_string_lossy().starts_with("ld-musl-"))
+        });
     match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") if musl => Some("linux-x64-musl"),
+        ("linux", "aarch64") if musl => Some("linux-arm64-musl"),
         ("linux", "x86_64") => Some("linux-x64"),
         ("linux", "aarch64") => Some("linux-arm64"),
         ("macos", "x86_64") => Some("darwin-x64"),
@@ -125,11 +136,43 @@ fn install_gh_build(
         })?;
     }
     point_link(&link, &binary)?;
+    prune_gh(root, &dest);
     Ok(binary)
 }
 
-/// Installs the newest Claude Code: `<root>/claude-<version>/claude`, linked at
-/// `<home>/.local/bin/claude`. Says which version.
+/// The `gh`s of pins gone by, once the link's moved on.
+fn prune_gh(root: &Path, keep: &Path) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_name().to_string_lossy().starts_with("gh-") && entry.path() != keep {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// Whether the `gh` found at `found` is the one [`install_gh`] linked, of a version this
+/// build doesn't pin: it's VibeOS's, so it follows. The owner's own is left alone.
+pub fn gh_needs_update(found: &Path, root: &Path, home: &Path) -> bool {
+    let real = |p: &Path| fs::canonicalize(p).ok();
+    let (Some(found), Some(linked), Some(root)) =
+        (real(found), real(&home.join(".local/bin/gh")), real(root))
+    else {
+        return false;
+    };
+    found == linked
+        && linked.starts_with(&root)
+        && linked != root.join(format!("gh-{GH_PINNED}")).join("gh")
+}
+
+/// How long Claude Code may take to install itself, as it downloads a build too.
+const CLAUDE_INSTALL_FOR: Duration = Duration::from_secs(20 * 60);
+
+/// Installs the newest Claude Code, the way its own installer does: downloads the build,
+/// checks it, and has it install itself, which keeps its versions and links
+/// `<home>/.local/bin/claude`. So it updates itself from then on as it always does, and
+/// tidies up what it no longer needs. Says which version.
 pub fn install_claude(releases: &str, root: &Path, home: &Path) -> Result<(String, PathBuf)> {
     let build =
         claude_build_here().ok_or_else(|| err("Claude Code has no build for this machine"))?;
@@ -147,27 +190,64 @@ fn install_claude_build(
     let releases = releases.trim_end_matches('/');
     in_scratch(root, ".claude-download", |scratch| {
         let (version, checksum) = images::claude_release(releases, build, scratch)?;
-        let dest = root.join(format!("claude-{version}"));
-        let binary = dest.join("claude");
-        if !binary.is_file() {
-            let got_path = scratch.join("claude");
-            fetch_bounded(&format!("{releases}/{version}/{build}/claude"), &got_path)?;
-            let got = sha256_file(&got_path).map_err(|e| err(format!("read Claude Code: {e}")))?;
-            if !got.eq_ignore_ascii_case(&checksum) {
-                return Err(err(format!(
-                    "Claude Code {version} has SHA-256 {got}, but its manifest says {checksum}"
-                )));
-            }
-            fs::set_permissions(&got_path, fs::Permissions::from_mode(0o755))
-                .map_err(|e| err(format!("make Claude Code runnable: {e}")))?;
-            let _ = fs::remove_dir_all(&dest);
-            fs::create_dir_all(&dest)
-                .map_err(|e| err(format!("create {}: {e}", dest.display())))?;
-            fs::rename(&got_path, &binary)
-                .map_err(|e| err(format!("keep {}: {e}", binary.display())))?;
+        let bootstrap = scratch.join("claude");
+        // However long it takes: it's big, and a slow link's not a stalled one.
+        fetch(&format!("{releases}/{version}/{build}/claude"), &bootstrap)?;
+        let got = sha256_file(&bootstrap).map_err(|e| err(format!("read Claude Code: {e}")))?;
+        if !got.eq_ignore_ascii_case(&checksum) {
+            return Err(err(format!(
+                "Claude Code {version} has SHA-256 {got}, but its manifest says {checksum}"
+            )));
         }
-        point_link(&link, &binary)?;
-        Ok((version, binary))
+        fs::set_permissions(&bootstrap, fs::Permissions::from_mode(0o755))
+            .map_err(|e| err(format!("make Claude Code runnable: {e}")))?;
+        // To a file, as a pipe left unread would stop it when full.
+        let said_at = scratch.join("install.log");
+        let said = fs::File::create(&said_at)
+            .map_err(|e| err(format!("keep what Claude Code's install says: {e}")))?;
+        // A link to nothing, from an install long gone, isn't in its way.
+        if fs::symlink_metadata(&link).is_ok() && fs::metadata(&link).is_err() {
+            let _ = fs::remove_file(&link);
+        }
+        let mut child = Command::new(&bootstrap)
+            .arg("install")
+            .env("HOME", home)
+            .current_dir(home)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(said)
+            .spawn()
+            .map_err(|e| err(format!("run Claude Code's install: {e}")))?;
+        let begun = Instant::now();
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if begun.elapsed() > CLAUDE_INSTALL_FOR => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(err("Claude Code's install took too long"));
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+                Err(e) => return Err(err(format!("Claude Code's install: {e}"))),
+            }
+        };
+        if !status.success() {
+            let said = fs::read_to_string(&said_at).unwrap_or_default();
+            return Err(err(format!(
+                "Claude Code's install failed: {}",
+                said.lines()
+                    .rfind(|l| !l.trim().is_empty())
+                    .unwrap_or("")
+                    .trim()
+            )));
+        }
+        if !link.exists() {
+            return Err(err(format!(
+                "Claude Code's install finished with nothing at {}",
+                link.display()
+            )));
+        }
+        Ok((version, link.clone()))
     })
 }
 
@@ -260,7 +340,8 @@ mod tests {
         );
         fs::create_dir_all(&root).unwrap();
         let url = format!("file://{}", releases.display());
-        let publish = |body: &[u8], claim: Option<&str>| {
+        fs::create_dir_all(&home).unwrap();
+        let publish = |body: &str, claim: Option<&str>| {
             let build = releases.join("2.1.400/linux-x64");
             fs::create_dir_all(&build).unwrap();
             let bin = build.join("claude");
@@ -279,19 +360,64 @@ mod tests {
             .unwrap();
             fs::write(releases.join("latest"), "2.1.400\n").unwrap();
         };
+        // As the real one does: it keeps itself under the home, and links that.
+        let installs_itself = "#!/bin/sh\n[ \"$1\" = install ] || exit 9\n\
+                               mkdir -p \"$HOME/.local/share/claude\" \"$HOME/.local/bin\"\n\
+                               cp \"$0\" \"$HOME/.local/share/claude/2.1.400\"\n\
+                               ln -sf \"$HOME/.local/share/claude/2.1.400\" \"$HOME/.local/bin/claude\"\n";
         let install = || install_claude_build(&url, "linux-x64", &root, &home);
-        publish(b"claude", Some(&"0".repeat(64)));
+        publish(installs_itself, Some(&"0".repeat(64)));
         let e = install().unwrap_err().to_string();
         assert!(e.contains("SHA-256"), "{e}");
         assert!(!home.join(".local/bin/claude").exists());
-        publish(b"claude", None);
-        let (version, binary) = install().unwrap();
+
+        publish("#!/bin/sh\necho 'no room' >&2\nexit 1\n", None);
+        let e = install().unwrap_err().to_string();
+        assert!(e.contains("no room"), "{e}");
+        assert!(!root.join(".claude-download").exists());
+
+        // What's left of an old install, a link to nothing, is no tool of anyone's.
+        fs::create_dir_all(home.join(".local/bin")).unwrap();
+        std::os::unix::fs::symlink("/nowhere/claude", home.join(".local/bin/claude")).unwrap();
+        publish(installs_itself, None);
+        let (version, link) = install().unwrap();
         assert_eq!(version, "2.1.400");
-        assert_eq!(
-            fs::read_link(home.join(".local/bin/claude")).unwrap(),
-            binary
+        assert_eq!(link, home.join(".local/bin/claude"));
+        assert!(link.exists());
+        // It's Claude's own layout, for it to update.
+        assert!(home.join(".local/share/claude/2.1.400").is_file());
+        assert!(!root.join(".claude-download").exists());
+
+        // One of the owner's is left as it is.
+        fs::remove_file(&link).unwrap();
+        fs::write(&link, "mine").unwrap();
+        assert!(
+            install()
+                .unwrap_err()
+                .to_string()
+                .contains("isn't VibeOS's")
         );
-        let mode = fs::metadata(&binary).unwrap().permissions().mode();
-        assert_eq!(mode & 0o111, 0o111);
+    }
+
+    #[test]
+    fn only_vibeos_own_gh_on_an_old_pin_is_moved() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, home) = (tmp.path().join("data"), tmp.path().join("home"));
+        fs::create_dir_all(home.join(".local/bin")).unwrap();
+        fs::create_dir_all(root.join("gh-0.1.0")).unwrap();
+        fs::write(root.join("gh-0.1.0/gh"), "").unwrap();
+        let link = home.join(".local/bin/gh");
+        symlink(root.join("gh-0.1.0/gh"), &link).unwrap();
+        assert!(gh_needs_update(&link, &root, &home));
+        let pinned = root.join(format!("gh-{GH_PINNED}"));
+        fs::create_dir_all(&pinned).unwrap();
+        fs::write(pinned.join("gh"), "").unwrap();
+        fs::remove_file(&link).unwrap();
+        symlink(pinned.join("gh"), &link).unwrap();
+        assert!(!gh_needs_update(&link, &root, &home));
+        let own = tmp.path().join("own-gh");
+        fs::write(&own, "").unwrap();
+        assert!(!gh_needs_update(&own, &root, &home));
     }
 }

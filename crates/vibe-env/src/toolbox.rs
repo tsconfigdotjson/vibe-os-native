@@ -1297,6 +1297,8 @@ impl ToolboxHost for Toolbox {
         };
         let result = (|| -> Result<u32> {
             self.boot(&plan, &host)?;
+            // `gh` checks the token with GitHub as it's given.
+            self.wait_network()?;
             let ran = self.machine.run(
                 &self.socket(),
                 &proto::Run {

@@ -39,7 +39,45 @@ pub(crate) struct Session {
     news: watch::Sender<u64>,
     stdin: tokio::sync::Mutex<Option<ChildStdin>>,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// What the flow's said, as it said it, since it was last answered. Read whole each
+    /// time, as a read can end anywhere, in an escape or a character. Never kept once
+    /// it's done.
+    said: Mutex<Vec<u8>>,
 }
+
+/// The pages each flow's own tool sends a person to: what's opened with no click, and
+/// taken over any other page it mentions. A host's word is all there is for a page, so
+/// anything else takes a click, showing where it goes.
+pub fn is_the_providers_page(what: SignInWhat, url: &str) -> bool {
+    let Some(rest) = url.get(8..) else {
+        return false;
+    };
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let hosts: &[&str] = match what {
+        SignInWhat::Github | SignInWhat::ToolboxGithub => &["github.com"],
+        SignInWhat::Claude | SignInWhat::ToolboxClaude => &[
+            "claude.com",
+            "claude.ai",
+            "platform.claude.com",
+            "console.anthropic.com",
+        ],
+    };
+    url.get(..8)
+        .is_some_and(|s| s.eq_ignore_ascii_case("https://"))
+        && hosts.iter().any(|h| host.eq_ignore_ascii_case(h))
+}
+
+/// The private directory a sign-in borrows, gone however it ends.
+struct Scratch(PathBuf);
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// How a sign-in's scratch directory is named.
+const SCRATCH_PREFIX: &str = ".toolbox-gh-";
 
 impl Session {
     fn change(&self, change: impl FnOnce(&mut SignIn)) {
@@ -63,24 +101,42 @@ pub fn read_said(what: SignInWhat, said: &str, into: &mut SignIn) {
         words.len().saturating_sub(1)
     };
     let words = &words[..whole];
-    if into.url.is_none() {
-        into.url = words
+    // The provider's own page, over anything else it mentions first.
+    if into
+        .url
+        .as_deref()
+        .is_none_or(|u| !is_the_providers_page(what, u))
+    {
+        let page = words
             .iter()
-            .find(|w| url_can_be_opened(w))
-            .map(|w| (*w).to_owned());
+            .find(|w| url_can_be_opened(w) && is_the_providers_page(what, w))
+            .or_else(|| words.iter().find(|w| url_can_be_opened(w)));
+        if let Some(page) = page {
+            into.url = Some((*page).to_owned());
+        }
     }
     match what {
         SignInWhat::Github | SignInWhat::ToolboxGithub => {
-            // "! First copy your one-time code: XXXX-XXXX"
-            if into.code.is_none()
-                && let Some(at) = words.windows(2).position(|w| w == ["one-time", "code:"])
-            {
-                into.code = words
-                    .get(at + 2)
-                    .filter(|c| {
-                        c.len() <= 32 && c.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
-                    })
-                    .map(|c| (*c).to_owned());
+            // "! First copy your one-time code: XXXX-XXXX", or with a clipboard to put
+            // it on, as `gh` 2.103 has on a Mac: "! One-time code (XXXX-XXXX) copied to
+            // clipboard". That's where it'd stay if it weren't read here.
+            if into.code.is_none() {
+                let plain_code = |c: &&str| {
+                    !c.is_empty()
+                        && c.len() <= 32
+                        && c.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+                };
+                let first = words
+                    .windows(2)
+                    .position(|w| w == ["one-time", "code:"])
+                    .and_then(|at| words.get(at + 2))
+                    .copied();
+                let copied = words
+                    .windows(2)
+                    .position(|w| w[0].eq_ignore_ascii_case("one-time") && w[1] == "code")
+                    .and_then(|at| words.get(at + 2))
+                    .and_then(|c| c.strip_prefix('(')?.strip_suffix(')'));
+                into.code = first.or(copied).filter(plain_code).map(str::to_owned);
             }
         }
         SignInWhat::Claude | SignInWhat::ToolboxClaude => {
@@ -88,40 +144,78 @@ pub fn read_said(what: SignInWhat, said: &str, into: &mut SignIn) {
             if said.contains("Paste code here") {
                 into.asks_for_code = true;
             }
+            // It says this, and waits for another.
+            if let Some(line) = said.lines().find(|l| l.contains("Invalid code")) {
+                into.error = Some(line.trim().chars().take(200).collect());
+                into.asks_for_code = true;
+            }
         }
     }
 }
 
-/// `text` without a terminal's colours and moves, which split what a flow says.
+/// `text` as a person would read it off a terminal: no colours, a move to another
+/// column counting as the space it shows as, and a hyperlink's address as a word of its
+/// own, as a TUI may give a long one whole only there.
 fn plain(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars();
+    let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
-        if c == '\u{1b}' {
-            if chars.next() == Some('[') {
-                for c in chars.by_ref() {
-                    if c.is_ascii_alphabetic() {
-                        break;
+        match c {
+            '\u{1b}' => match chars.next() {
+                Some('[') => {
+                    for c in chars.by_ref() {
+                        if ('@'..='~').contains(&c) {
+                            if matches!(c, 'G' | 'C') {
+                                out.push(' ');
+                            }
+                            break;
+                        }
                     }
                 }
-            }
-        } else if c == '\r' {
-            out.push('\n');
-        } else {
-            out.push(c);
+                Some(']') => {
+                    let mut body = String::new();
+                    while let Some(c) = chars.next() {
+                        if c == '\u{7}' {
+                            break;
+                        }
+                        if c == '\u{1b}' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                        body.push(c);
+                    }
+                    // "8;<params>;<address>"
+                    if let Some(rest) = body.strip_prefix("8;")
+                        && let Some((_, address)) = rest.split_once(';')
+                        && !address.is_empty()
+                    {
+                        out.push_str(address);
+                        out.push(' ');
+                    }
+                }
+                _ => {}
+            },
+            '\r' => out.push('\n'),
+            c => out.push(c),
         }
     }
     out
 }
 
-/// The last thing a failed flow said, that's safe to show: what looks like a token or
-/// a page's address goes.
-fn last_words(said: &str) -> Option<String> {
-    // Its prompt has no line end, so what's said next is on the same line.
+/// The last thing a failed flow said, that's safe to show. For the flow that prints a
+/// long-lived token, only what `vibe` itself says: a terminal wraps a token over lines,
+/// and no look at a line can tell. For the others, what looks like a token or a page's
+/// address goes.
+fn last_words(what: SignInWhat, said: &str) -> Option<String> {
     let line = said
         .lines()
         .map(|l| l.rsplit("prompted > ").next().unwrap_or(l).trim())
-        .rfind(|l| !l.is_empty() && !l.contains("Paste code") && !l.contains("https://"))?;
+        .rfind(|l| {
+            !l.is_empty()
+                && !l.contains("Paste code")
+                && !l.contains("https://")
+                && (what != SignInWhat::ToolboxClaude || l.starts_with("vibe:"))
+        })?;
     if line.contains("sk-") || line.contains("gho_") || line.contains("ghp_") {
         return None;
     }
@@ -135,7 +229,7 @@ struct Flow {
     env: Vec<(&'static str, OsString)>,
     /// A private directory to throw away after, and from which a toolbox's login is
     /// read first.
-    scratch: Option<PathBuf>,
+    scratch: Option<Scratch>,
 }
 
 impl Core {
@@ -182,13 +276,19 @@ impl Core {
                         "the toolbox is in use: close it, and you can sign in from here",
                     ));
                 }
+                if self.toolbox.as_ref().is_some_and(|t| t.has_unsaved()) {
+                    return Err(refused(
+                        "the toolbox has changes waiting to be saved: open its shell and exit \
+                         it, and you can sign in from here",
+                    ));
+                }
                 // On this Mac, where the browser is, into a place of its own: the
                 // owner's own `gh` login here isn't touched, and the login goes on
                 // into the toolbox after.
                 let scratch = self
                     .layout
                     .data_dir()
-                    .join(format!(".toolbox-gh-{}", self.new_token_id()?));
+                    .join(format!("{SCRATCH_PREFIX}{}", self.new_token_id()?));
                 vibe_core::paths::private_dir(&scratch).map_err(|e| {
                     error(
                         ErrorCode::CommandFailed,
@@ -210,19 +310,56 @@ impl Core {
                         ("NO_COLOR", "1".into()),
                         ("GH_CONFIG_DIR", scratch.clone().into_os_string()),
                     ],
-                    scratch: Some(scratch),
+                    scratch: Some(Scratch(scratch)),
                 })
             }
             SignInWhat::ToolboxClaude => {
                 if self.toolbox.is_none() {
                     return Err(refused("this host has no Linux toolbox"));
                 }
+                // launchd gives `vibed` no PATH to find it with, so it's told.
+                let checks = Arc::clone(&self.checks);
+                let found = tokio::task::spawn_blocking(move || checks.claude())
+                    .await
+                    .map_err(|e| error(ErrorCode::InternalError, e.to_string()))?;
+                let (claude, _) = found.map_err(|why| {
+                    refused(&format!(
+                        "Claude Code isn't here yet: {why}. VibeOS is on it"
+                    ))
+                })?;
                 Ok(Flow {
                     program: self.vibe_cli.clone(),
                     args: vec!["setup-token"],
-                    env: vec![("NO_COLOR", "1".into())],
+                    env: vec![
+                        ("NO_COLOR", "1".into()),
+                        ("VIBE_CLAUDE", claude.into_os_string()),
+                    ],
                     scratch: None,
                 })
+            }
+        }
+    }
+
+    /// What a flow left behind that nothing's looking after, as after a crash: each is
+    /// private, and may hold a login. Nothing runs longer than this.
+    pub(crate) fn sweep_sign_in_scratch(&self) {
+        let Ok(entries) = std::fs::read_dir(self.layout.data_dir()) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let old = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|at| at.elapsed().ok())
+                .is_some_and(|age| age > SIGN_IN_FOR + Duration::from_secs(5 * 60));
+            if old
+                && entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(SCRATCH_PREFIX)
+            {
+                let _ = std::fs::remove_dir_all(entry.path());
             }
         }
     }
@@ -248,11 +385,13 @@ impl Core {
                 asks_for_code: false,
                 opens_itself: self.info().os == "macos"
                     && matches!(p.what, SignInWhat::Claude | SignInWhat::ToolboxClaude),
+                finishing: false,
                 error: None,
             }),
             news: watch::channel(0).0,
             stdin: tokio::sync::Mutex::new(None),
             task: Mutex::new(None),
+            said: Mutex::default(),
         });
         let mut command = Command::new(&flow.program);
         command
@@ -272,9 +411,19 @@ impl Core {
         *session.stdin.lock().await = child.stdin.take();
         let stdout = child.stdout.take().expect("stdout is piped");
         let stderr = child.stderr.take().expect("stderr is piped");
-        // Whatever else is under way for this goes: there's one at a time.
+        // Whatever else is under way for this goes: there's one at a time. But not one
+        // that's been approved, and is putting the login where it goes.
         {
             let mut all = lock(&self.sign_ins);
+            if all.iter().any(|s| {
+                let now = lock(&s.now);
+                now.what == p.what && now.finishing && now.state == SignInState::Running
+            }) {
+                return Err(error(
+                    ErrorCode::Conflict,
+                    "that sign-in is finishing: try again when it's done",
+                ));
+            }
             for old in all.iter().filter(|s| lock(&s.now).what == p.what) {
                 if let Some(task) = lock(&old.task).take() {
                     task.abort();
@@ -294,48 +443,75 @@ impl Core {
         );
         let what = p.what;
         let task = tokio::spawn(async move {
-            let said = Arc::new(Mutex::new(String::new()));
             let read = |mut from: Box<dyn tokio::io::AsyncRead + Send + Unpin>| {
-                let (said, session) = (Arc::clone(&said), Arc::clone(&watching));
-                async move {
+                let session = Arc::clone(&watching);
+                tokio::spawn(async move {
                     let mut chunk = [0u8; 4096];
                     while let Ok(n) = from.read(&mut chunk).await {
                         if n == 0 {
                             return;
                         }
-                        let mut all = lock(&said);
-                        if all.len() < MOST_TO_READ {
-                            all.push_str(&plain(&String::from_utf8_lossy(&chunk[..n])));
-                        }
-                        session.change(|now| read_said(what, &all, now));
+                        let said = {
+                            let mut all = lock(&session.said);
+                            if all.len() < MOST_TO_READ {
+                                all.extend_from_slice(&chunk[..n]);
+                            }
+                            plain(&String::from_utf8_lossy(&all))
+                        };
+                        session.change(|now| read_said(what, &said, now));
                     }
-                }
+                })
             };
-            let finished = tokio::time::timeout(SIGN_IN_FOR, async {
-                let (_, _, status) =
-                    tokio::join!(read(Box::new(stdout)), read(Box::new(stderr)), child.wait());
-                status
-            })
-            .await;
-            let said = lock(&said).clone();
+            let readers = [read(Box::new(stdout)), read(Box::new(stderr))];
+            let finished = tokio::time::timeout(SIGN_IN_FOR, child.wait()).await;
             let ok = matches!(&finished, Ok(Ok(status)) if status.success());
+            let takes_it_on = ok && what == SignInWhat::ToolboxGithub;
+            if takes_it_on {
+                // Approved: it can't be cancelled from here, or the login's lost.
+                watching.change(|now| {
+                    now.finishing = true;
+                    now.asks_for_code = false;
+                });
+            }
+            // A grandchild may hold its output open: its exit's what counts.
+            for reader in readers {
+                let abort = reader.abort_handle();
+                if tokio::time::timeout(Duration::from_secs(2), reader)
+                    .await
+                    .is_err()
+                {
+                    abort.abort();
+                }
+            }
+            let said = plain(&String::from_utf8_lossy(&std::mem::take(&mut *lock(
+                &watching.said,
+            ))));
+            let refused = lock(&watching.now).error.clone();
             let mut why = match &finished {
                 Err(_) => Some("nobody finished signing in, so that was given up on".to_owned()),
                 Ok(Err(e)) => Some(e.to_string()),
                 Ok(Ok(_)) if ok => None,
-                Ok(Ok(status)) => {
-                    Some(last_words(&said).unwrap_or_else(|| format!("it ended with {status}")))
-                }
+                Ok(Ok(status)) => Some(
+                    last_words(what, &said)
+                        .or(refused)
+                        .unwrap_or_else(|| format!("it ended with {status}")),
+                ),
             };
-            if ok
-                && let (Some(core), SignInWhat::ToolboxGithub) = (&me, what)
-                && let Some(scratch) = &flow.scratch
-                && let Err(e) = core.toolbox_take_github_login(&flow.program, scratch).await
-            {
-                why = Some(e);
-            }
-            if let Some(scratch) = &flow.scratch {
-                let _ = std::fs::remove_dir_all(scratch);
+            drop(said);
+            if takes_it_on {
+                let token = match (&me, &flow.scratch) {
+                    (Some(core), Some(scratch)) => {
+                        core.toolbox_github_token(&flow.program, &scratch.0).await
+                    }
+                    _ => Err("this vibed isn't running as it should".to_owned()),
+                };
+                // Read: it needn't be on disk a moment longer.
+                drop(flow.scratch);
+                why = match (token, &me) {
+                    (Ok(token), Some(core)) => core.toolbox_give_github(token).await.err(),
+                    (Err(e), _) => Some(e),
+                    (Ok(_), None) => Some("this vibed isn't running as it should".to_owned()),
+                };
             }
             watching.change(|now| {
                 now.state = if why.is_none() {
@@ -345,6 +521,7 @@ impl Core {
                 };
                 now.error = why;
                 now.asks_for_code = false;
+                now.finishing = false;
             });
             if let Some(core) = me {
                 core.signed_in(what).await;
@@ -359,8 +536,14 @@ impl Core {
     /// at again now, and what git needs is set up.
     async fn signed_in(&self, what: SignInWhat) {
         *lock(&self.doctor_found) = None;
-        if what == SignInWhat::Github {
-            self.check_gh().await;
+        match what {
+            SignInWhat::Github => {
+                self.check_gh().await;
+            }
+            SignInWhat::Claude => self.look_at_claude_login().await,
+            SignInWhat::ToolboxGithub | SignInWhat::ToolboxClaude => {
+                self.publish(self.event(vibe_core::model::EventKind::ToolboxChanged));
+            }
         }
     }
 
@@ -379,6 +562,7 @@ impl Core {
     /// `signin.answer`: the code a page showed. Never logged, nor kept.
     pub async fn sign_in_answer(&self, p: SignInAnswerParams) -> Result<SignIn, ErrorObject> {
         let session = self.sign_in_session(&p.id)?;
+        let what = lock(&session.now).what;
         // A code is one word. Anything else couldn't be, and mustn't reach a prompt
         // as more than one line.
         if p.value.is_empty() || p.value.len() > 4096 || p.value.chars().any(char::is_control) {
@@ -388,14 +572,26 @@ impl Core {
         let Some(pipe) = stdin.as_mut() else {
             return Err(error(ErrorCode::Conflict, "nothing's asking for that now"));
         };
-        write_line(pipe, &p.value).await.map_err(|e| {
+        // A TUI on a terminal takes Return as a terminal sends it; a plain prompt takes
+        // a line.
+        let end = if what == SignInWhat::ToolboxClaude {
+            "\r"
+        } else {
+            "\n"
+        };
+        write_line(pipe, &p.value, end).await.map_err(|e| {
             error(
                 ErrorCode::CommandFailed,
                 format!("it can't be told that: {e}"),
             )
         })?;
         drop(stdin);
-        session.change(|now| now.asks_for_code = false);
+        // From here it's what it says about this that counts.
+        lock(&session.said).clear();
+        session.change(|now| {
+            now.asks_for_code = false;
+            now.error = None;
+        });
         let now = lock(&session.now).clone();
         Ok(now)
     }
@@ -403,6 +599,11 @@ impl Core {
     /// `signin.cancel`.
     pub async fn sign_in_cancel(&self, p: SignInParams) -> Result<SignIn, ErrorObject> {
         let session = self.sign_in_session(&p.id)?;
+        // Approved, and on its way: stopping now would lose it.
+        if lock(&session.now).finishing {
+            let now = lock(&session.now).clone();
+            return Ok(now);
+        }
         if let Some(task) = lock(&session.task).take() {
             task.abort();
         }
@@ -417,9 +618,13 @@ impl Core {
     }
 }
 
-async fn write_line(to: &mut (impl AsyncWrite + Unpin), value: &str) -> std::io::Result<()> {
+async fn write_line(
+    to: &mut (impl AsyncWrite + Unpin),
+    value: &str,
+    end: &str,
+) -> std::io::Result<()> {
     to.write_all(value.as_bytes()).await?;
-    to.write_all(b"\n").await?;
+    to.write_all(end.as_bytes()).await?;
     to.flush().await
 }
 
@@ -438,6 +643,7 @@ mod tests {
             code: None,
             asks_for_code: false,
             opens_itself: false,
+            finishing: false,
             error: None,
         }
     }
@@ -456,6 +662,25 @@ mod tests {
         assert_eq!(s.url.as_deref(), Some("https://github.com/login/device"));
         assert!(!s.asks_for_code);
 
+        // gh 2.103.3, the one VibeOS installs, where it has a clipboard to use: every
+        // Mac. And where it hasn't.
+        let mut s = fresh(SignInWhat::Github);
+        read_said(
+            SignInWhat::Github,
+            "! One-time code (B177-C539) copied to clipboard\nOpen this URL to continue in your \
+             web browser: https://github.com/login/device\n",
+            &mut s,
+        );
+        assert_eq!(s.code.as_deref(), Some("B177-C539"));
+        let mut s = fresh(SignInWhat::Github);
+        read_said(
+            SignInWhat::Github,
+            "! Failed to copy one-time code to clipboard\n! First copy your one-time code: \
+             B177-C539\nOpen this URL: https://github.com/login/device\n",
+            &mut s,
+        );
+        assert_eq!(s.code.as_deref(), Some("B177-C539"));
+
         let mut s = fresh(SignInWhat::Claude);
         read_said(
             SignInWhat::Claude,
@@ -469,6 +694,77 @@ mod tests {
             Some("https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c")
         );
         assert!(s.asks_for_code);
+    }
+
+    /// Bytes as `vibe setup-token` really passed them on from Claude Code 2.1.318: the
+    /// address whole only in a hyperlink, and columns where the spaces would be.
+    #[test]
+    fn the_setup_tokens_terminal_is_read_as_a_person_would() {
+        let bytes = "\u{1b}]8;id=1vyx0kg;https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c&state=2mYk\u{7}\
+                     \u{1b}[38;5;246mhttps://claude.com/cai/oauth/authori\u{1b}[39m\u{1b}]8;;\u{7}\r\r\n\
+                     \u{1b}]8;id=1vyx0kg;https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c&state=2mYk\u{7}\
+                     \u{1b}[38;5;246mze?code=true\u{1b}[39m\u{1b}]8;;\u{7}\r\r\n\r\r\n\r\r\n\
+                     \u{1b}[2GPaste\u{1b}[8Gcode\u{1b}[13Ghere\u{1b}[18Gif\u{1b}[21Gprompted\u{1b}[30G>\r\r\n\
+                     \u{1b}[>0q\u{1b}[?u\u{1b}]7501;?\u{7}\u{1b}[c";
+        let mut s = fresh(SignInWhat::ToolboxClaude);
+        read_said(SignInWhat::ToolboxClaude, &plain(bytes), &mut s);
+        assert_eq!(
+            s.url.as_deref(),
+            Some("https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c&state=2mYk")
+        );
+        assert!(s.asks_for_code);
+    }
+
+    #[test]
+    fn the_providers_own_page_is_told_from_any_other() {
+        use SignInWhat::{Claude, Github, ToolboxClaude, ToolboxGithub};
+        assert!(is_the_providers_page(
+            Github,
+            "https://github.com/login/device"
+        ));
+        assert!(is_the_providers_page(
+            ToolboxGithub,
+            "https://GITHUB.com/login"
+        ));
+        assert!(!is_the_providers_page(
+            Github,
+            "https://github.com.evil.example/login"
+        ));
+        assert!(!is_the_providers_page(
+            Github,
+            "https://evil.example/github.com/"
+        ));
+        assert!(!is_the_providers_page(Github, "https://claude.com/"));
+        assert!(!is_the_providers_page(Github, "http://github.com/login"));
+        assert!(is_the_providers_page(
+            Claude,
+            "https://claude.com/cai/oauth/authorize?x=1"
+        ));
+        assert!(is_the_providers_page(ToolboxClaude, "https://claude.ai/x"));
+        assert!(!is_the_providers_page(
+            Claude,
+            "https://claude.com.evil.example/"
+        ));
+        // Its own page, over one it happens to mention first.
+        let mut s = fresh(Github);
+        read_said(
+            Github,
+            "see https://docs.example.com/help then https://github.com/login/device ",
+            &mut s,
+        );
+        assert_eq!(s.url.as_deref(), Some("https://github.com/login/device"));
+    }
+
+    #[test]
+    fn a_wrong_code_is_said_and_another_is_asked_for() {
+        let mut s = fresh(SignInWhat::Claude);
+        read_said(
+            SignInWhat::Claude,
+            "Invalid code. Please make sure the full code was copied.\n",
+            &mut s,
+        );
+        assert!(s.asks_for_code);
+        assert!(s.error.as_deref().unwrap().starts_with("Invalid code"));
     }
 
     #[test]
@@ -488,21 +784,40 @@ mod tests {
 
     #[test]
     fn what_a_failed_flow_said_is_kept_only_if_its_safe() {
+        let g = SignInWhat::Github;
         assert_eq!(
-            last_words("x\nerror: access_denied\n\n").as_deref(),
+            last_words(g, "x\nerror: access_denied\n\n").as_deref(),
             Some("error: access_denied")
         );
-        assert_eq!(last_words("token sk-ant-oat01-secret\n"), None);
-        assert_eq!(last_words("oops gho_abc\n"), None);
-        assert_eq!(last_words("\n\n"), None);
+        assert_eq!(last_words(g, "token sk-ant-oat01-secret\n"), None);
+        assert_eq!(last_words(g, "oops gho_abc\n"), None);
+        assert_eq!(last_words(g, "\n\n"), None);
         assert_eq!(
-            last_words("Paste code here if prompted > That code was refused.\n").as_deref(),
+            last_words(
+                SignInWhat::Claude,
+                "Paste code here if prompted > That code was refused.\n"
+            )
+            .as_deref(),
             Some("That code was refused.")
+        );
+        // Where a token's printed, on a terminal that may wrap it: only `vibe`'s words.
+        let t = SignInWhat::ToolboxClaude;
+        assert_eq!(last_words(t, "sk-ant-oat01-abc\ndefghij\n"), None);
+        assert_eq!(
+            last_words(t, "sk-ant-oat01-abc\nvibe: can't keep it\n").as_deref(),
+            Some("vibe: can't keep it")
         );
     }
 
     #[test]
     fn colours_and_moves_dont_split_a_word() {
         assert_eq!(plain("\u{1b}[1mcode:\u{1b}[0m A\r\n"), "code: A\n\n");
+        assert_eq!(plain("a\u{1b}[8Gb"), "a b");
+        assert_eq!(
+            plain("\u{1b}]8;;https://x.example/\u{1b}\\t"),
+            "https://x.example/ t"
+        );
+        assert_eq!(plain("\u{1b}]8;;\u{7}t"), "t");
+        assert_eq!(plain("\u{1b}]0;title\u{7}t"), "t");
     }
 }

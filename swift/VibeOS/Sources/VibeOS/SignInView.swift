@@ -11,15 +11,24 @@ struct SignInView: View {
     @ObservedObject var model: MenuModel
     @State private var now: SignIn?
     @State private var error: String?
+    @State private var answerError: String?
     @State private var text = ""
     @State private var opened = false
     @State private var answering = false
+    /// Goes up with Try Again: a run belongs to the window, and goes when it does.
+    @State private var tries = 0
+
+    private struct Run: Hashable {
+        let request: SignInRequest?
+        let tries: Int
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text(title).font(.headline)
             if let error {
                 ErrorText(error: error)
+                tryAgain
             } else if let now {
                 content(now)
             } else {
@@ -28,8 +37,12 @@ struct SignInView: View {
         }
         .padding(20)
         .frame(width: 420, alignment: .leading)
-        .task(id: model.signInRequest) { await run() }
+        .task(id: Run(request: model.signInRequest, tries: tries)) { await run() }
         .onDisappear { cancelIfRunning() }
+    }
+
+    private var tryAgain: some View {
+        Button("Try Again") { tries += 1 }
     }
 
     private var title: String {
@@ -51,9 +64,13 @@ struct SignInView: View {
             Text("That was given up on.").foregroundStyle(.secondary)
         case .failed:
             ErrorText(error: now.error ?? "That didn't work.")
-            Button("Try Again") { Task { await run() } }
+            tryAgain
         case .running:
-            running(now)
+            if now.finishing {
+                Working(text: "Signed in. Giving Linux agents the login…")
+            } else {
+                running(now)
+            }
         }
     }
 
@@ -73,7 +90,14 @@ struct SignInView: View {
             Working(text: "Starting…")
         }
         if let url = now.url {
-            Button("Open \(URL(string: url)?.host ?? "the Page") Again") { open(url) }
+            let place = URL(string: url)?.host ?? "the Page"
+            if !now.what.isOwnPage(url) {
+                Text("This sign-in goes to \(place), which isn't the provider's own site. Open it only if you expected that.")
+                    .font(.callout)
+                    .foregroundStyle(Palette.attention)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Button(now.what.isOwnPage(url) ? "Open \(place) Again" : "Open \(place)") { open(url) }
                 .help(url)
         }
         if now.asksForCode {
@@ -89,6 +113,9 @@ struct SignInView: View {
                     Button("Continue") { Task { await answer(now) } }
                         .disabled(text.isEmpty || answering)
                 }
+                if let why = answerError ?? now.error {
+                    ErrorText(error: why)
+                }
             }
         } else if now.url != nil {
             Working(text: "Waiting for you to finish there…")
@@ -100,61 +127,99 @@ struct SignInView: View {
         NSWorkspace.shared.open(url)
     }
 
-    /// Starts it, and follows it to the end.
+    /// Starts it, and follows it to the end. A window closed, or a new request, ends this
+    /// and gives up on the flow, even one that's only now answering that it's started.
     private func run() async {
         guard let request = model.signInRequest else { return }
         now = nil
         error = nil
+        answerError = nil
         text = ""
         opened = false
-        do {
-            var current = try await model.call(
+        // Not this task's, so going away doesn't lose the answer, and the flow with it.
+        let starting = Task { @MainActor in
+            try await model.call(
                 SignInStart.self, SignInStartParams(host: request.host, what: request.what), timeout: 30)
-            show(current)
-            while current.state == .running {
-                try Task.checkCancellation()
-                current = try await model.call(
-                    SignInGet.self, SignInGetParams(host: request.host, id: current.id, seen: current.seq), timeout: 40)
-                show(current)
-            }
-            if current.state == .done {
-                await model.refresh()
-                model.settingsRevision += 1
-            }
-        } catch is CancellationError {
-            return
+        }
+        var current: SignIn
+        do {
+            current = try await starting.value
         } catch {
-            self.error = describe(error)
+            if !Task.isCancelled { self.error = describe(error) }
+            return
+        }
+        guard !Task.isCancelled else {
+            giveUp(on: current, host: request.host)
+            return
+        }
+        show(current)
+        // A blip's not a failure: the flow's still going, and it's asked again.
+        var missed = 0
+        while current.state == .running {
+            do {
+                let next = try await model.call(
+                    SignInGet.self, SignInGetParams(host: request.host, id: current.id, seen: current.seq), timeout: 40)
+                guard !Task.isCancelled else {
+                    giveUp(on: next, host: request.host)
+                    return
+                }
+                missed = 0
+                current = next
+                show(current)
+            } catch {
+                guard !Task.isCancelled else {
+                    giveUp(on: current, host: request.host)
+                    return
+                }
+                missed += 1
+                if missed >= 5 {
+                    self.error = describe(error)
+                    return
+                }
+                try? await Task.sleep(for: .seconds(2))
+            }
+        }
+        if current.state == .done {
+            await model.refresh()
+            model.setupMayHaveChanged()
         }
     }
 
     private func show(_ current: SignIn) {
         now = current
-        if let url = current.url, !opened {
+        if let url = current.url, !opened, !current.opensItself, current.what.isOwnPage(url) {
             opened = true
-            if !current.opensItself { open(url) }
+            open(url)
         }
     }
 
     private func answer(_ current: SignIn) async {
         guard let request = model.signInRequest, !text.isEmpty else { return }
         answering = true
+        answerError = nil
         defer { answering = false }
         do {
             let value = text.trimmingCharacters(in: .whitespacesAndNewlines)
-            show(
-                try await model.call(
-                    SignInAnswer.self, SignInAnswerParams(host: request.host, id: current.id, value: value), timeout: 30))
+            let next = try await model.call(
+                SignInAnswer.self, SignInAnswerParams(host: request.host, id: current.id, value: value), timeout: 30)
+            if next.seq >= (now?.seq ?? 0) { show(next) }
             text = ""
         } catch {
-            self.error = describe(error)
+            // What's typed stays, for another go: the flow's still waiting for it.
+            answerError = describe(error)
         }
     }
 
-    /// Closing the window gives up on one under way.
+    /// Closing the window gives up on one under way, but for one that's been approved.
     private func cancelIfRunning() {
-        guard let request = model.signInRequest, let current = now, current.state == .running else { return }
-        let params = SignInParams(host: request.host, id: current.id)
+        guard let request = model.signInRequest, let current = now else { return }
+        giveUp(on: current, host: request.host)
+    }
+
+    private func giveUp(on current: SignIn, host: String?) {
+        guard current.state == .running, !current.finishing else { return }
+        let params = SignInParams(host: host, id: current.id)
+        // Not this task's, which is likely what's just been cancelled.
         Task { _ = try? await model.call(SignInCancel.self, params, timeout: 10) }
     }
 }

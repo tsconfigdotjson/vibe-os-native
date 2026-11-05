@@ -1,5 +1,5 @@
 //! Signing in with one click, and tools that install themselves (#74). The flows are
-//! stand-ins, which say what the real `gh` 2.46 and Claude Code 2.1.318 say with no
+//! stand-ins, which say what the real `gh` 2.103.3 and Claude Code 2.1.318 say with no
 //! terminal. What `vibed` does with them, and with its children, is real.
 
 mod common;
@@ -7,13 +7,15 @@ mod common;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use common::{Golden, golden_checks, write_script};
-use vibe_core::model::{CheckId, CheckState, GhState, SignInState, SignInWhat};
+use vibe_core::model::{CheckId, CheckState, GhState, SignInState, SignInWhat, ToolboxState};
 use vibe_core::rpc::{
-    DoctorFixParams, ErrorCode, SignIn, SignInAnswerParams, SignInGetParams, SignInParams,
-    SignInStartParams,
+    DoctorFixParams, ErrorCode, NoParams, SignIn, SignInAnswerParams, SignInGetParams,
+    SignInParams, SignInStartParams,
 };
+use vibe_env::testing::TestToolbox;
 use vibed::core::Core;
 use vibed::doctor::FixedChecks;
 
@@ -70,9 +72,13 @@ d=$(dirname "$0")
 echo 'Opening browser to sign in…'
 echo "If the browser didn't open, visit: https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c"
 printf 'Paste code here if prompted > '
-read -r code || exit 3
-echo "$code" > "$d/claude-code"
-[ "$code" = good ] || { echo 'That code was refused.' >&2; exit 1; }
+while read -r code; do
+  echo "$code" > "$d/claude-code"
+  [ "$code" = good ] && exit 0
+  # As the real one does: says so on stderr, and goes on waiting.
+  echo 'Invalid code. Please make sure the full code was copied.' >&2
+done
+exit 3
 "#;
 
 impl World {
@@ -190,25 +196,28 @@ async fn claude_takes_the_code_its_page_showed() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_wrong_code_fails_saying_so_and_it_can_go_again() {
+async fn a_wrong_code_says_so_and_another_can_be_given() {
     let w = world_with(with_claude);
     write_script(&w.bin.join("claude"), CLAUDE);
     let now = w.start(SignInWhat::Claude).await;
     let now = w.until(now, |s| s.asks_for_code).await;
-    w.core
-        .sign_in_answer(SignInAnswerParams {
+    let answer = |value: &str| {
+        w.core.sign_in_answer(SignInAnswerParams {
             host: None,
             id: now.id.clone(),
-            value: "bad".into(),
+            value: value.into(),
         })
-        .await
-        .unwrap();
-    let now = w.until(now, |s| s.state != SignInState::Running).await;
-    assert_eq!(now.state, SignInState::Failed);
-    assert_eq!(now.error.as_deref(), Some("That code was refused."));
-    let again = w.start(SignInWhat::Claude).await;
-    assert_ne!(again.id, now.id);
-    assert_eq!(again.state, SignInState::Running);
+    };
+    answer("bad").await.unwrap();
+    let said = w.until(now.clone(), |s| s.error.is_some()).await;
+    // It's still going, asking again, with why.
+    assert_eq!(said.state, SignInState::Running);
+    assert!(said.asks_for_code);
+    assert!(said.error.as_deref().unwrap().starts_with("Invalid code"));
+    answer("good").await.unwrap();
+    let done = w.until(said, |s| s.state != SignInState::Running).await;
+    assert_eq!(done.state, SignInState::Done, "{done:?}");
+    assert_eq!(done.error, None);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -290,6 +299,128 @@ async fn linux_agents_github_goes_on_into_the_toolbox_and_leaves_nothing_here() 
         "gho_the_token"
     );
     assert!(!Path::new(&config).exists(), "the scratch went");
+}
+
+/// The window closed after approving, with a shell opened during the browser step: the
+/// login's kept, the toolbox isn't wedged, and the shell's state isn't disturbed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_approved_login_outlasts_the_window_and_waits_for_a_shell_opened_meanwhile() {
+    let golden = Golden::new();
+    let bin = golden.dir.path().join("flows");
+    fs::create_dir_all(&bin).unwrap();
+    write_script(&bin.join("gh"), GH);
+    let release = bin.join("release");
+    let shell = format!(
+        "while [ ! -e '{}' ]; do sleep 0.05; done",
+        release.display()
+    );
+    let layout = vibe_core::paths::Layout::new(&golden.home, "macos");
+    let mut config = golden.config();
+    config.gh = bin.join("gh").into_os_string();
+    config.checks = Arc::new(golden_checks());
+    config.toolbox = Some(Arc::new(TestToolbox::new(
+        layout.clone(),
+        vec!["sh".into(), "-c".into(), shell],
+    )));
+    let core = Arc::new(Core::open(config).unwrap());
+    core.spawn_links();
+    let w = World {
+        golden,
+        core: Arc::clone(&core),
+        bin,
+    };
+    let state = async || core.toolbox_status(NoParams {}).await.unwrap().state;
+
+    let now = w.start(SignInWhat::ToolboxGithub).await;
+    let now = w.until(now, |s| s.code.is_some()).await;
+    let env = fs::read_to_string(w.bin.join("gh-login-env")).unwrap();
+    let scratch = env
+        .lines()
+        .find_map(|l| l.strip_prefix("GH_CONFIG_DIR="))
+        .unwrap()
+        .to_owned();
+    core.open_toolbox(NoParams {}).await.unwrap();
+    fs::write(w.bin.join("approved"), "").unwrap();
+    let now = w.until(now, |s| s.finishing).await;
+
+    // Closing the window gives up on what's under way, but not on this.
+    let after = core
+        .sign_in_cancel(SignInParams {
+            host: None,
+            id: now.id.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(after.state, SignInState::Running);
+    assert!(after.finishing);
+    // Read, so it's not left on disk for however long the shell stays open.
+    for _ in 0..200 {
+        if !Path::new(&scratch).exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(!Path::new(&scratch).exists());
+    assert_eq!(state().await, ToolboxState::Open);
+
+    fs::write(&release, "").unwrap();
+    // As `vibed`'s own poll does, every few seconds.
+    let mut closed = false;
+    for _ in 0..400 {
+        core.check_toolbox().await;
+        if state().await == ToolboxState::Closed {
+            closed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(closed, "the shell's exit was noticed");
+    let done = w.until(after, |s| s.state != SignInState::Running).await;
+    assert_eq!(done.state, SignInState::Done, "{done:?}");
+    assert!(!done.finishing);
+    assert_eq!(state().await, ToolboxState::Closed);
+    let toolbox = layout.agent_dir(vibe_env::toolbox::TOOLBOX_REF);
+    assert_eq!(
+        fs::read_to_string(toolbox.join("github-token")).unwrap(),
+        "gho_the_token"
+    );
+}
+
+/// A flow's exit is what counts, even with something it left holding its output.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_flow_that_leaves_something_behind_still_ends() {
+    let w = world_with(|_, c| c);
+    write_script(
+        &w.bin.join("gh"),
+        "#!/bin/sh\n[ \"$1 $2\" = 'auth login' ] || exit 1\n\
+         echo '! First copy your one-time code: B177-C539' >&2\nsleep 20 &\nexit 0\n",
+    );
+    let begun = std::time::Instant::now();
+    let now = w.start(SignInWhat::Github).await;
+    let now = w.until(now, |s| s.state != SignInState::Running).await;
+    assert_eq!(now.state, SignInState::Done, "{now:?}");
+    assert!(begun.elapsed() < Duration::from_secs(15));
+}
+
+/// A flow that can't start leaves no scratch directory for a login to land in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_flow_that_cant_start_leaves_nothing_behind() {
+    let w = world_with(|_, c| c);
+    let _ = w
+        .core
+        .sign_in_start(SignInStartParams {
+            host: None,
+            what: SignInWhat::ToolboxGithub,
+        })
+        .await;
+    let data = vibe_core::paths::Layout::new(&w.golden.home, "macos").data_dir();
+    let left: Vec<_> = fs::read_dir(data)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(".toolbox-gh-"))
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
 }
 
 // Tools.
@@ -383,7 +514,15 @@ async fn what_a_host_lacks_goes_in_by_itself() {
     };
     let dir = claude_releases.join("2.1.400").join(build);
     fs::create_dir_all(&dir).unwrap();
-    fs::write(dir.join("claude"), "#!/bin/sh\n").unwrap();
+    // As the real one does: it keeps itself under the home, and links that.
+    fs::write(
+        dir.join("claude"),
+        "#!/bin/sh\n[ \"$1\" = install ] || exit 9\n\
+         mkdir -p \"$HOME/.local/share/claude\" \"$HOME/.local/bin\"\n\
+         cp \"$0\" \"$HOME/.local/share/claude/2.1.400\"\n\
+         ln -sf \"$HOME/.local/share/claude/2.1.400\" \"$HOME/.local/bin/claude\"\n",
+    )
+    .unwrap();
     fs::write(
         claude_releases.join("2.1.400/manifest.json"),
         serde_json::json!({

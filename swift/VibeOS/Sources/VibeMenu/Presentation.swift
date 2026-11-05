@@ -700,6 +700,24 @@ let commandNames: Set<String> = [
 
 // MARK: First run
 
+extension SignInWhat {
+    /// Whether `link` is the provider's own sign-in page. A page comes from the host's
+    /// word alone, and a host can be taken over: this one opens by itself, as the owner
+    /// just asked for it, and anything else takes a click that says where it goes.
+    public func isOwnPage(_ link: String) -> Bool {
+        guard let parts = URLComponents(string: link), parts.scheme?.lowercased() == "https",
+            parts.user == nil, parts.password == nil, parts.port == nil,
+            let host = parts.host?.lowercased()
+        else { return false }
+        switch self {
+        case .github, .toolboxGithub:
+            return host == "github.com"
+        case .claude, .toolboxClaude:
+            return ["claude.com", "claude.ai", "platform.claude.com", "console.anthropic.com"].contains(host)
+        }
+    }
+}
+
 /// What a setup step's button does.
 public enum SetupAction: Equatable, Sendable {
     /// Links vibe into /usr/local/bin.

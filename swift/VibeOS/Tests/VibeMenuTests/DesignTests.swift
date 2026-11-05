@@ -219,6 +219,21 @@ typealias StepStatus = SetupProgress.Step.Status
 
     /// Agents' own sign-in is theirs to do: setup never walks through it
     /// (#46), and without a Linux toolbox there's no toolbox step either.
+    /// A page is only a host's word, so only the provider's own opens with no click.
+    @Test func onlyTheProvidersOwnPageCountsAsIt() {
+        #expect(SignInWhat.github.isOwnPage("https://github.com/login/device"))
+        #expect(SignInWhat.toolboxGithub.isOwnPage("https://GitHub.com/login/device"))
+        #expect(SignInWhat.claude.isOwnPage("https://claude.com/cai/oauth/authorize?code=true"))
+        #expect(SignInWhat.toolboxClaude.isOwnPage("https://claude.ai/oauth/authorize"))
+        #expect(!SignInWhat.github.isOwnPage("https://github.com.evil.example/login/device"))
+        #expect(!SignInWhat.github.isOwnPage("https://github.com@evil.example/login/device"))
+        #expect(!SignInWhat.github.isOwnPage("https://evil.example/github.com/"))
+        #expect(!SignInWhat.github.isOwnPage("http://github.com/login/device"))
+        #expect(!SignInWhat.github.isOwnPage("https://github.com:8443/login/device"))
+        #expect(!SignInWhat.github.isOwnPage("https://claude.com/"))
+        #expect(!SignInWhat.claude.isOwnPage("https://github.com/"))
+    }
+
     @Test func setupHasNoAgentSignInStep() {
         let setup = SetupProgress(hasProject: true, hasKey: true, linuxGitHub: nil)
         let want: [StepID] = [StepID.project, StepID.key]

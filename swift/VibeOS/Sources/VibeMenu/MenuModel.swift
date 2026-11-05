@@ -2,9 +2,6 @@ import Combine
 import Foundation
 import VibeRPC
 
-/// What the menu shows, all of it from vibed: the app keeps no state of its
-/// own (PRD: Architecture). vibed's events keep it current as they happen;
-/// a slower poll refreshes what events don't carry, such as memory use.
 /// A sign-in the owner asked for: `what`, on `host`, or on this Mac.
 public struct SignInRequest: Hashable, Sendable {
     public var host: String?
@@ -18,6 +15,9 @@ public struct SignInRequest: Hashable, Sendable {
     }
 }
 
+/// What the menu shows, all of it from vibed: the app keeps no state of its
+/// own (PRD: Architecture). vibed's events keep it current as they happen;
+/// a slower poll refreshes what events don't carry, such as memory use.
 @MainActor
 public final class MenuModel: ObservableObject {
     public enum Connection: Equatable, Sendable {

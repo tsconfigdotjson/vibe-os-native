@@ -40,6 +40,8 @@ struct ToolboxPane: View {
         }
         // Again after each change, as a save notes a new home's logins.
         .task(id: model.toolbox) { await loadLogins() }
+        // And after a sign-in, which may leave the toolbox just as it was.
+        .task(id: model.settingsRevision) { await loadLogins() }
     }
 
     private var toolbox: some View {

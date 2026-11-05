@@ -1349,10 +1349,10 @@ struct HostRow: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 if !host.missing.isEmpty {
-                    Label("VibeOS is installing \(host.missing.joined(separator: ", ")) there", systemImage: "wrench.and.screwdriver")
+                    Label("Not there yet: \(host.missing.joined(separator: ", "))", systemImage: "wrench.and.screwdriver")
                         .font(.caption)
                         .foregroundStyle(Palette.attention)
-                        .help("VibeOS installs it by itself")
+                        .help("VibeOS installs gh and Claude Code by itself, and git where it can")
                 }
                 if let needs = host.needsAdmin, !needs.isEmpty {
                     Label(adminNeedsText(needs, host: host.name), systemImage: "lock")
@@ -1370,11 +1370,13 @@ struct HostRow: View {
             Spacer()
             if updating {
                 Working(text: "Updating…")
-            } else if !local {
+            } else {
                 ForEach(host.signIns ?? [], id: \.self) { what in
                     Button(what == .github ? "Sign In to GitHub…" : "Sign In to Claude…") { signIn(what) }
                         .help("Opens the page in your browser. That's all it asks.")
                 }
+            }
+            if !updating, !local {
                 if let needs = host.needsAdmin, !needs.isEmpty {
                     Button("Allow…", action: allow)
                         .help("Opens Terminal, where sudo on \(host.name) asks for its password. VibeOS never sees it.")

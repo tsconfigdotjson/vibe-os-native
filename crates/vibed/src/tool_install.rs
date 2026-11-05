@@ -14,19 +14,22 @@ use vibe_env::tools;
 use crate::core::{Core, lock};
 
 /// Installs git with whichever package manager a server has. `{sudo}` is how `sudo` is
-/// called: with `-n` so it never asks, or plainly on the owner's own terminal.
-pub const GIT_WITH_SUDO: &str = r#"if command -v apt-get >/dev/null 2>&1; then
-  {sudo} env DEBIAN_FRONTEND=noninteractive apt-get install -y -q git </dev/null
+/// called: with `-n` so it never asks, or plainly on the owner's own terminal. As root
+/// there's nothing to ask, and a server may have no `sudo` at all.
+pub const GIT_WITH_SUDO: &str = r#"if [ "$(id -u)" = 0 ]; then S=; else S="{sudo}"; fi
+if command -v apt-get >/dev/null 2>&1; then
+  $S env DEBIAN_FRONTEND=noninteractive apt-get update -q </dev/null &&
+    $S env DEBIAN_FRONTEND=noninteractive apt-get install -y -q git </dev/null
 elif command -v dnf >/dev/null 2>&1; then
-  {sudo} dnf install -y -q git </dev/null
+  $S dnf install -y -q git </dev/null
 elif command -v yum >/dev/null 2>&1; then
-  {sudo} yum install -y -q git </dev/null
+  $S yum install -y -q git </dev/null
 elif command -v zypper >/dev/null 2>&1; then
-  {sudo} zypper --non-interactive install git </dev/null
+  $S zypper --non-interactive install git </dev/null
 elif command -v pacman >/dev/null 2>&1; then
-  {sudo} pacman -S --noconfirm git </dev/null
+  $S pacman -S --noconfirm git </dev/null
 elif command -v apk >/dev/null 2>&1; then
-  {sudo} apk add git </dev/null
+  $S apk add git </dev/null
 else
   echo "This server has no package manager VibeOS knows, to install git with." >&2
   false
@@ -69,6 +72,7 @@ impl ToolInstall {
         ToolNow {
             installing: self.running.load(Ordering::SeqCst),
             error: lock(&self.error).clone(),
+            broken: false,
         }
     }
 }
@@ -83,11 +87,13 @@ pub struct ToolInstalls {
     git_sudo_tried: AtomicBool,
 }
 
-/// How a tool stands, for the doctor, when it isn't there.
+/// How a tool stands, for the doctor, when it doesn't answer.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ToolNow {
     pub installing: bool,
     pub error: Option<String>,
+    /// One's there and doesn't run: it isn't VibeOS's to put another beside it.
+    pub broken: bool,
 }
 
 impl ToolNow {
@@ -106,6 +112,17 @@ impl ToolNow {
             fixable,
             progress: None,
         };
+        let found = found.trim_end_matches('.');
+        if self.broken {
+            return row(
+                CheckState::Fail,
+                format!("{found}."),
+                Some(
+                    "One's there and doesn't run, so VibeOS leaves it as it is: remove it or put it right, and VibeOS takes it from there.",
+                ),
+                false,
+            );
+        }
         match &self.error {
             _ if self.installing => row(
                 CheckState::Working,
@@ -121,7 +138,7 @@ impl ToolNow {
             ),
             None => row(
                 CheckState::Fail,
-                format!("{}.", found.trim_end_matches('.')),
+                format!("{found}."),
                 Some("VibeOS installs it by itself."),
                 true,
             ),
@@ -138,34 +155,45 @@ pub struct ToolsNow {
 
 impl Core {
     pub(crate) async fn tools_now(&self) -> ToolsNow {
+        let checks = Arc::clone(&self.checks);
+        let found = tokio::task::spawn_blocking(move || checks.claude_found())
+            .await
+            .unwrap_or(false);
+        let mut claude = self.tool_installs.claude.now();
+        // Whether this is the owner's to see to, if it doesn't answer.
+        claude.broken = found;
         ToolsNow {
             gh: self.tool_installs.gh.now(),
-            claude: self.tool_installs.claude.now(),
+            claude,
         }
     }
 
     /// Installs what's missing, as far as it can be, with nobody asked. Quick when it's
     /// all there. Never over something of the owner's: if they have one, it's found,
-    /// and this has nothing to do.
+    /// and this has nothing to do. VibeOS's own `gh` follows a new pin.
     pub(crate) async fn repair_tools(&self) {
         if !self.checks.installs_tools() {
             return;
         }
         let checks = Arc::clone(&self.checks);
-        let (gh_missing, claude_missing, git_missing) = tokio::task::spawn_blocking(move || {
+        let (gh, claude_found, git_missing) = tokio::task::spawn_blocking(move || {
             (
-                checks.find("gh").is_none(),
-                checks.claude().is_err(),
+                checks.find("gh"),
+                checks.claude_found(),
                 checks.git().is_err(),
             )
         })
         .await
-        .unwrap_or((false, false, false));
+        .unwrap_or((Some(PathBuf::new()), true, false));
+        let (root, home) = (self.layout.data_dir(), self.layout.home().to_owned());
+        let gh_due = gh
+            .as_ref()
+            .is_none_or(|found| tools::gh_needs_update(found, &root, &home));
         // One named for it is the owner's to look after.
-        if gh_missing && self.gh == *"gh" {
+        if gh_due && self.gh == *"gh" && self.begin(&self.tool_installs.gh) {
             self.install_gh().await;
         }
-        if claude_missing {
+        if !claude_found && self.begin(&self.tool_installs.claude) {
             self.install_claude().await;
         }
         if git_missing && self.info().os == "linux" {
@@ -175,12 +203,13 @@ impl Core {
         }
     }
 
+    /// Takes `install` on, unless it's under way.
+    fn begin(&self, install: &ToolInstall) -> bool {
+        !install.running.swap(true, Ordering::SeqCst)
+    }
+
     async fn install_gh(&self) {
-        let install = &self.tool_installs.gh;
-        if install.running.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        crate::log!("vibed: gh isn't here, so VibeOS is installing it");
+        crate::log!("vibed: gh isn't here as it should be, so VibeOS is installing it");
         let (releases, root, home) = (
             self.tool_releases.gh.clone(),
             self.layout.data_dir(),
@@ -192,15 +221,11 @@ impl Core {
         .await
         .map_err(|e| e.to_string())
         .and_then(|done| done);
-        self.tool_installed("gh", install, done);
+        self.tool_installed("gh", &self.tool_installs.gh, done);
         self.check_gh().await;
     }
 
     async fn install_claude(&self) {
-        let install = &self.tool_installs.claude;
-        if install.running.swap(true, Ordering::SeqCst) {
-            return;
-        }
         crate::log!("vibed: Claude Code isn't here, so VibeOS is installing it");
         let (releases, root, home) = (
             self.tool_releases.claude.clone(),
@@ -215,7 +240,7 @@ impl Core {
         .await
         .map_err(|e| e.to_string())
         .and_then(|done| done);
-        self.tool_installed("Claude Code", install, done);
+        self.tool_installed("Claude Code", &self.tool_installs.claude, done);
     }
 
     fn tool_installed(&self, name: &str, install: &ToolInstall, done: Result<PathBuf, String>) {
@@ -260,20 +285,56 @@ impl Core {
         let ok = matches!(installed, Ok(Ok(status)) if status.success());
         self.git_needs_admin.store(!ok, Ordering::SeqCst);
         *lock(&self.doctor_found) = None;
+        self.publish(self.event(EventKind::HostLink));
     }
 
-    /// The doctor's Try Again, for a tool it can install. Says if that's what it was.
+    /// Whether `git` is missing and waiting for someone with `sudo`. It may have just
+    /// been put right, by the button or by hand, so that's looked at.
+    pub(crate) fn git_waits_for_admin(&self) -> bool {
+        if !self.git_needs_admin.load(Ordering::SeqCst) {
+            return false;
+        }
+        let path = std::env::var_os("PATH");
+        if crate::core::find_tool("git", path.as_deref(), Some(self.layout.home())).is_some() {
+            self.git_needs_admin.store(false, Ordering::SeqCst);
+            return false;
+        }
+        true
+    }
+
+    /// The doctor's Try Again, for a tool it can install: in the background, as a
+    /// download can outlast whoever asked. Says if that's what it was.
     pub(crate) async fn tool_try_again(&self, check: CheckId) -> bool {
         if !self.checks.installs_tools() {
             return false;
         }
+        let in_background = self.me.get().is_some() && self.runtime.get().is_some();
         match check {
             CheckId::Gh if lock(&self.gh_status).state == GhState::NotInstalled => {
-                self.install_gh().await;
+                if self.begin(&self.tool_installs.gh) {
+                    if in_background {
+                        self.in_background(|core| async move { core.install_gh().await });
+                    } else {
+                        self.install_gh().await;
+                    }
+                }
                 true
             }
             CheckId::Claude => {
-                self.install_claude().await;
+                let checks = Arc::clone(&self.checks);
+                let found = tokio::task::spawn_blocking(move || checks.claude_found())
+                    .await
+                    .unwrap_or(true);
+                if found {
+                    return false;
+                }
+                if self.begin(&self.tool_installs.claude) {
+                    if in_background {
+                        self.in_background(|core| async move { core.install_claude().await });
+                    } else {
+                        self.install_claude().await;
+                    }
+                }
                 true
             }
             _ => false,
