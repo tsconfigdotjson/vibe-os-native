@@ -1451,7 +1451,8 @@ s_real_external() {
     scripts/host-bundle.sh --out "$bundle" --target "$arch"
   fi
   # Port 443 for vibed, which runs as the server's user (PRD: External
-  # access): if it can't have it, the test fails saying how to allow it.
+  # access): vibed gets it itself with passwordless sudo; a server that needs
+  # a password fails this, saying so, as only the app's Allow… can do that.
   VIBE_HOST_BUNDLE="$bundle" cargo test -p vibe-cli --test linux_host --locked -- real_external_access --ignored --nocapture
 }
 

@@ -360,7 +360,7 @@ fn free_port() -> SocketAddr {
 fn bundle(dir: &Path) -> PathBuf {
     let arch = dir.join("bundle").join(std::env::consts::ARCH);
     fs::create_dir_all(&arch).unwrap();
-    for b in ["vibed", "vibe", "vibe-shim"] {
+    for b in ["vibed", "vibe", "vibe-shim", "vibe-bind"] {
         let src = if b == "vibe" {
             PathBuf::from(VIBE)
         } else {
@@ -811,7 +811,7 @@ fn a_linux_host_added_over_ssh_runs_agents_the_mac_drives_body(watch: &Watch) {
         .unwrap_or("");
     assert!(!needed.contains("gh") && !needed.contains("git"), "{added}");
     let lib = host.home.join(".local/lib/vibeos");
-    for b in ["vibed", "vibe", "vibe-shim"] {
+    for b in ["vibed", "vibe", "vibe-shim", "vibe-bind"] {
         let mode = fs::metadata(lib.join(b)).unwrap().permissions().mode();
         assert_eq!(mode & 0o755, 0o755, "{b}");
     }

@@ -408,6 +408,9 @@ pub struct Core {
     pub(crate) pi_installing: tokio::sync::Mutex<()>,
     /// Why Pi couldn't be installed, the last time.
     pub(crate) pi_install_failures: Mutex<crate::pi::PiFailures>,
+    /// `sudo -n` was tried for port 443. A refused try is in the server's logs, and
+    /// can mail its admin, so once a run is enough.
+    pub(crate) port_grant_tried: std::sync::atomic::AtomicBool,
     /// One admission at a time, so two starts can't both take the last
     /// room under `max_awake_agents`.
     pub(crate) admitting: tokio::sync::Mutex<()>,
@@ -627,6 +630,7 @@ impl Core {
             pi_releases: config.pi_releases,
             pi_installing: tokio::sync::Mutex::new(()),
             pi_install_failures: Mutex::default(),
+            port_grant_tried: std::sync::atomic::AtomicBool::new(false),
             admitting: tokio::sync::Mutex::new(()),
             starting: Mutex::new(0),
             fetching: Mutex::new(HashMap::new()),

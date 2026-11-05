@@ -64,6 +64,15 @@ pub struct ExternalConfig {
     pub probe_every: Duration,
     /// How hard the public endpoint is on each client.
     pub limits: Limits,
+    /// Where the root-owned helper that opens port 443 is, for a `vibed` that
+    /// can't itself ([`crate::bind_helper`]).
+    pub bind_helper: PathBuf,
+    /// The build of it to put there; by default, the one beside `vibed`.
+    pub bind_source: Option<PathBuf>,
+    /// The `PATH` for doing that, for a test's stand-in `sudo`.
+    pub bind_path: Option<std::ffi::OsString>,
+    /// For tests: acts as if the kernel refused this user the port.
+    pub deny_direct: bool,
 }
 
 impl Default for ExternalConfig {
@@ -76,6 +85,10 @@ impl Default for ExternalConfig {
             fixed_cert: None,
             probe_every: Duration::from_secs(5),
             limits: Limits::default(),
+            bind_helper: PathBuf::from(crate::bind_helper::HELPER),
+            bind_source: None,
+            bind_path: None,
+            deny_direct: false,
         }
     }
 }
@@ -87,6 +100,9 @@ pub(crate) struct Public {
     task: JoinHandle<()>,
     /// What keeps it from working, or holds it up, if anything does.
     detail: Arc<Mutex<Option<String>>>,
+    /// The kernel keeps its port from this user, and nothing that needs no password
+    /// has got round that yet. It goes with this, so never outlasts it.
+    port_denied: Arc<AtomicBool>,
 }
 
 impl Drop for Public {
@@ -542,14 +558,74 @@ impl MacPeer {
     }
 }
 
+/// Why the public endpoint can't listen yet, and if that's for want of the
+/// privilege, which the owner's one button gives.
+struct BindTrouble {
+    why: String,
+    denied: bool,
+}
+
 /// The public endpoint's listener on `port`: every address, IPv6 and IPv4
-/// alike where the machine has IPv6, else IPv4; or only `listen`.
+/// alike where the machine has IPv6, else IPv4; or only `listen`. A port the kernel
+/// keeps from this user comes through the helper, which is put in place first if
+/// that can be done without asking anyone (`tried` keeps that to once a run). The
+/// kernel refuses a port that's taken as it does a free one, so what's listening is
+/// looked at first: no privilege would help that.
 async fn bind_public(
-    listen: Option<std::net::IpAddr>,
-    port: u16,
+    config: &ExternalConfig,
     domain: &str,
-) -> Result<TcpListener, String> {
-    let bound = match listen {
+    tried: &AtomicBool,
+) -> Result<TcpListener, BindTrouble> {
+    let port = config.port;
+    let bound = match bind_directly(config).await {
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied && listening_on(port) => {
+            Err(std::io::ErrorKind::AddrInUse.into())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied && config.listen.is_none() => {
+            bind_through_helper(config, tried).await
+        }
+        other => other,
+    };
+    bound.map_err(|e| {
+        let denied = e.kind() == std::io::ErrorKind::PermissionDenied;
+        let why = match e.kind() {
+            std::io::ErrorKind::PermissionDenied => format!(
+                "can't listen on port {port}: this server keeps it for root, and VibeOS can't \
+                 allow it without a password. Allow… in Settings → Hosts does it, asking for the \
+                 password there once. With no Mac linked, ask whoever has sudo here to allow it"
+            ),
+            std::io::ErrorKind::AddrInUse => format!(
+                "can't listen on port {port}: another program on this server has it, such as a \
+                 web server. https://{domain}/mcp needs it"
+            ),
+            _ => format!("can't listen on port {port}: {e}"),
+        };
+        BindTrouble { why, denied }
+    })
+}
+
+/// Whether anything's listening on TCP `port` here, as the kernel lists it: the
+/// fourth field is the state, where `0A` is listening. It's only ever read to say
+/// what's in the way, so anything it can't read says no.
+fn listening_on(port: u16) -> bool {
+    let want = format!(":{port:04X}");
+    ["/proc/net/tcp", "/proc/net/tcp6"].iter().any(|table| {
+        std::fs::read_to_string(table).is_ok_and(|text| {
+            text.lines().skip(1).any(|line| {
+                let mut fields = line.split_whitespace().skip(1);
+                let local = fields.next().unwrap_or("");
+                local.ends_with(&want) && fields.nth(1) == Some("0A")
+            })
+        })
+    })
+}
+
+async fn bind_directly(config: &ExternalConfig) -> std::io::Result<TcpListener> {
+    let port = config.port;
+    if config.deny_direct {
+        return Err(std::io::ErrorKind::PermissionDenied.into());
+    }
+    match config.listen {
         Some(ip) => TcpListener::bind((ip, port)).await,
         None => match dual_stack(port) {
             Ok(l) => Ok(l),
@@ -557,20 +633,61 @@ async fn bind_public(
             Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => Err(e),
             Err(_) => TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port)).await,
         },
+    }
+}
+
+/// The port from the helper, having tried putting that in place if it can't help
+/// yet. That can also have opened the port to this user another way.
+async fn bind_through_helper(
+    config: &ExternalConfig,
+    tried: &AtomicBool,
+) -> std::io::Result<TcpListener> {
+    let ask = || async {
+        let helper = config.bind_helper.clone();
+        let test_port = (config.port != HTTPS_PORT).then_some(config.port);
+        tokio::task::spawn_blocking(move || crate::bind_helper::open(&helper, test_port))
+            .await
+            .map_err(std::io::Error::other)?
     };
-    bound.map_err(|e| match e.kind() {
-        std::io::ErrorKind::PermissionDenied => format!(
-            "can't listen on port {port}: vibed runs as you, and Linux keeps ports below 1024 for \
-             root. Allow it once on this server, as root: echo \
-             'net.ipv4.ip_unprivileged_port_start={port}' | sudo tee /etc/sysctl.d/60-vibeos.conf \
-             && sudo sysctl --system"
-        ),
-        std::io::ErrorKind::AddrInUse => format!(
-            "can't listen on port {port}: another program on this server has it, such as a web \
-             server. https://{domain}/mcp needs it"
-        ),
-        _ => format!("can't listen on port {port}: {e}"),
-    })
+    let denied = |e: &std::io::Error| {
+        matches!(
+            e.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+        )
+    };
+    let listener = match ask().await {
+        Err(e) if denied(&e) && !tried.swap(true, Ordering::SeqCst) => {
+            let Some(source) = config.bind_source.clone().or_else(|| {
+                Some(
+                    std::env::current_exe()
+                        .ok()?
+                        .parent()?
+                        .join(crate::bind_helper::SOURCE),
+                )
+            }) else {
+                return Err(std::io::ErrorKind::PermissionDenied.into());
+            };
+            let (helper, path) = (config.bind_helper.clone(), config.bind_path.clone());
+            let granted = tokio::task::spawn_blocking(move || {
+                crate::bind_helper::grant_quietly(&source, &helper, path.as_deref())
+            })
+            .await
+            .unwrap_or(false);
+            if !granted {
+                return Err(std::io::ErrorKind::PermissionDenied.into());
+            }
+            match bind_directly(config).await {
+                Ok(l) => return Ok(l),
+                Err(_) => ask().await,
+            }
+        }
+        other => other,
+    };
+    match listener {
+        Err(e) if denied(&e) => Err(std::io::ErrorKind::PermissionDenied.into()),
+        Err(e) => Err(e),
+        Ok(l) => TcpListener::from_std(l),
+    }
 }
 
 /// A listener on every IPv6 and IPv4 address at `port`, whatever the
@@ -619,6 +736,7 @@ async fn run_public(
     domain: String,
     config: ExternalConfig,
     detail: Arc<Mutex<Option<String>>>,
+    port_denied: Arc<AtomicBool>,
 ) {
     let Some(c) = core.upgrade() else { return };
     let certs = Arc::new(Certs::new(&domain));
@@ -644,14 +762,22 @@ async fn run_public(
         },
     }
     let listener = loop {
-        match bind_public(config.listen, config.port, &domain).await {
+        let Some(c) = core.upgrade() else { return };
+        let bound = bind_public(&config, &domain, &c.port_grant_tried).await;
+        drop(c);
+        match bound {
             Ok(l) => break l,
-            Err(why) => {
-                set_detail(&detail, Some(why));
-                tokio::time::sleep(Duration::from_secs(30)).await;
+            Err(trouble) => {
+                set_detail(&detail, Some(trouble.why));
+                port_denied.store(trouble.denied, Ordering::SeqCst);
+                // Soon, once it's the one button that's awaited.
+                let wait = if trouble.denied { 5 } else { 30 };
+                tokio::time::sleep(Duration::from_secs(wait)).await;
             }
         }
     };
+    set_detail(&detail, None);
+    port_denied.store(false, Ordering::SeqCst);
     let Some(c) = core.upgrade() else { return };
     crate::log!(
         "vibed: serving https://{domain}/mcp publicly, on port {}",
@@ -776,6 +902,14 @@ impl Core {
     /// Fills in what this host's own row says of external access: why it
     /// isn't working, if it isn't, and whether a Mac answers through the
     /// tunnel.
+    /// Whether the kernel keeps the public endpoint's port from this user, with
+    /// nothing left to try that needs no password.
+    pub(crate) fn port_denied(&self) -> bool {
+        lock(&self.public)
+            .as_ref()
+            .is_some_and(|p| p.port_denied.load(Ordering::SeqCst))
+    }
+
     pub(crate) fn describe_public(&self, info: &mut HostInfo) {
         if !info.external {
             return;
@@ -806,16 +940,19 @@ impl Core {
             return;
         };
         let detail = Arc::new(Mutex::new(None));
+        let port_denied = Arc::new(AtomicBool::new(false));
         let task = rt.spawn(run_public(
             me.clone(),
             domain.clone(),
             self.external.clone(),
             Arc::clone(&detail),
+            Arc::clone(&port_denied),
         ));
         *public = Some(Public {
             domain,
             task,
             detail,
+            port_denied,
         });
     }
 
