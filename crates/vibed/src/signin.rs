@@ -174,18 +174,23 @@ fn plain(text: &str) -> String {
                 }
                 Some(']') => {
                     let mut body = String::new();
+                    let mut ended = false;
                     while let Some(c) = chars.next() {
                         if c == '\u{7}' {
+                            ended = true;
                             break;
                         }
                         if c == '\u{1b}' && chars.peek() == Some(&'\\') {
                             chars.next();
+                            ended = true;
                             break;
                         }
                         body.push(c);
                     }
-                    // "8;<params>;<address>"
-                    if let Some(rest) = body.strip_prefix("8;")
+                    // "8;<params>;<address>". One a read ended partway through is no
+                    // address yet: the next read has the whole of it.
+                    if ended
+                        && let Some(rest) = body.strip_prefix("8;")
                         && let Some((_, address)) = rest.split_once(';')
                         && !address.is_empty()
                     {
@@ -819,5 +824,6 @@ mod tests {
         );
         assert_eq!(plain("\u{1b}]8;;\u{7}t"), "t");
         assert_eq!(plain("\u{1b}]0;title\u{7}t"), "t");
+        assert_eq!(plain("a \u{1b}]8;;https://x.example/lo"), "a ");
     }
 }

@@ -18,8 +18,9 @@ use crate::core::{Core, lock};
 /// there's nothing to ask, and a server may have no `sudo` at all.
 pub const GIT_WITH_SUDO: &str = r#"if [ "$(id -u)" = 0 ]; then S=; else S="{sudo}"; fi
 if command -v apt-get >/dev/null 2>&1; then
-  $S env DEBIAN_FRONTEND=noninteractive apt-get update -q </dev/null &&
-    $S env DEBIAN_FRONTEND=noninteractive apt-get install -y -q git </dev/null
+  # One dead repository fails an update, and needn't stop git from the rest.
+  $S env DEBIAN_FRONTEND=noninteractive apt-get update -q </dev/null
+  $S env DEBIAN_FRONTEND=noninteractive apt-get install -y -q git </dev/null
 elif command -v dnf >/dev/null 2>&1; then
   $S dnf install -y -q git </dev/null
 elif command -v yum >/dev/null 2>&1; then
