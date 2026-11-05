@@ -2046,9 +2046,14 @@ fn real_external_access() {
 /// and only then one button on the Mac. Never a command to copy.
 #[test]
 fn lingering_is_turned_on_any_way_that_needs_no_password() {
+    bounded(DEADLINE, lingering_is_turned_on_any_way_that_needs_no_password_body);
+}
+
+fn lingering_is_turned_on_any_way_that_needs_no_password_body(watch: &Watch) {
     let golden = common::Golden::new();
     let hosts = common::short_tempdir();
-    let ssh = fake_ssh(hosts.path());
+    watch.owns(golden.dir.path());
+    let ssh = fake_ssh(watch, hosts.path());
     let host = FakeHost::new(hosts.path(), "me@vps", &golden.claude);
     let state = PathBuf::from(format!("{}.d", host.home.display()));
     fs::write(state.join("refuse-linger"), "").unwrap();
@@ -2062,9 +2067,14 @@ fn lingering_is_turned_on_any_way_that_needs_no_password() {
 
 #[test]
 fn a_host_that_refuses_lingering_gets_a_button_not_a_command() {
+    bounded(DEADLINE, a_host_that_refuses_lingering_gets_a_button_not_a_command_body);
+}
+
+fn a_host_that_refuses_lingering_gets_a_button_not_a_command_body(watch: &Watch) {
     let golden = common::Golden::new();
     let hosts = common::short_tempdir();
-    let ssh = fake_ssh(hosts.path());
+    watch.owns(golden.dir.path());
+    let ssh = fake_ssh(watch, hosts.path());
     let host = FakeHost::new(hosts.path(), "me@vps", &golden.claude);
     let state = PathBuf::from(format!("{}.d", host.home.display()));
     fs::write(state.join("refuse-linger"), "").unwrap();
