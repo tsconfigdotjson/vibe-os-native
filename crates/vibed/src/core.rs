@@ -450,6 +450,8 @@ pub struct Core {
     pub(crate) sends: Mutex<HashMap<String, vibe_status::Mark>>,
     /// When a Pi agent was last sent a line to answer.
     pub(crate) pi_sent_at: Mutex<HashMap<String, vibe_status::Timestamp>>,
+    /// What the record each exited Pi agent left says it gave up with.
+    pub(crate) pi_exits: Mutex<HashMap<String, crate::status::PiExit>>,
     /// When each agent's program was last started, until a send has waited for
     /// it to take input (`Core::wait_started`).
     pub(crate) started_at: Mutex<HashMap<String, std::time::Instant>>,
@@ -673,6 +675,7 @@ impl Core {
             tails: Mutex::new(HashMap::new()),
             sends: Mutex::new(HashMap::new()),
             pi_sent_at: Mutex::new(HashMap::new()),
+            pi_exits: Mutex::new(HashMap::new()),
             started_at: Mutex::new(HashMap::new()),
             pi_alerts: Mutex::new(std::collections::BTreeMap::new()),
             mac_heard: Mutex::new(heard_at_start),
@@ -1654,7 +1657,9 @@ impl Core {
                             .agent(host, &p.agent)
                             .is_ok_and(|a| a.agent == AgentKind::Pi);
                         let why = (is_pi && record.exit.code.unwrap_or(0) != 0)
-                            .then(|| vibe_status::pi_error_at_exit(&record.output.screen))
+                            .then(|| {
+                                vibe_status::pi_error_at_exit(&record.output.screen, record.cols)
+                            })
                             .flatten()
                             .map_or(String::new(), |why| format!(". {why}"));
                         error(

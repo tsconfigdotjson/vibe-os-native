@@ -13,7 +13,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use tokio::io::unix::AsyncFd;
 use vibe_core::limits::{self, HostLimits};
@@ -34,6 +34,13 @@ const PI_SCREEN_AFTER: Duration = Duration::from_secs(3);
 
 /// Beside a Pi agent's other files: when it was launched with nothing to do.
 const PI_AT_REST: &str = "pi-at-rest";
+
+/// What an exited Pi's record says, kept while the file stays as it was: it's read
+/// on every refresh of every such agent, and can hold 10,000 lines of history.
+pub(crate) struct PiExit {
+    file: (SystemTime, u64),
+    gave_up_with: Option<String>,
+}
 
 /// This machine's clock, which is what a transcript's file time is by.
 pub(crate) fn wall_clock() -> Timestamp {
@@ -102,17 +109,25 @@ impl Core {
     /// model it won't take, say, it's gone before it writes or draws anything, and
     /// this is all that says why. Pi has the last word on what a model is (PRD:
     /// Profiles), so this is how it's heard. A new session makes it old news.
-    async fn pi_gave_up_with(&self, a: &AgentRecord) -> Option<String> {
-        if a.state == AgentState::Asleep
-            || self.is_busy(&a.agent_ref)
-            || !self
-                .layout
-                .agent_dir(&a.agent_ref)
-                .join(vibe_core::shim::RECORD_FILE)
-                .is_file()
-            || self.session_runs(&a.agent_ref).await
-        {
+    pub(crate) async fn pi_gave_up_with(&self, a: &AgentRecord) -> Option<String> {
+        if a.state == AgentState::Asleep || self.is_busy(&a.agent_ref) {
             return None;
+        }
+        let path = self
+            .layout
+            .agent_dir(&a.agent_ref)
+            .join(vibe_core::shim::RECORD_FILE);
+        // Taken before the file is read: if it's replaced meanwhile, what's kept is
+        // kept under the old look, so the next one reads it again.
+        let meta = std::fs::metadata(&path).ok().filter(|m| m.is_file())?;
+        if self.session_runs(&a.agent_ref).await {
+            return None;
+        }
+        let file = (meta.modified().ok()?, meta.len());
+        if let Some(known) = lock(&self.pi_exits).get(&a.agent_ref)
+            && known.file == file
+        {
+            return known.gave_up_with.clone();
         }
         let (layout, agent_ref) = (self.layout.clone(), a.agent_ref.clone());
         let record =
@@ -120,10 +135,17 @@ impl Core {
                 .await
                 .ok()??;
         // Ended on its own and not well: not told to go, and not a quit.
-        if record.exit.code.unwrap_or(0) == 0 {
-            return None;
-        }
-        vibe_status::pi_error_at_exit(&record.output.screen)
+        let gave_up_with = (record.exit.code.unwrap_or(0) != 0)
+            .then(|| vibe_status::pi_error_at_exit(&record.output.screen, record.cols))
+            .flatten();
+        lock(&self.pi_exits).insert(
+            a.agent_ref.clone(),
+            PiExit {
+                file,
+                gave_up_with: gave_up_with.clone(),
+            },
+        );
+        gave_up_with
     }
 
     /// When the last thing typed to `a` was, if its transcript has shown nothing
@@ -253,6 +275,7 @@ impl Core {
     pub(crate) fn forget_status(&self, agent_ref: &str) {
         lock(&self.tails).remove(agent_ref);
         lock(&self.sends).remove(agent_ref);
+        lock(&self.pi_exits).remove(agent_ref);
         lock(&self.typing).remove(agent_ref);
         lock(&self.asleep_since).running(agent_ref);
         self.pressure_unpause(agent_ref);
@@ -348,6 +371,7 @@ impl Core {
         lock(&self.tails).retain(|r, _| refs.contains(r.as_str()));
         lock(&self.sends).retain(|r, _| refs.contains(r.as_str()));
         lock(&self.pi_sent_at).retain(|r, _| refs.contains(r.as_str()));
+        lock(&self.pi_exits).retain(|r, _| refs.contains(r.as_str()));
         lock(&self.started_at).retain(|r, _| refs.contains(r.as_str()));
         published.retain(|r, _| refs.contains(r.as_str()));
         let debounce = self.idle_debounce();

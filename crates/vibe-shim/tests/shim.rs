@@ -318,6 +318,7 @@ fn an_exit_is_sent_to_clients_and_recorded() {
     assert_eq!(record.exit, exit);
     assert_eq!(record.agent, "quiet-amber-otter");
     assert_eq!(record.command, ["sh", "-c", "read x; echo got-$x; exit 3"]);
+    assert_eq!(record.cols, Some(shim::Size::DEFAULT.cols));
     assert!(
         record.output.screen.contains("got-yes"),
         "{:?}",

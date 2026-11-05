@@ -1584,6 +1584,32 @@ async fn a_model_pi_wont_take_is_said_in_pis_words() {
     let agent = list.agents.iter().find(|x| x.agent == r).unwrap();
     assert_eq!(agent.status.activity, Activity::Errored);
 
+    // A send wakes it, it gives up again, and the send says what Pi said.
+    let record = w.layout.agent_dir(&r).join(vibe_core::shim::RECORD_FILE);
+    let before = fs::metadata(&record).unwrap().modified().unwrap();
+    let e = w
+        .core
+        .send_input(
+            None,
+            &r,
+            vibe_mcp::Input::Text {
+                text: "are you there?".into(),
+                submit: true,
+                force: false,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(e.message.contains("nothing was sent"), "{}", e.message);
+    assert!(
+        e.message.contains("Model \"no-such-model\" not found"),
+        "{}",
+        e.message
+    );
+    assert!(!e.message.contains("os error"), "{}", e.message);
+    assert!(!e.message.contains("--list-models"), "{}", e.message);
+    assert_ne!(fs::metadata(&record).unwrap().modified().unwrap(), before);
+
     // A new agent has the profile as it is now, and nothing of that stays.
     let b = w.start("hello again").await;
     w.wait_for(&b.agent, Activity::Done).await;
@@ -1592,6 +1618,55 @@ async fn a_model_pi_wont_take_is_said_in_pis_words() {
     assert_eq!(agent.status.error, None);
     w.delete(&r).await;
     w.delete(&b.agent).await;
+}
+
+/// An exited Pi's record is read once, not on every refresh, and read again when it
+/// changes.
+#[tokio::test]
+async fn what_an_exited_pi_left_is_read_again_only_when_it_changes() {
+    let w = world().await;
+    w.sign_in();
+    w.core
+        .update_profile(ProfileUpdateParams {
+            project: "app".into(),
+            profile: "pi-linux".into(),
+            pi_model: Some("no-such-model".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    let r = w.start("hello").await.agent;
+    let file = w.layout.agent_dir(&r).join(vibe_core::shim::RECORD_FILE);
+    let socket = w.layout.session_socket(&r);
+    wait_until("it to exit", || !socket.exists() && file.is_file());
+    let error = async || {
+        let list = w.core.agents(HostParams { host: None }).await.unwrap();
+        let agent = list.agents.iter().find(|x| x.agent == r).unwrap();
+        agent.status.error.clone()
+    };
+    assert!(error().await.unwrap().contains("no-such-model"));
+
+    // Other bytes in a file that looks the same: this is only said if it isn't read.
+    let looks = fs::metadata(&file).unwrap();
+    fs::write(&file, " ".repeat(usize::try_from(looks.len()).unwrap())).unwrap();
+    let set_time = |at| {
+        fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(at)
+            .unwrap();
+    };
+    set_time(looks.modified().unwrap());
+    assert!(error().await.unwrap().contains("no-such-model"));
+
+    // Looking different, it's read: what can't be parsed says nothing.
+    set_time(looks.modified().unwrap() + std::time::Duration::from_secs(5));
+    assert_eq!(error().await, None);
+
+    // And a quit is no complaint, whatever was said before.
+    common::write_record(&w.layout, &r, Some(0), None, "2026-11-05T10:00:00Z");
+    assert_eq!(error().await, None);
+    w.delete(&r).await;
 }
 
 /// `pi auth check` says `invalid` of every bare id. That isn't a refusal, so with a

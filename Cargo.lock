@@ -1801,6 +1801,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "unicode-width",
  "vibe-core",
 ]
 

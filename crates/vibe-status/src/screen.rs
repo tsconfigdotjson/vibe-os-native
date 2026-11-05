@@ -6,6 +6,8 @@
 //! gone 20 s without a result. A long tool run in auto mode looks the same.
 //! The shim's screen model settles it: a real prompt draws a dialog.
 
+use unicode_width::UnicodeWidthChar;
+
 /// How many of the screen's last non-blank lines a dialog is looked for in.
 /// Claude draws its prompt at the bottom, above at most a status line or
 /// two.
@@ -106,27 +108,37 @@ pub fn pi_error_on_screen(screen: &str) -> Option<String> {
 /// What Pi said as it gave up, if it did: `screen` is what was left when it exited
 /// with a failure. One it won't start at all, such as on a model it doesn't know or
 /// can't choose for, prints `Error: ` and why and exits, before it draws anything
-/// (`main.ts`), so the error is the last thing there, however a terminal wrapped it.
-/// In Pi's words, but for what it says to type: nobody here is at Pi's command line.
-/// Part of a screen can come from a guest, so it's said as an alert is.
-pub fn pi_error_at_exit(screen: &str) -> Option<String> {
+/// (`main.ts`), so the error is the last thing there, however a terminal `cols` wide
+/// wrapped it. In Pi's words, but for what it says to type: nobody here is at Pi's
+/// command line. Part of a screen can come from a guest, so it's said as an alert is.
+pub fn pi_error_at_exit(screen: &str, cols: Option<u16>) -> Option<String> {
     let lines: Vec<&str> = screen.trim_end().lines().map(str::trim_end).collect();
     let at = lines.iter().rposition(|l| l.starts_with("Error: "))?;
     let said = &lines[at..];
     if said.iter().any(|l| l.is_empty()) {
         return None;
     }
-    // A full row ran on to the next in the middle of whatever it was saying. One
-    // shorter broke at a space, which the screen trims, or was the end of a line.
-    let row = said.iter().map(|l| l.chars().count()).max()?;
+    // A row ran on to the next, in the middle of whatever it was saying, if what came
+    // next wouldn't fit on it. One with room broke at a space, which the screen trims,
+    // or was the end of a line. Counted in cells, as the terminal does. With no width
+    // recorded, the longest line is as near as can be told.
+    let longest = said.iter().map(|l| cells(l)).max()?;
+    let row = cols.map_or(longest, |cols| longest.max(usize::from(cols)));
     let mut message = String::new();
-    for line in said {
+    for (i, line) in said.iter().enumerate() {
         message.push_str(line);
-        if line.chars().count() < row {
+        let next = said
+            .get(i + 1)
+            .and_then(|l| l.chars().next())
+            .and_then(UnicodeWidthChar::width)
+            .unwrap_or(0);
+        if cells(line) + next.max(1) <= row {
             message.push(' ');
         }
     }
     let message = message.strip_prefix("Error: ")?;
+    // Asked before it's cut short: a long list of providers would lose this.
+    let no_login = message.contains("No matching provider is authenticated");
     // Where a terminal broke the line, the space on either side of `Use` may have gone.
     let words = message
         .match_indices("Use")
@@ -136,14 +148,25 @@ pub fn pi_error_at_exit(screen: &str) -> Option<String> {
     if words.is_empty() {
         return None;
     }
-    Some(if words.starts_with("Model \"") {
+    if !words.starts_with("Model \"") {
+        return Some(words);
+    }
+    let then = "then start a new agent: this one keeps the model it started with.";
+    // Naming one of them isn't enough with no login for it: a start would refuse it.
+    Some(if no_login {
         format!(
-            "{words} Set this profile's model to one Pi has, written as provider/id, then start \
-             a new agent: this one keeps the model it started with."
+            "{words} Sign in to one of them in the VibeOS app, in Settings → Agents (at a \
+             terminal, `pi` and /login, in `vibe toolbox` for a `linux` agent), set this \
+             profile's model to it, written as provider/id, {then}"
         )
     } else {
-        words
+        format!("{words} Set this profile's model to one Pi has, written as provider/id, {then}")
     })
+}
+
+/// How many of a terminal's cells `line` takes up.
+fn cells(line: &str) -> usize {
+    line.chars().filter_map(UnicodeWidthChar::width).sum()
 }
 
 /// Whether a line of Pi's screen is its spinner: `⠋ Working (esc to interrupt)`
@@ -269,13 +292,16 @@ mod tests {
     const AMBIGUOUS: &str = "Error: Model \"deepseek-v4.1-flash\" is ambiguous across providers: \
          opencode-go/deepseek-v4.1-flash, opencode/deepseek-v4.1-flash. More than one matching \
          provider is authenticated. Use --provider or provider/model.";
+    const NO_LOGIN: &str = "Error: Model \"gpt-5\" is ambiguous across providers: azure/gpt-5, \
+         cloudflare-ai-gateway/gpt-5, openai/gpt-5, opencode/gpt-5. No matching provider is \
+         authenticated. Use --provider or provider/model.";
     const WARNING: &str = "Warning: No project session found with id 'x'; creating a new session \
          with that id.";
 
     #[test]
     fn what_pi_said_as_it_gave_up_is_said_in_its_words_with_nothing_to_type() {
         assert_eq!(
-            pi_error_at_exit(&format!("{WARNING}\n{NOT_FOUND}\n\n\n")).as_deref(),
+            pi_error_at_exit(&format!("{WARNING}\n{NOT_FOUND}\n\n\n"), None).as_deref(),
             Some(
                 "Model \"no-such-model\" not found. Set this profile's model to one Pi has, \
                  written as provider/id, then start a new agent: this one keeps the model it \
@@ -283,7 +309,7 @@ mod tests {
             )
         );
         assert_eq!(
-            pi_error_at_exit(AMBIGUOUS).as_deref(),
+            pi_error_at_exit(AMBIGUOUS, None).as_deref(),
             Some(
                 "Model \"deepseek-v4.1-flash\" is ambiguous across providers: \
                  opencode-go/deepseek-v4.1-flash, opencode/deepseek-v4.1-flash. More than one \
@@ -294,14 +320,14 @@ mod tests {
         );
         // Not about a model: only Pi's words.
         assert_eq!(
-            pi_error_at_exit("Error: Invalid settings").as_deref(),
+            pi_error_at_exit("Error: Invalid settings", None).as_deref(),
             Some("Invalid settings")
         );
     }
 
     #[test]
     fn what_pi_said_as_it_gave_up_reads_the_same_however_it_was_wrapped() {
-        let whole = pi_error_at_exit(AMBIGUOUS).unwrap();
+        let whole = pi_error_at_exit(AMBIGUOUS, None).unwrap();
         for width in [40, 61, 80, 120] {
             let chars: Vec<char> = AMBIGUOUS.chars().collect();
             let rows: Vec<String> = chars
@@ -310,11 +336,91 @@ mod tests {
                 .collect();
             let screen = format!("{WARNING}\n{}\n", rows.join("\n"));
             assert_eq!(
-                pi_error_at_exit(&screen).as_deref(),
+                pi_error_at_exit(&screen, None).as_deref(),
                 Some(&*whole),
                 "{width}"
             );
         }
+    }
+
+    /// With the width known, a wrap that falls on a space keeps the space, at every
+    /// width there is.
+    #[test]
+    fn what_pi_said_as_it_gave_up_loses_no_space_at_any_width() {
+        let whole = pi_error_at_exit(AMBIGUOUS, None).unwrap();
+        let chars: Vec<char> = AMBIGUOUS.chars().collect();
+        for width in 30..=200 {
+            let rows: Vec<String> = chars
+                .chunks(width)
+                .map(|row| row.iter().collect::<String>().trim_end().to_owned())
+                .collect();
+            let screen = format!("{WARNING}\n{}\n", rows.join("\n"));
+            assert_eq!(
+                pi_error_at_exit(&screen, Some(u16::try_from(width).unwrap())).as_deref(),
+                Some(&*whole),
+                "{width}"
+            );
+        }
+    }
+
+    /// A model named in wide characters, or with combining ones, as a terminal wraps
+    /// it by its cells: a wide one that won't fit leaves the last cell empty.
+    #[test]
+    fn what_pi_said_as_it_gave_up_is_joined_by_cells_not_chars() {
+        let wrap = |text: &str, width: usize| {
+            let (mut rows, mut row, mut used) = (Vec::new(), String::new(), 0);
+            for c in text.chars() {
+                let w = c.width().unwrap_or(0);
+                if used + w > width {
+                    rows.push(row.trim_end().to_owned());
+                    (row, used) = (String::new(), 0);
+                }
+                row.push(c);
+                used += w;
+            }
+            rows.push(row.trim_end().to_owned());
+            rows.join("\n")
+        };
+        for model in [
+            "模型".repeat(30),
+            format!("模型模型模{}", "a".repeat(60)),
+            "e\u{301}".repeat(60),
+        ] {
+            let error = format!("Error: Model \"{model}\" not found. Use --list-models to see.");
+            let whole = pi_error_at_exit(&error, None).unwrap();
+            for width in 30..=200 {
+                let screen = wrap(&error, width);
+                assert_eq!(
+                    pi_error_at_exit(&screen, Some(u16::try_from(width).unwrap())).as_deref(),
+                    Some(&*whole),
+                    "{width}"
+                );
+            }
+        }
+    }
+
+    /// Pi's words with an anthropic-only key: naming one of them takes a login too.
+    #[test]
+    fn a_model_no_login_can_have_says_to_sign_in_as_well() {
+        let said = pi_error_at_exit(NO_LOGIN, Some(80)).unwrap();
+        assert!(
+            said.contains("No matching provider is authenticated."),
+            "{said}"
+        );
+        assert!(said.contains("Sign in to one of them"), "{said}");
+        assert!(said.contains("Settings → Agents"), "{said}");
+        assert!(said.contains("`pi` and /login"), "{said}");
+        assert!(said.contains("start a new agent"), "{said}");
+        assert!(!said.contains("--provider"), "{said}");
+        // However many providers there are, and however short that's cut.
+        let many = format!("provider/gpt-5, {}", "provider/gpt-5, ".repeat(100));
+        let long = NO_LOGIN.replace("azure/gpt-5, ", &many);
+        let said = pi_error_at_exit(&long, Some(80)).unwrap();
+        assert!(!said.contains("No matching"), "{said}");
+        assert!(said.contains("Sign in to one of them"), "{said}");
+        // With a login for several, a choice is all it takes.
+        let said = pi_error_at_exit(AMBIGUOUS, None).unwrap();
+        assert!(!said.contains("Sign in"), "{said}");
     }
 
     /// As read off the real Pi through the real shim, at 80 columns, with the model
@@ -327,35 +433,40 @@ mod tests {
             "Error: Model \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" not found.\n\
              Use --list-models to see available models.\n",
         ] {
-            let said = pi_error_at_exit(screen).unwrap();
-            assert!(!said.contains("--list-models"), "{said}");
-            assert!(!said.contains("Use"), "{said}");
-            assert!(said.contains("not found."), "{said}");
+            for cols in [None, Some(80)] {
+                let said = pi_error_at_exit(screen, cols).unwrap();
+                assert!(!said.contains("--list-models"), "{said}");
+                assert!(!said.contains("Use"), "{said}");
+                assert!(said.contains("not found."), "{said}");
+            }
         }
         // A model named with the word is left alone.
-        let said = pi_error_at_exit("Error: Model \"Use-it\" not found.").unwrap();
+        let said = pi_error_at_exit("Error: Model \"Use-it\" not found.", None).unwrap();
         assert!(said.contains("Use-it"), "{said}");
     }
 
     #[test]
     fn only_the_last_thing_on_the_screen_is_what_pi_gave_up_with() {
-        assert_eq!(pi_error_at_exit(""), None);
-        assert_eq!(pi_error_at_exit("all done\n"), None);
-        assert_eq!(pi_error_at_exit("Error: "), None);
+        assert_eq!(pi_error_at_exit("", None), None);
+        assert_eq!(pi_error_at_exit("all done\n", None), None);
+        assert_eq!(pi_error_at_exit("Error: ", None), None);
         // A tool's output, long before.
         assert_eq!(
-            pi_error_at_exit("Error: from a tool\n\nand on it went\n\nbye\n"),
+            pi_error_at_exit("Error: from a tool\n\nand on it went\n\nbye\n", None),
             None
         );
         // In prose, not at the start of a line.
-        assert_eq!(pi_error_at_exit("It said Error: nothing much\n"), None);
+        assert_eq!(
+            pi_error_at_exit("It said Error: nothing much\n", None),
+            None
+        );
     }
 
     #[test]
     fn what_pi_said_as_it_gave_up_moves_no_cursor_and_is_kept_short() {
-        let said = pi_error_at_exit("Error: a\u{1b}[2Jb\u{202e}c\n").unwrap();
+        let said = pi_error_at_exit("Error: a\u{1b}[2Jb\u{202e}c\n", None).unwrap();
         assert_eq!(said, "a[2Jbc");
-        let said = pi_error_at_exit(&format!("Error: {}", "x".repeat(5000))).unwrap();
+        let said = pi_error_at_exit(&format!("Error: {}", "x".repeat(5000)), None).unwrap();
         assert!(said.chars().count() <= 401, "{}", said.len());
     }
 

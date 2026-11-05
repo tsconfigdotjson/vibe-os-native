@@ -334,6 +334,10 @@ pub struct Record {
     pub exit: SessionExit,
     /// The last screen and the history kept.
     pub output: Output,
+    /// How wide the terminal was at the end, which says where the screen's lines
+    /// were wrapped. None in a record from a shim before this was kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cols: Option<u16>,
 }
 
 /// The name of a signal, as in `SIGKILL`, for the common ones.
