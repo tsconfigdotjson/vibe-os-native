@@ -120,6 +120,8 @@ pub struct Config {
     pub checks: Arc<dyn crate::doctor::HostChecks>,
     /// Where Pi's releases are, for `pi.install`.
     pub pi_releases: String,
+    /// Where `gh` and Claude Code come from, when they're missing.
+    pub tool_releases: crate::tool_install::ToolReleases,
     /// What runs as Pi for its list and its sign-in, in place of the pinned one, in
     /// tests.
     pub pi_driver: Option<std::path::PathBuf>,
@@ -189,6 +191,7 @@ impl Config {
             },
             checks,
             pi_releases: crate::pi::releases_from_env(),
+            tool_releases: crate::tool_install::ToolReleases::from_env(),
             pi_driver: None,
             pi_login_idle: Duration::from_secs(2 * 60),
             linux_images: None,
@@ -421,6 +424,16 @@ pub struct Core {
     pub(crate) pi_install_failures: Mutex<crate::pi::PiFailures>,
     /// The template's moving to a new base by itself.
     pub(crate) toolbox_moving: std::sync::atomic::AtomicBool,
+    /// The sign-ins under way, or last finished, of each kind.
+    pub(crate) sign_ins: Mutex<Vec<Arc<crate::signin::Session>>>,
+    /// `gh` and Claude Code being installed, and what went wrong the last time.
+    pub(crate) tool_installs: crate::tool_install::ToolInstalls,
+    /// Where those two come from.
+    pub(crate) tool_releases: crate::tool_install::ToolReleases,
+    /// `git` is missing here, and only someone with `sudo` can install it.
+    pub(crate) git_needs_admin: std::sync::atomic::AtomicBool,
+    /// Claude Code's here, and not signed in, as last looked at.
+    pub(crate) claude_signed_out: std::sync::atomic::AtomicBool,
     /// `sudo -n` was tried for port 443. A refused try is in the server's logs, and
     /// can mail its admin, so once a run is enough.
     pub(crate) port_grant_tried: std::sync::atomic::AtomicBool,
@@ -647,6 +660,11 @@ impl Core {
             pi_installing: tokio::sync::Mutex::new(()),
             pi_install_failures: Mutex::default(),
             toolbox_moving: std::sync::atomic::AtomicBool::new(false),
+            sign_ins: Mutex::default(),
+            tool_installs: crate::tool_install::ToolInstalls::default(),
+            tool_releases: config.tool_releases,
+            git_needs_admin: std::sync::atomic::AtomicBool::new(false),
+            claude_signed_out: std::sync::atomic::AtomicBool::new(false),
             port_grant_tried: std::sync::atomic::AtomicBool::new(false),
             admitting: tokio::sync::Mutex::new(()),
             starting: Mutex::new(0),
@@ -1313,9 +1331,9 @@ impl Core {
         Err(error(
             ErrorCode::CommandFailed,
             format!(
-                "GitHub isn't signed in on {}, so {repo} can't be cloned yet. Sign in to GitHub \
-                 there with `gh auth login`, then add the project again. What gh said: \
-                 {said}",
+                "GitHub isn't signed in on {}, so {repo} can't be cloned yet. Sign in with one \
+                 click, in VibeOS's setup or Settings → Hosts, then add the project again. What \
+                 gh said: {said}",
                 self.label
             ),
         ))
@@ -1410,12 +1428,28 @@ impl Core {
             Err(e) => crate::log!("vibed: can't look at lingering: {e}"),
         }
         self.repair_pi().await;
+        self.repair_tools().await;
+        self.look_at_claude_login().await;
+        self.sweep_sign_in_scratch();
         // A download that failed goes on by itself, and sooner than its daily round.
         if let Some(watch) = &self.linux_images
             && watch.check().state == vibe_core::model::CheckState::Fail
         {
             watch.kick();
         }
+    }
+
+    /// Whether Claude Code's here and not signed in, for what `hosts.list` says, which
+    /// is asked too often to go to a Mac's Keychain each time.
+    pub(crate) async fn look_at_claude_login(&self) {
+        let checks = Arc::clone(&self.checks);
+        let out = tokio::task::spawn_blocking(move || {
+            checks.claude().is_ok() && checks.claude_login().is_err()
+        })
+        .await
+        .unwrap_or(false);
+        self.claude_signed_out
+            .store(out, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn spawn_gh_checks(self: &Arc<Self>, every: Duration) -> tokio::task::JoinHandle<()> {

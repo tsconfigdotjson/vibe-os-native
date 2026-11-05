@@ -252,8 +252,8 @@ pub async fn github_clone(
         let _ = fs::remove_dir_all(&partial);
         return Err(match failure {
             Failed::NoGh => failed(
-                "can't run gh: it isn't installed on this host. Install it from \
-                 https://cli.github.com, then add the project again"
+                "can't run gh: it isn't installed on this host yet. VibeOS installs it by itself: \
+                 add the project again in a moment"
                     .into(),
             ),
             Failed::Ran(e) => failed(format!("gh repo clone {repo} failed: {e}")),

@@ -25,6 +25,10 @@ public enum VibeRPC {
         HostsAdd.name,
         HostsUpgrade.name,
         HostsAdmin.name,
+        SignInStart.name,
+        SignInGet.name,
+        SignInAnswer.name,
+        SignInCancel.name,
         HostsRemove.name,
         HostsExternal.name,
         TunnelPrepare.name,
@@ -612,6 +616,19 @@ public enum CheckId: String, Codable, CaseIterable, Hashable, Sendable {
 public enum AdminNeed: String, Codable, CaseIterable, Hashable, Sendable {
     case linger
     case port443 = "port_443"
+    case git
+}
+
+/// What can be signed in to from the app.
+public enum SignInWhat: String, Codable, CaseIterable, Hashable, Sendable {
+    case github, claude
+    case toolboxGithub = "toolbox_github"
+    case toolboxClaude = "toolbox_claude"
+}
+
+/// How a sign-in stands.
+public enum SignInState: String, Codable, CaseIterable, Hashable, Sendable {
+    case running, done, failed, cancelled
 }
 
 /// How a doctor check went: `pass`; `fail`, which needs the owner;
@@ -660,6 +677,35 @@ public enum HostsAdmin: RPCMethod {
     public typealias Params = HostNameParams
     public typealias Result = HostAdmin
     public static let name = "hosts.admin"
+}
+
+/// `signin.start`: the one click for a sign-in: starts the provider's own flow on
+/// the host, and says what it wants of a person.
+public enum SignInStart: RPCMethod {
+    public typealias Params = SignInStartParams
+    public typealias Result = SignIn
+    public static let name = "signin.start"
+}
+
+/// `signin.get`: how a sign-in stands, once it's moved on from `seen`.
+public enum SignInGet: RPCMethod {
+    public typealias Params = SignInGetParams
+    public typealias Result = SignIn
+    public static let name = "signin.get"
+}
+
+/// `signin.answer`: gives a sign-in the code its page showed.
+public enum SignInAnswer: RPCMethod {
+    public typealias Params = SignInAnswerParams
+    public typealias Result = SignIn
+    public static let name = "signin.answer"
+}
+
+/// `signin.cancel`: gives up on a sign-in.
+public enum SignInCancel: RPCMethod {
+    public typealias Params = SignInParams
+    public typealias Result = SignIn
+    public static let name = "signin.cancel"
 }
 
 /// `hosts.remove`: forgets a Linux host and ends its link; nothing on the
@@ -1104,6 +1150,8 @@ public struct HostInfo: Codable, Hashable, Sendable {
     /// What this Linux host needs someone with sudo there to allow, once;
     /// `hosts.admin` says how. Missing when there's nothing.
     public var needsAdmin: [AdminNeed]?
+    /// What this host still needs signing in to, each one click on `signin.start`.
+    public var signIns: [SignInWhat]?
     /// Why upgrading this Linux host's vibed failed, the last time this Mac tried.
     /// It tries again by itself; `hosts.upgrade` is Retry.
     public var upgradeError: String?
@@ -1117,6 +1165,7 @@ public struct HostInfo: Codable, Hashable, Sendable {
         case externalDetail = "external_detail"
         case memory
         case needsAdmin = "needs_admin"
+        case signIns = "sign_ins"
         case upgradeError = "upgrade_error"
     }
 }
@@ -1214,7 +1263,99 @@ public struct HostNameParams: Codable, Hashable, Sendable {
     }
 }
 
-/// How an install over SSH went.
+public struct SignInStartParams: Codable, Hashable, Sendable {
+    public var host: String?
+    public var what: SignInWhat
+
+    public init(host: String? = nil, what: SignInWhat) {
+        self.host = host
+        self.what = what
+    }
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case host, what
+    }
+}
+
+public struct SignInParams: Codable, Hashable, Sendable {
+    public var host: String?
+    public var id: String
+
+    public init(host: String? = nil, id: String) {
+        self.host = host
+        self.id = id
+    }
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case host, id
+    }
+}
+
+public struct SignInGetParams: Codable, Hashable, Sendable {
+    public var host: String?
+    public var id: String
+    /// The `seq` last seen: it answers once there's newer, or after a while.
+    public var seen: Int?
+
+    public init(host: String? = nil, id: String, seen: Int? = nil) {
+        self.host = host
+        self.id = id
+        self.seen = seen
+    }
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case host, id, seen
+    }
+}
+
+public struct SignInAnswerParams: Codable, Hashable, Sendable {
+    public var host: String?
+    public var id: String
+    /// The code the page showed.
+    public var value: String
+
+    public init(host: String? = nil, id: String, value: String) {
+        self.host = host
+        self.id = id
+        self.value = value
+    }
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case host, id, value
+    }
+}
+
+/// How a sign-in stands.
+public struct SignIn: Codable, Hashable, Sendable {
+    public var id: String
+    public var host: String
+    public var what: SignInWhat
+    /// Goes up with each change.
+    public var seq: Int
+    public var state: SignInState
+    /// The page to open on the Mac, always `https`.
+    public var url: String?
+    /// The code to enter at that page.
+    public var code: String?
+    /// That page shows a code to bring back, for `signin.answer`.
+    public var asksForCode: Bool
+    /// The flow opens the browser itself, as it's on the Mac.
+    public var opensItself: Bool
+    /// It's been approved, and the login's on its way to where it goes: it can't be
+    /// given up on now.
+    public var finishing: Bool
+    /// Why it failed, or why what was just given it wasn't taken, in words.
+    public var error: String?
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case id, host, what, seq, state, url, code
+        case asksForCode = "asks_for_code"
+        case opensItself = "opens_itself"
+        case finishing
+        case error
+    }
+}
+
 /// `hosts.admin`'s answer.
 public struct HostAdmin: Codable, Hashable, Sendable {
     /// The line a Terminal here runs: ssh to the host, where sudo asks for its
@@ -1226,6 +1367,7 @@ public struct HostAdmin: Codable, Hashable, Sendable {
     }
 }
 
+/// How an install over SSH went.
 public struct HostInstall: Codable, Hashable, Sendable {
     public var host: HostInfo
     /// Whether it changed what the server runs.

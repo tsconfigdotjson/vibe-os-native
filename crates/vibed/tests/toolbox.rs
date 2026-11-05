@@ -614,7 +614,7 @@ async fn see_logins_says_what_the_home_holds_and_whether_claude_is_logged_in() {
     assert!(
         l.claude_problem
             .as_deref()
-            .is_some_and(|p| p.contains("vibe setup-token")),
+            .is_some_and(|p| p.contains("Settings")),
         "{l:?}"
     );
 }

@@ -50,7 +50,7 @@ fn err(message: impl Into<String>) -> ImageError {
 }
 
 /// What `SHA256SUMS` says of `name`.
-fn sum_of<'a>(sums: &'a str, name: &str) -> Option<&'a str> {
+pub(crate) fn sum_of<'a>(sums: &'a str, name: &str) -> Option<&'a str> {
     sums.lines().find_map(|l| {
         let (sum, file) = l.split_once(char::is_whitespace)?;
         (file.trim().trim_start_matches('*') == name).then_some(sum.trim())
@@ -268,13 +268,15 @@ pub fn keep(releases: &str, version: &str, platform: &str, root: &Path) -> Resul
 }
 
 /// Says why `link` can't be pointed at an install under `root`, if it can't.
-fn check_link(link: &Path, root: &Path) -> Result<()> {
+pub(crate) fn check_link(link: &Path, root: &Path) -> Result<()> {
     match fs::symlink_metadata(link) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(err(format!("look at {}: {e}", link.display()))),
         Ok(_) => {
             let ours = fs::read_link(link).is_ok_and(|to| to.starts_with(root));
-            if ours {
+            // A link to nothing isn't anyone's tool: what it was is gone.
+            let dangling = fs::metadata(link).is_err();
+            if ours || dangling {
                 Ok(())
             } else {
                 Err(err(format!(
@@ -287,7 +289,7 @@ fn check_link(link: &Path, root: &Path) -> Result<()> {
 }
 
 /// Points `link` at `binary`, in one step.
-fn point_link(link: &Path, binary: &Path) -> Result<()> {
+pub(crate) fn point_link(link: &Path, binary: &Path) -> Result<()> {
     let parent = link.parent().unwrap_or(Path::new("/"));
     fs::create_dir_all(parent).map_err(|e| err(format!("create {}: {e}", parent.display())))?;
     let mut tmp = link.as_os_str().to_owned();

@@ -130,6 +130,7 @@ pub trait Remote: Send + Sync + fmt::Debug {
             let step = match need {
                 AdminNeed::Linger => "sudo loginctl enable-linger \"$(id -un)\"\n".to_owned(),
                 AdminNeed::Port443 => port_443_step(&self.bind_sums()),
+                AdminNeed::Git => crate::tool_install::GIT_WITH_SUDO.replace("{sudo}", "sudo"),
             };
             script.push_str(&format!(
                 "{{\n{step}}} || {{\n  echo \"VibeOS: that didn't work, for the reason above. Try \

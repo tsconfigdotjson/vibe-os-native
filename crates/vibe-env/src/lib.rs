@@ -48,6 +48,7 @@ pub mod pi_setup;
 pub mod sparse;
 pub mod testing;
 pub mod toolbox;
+pub mod tools;
 pub mod tree;
 pub mod vm;
 

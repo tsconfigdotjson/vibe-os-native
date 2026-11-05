@@ -283,7 +283,7 @@ pub fn keychain_token() -> TokenSource {
     Arc::new(|| match TokenStore::current().load() {
         Ok(Some(token)) => Ok(token),
         Ok(None) => Err(EnvError::new(
-            "linux agents have no Claude login yet: run `vibe setup-token`",
+            "linux agents have no Claude login yet: Settings → Linux Toolbox signs in with one click",
         )),
         Err(e) => Err(EnvError::new(format!(
             "can't read the Claude login for linux agents: {e}"

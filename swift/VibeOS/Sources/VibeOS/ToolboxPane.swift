@@ -8,6 +8,7 @@ import VibeRPC
 /// new Linux agents start with. The Linux home's logins were noted when
 /// the toolbox saved it, so reading them boots nothing.
 struct ToolboxPane: View {
+    @Environment(\.openWindow) private var openWindow
     @ObservedObject var model: MenuModel
     @State private var logins: ToolboxLogins?
     @State private var error: String?
@@ -39,6 +40,8 @@ struct ToolboxPane: View {
         }
         // Again after each change, as a save notes a new home's logins.
         .task(id: model.toolbox) { await loadLogins() }
+        // And after a sign-in, which may leave the toolbox just as it was.
+        .task(id: model.settingsRevision) { await loadLogins() }
     }
 
     private var toolbox: some View {
@@ -108,6 +111,11 @@ struct ToolboxPane: View {
         model.runInTerminal(["toolbox", "rebuild"], exec: false)
     }
 
+    private func signIn(_ what: SignInWhat) {
+        model.signInRequest = SignInRequest(what: what)
+        show(WindowID.signIn, with: openWindow)
+    }
+
     /// Always asks: a detached shell is how a long install is left running,
     /// and what it has done so far would become the new template.
     private func saveAndClose() {
@@ -131,11 +139,20 @@ struct ToolboxPane: View {
                 if summary.rows.isEmpty {
                     Text(summary.headline).foregroundStyle(.secondary)
                 }
+                if !(logins?.logins ?? []).contains(where: { $0.tool == .gh }) {
+                    LabeledContent {
+                        Button("Sign In…") { signIn(.toolboxGithub) }
+                            .disabled(model.toolbox?.state != .closed)
+                            .help("One browser sign-in, kept in the Linux home")
+                    } label: {
+                        Text("Linux agents aren't signed in to GitHub.").foregroundStyle(.secondary)
+                    }
+                }
                 // Agents' own sign-in: a hint, and a way to do it, no more.
                 if let hint = summary.signInHint {
                     LabeledContent {
-                        Button("Sign In…") { model.runInTerminal(["setup-token"], exec: true) }
-                            .help("Runs vibe setup-token in Terminal: one browser sign-in, kept in your Keychain")
+                        Button("Sign In…") { signIn(.toolboxClaude) }
+                            .help("One browser sign-in, kept in your Keychain")
                     } label: {
                         Text(hint).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                     }

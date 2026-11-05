@@ -48,6 +48,9 @@ pub const RETRY_AFTER: i64 = 24 * 60 * 60;
 /// How often the supervisor asks whether the weekly update is due.
 pub const UPDATE_CHECK_EVERY: Duration = Duration::from_secs(60 * 60);
 
+/// How long a login just approved in a browser waits for the toolbox to be free.
+const TOOLBOX_WAIT: Duration = Duration::from_secs(10 * 60);
+
 /// The shell's window title.
 const TITLE: &str = "Linux toolbox";
 
@@ -826,6 +829,71 @@ impl Core {
                 }
             }
         }
+    }
+
+    /// The GitHub login a browser sign-in left at `scratch`, a `gh` config directory of
+    /// its own.
+    pub(crate) async fn toolbox_github_token(
+        &self,
+        gh: &std::ffi::OsStr,
+        scratch: &std::path::Path,
+    ) -> Result<String, String> {
+        let out = tokio::process::Command::new(gh)
+            .args(["auth", "token", "--hostname", "github.com"])
+            .env("GH_CONFIG_DIR", scratch)
+            .env("HOME", self.layout.home())
+            .stdin(std::process::Stdio::null())
+            .output()
+            .await
+            .map_err(|e| format!("can't run gh: {e}"))?;
+        if !out.status.success() {
+            return Err("gh signed in, and won't say with what".to_owned());
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+    }
+
+    /// Takes that login on into the toolbox's Linux home, for new linux agents. A shell
+    /// opened meanwhile is waited for, for a while: a login just approved in a browser
+    /// isn't to be thrown away for that, nor the shell's state disturbed.
+    pub(crate) async fn toolbox_give_github(&self, token: String) -> Result<(), String> {
+        let host = self
+            .toolbox
+            .clone()
+            .ok_or("this host has no Linux toolbox")?;
+        let deadline = Instant::now() + TOOLBOX_WAIT;
+        let op = loop {
+            // Looked at with the lock held: nothing opens or changes it now.
+            if let Ok(op) = self.take_toolbox()
+                && *lock(&self.toolbox_state) == ToolboxState::Closed
+                && !host.is_open()
+                && !host.has_unsaved()
+            {
+                break op;
+            }
+            if Instant::now() >= deadline {
+                return Err(
+                    "the toolbox stayed in use, so that login wasn't kept: sign in again once \
+                     it's closed"
+                        .to_owned(),
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        };
+        self.set_toolbox(ToolboxState::Saving);
+        let done = blocking(move || host.log_in_to_github(&token)).await;
+        let result = match done {
+            Ok(result) => {
+                let message = result.as_ref().err().map(ToString::to_string);
+                let _ = self.finish_run(ToolboxAction::Shell, result);
+                message.map_or(Ok(()), Err)
+            }
+            Err(e) => {
+                self.toolbox_closed();
+                Err(e.message)
+            }
+        };
+        drop(op);
+        result
     }
 
     /// Runs the weekly update if it's due.

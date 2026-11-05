@@ -12,7 +12,7 @@ use vibe_core::model::{
     Activity, AdminNeed, AgentKind, AgentState, Certainty, CheckId, CheckState, Environment,
     EventKind, GhState, HostLink, LoginTool, MessageRole, Mode, Model, PiLoginMethod, PiLoginState,
     PiPromptKind, PiTarget, ProjectSource, Reasoning, ServiceRole, ServiceState, SessionState,
-    StopReason, ToolboxAction, ToolboxState, TunnelState, WakeupKind,
+    SignInState, SignInWhat, StopReason, ToolboxAction, ToolboxState, TunnelState, WakeupKind,
 };
 use vibe_core::paths;
 use vibe_core::rpc::*;
@@ -165,6 +165,11 @@ fn rust_types() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
         entry::<HostNameParams>(),
         entry::<HostInstall>(),
         entry::<HostAdmin>(),
+        entry::<SignInStartParams>(),
+        entry::<SignInParams>(),
+        entry::<SignInGetParams>(),
+        entry::<SignInAnswerParams>(),
+        entry::<SignIn>(),
         entry::<HostExternalParams>(),
         entry::<TunnelPrepared>(),
         entry::<Project>(),
@@ -294,6 +299,10 @@ fn rust_methods() -> BTreeMap<&'static str, MethodTypes> {
         method::<HostsAdd>(),
         method::<HostsUpgrade>(),
         method::<HostsAdmin>(),
+        method::<SignInStart>(),
+        method::<SignInGet>(),
+        method::<SignInAnswer>(),
+        method::<SignInCancel>(),
         method::<HostsRemove>(),
         method::<HostsExternal>(),
         method::<TunnelPrepare>(),
@@ -414,6 +423,8 @@ fn rust_enums() -> BTreeMap<&'static str, Vec<&'static str>> {
         ("LoginTool", names(LoginTool::ALL, LoginTool::as_str)),
         ("CheckId", names(CheckId::ALL, CheckId::as_str)),
         ("AdminNeed", names(AdminNeed::ALL, AdminNeed::as_str)),
+        ("SignInWhat", names(SignInWhat::ALL, SignInWhat::as_str)),
+        ("SignInState", names(SignInState::ALL, SignInState::as_str)),
         ("CheckState", names(CheckState::ALL, CheckState::as_str)),
         (
             "ServiceState",
@@ -835,6 +846,15 @@ fn examples_cover_the_contract() {
         // The same of an upgrade.
         if ty == "HostInfo" {
             seen_keys.insert("upgrade_error");
+            // Only one still to be signed in to says so; the examples' hosts have no
+            // live link.
+            seen_keys.insert("sign_ins");
+        }
+        // Only a flow that's said something has these, which takes a real person.
+        if ty == "SignIn" {
+            for key in ["url", "code", "error"] {
+                seen_keys.insert(key);
+            }
         }
         assert_eq!(
             seen_keys, fields,

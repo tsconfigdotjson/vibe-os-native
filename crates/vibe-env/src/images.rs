@@ -925,6 +925,47 @@ impl Version {
     }
 }
 
+/// The newest Claude Code at `releases` and the sum of its `build`, as its own manifest
+/// says, working in `scratch`.
+pub(crate) fn claude_release(
+    releases: &str,
+    build: &str,
+    scratch: &Path,
+) -> Result<(String, String)> {
+    let latest = scratch.join("latest");
+    fetch_bounded(&format!("{releases}/latest"), &latest)?;
+    let version = fs::read_to_string(&latest)
+        .map_err(io_err("read the latest version"))?
+        .trim()
+        .to_owned();
+    if Version::parse(&version).is_none() {
+        return Err(err(format!(
+            "{releases}/latest isn't a version: {:?}",
+            version.chars().take(40).collect::<String>()
+        )));
+    }
+    let manifest_path = scratch.join("manifest.json");
+    fetch_bounded(
+        &format!("{releases}/{version}/manifest.json"),
+        &manifest_path,
+    )?;
+    let manifest: ClaudeManifest = serde_json::from_slice(
+        &fs::read(&manifest_path).map_err(io_err("read Claude's manifest"))?,
+    )
+    .map_err(|e| err(format!("Claude {version}'s manifest can't be read: {e}")))?;
+    if manifest.version != version {
+        return Err(err(format!(
+            "Claude {version}'s manifest is for {}",
+            manifest.version
+        )));
+    }
+    let file = manifest
+        .platforms
+        .get(build)
+        .ok_or_else(|| err(format!("Claude {version} has no {build} build")))?;
+    Ok((version, file.checksum.clone()))
+}
+
 /// Downloads `url` to `dest` with `curl`, over HTTPS or from a local file.
 pub(crate) fn fetch(url: &str, dest: &Path) -> Result<()> {
     fetch_with(url, dest, &[])

@@ -767,11 +767,21 @@ impl crate::toolbox::ToolboxHost for TestToolbox {
         })
     }
 
+    fn log_in_to_github(&self, token: &str) -> Result<crate::toolbox::Saved> {
+        fs::create_dir_all(self.dir()).map_err(|e| EnvError::new(e.to_string()))?;
+        fs::write(self.dir().join("github-token"), token)
+            .map_err(|e| EnvError::new(e.to_string()))?;
+        Ok(crate::toolbox::Saved {
+            home: Some(self.keep(crate::images::Kind::Home, None)?),
+            ..Default::default()
+        })
+    }
+
     fn logins(&self) -> vibe_core::rpc::ToolboxLogins {
         let claude = if self.claude {
             Ok(())
         } else {
-            Err("linux agents have no Claude login yet: run `vibe setup-token`".into())
+            Err("linux agents have no Claude login yet: Settings → Linux Toolbox signs in with one click".into())
         };
         crate::toolbox::home_logins(&self.images, claude)
     }

@@ -495,8 +495,8 @@ fn describe_install(i: &HostInstall) -> String {
     );
     if !h.missing.is_empty() {
         out.push_str(&format!(
-            "Still needed there for its agents: {}. Install and log in to them on the server \
-             itself (`gh auth login`, and `claude` then /login).\n",
+            "Still needed there for its agents: {}. VibeOS installs them by itself, and \
+             Settings → Hosts signs in with one click.\n",
             h.missing.join(", ")
         ));
     }
@@ -917,6 +917,7 @@ mod tests {
             memory: None,
             needs_admin: vec![],
             upgrade_error: None,
+            sign_ins: vec![],
         };
         assert_eq!(
             describe_host(&h),

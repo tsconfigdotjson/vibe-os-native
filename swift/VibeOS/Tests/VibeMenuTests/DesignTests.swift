@@ -219,6 +219,21 @@ typealias StepStatus = SetupProgress.Step.Status
 
     /// Agents' own sign-in is theirs to do: setup never walks through it
     /// (#46), and without a Linux toolbox there's no toolbox step either.
+    /// A page is only a host's word, so only the provider's own opens with no click.
+    @Test func onlyTheProvidersOwnPageCountsAsIt() {
+        #expect(SignInWhat.github.isOwnPage("https://github.com/login/device"))
+        #expect(SignInWhat.toolboxGithub.isOwnPage("https://GitHub.com/login/device"))
+        #expect(SignInWhat.claude.isOwnPage("https://claude.com/cai/oauth/authorize?code=true"))
+        #expect(SignInWhat.toolboxClaude.isOwnPage("https://claude.ai/oauth/authorize"))
+        #expect(!SignInWhat.github.isOwnPage("https://github.com.evil.example/login/device"))
+        #expect(!SignInWhat.github.isOwnPage("https://github.com@evil.example/login/device"))
+        #expect(!SignInWhat.github.isOwnPage("https://evil.example/github.com/"))
+        #expect(!SignInWhat.github.isOwnPage("http://github.com/login/device"))
+        #expect(!SignInWhat.github.isOwnPage("https://github.com:8443/login/device"))
+        #expect(!SignInWhat.github.isOwnPage("https://claude.com/"))
+        #expect(!SignInWhat.claude.isOwnPage("https://github.com/"))
+    }
+
     @Test func setupHasNoAgentSignInStep() {
         let setup = SetupProgress(hasProject: true, hasKey: true, linuxGitHub: nil)
         let want: [StepID] = [StepID.project, StepID.key]
@@ -339,8 +354,8 @@ typealias StepStatus = SetupProgress.Step.Status
         let wantGit: SetupAction? = SetupAction.installCommandLineTools
         #expect(git == wantGit)
         let gh: SetupAction? = Self.action(fresh, StepID.check(CheckId.gh))
-        let wantGh: SetupAction? = SetupAction.open("https://cli.github.com")
-        #expect(gh == wantGh)
+        // VibeOS is installing it: nothing to press.
+        #expect(gh == nil)
         // git can't use gh before gh is logged in, nor can claude sign in
         // before it's installed: those steps are there, and wait.
         let ghGitStep: SetupProgress.Step? = Self.step(fresh, StepID.check(CheckId.ghGit))
@@ -348,8 +363,7 @@ typealias StepStatus = SetupProgress.Step.Status
         let ghGit: SetupAction? = Self.action(fresh, StepID.check(CheckId.ghGit))
         #expect(ghGit == nil)
         let claude: SetupAction? = Self.action(fresh, StepID.check(CheckId.claude))
-        let wantClaude: SetupAction? = SetupAction.open("https://claude.com/claude-code")
-        #expect(claude == wantClaude)
+        #expect(claude == nil)
         let loginStep: SetupProgress.Step? = Self.step(fresh, StepID.check(CheckId.claudeLogin))
         #expect(loginStep != nil)
         let login: SetupAction? = Self.action(fresh, StepID.check(CheckId.claudeLogin))
@@ -361,11 +375,11 @@ typealias StepStatus = SetupProgress.Step.Status
         let ids = Self.ids(fresh)
         #expect(!ids.contains(StepID.command))
         #expect(!ids.contains(StepID.terminal))
-        // With gh there, its button logs in, in Terminal.
+        // With gh there, its button signs in, with no terminal.
         var withGh = fresh
         withGh.ghInstalled = true
         let logIn: SetupAction? = Self.action(withGh, StepID.check(CheckId.gh))
-        let wantLogIn: SetupAction? = SetupAction.terminal("gh auth login")
+        let wantLogIn: SetupAction? = SetupAction.signIn(SignInWhat.github)
         #expect(logIn == wantLogIn)
     }
 

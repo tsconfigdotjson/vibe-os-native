@@ -210,6 +210,22 @@ async fn call(
             encode_result(core.upgrade_host(decode::<HostsUpgrade>(params)?).await)
         }
         HostsAdmin::NAME => encode_result(core.host_admin(decode::<HostsAdmin>(params)?)),
+        vibe_core::rpc::SignInStart::NAME => encode_result(
+            core.sign_in_start(decode::<vibe_core::rpc::SignInStart>(params)?)
+                .await,
+        ),
+        vibe_core::rpc::SignInGet::NAME => encode_result(
+            core.sign_in_get(decode::<vibe_core::rpc::SignInGet>(params)?)
+                .await,
+        ),
+        vibe_core::rpc::SignInAnswer::NAME => encode_result(
+            core.sign_in_answer(decode::<vibe_core::rpc::SignInAnswer>(params)?)
+                .await,
+        ),
+        vibe_core::rpc::SignInCancel::NAME => encode_result(
+            core.sign_in_cancel(decode::<vibe_core::rpc::SignInCancel>(params)?)
+                .await,
+        ),
         HostsRemove::NAME => encode_result(core.remove_host(decode::<HostsRemove>(params)?).await),
         HostsExternal::NAME => {
             encode_result(core.set_external(decode::<HostsExternal>(params)?).await)

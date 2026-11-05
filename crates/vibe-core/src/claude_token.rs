@@ -217,7 +217,7 @@ fn security(keychain: &Target) -> io::Result<Command> {
 fn bad(why: impl std::fmt::Display) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
-        format!("the kept Claude token {why}; run `vibe setup-token` again"),
+        format!("the kept Claude token {why}; sign in again in Settings → Linux Toolbox"),
     )
 }
 
@@ -383,7 +383,7 @@ mod tests {
         assert_eq!(store.load().unwrap().as_deref(), Some(TOKEN));
         fs::write(tmp.path().join("token"), "garbage").unwrap();
         let e = store.load().unwrap_err();
-        assert!(e.to_string().contains("vibe setup-token"), "{e}");
+        assert!(e.to_string().contains("Settings"), "{e}");
         assert!(store.remove().unwrap());
         assert!(!store.remove().unwrap());
     }

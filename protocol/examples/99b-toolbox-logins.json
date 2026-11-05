@@ -10,19 +10,19 @@
     "jsonrpc": "2.0",
     "id": 100,
     "result": {
+      "claude": false,
+      "claude_problem": "linux agents have no Claude login yet: Settings → Linux Toolbox signs in with one click",
       "home": 1,
       "logins": [
         {
-          "tool": "gh",
-          "account": "me on github.com"
+          "account": "me on github.com",
+          "tool": "gh"
         },
         {
-          "tool": "git",
-          "account": "Me <me@example.com>"
+          "account": "Me <me@example.com>",
+          "tool": "git"
         }
-      ],
-      "claude": false,
-      "claude_problem": "linux agents have no Claude login yet: run `vibe setup-token`"
+      ]
     }
   }
 }

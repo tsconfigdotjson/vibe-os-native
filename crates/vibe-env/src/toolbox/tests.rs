@@ -806,6 +806,25 @@ fn the_clock_is_set_before_anything_runs() {
     assert_eq!(boots, clocks, "{calls:?}");
 }
 
+/// `gh` checks a token with GitHub as it's given, and an approved login mustn't lose
+/// that race with DHCP. And it isn't on anything's command line.
+#[test]
+fn a_github_login_waits_for_the_network_and_keeps_its_token_off_the_command_line() {
+    let s = Setup::new();
+    answer(&s, |_| String::new(), None);
+    s.fake.state.lock().unwrap().network_after = 3;
+    s.toolbox.log_in_to_github("gho_secret").unwrap();
+    let state = s.fake.state.lock().unwrap();
+    assert_eq!(state.network_after, 0);
+    let login = state
+        .runs
+        .iter()
+        .rfind(|run| run.env.contains_key("VIBE_GH_TOKEN"))
+        .expect("the login ran");
+    assert_eq!(login.env["VIBE_GH_TOKEN"], "gho_secret");
+    assert!(!login.command.join(" ").contains("gho_secret"));
+}
+
 #[test]
 fn updates_wait_for_the_network_and_give_up_saying_so() {
     let s = Setup::new();

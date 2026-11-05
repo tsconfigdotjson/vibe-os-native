@@ -64,6 +64,10 @@ pub const FORWARDED: &[&str] = &[
     "agents.check",
     "agents.output",
     "agents.messages",
+    "signin.start",
+    "signin.get",
+    "signin.answer",
+    "signin.cancel",
     "pi.status",
     "pi.install",
     "pi.forget",
@@ -171,12 +175,14 @@ impl Core {
                 h.missing = self.missing_tools();
                 h.memory = self.memory_use();
                 h.needs_admin = self.admin_needs();
+                h.sign_ins = self.sign_ins_needed();
                 self.describe_public(h);
             } else if let Some(link) = self.link(&h.name) {
                 *h = link.describe(h.clone());
                 if let Some(own) = link.reported() {
                     h.memory = own.memory;
                     h.needs_admin = own.needs_admin;
+                    h.sign_ins = own.sign_ins;
                 }
                 let upgrade = lock(&link.upgrade);
                 h.upgrade_error.clone_from(&upgrade.error);
@@ -265,6 +271,22 @@ impl Core {
             .collect()
     }
 
+    /// What this host still needs signing in to, as far as it can cheaply tell, as
+    /// `hosts.list` is asked with every ping: `gh`'s login as its hourly check last
+    /// found, and Claude Code's as last looked at. Not one that isn't here yet: there's
+    /// nothing to sign in with.
+    fn sign_ins_needed(&self) -> Vec<vibe_core::model::SignInWhat> {
+        use vibe_core::model::{GhState, SignInWhat};
+        let mut needed = Vec::new();
+        if lock(&self.gh_status).state == GhState::LoggedOut {
+            needed.push(SignInWhat::Github);
+        }
+        if self.claude_signed_out.load(Ordering::SeqCst) {
+            needed.push(SignInWhat::Claude);
+        }
+        needed
+    }
+
     /// What this host needs `sudo` for, which VibeOS has tried everything else for.
     /// Only a look at a file: `hosts.list` is asked with every ping.
     fn admin_needs(&self) -> Vec<AdminNeed> {
@@ -274,6 +296,9 @@ impl Core {
         }
         if self.port_denied() {
             needs.push(AdminNeed::Port443);
+        }
+        if self.git_waits_for_admin() {
+            needs.push(AdminNeed::Git);
         }
         needs
     }
@@ -360,6 +385,7 @@ impl Core {
             memory: None,
             needs_admin: installed.needs_admin.clone(),
             upgrade_error: None,
+            sign_ins: Vec::new(),
         };
         self.store()
             .add_host(&info, self.now())
@@ -749,6 +775,7 @@ impl Core {
             memory: None,
             needs_admin: Vec::new(),
             upgrade_error: None,
+            sign_ins: Vec::new(),
         });
         e.state = Some(info.link.to_string());
         e.message = info.detail;

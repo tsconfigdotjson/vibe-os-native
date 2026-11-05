@@ -1,66 +1,71 @@
 {
   "description": "vibe doctor, and the first run's checklist: every check, in order, as this host's vibed sees it. git using gh for GitHub is VibeOS's to set up, so it has by now, with gh logged in. The Mac sleeps after 10 minutes idle, which only the owner can change: that says what to do in its hint. Tailscale, when it isn't running, is optional rather than a fail. linux is the Mac's Linux images, the base image and Claude Code, which vibed downloads at first launch: here the base image is 40% of the way in, so the check is working, with its progress in percent.",
-  "request": {"jsonrpc": "2.0", "id": 101, "method": "doctor.check", "params": {}},
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 101,
+    "method": "doctor.check",
+    "params": {}
+  },
   "response": {
     "jsonrpc": "2.0",
     "id": 101,
     "result": {
       "checks": [
         {
-          "id": "git",
-          "state": "pass",
           "detail": "git 2.50.1 is installed.",
-          "fixable": false
+          "fixable": false,
+          "id": "git",
+          "state": "pass"
         },
         {
-          "id": "gh",
-          "state": "pass",
           "detail": "GitHub's gh is logged in to github.com as me.",
-          "fixable": false
+          "fixable": false,
+          "id": "gh",
+          "state": "pass"
         },
         {
-          "id": "gh_git",
-          "state": "pass",
           "detail": "git asks gh for GitHub's credentials.",
-          "fixable": false
+          "fixable": false,
+          "id": "gh_git",
+          "state": "pass"
         },
         {
-          "id": "claude",
-          "state": "pass",
           "detail": "Claude Code 2.1.314 is at /usr/local/bin/claude.",
-          "fixable": false
+          "fixable": false,
+          "id": "claude",
+          "state": "pass"
         },
         {
-          "id": "claude_login",
-          "state": "pass",
           "detail": "Claude Code is signed in, with its login in your Keychain.",
-          "fixable": false
+          "fixable": false,
+          "id": "claude_login",
+          "state": "pass"
         },
         {
-          "id": "power",
-          "state": "fail",
           "detail": "This Mac sleeps after 10 minutes idle, and agents stop answering while it sleeps.",
-          "hint": "In System Settings → Energy, turn on Prevent automatic sleeping when the display is off (on a laptop, in Battery → Options, on power adapter); or run `sudo pmset -c sleep 0` in Terminal.",
-          "fixable": false
+          "fixable": false,
+          "hint": "In System Settings → Energy, turn on Prevent automatic sleeping when the display is off (on a laptop, in Battery → Options, on power adapter). VibeOS's setup has a button for it too.",
+          "id": "power",
+          "state": "fail"
         },
         {
-          "id": "tailscale",
-          "state": "pass",
           "detail": "Tailscale is up, at 100.101.102.103; Settings can serve MCP there too.",
-          "fixable": false
+          "fixable": false,
+          "id": "tailscale",
+          "state": "pass"
         },
         {
-          "id": "linux",
-          "state": "working",
           "detail": "Downloading the Linux base image.",
           "fixable": false,
-          "progress": 40
+          "id": "linux",
+          "progress": 40,
+          "state": "working"
         },
         {
-          "id": "pi",
-          "state": "pass",
           "detail": "Pi 1.5.0 is at /usr/local/bin/pi.",
-          "fixable": false
+          "fixable": false,
+          "id": "pi",
+          "state": "pass"
         }
       ]
     }
