@@ -1647,7 +1647,7 @@ struct GeneralPane: View {
             }
             Section("About") {
                 HStack(spacing: 14) {
-                    BrandMark(lit: 3, size: 44)
+                    AppMark(size: 44)
                     VStack(alignment: .leading, spacing: 2) {
                         Text("VibeOS").font(.headline)
                         Text("Version \(version)").font(.caption).foregroundStyle(.secondary)

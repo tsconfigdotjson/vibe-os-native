@@ -41,6 +41,9 @@ enum Palette {
     static let inkTop = Color(red: 0x26 / 255, green: 0x2B / 255, blue: 0x5E / 255)
     static let inkBottom = Color(red: 0x0A / 255, green: 0x0C / 255, blue: 0x1F / 255)
     static let moon = Color(red: 0xE6 / 255, green: 0xE4 / 255, blue: 0xFF / 255)
+    /// The app icon's two colours, from Support/AppIcon.svg.
+    static let iconPlate = Color(red: 0x0D / 255, green: 0x11 / 255, blue: 0x17 / 255)
+    static let iconCell = Color(red: 0x56 / 255, green: 0xCF / 255, blue: 0xE1 / 255)
 }
 
 enum Metrics {
@@ -493,6 +496,28 @@ struct BrandMark: View {
                 .opacity(on ? 1 : 0)
         }
         .frame(width: cell, height: cell)
+    }
+}
+
+/// The app icon, as the Dock and Finder show it: a dark plate with a cyan
+/// cell left of centre. Vectors at Support/AppIcon.svg's proportions, so it's
+/// crisp at any size and needs no bundle, as a `swift run` build has none. The
+/// plate is rounded here because the SVG leaves that to the Dock's mask.
+struct AppMark: View {
+    var size: CGFloat = 56
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            RoundedRectangle(cornerRadius: size * 0.225, style: .continuous)
+                .fill(Palette.iconPlate)
+                .shadow(color: .black.opacity(0.25), radius: size * 0.04, y: size * 0.02)
+            RoundedRectangle(cornerRadius: size * 8 / 512, style: .circular)
+                .fill(Palette.iconCell)
+                .frame(width: size * 160 / 512, height: size * 256 / 512)
+                .offset(x: size * 128 / 512, y: size * 128 / 512)
+        }
+        .frame(width: size, height: size)
+        .accessibilityHidden(true)
     }
 }
 
