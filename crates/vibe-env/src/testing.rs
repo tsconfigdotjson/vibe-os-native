@@ -740,10 +740,21 @@ impl crate::toolbox::ToolboxHost for TestToolbox {
         })
     }
 
-    fn rebuild(&self, recipe: &vibe_core::toolbox::Recipe) -> Result<crate::toolbox::Saved> {
+    fn rebuild(
+        &self,
+        recipe: &vibe_core::toolbox::Recipe,
+        whole_only: bool,
+    ) -> Result<crate::toolbox::Saved> {
         fs::create_dir_all(self.dir()).map_err(|e| EnvError::new(e.to_string()))?;
         for install in &recipe.install {
             self.sh(&format!("installing {}", install.name), &install.run)?;
+        }
+        if whole_only && !self.uncovered.is_empty() {
+            return Ok(crate::toolbox::Saved {
+                template: None,
+                home: None,
+                uncovered: self.uncovered.clone(),
+            });
         }
         let newest = self
             .images

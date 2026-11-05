@@ -218,14 +218,12 @@ impl Watch {
                         CheckState::Optional,
                         format!(
                             "Linux agents have no shared MCP services yet: the template is on \
-                             base image {}, and they need {}.",
+                             base image {}, and they need {}. Settings → Linux Toolbox says how \
+                             its move there is going.",
                             boots.unwrap_or(0),
                             images::SERVICES_BASE
                         ),
-                        Some(
-                            "Rebuild Template in Settings → Linux Toolbox, or run `vibe toolbox \
-                             rebuild`.",
-                        ),
+                        None,
                         None,
                     )
                 };
@@ -372,7 +370,7 @@ mod tests {
     }
 
     #[test]
-    fn the_doctor_says_to_rebuild_a_template_from_before_shared_services() {
+    fn the_doctor_says_a_template_from_before_shared_services_is_moving() {
         let tmp = tempfile::tempdir().unwrap();
         let layout = Layout::new(tmp.path().join("home"), "macos");
         let dir = layout.linux_dir();
@@ -405,10 +403,8 @@ mod tests {
         let check = Watch::new(&layout, sources()).check();
         assert_eq!(check.state, CheckState::Optional, "{check:?}");
         assert!(check.detail.contains("no shared MCP services"), "{check:?}");
-        assert!(
-            check.hint.as_deref().unwrap().contains("Rebuild Template"),
-            "{check:?}"
-        );
+        assert!(check.detail.contains("Settings"), "{check:?}");
+        assert_eq!(check.hint, None, "nothing's asked of the owner");
         assert!(!check.fixable, "downloading can't fix it: {check:?}");
 
         // Rebuilt, on the base that has them.

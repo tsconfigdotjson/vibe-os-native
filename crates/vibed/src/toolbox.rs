@@ -19,6 +19,7 @@
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -66,6 +67,49 @@ struct Kept {
     /// The last weekly or manual update: when, and whether it worked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     update: Option<Attempt>,
+    /// The last time the template didn't move to a new base by itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    moved: Option<NotMoved>,
+}
+
+/// A move of the template to a new base by itself that didn't happen.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotMoved {
+    /// Unix seconds.
+    pub at: i64,
+    /// The base it was for.
+    pub base: u32,
+    /// The template it was from.
+    pub template: u32,
+    /// A sum of `toolbox.toml` as it was, or nothing if there's none.
+    pub recipe: String,
+    /// What moving would have lost, if that's why. Otherwise it failed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub held: Vec<String>,
+}
+
+/// Whether the template should move by itself to base `newest` now, from `template`
+/// on `base`, with this `recipe`. Whatever came of the last try, once what it had to
+/// go on has changed. Otherwise not if it would lose something: nobody wants minutes
+/// of VM time for the same answer. And if it failed, a day on, as its weekly update is.
+pub fn move_due(
+    now: i64,
+    base: u32,
+    newest: u32,
+    template: u32,
+    recipe: &str,
+    last: Option<&NotMoved>,
+) -> bool {
+    if base >= newest {
+        return false;
+    }
+    let Some(last) = last.filter(|l| l.base == newest) else {
+        return true;
+    };
+    if last.template != template || last.recipe != recipe {
+        return true;
+    }
+    last.held.is_empty() && now - last.at >= RETRY_AFTER
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,7 +122,7 @@ pub struct Attempt {
 /// Whether the weekly update is due at `now`: a week after the template
 /// was last made (by the shell, an update or a rebuild) or updated, and a
 /// day after an update that failed. With no template there's nothing to
-/// update; **Rebuild template** makes the first from the recipe.
+/// update; `toolbox.rebuild` makes the first from the recipe.
 pub fn update_due(now: i64, template_made: Option<i64>, last: Option<Attempt>) -> bool {
     let Some(made) = template_made else {
         return false;
@@ -260,6 +304,18 @@ impl Core {
                 ok: result.is_ok(),
             });
         }
+        // It's where it should be, by whichever way: nothing's waiting.
+        if action == ToolboxAction::Rebuild && result.is_ok() {
+            kept.moved = None;
+        }
+        // A weekly update adds a version, and changes nothing about what a move would
+        // lose: it's no reason to try the whole of it again.
+        if action == ToolboxAction::Update
+            && let (Ok(saved), Some(moved)) = (&result, kept.moved.as_mut())
+            && let Some(template) = saved.template
+        {
+            moved.template = template;
+        }
         self.keep(&kept);
         self.set_toolbox(ToolboxState::Closed);
         self.toolbox_event(message);
@@ -306,6 +362,7 @@ impl Core {
                 home: None,
                 base: None,
                 newest_base: None,
+                rebuild_held: Vec::new(),
                 last: None,
                 clients: None,
             };
@@ -316,6 +373,7 @@ impl Core {
             home: versions.home,
             base: versions.base,
             newest_base: versions.newest_base,
+            rebuild_held: self.toolbox_held(&versions),
             last: self.kept().last,
             clients,
         }
@@ -472,7 +530,7 @@ impl Core {
         let recipe =
             recipe::load(&self.layout.toolbox_config()).map_err(|e| failed(e.to_string()))?;
         self.set_toolbox(ToolboxState::Rebuilding);
-        let result = blocking(move || host.rebuild(&recipe)).await;
+        let result = blocking(move || host.rebuild(&recipe, false)).await;
         let result = match result {
             Ok(r) => r,
             Err(e) => {
@@ -631,6 +689,145 @@ impl Core {
         self.save_exited_toolbox(host).await;
     }
 
+    /// A sum of `toolbox.toml` as it stands, or nothing if there's none.
+    fn recipe_sum(&self) -> String {
+        fs::read(self.layout.toolbox_config())
+            .map(|bytes| crate::remote::sha256_hex(&bytes))
+            .unwrap_or_default()
+    }
+
+    /// What moving the template would lose, if that's what it's waiting on.
+    pub(crate) fn toolbox_held(&self, versions: &Versions) -> Vec<String> {
+        match self.kept().moved {
+            Some(moved)
+                if Some(moved.base) == versions.newest_base
+                    && Some(moved.template) == versions.template
+                    && versions.base < versions.newest_base =>
+            {
+                moved.held
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Moves the template to a new base image by itself, once one's here (PRD: Base
+    /// image updates). New agents take it as soon as it's kept; agents that exist
+    /// keep the images they have until their next fresh boot, as an image is never
+    /// changed in place, so one asleep still wakes. What the owner installed by hand
+    /// and the recipe doesn't cover isn't lost behind their back: then nothing moves,
+    /// and Settings says what with one click.
+    pub async fn rebuild_toolbox_if_due(&self) {
+        let Some(host) = self.toolbox.clone() else {
+            return;
+        };
+        let versions = host.versions();
+        let (Some(template), Some(base), Some(newest)) =
+            (versions.template, versions.base, versions.newest_base)
+        else {
+            return;
+        };
+        let recipe_sum = self.recipe_sum();
+        if !move_due(
+            self.now(),
+            base,
+            newest,
+            template,
+            &recipe_sum,
+            self.kept().moved.as_ref(),
+        ) || host.is_open()
+            || host.has_unsaved()
+        {
+            return;
+        }
+        // Its download isn't done, or there's no room: it's no failure, and it's
+        // looked at again soon.
+        if self
+            .linux_images
+            .as_ref()
+            .is_some_and(|w| w.check().state == vibe_core::model::CheckState::Working)
+        {
+            return;
+        }
+        if (self.free_disk)(&self.layout.linux_dir())
+            .is_some_and(|free| free < crate::agents::MIN_FREE_DISK)
+        {
+            crate::log!("vibed: the template waits for disk to move to base image {newest}");
+            return;
+        }
+        let Ok(_op) = self.take_toolbox() else {
+            return;
+        };
+        let not_moved = |held: Vec<String>| NotMoved {
+            at: self.now(),
+            base: newest,
+            template,
+            recipe: recipe_sum.clone(),
+            held,
+        };
+        let recipe = match recipe::load(&self.layout.toolbox_config()) {
+            Ok(recipe) => recipe,
+            Err(e) => {
+                let why = vibe_env::EnvError::new(e.to_string());
+                let _ = self.finish_run(ToolboxAction::Rebuild, Err(why));
+                let mut kept = self.kept();
+                kept.moved = Some(not_moved(Vec::new()));
+                self.keep(&kept);
+                return;
+            }
+        };
+        crate::log!("vibed: moving the template to base image {newest}");
+        self.set_toolbox(ToolboxState::Rebuilding);
+        // Nobody asked for this, so it doesn't count among the agents awake: it isn't
+        // to put an agent to sleep early, or keep one from waking.
+        self.toolbox_moving.store(true, Ordering::SeqCst);
+        let done = blocking(move || host.rebuild(&recipe, true)).await;
+        self.toolbox_moving.store(false, Ordering::SeqCst);
+        let done = match done {
+            Ok(done) => done,
+            Err(e) => {
+                crate::log!("vibed: moving the template failed: {}", e.message);
+                self.toolbox_closed();
+                return;
+            }
+        };
+        match done {
+            Ok(saved) if saved.template.is_none() => {
+                crate::log!(
+                    "vibed: the template stays on base image {base}: moving would lose {}",
+                    saved.uncovered.join(", ")
+                );
+                let mut kept = self.kept();
+                kept.moved = Some(not_moved(saved.uncovered));
+                // What failed before isn't what's in the way now.
+                if kept
+                    .last
+                    .as_ref()
+                    .is_some_and(|l| l.action == ToolboxAction::Rebuild && l.error.is_some())
+                {
+                    kept.last = None;
+                }
+                self.keep(&kept);
+                self.toolbox_closed();
+                self.toolbox_event(format!(
+                    "The template stays on its base image for now: moving it would lose {}.",
+                    kept.moved
+                        .as_ref()
+                        .map(|m| m.held.join(", "))
+                        .unwrap_or_default()
+                ));
+            }
+            done => {
+                let failed = done.is_err();
+                let _ = self.finish_run(ToolboxAction::Rebuild, done);
+                if failed {
+                    let mut kept = self.kept();
+                    kept.moved = Some(not_moved(Vec::new()));
+                    self.keep(&kept);
+                }
+            }
+        }
+    }
+
     /// Runs the weekly update if it's due.
     pub async fn update_toolbox_if_due(&self) {
         let Some(host) = self.toolbox.clone() else {
@@ -660,8 +857,8 @@ impl Core {
 
     /// At start: an open toolbox is watched again, and what an unfinished
     /// update or rebuild left is thrown away. Then, every `poll`, the open
-    /// toolbox is checked; and every `update_check`, whether the weekly
-    /// update is due.
+    /// toolbox is checked; and every `update_check`, whether a new base image or
+    /// the weekly update is due.
     pub fn spawn_toolbox(
         self: &Arc<Self>,
         poll: Duration,
@@ -692,6 +889,7 @@ impl Core {
                 core.check_toolbox().await;
                 if checked.is_none_or(|t| t.elapsed() >= update_check) {
                     checked = Some(Instant::now());
+                    core.rebuild_toolbox_if_due().await;
                     core.update_toolbox_if_due().await;
                 }
             }
@@ -704,6 +902,57 @@ mod tests {
     use super::*;
 
     const DAY: i64 = 24 * 60 * 60;
+
+    #[test]
+    fn a_failed_move_goes_again_at_once_if_what_it_had_to_go_on_has_changed() {
+        let failed = NotMoved {
+            at: 10 * DAY,
+            base: 3,
+            template: 5,
+            recipe: "r".into(),
+            held: Vec::new(),
+        };
+        assert!(!move_due(10 * DAY + 60, 2, 3, 5, "r", Some(&failed)));
+        assert!(move_due(10 * DAY + 60, 2, 3, 5, "fixed", Some(&failed)));
+        assert!(move_due(10 * DAY + 60, 2, 3, 6, "r", Some(&failed)));
+    }
+
+    #[test]
+    fn the_template_moves_once_for_each_base_or_when_what_held_it_changes() {
+        let due = |last: Option<&NotMoved>| move_due(10 * DAY, 2, 3, 5, "r", last);
+        // Nothing's new: there's nothing to do.
+        assert!(!move_due(10 * DAY, 3, 3, 5, "r", None));
+        assert!(!move_due(10 * DAY, 4, 3, 5, "r", None));
+        assert!(due(None));
+        let held = NotMoved {
+            at: 9 * DAY,
+            base: 3,
+            template: 5,
+            recipe: "r".into(),
+            held: vec!["apt: htop".into()],
+        };
+        // Held: not again, however long, till what could change the answer has.
+        assert!(!move_due(100 * DAY, 2, 3, 5, "r", Some(&held)));
+        assert!(
+            move_due(10 * DAY, 2, 3, 6, "r", Some(&held)),
+            "the template"
+        );
+        assert!(
+            move_due(10 * DAY, 2, 3, 5, "new", Some(&held)),
+            "the recipe"
+        );
+        assert!(
+            move_due(10 * DAY, 2, 4, 5, "r", Some(&held)),
+            "another base"
+        );
+        // Failed: a day on.
+        let failed = NotMoved {
+            held: Vec::new(),
+            ..held
+        };
+        assert!(!move_due(9 * DAY + 60, 2, 3, 5, "r", Some(&failed)));
+        assert!(move_due(10 * DAY, 2, 3, 5, "r", Some(&failed)));
+    }
 
     #[test]
     fn the_update_runs_weekly_and_a_day_after_a_failure() {

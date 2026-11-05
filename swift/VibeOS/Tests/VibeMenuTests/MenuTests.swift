@@ -173,7 +173,7 @@ import VibeRPC
         #expect(summary.state == "Closed")
         #expect(!summary.working && !summary.closable)
         #expect(summary.versions == "Template v3 · Linux home v2 · Base 1")
-        #expect(summary.notes == ["Base 2 is installed. Rebuild Template moves to it.", "Not in toolbox.toml: apt: htop"])
+        #expect(summary.notes == ["Base 2 is installed. VibeOS moves the template to it by itself.", "Not in toolbox.toml: apt: htop"])
         status.state = .open
         status.newestBase = 1
         status.last?.error = "installing gcloud exited with code 3"

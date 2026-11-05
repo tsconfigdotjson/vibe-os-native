@@ -134,10 +134,9 @@ public func serviceFailure(_ error: any Error, host: String) -> String {
     return describe(error)
 }
 
-/// Whether this Mac's Linux agents can't have shared services until Rebuild
-/// Template: its template is on a base image from before them, and one that has
-/// them is installed for it to move to. Until that's downloaded, a rebuild
-/// wouldn't help.
+/// Whether this Mac's Linux agents can't have shared services until the template
+/// moves: it's on a base image from before them, and one that has them is installed
+/// for it to move to. Until that's downloaded, it can't.
 public func servicesNeedRebuild(_ toolbox: ToolboxStatus?) -> Bool {
     guard let toolbox, toolbox.state != .unavailable, let base = toolbox.base,
         let newest = toolbox.newestBase

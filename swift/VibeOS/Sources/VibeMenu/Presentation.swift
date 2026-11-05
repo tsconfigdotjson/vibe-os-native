@@ -230,7 +230,7 @@ public enum MCPSetup {
 
 /// What Settings → Linux Toolbox says about the toolbox (PRD: The toolbox
 /// shell): what it's doing, the versions new agents boot, and a note or two
-/// (a newer base image Rebuild Template would move to, how the last run
+/// (a newer base image the template is moving to, how the last run
 /// went). Only what vibed says now: the shell shows as open only while it
 /// is.
 public struct ToolboxSummary: Equatable, Sendable {
@@ -275,13 +275,20 @@ public struct ToolboxSummary: Equatable, Sendable {
         if let home = status.home { parts.append("Linux home v\(home)") }
         if let base = status.base { parts.append("Base \(base)") }
         if !parts.isEmpty { versions = parts.joined(separator: " · ") }
+        let held = status.rebuildHeld ?? []
         if let newest = status.newestBase, newest > (status.base ?? 0) {
-            notes.append("Base \(newest) is installed. Rebuild Template moves to it.")
+            if held.isEmpty {
+                notes.append("Base \(newest) is installed. VibeOS moves the template to it by itself.")
+            } else {
+                notes.append(
+                    "Base \(newest) is installed. New agents stay on the current template, as moving would "
+                        + "lose what you installed by hand and toolbox.toml doesn't cover: "
+                        + held.joined(separator: ", ") + ".")
+            }
         }
         if servicesNeedRebuild(status) {
             notes.append(
-                "Linux agents have no shared services until the template is on base \(VibeRPC.sharedServicesBase): "
-                    + "Rebuild Template.")
+                "Linux agents have no shared services until the template is on base \(VibeRPC.sharedServicesBase).")
         }
         if let last = status.last {
             let what: String
@@ -868,7 +875,8 @@ public struct SetupProgress: Equatable, Sendable {
         let linux = doctor.first { $0.id == .linux }
         if let linux { steps.append(step(for: linux)) }
         if let linuxGitHub {
-            let ready = linux.map { $0.state == .pass } ?? true
+            // Downloaded: the template's own move is no reason to wait.
+            let ready = linux.map { $0.state == .pass || $0.state == .optional } ?? true
             steps.append(
                 Step(
                     id: .toolbox, title: "Set up the Linux toolbox",
@@ -958,7 +966,9 @@ public struct SetupProgress: Equatable, Sendable {
         let passed = check.state == .pass
         let claudeReady = doctor.contains { $0.id == .claude && $0.state == .pass }
         var step = Step(
-            id: .check(check.id), title: checkTitle(check.id, passed: passed),
+            id: .check(check.id),
+            title: check.id == .linux && check.state == .optional
+                ? checkTitle(.linux, passed: true) : checkTitle(check.id, passed: passed),
             detail: welcomeDetail(check, claudeReady: claudeReady), status: status)
         guard !passed, check.state != .working else { return step }
         switch check.id {

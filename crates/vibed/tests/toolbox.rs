@@ -55,13 +55,35 @@ fn world() -> World {
 
 impl World {
     fn core_with(&self, toolbox: Option<TestToolbox>) -> Arc<Core> {
+        Arc::new(Core::open(self.config_with(toolbox)).unwrap())
+    }
+
+    fn config_with(&self, toolbox: Option<TestToolbox>) -> Config {
         let mut config = Config::new(DaemonInfo::current(), self.layout.clone());
+        // Whatever this machine's disk is doing.
+        config.free_disk = Arc::new(|_: &std::path::Path| None);
         config.gh = "/nonexistent/gh".into();
         config.shim = workspace_bin("vibe-shim").into_os_string();
         let clock = self.clock.clone();
         config.clock = Arc::new(move || clock.load(Ordering::SeqCst));
         config.toolbox = toolbox.map(|t| Arc::new(t) as _);
-        Arc::new(Core::open(config).unwrap())
+        config
+    }
+
+    /// A new app has brought a new base image.
+    fn new_base(&self, n: u32) {
+        let base = self.layout.linux_dir().join(format!("base-{n}"));
+        fs::create_dir_all(&base).unwrap();
+        for f in ["Image", "initrd", "base.img"] {
+            fs::write(base.join(f), f).unwrap();
+        }
+    }
+
+    fn base_of_template(&self, n: u32) -> String {
+        fs::read_to_string(self.layout.linux_dir().join(format!("template-{n}.base")))
+            .unwrap()
+            .trim()
+            .to_owned()
     }
 
     fn core(&self, shell: &[&str]) -> Arc<Core> {
@@ -848,4 +870,223 @@ async fn save_and_close_tells_a_failed_hang_up_from_a_shell_just_gone() {
         (status.state, status.template),
         (ToolboxState::Closed, Some(1))
     );
+}
+
+/// #74: a template follows a new base image with nobody pressing anything.
+mod a_new_base {
+    use super::*;
+    use vibe_core::model::{CheckId, CheckState};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_template_moves_to_it_by_itself_and_only_once() {
+        let w = world();
+        let count = w._dir.path().join("replays");
+        w.recipe(&format!(
+            "[[install]]\nname = \"tool\"\nrun = \"echo x >> {}\"\n",
+            count.display()
+        ));
+        let core = w.core(&["true"]);
+        // With nothing new, there's nothing to do. No template yet: new agents boot
+        // the newest base as they are.
+        core.rebuild_toolbox_if_due().await;
+        assert!(!count.exists());
+        core.rebuild_toolbox(NoParams {}).await.unwrap();
+        assert_eq!(w.base_of_template(1), "1");
+        fs::remove_file(&count).unwrap();
+        core.rebuild_toolbox_if_due().await;
+        assert!(!count.exists(), "it's on the newest already");
+
+        // A release with a new base: the recipe's replayed, and new agents get it.
+        w.new_base(2);
+        assert!(core.toolbox_status(NoParams {}).await.unwrap().base == Some(1));
+        core.rebuild_toolbox_if_due().await;
+        assert_eq!(w.base_of_template(2), "2");
+        let status = core.toolbox_status(NoParams {}).await.unwrap();
+        assert_eq!((status.template, status.base), (Some(2), Some(2)));
+        assert_eq!(status.state, ToolboxState::Closed);
+        assert_eq!(status.rebuild_held, Vec::<String>::new());
+        assert_eq!(status.last.unwrap().action, ToolboxAction::Rebuild);
+        assert_eq!(fs::read_to_string(&count).unwrap(), "x\n");
+        // And it's done.
+        core.rebuild_toolbox_if_due().await;
+        assert_eq!(fs::read_to_string(&count).unwrap(), "x\n");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn what_was_installed_by_hand_isnt_lost_behind_the_owners_back() {
+        let w = world();
+        let count = w._dir.path().join("replays");
+        let recipe = format!(
+            "[[install]]\nname = \"tool\"\nrun = \"echo x >> {}\"\n",
+            count.display()
+        );
+        w.recipe(&recipe);
+        let core = w.core_with(Some(
+            w.toolbox(&["true"])
+                .with_uncovered(vec!["apt: htop".into()]),
+        ));
+        core.rebuild_toolbox(NoParams {}).await.unwrap();
+        fs::remove_file(&count).unwrap();
+        w.new_base(2);
+
+        core.rebuild_toolbox_if_due().await;
+        // Nothing moved: new agents stay on what they have, and it says what's up.
+        assert!(!w.version("template-2.img"));
+        let status = core.toolbox_status(NoParams {}).await.unwrap();
+        assert_eq!(status.rebuild_held, ["apt: htop"]);
+        assert_eq!((status.template, status.base), (Some(1), Some(1)));
+        assert_eq!(status.state, ToolboxState::Closed);
+        assert_eq!(status.newest_base, Some(2));
+
+        // It isn't tried again for the same answer, however long it's been...
+        w.advance(30 * DAY);
+        core.rebuild_toolbox_if_due().await;
+        assert_eq!(fs::read_to_string(&count).unwrap(), "x\n");
+        // ...only once what could change that has.
+        w.recipe(&format!("{recipe}\n# and now it has htop\n"));
+        core.rebuild_toolbox_if_due().await;
+        assert_eq!(fs::read_to_string(&count).unwrap(), "x\nx\n");
+
+        // The one click: it moves anyway, as asked, and nothing's waiting then.
+        let run = core.rebuild_toolbox(NoParams {}).await.unwrap();
+        assert_eq!(run.uncovered, ["apt: htop"]);
+        assert_eq!(w.base_of_template(2), "2");
+        let status = core.toolbox_status(NoParams {}).await.unwrap();
+        assert_eq!(status.rebuild_held, Vec::<String>::new());
+    }
+
+    /// The review's: a weekly update adds a version, and isn't to set off the whole
+    /// attempt again each week for the same answer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_weekly_update_doesnt_undo_a_hold() {
+        let w = world();
+        let count = w._dir.path().join("replays");
+        w.recipe(&format!(
+            "[[install]]\nname = \"tool\"\nrun = \"echo x >> {}\"\n\n[update]\nrun = [\"true\"]\n",
+            count.display()
+        ));
+        let core = w.core_with(Some(
+            w.toolbox(&["true"])
+                .with_uncovered(vec!["apt: htop".into()]),
+        ));
+        core.rebuild_toolbox(NoParams {}).await.unwrap();
+        fs::remove_file(&count).unwrap();
+        w.new_base(2);
+        core.rebuild_toolbox_if_due().await;
+        assert_eq!(fs::read_to_string(&count).unwrap(), "x\n");
+        core.update_toolbox(NoParams {}).await.unwrap();
+        // Still held, as it was, and not tried again.
+        let status = core.toolbox_status(NoParams {}).await.unwrap();
+        assert_eq!(status.rebuild_held, ["apt: htop"]);
+        core.rebuild_toolbox_if_due().await;
+        assert_eq!(fs::read_to_string(&count).unwrap(), "x\n");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_broken_recipe_is_said_and_a_fixed_one_goes_at_once() {
+        let w = world();
+        let core = w.core(&["true"]);
+        core.rebuild_toolbox(NoParams {}).await.unwrap();
+        w.recipe("packages = [\"--bad\"]\n");
+        w.new_base(2);
+        core.rebuild_toolbox_if_due().await;
+        let status = core.toolbox_status(NoParams {}).await.unwrap();
+        let said = status.last.unwrap().error.unwrap();
+        assert!(said.contains("isn't a Debian package name"), "{said}");
+        assert_eq!(status.state, ToolboxState::Closed);
+        // Fixed: no waiting out the day.
+        w.recipe("packages = []\n");
+        core.rebuild_toolbox_if_due().await;
+        assert_eq!(w.base_of_template(2), "2");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_move_says_so_and_goes_again_a_day_on() {
+        let w = world();
+        let count = w._dir.path().join("replays");
+        let core = w.core(&["true"]);
+        core.rebuild_toolbox(NoParams {}).await.unwrap();
+        w.recipe(&format!(
+            "[[install]]\nname = \"tool\"\nrun = \"echo x >> {}; exit 4\"\n",
+            count.display()
+        ));
+        w.new_base(2);
+        core.rebuild_toolbox_if_due().await;
+        let status = core.toolbox_status(NoParams {}).await.unwrap();
+        assert!(status.last.unwrap().error.is_some());
+        assert_eq!(
+            (status.template, status.state),
+            (Some(1), ToolboxState::Closed)
+        );
+        // Not at every look.
+        core.rebuild_toolbox_if_due().await;
+        assert_eq!(fs::read_to_string(&count).unwrap(), "x\n");
+        w.advance(DAY);
+        core.rebuild_toolbox_if_due().await;
+        assert_eq!(fs::read_to_string(&count).unwrap(), "x\nx\n");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_open_shell_is_left_alone() {
+        let w = world();
+        let shell = w.held_shell();
+        let core = w.core(&["/bin/sh", "-c", &shell]);
+        core.rebuild_toolbox(NoParams {}).await.unwrap();
+        w.new_base(2);
+        core.open_toolbox(NoParams {}).await.unwrap();
+        core.rebuild_toolbox_if_due().await;
+        assert!(!w.version("template-2.img"));
+        assert_eq!(
+            core.toolbox_status(NoParams {}).await.unwrap().state,
+            ToolboxState::Open
+        );
+        fs::write(w.release(), "").unwrap();
+        core.close_toolbox(NoParams {}).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_doctor_says_how_it_stands_and_asks_only_if_it_must() {
+        let w = world();
+        let bin = w._dir.path().join("claude-bin");
+        fs::write(&bin, "claude").unwrap();
+        vibe_env::images::Images::new(w.layout.linux_dir())
+            .add_managed("2.1.308", &bin, "x")
+            .unwrap();
+        let mut config = w.config_with(Some(
+            w.toolbox(&["true"])
+                .with_uncovered(vec!["apt: htop".into()]),
+        ));
+        config.linux_images = Some(vibed::linux::Watch::new(
+            &w.layout,
+            vibed::linux::Sources {
+                base_releases: "file:///nowhere".into(),
+                base_release: 2,
+                claude_releases: "file:///nowhere".into(),
+                pi_releases: "file:///nowhere".into(),
+            },
+        ));
+        let core = Arc::new(Core::open(config).unwrap());
+        core.rebuild_toolbox(NoParams {}).await.unwrap();
+        w.new_base(2);
+        let row = |report: vibe_core::rpc::DoctorReport| {
+            report
+                .checks
+                .into_iter()
+                .find(|c| c.id == CheckId::Linux)
+                .unwrap()
+        };
+        assert_ne!(row(core.doctor().await).state, CheckState::Fail);
+        core.rebuild_toolbox_if_due().await;
+        // Agents work, so nothing's on the list of what needs the owner, and it says
+        // where the one click is.
+        let held = row(core.doctor().await);
+        assert_eq!(
+            (held.state, held.fixable),
+            (CheckState::Optional, false),
+            "{held:?}"
+        );
+        assert!(held.detail.contains("apt: htop"), "{held:?}");
+        assert!(held.detail.contains("Settings"), "{held:?}");
+        assert_eq!(held.hint, None);
+    }
 }

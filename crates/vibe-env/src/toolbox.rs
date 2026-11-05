@@ -31,9 +31,9 @@
 //! toolbox is hidden in agents, as Claude Code is the daemon's to keep.
 //!
 //! The same VM runs, without a shell, the weekly `[update]` commands of
-//! `toolbox.toml` (a new template version) and **Rebuild template**, which
-//! replays the recipe into a blank template on the newest base and lists
-//! what the old template has that the recipe doesn't cover. Only one runs
+//! `toolbox.toml` (a new template version) and the rebuild `vibed` runs itself when
+//! a new base ships, which replays the recipe into a blank template on the newest
+//! base and lists what the old template has that the recipe doesn't cover. Only one runs
 //! at a time, and they all use the ref [`TOOLBOX_REF`]: `run/toolbox.vm`,
 //! and `~/VibeOS/agents/toolbox/` for its working disks and `vm.json`,
 //! which keeps the layers it uses from being pruned while it runs.
@@ -100,14 +100,19 @@ const INVENTORY_TIMEOUT: Duration = Duration::from_secs(120);
 const RUN_OUTPUT: usize = 32 * 1024;
 
 /// Lists what's installed system-wide, one item per line: manually
-/// installed Debian packages, apt sources, what's in `/opt` and
-/// `/usr/local`, and global npm packages. Run on the old template, its
-/// base and the rebuilt template, it tells what was installed by hand and
-/// what the recipe doesn't cover.
+/// installed Debian packages, apt sources, what's at the top of `/opt` and
+/// `/usr/local`'s directories, what `pip` put under `/usr/local` as root, added
+/// certificates, and global npm packages. Run on the old template, its base and the
+/// rebuilt template, it tells what was installed by hand and what the recipe doesn't
+/// cover. That's all it can see: an edit in `/etc`, or a file put elsewhere, isn't
+/// on it. Bounded, as a run's output is ([`RUN_OUTPUT`]).
 pub const INVENTORY: &str = r#"apt-mark showmanual 2>/dev/null | sed 's/^/apt: /'
 for d in /etc/apt/sources.list.d /opt /usr/local/bin /usr/local/sbin /usr/local/lib \
          /usr/local/libexec /usr/local/share /usr/local/include /usr/local/etc; do
   [ -d "$d" ] && ls -1A "$d" 2>/dev/null | sed "s|^|$d/|"
+done
+for d in /usr/local/share/ca-certificates /usr/local/lib/python3*/dist-packages; do
+  [ -d "$d" ] && ls -1A "$d" 2>/dev/null | grep -v '^__pycache__$' | sed "s|^|$d/|"
 done
 npm ls -g --depth=0 --parseable 2>/dev/null | sed -n 's|.*/node_modules/||p' | sed 's/^/npm: /'
 exit 0"#;
@@ -262,13 +267,19 @@ pub trait ToolboxHost: Send + Sync + fmt::Debug {
     fn close(&self) -> Result<Saved>;
     /// Throws away whatever an unfinished toolbox left, stopping its VM.
     fn discard(&self) -> Result<()>;
+    /// Whether a shell's changes wait to be saved, which holds back any rebuild.
+    fn has_unsaved(&self) -> bool {
+        false
+    }
     /// Runs `commands` as root on the template, then keeps it as the next
     /// version: `[update]`.
     fn update(&self, commands: &[String]) -> Result<Saved>;
     /// Replays `recipe` into a blank template on the newest base, keeps it,
     /// and lists what the old template has that the recipe doesn't cover.
-    /// The Linux home carries over as it is.
-    fn rebuild(&self, recipe: &Recipe) -> Result<Saved>;
+    /// The Linux home carries over as it is. With `whole_only`, as nobody's there
+    /// to see what's lost, a template that lacks any of that isn't kept: it says
+    /// what's uncovered, with no `template`.
+    fn rebuild(&self, recipe: &Recipe, whole_only: bool) -> Result<Saved>;
     /// The logins the newest Linux home holds, as noted when it was saved,
     /// and whether linux agents have a Claude login. Boots nothing.
     fn logins(&self) -> ToolboxLogins;
@@ -693,8 +704,8 @@ impl Toolbox {
                 .find(|p| p.contains("unknown setting"))
             {
                 return Err(err(format!(
-                    "base image {}'s vibe-guest is too old for the toolbox ({p}): \
-                     `vibe toolbox rebuild` moves the template to the newest base image",
+                    "base image {}'s vibe-guest is too old for the toolbox ({p}), so it can't \
+                     open until the template moves to the newest base image",
                     plan.base.version
                 )));
             }
@@ -862,6 +873,49 @@ impl Toolbox {
 
     /// The template's next version from what `work` does in a toolbox VM
     /// booted on `plan`; nothing is kept if any of it fails.
+    /// Puts back what was installed by hand that a machine can: Debian packages and
+    /// global npm packages, by the names the inventory has. As far as it can, and
+    /// quietly: what's still missing afterwards is what's said to the owner, so
+    /// nothing else is asked of them for it.
+    fn reinstall(&self, by_hand: &BTreeSet<String>, recipe: &Recipe) {
+        let plain = |name: &&str| {
+            !name.is_empty()
+                && !name.starts_with('-')
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "+-._:@/".contains(c))
+        };
+        let apt: Vec<String> = by_hand
+            .iter()
+            .filter_map(|item| item.strip_prefix("apt: "))
+            .filter(plain)
+            .filter(|name| !recipe.packages.iter().any(|p| p == name))
+            .map(str::to_owned)
+            .collect();
+        let quietly = |what: &str, argv: Vec<String>| self.run(what, argv, COMMAND_TIMEOUT).is_ok();
+        let all_at_once = apt_commands(&apt)
+            .into_iter()
+            .all(|argv| quietly("putting back what was installed by hand", argv));
+        // One that's gone from the new base shouldn't cost the others.
+        if !all_at_once {
+            for name in &apt {
+                if let Some(install) = apt_commands(std::slice::from_ref(name)).pop() {
+                    quietly("putting back what was installed by hand", install);
+                }
+            }
+        }
+        for name in by_hand
+            .iter()
+            .filter_map(|item| item.strip_prefix("npm: "))
+            .filter(plain)
+        {
+            quietly(
+                "putting back what was installed by hand",
+                as_root(&format!("npm install -g -- {name}")),
+            );
+        }
+    }
+
     fn build_template(
         &self,
         plan: &Plan,
@@ -890,6 +944,10 @@ impl Toolbox {
 }
 
 impl ToolboxHost for Toolbox {
+    fn has_unsaved(&self) -> bool {
+        self.unsaved().is_some()
+    }
+
     fn versions(&self) -> Versions {
         let template = self.images.newest_of(Kind::Template);
         Versions {
@@ -1131,7 +1189,7 @@ impl ToolboxHost for Toolbox {
         })
     }
 
-    fn rebuild(&self, recipe: &Recipe) -> Result<Saved> {
+    fn rebuild(&self, recipe: &Recipe, whole_only: bool) -> Result<Saved> {
         let _busy = self.take()?;
         if self.machine.running(&self.socket()) || self.opened().is_some() {
             return Err(err(
@@ -1176,6 +1234,7 @@ impl ToolboxHost for Toolbox {
             claude: false,
         };
         let mut after = BTreeSet::new();
+        let mut held = false;
         let template = self.build_template(&plan, &host, || {
             for argv in apt_commands(&recipe.packages) {
                 self.run("installing the recipe's packages", argv, COMMAND_TIMEOUT)?;
@@ -1187,13 +1246,26 @@ impl ToolboxHost for Toolbox {
                     COMMAND_TIMEOUT,
                 )?;
             }
+            self.reinstall(&by_hand, recipe);
             after = self.inventory()?;
+            if whole_only && !uncovered(&by_hand, &BTreeSet::new(), &after).is_empty() {
+                held = true;
+                return Err(err("it wouldn't have all the old template has"));
+            }
             Ok(())
-        })?;
+        });
+        let uncovered = uncovered(&by_hand, &BTreeSet::new(), &after);
+        if held {
+            return Ok(Saved {
+                template: None,
+                home: None,
+                uncovered,
+            });
+        }
         Ok(Saved {
-            template: Some(template),
+            template: Some(template?),
             home: None,
-            uncovered: uncovered(&by_hand, &BTreeSet::new(), &after),
+            uncovered,
         })
     }
 

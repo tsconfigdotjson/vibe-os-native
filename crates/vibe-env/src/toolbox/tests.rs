@@ -199,7 +199,7 @@ fn the_shell_boots_the_template_and_home_writable() {
     // Nor do an update or a rebuild run beside it.
     let e = s.toolbox.update(&["true".into()]).unwrap_err();
     assert!(e.message().contains("shell is open"), "{e}");
-    let e = s.toolbox.rebuild(&Recipe::default()).unwrap_err();
+    let e = s.toolbox.rebuild(&Recipe::default(), false).unwrap_err();
     assert!(e.message().contains("shell is open"), "{e}");
     // Closing while the shell runs ends it; what it did is kept.
     assert_eq!(
@@ -284,11 +284,15 @@ fn a_shell_that_cant_be_saved_is_kept_unsaved_and_saved_next_time() {
     );
     assert_eq!(s.toolbox.versions().template, None);
     assert!(!s.toolbox.is_open());
+    assert!(
+        s.toolbox.has_unsaved(),
+        "so a move by itself waits, and isn't a failure"
+    );
     assert!(s.working("template.img").exists() && s.working("home.img").exists());
     // Nothing else runs on the toolbox until they're saved...
     for e in [
         s.toolbox.update(&["true".into()]).unwrap_err(),
-        s.toolbox.rebuild(&Recipe::default()).unwrap_err(),
+        s.toolbox.rebuild(&Recipe::default(), false).unwrap_err(),
     ] {
         assert!(e.message().contains("unsaved changes"), "{e}");
     }
@@ -352,7 +356,7 @@ fn a_base_whose_guest_predates_the_toolbox_is_refused() {
         vec!["the kernel command line: `vibe.home=home`: unknown setting `vibe.home`".into()];
     let e = s.toolbox.open().unwrap_err();
     assert!(e.message().contains("too old for the toolbox"), "{e}");
-    assert!(e.message().contains("vibe toolbox rebuild"), "{e}");
+    assert!(e.message().contains("until the template moves"), "{e}");
     assert!(!s.fake.vm(&s.socket()).running);
     assert!(!s.toolbox.is_open() && !s.working("template.img").exists());
 }
@@ -533,6 +537,78 @@ fn updates_run_as_root_and_keep_only_a_template() {
     );
 }
 
+/// #74: with nobody there to see it, what was installed by hand isn't left behind:
+/// nothing's kept, new agents stay put, and it says what's uncovered.
+#[test]
+fn a_rebuild_by_itself_keeps_nothing_that_would_lose_something() {
+    let s = Setup::new();
+    s.session(|| s.write("template.img", 4096, b"by hand"));
+    add_base(&s.layout, 2);
+    answer(
+        &s,
+        |c| {
+            let ids: Vec<&str> = c.disks.iter().map(|d| d.id.as_str()).collect();
+            let writable = c.disks.iter().any(|d| !d.read_only);
+            let mut items = vec!["apt: git"];
+            if ids.contains(&"template") && !writable {
+                items.push("apt: htop");
+            }
+            items.join("\n") + "\n"
+        },
+        None,
+    );
+    let saved = s.toolbox.rebuild(&Recipe::default(), true).unwrap();
+    assert_eq!(
+        saved,
+        Saved {
+            template: None,
+            home: None,
+            uncovered: vec!["apt: htop".into()],
+        }
+    );
+    assert!(!s.version("template-2.img").exists());
+    let images = Images::new(s.layout.linux_dir());
+    assert_eq!(images.layers().unwrap().base.version, 1, "new agents stay");
+    // It left nothing running, and it can go again.
+    assert!(!s.toolbox.is_open());
+
+    // What it has by hand, the new one has too: nothing's lost, so it's kept. It
+    // still differs from the old base, which is what makes it by hand.
+    answer(
+        &s,
+        |c| {
+            let ids: Vec<&str> = c.disks.iter().map(|d| d.id.as_str()).collect();
+            let writable = c.disks.iter().any(|d| !d.read_only);
+            if ids.contains(&"template") || writable {
+                "apt: git\napt: htop\n".to_owned()
+            } else {
+                "apt: git\n".to_owned()
+            }
+        },
+        None,
+    );
+    let saved = s.toolbox.rebuild(&Recipe::default(), true).unwrap();
+    assert_eq!(saved.template, Some(2));
+    assert_eq!(saved.uncovered, Vec::<String>::new());
+    assert_eq!(images.layers().unwrap().base.version, 2);
+    // It was put back by its name, not asked of anyone.
+    let installs: Vec<Vec<String>> = s
+        .fake
+        .state
+        .lock()
+        .unwrap()
+        .runs
+        .iter()
+        .map(|r| r.command.clone())
+        .filter(|c| c.last().map(String::as_str) == Some("htop"))
+        .collect();
+    assert!(!installs.is_empty());
+    assert!(
+        installs.iter().all(|c| c.contains(&"--".to_owned())),
+        "{installs:?}"
+    );
+}
+
 #[test]
 fn a_rebuild_replays_the_recipe_on_the_new_base_and_lists_what_it_doesnt_cover() {
     let s = Setup::new();
@@ -580,7 +656,7 @@ run = "curl -sSL https://sdk.cloud.google.com | bash -s -- --disable-prompts --i
 "#,
     )
     .unwrap();
-    let saved = s.toolbox.rebuild(&recipe).unwrap();
+    let saved = s.toolbox.rebuild(&recipe, false).unwrap();
     assert_eq!(
         saved,
         Saved {
@@ -617,6 +693,9 @@ run = "curl -sSL https://sdk.cloud.google.com | bash -s -- --disable-prompts --i
             apt_commands(&["kubectl".into()])[0].clone(),
             apt_commands(&["kubectl".into()])[1].clone(),
             as_root(&recipe.install[0].run),
+            // What's by hand and not in the recipe: tried, as VibeOS can.
+            apt_commands(&["htop".into()])[0].clone(),
+            apt_commands(&["htop".into()])[1].clone(),
         ]
     );
     assert!(runs[1].ends_with(&["--".into(), "kubectl".into()]));
@@ -634,7 +713,7 @@ run = "curl -sSL https://sdk.cloud.google.com | bash -s -- --disable-prompts --i
 
     // A recipe step that fails keeps nothing.
     answer(&s, |_| String::new(), Some("apt-get install"));
-    let e = s.toolbox.rebuild(&recipe).unwrap_err();
+    let e = s.toolbox.rebuild(&recipe, false).unwrap_err();
     assert!(
         e.message().contains("installing the recipe's packages"),
         "{e}"
@@ -646,7 +725,7 @@ run = "curl -sSL https://sdk.cloud.google.com | bash -s -- --disable-prompts --i
 fn a_rebuild_with_no_template_yet_has_nothing_to_compare() {
     let s = Setup::new();
     answer(&s, |_| "apt: git\n".into(), None);
-    let saved = s.toolbox.rebuild(&Recipe::default()).unwrap();
+    let saved = s.toolbox.rebuild(&Recipe::default(), false).unwrap();
     assert_eq!(saved.template, Some(1));
     assert!(saved.uncovered.is_empty());
     // Only the new template was booted: one inventory.
@@ -720,7 +799,7 @@ fn the_clock_is_set_before_anything_runs() {
     assert!(boot < clock && clock < run, "{calls:?}");
     // The shell's VM too, and the rebuild's every boot.
     s.session(|| {});
-    s.toolbox.rebuild(&Recipe::default()).unwrap();
+    s.toolbox.rebuild(&Recipe::default(), false).unwrap();
     let calls = s.calls();
     let boots = calls.iter().filter(|c| *c == "boot").count();
     let clocks = calls.iter().filter(|c| *c == "clock").count();

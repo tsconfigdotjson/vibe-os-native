@@ -856,14 +856,50 @@ impl Core {
             }
             Err(e) => (Self::found_failed(&e.to_string()), None),
         };
-        report(
+        let mut report = report(
             found,
             &gh,
             &(self.tailscale)(),
             linux,
             self.info().os == "macos",
             &pi_wanted,
-        )
+        );
+        self.say_how_the_template_stands(&mut report);
+        report
+    }
+
+    /// The `linux` check, once the images are there: the template's on its way to a
+    /// new base by itself, or it's waiting because that would lose something. Agents
+    /// work either way, so neither is on the list of what needs the owner.
+    fn say_how_the_template_stands(&self, report: &mut DoctorReport) {
+        let Some(check) = report.checks.iter_mut().find(|c| c.id == CheckId::Linux) else {
+            return;
+        };
+        if !matches!(check.state, CheckState::Pass | CheckState::Optional) {
+            return;
+        }
+        let Some(host) = &self.toolbox else {
+            return;
+        };
+        let held = self.toolbox_held(&host.versions());
+        if *lock(&self.toolbox_state) == vibe_core::model::ToolboxState::Rebuilding
+            && self
+                .toolbox_moving
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            check.state = CheckState::Optional;
+            check.detail = "VibeOS is moving the Linux template to the new base image.".to_owned();
+            check.hint = None;
+        } else if !held.is_empty() {
+            check.state = CheckState::Optional;
+            check.detail = format!(
+                "The Linux template stays on its base image for now: moving it would lose what \
+                 was installed by hand and VibeOS can't put back: {}. Settings → Linux Toolbox \
+                 moves it with one click.",
+                held.join(", ")
+            );
+            check.hint = None;
+        }
     }
 
     fn found_failed(e: &str) -> Found {

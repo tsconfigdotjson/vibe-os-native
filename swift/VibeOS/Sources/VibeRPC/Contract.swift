@@ -2361,8 +2361,12 @@ public struct ToolboxStatus: Codable, Hashable, Sendable {
     public var home: Int?
     /// The base release new agents boot: the template's.
     public var base: Int?
-    /// The newest base release installed; newer than `base`, offer Rebuild template.
+    /// The newest base release installed; newer than `base`, vibed moves the
+    /// template to it by itself.
     public var newestBase: Int?
+    /// What moving there would lose, which was installed by hand and isn't in the
+    /// recipe, so it's waiting for the owner: `toolbox.rebuild` moves it anyway.
+    public var rebuildHeld: [String]?
     /// The last shell, update or rebuild to finish.
     public var last: ToolboxRun?
     /// How many terminals are attached to the open shell: 0 when it's open
@@ -2373,6 +2377,7 @@ public struct ToolboxStatus: Codable, Hashable, Sendable {
     public enum CodingKeys: String, CodingKey, CaseIterable {
         case state, template, home, base
         case newestBase = "newest_base"
+        case rebuildHeld = "rebuild_held"
         case last, clients
     }
 }
