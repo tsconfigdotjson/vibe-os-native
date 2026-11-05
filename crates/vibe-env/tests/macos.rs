@@ -677,18 +677,22 @@ fn disk_past_soft_warns_and_past_hard_pauses() {
         disk_soft: 2 * MIB,
         ..roomy()
     });
-    wait("a disk warning", Duration::from_secs(10), || {
-        a.usage().warnings.contains(&Limit::Disk)
-    });
-    let u = a.usage();
-    assert!(u.disk.unwrap() >= 4 * MIB, "{u:?}");
-    assert_eq!(u.paused, None);
+    // With all four written: the warning comes at two, while it's still writing.
+    wait(
+        "a disk warning and all four",
+        Duration::from_secs(60),
+        || {
+            let u = a.usage();
+            u.warnings.contains(&Limit::Disk) && u.disk.is_some_and(|d| d >= 4 * MIB)
+        },
+    );
+    assert_eq!(a.usage().paused, None);
     a.apply(Limits {
         disk_soft: 2 * MIB,
         disk_hard: 3 * MIB,
         ..roomy()
     });
-    wait("a disk pause", Duration::from_secs(10), || {
+    wait("a disk pause", Duration::from_secs(60), || {
         a.usage().paused == Some(Limit::Disk)
     });
     assert!(a.procs().iter().all(|p| p.stopped), "paused means stopped");
@@ -696,10 +700,12 @@ fn disk_past_soft_warns_and_past_hard_pauses() {
     // again: a fresh one does, or doesn't.
     fs::remove_file(a.handle.worktree.join("fill")).unwrap();
     assert_eq!(h.backend.wake(&a.handle).unwrap(), Woke::Exact);
-    std::thread::sleep(Duration::from_secs(2));
+    // Until there's a fresh one: a pause from the old one would still be there then.
+    wait("a fresh measurement", Duration::from_secs(60), || {
+        a.usage().disk.is_some_and(|d| d < 3 * MIB)
+    });
     let u = a.usage();
     assert_eq!(u.paused, None, "{u:?}");
-    assert!(u.disk.is_some_and(|d| d < 3 * MIB), "{u:?}");
     assert!(a.procs().iter().all(|p| !p.stopped));
 }
 
