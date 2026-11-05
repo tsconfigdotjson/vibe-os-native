@@ -1039,9 +1039,11 @@ fn shared_connection(golden: &common::Golden, dest: &str) -> String {
         bundle: None,
         shared: Some(golden.config().layout.run_dir()),
     };
+    step("ssh -O check");
     let check = Command::new("ssh")
         .args(remote.sharing(dest))
-        .args(["-O", "check", "--", dest])
+        // A connection that's stopped doesn't answer, and this would wait for it.
+        .args(["-o", "ConnectTimeout=20", "-O", "check", "--", dest])
         .in_files()
         .unwrap();
     let said = String::from_utf8_lossy(&check.stderr).into_owned();
@@ -1497,10 +1499,12 @@ fn real_linux_host_body(watch: &Watch) {
     }
     // A hung connection, as a pulled cable would make it.
     let (_, events) = mac.core.subscribe();
-    let connection = shared_connection(&golden, &dest);
-    let _ = Command::new("kill").args(["-STOP", &connection]).status();
+    // Ended however this goes: its socket can be at a path every run shares, with no
+    // name of this test's in it, so left stopped it would hold up the next run.
+    let connection = Relays(vec![shared_connection(&golden, &dest)]);
+    connection.signal("-STOP");
     wait_for_link_down(&mac, events, "testhost", Duration::from_secs(60));
-    let _ = Command::new("kill").args(["-KILL", &connection]).status();
+    drop(connection);
     wait_for("the link to come back", Duration::from_secs(90), || {
         link_is("  connected")
     });
@@ -1921,6 +1925,7 @@ fn drop_test_branches(dest: &str, project: &str, branches: &[&str]) {
          && git -C \"$dir\" branch -q -D {}",
         branches.join(" ")
     );
+    step("ssh, dropping the test's branches");
     let out = Command::new("ssh")
         .args(["-o", "BatchMode=yes", "--", dest, &script])
         .in_files()
@@ -2439,6 +2444,7 @@ fn real_external_access_body(watch: &Watch) {
         401,
         "it stopped serving"
     );
+    step("ssh, restarting vibed");
     let restart = Command::new("ssh")
         .args(["-o", "BatchMode=yes", "--", &dest])
         .arg("systemctl --user restart vibed.service")
