@@ -67,6 +67,15 @@ impl TokenStore {
         }
     }
 
+    /// Whether a token can be kept here at all: nothing's read or written, so
+    /// `vibe setup-token` can say so before anyone signs in for nothing.
+    pub fn ready(&self) -> io::Result<()> {
+        match self {
+            TokenStore::File(_) => Ok(()),
+            TokenStore::Keychain { keychain, .. } => security(keychain).map(drop),
+        }
+    }
+
     /// The token, or `None` if none is kept.
     pub fn load(&self) -> io::Result<Option<String>> {
         let text = match self {
@@ -423,6 +432,7 @@ mod tests {
             keychain: Target::Login,
         };
         for e in [
+            store.ready().unwrap_err(),
             store.load().unwrap_err(),
             store.store(TOKEN).unwrap_err(),
             store.remove().unwrap_err(),

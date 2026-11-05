@@ -313,6 +313,34 @@ fn setup_token(dir: &Path, body: &str) -> (Output, PathBuf) {
     (out, token)
 }
 
+/// The Keychain's shut to this `vibe` (and absent, off a Mac), so Claude's never
+/// asked for a token that would be lost.
+#[test]
+fn setup_token_asks_for_no_sign_in_it_cant_keep() {
+    let tmp = tempfile::tempdir().unwrap();
+    let asked = tmp.path().join("asked");
+    let claude = tmp.path().join("claude");
+    let body = format!("#!/bin/sh\ntouch {}\necho {TOKEN}\n", asked.display());
+    fs::write(&claude, body).unwrap();
+    fs::set_permissions(&claude, fs::Permissions::from_mode(0o755)).unwrap();
+    let out = Command::new(VIBE)
+        .arg("setup-token")
+        .env("VIBE_CLAUDE", &claude)
+        .env_remove("VIBE_TEST_TOKEN_FILE")
+        .env("VIBE_LOGIN_KEYCHAIN", "never")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(!asked.exists(), "claude ran");
+    assert!(!text(&out.stdout).contains(TOKEN));
+    assert!(
+        text(&out.stderr).contains("can't keep a token"),
+        "{}",
+        text(&out.stderr)
+    );
+}
+
 #[test]
 fn setup_token_keeps_the_token_claude_printed() {
     let tmp = tempfile::tempdir().unwrap();

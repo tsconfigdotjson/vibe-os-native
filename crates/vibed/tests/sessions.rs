@@ -336,6 +336,50 @@ async fn a_started_session_is_detached_and_outlives_vibed() {
     );
 }
 
+/// `vibed`'s `allow` isn't for its agents. Run again by itself, with `allow` around
+/// it, as this can't be changed for a process with other threads, and with no
+/// `Core`, as nothing here should have a way to a Keychain: only a shim and a `sh`.
+#[tokio::test]
+async fn allow_isnt_passed_on_to_an_agent() {
+    use vibe_core::keychain::GUARD_ENV;
+    const AGAIN: &str = "VIBE_TEST_ALLOW_AROUND";
+    if std::env::var_os(AGAIN).is_none() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["allow_isnt_passed_on_to_an_agent", "--exact"])
+            .env(AGAIN, "1")
+            .env(GUARD_ENV, "allow")
+            .output()
+            .unwrap();
+        let said = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{said}");
+        assert!(said.contains("1 passed"), "{said}");
+        return;
+    }
+    assert_eq!(std::env::var(GUARD_ENV).as_deref(), Ok("allow"));
+    let w = world();
+    std::fs::create_dir_all(w.layout.home()).unwrap();
+    let said = w.layout.home().join("said");
+    let script = format!(
+        "printf '[%s]' \"${GUARD_ENV}\" > {0}.new; mv {0}.new {0}",
+        said.display()
+    );
+    let spec = SessionSpec {
+        agent: "quiet-amber-otter".into(),
+        command: ["sh", "-c", script.as_str()].map(OsString::from).to_vec(),
+        cwd: w.layout.home().to_owned(),
+        env: Vec::new(),
+        clean_env: false,
+        size: None,
+        vm: None,
+    };
+    let shim = workspace_bin("vibe-shim").into_os_string();
+    vibed::sessions::spawn_shim(&shim, &w.layout, &spec)
+        .await
+        .unwrap();
+    wait_until("its word", || said.exists());
+    assert_eq!(std::fs::read_to_string(&said).unwrap(), "[]");
+}
+
 #[tokio::test]
 async fn starting_reports_what_went_wrong() {
     let w = world();

@@ -15,7 +15,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use vibe_core::keychain::{SECURITY, Target};
+use vibe_core::keychain::Target;
 
 use crate::util::{base64_decode, base64_standard};
 
@@ -90,7 +90,8 @@ const SECURITY_TIMEOUT: Duration = Duration::from_secs(10);
 /// leave one waiting on someone who isn't there.
 #[derive(Debug, Clone)]
 pub struct Keychain {
-    program: PathBuf,
+    /// A stand-in for the real `security`.
+    program: Option<PathBuf>,
     timeout: Duration,
     keychain: Target,
 }
@@ -98,7 +99,7 @@ pub struct Keychain {
 impl Default for Keychain {
     fn default() -> Self {
         Keychain {
-            program: PathBuf::from(SECURITY),
+            program: None,
             timeout: SECURITY_TIMEOUT,
             keychain: Target::Login,
         }
@@ -116,7 +117,7 @@ impl Keychain {
     /// Another `security`, with another limit: for tests.
     pub fn with_program(program: PathBuf, timeout: Duration) -> Keychain {
         Keychain {
-            program,
+            program: Some(program),
             timeout,
             keychain: Target::Login,
         }
@@ -147,9 +148,11 @@ impl Keychain {
     /// Runs `security` with `args` and then the keychain to use, giving it `input`
     /// instead, whose lines name their own, for at most the limit.
     fn run(&self, args: &[&str], input: Option<&[u8]>) -> io::Result<Ran> {
-        let mut child = self
-            .keychain
-            .command_with(&self.program)?
+        let mut command = match &self.program {
+            Some(program) => self.keychain.command_with(program)?,
+            None => self.keychain.command()?,
+        };
+        let mut child = command
             .args(args)
             .args(self.keychain.arg().filter(|_| input.is_none()))
             .stdin(if input.is_some() {
@@ -312,6 +315,34 @@ impl FileStore {
             ));
         }
         Ok(self.0.join(format!("{service}.login")))
+    }
+
+    /// Removes every login kept here, for when logins have moved to the Keychain:
+    /// nothing would ever read or renew one again, and it's a live token on a disk.
+    /// Says how many went. What else is in the directory stays.
+    pub fn remove_all(&self) -> io::Result<usize> {
+        let entries = match fs::read_dir(&self.0) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e),
+        };
+        let mut removed = 0;
+        for entry in entries {
+            let path = entry?.path();
+            match path.extension().and_then(|e| e.to_str()) {
+                Some("login") => {
+                    fs::remove_file(&path)?;
+                    removed += 1;
+                }
+                // What a crash left of one, before anything else here is running.
+                Some("new") => fs::remove_file(&path)?,
+                _ => {}
+            }
+        }
+        if removed > 0 {
+            fs::File::open(&self.0)?.sync_all()?;
+        }
+        Ok(removed)
     }
 
     /// The directory, made private if it's new, and refused if it's open to
@@ -507,6 +538,27 @@ mod tests {
     }
 
     #[test]
+    fn removing_a_file_stores_logins_leaves_what_else_is_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileStore(dir.path().join("services"));
+        assert_eq!(store.remove_all().unwrap(), 0, "no directory yet");
+        store.store("linear", &secret("a")).unwrap();
+        store.store("github", &secret("b")).unwrap();
+        fs::write(store.0.join("slack.new"), "what a crash left").unwrap();
+        for other in ["services.json", "services-audit.log", "logins"] {
+            fs::write(store.0.join(other), "kept").unwrap();
+        }
+        assert_eq!(store.remove_all().unwrap(), 2);
+        assert_eq!(store.load("linear").unwrap(), None);
+        assert_eq!(store.load("github").unwrap(), None);
+        assert!(!store.0.join("slack.new").exists());
+        for other in ["services.json", "services-audit.log", "logins"] {
+            assert!(store.0.join(other).exists(), "{other}");
+        }
+        assert_eq!(store.remove_all().unwrap(), 0);
+    }
+
+    #[test]
     fn a_file_stores_logins_are_only_ever_plainly_named() {
         let store = FileStore(PathBuf::from("/nowhere"));
         for bad in ["", "../x", "a/b", "a b", ".."] {
@@ -602,7 +654,7 @@ mod tests {
         let program = recording_security(dir.path());
         let file = dir.path().join("own/test.keychain-db");
         let store = Keychain {
-            program,
+            program: Some(program),
             timeout: Duration::from_secs(10),
             keychain: Target::File(file.clone()),
         };
@@ -633,7 +685,7 @@ mod tests {
     fn a_keychain_files_path_doesnt_count_against_a_login() {
         let dir = tempfile::tempdir().unwrap();
         let store = Keychain {
-            program: recording_security(dir.path()),
+            program: Some(recording_security(dir.path())),
             timeout: Duration::from_secs(10),
             keychain: Target::File(PathBuf::from(format!("/{}", "x".repeat(89)))),
         };
