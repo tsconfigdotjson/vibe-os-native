@@ -41,7 +41,7 @@ use vibe_env::{AgentSpec, Backend, Handle, Launch, Limits, Run, TerminalEnd, Wok
 use vibe_relay::local;
 
 use crate::core::{Core, error, invalid, lock, store_error};
-use crate::projects::{git, git_within};
+use crate::projects::{GIT_CONFIG_FROM_ENV, git, git_within, git_without};
 use crate::services::injection;
 use crate::sessions::{self, Probe, SessionSpec};
 use crate::sleep::Early;
@@ -1812,6 +1812,11 @@ impl Core {
         // `gc.auto` and `gc.autoPackLimit`, and
         // `maintenance.commit-graph.auto`. Neither depends on the order they
         // run in.
+        //
+        // Not with settings in the environment: a `vibed` started from an agent's
+        // terminal has the `gc.auto=0` agents get, as they leave this to `vibed`, and
+        // gc would quietly never run. What's in a git config file is someone's choice,
+        // and stands.
         let maintain = [
             "-c",
             "gc.autoDetach=false",
@@ -1826,7 +1831,7 @@ impl Core {
             "--auto",
             "--quiet",
         ];
-        match git_within(project, &maintain, FETCH_TIMEOUT).await {
+        match git_without(project, &maintain, FETCH_TIMEOUT, &GIT_CONFIG_FROM_ENV).await {
             Ok(Ok(_)) => {}
             Ok(Err(why)) => crate::log!("vibed: git maintenance on {project_name}: {why}"),
             Err(e) => crate::log!("vibed: git maintenance on {project_name}: {}", e.message),

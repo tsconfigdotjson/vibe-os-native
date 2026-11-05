@@ -48,7 +48,21 @@ impl Drop for GroupKiller {
 /// own, and gives up after `timeout`. Giving up, or dropping the future,
 /// kills the command and everything it started.
 async fn run(program: &OsStr, args: &[&OsStr], timeout: Duration) -> io::Result<Output> {
-    let child = Command::new(program)
+    run_without(program, args, timeout, &[]).await
+}
+
+/// [`run`], with `unset` taken out of what it inherits.
+async fn run_without(
+    program: &OsStr,
+    args: &[&OsStr],
+    timeout: Duration,
+    unset: &[&str],
+) -> io::Result<Output> {
+    let mut command = Command::new(program);
+    for name in unset {
+        command.env_remove(name);
+    }
+    let child = command
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GH_PROMPT_DISABLED", "1")
@@ -129,9 +143,22 @@ pub(crate) async fn git_within(
     args: &[&str],
     timeout: Duration,
 ) -> Result<Result<String, String>, ErrorObject> {
+    git_without(dir, args, timeout, &[]).await
+}
+
+/// How a process hands git settings to the gits under it, as a host does its agents'.
+pub(crate) const GIT_CONFIG_FROM_ENV: [&str; 2] = ["GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"];
+
+/// [`git_within`], with `unset` taken out of what it inherits.
+pub(crate) async fn git_without(
+    dir: &Path,
+    args: &[&str],
+    timeout: Duration,
+    unset: &[&str],
+) -> Result<Result<String, String>, ErrorObject> {
     let mut all: Vec<&OsStr> = vec![OsStr::new("-C"), dir.as_os_str()];
     all.extend(args.iter().map(OsStr::new));
-    let out = run(OsStr::new("git"), &all, timeout)
+    let out = run_without(OsStr::new("git"), &all, timeout, unset)
         .await
         .map_err(|e| failed(format!("can't run git: {e}")))?;
     Ok(if out.status.success() {
