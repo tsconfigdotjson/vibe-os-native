@@ -44,6 +44,11 @@ pub trait HostChecks: Send + Sync + fmt::Debug {
     /// Whether git asks `gh` for github.com's credentials, as `gh auth
     /// setup-git` sets it up, or has a helper of the owner's own for it.
     fn git_uses_gh(&self) -> Result<bool, String>;
+    /// Whether what git has for github.com is a helper of the owner's own, rather than
+    /// `gh`'s.
+    fn owners_github_helper(&self) -> bool {
+        false
+    }
     /// Runs `<gh> auth setup-git`.
     fn setup_git(&self, gh: &OsStr) -> Result<(), String>;
     /// The `claude` this host's native agents run, and its version.
@@ -229,6 +234,17 @@ impl Machine {
     }
 }
 
+impl Machine {
+    /// The credential helpers git's global config has for `key`. Exit 1 is "not set",
+    /// which is an answer too. Whatever a failure printed is git's complaint, not a
+    /// helper, as of a `.gitconfig` it can't read: that's none, and `gh auth setup-git`
+    /// then meets the same trouble and says so.
+    fn git_helpers(&self, git: &str, key: &str) -> Result<String, String> {
+        let (read, text) = self.run(&[git, "config", "--global", "--get-all", key])?;
+        Ok(if read { text } else { String::new() })
+    }
+}
+
 impl HostChecks for Machine {
     fn find(&self, name: &str) -> Option<PathBuf> {
         self.which(name)
@@ -246,18 +262,25 @@ impl HostChecks for Machine {
         let git = self.git_program()?;
         let git = git.to_string_lossy();
         let mut helpers = String::new();
-        for key in ["credential.https://github.com.helper", "credential.helper"] {
-            // Exit 1 is "not set", which is an answer too.
-            let (_, text) = self.run(&[&git, "config", "--global", "--get-all", key])?;
+        for key in [GITHUB_HELPER, "credential.helper"] {
+            let text = self.git_helpers(&git, key)?;
             // A way of its own for GitHub alone is the owner's, and `gh auth setup-git`
             // would replace it, so it counts.
-            if key.contains("github.com") && !text.trim().is_empty() && !uses_gh(&text) {
+            if key == GITHUB_HELPER && is_owners_helper(&text) {
                 return Ok(true);
             }
             helpers.push_str(&text);
             helpers.push('\n');
         }
         Ok(uses_gh(&helpers))
+    }
+
+    fn owners_github_helper(&self) -> bool {
+        let Ok(git) = self.git_program() else {
+            return false;
+        };
+        self.git_helpers(&git.to_string_lossy(), GITHUB_HELPER)
+            .is_ok_and(|text| is_owners_helper(&text))
     }
 
     fn setup_git(&self, gh: &OsStr) -> Result<(), String> {
@@ -492,6 +515,14 @@ impl HostChecks for FixedChecks {
     }
 }
 
+/// The key for a credential helper just for GitHub.
+const GITHUB_HELPER: &str = "credential.https://github.com.helper";
+
+/// Whether those helpers for GitHub, one per line, are the owner's, not `gh`'s.
+fn is_owners_helper(helpers: &str) -> bool {
+    !helpers.trim().is_empty() && !uses_gh(helpers)
+}
+
 /// Whether git's credential helpers, one per line, include `gh`'s.
 pub fn uses_gh(helpers: &str) -> bool {
     helpers.lines().any(|l| {
@@ -571,9 +602,15 @@ fn fail(id: CheckId, detail: impl AsRef<str>, hint: &str) -> DoctorCheck {
 /// otherwise run git, claude, security and pmset again.
 pub const FOUND_FOR: Duration = Duration::from_secs(15);
 
+/// Held while `gh auth setup-git` runs. A clone, a sign-in's check and the doctor can all
+/// come to it at once, and two together fail on git's lock on its config, which the
+/// doctor would show the owner as a failure.
+static GIT_SETUP: Mutex<()> = Mutex::new(());
+
 /// Whether git asks `gh` for GitHub's credentials, having set that up if not:
 /// nobody's asked to, once `gh` is logged in.
 pub(crate) fn git_through_gh(checks: &dyn HostChecks, gh: &OsStr) -> Result<bool, String> {
+    let _alone = lock(&GIT_SETUP);
     if checks.git_uses_gh()? {
         return Ok(true);
     }
@@ -611,6 +648,8 @@ pub(crate) enum PiWanted {
 pub(crate) struct Found {
     git: Result<String, String>,
     git_uses_gh: Result<bool, String>,
+    /// That what git has for GitHub is a helper of the owner's own.
+    owners_helper: bool,
     claude: Result<(PathBuf, String), String>,
     claude_login: Result<String, String>,
     pi: Result<(PathBuf, String), String>,
@@ -670,6 +709,10 @@ fn report(
     // tried by now, and tries again next time.
     let retry = "VibeOS sets this up itself, and tries again each time it checks.";
     checks.push(match (&found.git_uses_gh, gh_ok) {
+        (Ok(true), _) if found.owners_helper => pass(
+            CheckId::GhGit,
+            "git uses a credential helper of your own for GitHub",
+        ),
         (Ok(true), _) => pass(CheckId::GhGit, "git asks gh for GitHub's credentials"),
         (_, false) => DoctorCheck {
             state: CheckState::Optional,
@@ -688,10 +731,17 @@ fn report(
                 retry,
             )
         },
+        // It tried and was refused: said as what's in the way, as what's said is usually
+        // a file of the owner's that only they can put right.
         (Err(why), true) => match found.git {
             Ok(_) => DoctorCheck {
                 fixable: true,
-                ..fail(CheckId::GhGit, why, retry)
+                ..fail(
+                    CheckId::GhGit,
+                    why,
+                    "VibeOS tries again each time it checks. If this stays, what's said here is \
+                     in its way, and it's yours to clear.",
+                )
             },
             Err(_) => fail(CheckId::GhGit, why, install_git),
         },
@@ -862,9 +912,12 @@ impl Core {
                     Ok(_) => checks.git_uses_gh(),
                     Err(why) => Err(why.clone()),
                 };
+                let owners_helper =
+                    matches!(git_uses_gh, Ok(true)) && checks.owners_github_helper();
                 Found {
                     git,
                     git_uses_gh,
+                    owners_helper,
                     claude: checks.claude(),
                     claude_login: checks.claude_login(),
                     pi: checks.pi(),
@@ -939,6 +992,7 @@ impl Core {
             Found {
                 git: Err(why.clone()),
                 git_uses_gh: Err(why.clone()),
+                owners_helper: false,
                 claude: Err(why.clone()),
                 claude_login: Err(why.clone()),
                 pi: Err(why.clone()),
@@ -962,10 +1016,13 @@ impl Core {
                     ));
                 }
                 let (checks, gh) = (Arc::clone(&self.checks), self.gh_program().await);
-                tokio::task::spawn_blocking(move || checks.setup_git(&gh))
-                    .await
-                    .map_err(|e| error(ErrorCode::InternalError, e.to_string()))?
-                    .map_err(|e| error(ErrorCode::CommandFailed, e))?;
+                tokio::task::spawn_blocking(move || {
+                    let _alone = lock(&GIT_SETUP);
+                    checks.setup_git(&gh)
+                })
+                .await
+                .map_err(|e| error(ErrorCode::InternalError, e.to_string()))?
+                .map_err(|e| error(ErrorCode::CommandFailed, e))?;
                 crate::log!("vibed: git now asks gh for GitHub's credentials (gh auth setup-git)");
                 *lock(&self.doctor_found) = None;
             }
@@ -1077,6 +1134,7 @@ mod tests {
         Found {
             git: Ok("git version 2.50.1".into()),
             git_uses_gh: Ok(true),
+            owners_helper: false,
             claude: Ok((
                 "/usr/local/bin/claude".into(),
                 "2.1.314 (Claude Code)".into(),
@@ -1149,6 +1207,7 @@ mod tests {
         let fresh = Found {
             git: Err("git needs Apple's Command Line Tools, which aren't installed".into()),
             git_uses_gh: Ok(false),
+            owners_helper: false,
             claude: Err("claude isn't on your login shell's PATH".into()),
             claude_login: Err("Claude Code isn't signed in".into()),
             pi: Err("Pi isn't on your login shell's PATH".into()),
@@ -1193,8 +1252,103 @@ mod tests {
         let r = report(half, &logged_in(), &[], None, true);
         assert_eq!(r.checks[2].state, CheckState::Fail);
         assert!(r.checks[2].detail.contains("no space left"));
-        assert!(r.checks[2].hint.as_deref().unwrap().contains("itself"));
+        let hint = r.checks[2].hint.as_deref().unwrap();
+        assert!(hint.contains("yours to clear"), "{hint}");
+        assert!(
+            !hint.contains("--fix") && !hint.contains("itself"),
+            "{hint}"
+        );
         assert!(r.checks[2].fixable);
+
+        // What's said is what's so: a helper of the owner's isn't gh.
+        let mut own = found();
+        own.owners_helper = true;
+        let r = report(own, &logged_in(), &[], None, true);
+        assert_eq!(r.checks[2].state, CheckState::Pass);
+        assert!(
+            r.checks[2].detail.contains("of your own"),
+            "{:?}",
+            r.checks[2]
+        );
+        assert!(!r.checks[2].detail.contains("asks gh"), "{:?}", r.checks[2]);
+    }
+
+    /// The real git, on a `.gitconfig` it can't read: what it complains isn't a helper of
+    /// the owner's, so nothing passes on the strength of it, and what's wrong gets said.
+    #[test]
+    fn a_gitconfig_git_cant_read_is_not_a_helper_of_the_owners() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (home, bin) = (tmp.path().join("home"), tmp.path().join("bin"));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        let gh = script(&bin, "gh", "echo 'fatal: bad config line 1' >&2; exit 1");
+        let path = std::env::var("PATH").unwrap_or_default();
+        let machine = Machine::new(&home).with_path(&path);
+        let config = home.join(".gitconfig");
+        for broken in [true, false] {
+            if broken {
+                std::fs::write(&config, "[not a section\n").unwrap();
+            } else {
+                std::fs::remove_file(&config).unwrap();
+                std::fs::create_dir(&config).unwrap();
+            }
+            assert_eq!(machine.git_uses_gh(), Ok(false));
+            assert!(!machine.owners_github_helper());
+            let said = git_through_gh(&machine, gh.as_os_str()).unwrap_err();
+            assert!(said.contains("bad config"), "{said}");
+        }
+    }
+
+    /// Run together, `gh auth setup-git` fails on git's lock on its config, as real gh
+    /// did for 4 of 8 at once: it goes one at a time, and only the first has to run it.
+    #[test]
+    fn git_is_set_up_once_however_many_ask_at_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (home, bin) = (tmp.path().join("home"), tmp.path().join("bin"));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        let config = tmp.path().join("helper");
+        let (runs, held) = (tmp.path().join("runs"), tmp.path().join("held"));
+        script(
+            &bin,
+            "git",
+            &format!(
+                r#"case "$1" in
+--version) echo "git version 2.50.1" ;;
+config) [ "$4" = credential.helper ] && exit 1; cat "{c}" 2>/dev/null || exit 1 ;;
+esac"#,
+                c = config.display()
+            ),
+        );
+        let gh = script(
+            &bin,
+            "gh",
+            &format!(
+                r#"mkdir "{h}" 2>/dev/null || {{ echo 'could not lock config file' >&2; exit 1; }}
+echo ran >>"{r}"
+sleep 0.2
+echo '!gh auth git-credential' >"{c}"
+rmdir "{h}""#,
+                h = held.display(),
+                r = runs.display(),
+                c = config.display()
+            ),
+        );
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let machine = Machine::new(&home).with_path(&path);
+        std::thread::scope(|s| {
+            let asked: Vec<_> = (0..8)
+                .map(|_| s.spawn(|| git_through_gh(&machine, gh.as_os_str())))
+                .collect();
+            for one in asked {
+                assert_eq!(one.join().unwrap(), Ok(true));
+            }
+        });
+        assert_eq!(std::fs::read_to_string(&runs).unwrap(), "ran\n");
     }
 
     #[test]
@@ -1516,9 +1670,12 @@ printf '\n!%s auth git-credential\n' "$0" > "{c}""#,
         // A helper of the owner's own, just for GitHub, is theirs, and counts.
         std::fs::write(&config, "/opt/custom-helper\n").unwrap();
         assert_eq!(m.git_uses_gh(), Ok(true));
+        assert!(m.owners_github_helper());
         std::fs::remove_file(&config).unwrap();
+        assert!(!m.owners_github_helper());
         m.setup_git(gh.as_os_str()).unwrap();
         assert_eq!(m.git_uses_gh(), Ok(true));
+        assert!(!m.owners_github_helper(), "gh's isn't the owner's");
         assert_eq!(
             m.claude(),
             Ok((claude.clone(), "2.1.314 (Claude Code)".into()))

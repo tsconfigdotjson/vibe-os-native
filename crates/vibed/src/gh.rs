@@ -24,48 +24,118 @@ pub const TIMEOUT: Duration = Duration::from_secs(30);
 /// <https://api.github.com/meta> and on its "SSH key fingerprints" page. These are
 /// what a first connection is checked against, so nothing has to accept a key on
 /// first sight. The fingerprints are held to in a test. If GitHub ever rotates
-/// them, a clone falls back to HTTPS until a new build has the new ones.
+/// them, a clone falls back to HTTPS until a new build has the new ones, and one it
+/// has stopped publishing, as it did a leaked one in 2023, isn't added by a build
+/// that's still in the field: see [`published_host_keys`].
 pub const GITHUB_HOST_KEYS: [&str; 3] = [
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl",
     "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg=",
     "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+VTTvDP6mHBL9j1aNUkY4Ue1gvwnGLVlOhGeYrnZaMgRK6+PKCUXaDbC7qtbW8gIkhL7aGCsOr/C56SJMy/BCZfxd1nWzAOxSDPgVsmerOBYfNqltV9/hWCqBywINIR+5dIg6JTJ72pcEpEjcYgXkE2YEFXV1JHnsKgbLWNlhScqb2UmyRkQyytRLtL+38TGxkxCflmO+5Z8CSSNY7GidjMIZ7Q4zMjA2n1nGrlTDkzwDCsw+wqFPGQA179cnfGWOWRVruj16z6XyvxvjJwbz0wQZ75XK5tKSb7FNyeIEs4TT4jk+S4dhPeAUC5y+bDYirYgM4GC7uEnztnZyaVWQ7B381AK4Qdrwt51ZqExKbQpTUNn+EjqoTwvqNj4kqx5QUCI0ThS/YkOxJCXmPUWZbhjpCg56i+2aB6CmK2JGhn57K5mj0MNdBXA4/WnwH6XoPWJzK5Nyu2zB3nAZp+S5hpQs+p1vN1/wsjk=",
 ];
 
-/// Whether `known_hosts` has a key of `key`'s type for github.com itself, by name.
-/// One that isn't the same key is still the owner's say for that type, as a newer
-/// key is after a rotation, and `@revoked` counts. A hashed line can't be told without
-/// hashing, so it doesn't count, and costs one plain line beside it, once.
-fn known(known_hosts: &str, key: &str) -> bool {
-    let kind = key.split_once(' ').map_or(key, |(kind, _)| kind);
-    known_hosts.lines().any(|line| {
+/// The names SSH looks GitHub up by: its own, and GitHub's documented way round a
+/// blocked port 22 (`HostName ssh.github.com`, `Port 443`), which has the same keys.
+const GITHUB_SSH_NAMES: [&str; 2] = ["github.com", "[ssh.github.com]:443"];
+
+/// What `known_hosts` has for `name` of keys of type `kind`: each one, and whether it's
+/// marked, as `@revoked` is. A hashed line can't be told without hashing, so it doesn't
+/// count, and costs one plain line beside it, once.
+fn held<'a>(
+    known_hosts: &'a str,
+    name: &'a str,
+    kind: &'a str,
+) -> impl Iterator<Item = (bool, &'a str)> {
+    known_hosts.lines().filter_map(move |line| {
         let mut fields = line.split_whitespace().peekable();
-        fields.next_if(|f| f.starts_with('@'));
-        let Some(hosts) = fields.next() else {
-            return false;
-        };
-        !hosts.starts_with('#')
-            && hosts.split(',').any(|h| h == "github.com")
-            && fields.next() == Some(kind)
+        let marked = fields.next_if(|f| f.starts_with('@')).is_some();
+        let hosts = fields.next()?;
+        if hosts.starts_with('#') || !hosts.split(',').any(|h| h == name) {
+            return None;
+        }
+        (fields.next() == Some(kind)).then(|| (marked, fields.next().unwrap_or("")))
     })
 }
 
-/// Adds to `<home>/.ssh/known_hosts` GitHub's key of each type it has none of, and
-/// says if it added any. Nothing that's there is touched. Run often, so it's only
-/// a read when there's nothing to do.
-pub fn pin_host_keys(home: &Path) -> io::Result<bool> {
+/// The lines `known_hosts` wants of `keys`: each under each name that has no key of its
+/// type. A key of that type for github.com that isn't this one, as a newer key is after a
+/// rotation, or one marked `@revoked`, is the owner's say for that type, under both names.
+fn wanted<'a>(known_hosts: &str, keys: impl Iterator<Item = &'a str>) -> Vec<String> {
+    let mut lines = Vec::new();
+    for key in keys {
+        let (kind, blob) = key.split_once(' ').unwrap_or((key, ""));
+        if held(known_hosts, GITHUB_SSH_NAMES[0], kind).any(|(marked, k)| marked || k != blob) {
+            continue;
+        }
+        for name in GITHUB_SSH_NAMES {
+            if held(known_hosts, name, kind).next().is_none() {
+                lines.push(format!("{name} {key}\n"));
+            }
+        }
+    }
+    lines
+}
+
+fn read_known_hosts(path: &Path) -> io::Result<String> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether a key this build pins looks to be missing from `<home>/.ssh/known_hosts`, so
+/// that GitHub's worth asking. Run often, so it's only a read. One that can't be read
+/// says yes, so that [`pin_host_keys`] gets to say why.
+pub fn pins_missing(home: &Path) -> bool {
+    read_known_hosts(&home.join(".ssh/known_hosts")).map_or(true, |there| {
+        !wanted(&there, GITHUB_HOST_KEYS.into_iter()).is_empty()
+    })
+}
+
+/// The keys GitHub publishes now, asked for over TLS with `gh`'s login. A build can be
+/// out in the field long after GitHub has dropped a key, so what's pinned goes in only
+/// if it's still listed here. Only that: a key new to this build isn't trusted from here.
+pub async fn published_host_keys(gh: &OsStr) -> Result<Vec<String>, String> {
+    let args = [
+        "api",
+        "meta",
+        "--hostname",
+        "github.com",
+        "--jq",
+        ".ssh_keys[]",
+    ];
+    match output(gh, &args, "gh api meta").await {
+        Ok((true, text)) => Ok(text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_owned)
+            .collect()),
+        Ok((false, text)) => Err(format!(
+            "gh api meta failed: {}",
+            text.lines()
+                .map(str::trim)
+                .rfind(|l| !l.is_empty())
+                .unwrap_or("it didn't say why")
+        )),
+        Err(check) => Err(check.detail),
+    }
+}
+
+/// Adds to `<home>/.ssh/known_hosts` those of GitHub's keys still in `published` that it
+/// wants, and says if it added any. Nothing that's there is touched.
+pub fn pin_host_keys(home: &Path, published: &[String]) -> io::Result<bool> {
     static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let dir = home.join(".ssh");
     let path = dir.join("known_hosts");
-    let there = match fs::read(&path) {
-        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(e),
-    };
-    let missing: Vec<&str> = GITHUB_HOST_KEYS
-        .into_iter()
-        .filter(|key| !known(&there, key))
-        .collect();
+    let there = read_known_hosts(&path)?;
+    let missing = wanted(
+        &there,
+        GITHUB_HOST_KEYS
+            .into_iter()
+            .filter(|key| published.iter().any(|p| p == key)),
+    );
     if missing.is_empty() {
         return Ok(false);
     }
@@ -77,9 +147,7 @@ pub fn pin_host_keys(home: &Path) -> io::Result<bool> {
     if !there.is_empty() && !there.ends_with('\n') {
         lines.push('\n');
     }
-    for key in missing {
-        lines.push_str(&format!("github.com {key}\n"));
-    }
+    lines.extend(missing);
     fs::OpenOptions::new()
         .append(true)
         .create(true)
@@ -224,11 +292,15 @@ pub fn interpret(success: bool, output: &str) -> Check {
         .map(str::trim);
     // A gh as old as Ubuntu's 2.46 exits 0 even when its only login failed, with a
     // missing or bad token, so its words count over its exit. That line can end
-    // "using token", which isn't one, and is left out of what's kept.
-    let failed_login = bare
-        .clone()
-        .find(|l| l.to_ascii_lowercase().contains("failed to log in"))
-        .map(|l| l.split(" using token").next().unwrap_or(l));
+    // "using token", which isn't one, and is left out of what's kept. A timeout is the
+    // same line, from a newer gh, and says nothing against the login.
+    let said = |words: &str| {
+        bare.clone()
+            .find(|l| l.to_ascii_lowercase().contains(words))
+            .map(|l| l.split(" using token").next().unwrap_or(l))
+    };
+    let failed_login = said("failed to log in");
+    let timed_out = said("timeout trying to log in");
     let lines: Vec<&str> = bare
         .filter(|l| !l.is_empty() && !l.to_ascii_lowercase().contains("token"))
         .collect();
@@ -259,11 +331,33 @@ pub fn interpret(success: bool, output: &str) -> Check {
         },
         account: None,
         detail: logged_out
+            .map(without_the_command)
+            .or(timed_out)
             .or(lines.first().copied())
             .unwrap_or("gh auth status failed")
             .chars()
             .take(300)
             .collect(),
+    }
+}
+
+/// What gh said of a login, without the command it goes on to give, as this is shown
+/// beside the one click that does it.
+fn without_the_command(line: &str) -> &str {
+    let said = [
+        "To log in, run",
+        "To re-authenticate, run",
+        "Run gh auth login",
+    ]
+    .iter()
+    .fold(line, |said, command| {
+        said.split(command).next().unwrap_or(said)
+    })
+    .trim();
+    if said.is_empty() {
+        "gh's login no longer works"
+    } else {
+        said
     }
 }
 
@@ -334,11 +428,16 @@ mod tests {
         out
     }
 
+    fn all_published() -> Vec<String> {
+        GITHUB_HOST_KEYS.map(str::to_owned).to_vec()
+    }
+
     #[test]
     fn a_fresh_home_gets_the_keys_privately_and_only_once() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
-        assert!(pin_host_keys(tmp.path()).unwrap());
+        assert!(pins_missing(tmp.path()));
+        assert!(pin_host_keys(tmp.path(), &all_published()).unwrap());
         let dir = tmp.path().join(".ssh");
         let file = dir.join("known_hosts");
         let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
@@ -347,12 +446,62 @@ mod tests {
         let first = fs::read_to_string(&file).unwrap();
         let want: String = GITHUB_HOST_KEYS
             .iter()
-            .map(|k| format!("github.com {k}\n"))
+            .flat_map(|k| {
+                [
+                    format!("github.com {k}\n"),
+                    format!("[ssh.github.com]:443 {k}\n"),
+                ]
+            })
             .collect();
         assert_eq!(first, want);
         // Nothing to do, so nothing done.
-        assert!(!pin_host_keys(tmp.path()).unwrap());
+        assert!(!pins_missing(tmp.path()));
+        assert!(!pin_host_keys(tmp.path(), &all_published()).unwrap());
         assert_eq!(fs::read_to_string(&file).unwrap(), first);
+    }
+
+    /// A key GitHub has stopped publishing, as it did the leaked RSA key in 2023, isn't
+    /// added by a build still carrying it, whatever else it adds.
+    #[test]
+    fn a_key_github_no_longer_publishes_is_not_added() {
+        let [ed25519, ecdsa, rsa] = GITHUB_HOST_KEYS;
+        let tmp = tempfile::tempdir().unwrap();
+        let listed = vec![ed25519.to_owned(), ecdsa.to_owned(), "ssh-rsa NEWER".into()];
+        assert!(pin_host_keys(tmp.path(), &listed).unwrap());
+        let now = fs::read_to_string(tmp.path().join(".ssh/known_hosts")).unwrap();
+        assert!(!now.contains(rsa), "{now}");
+        assert!(!now.contains("NEWER"), "only what's pinned goes in: {now}");
+        assert_eq!(now.lines().count(), 4, "{now}");
+
+        // Having asked and been told nothing, nothing goes in.
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!pin_host_keys(tmp.path(), &[]).unwrap());
+        assert!(!tmp.path().join(".ssh").exists());
+    }
+
+    /// Ubuntu's gh 2.46 and this build's own both take this.
+    #[tokio::test]
+    async fn the_published_keys_are_asked_for_as_gh_takes_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gh = script(
+            tmp.path(),
+            r#"[ "$*" = "api meta --hostname github.com --jq .ssh_keys[]" ] || exit 9
+echo "ssh-ed25519 AAAA"
+echo "ssh-rsa BBBB""#,
+        );
+        assert_eq!(
+            published_host_keys(gh.as_os_str()).await,
+            Ok(vec![
+                "ssh-ed25519 AAAA".to_owned(),
+                "ssh-rsa BBBB".to_owned()
+            ])
+        );
+        let gh = script(
+            tmp.path(),
+            "echo 'gh: Bad credentials (HTTP 401)' >&2; exit 1",
+        );
+        let why = published_host_keys(gh.as_os_str()).await.unwrap_err();
+        assert!(why.contains("HTTP 401"), "{why}");
     }
 
     #[test]
@@ -372,34 +521,40 @@ mod tests {
         );
         fs::write(&file, &there).unwrap();
         fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(pin_host_keys(tmp.path()).unwrap());
+        assert!(pin_host_keys(tmp.path(), &all_published()).unwrap());
         let now = fs::read_to_string(&file).unwrap();
+        let other = "[ssh.github.com]:443";
         assert_eq!(
             now,
-            format!("{there}\ngithub.com {ecdsa}\ngithub.com {rsa}\n")
+            format!(
+                "{there}\n{other} {ed25519}\ngithub.com {ecdsa}\n{other} {ecdsa}\n\
+                 github.com {rsa}\n{other} {rsa}\n"
+            )
         );
         let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!((mode(&dir), mode(&file)), (0o755, 0o644), "the owner's");
-        assert!(!pin_host_keys(tmp.path()).unwrap());
+        assert!(!pin_host_keys(tmp.path(), &all_published()).unwrap());
 
         // A key of that type that isn't GitHub's pin, such as a newer one after a
-        // rotation, is theirs to have put there: the pin doesn't go in beside it.
+        // rotation, is theirs to have put there: the pin doesn't go in beside it, under
+        // either name.
         let tmp = tempfile::tempdir().unwrap();
         fs::create_dir(tmp.path().join(".ssh")).unwrap();
         let file = tmp.path().join(".ssh/known_hosts");
         fs::write(&file, "github.com ssh-rsa NEWER\n").unwrap();
-        assert!(pin_host_keys(tmp.path()).unwrap());
+        assert!(pin_host_keys(tmp.path(), &all_published()).unwrap());
         let now = fs::read_to_string(&file).unwrap();
         assert!(!now.contains(rsa), "{now}");
-        assert_eq!(now.lines().count(), 3, "{now}");
+        assert_eq!(now.lines().count(), 5, "{now}");
+        assert!(!pins_missing(tmp.path()));
 
-        // A key the owner has revoked is theirs to have said.
+        // A key the owner has revoked is theirs to have said, for both names.
         let tmp = tempfile::tempdir().unwrap();
         fs::create_dir(tmp.path().join(".ssh")).unwrap();
         let revoked = format!("@revoked github.com {rsa}\n");
         let file = tmp.path().join(".ssh/known_hosts");
         fs::write(&file, &revoked).unwrap();
-        assert!(pin_host_keys(tmp.path()).unwrap());
+        assert!(pin_host_keys(tmp.path(), &all_published()).unwrap());
         let now = fs::read_to_string(&file).unwrap();
         assert_eq!(now.matches(rsa).count(), 1, "{now}");
     }
@@ -408,7 +563,8 @@ mod tests {
     fn a_known_hosts_that_cant_be_written_is_an_error_not_a_panic() {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join(".ssh"), "a file").unwrap();
-        assert!(pin_host_keys(tmp.path()).is_err());
+        assert!(pins_missing(tmp.path()), "so that it gets to say why");
+        assert!(pin_host_keys(tmp.path(), &all_published()).is_err());
     }
 
     #[test]
@@ -464,11 +620,42 @@ mod tests {
         );
         assert_eq!(c.state, GhState::LoggedOut);
         assert_eq!(c.account, None);
-        assert!(
-            c.detail.starts_with("You are not logged into"),
-            "{}",
-            c.detail
+        // Shown beside the one click that does it, so without the command.
+        assert_eq!(c.detail, "You are not logged into any GitHub hosts.");
+        let c = interpret(
+            false,
+            "You are not logged into the GitHub host \"github.com\". Run gh auth login -h github.com\n",
         );
+        assert_eq!(
+            c.detail,
+            "You are not logged into the GitHub host \"github.com\"."
+        );
+    }
+
+    /// Words from gh 2.103.3's source, the one this build installs.
+    #[test]
+    fn a_rejected_refresh_token_is_a_sign_in_without_the_command() {
+        let out = "github.com\n  X Refresh token for github.com account me was rejected\n  - Active account: true\n  - The stored expiring credential was removed because its refresh token is no longer valid.\n  - To re-authenticate, run: gh auth login -h github.com\n";
+        let c = interpret(false, out);
+        assert_eq!(c.state, GhState::LoggedOut);
+        assert_eq!(c.detail, "gh's login no longer works");
+    }
+
+    /// Words from gh 2.103.3's source: it says this when GitHub didn't answer in time.
+    #[test]
+    fn a_timeout_says_so_and_is_not_a_sign_in() {
+        let out = "github.com\n  X Timeout trying to log in to github.com account me (keyring)\n  - Active account: true\n";
+        let c = interpret(false, out);
+        assert_eq!(c.state, GhState::Error);
+        assert_eq!(
+            c.detail,
+            "Timeout trying to log in to github.com account me (keyring)"
+        );
+        let out =
+            "github.com\n  X Timeout trying to log in to github.com using token (hosts.yml)\n";
+        let c = interpret(false, out);
+        assert_eq!(c.state, GhState::Error);
+        assert_eq!(c.detail, "Timeout trying to log in to github.com");
     }
 
     #[test]

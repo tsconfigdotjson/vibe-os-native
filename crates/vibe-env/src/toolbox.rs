@@ -117,6 +117,18 @@ done
 npm ls -g --depth=0 --parseable 2>/dev/null | sed -n 's|.*/node_modules/||p' | sed 's/^/npm: /'
 exit 0"#;
 
+/// Gives `gh` in the Linux home the login in `$VIBE_GH_TOKEN`, for git as well. A linux
+/// agent shares its project's `.git`, whose `origin` may well be SSH, as the Mac's clone
+/// is, and that login is what it has to push with (PRD: Key user flows, Finish): the
+/// Linux home has no SSH key unless one's been put there, nor a known GitHub host key. So
+/// git goes to GitHub over HTTPS here, for an `origin` in either of the usual SSH forms,
+/// and only here: the project's config isn't touched. Run again, it changes nothing, and
+/// leaves other values be.
+pub(crate) const GH_LOGIN: &str = r#"printf %s "$VIBE_GH_TOKEN" | gh auth login --hostname github.com --with-token &&
+gh auth setup-git --hostname github.com &&
+git config --global --replace-all url.https://github.com/.insteadOf git@github.com: '^git@github\.com:$' &&
+git config --global --replace-all url.https://github.com/.insteadOf ssh://git@github.com/ '^ssh://git@github\.com/$'"#;
+
 /// How long the look at the Linux home's logins may take: it reads a few
 /// small files.
 const LOGINS_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1302,13 +1314,7 @@ impl ToolboxHost for Toolbox {
             let ran = self.machine.run(
                 &self.socket(),
                 &proto::Run {
-                    command: vec![
-                        "/bin/bash".into(),
-                        "-c".into(),
-                        "printf %s \"$VIBE_GH_TOKEN\" | gh auth login --hostname github.com \
-                         --with-token && gh auth setup-git --hostname github.com"
-                            .into(),
-                    ],
+                    command: vec!["/bin/bash".into(), "-c".into(), GH_LOGIN.into()],
                     env: [("VIBE_GH_TOKEN".to_owned(), token.to_owned())]
                         .into_iter()
                         .collect(),

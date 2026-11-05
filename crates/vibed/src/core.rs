@@ -1340,16 +1340,24 @@ impl Core {
     }
 
     /// Sets up what git and `gh` need of this host for GitHub, as nobody should have
-    /// to (PRD: Key user flows, Add a project): GitHub's own host keys in
-    /// `known_hosts`, and, with `gh` logged in, git asking it for credentials. Quiet,
-    /// and quick when it's all there. What can't be done now is logged: a clone
-    /// still has HTTPS, and `gh` logged out gets said when it matters.
+    /// to (PRD: Key user flows, Add a project): with `gh` logged in, GitHub's own host
+    /// keys in `known_hosts`, those it still publishes, and git asking it for
+    /// credentials. Quiet, and quick when it's all there. What can't be done now is
+    /// logged: a clone still has HTTPS, and `gh` logged out gets said when it matters.
     pub(crate) async fn prepare_github(&self, logged_in: bool) {
         let home = self.layout.home().to_owned();
         let checks = Arc::clone(&self.checks);
         let gh = self.gh_program().await;
+        let published = if logged_in && gh::pins_missing(&home) {
+            gh::published_host_keys(&gh).await.unwrap_or_else(|why| {
+                crate::log!("vibed: can't ask GitHub for its host keys: {why}");
+                Vec::new()
+            })
+        } else {
+            Vec::new()
+        };
         let set_up = tokio::task::spawn_blocking(move || {
-            match gh::pin_host_keys(&home) {
+            match gh::pin_host_keys(&home, &published) {
                 Ok(true) => crate::log!("vibed: GitHub's host keys are in known_hosts now"),
                 Ok(false) => {}
                 Err(e) => crate::log!("vibed: can't add GitHub's host keys to known_hosts: {e}"),

@@ -825,6 +825,85 @@ fn a_github_login_waits_for_the_network_and_keeps_its_token_off_the_command_line
     assert!(!login.command.join(" ").contains("gho_secret"));
 }
 
+/// The real git, in a home of its own, with a stand-in for `gh`, which the guest has.
+#[test]
+fn a_github_login_takes_an_ssh_origin_over_https_with_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let gh = tmp.path().join("gh");
+    fs::write(&gh, "#!/bin/sh\ncat >/dev/null\nexit 0\n").unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        tmp.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .env("HOME", tmp.path())
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("GIT_CONFIG_GLOBAL")
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    };
+    // Something of the owner's own under the same key.
+    git(&[
+        "config",
+        "--global",
+        "url.https://github.com/.insteadOf",
+        "gh:",
+    ]);
+    let login = || {
+        let status = std::process::Command::new("bash")
+            .args(["-c", GH_LOGIN])
+            .env("HOME", tmp.path())
+            .env("PATH", &path)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("VIBE_GH_TOKEN", "gho_secret")
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("GIT_CONFIG_GLOBAL")
+            .stdin(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+    };
+    login();
+    for origin in [
+        "git@github.com:me/web.git",
+        "ssh://git@github.com/me/web.git",
+    ] {
+        assert_eq!(
+            git(&["ls-remote", "--get-url", origin]),
+            "https://github.com/me/web.git"
+        );
+    }
+    // Another host's isn't GitHub's to answer for.
+    assert_eq!(
+        git(&["ls-remote", "--get-url", "git@gitlab.com:me/web.git"]),
+        "git@gitlab.com:me/web.git"
+    );
+    // Signing in again changes nothing, and what was the owner's stays.
+    let once = fs::read_to_string(tmp.path().join(".gitconfig")).unwrap();
+    login();
+    assert_eq!(
+        fs::read_to_string(tmp.path().join(".gitconfig")).unwrap(),
+        once
+    );
+    assert_eq!(
+        git(&[
+            "config",
+            "--global",
+            "--get-all",
+            "url.https://github.com/.insteadOf"
+        ])
+        .lines()
+        .collect::<Vec<_>>(),
+        ["gh:", "git@github.com:", "ssh://git@github.com/"]
+    );
+}
+
 #[test]
 fn updates_wait_for_the_network_and_give_up_saying_so() {
     let s = Setup::new();
