@@ -470,13 +470,17 @@ fn bad_requests_and_launches_are_refused_with_a_reason() {
 fn the_process_report_covers_everything_the_command_started() {
     let g = Guest::start("procs", true, &[]);
     let pid = g.launch(&["sh", "-c", "setsid sleep 300 & sleep 300 & exec sleep 301"]);
+    // A process has its new name early in an exec, before its arguments show, and
+    // the rss in /proc/<pid>/stat lags further: 0 until the kernel's batched count
+    // first catches up. So the name alone can catch one with neither. A report
+    // with no arguments has no `args` at all.
     wait_until("three sleeps", || {
         let report = g.ok(json!({"op": "processes"}));
         report["processes"]
             .as_array()
             .unwrap()
             .iter()
-            .filter(|p| p["name"] == "sleep")
+            .filter(|p| p["name"] == "sleep" && p["args"].is_array() && p["rss"].as_u64() > Some(0))
             .count()
             == 3
     });
