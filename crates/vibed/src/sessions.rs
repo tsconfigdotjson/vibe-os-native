@@ -426,7 +426,17 @@ mod tests {
         assert!(!remove_stale(&path).unwrap());
         assert!(path.exists());
         drop(lock);
-        assert!(remove_stale(&path).unwrap());
+        // This process may hold the lock a moment longer: a child another test
+        // is spawning shares the open file until its exec closes it, as
+        // `StateLock::take` allows for.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !remove_stale(&path).unwrap() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the lock was never let go"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert!(!path.exists());
         assert!(!remove_stale(&path).unwrap(), "nothing left to remove");
         // Never anything but a socket.

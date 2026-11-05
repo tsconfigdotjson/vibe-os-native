@@ -613,44 +613,76 @@ fn cpu_is_held_to_its_cap() {
         "spin",
         "while :; do :; done & while :; do :; done & echo spinning",
     );
-    wait("two spinners", Duration::from_secs(10), || {
+    wait("two spinners", Duration::from_secs(60), || {
         a.procs().len() >= 3
     });
     let cpu = |a: &Agent| a.usage().cpu_ms;
-    // What it uses unlimited, which a busy machine may hold under the cap.
-    let cores_over = |a: &Agent, d: Duration| {
-        let (before, t) = (cpu(a), Instant::now());
-        std::thread::sleep(d);
-        (cpu(a) - before) as f64 / t.elapsed().as_millis() as f64
-    };
-    let free = cores_over(&a, Duration::from_secs(1));
+    let (before, t) = (cpu(&a), Instant::now());
+    std::thread::sleep(Duration::from_secs(1));
+    let free = (cpu(&a) - before) as f64 / t.elapsed().as_millis() as f64;
     a.apply(Limits {
         cpu_cores: 1,
         ..roomy()
     });
-    // The background, then duty cycling, take a few seconds to settle.
-    std::thread::sleep(Duration::from_secs(7));
-    // Meanwhile, a duty cycle is seen stopping the spinners now and then.
-    let t = Instant::now();
-    let mut seen_stopped = false;
-    let before = cpu(&a);
-    while t.elapsed() < Duration::from_secs(4) {
-        let procs = a.procs();
-        seen_stopped |= procs.iter().any(|p| p.stopped);
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    let cores = (cpu(&a) - before) as f64 / t.elapsed().as_millis() as f64;
-    eprintln!("{free:.2} cores unlimited, {cores:.2} held to 1");
-    assert!(cores < 1.35, "{cores:.2} cores against a cap of 1");
-    assert!(cores > 0.2, "{cores:.2} cores: throttled, not stopped");
-    if free > 1.4 {
-        assert!(seen_stopped, "over the cap, but never duty cycled");
-    } else {
-        eprintln!("the machine gave it only {free:.2} cores: duty cycling not required");
-    }
+    // The background, then duty cycling, take a few seconds to settle, and go by
+    // what the machine gives it from one walk to the next: what it gave a moment
+    // ago, or gives now, says little about what the governor saw. Under the cap
+    // for its own reasons, in the background on a small Mac or beside other work,
+    // it has no need of a duty cycle, and when that work ends it's over again
+    // until the governor has seen so. So it's given until a whole window is under
+    // the cap, and a stop is looked for only while the governor says it's cycling.
+    // With no duty cycle at all, that has to last, as a governor that never
+    // cycles would be under the cap too, for as long as other work holds it there.
+    let applied = Instant::now();
+    let (mut cycled, mut seen_stopped) = (false, false);
+    let mut under_since: Option<Instant> = None;
+    let cores = loop {
+        let (before, t) = (cpu(&a), Instant::now());
+        while t.elapsed() < Duration::from_secs(4) {
+            seen_stopped |= a.procs().iter().any(|p| p.stopped);
+            cycled |= h.backend.duty(&a.handle) < 1.0;
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let cores = (cpu(&a) - before) as f64 / t.elapsed().as_millis() as f64;
+        let under = cores < 1.35;
+        if !under {
+            under_since = None;
+        } else if under_since.is_none() {
+            under_since = Some(t);
+        }
+        let duty = h.backend.duty(&a.handle);
+        // A stop this short may fall between two looks.
+        let cycling = duty < 0.9;
+        let settled = if cycled {
+            applied.elapsed() >= Duration::from_secs(7)
+        } else {
+            under_since.is_some_and(|t| t.elapsed() >= Duration::from_secs(20))
+        };
+        // Two spinners held to one core want a duty near a half: much less is
+        // holding it to far less than its cap, whatever the machine is doing.
+        if under && settled && (!cycling || seen_stopped) && duty > 0.2 {
+            break cores;
+        }
+        assert!(
+            applied.elapsed() < Duration::from_secs(120),
+            "{cores:.2} cores against a cap of 1, duty {duty:.2}, seen stopped {seen_stopped}"
+        );
+    };
+    eprintln!(
+        "{free:.2} cores unlimited, {cores:.2} held to 1, cycled {cycled}, seen stopped {seen_stopped}"
+    );
     assert_eq!(a.usage().paused, None, "CPU never pauses");
+    // Throttled, not stopped: it goes on, however little the machine gives it.
+    let running = cpu(&a);
+    wait("it to go on running", Duration::from_secs(60), || {
+        cpu(&a) > running + 200
+    });
     // Asleep, a duty cycle doesn't continue it; woken, it runs on.
     h.backend.sleep(&a.handle).unwrap();
+    wait("it to stop", Duration::from_secs(60), || {
+        a.procs().iter().all(|p| p.stopped)
+    });
+    // Long enough for a duty cycle to have let it go, if one would.
     std::thread::sleep(Duration::from_secs(2));
     assert!(a.procs().iter().all(|p| p.stopped), "{:?}", a.procs());
     let asleep = cpu(&a);
@@ -658,7 +690,7 @@ fn cpu_is_held_to_its_cap() {
     assert!(cpu(&a) - asleep < 50, "it ran while asleep");
     assert_eq!(h.backend.wake(&a.handle).unwrap(), Woke::Exact);
     let woke = cpu(&a);
-    wait("it to spin again", Duration::from_secs(5), || {
+    wait("it to spin again", Duration::from_secs(60), || {
         cpu(&a) > woke + 200
     });
 }

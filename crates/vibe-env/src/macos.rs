@@ -140,6 +140,8 @@ struct State {
     disk: Option<u64>,
     /// What a duty cycle stopped, which it continues.
     duty_stopped: Vec<u32>,
+    /// The share of each period it runs, as of the governor's last walk.
+    duty: f64,
     /// Whether it's in the background. Children inherit that, so letting
     /// go brings back every member, not just those put there.
     background: bool,
@@ -186,6 +188,7 @@ impl Agent {
                 warnings: Vec::new(),
                 disk: None,
                 duty_stopped: Vec::new(),
+                duty: 1.0,
                 background: false,
                 woke: false,
             }),
@@ -328,6 +331,12 @@ impl Macos {
         ]
     }
 
+    /// The share of each period its governor lets it run, as of its last walk:
+    /// 1 unless it's duty cycling.
+    pub fn duty(&self, h: &Handle) -> f64 {
+        lock(&self.agent(h).state).duty
+    }
+
     /// Stops every governor at once, bringing back what each put in the
     /// background or stopped for a duty cycle, as `vibed` must before it
     /// exits: its threads die with it, mid cycle or not.
@@ -358,6 +367,7 @@ fn let_go(st: &mut State, procs: &[Proc]) {
             let _ = tree::set_background(p.pid, false);
         }
     }
+    st.duty = 1.0;
     let stopped = std::mem::take(&mut st.duty_stopped);
     if st.mode == Mode::Running {
         for pid in stopped {
@@ -939,6 +949,7 @@ fn govern(agent: &Agent, mut members: Members, stop: &AtomicBool, intervals: Int
             let disk = lock(&disk).bytes;
             st.disk = disk;
             duty = 1.0;
+            st.duty = duty;
             match st.mode {
                 Mode::Running => {
                     let d = g.observe(now - started, wall_ms(), &procs, disk);
@@ -962,6 +973,7 @@ fn govern(agent: &Agent, mut members: Members, stop: &AtomicBool, intervals: Int
                         }
                     }
                     duty = d.duty;
+                    st.duty = duty;
                 }
                 Mode::Asleep | Mode::Paused { .. } => {
                     // Still stopped: whatever runs again, or was started

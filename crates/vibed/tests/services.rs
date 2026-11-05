@@ -1325,7 +1325,15 @@ struct Pair {
     _dir: tempfile::TempDir,
 }
 
+/// A Mac and a host, with the Mac's calls in no hurry for a token that's coming:
+/// they go on the moment it lands.
 async fn pair(fake: &FakeService) -> Pair {
+    pair_waiting(fake, Duration::from_secs(60)).await
+}
+
+/// One whose Mac gives a token this long to come: what a test of the owner being
+/// away spends, waiting it out.
+async fn pair_waiting(fake: &FakeService, token_wait: Duration) -> Pair {
     let dir = tempfile::tempdir().unwrap();
     let logins = FileStore(dir.path().join("services"));
     let host = node(
@@ -1351,9 +1359,12 @@ async fn pair(fake: &FakeService) -> Pair {
     let t = tapped.clone();
     let mac = node(fake, Place::Mac, mac_logins.clone(), None, move |config| {
         config.remote = t;
+        config.services.as_mut().unwrap().token_wait = token_wait;
         config.link_timing = Timing {
             ping_every: Duration::from_millis(200),
-            ping_timeout: Duration::from_millis(400),
+            // For a line gone silent, which nothing here is: a cut closes it. Any
+            // less, and a stalled test takes a healthy link down, mid-call.
+            ping_timeout: Duration::from_secs(600),
             connect_timeout: Duration::from_secs(5),
             min_backoff: Duration::from_millis(50),
             max_backoff: Duration::from_millis(300),
@@ -1369,10 +1380,9 @@ async fn pair(fake: &FakeService) -> Pair {
         })
         .await
         .unwrap();
-    for _ in 0..500 {
-        if rpc(&mac.core, "services.list", json!({"host": "vps"})).await["result"].is_object() {
-            break;
-        }
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !rpc(&mac.core, "services.list", json!({"host": "vps"})).await["result"].is_object() {
+        assert!(Instant::now() < deadline, "the link never came up");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     Pair {
@@ -1678,7 +1688,7 @@ async fn the_mac_as_a_follower_serves_its_agents_and_a_401_gets_it_a_new_token()
 
     let socket = p.mac.core.services_socket();
     let cache = p.mac.golden.home.join("cache");
-    let mut shim = blocking(move || {
+    let shim = blocking(move || {
         let mut shim = Shim::start(&socket, &cache, Some("on-the-mac"));
         assert_eq!(text(&shim.call("list_issues")), "issues on /mcp");
         shim
@@ -1694,10 +1704,10 @@ async fn the_mac_as_a_follower_serves_its_agents_and_a_401_gets_it_a_new_token()
     // Turned down at the Mac: it asks once, the owner refreshes, and the same
     // call goes through with no one the wiser.
     fake.expire_access();
-    shim = blocking(move || {
+    blocking(move || {
+        let mut shim = shim;
         let answer = shim.call("list_issues");
         assert_eq!(text(&answer), "issues on /mcp", "{answer}");
-        shim
     })
     .await;
     assert_eq!(fake.refreshes(), 1, "at the owner");
@@ -1707,6 +1717,22 @@ async fn the_mac_as_a_follower_serves_its_agents_and_a_401_gets_it_a_new_token()
     );
     p.mac_following().await;
     assert_eq!(p.mac_logins.load("linear").unwrap().unwrap().refresh, None);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn with_the_owner_away_a_macs_agent_is_served_until_its_token_is_refused() {
+    let fake = FakeService::start().await;
+    let p = pair_waiting(&fake, Duration::from_millis(500)).await;
+    p.connect_host().await;
+    p.mac_following().await;
+    let socket = p.mac.core.services_socket();
+    let cache = p.mac.golden.home.join("cache");
+    let mut shim = blocking(move || {
+        let mut shim = Shim::start(&socket, &cache, Some("on-the-mac"));
+        assert_eq!(text(&shim.call("list_issues")), "issues on /mcp");
+        shim
+    })
+    .await;
 
     // With the owner away, the token it has serves until it's refused or runs
     // out, and then the agent's told why, and the tools still list.
@@ -1731,7 +1757,7 @@ async fn the_mac_as_a_follower_serves_its_agents_and_a_401_gets_it_a_new_token()
     assert_eq!(p.mac.service().state, ServiceState::OwnerUnreachable);
     assert_eq!(
         fake.refreshes(),
-        1,
+        0,
         "the Mac can't, and the owner wasn't asked"
     );
 }

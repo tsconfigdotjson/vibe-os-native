@@ -53,6 +53,21 @@ fn deps(
     }
 }
 
+/// A sign-in's tools are read in the background: this waits, so that's not going
+/// on beside what a test does next. They're told of only once they're kept: `info`
+/// has them sooner, and a late save would land on whatever a test has put in the
+/// state file by then.
+async fn tools_kept(changes: &Mutex<Vec<ServiceInfo>>) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while !changes.lock().unwrap().iter().any(|i| i.tools > 0) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "it never kept the tools"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 impl World {
     async fn start(store: Arc<dyn SecretStore>) -> World {
         let fake = FakeService::start().await;
@@ -98,14 +113,7 @@ impl World {
         assert_eq!(auth.callback_scheme, "vibeos");
         let back = self.fake.sign_in(&auth.url).await;
         let info = self.services.complete("linear", &back).await.unwrap();
-        // Its tools are read in the background: wait, so that's not going on
-        // beside what a test does next.
-        for _ in 0..500 {
-            if self.info().tools > 0 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        tools_kept(&self.changes).await;
         info
     }
 
@@ -1048,7 +1056,8 @@ async fn a_linux_host_says_a_login_gets_mended_on_the_mac() {
     let fake = FakeService::start().await;
     let dir = tempfile::tempdir().unwrap();
     let store: Arc<dyn SecretStore> = Arc::new(MemoryStore::default());
-    let (now, audit, changes) = (Arc::default(), Arc::default(), Arc::default());
+    let (now, audit) = (Arc::default(), Arc::default());
+    let changes: Arc<Mutex<Vec<ServiceInfo>>> = Arc::default();
     let services = Services::new(
         vec![fake.service()],
         store,
@@ -1068,6 +1077,7 @@ async fn a_linux_host_says_a_login_gets_mended_on_the_mac() {
     let auth = services.connect("linear").await.unwrap();
     let back = fake.sign_in(&auth.url).await;
     services.complete("linear", &back).await.unwrap();
+    tools_kept(&changes).await;
     fake.reject_all_tokens(true);
     let lost = a.call("list_issues").await;
     assert!(is_error(&lost));
@@ -1821,6 +1831,11 @@ struct Follower {
 
 impl World {
     fn follower(&self) -> Follower {
+        self.follower_waiting(deps(&self.now, &Arc::default(), &Arc::default()).token_wait)
+    }
+
+    /// One that gives a token this long to come.
+    fn follower_waiting(&self, token_wait: Duration) -> Follower {
         let dir = tempfile::tempdir().unwrap();
         let state_file = dir.path().join("services.json");
         let store = Arc::new(MemoryStore::default());
@@ -1829,7 +1844,10 @@ impl World {
             vec![self.fake.service()],
             store.clone(),
             state_file.clone(),
-            deps(&self.now, &audit, &Arc::default()),
+            Deps {
+                token_wait,
+                ..deps(&self.now, &audit, &Arc::default())
+            },
         );
         Follower {
             services,
@@ -1924,7 +1942,9 @@ async fn a_follower_uses_the_token_it_was_given_and_holds_no_refresh_token() {
 async fn a_follower_turned_down_asks_once_and_the_owner_refreshes() {
     let w = World::new().await;
     w.sign_in().await;
-    let f = w.follower();
+    // The token comes here, and the call goes on the moment it does. Going without
+    // is another test's.
+    let f = w.follower_waiting(Duration::from_secs(60));
     let first = f.given_by(&w.services, None).await;
     let mut a = Shim::open(&f.services, "a");
     a.call("list_issues").await;
@@ -1935,7 +1955,8 @@ async fn a_follower_turned_down_asks_once_and_the_owner_refreshes() {
         let (owner, follower) = (w.services.clone(), f.services.clone());
         let first = first.clone();
         tokio::spawn(async move {
-            for _ in 0..500 {
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            while std::time::Instant::now() < deadline {
                 if follower.list().services[0].wants_token {
                     let access = owner.token("linear", Some(&first)).await.unwrap();
                     follower
@@ -2005,9 +2026,16 @@ async fn a_follower_serves_until_its_token_runs_out_then_says_the_owner_is_away(
     );
     // Tools still list, and the next call doesn't wait all over again.
     assert!(a.tools().await.contains(&"list_issues".to_owned()));
-    let started = std::time::Instant::now();
-    assert!(is_error(&a.call("list_issues").await));
-    assert!(started.elapsed() < Duration::from_millis(250));
+    // A stall can hold one call as long as a wait would. Only waiting holds them all.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let started = std::time::Instant::now();
+        assert!(is_error(&a.call("list_issues").await));
+        if started.elapsed() < Duration::from_millis(250) {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "each call waited");
+    }
 
     // It's back: no restart, no sign-in.
     w.services.refresh_due().await;
