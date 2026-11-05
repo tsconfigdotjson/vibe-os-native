@@ -785,6 +785,45 @@ fn a_real_close_with_output_running_saves_the_toolbox() {
     }
 }
 
+/// `yes`, with a terminal attached: closing the window saves, and so does Save &
+/// Close, which is `vibe toolbox close` here and the button in Settings. The shell
+/// has to pass the hang-up on, as job control has `yes` in a group of its own.
+#[test]
+fn closing_with_yes_running_saves_the_toolbox() {
+    let w = toolbox_world();
+    let size = Size { rows: 24, cols: 80 };
+    let toolbox = || {
+        let mut cmd = w.vibe();
+        cmd.arg("toolbox");
+        let mut term = Term::spawn(cmd, size);
+        term.attached();
+        term.type_line("yes");
+        term.expect("y\r\ny");
+        term
+    };
+    let saved = |version: u32| {
+        w.layout
+            .linux_dir()
+            .join(format!("template-{version}.img"))
+            .exists()
+    };
+
+    let mut term = toolbox();
+    term.close_window_while_writing();
+    assert_eq!(term.wait(), Some(0), "{}", term.text());
+    assert!(saved(1));
+
+    let mut term = toolbox();
+    let out = w.vibe().args(["toolbox", "close"]).output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("Saved template 2 and Linux home 2"),
+        "{out:?}"
+    );
+    assert!(saved(2));
+    term.wait();
+}
+
 /// A window can hang up before it closes, or without closing at all, with
 /// `vibe` blocked writing to a terminal nobody reads: the hangup is still heard,
 /// and saves. The terminal stays open until the save is seen, so nothing but the

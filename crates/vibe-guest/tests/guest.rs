@@ -391,6 +391,40 @@ fn a_shim_that_stalls_under_a_flood_is_given_a_few_seconds() {
     assert!(alive(pid));
 }
 
+/// A run's end doesn't wait for a stalled shim. A write to one holds the state for
+/// `SEND_TIMEOUT`, and the shell ending has to wait for the state; what's run beside
+/// it mustn't wait as well, or a `kill` that worked looks out of time. This is
+/// `Toolbox::hang_up` as Save & Close runs it, on the 5 s it gets (#69), staying a
+/// moment so that the shell's end is seen first.
+#[test]
+fn a_run_ends_in_its_own_time_beside_a_stalled_shim() {
+    let g = Guest::start("stall-run", false, &[]);
+    let pid = g.launch(&["sh"]);
+    let mut t = g.attach(None);
+    t.send("while :; do echo spam; done\n");
+    t.expect("spam");
+    // Nothing reads from here on, so a write is soon stuck with the state held.
+    std::thread::sleep(Duration::from_millis(300));
+    let started = Instant::now();
+    let ran = g.ok(json!({
+        "op": "run",
+        "command": ["sh", "-c", "kill -s HUP -- \"-$1\"; sleep 0.5", "hang-up", pid.to_string()],
+        "timeout_ms": 5000,
+    }));
+    assert_eq!(ran["code"], 0, "{ran}\n{}", g.log());
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "took {:?}: {}",
+        started.elapsed(),
+        g.log()
+    );
+    // The shell's end is still heard, once the write has given up.
+    wait_until("the guest to see the shell end", || !alive(pid));
+    wait_until("the guest to say the shell ended", || {
+        g.log().contains("ended")
+    });
+}
+
 #[test]
 fn the_environment_reaches_the_command_and_never_the_log() {
     let g = Guest::start("env", false, &[]);

@@ -119,8 +119,12 @@ impl Vm {
     }
 
     fn launch_shell(&self) -> u32 {
+        self.launch(&["sh"])
+    }
+
+    fn launch(&self, command: &[&str]) -> u32 {
         let launch = Launch {
-            command: vec!["sh".into()],
+            command: command.iter().map(|&c| c.to_owned()).collect(),
             env: Default::default(),
             cwd: Some(self.dir.path().to_string_lossy().into_owned()),
             size: Some(TermSize {
@@ -440,15 +444,27 @@ fn a_linux_agents_terminal_is_held_in_the_guest_and_outlives_its_shims() {
 /// waits for to save (#69).
 #[test]
 fn a_hang_up_in_the_guest_ends_a_shell_flooding_its_terminal() {
+    hang_up_on_a_flood(&["sh"], "while :; do echo spam; done", "spam\r\nspam");
+}
+
+/// The same with what a toolbox has: a login `bash`, whose job control puts `yes`
+/// in a group of its own, out of reach of the `kill`, so the shell has to pass the
+/// hang-up on. This terminal is a Linux one on a Mac too: it's in the guest.
+#[test]
+fn a_hang_up_in_the_guest_ends_a_login_bash_running_yes() {
+    hang_up_on_a_flood(&["/bin/bash", "-l"], "yes", "y\r\ny");
+}
+
+fn hang_up_on_a_flood(command: &[&str], flood: &str, flooding_says: &str) {
     let vm = Vm::start();
-    let pid = vm.launch_shell();
+    let pid = vm.launch(command);
     let shim = vm.shim("flood");
     let _stuck = shim.attach(None);
     let mut a = shim.attach(None);
     // There's always more to read, and a timeout in mid-frame would lose its place.
     a.stream.set_read_timeout(Some(WAIT)).unwrap();
-    a.type_line("while :; do echo spam; done");
-    a.expect("spam\r\nspam");
+    a.type_line(flood);
+    a.expect(flooding_says);
     let flooding = Instant::now();
     while flooding.elapsed() < Duration::from_secs(2) {
         assert!(a.pump(), "the shim closed: {}", shim.log());
