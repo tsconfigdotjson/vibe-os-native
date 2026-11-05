@@ -65,6 +65,10 @@ pub(crate) struct Upgrade {
     pub(crate) reconnected: bool,
     /// What went wrong the last time, until something's gone right.
     pub(crate) error: Option<String>,
+    /// The version it went back to, when the last try's build wouldn't start. That comes
+    /// up looking as if nothing is wrong, though this Mac's build is what's wrong, so
+    /// it's only another version, or a try that works, that says it's been put right.
+    pub(crate) went_back_to: Option<String>,
 }
 
 impl Upgrade {

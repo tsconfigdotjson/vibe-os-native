@@ -176,6 +176,23 @@ impl FakeHost {
                 std::env::consts::ARCH
             ),
         );
+        // Only Linux has `/proc`: see the test that makes this file.
+        if !cfg!(target_os = "linux") {
+            write_exe(
+                &bin.join("readlink"),
+                r#"#!/bin/sh
+case "$1" in
+/proc/*/exe)
+  if [ -e "$HOME.d/exe-deleted" ]; then
+    rm -f "$HOME.d/exe-deleted"
+    echo "$HOME/.local/lib/vibeos/vibed (deleted)"
+  fi
+  exit 0 ;;
+esac
+exec /usr/bin/readlink "$@"
+"#,
+            );
+        }
         // `systemctl --user`: the service runs as a plain process, with the
         // unit's PATH, and restarting it stops only vibed (KillMode=process).
         write_exe(
@@ -2050,6 +2067,7 @@ fn a_hosts_state_is_kept_body(watch: &Watch) {
     // It's stopped midway, by a signal, as a person would, and then again, impatiently.
     // The second, during the putting back, doesn't stop that.
     let marker = hosts.path().join("off-now");
+    let stopped_said = hosts.path().join("stopped-said");
     let mut stopped = keep();
     stopped
         .args([
@@ -2058,7 +2076,7 @@ fn a_hosts_state_is_kept_body(watch: &Watch) {
             &format!("{off}; touch {}; sleep 600", marker.display()),
         ])
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(fs::File::create(&stopped_said).unwrap());
     let mut child = stopped.spawn().unwrap();
     // Nobody reading what it says, as with a `| tee` that has gone.
     drop(child.stdout.take());
@@ -2071,7 +2089,12 @@ fn a_hosts_state_is_kept_body(watch: &Watch) {
     std::thread::sleep(Duration::from_millis(50));
     unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
     let ended = child.wait().unwrap();
-    assert_eq!(ended.code(), Some(143));
+    assert_eq!(
+        ended.code(),
+        Some(143),
+        "it said: {}",
+        fs::read_to_string(&stopped_said).unwrap()
+    );
     assert!(domain_there());
 
     // What a real test leaves behind of its own, if it failed before tidying up, goes.
@@ -2464,6 +2487,11 @@ fn an_upgrade_cut_short_after_its_files_went_in_is_finished_by_the_next_body(wat
     let mac = mac(&golden, &ssh, bundle(golden.dir.path()));
     ok(vibe(&mac.socket, &["host", "add", "vps", "me@vps"]));
     let before = host.pid().unwrap();
+    // Only Linux has `/proc`, which the install asks. This host is a stand-in, so
+    // elsewhere it's told what Linux would say. On Linux this asks the real thing.
+    if !cfg!(target_os = "linux") {
+        fs::write(host.d.join("exe-deleted"), "").unwrap();
+    }
     // As the upload does: the same bytes, a new file, the old one gone from under
     // the vibed that's running.
     let installed = host.home.join(".local/lib/vibeos/vibed");
@@ -2517,11 +2545,44 @@ fn a_build_that_wont_start_goes_back_to_the_one_before_and_says_so_body(watch: &
     let lib = host.home.join(".local/lib/vibeos");
     assert!(!lib.join(".vibed.prev").exists());
     // It's running on it again, and the Mac reaches it.
-    wait_for("the link", Duration::from_secs(30), || {
+    let row = || {
         ok(vibe(&mac.socket, &["host"]))
             .lines()
-            .any(|l| l.starts_with("vps  ") && l.contains("  connected"))
+            .find(|l| l.starts_with("vps  "))
+            .unwrap_or_default()
+            .to_owned()
+    };
+    wait_for("the link", Duration::from_secs(30), || {
+        row().contains("  connected")
     });
+    // That it's back isn't that it's fixed: it still says what happened.
+    assert!(row().contains("upgrading it failed"), "{}", row());
+    // And a later look that finds no `vibed` doesn't put the same bad build back, which
+    // would cut the host off all over again, with nobody having asked. It was this,
+    // straight after going back, that kept the link away.
+    let stopped = Command::new(host.d.join("bin/systemctl"))
+        .args(["--user", "stop"])
+        .env("HOME", &host.home)
+        .in_files()
+        .unwrap();
+    assert!(stopped.status.success(), "{stopped:?}");
+    wait_for("the link to go", Duration::from_secs(30), || {
+        !row().contains("  connected")
+    });
+    let quiet = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < quiet {
+        assert_eq!(
+            fs::read(&installed).unwrap(),
+            good,
+            "it put the bad build back"
+        );
+        assert!(
+            !lib.join(".vibed.new").exists(),
+            "it's putting the bad build back"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(row().contains("upgrading it failed"), "{}", row());
 }
 
 /// B1 of the review, by the real install's own look at what's there.
