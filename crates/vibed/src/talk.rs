@@ -478,14 +478,22 @@ impl Core {
     /// until it's up: typed to before that, what's typed waits in a terminal that
     /// isn't raw yet, so its Enter arrives as a newline in the text and nothing is
     /// submitted. A frozen program thawed is where it was, and isn't waited for.
-    /// Says whether it waited, and fails if the program still isn't up: only the
-    /// first send is held to that, so another types, for a caller who's looked.
+    /// Says whether it's just started, which a Pi may still be for a while after
+    /// the wait, and fails if the program still isn't up. Only one send is held to
+    /// that: the next is typed without waiting, whether its caller has looked or not.
     async fn wait_started(&self, agent_ref: &str, socket: &Path) -> Result<bool, ErrorObject> {
-        let started = lock(&self.started_at).remove(agent_ref);
-        let Some(left) = started.and_then(|at| READY_WITHIN.checked_sub(at.elapsed())) else {
+        let Some(at) = lock(&self.started_at).remove(agent_ref) else {
             return Ok(false);
         };
-        if !wait_ready(socket, left).await {
+        let Some(left) = READY_WITHIN.checked_sub(at.elapsed()) else {
+            return Ok(at.elapsed() < READY_WITHIN + PI_STARTUP_WITHIN);
+        };
+        // Long enough to see a screen stay still, however little of the time's left.
+        if !wait_ready(socket, left.max(SETTLE + Duration::from_millis(200))).await {
+            // Kept for the next send, unless it's been started again since.
+            lock(&self.started_at)
+                .entry(agent_ref.to_owned())
+                .or_insert(at);
             return Err(error(
                 ErrorCode::Conflict,
                 format!(

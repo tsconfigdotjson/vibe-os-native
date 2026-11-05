@@ -1224,8 +1224,8 @@ async fn a_question_that_comes_up_during_the_wait_for_a_start_stops_the_text() {
         .await
         .unwrap_err();
     assert!(e.message.contains("is waiting on a question"), "{e:?}");
+    w.wait_screen(&a.agent, "Red or blue?");
     let screen = w.core.agent_output(None, &a.agent, None).await.unwrap();
-    assert!(screen.screen.contains("Red or blue?"), "{}", screen.screen);
     assert!(!screen.screen.contains("blue\n"), "{}", screen.screen);
     w.core.delete_agent(delete(&a.agent, true)).await.unwrap();
 }
