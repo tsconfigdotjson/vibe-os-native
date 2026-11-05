@@ -598,11 +598,25 @@ mod tests {
         assert_eq!(t[0].answer, Answer::Connected);
         assert!(!t[0].local);
         drop(open);
-        let t = try_addresses(&Target {
-            host: "127.0.0.1".into(),
-            port,
-        })
-        .await;
-        assert_eq!(t[0].answer, Answer::Refused);
+        // A port let go of refuses, unless it's someone's by the time it's tried: another
+        // test's, or this very connection's. Then it says nothing, so another port is
+        // tried; if every one connects, this fails. (Holding the port, bound and not
+        // listening, would refuse on Linux, but a Mac drops the connection unanswered.)
+        let mut answer = Answer::Connected;
+        for _ in 0..20 {
+            let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = closed.local_addr().unwrap().port();
+            drop(closed);
+            let mut t = try_addresses(&Target {
+                host: "127.0.0.1".into(),
+                port,
+            })
+            .await;
+            answer = t.remove(0).answer;
+            if answer != Answer::Connected {
+                break;
+            }
+        }
+        assert_eq!(answer, Answer::Refused);
     }
 }

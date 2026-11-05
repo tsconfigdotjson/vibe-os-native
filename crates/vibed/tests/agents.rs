@@ -1603,7 +1603,29 @@ async fn a_start_cut_short_by_a_crash_is_undone_by_the_next_vibed() {
     let origin = w.origin.to_str().unwrap();
     git(&["-C", origin, "checkout", "-q", "-b", "slow-setup"]);
     fs::create_dir_all(w.origin.join(".vibe")).unwrap();
-    fs::write(w.origin.join(".vibe/setup.sh"), "sleep 3\n").unwrap();
+    // It says when it's running and when it's done, and goes on until it's told to. Or
+    // until this test has gone, by a failure that removed `marks` or by being killed,
+    // so it can neither hold up a failure's report nor outlive the test for long.
+    let marks = tempfile::tempdir().unwrap();
+    let [started, finish, finished] =
+        ["started", "finish", "finished"].map(|name| marks.path().join(name));
+    fs::write(
+        w.origin.join(".vibe/setup.sh"),
+        format!(
+            "touch '{started}'\n\
+             i=0\n\
+             while [ ! -e '{finish}' ] && [ -d '{marks}' ] && [ $i -lt 6000 ]; do\n\
+             sleep 0.05\n\
+             i=$((i+1))\n\
+             done\n\
+             touch '{finished}'\n",
+            started = started.display(),
+            finish = finish.display(),
+            marks = marks.path().display(),
+            finished = finished.display()
+        ),
+    )
+    .unwrap();
     git(&["-C", origin, "add", "."]);
     git(&["-C", origin, "commit", "-q", "-m", "slow"]);
     git(&["-C", origin, "checkout", "-q", "-"]);
@@ -1615,15 +1637,18 @@ async fn a_start_cut_short_by_a_crash_is_undone_by_the_next_vibed() {
     let mut p = start("x");
     p.from = Some("slow-setup".into());
     p.name = Some("cut-short".into());
-    let cut = tokio::time::timeout(Duration::from_millis(1500), w.core.start_agent(p)).await;
-    assert!(cut.is_err(), "the start finished: {cut:?}");
+    tokio::select! {
+        done = w.core.start_agent(p) => panic!("the start finished: {done:?}"),
+        () = file_appears(&started) => {}
+    }
     assert!(w.layout.worktree("app", "cut-short").exists());
     let listed = w.list().await;
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].agent, "cut-short");
     drop(w.core);
     // Let the orphaned setup finish, as it would have died with vibed.
-    std::thread::sleep(Duration::from_secs(2));
+    fs::write(&finish, "").unwrap();
+    file_appears(&finished).await;
 
     let core = Arc::new(Core::open(w.golden.config()).unwrap());
     let w = World { core, ..w };
@@ -1633,6 +1658,17 @@ async fn a_start_cut_short_by_a_crash_is_undone_by_the_next_vibed() {
     assert_eq!(git_out(&w.project, &["branch", "--list"]), branches);
     let worktrees = git_out(&w.project, &["worktree", "list"]);
     assert!(!worktrees.contains("cut-short"), "{worktrees}");
+}
+
+/// Waits for what a script says by making `path`, however busy this machine is.
+async fn file_appears(path: &Path) {
+    for _ in 0..6000 {
+        if path.exists() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("{} never appeared", path.display());
 }
 
 /// The test backend, but whose agents go on without their shim, as a
