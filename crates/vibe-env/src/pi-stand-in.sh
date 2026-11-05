@@ -12,7 +12,9 @@
 #   think N    takes N seconds over its answer, its prompt on disk and no more
 #   nologin    fails before it writes anything, showing why only on its screen
 #   sayerror   answers with what reads just like that error
-#   /anything  is Pi's to deal with: it writes nothing, and shows nothing here
+#   /model, !ls and the rest of Pi's own commands are Pi's to deal with: they write
+#              nothing, and show nothing here. Any other `/` or `!` goes on as a
+#              prompt, as in Pi (`interactive-mode.ts`).
 #   tool N     runs a tool for N seconds: a long, silent tool call
 #   limit      stops at a usage limit
 #   error      stops at an API error
@@ -226,7 +228,14 @@ editor() {
 unedit() { printf '\033[3A\033[J'; }
 turn() {
   words=" $1 "
-  case $1 in /*) return ;; esac
+  case $1 in
+    /settings|/scoped-models|/share|/copy|/session|/changelog|/hotkeys|/fork|/clone|\
+    /tree|/trust|/logout|/new|/reload|/debug|/resume|/quit) return ;;
+    /model|/model\ *|/thinking|/thinking\ *|/export|/export\ *|/import|/import\ *|\
+    /bug|/bug\ *|/name|/name\ *|/login|/login\ *|/compact|/compact\ *) return ;;
+    '!'|'!!') ;;
+    '!'*) return ;;
+  esac
   printf ' %s\n\n' "$1"
   case $words in *" wait "*)
     n=${words#* wait }; working "${n%% *}"

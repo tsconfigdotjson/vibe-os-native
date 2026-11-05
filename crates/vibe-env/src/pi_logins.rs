@@ -100,6 +100,22 @@ const HISTORY_FILE: &str = "history.json";
 /// as it was for a refresh from an agent's VM to go through.
 const HARMLESS_FIELDS: &[&str] = &["availableModelIds", "scopes", "scope"];
 
+/// What a login's field is called if it says where the login goes, as Copilot's
+/// `enterpriseUrl` does, or what another provider's would likely be called. No login of
+/// Pi 1.5's has a `server`, a `tenant` or a `proxy`.
+const PLACE_WORDS: &[&str] = &[
+    "url",
+    "uri",
+    "domain",
+    "host",
+    "endpoint",
+    "enterprise",
+    "gateway",
+    "server",
+    "tenant",
+    "proxy",
+];
+
 /// One thing at a time touches the store: this tick's sweep, or a VM's launch.
 static BROKER: Mutex<()> = Mutex::new(());
 
@@ -422,13 +438,26 @@ fn leads_elsewhere(entry: &Value, enterprise: Option<&str>) -> bool {
     })
 }
 
-/// `^[a-z0-9.-]+\.githubcopilot\.com$`.
+/// A plain name under `githubcopilot.com`.
 fn copilot_host(host: &str) -> bool {
-    host.strip_suffix(".githubcopilot.com").is_some_and(|name| {
-        !name.is_empty()
-            && name
+    host.strip_suffix(".githubcopilot.com")
+        .is_some_and(plain_host_name)
+}
+
+/// Whether `name` is a host's name as anyone would write it: labels of lower-case
+/// letters, digits and hyphens, none empty, none starting or ending with a hyphen,
+/// none over DNS's 63, and none with `--` where an encoded one has it, as `xn--` does,
+/// which can spell a name that only looks like another.
+fn plain_host_name(name: &str) -> bool {
+    name.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label.get(2..4) != Some("--")
+            && label
                 .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '-')
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
     })
 }
 
@@ -457,34 +486,59 @@ fn owners_enterprise<'a>(
 /// Whether a login's field says where it goes by its name alone, whatever its
 /// value looks like: an enterprise named `corp` is as good as a URL.
 fn field_names_a_place(field: &str) -> bool {
-    let field = field.to_ascii_lowercase();
-    [
-        "url",
-        "uri",
-        "domain",
-        "host",
-        "endpoint",
-        "enterprise",
-        "gateway",
-    ]
-    .iter()
-    .any(|word| field.contains(word))
+    let words = words_of(field);
+    // A place may be split up too, as in `endPoint` and `gate_way`.
+    let split = words.windows(2).map(<[String]>::concat);
+    words
+        .iter()
+        .cloned()
+        .chain(split)
+        .chain([words.concat()])
+        .any(|word| word_names_a_place(&word))
 }
 
-/// Whether `host` is the enterprise's, as a GitHub Enterprise login's proxy is, in
-/// the same plain characters.
+/// The words of a field's name, in lower case: `baseURL`, `BASE_URL` and `base-url`
+/// are all `base` and `url`.
+fn words_of(field: &str) -> Vec<String> {
+    let mut words = vec![String::new()];
+    let mut after_lower = false;
+    for c in field.chars() {
+        if !c.is_ascii_alphabetic() {
+            words.push(String::new());
+        } else if after_lower && c.is_ascii_uppercase() {
+            words.push(c.to_ascii_lowercase().to_string());
+        } else if let Some(word) = words.last_mut() {
+            word.push(c.to_ascii_lowercase());
+        }
+        after_lower = c.is_ascii_lowercase();
+    }
+    words
+}
+
+/// Whether a word of a field's name is a place, or one or more of them, as `urls` is.
+/// A name needn't show where its words part, as `baseurl` and `APIHost` don't, so one
+/// run on to another word counts too. That word has to be more than a letter, or
+/// `ghost` and `curl` would count. The letters of a place in the middle of a word,
+/// as in `security`, are nothing. What's wrongly taken for a place only leaves that
+/// sign-in in its own VM, and the owner told.
+fn word_names_a_place(word: &str) -> bool {
+    let word = word.strip_suffix('s').unwrap_or(word);
+    PLACE_WORDS.iter().any(|place| {
+        word == *place
+            || word.strip_prefix(place).is_some_and(|rest| rest.len() > 1)
+            || word.strip_suffix(place).is_some_and(|rest| rest.len() > 1)
+    })
+}
+
+/// Whether `host` is the enterprise's, as a GitHub Enterprise login's proxy is, by a
+/// plain name.
 fn enterprise_host(host: &str, enterprise: Option<&str>) -> bool {
     enterprise
         .filter(|domain| !domain.is_empty())
         .is_some_and(|domain| {
             host.strip_suffix(domain)
                 .and_then(|name| name.strip_suffix('.'))
-                .is_some_and(|name| {
-                    !name.is_empty()
-                        && name.chars().all(|c| {
-                            c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '-'
-                        })
-                })
+                .is_some_and(plain_host_name)
         })
 }
 

@@ -944,8 +944,51 @@ fn a_refresh_of_an_enterprises_login_stays_with_that_enterprise() {
         "corp.ghe.com.evil.example",
         "evilcorp.ghe.com",
         "corp.ghe.com",
+        // Under the owner's domain, but no host's name: what's encoded, or broken.
+        "xn--pple-43d.corp.ghe.com",
+        "a.xn--pple-43d.corp.ghe.com",
+        "ab--cd.corp.ghe.com",
+        "x..corp.ghe.com",
+        "..corp.ghe.com",
+        ".corp.ghe.com",
+        "-.corp.ghe.com",
+        "-x.corp.ghe.com",
+        "x-.corp.ghe.com",
+        "a.-.corp.ghe.com",
+        "UPPER.corp.ghe.com",
     ] {
         write(&a, &login(host, "corp.ghe.com", NOW + 3));
+        let report = w.done(&a);
+        assert!(
+            report.refused.contains_key("github-copilot"),
+            "{host}: {report:?}"
+        );
+    }
+    let long = "a".repeat(64);
+    write(
+        &a,
+        &login(&format!("{long}.corp.ghe.com"), "corp.ghe.com", NOW + 3),
+    );
+    assert!(w.done(&a).refused.contains_key("github-copilot"));
+    // What a name can be still goes through, up to DNS's limit for a label.
+    for (n, host) in [
+        "a1.b-2.corp.ghe.com".to_owned(),
+        "x.corp.ghe.com".to_owned(),
+        format!("{}.corp.ghe.com", "a".repeat(63)),
+    ]
+    .iter()
+    .enumerate()
+    {
+        write(&a, &login(host, "corp.ghe.com", NOW + 4 + n as u64));
+        assert_eq!(w.done(&a).taken, ["github-copilot"], "{host}");
+    }
+    // Copilot's own domain is held to the same.
+    for host in [
+        "xn--pple-43d.githubcopilot.com",
+        "x..githubcopilot.com",
+        "-.githubcopilot.com",
+    ] {
+        write(&a, &login(host, "corp.ghe.com", NOW + 9));
         let report = w.done(&a);
         assert!(
             report.refused.contains_key("github-copilot"),
@@ -1005,6 +1048,37 @@ fn an_agent_cant_name_an_enterprise_of_its_own() {
         "apiHost",
         "gatewayId",
         "endpoint",
+        // However its words are set apart, or if they aren't.
+        "baseURL",
+        "BASE_URL",
+        "base_url",
+        "base-url",
+        "base.url",
+        "baseURLs",
+        "APIHost",
+        "HTTPHost",
+        "ENTERPRISE",
+        "baseurl",
+        "APIHOST",
+        "hostname",
+        "subdomain",
+        "url2",
+        "endpoints",
+        "redirectUris",
+        "endPoint",
+        "EndPoint",
+        "gateWay",
+        "gate_way",
+        "enterPrise",
+        "uRL",
+        "hoST",
+        "myEndPointId",
+        // Places by other names, which Pi 1.5 doesn't read.
+        "tenant",
+        "tenantId",
+        "server",
+        "serverName",
+        "proxy",
     ] {
         let w = world();
         let a = w.copy("a");
@@ -1028,6 +1102,35 @@ fn an_agent_cant_name_an_enterprise_of_its_own() {
         ),
     );
     assert_eq!(w.done(&a).first, ["openai-codex"]);
+}
+
+/// A field isn't about a place for having the letters of one inside a word of its
+/// own: `uri` in `security`, `host` in `ghost`.
+#[test]
+fn a_field_that_only_has_the_letters_of_a_place_goes_through() {
+    for field in [
+        "securityLevel",
+        "security_level",
+        "SECURITY_LEVEL",
+        "security",
+        "ghostId",
+        "ghost_id",
+        "ghost",
+        "obscurityMode",
+        "curlVersion",
+    ] {
+        let w = world();
+        let a = w.copy("a");
+        write(
+            &a,
+            &format!(
+                r#"{{"p":{{"type":"oauth","refresh":"r","access":"a","expires":{},"{field}":"high"}}}}"#,
+                NOW + 1
+            ),
+        );
+        let report = w.done(&a);
+        assert_eq!(report.first, ["p"], "{field}: {report:?}");
+    }
 }
 
 /// B1: the enterprise a refresh is held to has to be the owner's, and a domain.

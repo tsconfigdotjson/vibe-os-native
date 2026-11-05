@@ -1050,21 +1050,77 @@ async fn a_send_pi_takes_itself_is_no_failed_turn() {
     w.sign_in();
     let r = w.start("sayerror").await.agent;
     w.wait_for(&r, Activity::Done).await;
+    for text in ["/model", "!ls"] {
+        w.core
+            .send_input(
+                None,
+                &r,
+                vibe_mcp::Input::Text {
+                    text: text.into(),
+                    submit: true,
+                    force: false,
+                },
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        let (_, activity, _) = w.state(&r).await;
+        assert_eq!(activity, Activity::Done, "{text}");
+    }
+    w.delete(&r).await;
+}
+
+/// Nit: what starts with a `/` needn't be Pi's. A path goes to the model, and if the
+/// turn fails before it starts, the screen says why, as for any other.
+#[tokio::test]
+async fn a_prompt_starting_with_a_slash_that_fails_shows_its_error() {
+    let w = world().await;
+    w.sign_in();
+    let r = w.start("hello").await.agent;
+    w.wait_for(&r, Activity::Done).await;
     w.core
         .send_input(
             None,
             &r,
             vibe_mcp::Input::Text {
-                text: "/model".into(),
+                text: "/tmp/notes.txt nologin".into(),
                 submit: true,
                 force: false,
             },
         )
         .await
         .unwrap();
-    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-    let (_, activity, _) = w.state(&r).await;
-    assert_eq!(activity, Activity::Done);
+    w.wait_screen(&r, "No API key found for mock").await;
+    w.wait_for(&r, Activity::Errored).await;
+    let list = w.core.agents(HostParams { host: None }).await.unwrap();
+    let error = list.agents.iter().find(|a| a.agent == r).unwrap();
+    assert!(
+        error
+            .status
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("No API key found for mock")),
+        "{:?}",
+        error.status
+    );
+    let check = w.core.check_agent(None, &r, false).await.unwrap();
+    assert!(check.answered, "it's answered all it will");
+    // And one that works is answered as any other is.
+    w.core
+        .send_input(
+            None,
+            &r,
+            vibe_mcp::Input::Text {
+                text: "/tmp/notes.txt is empty".into(),
+                submit: true,
+                force: false,
+            },
+        )
+        .await
+        .unwrap();
+    w.wait_screen(&r, "Working on: /tmp/notes.txt is empty")
+        .await;
+    w.wait_for(&r, Activity::Done).await;
     w.delete(&r).await;
 }
 

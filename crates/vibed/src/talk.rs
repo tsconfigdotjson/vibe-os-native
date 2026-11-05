@@ -433,10 +433,11 @@ impl Core {
             Ok(r) => {
                 lock(&self.sends).insert(agent_ref.to_owned(), mark);
                 // Pi takes `/model` or `!ls` itself, and writes nothing for them: no
-                // answer is owed, and nothing on its screen is about them.
+                // answer is owed, and nothing on its screen is about them. Any other
+                // prompt is owed one, whatever it starts with.
                 let answer_owed = r.agent == vibe_core::model::AgentKind::Pi
                     && matches!(&input, Input::Text { submit: true, text, .. }
-                        if !text.trim_start().starts_with(['/', '!']));
+                        if !pi_takes_itself(text));
                 if answer_owed {
                     lock(&self.pi_sent_at)
                         .insert(agent_ref.to_owned(), crate::status::wall_clock());
@@ -733,6 +734,70 @@ async fn wait_ready(socket: &Path, within: Duration) {
     }
 }
 
+/// Pi 1.5's own commands that are only ever the whole of what's submitted
+/// (`interactive-mode.ts`). With anything after them, they go to the model.
+const PI_COMMANDS: &[&str] = &[
+    "/settings",
+    "/scoped-models",
+    "/share",
+    "/copy",
+    "/session",
+    "/changelog",
+    "/hotkeys",
+    "/fork",
+    "/clone",
+    "/tree",
+    "/trust",
+    "/logout",
+    "/new",
+    "/reload",
+    "/debug",
+    "/arminsayshi",
+    "/dementedelves",
+    "/resume",
+    "/quit",
+];
+
+/// Those that may have words after them, past a space.
+const PI_COMMANDS_WITH_WORDS: &[&str] = &[
+    "/model",
+    "/thinking",
+    "/export",
+    "/import",
+    "/bug",
+    "/name",
+    "/login",
+    "/compact",
+];
+
+/// Whether Pi deals with `text` itself when it's submitted, as its editor sorts it
+/// (`interactive-mode.ts`), so no turn comes of it: nothing at all, one of its
+/// commands, or a `!` with a command to run. Everything else goes on as a prompt,
+/// a path or a `/skill:` as much as a question, and can fail as any prompt can.
+///
+/// Only Pi knows an extension's commands, so one reads as a prompt here. If it writes
+/// and draws nothing, under what reads just like one of Pi's errors, that reads as
+/// the turn having failed, until the next send.
+///
+/// A paste gets to Pi's editor with its tabs as four spaces and its other control
+/// characters gone (`editor.ts`), so that's what's looked at.
+fn pi_takes_itself(text: &str) -> bool {
+    let text: String = text
+        .replace('\t', "    ")
+        .chars()
+        .filter(|c| *c >= ' ' || matches!(c, '\n' | '\r'))
+        .collect();
+    let text = text.trim();
+    let command = text.strip_prefix("!!").or_else(|| text.strip_prefix('!'));
+    text.is_empty()
+        || PI_COMMANDS.contains(&text)
+        || PI_COMMANDS_WITH_WORDS.iter().any(|name| {
+            text.strip_prefix(name)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
+        })
+        || command.is_some_and(|command| !command.trim().is_empty())
+}
+
 /// Sees a Pi that's just started take what was sent. It can look ready, with its
 /// editor up, while its startup goes on, which can take a while if it's fetching
 /// its tools: until then it hands back whatever's submitted. So while the text's
@@ -939,6 +1004,55 @@ mod tests {
             assert_eq!(params.host.as_deref(), Some("vps"));
             assert_eq!(params.request_id.as_deref(), Some("id-1"));
             assert_eq!(input_of(&params).unwrap(), input);
+        }
+    }
+
+    /// As Pi 1.5's editor sorts what's submitted (`interactive-mode.ts`).
+    #[test]
+    fn what_pi_takes_itself_owes_no_answer() {
+        for text in [
+            "",
+            "  \n",
+            "/model",
+            "  /model\n",
+            "/model openai/gpt-5",
+            "/compact keep the plan",
+            "/login",
+            "/name a name",
+            "/model\twhat's this?",
+            "/model\x07",
+            "/new",
+            "/quit",
+            "/settings",
+            "/session",
+            "!ls",
+            "! ls",
+            " !ls",
+            "!!ls",
+            "!! ls",
+            "!!!",
+        ] {
+            assert!(pi_takes_itself(text), "{text:?}");
+        }
+        for text in [
+            // A path, a skill or template, or nothing Pi knows: all go to the model.
+            "/tmp/notes.txt is empty, why?",
+            "/skill:review the diff",
+            "/fix the tests",
+            "/models",
+            // Only some of Pi's commands take words, and only after a space.
+            "/quit now",
+            "/new branch please",
+            "/session what's this?",
+            "/model\nwhat's this?",
+            // With no command to run, Pi sends these on too.
+            "!",
+            "!!",
+            " ! ",
+            "hello",
+            "what does /model do?",
+        ] {
+            assert!(!pi_takes_itself(text), "{text:?}");
         }
     }
 
