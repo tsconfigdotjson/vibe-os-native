@@ -3,16 +3,20 @@
 # vX.Y.Z, where X.Y.Z is the Cargo workspace's version (and Info.plist's),
 # and this:
 #
-#   1. publishes the Linux base image this version boots, base-<n>, as a
+#   1. holds Cargo.lock to RustSec as it stands today (scripts/advisories.sh),
+#      as an advisory can come out after the merge CI checked: with one open,
+#      nothing below happens. Fix it or except it in deny.toml on main, then tag
+#      that: this checks the tag's commit, so a rerun of this tag fails the same
+#   2. publishes the Linux base image this version boots, base-<n>, as a
 #      release of its own, if it isn't one already: vibed downloads it from
 #      there at first launch. A base release is never changed once out
 #      (PRD: never change a disk image in place), so a later version that
 #      boots the same one leaves it be
-#   2. builds VibeOS.app for Apple Silicon with scripts/release-macos.sh:
+#   3. builds VibeOS.app for Apple Silicon with scripts/release-macos.sh:
 #      signed with the owner's Developer ID under the hardened runtime,
 #      vibe-vm with com.apple.security.virtualization; notarized and stapled;
 #      in a DMG, notarized and stapled too; with Sparkle, and its appcast
-#   3. publishes the DMG and appcast.xml as release vX.Y.Z, the latest one,
+#   4. publishes the DMG and appcast.xml as release vX.Y.Z, the latest one,
 #      where the app's Sparkle looks for updates
 #
 # It reads these repository Actions secrets, and never prints them:
@@ -61,9 +65,29 @@ jobs:
             exit 1
           fi
 
+  advisories:
+    name: RustSec advisories
+    needs: on-main
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the Rust toolchain
+        run: |
+          if ! command -v rustup >/dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          rustup toolchain install
+
+      - name: scripts/advisories.sh
+        run: scripts/advisories.sh
+
   base-image:
     name: Linux base image
-    needs: on-main
+    needs: advisories
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 120
     permissions:

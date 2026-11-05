@@ -1,6 +1,7 @@
 # CI runs the same script developers run: scripts/check-full.sh. On Linux it
-# covers the Rust workspace, the vibe-guest cross-build and the vibed smoke
-# test; on macOS 26 it adds both Swift packages, the Swift contract tests,
+# covers the Rust workspace, Cargo.lock against RustSec, the vibe-guest
+# cross-build and the vibed smoke test; on macOS 26 it adds both Swift
+# packages, the Swift contract tests,
 # ad hoc signing and the vibe-vm and VibeOS.app smoke tests. The runner is
 # itself a VM, so the step that boots real VMs (vm-cycle) is N/A there; it
 # needs a Mac on real hardware.
@@ -64,6 +65,7 @@ jobs:
             target
             swift/VibeOS/.build
             swift/vibe-vm/.build
+            ~/.cache/vibeos/tools/cargo-deny-*
           key: ${{ matrix.name }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'swift/*/Package.swift') }}
           restore-keys: ${{ matrix.name }}-
 

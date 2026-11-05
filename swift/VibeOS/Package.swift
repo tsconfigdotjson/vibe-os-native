@@ -16,7 +16,7 @@ var packages: [Package.Dependency] = []
 var appDependencies: [Target.Dependency] = ["VibeRPC", "VibeMenu"]
 var appLinking: [LinkerSetting] = []
 if sparkle {
-    packages.append(.package(url: "https://github.com/sparkle-project/Sparkle", exact: "2.10.0"))
+    packages.append(.package(url: "https://github.com/sparkle-project/Sparkle", exact: "2.10.1"))
     appDependencies.append(.product(name: "Sparkle", package: "Sparkle"))
     appLinking.append(.unsafeFlags(["-Xlinker", "-rpath", "-Xlinker", "@executable_path/../Frameworks"]))
 }
