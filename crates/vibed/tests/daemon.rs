@@ -4,7 +4,9 @@
 
 mod common;
 
+use std::fs::{DirBuilder, File, Permissions};
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -244,8 +246,89 @@ fn the_services_socket_lasts_as_long_as_vibed() {
     assert_eq!(left, Vec::<String>::new());
 }
 
+/// A lock that's busy as `vibed` starts, as one kept a moment by the `vibed`
+/// before it can be, only holds up the shared services' socket until it's free.
+#[test]
+fn the_services_socket_comes_up_once_its_lock_is_free() {
+    let tmp = common::short_tempdir();
+    let socket = socket_in(&tmp);
+    let run = Layout::new(tmp.path().join("home"), std::env::consts::OS).run_dir();
+    DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&run)
+        .unwrap();
+    let services = run.join(".services.sock");
+    let lock = File::create(vibe_core::socket::lock_path(&services)).unwrap();
+    lock.try_lock().unwrap();
+    let d = spawn(&mut vibed(&tmp, &socket), &socket);
+    // Its answer comes after its first try: the socket connects sooner than that.
+    assert_eq!(hello(&socket)["result"]["daemon"], "vibed");
+    // A few tries' worth, which it says once.
+    std::thread::sleep(Duration::from_millis(2500));
+    assert!(
+        !services.exists(),
+        "it served {services:?} with the lock held"
+    );
+    drop(lock);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while UnixStream::connect(&services).is_err() {
+        assert!(Instant::now() < deadline, "it never served {services:?}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let stderr = stop(d);
+    assert_eq!(
+        stderr
+            .matches("can't serve shared services' socket")
+            .count(),
+        1,
+        "{stderr}"
+    );
+    assert!(stderr.contains("socket is up after all"), "{stderr}");
+    assert!(!services.exists(), "{services:?} outlived vibed");
+}
+
+/// What's wrong with a socket's path is what's reported, not another process
+/// that isn't there.
+#[test]
+fn a_bad_socket_path_is_called_that() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Under a file. It's readable by others, which isn't what's wrong with it.
+    let file = tmp.path().join("file");
+    std::fs::write(&file, "").unwrap();
+    std::fs::set_permissions(&file, Permissions::from_mode(0o644)).unwrap();
+    let out = refused_in_time(&mut vibed(&tmp, &file.join("vibed.sock")));
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(&format!("can't use {}", file.display())),
+        "{stderr}"
+    );
+    assert!(stderr.contains("Not a directory"), "{stderr}");
+    assert!(!stderr.contains("already serving"), "{stderr}");
+
+    // Its lock can't be opened: a directory is where it should be.
+    let socket = socket_in(&tmp);
+    let lock = vibe_core::socket::lock_path(&socket);
+    DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&lock)
+        .unwrap();
+    let out = refused_in_time(&mut vibed(&tmp, &socket));
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(&format!("can't open {}", lock.display())),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("already serving"), "{stderr}");
+}
+
 /// As soon as its socket answers, a `vibed` holds the state: two started at once
-/// can't each find the other's socket and go on to serve.
+/// can't each find the other's socket and go on to serve. And the one refused
+/// bound nothing: not even for a moment, which a socket's absence afterwards
+/// wouldn't show, as its guard removes it. Only its directory would be left.
 #[test]
 fn two_daemons_started_together_leave_one() {
     for _ in 0..3 {
@@ -254,34 +337,34 @@ fn two_daemons_started_together_leave_one() {
             tmp.path().join("one/vibed.sock"),
             tmp.path().join("two/vibed.sock"),
         );
-        let mut a = vibed(&tmp, &one).stderr(Stdio::piped()).spawn().unwrap();
-        let mut b = vibed(&tmp, &two).stderr(Stdio::piped()).spawn().unwrap();
+        let start = |socket: &Path| Daemon {
+            child: vibed(&tmp, socket).stderr(Stdio::piped()).spawn().unwrap(),
+        };
+        let (mut a, mut b) = (start(&one), start(&two));
         // The refused one exits, once the lock has had its moment.
         let deadline = Instant::now() + Duration::from_secs(30);
-        let (winner, mut alive, socket) = loop {
-            if a.try_wait().unwrap().is_some() {
-                break (&two, b, &one);
+        let (_winner, serving, mut loser, refused) = loop {
+            if a.child.try_wait().unwrap().is_some() {
+                break (b, &two, a, &one);
             }
-            if b.try_wait().unwrap().is_some() {
-                break (&one, a, &two);
+            if b.child.try_wait().unwrap().is_some() {
+                break (a, &one, b, &two);
             }
-            if Instant::now() >= deadline {
-                let _ = a.kill();
-                let _ = b.kill();
-                let _ = a.wait();
-                let _ = b.wait();
-                panic!("both are still serving");
-            }
+            assert!(Instant::now() < deadline, "both are still serving");
             std::thread::sleep(Duration::from_millis(20));
         };
-        assert_eq!(hello_when_up(winner)["result"]["daemon"], "vibed");
+        let status = loser.child.wait().unwrap();
+        let mut stderr = String::new();
+        std::io::Read::read_to_string(&mut loser.child.stderr.take().unwrap(), &mut stderr)
+            .unwrap();
+        assert_eq!(status.code(), Some(1), "{stderr}");
         assert!(
-            !socket.exists(),
-            "the refused one left {}",
-            socket.display()
+            stderr.contains("another vibed is already using"),
+            "{stderr}"
         );
-        let _ = alive.kill();
-        let _ = alive.wait();
+        assert_eq!(hello_when_up(serving)["result"]["daemon"], "vibed");
+        let dir = refused.parent().unwrap();
+        assert!(!dir.exists(), "the refused one made {}", dir.display());
     }
 }
 

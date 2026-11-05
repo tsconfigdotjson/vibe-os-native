@@ -20,11 +20,12 @@
 use std::collections::HashMap;
 use std::io;
 use std::os::unix::net::UnixStream as StdUnixStream;
+use std::path::Path;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use serde_json::{Map, json};
-use tokio::net::UnixStream;
+use tokio::net::{UnixListener, UnixStream};
 use tokio::task::JoinHandle;
 use vibe_core::model::{AgentKind, AgentState, LOCAL_HOST, ServiceRole, ServiceState};
 use vibe_core::rpc::{
@@ -33,6 +34,7 @@ use vibe_core::rpc::{
     ServiceOverview, ServiceOverviewList, ServiceParams, ServiceSetParams, ServiceTokenParams,
     ServicesComplete, ServicesDisconnect, ServicesFollow, ServicesList, ServicesToken,
 };
+use vibe_core::socket::SocketGuard;
 use vibe_core::store::{AgentRecord, StoreError};
 use vibe_env::Backend;
 use vibe_relay::local;
@@ -50,6 +52,9 @@ const FOLLOW_EVERY: Duration = Duration::from_secs(30);
 /// How long a host gets to answer anything about a service, so one that's stuck
 /// can't hold up the others' tokens or the app.
 const HOST_ANSWER: Duration = Duration::from_secs(3);
+
+/// How soon the local socket is tried again, when it couldn't be bound.
+const BIND_AGAIN: Duration = Duration::from_secs(1);
 
 /// How often an owner looks for logins past half their life.
 const REFRESH_LOOK: Duration = Duration::from_secs(60);
@@ -665,20 +670,16 @@ impl Core {
         if self.services.is_none() {
             return tasks;
         }
-        match crate::server::bind(&self.services_socket()) {
-            Err(e) => crate::log!("vibed: can't serve shared services' socket: {e}"),
-            Ok((listener, guard)) => match tokio::net::UnixListener::from_std(listener) {
-                Err(e) => crate::log!("vibed: can't serve shared services' socket: {e}"),
-                Ok(listener) => {
-                    let core = Arc::downgrade(self);
-                    tasks.push(tokio::spawn(async move {
-                        // Held for as long as it's served.
-                        let _guard = guard;
-                        serve_socket(core, listener).await;
-                    }));
-                }
-            },
-        }
+        // The first try is here, so it's there for whatever comes next.
+        let socket = self.services_socket();
+        let first = bind_local(&socket);
+        let core = Arc::downgrade(self);
+        tasks.push(tokio::spawn(async move {
+            // The guard is held for as long as it's served.
+            if let Some((listener, _guard)) = local_socket(&core, &socket, first).await {
+                serve_socket(core, listener).await;
+            }
+        }));
         let core = Arc::downgrade(self);
         tasks.push(tokio::spawn(async move { keep_relays(core).await }));
         // In the background, as a locked Keychain can take a while to say so.
@@ -697,6 +698,48 @@ impl Core {
             keep_followers(core, wake).await;
         }));
         tasks
+    }
+}
+
+type LocalSocket = (UnixListener, SocketGuard);
+
+fn bind_local(socket: &Path) -> Result<LocalSocket, String> {
+    let (listener, guard) = crate::server::bind(socket).map_err(|e| e.to_string())?;
+    let listener = UnixListener::from_std(listener).map_err(|e| e.to_string())?;
+    Ok((listener, guard))
+}
+
+/// The local socket, as soon as it can be had, given how the first try went. No
+/// agent here reaches its services without it, so one failure isn't the end of
+/// them until `vibed` next restarts: the `vibed` before this one, or a child of
+/// its not yet started, can hold the lock a moment longer than the state's. Each
+/// new reason is logged once. `None` once there's no more `vibed` to serve.
+async fn local_socket(
+    core: &Weak<Core>,
+    socket: &Path,
+    first: Result<LocalSocket, String>,
+) -> Option<LocalSocket> {
+    let mut attempt = first;
+    let mut said = None;
+    loop {
+        match attempt {
+            Ok(bound) => {
+                if said.is_some() {
+                    crate::log!("vibed: shared services' socket is up after all");
+                }
+                return Some(bound);
+            }
+            Err(e) if said.as_ref() != Some(&e) => {
+                crate::log!("vibed: can't serve shared services' socket yet: {e}");
+                said = Some(e);
+            }
+            Err(_) => {}
+        }
+        tokio::time::sleep(BIND_AGAIN).await;
+        if core.strong_count() == 0 {
+            return None;
+        }
+        attempt = bind_local(socket);
     }
 }
 
@@ -810,7 +853,7 @@ pub fn injection(kind: AgentKind, servers: Option<&str>, auto_allowed: &[String]
 }
 
 /// Accepts shims until the core goes.
-async fn serve_socket(core: Weak<Core>, listener: tokio::net::UnixListener) {
+async fn serve_socket(core: Weak<Core>, listener: UnixListener) {
     loop {
         let Ok((conn, _)) = listener.accept().await else {
             tokio::time::sleep(Duration::from_millis(100)).await;

@@ -225,7 +225,8 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
     let mut term = signal(SignalKind::terminate())?;
     let mut int = signal(SignalKind::interrupt())?;
     // Another vibed on this socket is the likelier story, and takes no waiting.
-    if vibe_core::socket::lock_held(&path) {
+    // A lock that can't be looked at isn't one: `bind` says what's wrong.
+    if let Ok(true) = vibe_core::socket::lock_state(&path) {
         return Err(server::BindError::AlreadyRunning { path }.into());
     }
     // The state first: a vibed refused for another's state must bind nothing, as

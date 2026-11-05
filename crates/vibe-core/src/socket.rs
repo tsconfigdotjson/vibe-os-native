@@ -79,20 +79,25 @@ pub fn lock_path(socket: &Path) -> PathBuf {
 }
 
 /// Whether a process holds the lock beside `socket`, as whatever's serving it
-/// does. If that can't be told, it's taken as held, so nothing is removed or
-/// replaced on a guess.
-pub fn lock_held(socket: &Path) -> bool {
+/// does, or why that can't be told.
+pub fn lock_state(socket: &Path) -> io::Result<bool> {
     let lock = match OpenOptions::new().write(true).open(lock_path(socket)) {
         Ok(f) => f,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return false,
-        Err(_) => return true,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
     };
     match lock.try_lock() {
         // Released as `lock` drops.
-        Ok(()) => false,
-        Err(TryLockError::WouldBlock) => true,
-        Err(TryLockError::Error(_)) => true,
+        Ok(()) => Ok(false),
+        Err(TryLockError::WouldBlock) => Ok(true),
+        Err(TryLockError::Error(e)) => Err(e),
     }
+}
+
+/// [`lock_state`], for deciding what to do to a socket: if it can't be told, the
+/// lock is taken as held, so nothing is removed or replaced on a guess.
+pub fn lock_held(socket: &Path) -> bool {
+    lock_state(socket).unwrap_or(true)
 }
 
 /// Binds the socket at `path`, readable and writable only by this user.
@@ -111,6 +116,13 @@ pub fn bind(path: &Path) -> Result<(std::os::unix::net::UnixListener, SocketGuar
         _ => Path::new("."),
     };
     match fs::metadata(dir) {
+        // Not one to judge by its owner and mode, which would have the owner
+        // `chmod` a file for nothing.
+        Ok(meta) if !meta.is_dir() => {
+            return Err(io_err("use", dir)(io::Error::from_raw_os_error(
+                libc::ENOTDIR,
+            )));
+        }
         Ok(meta) => {
             // SAFETY: geteuid has no preconditions and can't fail.
             let me = unsafe { libc::geteuid() };
