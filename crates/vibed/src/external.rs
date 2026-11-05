@@ -911,6 +911,16 @@ impl Core {
     }
 
     pub(crate) fn describe_public(&self, info: &mut HostInfo) {
+        if let Ok(Some((at, by))) = self.store().host_external_changed(LOCAL_HOST) {
+            info.external_changed_at = Some(at);
+            if !info.external {
+                let by = by.map_or(String::new(), |by| format!(" by {by}"));
+                info.external_note = Some(format!(
+                    "turned off{by} at {}; turn it on again to serve it",
+                    vibe_core::time::rfc3339(at)
+                ));
+            }
+        }
         if !info.external {
             return;
         }
@@ -1060,7 +1070,10 @@ impl Core {
             None
         };
         if host == LOCAL_HOST {
-            return self.set_external_here(domain);
+            return self.set_external_here(
+                domain,
+                p.by.as_deref().unwrap_or("something that didn't say who"),
+            );
         }
         let link = self.linux_host(host)?;
         // The host serves it, so it's told first while it can be: a refusal
@@ -1074,12 +1087,17 @@ impl Core {
                         host: None,
                         on: p.on,
                         domain: domain.clone(),
+                        by: Some(self.who_asks()),
                     },
                 )
                 .await?;
             // What it says of itself now, without waiting for the next ping.
             link.note_report(theirs);
+            *lock(&link.external_told) = Some(Instant::now());
+            *lock(&link.external_refused) = None;
         }
+        // Waits for the link if it couldn't be told, as a request, not a standing order.
+        let waiting = (!link.connected()).then(|| self.now());
         let others: Vec<String> = if domain.is_some() {
             self.store()
                 .hosts()
@@ -1094,6 +1112,19 @@ impl Core {
         self.store()
             .set_host_external(host, domain.as_deref())
             .map_err(store_error)?;
+        self.store()
+            .set_host_external_asked(host, waiting)
+            .map_err(store_error)?;
+        // Chosen afresh: nothing is to go back to what was chosen before.
+        self.store()
+            .clear_host_external_chosen()
+            .map_err(store_error)?;
+        // Stopped by name, it's not taken to be serving, even if it's gone and can't say.
+        if domain.is_none() {
+            self.store()
+                .set_host_external_seen(host, None)
+                .map_err(store_error)?;
+        }
         match &domain {
             Some(d) => crate::log!("vibed: {host} is the external address, at https://{d}/mcp"),
             None => crate::log!("vibed: {host} is no longer the external address"),
@@ -1101,7 +1132,14 @@ impl Core {
         // There's one external address: the one before it stops serving.
         for other in others {
             if let Some(l) = self.link(&other) {
-                self.tell_external(&l, None);
+                if l.connected() {
+                    self.tell_external(&l, None);
+                } else {
+                    // A request, like any made with its link down.
+                    self.store()
+                        .set_host_external_asked(&other, Some(self.now()))
+                        .map_err(store_error)?;
+                }
                 self.host_link_changed(&l);
             }
         }
@@ -1110,18 +1148,37 @@ impl Core {
         self.host_info(host)
     }
 
-    fn set_external_here(&self, domain: Option<String>) -> Result<HostInfo, ErrorObject> {
+    /// Who to say asked, when this Mac asks a host for something.
+    fn who_asks(&self) -> String {
+        format!("the Mac {}", self.label())
+    }
+
+    fn set_external_here(&self, domain: Option<String>, by: &str) -> Result<HostInfo, ErrorObject> {
         if !self.external.serve_here {
             return Err(invalid(
                 "this Mac never listens publicly: make a Linux host with a public address the external address",
             ));
         }
+        let was = self
+            .store()
+            .host_external(LOCAL_HOST)
+            .map_err(store_error)?;
         self.store()
             .set_host_external(LOCAL_HOST, domain.as_deref())
             .map_err(store_error)?;
+        // Only a change is one: asking again mustn't make a Mac's request look stale.
+        if was != domain {
+            self.store()
+                .set_host_external_changed(LOCAL_HOST, self.now(), Some(by))
+                .map_err(store_error)?;
+        }
         match &domain {
-            Some(d) => crate::log!("vibed: this host is the external address, at https://{d}/mcp"),
-            None => crate::log!("vibed: this host is no longer the external address"),
+            Some(d) => crate::log!(
+                "vibed: this host is the external address, at https://{d}/mcp, as {by} asked"
+            ),
+            None => {
+                crate::log!("vibed: this host is no longer the external address, as {by} asked")
+            }
         }
         self.sync_public();
         let mut e = self.event(EventKind::HostLink);
@@ -1142,35 +1199,126 @@ impl Core {
                 host: None,
                 on: domain.is_some(),
                 domain,
+                by: Some(core.who_asks()),
             };
-            if let Err(e) = core.forward_typed::<HostsExternal>(&link, &params).await {
-                crate::log!(
-                    "vibed: can't tell {} whether it's the external address: {}",
-                    link.name,
-                    e.message
-                );
+            *lock(&link.external_told) = Some(Instant::now());
+            match core.forward_typed::<HostsExternal>(&link, &params).await {
+                Ok(theirs) => {
+                    link.note_report(theirs);
+                    *lock(&link.external_refused) = None;
+                    if let Err(e) = core.store().set_host_external_asked(&link.name, None) {
+                        crate::log!("vibed: can't note {} took it: {e}", link.name);
+                    }
+                    core.host_link_changed(&link);
+                }
+                Err(e) => {
+                    crate::log!(
+                        "vibed: can't tell {} whether it's the external address: {}",
+                        link.name,
+                        e.message
+                    );
+                    *lock(&link.external_refused) = Some(e.message);
+                    // Still to be delivered, as it would be with the link down.
+                    if matches!(core.store().host_external_asked(&link.name), Ok(None)) {
+                        let now = core.now();
+                        let _ = core.store().set_host_external_asked(&link.name, Some(now));
+                    }
+                    core.host_link_changed(&link);
+                }
             }
         });
     }
 
-    /// Once `link` is up: if its host doesn't serve the external address as
-    /// this Mac has it, it's told to. This Mac's choice wins.
+    /// Once `link` is up, and when its host says something new of itself. The
+    /// external address is the host's: what it says wins, and nothing here turns it
+    /// off, so a stale Mac, or a new one that's never heard of it, can't knock over
+    /// what's serving. The exception is what someone chose here while the link was
+    /// down, which goes to it now, unless it has changed there since.
     pub(crate) fn reconcile_external(&self, link: &Arc<crate::link::Link>) {
-        let want = self.store().host_external(&link.name).ok().flatten();
+        let name = &link.name;
+        // Nothing to go by, which isn't the same as hearing it's off.
+        let Some(report) = link.reported() else {
+            return;
+        };
+        let want = self.store().host_external(name).ok().flatten();
         let theirs = link.reported_domain();
-        if want != theirs {
-            crate::log!(
-                "vibed: {} {}; telling it",
-                link.name,
-                match &want {
-                    Some(d) => format!("isn't serving https://{d}/mcp yet"),
-                    None => "still serves an external address this Mac turned off".into(),
-                }
-            );
-            self.tell_external(link, want);
+        // Kept, as its link going down shouldn't lose what it might be serving.
+        if self.store().host_external_seen(name).ok().flatten() != theirs {
+            let _ = self.store().set_host_external_seen(name, theirs.as_deref());
         }
+        let told_lately = {
+            let wait = if lock(&link.external_refused).is_some() {
+                RETRY_REFUSED
+            } else {
+                JUST_TOLD
+            };
+            lock(&link.external_told).is_some_and(|at| at.elapsed() < wait)
+        };
+        let asked = self.store().host_external_asked(name).ok().flatten();
+        if let Some(asked) = asked {
+            if report.external_changed_at.is_none_or(|at| at <= asked) {
+                if want == theirs {
+                    let _ = self.store().set_host_external_asked(name, None);
+                } else if !told_lately {
+                    crate::log!(
+                        "vibed: {name} has a choice made here while it was away; telling it"
+                    );
+                    self.tell_external(link, want);
+                }
+                return;
+            }
+            crate::log!("vibed: {name}'s external address changed there since a choice made here");
+            let _ = self.store().set_host_external_asked(name, None);
+        }
+        // What a ping sent before that says isn't news.
+        if want == theirs || told_lately {
+            return;
+        }
+        if want.is_none() {
+            // Serving what this Mac chose before it stopped: this Mac's choice stands.
+            let chosen = self.store().host_external_chosen(name).ok().flatten();
+            if let (Some(d), true) = (&theirs, theirs == chosen) {
+                crate::log!("vibed: {name} serves https://{d}/mcp again, so it's used again");
+                // In two statements, as each holds the store till its end.
+                let set = self.store().set_host_external(name, Some(d));
+                let set = set.and_then(|()| self.store().set_host_external_chosen(name, None));
+                if let Err(e) = set {
+                    crate::log!("vibed: can't note what {name} said of its external address: {e}");
+                    return;
+                }
+                self.sync_tunnel();
+                self.host_link_changed(link);
+            }
+            // Otherwise it's serving something this Mac never chose: it isn't this
+            // Mac's to change, or to run a tunnel for. It may be another Mac's.
+            return;
+        }
+        match &theirs {
+            Some(d) => crate::log!("vibed: {name} serves https://{d}/mcp, so that's what it is"),
+            None => crate::log!("vibed: {name} isn't the external address any more"),
+        }
+        let keep = if theirs.is_none() {
+            want.as_deref()
+        } else {
+            None
+        };
+        let set = self.store().set_host_external(name, theirs.as_deref());
+        let set = set.and_then(|()| self.store().set_host_external_chosen(name, keep));
+        if let Err(e) = set {
+            crate::log!("vibed: can't note what {name} said of its external address: {e}");
+            return;
+        }
+        self.sync_tunnel();
+        self.host_link_changed(link);
     }
 }
+
+/// How long after telling a host about its external address a report that says
+/// otherwise is taken for one from before.
+const JUST_TOLD: Duration = Duration::from_secs(10);
+
+/// How long before asking again a host that refused what it was asked.
+const RETRY_REFUSED: Duration = Duration::from_secs(300);
 
 #[cfg(test)]
 mod tests {

@@ -1714,16 +1714,344 @@ async fn the_tunnel_says_why_it_is_down() {
     w.wait("the tunnel back", |h| h.tunnel == Some(TunnelState::Up))
         .await;
     assert!(*w.wires.tunnels.lock().unwrap() >= 2);
-    // Removing the host turns it off there, and the tunnel goes.
+    // Removing the host is about this Mac: it goes on serving, as it's its own.
     let removed = rpc(&w.mac, "hosts.remove", json!({"host": "vps"})).await;
     assert!(removed.get("result").is_some(), "{removed}");
+    assert!(w.host.hosts().unwrap().hosts[0].external);
+}
+
+/// #100: what the host's own row says of its external address.
+fn own_row(host: &Core) -> vibe_core::rpc::HostInfo {
+    host.hosts().unwrap().hosts.remove(0)
+}
+
+/// #100. A Mac that's never heard of a host's external address, as a test's or a
+/// reinstalled one's, doesn't turn it off when it links: its "off" is only that it
+/// hasn't chosen. Nor does it take it over with a tunnel of its own, as that may be
+/// another Mac's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_mac_leaves_a_hosts_external_address_alone() {
+    let w = world(limits()).await;
+    let on = rpc(
+        &w.host,
+        "hosts.external",
+        json!({"on": true, "domain": "vps.test"}),
+    )
+    .await;
+    assert_eq!(on["result"]["external"], true, "{on}");
+    // Through the link going down and coming up, when a Mac used to say.
+    w.wires.pull();
+    w.wait("the link down", |h| h.link == HostLink::Down).await;
+    w.wires.plug_in();
+    w.wait("what it serves, as a note", |h| {
+        h.link == HostLink::Connected
+            && h.external_note
+                .as_deref()
+                .is_some_and(|n| n.contains("https://vps.test/mcp on its own"))
+    })
+    .await;
+    assert!(own_row(&w.host).external, "it goes on serving");
+    let vps = w.vps();
+    assert!(!vps.external, "{vps:?}");
+    assert_eq!(vps.tunnel, None);
+    assert_eq!(*w.wires.tunnels.lock().unwrap(), 0, "no tunnel of its own");
+}
+
+/// #100. Turned off on the host while this Mac was away: the Mac doesn't turn it on
+/// again, and says who did it. Its old choice was only ever what it last knew.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_turned_off_there_stays_off_and_says_who_did_it() {
+    let w = world(limits()).await;
+    w.turn_on().await;
+    w.wires.pull();
+    w.wait("the link down", |h| h.link == HostLink::Down).await;
+    let off = rpc(
+        &w.host,
+        "hosts.external",
+        json!({"on": false, "by": "this host's `vibe`"}),
+    )
+    .await;
+    assert_eq!(off["result"]["external"], false, "{off}");
+    w.wires.plug_in();
+    w.wait("the Mac to go by the host", |h| {
+        !h.external && h.link == HostLink::Connected && h.external_note.is_some()
+    })
+    .await;
+    let vps = w.vps();
+    let note = vps.external_note.as_deref().unwrap();
+    assert!(note.contains("turned off by this host's `vibe`"), "{note}");
+    assert_eq!(
+        vps.external_last.as_deref(),
+        Some(DOMAIN),
+        "what one click turns on"
+    );
+    assert_eq!(vps.external_serves, None);
+    assert!(!own_row(&w.host).external, "it stays off");
+
+    // On again there, at the name this Mac chose: this Mac's choice stands, and its
+    // tunnel comes back, rather than it dropping out for good.
+    let on = rpc(
+        &w.host,
+        "hosts.external",
+        json!({"on": true, "domain": DOMAIN}),
+    )
+    .await;
+    assert_eq!(on["result"]["external"], true, "{on}");
+    w.wait("the Mac to use it again", |h| {
+        h.external && h.tunnel == Some(TunnelState::Up)
+    })
+    .await;
+    assert_eq!(w.vps().external_last, None);
+}
+
+/// #100. One click on what a host serves on its own uses it, and another stops it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn what_a_host_serves_on_its_own_can_be_used_or_stopped_from_here() {
+    let w = world(limits()).await;
+    let on = rpc(
+        &w.host,
+        "hosts.external",
+        json!({"on": true, "domain": DOMAIN}),
+    )
+    .await;
+    assert_eq!(on["result"]["external"], true, "{on}");
+    w.wait("what it serves", |h| {
+        h.external_serves.as_deref() == Some(DOMAIN)
+    })
+    .await;
+    assert!(!w.vps().external);
+    // Stopped from here, by name, though this Mac isn't using it.
+    let off = rpc(
+        &w.mac,
+        "hosts.external",
+        json!({"host": "vps", "on": false}),
+    )
+    .await;
+    assert_eq!(off["result"]["external"], false, "{off}");
+    assert!(!own_row(&w.host).external);
+    let own = own_row(&w.host);
+    assert!(
+        own.external_note
+            .as_deref()
+            .unwrap()
+            .contains("by the Mac "),
+        "{own:?}"
+    );
+    // Asked again of a host that's already off, it isn't another change.
+    let changed = own.external_changed_at;
+    w.mac_clock_ahead.store(0, Ordering::SeqCst);
+    rpc(&w.host, "hosts.external", json!({"on": false})).await;
+    assert_eq!(own_row(&w.host).external_changed_at, changed);
+    // And used with the name it said.
+    let on = rpc(
+        &w.host,
+        "hosts.external",
+        json!({"on": true, "domain": DOMAIN}),
+    )
+    .await;
+    assert_eq!(on["result"]["external"], true, "{on}");
+    w.wait("what it serves again", |h| {
+        h.external_serves.as_deref() == Some(DOMAIN)
+    })
+    .await;
+    let used = rpc(
+        &w.mac,
+        "hosts.external",
+        json!({"host": "vps", "on": true, "domain": DOMAIN}),
+    )
+    .await;
+    assert_eq!(used["result"]["external"], true, "{used}");
+    w.wait("the tunnel", |h| h.tunnel == Some(TunnelState::Up))
+        .await;
+    assert_eq!(w.vps().external_serves, None);
+}
+
+/// #100. Forgotten with its link down, a host serving publicly would go on taking this
+/// Mac's keys, where no revoke could reach them, so that's refused until the Mac can tell
+/// it, or someone has said here that it's gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_public_host_isnt_forgotten_with_this_macs_keys_on_it() {
+    let w = world(limits()).await;
+    w.turn_on().await;
+    let key = w.key("laptop");
+    w.pushed(&key).await;
+    w.wires.pull();
+    w.wait("the link down", |h| h.link == HostLink::Down).await;
+    let refused = rpc(&w.mac, "hosts.remove", json!({"host": "vps"})).await;
+    let said = refused["error"]["message"].as_str().unwrap();
+    assert!(
+        said.contains("API keys") && said.contains("gone for good"),
+        "{refused}"
+    );
+    // Gone for good, then, as far as anyone here can tell.
+    let off = rpc(
+        &w.mac,
+        "hosts.external",
+        json!({"host": "vps", "on": false}),
+    )
+    .await;
+    assert_eq!(off["result"]["external"], false, "{off}");
+    let removed = rpc(&w.mac, "hosts.remove", json!({"host": "vps"})).await;
+    assert!(removed.get("result").is_some(), "{removed}");
+}
+
+/// #100. Someone's choice made here while the link was down is a request: it reaches
+/// the host when the link's back. Unless the host has changed since, when it's stale.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_choice_made_while_the_link_was_down_goes_to_the_host_unless_its_stale() {
+    let w = world(limits()).await;
+    w.turn_on().await;
+    w.wires.pull();
+    w.wait("the link down", |h| h.link == HostLink::Down).await;
+    let off = rpc(
+        &w.mac,
+        "hosts.external",
+        json!({"host": "vps", "on": false}),
+    )
+    .await;
+    assert_eq!(off["result"]["external"], false, "{off}");
+    w.wires.plug_in();
     for _ in 0..500 {
-        if !w.host.hosts().unwrap().hosts[0].external {
+        if !own_row(&w.host).external {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert!(!w.host.hosts().unwrap().hosts[0].external);
+    let own = own_row(&w.host);
+    assert!(!own.external, "it was asked by name");
+    assert!(
+        own.external_note
+            .as_deref()
+            .unwrap()
+            .contains("by the Mac "),
+        "{own:?}"
+    );
+
+    // Now on from here, turned off while away, in the Mac's past; and then the host
+    // turned on later. What was chosen here is older, so it doesn't win.
+    w.turn_on().await;
+    w.wires.pull();
+    w.wait("the link down again", |h| h.link == HostLink::Down)
+        .await;
+    w.mac_clock_ahead.store(-100, Ordering::SeqCst);
+    rpc(
+        &w.mac,
+        "hosts.external",
+        json!({"host": "vps", "on": false}),
+    )
+    .await;
+    w.mac_clock_ahead.store(0, Ordering::SeqCst);
+    rpc(
+        &w.host,
+        "hosts.external",
+        json!({"on": true, "domain": "vps.test"}),
+    )
+    .await;
+    w.wires.plug_in();
+    w.wait("the link back", |h| h.link == HostLink::Connected)
+        .await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(own_row(&w.host).external, "a stale off stops nothing");
+}
+
+/// #100. With the Mac gone, a host goes on serving across a restart of its `vibed`, with
+/// the keys it has: nothing it needs is the Mac's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn with_the_mac_gone_a_host_serves_across_a_restart() {
+    let w = world(limits()).await;
+    w.turn_on().await;
+    let key = w.key("laptop");
+    w.pushed(&key).await;
+    w.wires.pull();
+    let w = w.restart_host().await;
+    assert!(own_row(&w.host).external, "its own state says so");
+    let c = w.client(&key);
+    let list = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).to_string();
+    for _ in 0..500 {
+        // Nothing to post to until it's listening again.
+        if TcpStream::connect(w.public).await.is_ok() && c.post("/mcp", &list).await.status == 200 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("it isn't serving");
+}
+
+/// #100. The same for a host serving on its own, though with its link down it can't say
+/// so now, and what it last said is what's there to stop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_serving_on_its_own_isnt_forgotten_with_this_macs_keys_on_it() {
+    let w = world(limits()).await;
+    let on = rpc(
+        &w.host,
+        "hosts.external",
+        json!({"on": true, "domain": DOMAIN}),
+    )
+    .await;
+    assert_eq!(on["result"]["external"], true, "{on}");
+    w.wait("what it serves", |h| {
+        h.external_serves.as_deref() == Some(DOMAIN)
+    })
+    .await;
+    let key = w.key("laptop");
+    w.pushed(&key).await;
+    w.wires.pull();
+    w.wait("the link down", |h| h.link == HostLink::Down).await;
+    let vps = w.vps();
+    assert_eq!(vps.external_serves.as_deref(), Some(DOMAIN), "{vps:?}");
+    assert!(vps.external_note.unwrap().contains("last said it serves"));
+    let refused = rpc(&w.mac, "hosts.remove", json!({"host": "vps"})).await;
+    let said = refused["error"]["message"].as_str().unwrap();
+    assert!(
+        said.contains("API keys") && said.contains("gone for good"),
+        "{refused}"
+    );
+    let off = rpc(
+        &w.mac,
+        "hosts.external",
+        json!({"host": "vps", "on": false}),
+    )
+    .await;
+    assert_eq!(off["result"]["external"], false, "{off}");
+    assert_eq!(w.vps().external_serves, None);
+    let removed = rpc(&w.mac, "hosts.remove", json!({"host": "vps"})).await;
+    assert!(removed.get("result").is_some(), "{removed}");
+}
+
+/// Item 10 of #69: a real-host test's own Mac, linking and then forgetting a host,
+/// wiped the keys the real Mac had pushed there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forgetting_a_host_takes_only_this_macs_keys_off_it() {
+    let w = world(limits()).await;
+    w.host
+        .sync_keys(vibe_core::rpc::KeySyncParams {
+            keys: vec![vibe_core::rpc::KeyHash {
+                name: "another Mac's".into(),
+                prefix: "vk_another".into(),
+                hash: "a".repeat(64),
+                created_at: "2026-10-30T12:00:00Z".into(),
+            }],
+            from: Some("another-mac".into()),
+        })
+        .unwrap();
+    let names = |w: &World| -> Vec<String> {
+        let mut names: Vec<String> = w
+            .host
+            .keys()
+            .unwrap()
+            .keys
+            .into_iter()
+            .map(|k| k.name)
+            .collect();
+        names.sort();
+        names
+    };
+    let key = w.key("laptop");
+    w.pushed(&key).await;
+    assert_eq!(names(&w), ["another Mac's", "laptop"]);
+    let removed = rpc(&w.mac, "hosts.remove", json!({"host": "vps"})).await;
+    assert!(removed.get("result").is_some(), "{removed}");
+    assert_eq!(names(&w), ["another Mac's"]);
 }
 
 /// Issue #45: the host's `vibed` restarted, as an upgrade does, while the

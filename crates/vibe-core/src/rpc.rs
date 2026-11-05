@@ -877,6 +877,21 @@ pub struct HostInfo {
     /// While it's the external address, the Mac's tunnel to it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tunnel: Option<TunnelState>,
+    /// On a Linux host's own row, when its external address last changed, so a Mac
+    /// can tell whether a request it couldn't deliver is still news.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_changed_at: Option<i64>,
+    /// What to know about its external address that isn't trouble: who turned it
+    /// off and when, or that it serves on its own, with this Mac not using it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_note: Option<String>,
+    /// The name it serves, while this Mac isn't using it: what to use with one click.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_serves: Option<String>,
+    /// The name this Mac chose for it, while it no longer serves that: what to turn on
+    /// again with one click.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_last: Option<String>,
     /// While it's the external address and something keeps it from
     /// working, or holds it up, what and how to fix it: such as port 443,
     /// or Let's Encrypt not reaching the domain.
@@ -942,6 +957,10 @@ pub struct HostExternalParams {
     /// pointing at the host. Needed to turn it on; ignored to turn it off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub domain: Option<String>,
+    /// Who's asking, for the host to log and say: a Mac's name, when a Mac passes
+    /// this on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1320,8 +1339,13 @@ pub struct KeyHash {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KeySyncParams {
-    /// Every key the Mac has now; any pushed before and not here is gone.
+    /// Every key this Mac has now; any it pushed before and not here is gone. What
+    /// another Mac pushed stays.
     pub keys: Vec<KeyHash>,
+    /// Which Mac this is: its install's own id. A Mac too old to say is one more
+    /// source, of whatever was pushed with none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

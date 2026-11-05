@@ -7,7 +7,8 @@
     "params": {
       "host": "vps",
       "on": true,
-      "domain": "VPS.example.com"
+      "domain": "VPS.example.com",
+      "by": "the Mac studio"
     }
   },
   "response": {

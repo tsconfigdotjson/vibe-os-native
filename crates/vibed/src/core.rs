@@ -723,6 +723,19 @@ impl Core {
         lock(&self.store)
     }
 
+    /// This install's id, which a host knows the keys it pushes by.
+    pub(crate) fn install_id(&self) -> Result<String, ErrorObject> {
+        let random = keys::random_bytes().map_err(|e| {
+            error(
+                ErrorCode::InternalError,
+                format!("Internal error: no randomness: {e}"),
+            )
+        })?;
+        self.store()
+            .install_id(|| random.iter().map(|b| format!("{b:02x}")).collect())
+            .map_err(store_error)
+    }
+
     /// 32 random bytes, from the same source as API keys.
     pub(crate) fn random(&self) -> Result<[u8; keys::KEY_BYTES], ErrorObject> {
         (self.entropy)().map_err(|e| {

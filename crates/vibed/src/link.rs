@@ -147,6 +147,14 @@ pub struct Link {
     /// push failed or couldn't be made, or none has been since it started. The next
     /// ping tries again.
     pub(crate) keys_stale: AtomicBool,
+    /// When this Mac last told the host about its external address: a ping sent
+    /// before that may answer with what it was.
+    /// One push of keys to it at a time, so that an older list can't arrive after a
+    /// newer one and undo it, which could bring back a revoked key.
+    pub(crate) keys_pushing: tokio::sync::Mutex<()>,
+    pub(crate) external_told: Mutex<Option<Instant>>,
+    /// Why the host wouldn't take what this Mac last told it, if it wouldn't.
+    pub(crate) external_refused: Mutex<Option<String>>,
     /// The projects it last listed, as it still has them while it's away.
     pub(crate) projects_seen: Mutex<Vec<String>>,
     /// Whether its `vibed` sends [`vibe_core::rpc::CALL_ACCEPTED`].
@@ -214,6 +222,9 @@ impl Link {
             behind: AtomicBool::new(false),
             refresh_wanted: AtomicBool::new(false),
             keys_stale: AtomicBool::new(true),
+            keys_pushing: tokio::sync::Mutex::new(()),
+            external_told: Mutex::new(None),
+            external_refused: Mutex::new(None),
             projects_seen: Mutex::new(Vec::new()),
             accepts_calls: AtomicBool::new(false),
         }
@@ -314,6 +325,8 @@ impl Link {
         };
         self.up.send_replace(false);
         lock(&self.idle).clear();
+        // What the next link says is news, however soon that is.
+        *lock(&self.external_told) = None;
         changed
     }
 
@@ -551,6 +564,9 @@ async fn session(core: &Weak<Core>, link: &Arc<Link>, timing: Timing) -> Result<
                         if link.behind.load(Ordering::SeqCst) {
                             c.upgrade_in_background(link);
                         }
+                        // Every time, as a report put off for being too soon after
+                        // telling it won't change again.
+                        c.reconcile_external(link);
                         // A push that failed is tried again.
                         if link.keys_stale.load(Ordering::SeqCst) {
                             c.push_keys_to(link);

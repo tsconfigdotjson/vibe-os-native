@@ -100,9 +100,12 @@ for the menu's header. `mcp.changed` says when that changes, and
 `host.added`, `host.removed` and `host.link` when the hosts or their links
 do. A Linux host's events come onto the Mac's stream under its name. The Mac
 pushes its API keys to each linked host by their hashes (`keys.sync`), so
-one key works on every host.
+one key works on every host. It says which Mac it is (`from`), and replaces only
+what that Mac pushed, so a host can be shared.
 
-**External access.** `hosts.external` makes one Linux host the external
+**External access.** The external address belongs to the host, which keeps it
+with no Mac. `hosts.external` asks for it, naming who's asking (`by`), and only
+that switches it. It makes one Linux host the external
 address: it serves MCP publicly at `https://<domain>/mcp` (port 443, with a
 certificate from Let's Encrypt, every call rate-limited and logged), and
 the Mac keeps an SSH reverse tunnel to it. While it is, `hosts.list` gives

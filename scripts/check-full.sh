@@ -82,7 +82,9 @@
 #     for the server with cargo-zigbuild and run there with the bundle's
 #     vibe-shim: the conformance suite on its real cgroups, and a memory hog
 #     stopped by its own limit while its neighbour runs on. Every test agent
-#     there has a memory limit of tens of MB, and nothing is left behind
+#     there has a memory limit of tens of MB, and nothing is left behind. These
+#     run under scripts/keep-host-state.sh, which puts the server's external
+#     address back as it was, and fails if that or an API key isn't
 #   - external access through a real server (#18), when VIBE_TEST_LINUX_HOST
 #     is set and VIBE_TEST_EXTERNAL_DOMAIN is a public DNS name pointing at
 #     it, with port 443 open there and usable by its user (N/A otherwise):
@@ -1450,7 +1452,10 @@ s_real_host() {
     bundle="$WORK/host-bundle"
     scripts/host-bundle.sh --out "$bundle" --target "$arch"
   fi
-  VIBE_HOST_BUNDLE="$bundle" cargo test -p vibe-cli --test linux_host --locked -- real_linux_host --ignored --nocapture
+  # Under this, as a test's own Mac can change a real host: it's put back as it was.
+  # The bundle's path stays off its command line: the cleanup below kills by "$WORK/".
+  VIBE_HOST_BUNDLE="$bundle" scripts/keep-host-state.sh "$VIBE_TEST_LINUX_HOST" -- \
+    cargo test -p vibe-cli --test linux_host --locked -- real_linux_host --ignored --nocapture
   real_host_cgroups "$VIBE_TEST_LINUX_HOST" "$arch" "$bundle"
 }
 
@@ -1473,7 +1478,10 @@ s_real_external() {
   # Port 443 for vibed, which runs as the server's user (PRD: External
   # access): vibed gets it itself with passwordless sudo; a server that needs
   # a password fails this, saying so, as only the app's Allow… can do that.
-  VIBE_HOST_BUNDLE="$bundle" cargo test -p vibe-cli --test linux_host --locked -- real_external_access --ignored --nocapture
+  # Under this, as it changes the external address: it's put back as it was.
+  # The bundle's path stays off its command line: the cleanup below kills by "$WORK/".
+  VIBE_HOST_BUNDLE="$bundle" scripts/keep-host-state.sh "$VIBE_TEST_LINUX_HOST" -- \
+    cargo test -p vibe-cli --test linux_host --locked -- real_external_access --ignored --nocapture
 }
 
 # real_host_cgroups <ssh destination> <arch> <bundle>: the cgroups backend's

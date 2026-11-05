@@ -23,7 +23,7 @@ truth.
 | `swift/VibeOS` | `VibeOS.app`, the SwiftUI menu bar app, and `VibeRPC`, its socket client |
 | `swift/vibe-vm` | `vibe-vm`, the Virtualization.framework helper |
 | `protocol/` | The socket contract both sides are tested against, `vibe-vm`'s in `protocol/vibe-vm/` and `vibe-guest`'s in `protocol/vibe-guest/`; see the READMEs |
-| `scripts/` | `check-full.sh` runs every check; `advisories.sh` holds `Cargo.lock` to RustSec, by `deny.toml`'s rules; `sign-macos.sh` signs for local use; `test-guest.sh` builds the test guest; `base-image.sh` builds the Linux base image (with Docker); `vm-reboot-test.sh` checks a saved VM survives a reboot; `host-bundle.sh` builds the Linux `vibed` that Add Linux Host installs, with `zig-tools.sh` fetching what that takes on first use; `release-macos.sh` builds a release DMG; `sparkle.py` signs it for Sparkle and writes the appcast |
+| `scripts/` | `check-full.sh` runs every check; `advisories.sh` holds `Cargo.lock` to RustSec, by `deny.toml`'s rules; `sign-macos.sh` signs for local use; `test-guest.sh` builds the test guest; `base-image.sh` builds the Linux base image (with Docker); `vm-reboot-test.sh` checks a saved VM survives a reboot; `keep-host-state.sh` puts a real host back as it was after a test of it; `host-bundle.sh` builds the Linux `vibed` that Add Linux Host installs, with `zig-tools.sh` fetching what that takes on first use; `release-macos.sh` builds a release DMG; `sparkle.py` signs it for Sparkle and writes the appcast |
 
 Every crate builds on macOS and Linux (x86_64 and arm64); `vibe-guest` and
 `vibe-testguest` do their work only as static `aarch64-unknown-linux-musl`

@@ -1085,6 +1085,16 @@ public struct HostInfo: Codable, Hashable, Sendable {
     public var url: String?
     /// While it's the external address, the Mac's tunnel to it.
     public var tunnel: TunnelState?
+    /// On a Linux host's own row, when its external address last changed.
+    public var externalChangedAt: Int64?
+    /// What to know about its external address that isn't trouble: who turned it
+    /// off and when, or that it serves on its own, with this Mac not using it.
+    public var externalNote: String?
+    /// The name it serves, while this Mac isn't using it: what to use with one click.
+    public var externalServes: String?
+    /// The name this Mac chose for it, while it no longer serves that: what to turn on
+    /// again with one click.
+    public var externalLast: String?
     /// While it's the external address and something keeps it from
     /// working, or holds it up, what, and how to fix it.
     public var externalDetail: String?
@@ -1100,6 +1110,10 @@ public struct HostInfo: Codable, Hashable, Sendable {
 
     public enum CodingKeys: String, CodingKey, CaseIterable {
         case name, os, label, link, external, mcp, address, version, missing, detail, url, tunnel
+        case externalChangedAt = "external_changed_at"
+        case externalNote = "external_note"
+        case externalServes = "external_serves"
+        case externalLast = "external_last"
         case externalDetail = "external_detail"
         case memory
         case needsAdmin = "needs_admin"
@@ -1146,6 +1160,8 @@ public struct HostExternalParams: Codable, Hashable, Sendable {
     /// The public DNS name it's reached at, pointing at the host. Needed to
     /// turn it on.
     public var domain: String?
+    /// Who's asking; `vibed` fills it in when it passes this on to a host.
+    public var by: String?
 
     public init(host: String?, on: Bool, domain: String? = nil) {
         self.host = host
@@ -1154,7 +1170,7 @@ public struct HostExternalParams: Codable, Hashable, Sendable {
     }
 
     public enum CodingKeys: String, CodingKey, CaseIterable {
-        case host, on, domain
+        case host, on, domain, by
     }
 }
 
@@ -1580,9 +1596,11 @@ public struct KeyHash: Codable, Hashable, Sendable {
 
 public struct KeySyncParams: Codable, Hashable, Sendable {
     public var keys: [KeyHash]
+    /// Which Mac this is, so that it replaces only what it pushed.
+    public var from: String?
 
     public enum CodingKeys: String, CodingKey, CaseIterable {
-        case keys
+        case keys, from
     }
 }
 
