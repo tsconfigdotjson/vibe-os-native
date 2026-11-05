@@ -1092,6 +1092,21 @@ fn readonly(path: &Path) -> Result<()> {
         .map_err(io_err(format!("make {} read-only", path.display())))
 }
 
+/// Reads until `buf` is full or `from` ends, and says how much it got. A signal cutting
+/// a read short is no reason to throw away an unpack.
+fn fill(from: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
+    let mut got = 0;
+    while got < buf.len() {
+        match from.read(&mut buf[got..]) {
+            Ok(0) => break,
+            Ok(n) => got += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(got)
+}
+
 /// Unpacks a gzip file with `gzip -dc`, writing only blocks that aren't all
 /// zeros, and then punching holes where the filesystem wrote zeros anyway,
 /// so an ext4 image stays as sparse as it was made.
@@ -1123,13 +1138,7 @@ fn gunzip_sparse(src: &Path, dest: &Path) -> Result<()> {
     let mut written = 0u64;
     let copied = (|| -> io::Result<()> {
         loop {
-            let mut got = 0;
-            while got < buf.len() {
-                match stdout.read(&mut buf[got..])? {
-                    0 => break,
-                    n => got += n,
-                }
-            }
+            let got = fill(&mut stdout, &mut buf)?;
             if got == 0 {
                 break;
             }
@@ -1616,23 +1625,100 @@ mod tests {
         f.write_all_at(b"data", 10 << 20).unwrap();
         f.write_all_at(b"tail", (64 << 20) - 4).unwrap();
         drop(f);
+        let zipped = Command::new("gzip").arg("-k").arg(&raw).output().unwrap();
         assert!(
-            Command::new("gzip")
-                .arg("-k")
-                .arg(&raw)
-                .status()
-                .unwrap()
-                .success()
+            zipped.status.success(),
+            "gzip -k: {zipped:?}\n{}",
+            about_the_disk(tmp.path())
         );
         let out = tmp.path().join("out");
-        gunzip_sparse(&tmp.path().join("raw.gz"), &out).unwrap();
+        gunzip_sparse(&tmp.path().join("raw.gz"), &out)
+            .unwrap_or_else(|e| panic!("{e}\n{}", about_the_disk(tmp.path())));
         assert_eq!(sha256_file(&out).unwrap(), sha256_file(&raw).unwrap());
-        use std::os::unix::fs::MetadataExt;
-        assert!(fs::metadata(&out).unwrap().blocks() * 512 < 1 << 20);
+        let taken = on_disk(&out);
+        assert!(
+            taken < 1 << 20,
+            "{taken} bytes on disk of a file with 8 KiB of data. {}",
+            why_not_sparse(&out, tmp.path())
+        );
         // A broken archive leaves nothing.
         fs::write(tmp.path().join("bad.gz"), "not gzip").unwrap();
         assert!(gunzip_sparse(&tmp.path().join("bad.gz"), &tmp.path().join("bad")).is_err());
         assert!(!tmp.path().join("bad").exists());
+    }
+
+    fn on_disk(path: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(path).unwrap().blocks() * 512
+    }
+
+    /// `df`'s word on the filesystem under `dir`, and on how full it is.
+    fn about_the_disk(dir: &Path) -> String {
+        let df = Command::new("df").arg("-k").arg(dir).output();
+        match df {
+            Ok(df) => String::from_utf8_lossy(&df.stdout).trim().to_owned(),
+            Err(e) => format!("df: {e}"),
+        }
+    }
+
+    /// What to know when an image that should be sparse isn't: whether it was only
+    /// late in saying so, whether there was more to give back, and whether this
+    /// filesystem can hold a hole at all. It's for a panic's text, on a disk that may be
+    /// full, so what it can't do there it says instead.
+    fn why_not_sparse(path: &Path, dir: &Path) -> String {
+        std::thread::sleep(Duration::from_secs(2));
+        let later = on_disk(path);
+        let punched = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .and_then(|file| {
+                let punched = crate::sparse::punch_zeros(&file)?;
+                file.sync_all()?;
+                Ok(punched)
+            });
+        let probe = dir.join("hole-probe");
+        let hole = File::create(&probe)
+            .and_then(|hole| {
+                hole.set_len(64 << 20)?;
+                hole.sync_all()
+            })
+            .map(|()| on_disk(&probe));
+        format!(
+            "2 s later, {later} bytes. Punched again, {punched:?} given back, so {} bytes. \
+             An empty 64 MiB file takes {hole:?} bytes here.\n{}",
+            on_disk(path),
+            about_the_disk(dir)
+        )
+    }
+
+    /// A read of `gzip -dc`'s pipe that a signal cuts short goes on. Anything else stops
+    /// the unpack.
+    #[test]
+    fn a_read_cut_short_by_a_signal_goes_on() {
+        struct Jumpy(Vec<io::Result<&'static [u8]>>);
+        impl Read for Jumpy {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.0.is_empty() {
+                    return Ok(0);
+                }
+                let got = self.0.remove(0)?;
+                buf[..got.len()].copy_from_slice(got);
+                Ok(got.len())
+            }
+        }
+        let cut = || Err(io::Error::from(io::ErrorKind::Interrupted));
+        let mut from = Jumpy(vec![Ok(b"ab"), cut(), Ok(b"cd"), cut(), Ok(b"ef")]);
+        let mut buf = [0; 4];
+        assert_eq!(fill(&mut from, &mut buf).unwrap(), 4);
+        assert_eq!(&buf, b"abcd");
+        // What's left is short of a block, then the end.
+        assert_eq!(fill(&mut from, &mut buf).unwrap(), 2);
+        assert_eq!(&buf[..2], b"ef");
+        assert_eq!(fill(&mut from, &mut buf).unwrap(), 0);
+
+        let mut broken = Jumpy(vec![Ok(b"ab"), Err(io::Error::other("gone"))]);
+        assert!(fill(&mut broken, &mut buf).is_err());
     }
 
     fn pi_build(tmp: &Path, version: &str) -> pi_release::Build {

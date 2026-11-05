@@ -29,7 +29,9 @@ use tokio::net::{TcpStream, UnixListener, UnixStream};
 use tokio::sync::watch;
 use vibe_core::model::{HostLink, TunnelState};
 use vibe_core::paths::Layout;
-use vibe_core::rpc::{ErrorCode, HostAddParams, KeyCreateParams, KeyParams, MAX_MESSAGE_BYTES};
+use vibe_core::rpc::{
+    ErrorCode, HostAddParams, HostParams, KeyCreateParams, KeyParams, MAX_MESSAGE_BYTES,
+};
 use vibe_mcp::public::Limits;
 use vibed::core::{Core, OpenError};
 use vibed::external::ExternalConfig;
@@ -50,6 +52,10 @@ struct Wires {
     frozen: watch::Sender<bool>,
     /// Every call that's gone into a tunnel, by its method, oldest first.
     heard: Arc<Mutex<Vec<String>>>,
+    /// The same, once the Mac has closed the connection it came on: it's done with
+    /// there, whatever it did, as the Mac reads no more of a connection until a call
+    /// on it has finished.
+    over: Arc<Mutex<Vec<String>>>,
     /// What a Mac says back through a tunnel goes nowhere, while what's sent to
     /// it arrives: a call that's done there, with the host never hearing so.
     replies_lost: Arc<AtomicBool>,
@@ -68,6 +74,7 @@ impl Wires {
             up: watch::channel(true).0,
             frozen: watch::channel(false).0,
             heard: Arc::default(),
+            over: Arc::default(),
             replies_lost: Arc::new(AtomicBool::new(false)),
             hang_up: watch::channel(0).0,
             tunnels: Mutex::new(0),
@@ -90,9 +97,30 @@ impl Wires {
     fn hang_up_dials(&self) {
         self.hang_up.send_modify(|n| *n += 1);
     }
+
+    /// Waits until the Mac is done with every call of `method` that's come through, and
+    /// with at least `count`, those known to have been sent but maybe not there yet.
+    async fn calls_over(&self, method: &str, count: usize) {
+        let tally = |calls: &Mutex<Vec<String>>| {
+            let calls = calls.lock().unwrap();
+            calls.iter().filter(|m| *m == method).count()
+        };
+        for _ in 0..3000 {
+            if tally(&self.over) >= count.max(tally(&self.heard)) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!(
+            "the Mac finished with {} of {count} calls of {method}; it heard {:?}",
+            tally(&self.over),
+            self.heard.lock().unwrap()
+        );
+    }
 }
 
-/// Copies bytes both ways until either side ends or the network goes.
+/// Copies bytes both ways until `b` ends or the network goes. Once `a` ends, `b` is told
+/// and has its say, with nobody left to hear it.
 async fn pump(
     a: UnixStream,
     b: UnixStream,
@@ -100,6 +128,7 @@ async fn pump(
     mut frozen: watch::Receiver<bool>,
     b_lost: Arc<AtomicBool>,
     heard: Option<Arc<Mutex<Vec<String>>>>,
+    over: Option<Arc<Mutex<Vec<String>>>>,
 ) {
     let (mut ar, mut aw) = a.into_split();
     let (mut br, mut bw) = b.into_split();
@@ -108,6 +137,8 @@ async fn pump(
     // Its end closed: what's on the way still gets there, as with ssh, which closes the
     // other end only once that's done with too.
     let mut a_done = false;
+    // What's come through this connection, for `over` when it ends.
+    let mut carried = Vec::new();
     loop {
         if !*up.borrow_and_update() {
             return;
@@ -133,6 +164,7 @@ async fn pump(
                             let call: Value = serde_json::from_str(line).unwrap_or_default();
                             if let Some(method) = call["params"]["method"].as_str() {
                                 heard.lock().unwrap().push(method.to_owned());
+                                carried.push(method.to_owned());
                             }
                         }
                     }
@@ -140,9 +172,15 @@ async fn pump(
                 }
             },
             n = br.read(&mut y) => match n {
-                Ok(0) | Err(_) => return,
+                Ok(0) | Err(_) => {
+                    if let Some(over) = &over {
+                        over.lock().unwrap().extend(carried);
+                    }
+                    return;
+                }
                 Ok(_) if b_lost.load(Ordering::SeqCst) => {}
-                Ok(n) => if aw.write_all(&y[..n]).await.is_err() && !a_done { return },
+                // With nobody left to tell, reading `a` finds its end, and that ends `b`.
+                Ok(n) => { let _ = aw.write_all(&y[..n]).await; }
             },
         }
     }
@@ -168,7 +206,7 @@ impl Remote for Wires {
             let mut hang_up = self.hang_up.subscribe();
             tokio::spawn(async move {
                 tokio::select! {
-                    () = pump(host, theirs, up, frozen, Arc::new(AtomicBool::new(false)), None) => {}
+                    () = pump(host, theirs, up, frozen, Arc::new(AtomicBool::new(false)), None, None) => {}
                     _ = hang_up.changed() => {}
                 }
             });
@@ -222,6 +260,7 @@ impl Remote for Wires {
             let frozen = self.frozen.clone();
             let replies_lost = Arc::clone(&self.replies_lost);
             let heard = Arc::clone(&self.heard);
+            let over = Arc::clone(&self.over);
             Ok(TunnelChild {
                 ended: Box::pin(async move {
                     loop {
@@ -236,6 +275,7 @@ impl Remote for Wires {
                                     frozen.subscribe(),
                                     Arc::clone(&replies_lost),
                                     Some(Arc::clone(&heard)),
+                                    Some(Arc::clone(&over)),
                                 ));
                             }
                             _ = up.changed() => {
@@ -610,6 +650,26 @@ impl World {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         false
+    }
+
+    /// A listing the Mac has answered for. One that came up empty-handed says it's
+    /// unavailable, however briefly, and that's not what's being looked at.
+    async fn listing_the_mac_answered(&self, c: &mut Client) -> String {
+        let mut listed = String::new();
+        for _ in 0..300 {
+            listed = c.call("vibe_list_agents", json!({})).await;
+            if !listed.contains("unavailable") {
+                return listed;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("the Mac never answered a listing: {listed}");
+    }
+
+    /// Whether the Mac has `agent`, as it says itself, with no tunnel in between.
+    async fn mac_has(&self, agent: &str) -> bool {
+        let list = self.mac.agents(HostParams { host: None }).await.unwrap();
+        list.agents.iter().any(|a| a.agent == agent)
     }
 
     /// Waits until the host takes `key`, once the Mac has pushed it.
@@ -1275,15 +1335,45 @@ async fn a_delete_held_up_by_a_sleeping_mac_doesnt_run_once_its_too_old() {
     assert!(failed.contains("check vibe_list_agents"), "{failed}");
     w.mac_clock_ahead.store(61, Ordering::SeqCst);
     w.thaw().await;
-    // Time for it to have got there, had it been let through.
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    let listed = c.call("vibe_list_agents", json!({})).await;
+    // Only now can the clocks agree again, or it would run after all.
+    w.wires.calls_over("agents.delete", 1).await;
+    assert!(w.mac_has("on-mac").await, "held past the window, it ran");
+    let listed = w.listing_the_mac_answered(&mut c).await;
     assert!(listed.contains("mac:on-mac"), "{listed}");
-    assert!(!listed.contains("unavailable"), "{listed}");
 
     w.mac_clock_ahead.store(0, Ordering::SeqCst);
-    c.call("vibe_delete_agent", delete).await;
-    let listed = c.call("vibe_list_agents", json!({})).await;
+    // A Mac this short of time can miss the deadline for taking a call, or a look at it,
+    // and a caller is told to look and try again. A look that missed can also refuse a
+    // call, which sends nothing. Anything else fails, as does a Mac that never takes it.
+    let mut sent = 1;
+    let mut failed = String::new();
+    for _ in 0..20 {
+        w.thaw().await;
+        let (error, text) = c.tool("vibe_delete_agent", delete.clone()).await;
+        if !error {
+            failed.clear();
+            break;
+        }
+        let missed = text.contains("didn't take agents.delete");
+        let looked = text.contains("it stopped answering");
+        assert!(
+            missed || looked || text.contains("so nothing was sent"),
+            "{text}"
+        );
+        if missed || looked {
+            // A missed deadline is sure to have been sent. The other may not have been.
+            sent += usize::from(missed);
+            w.wires.calls_over("agents.delete", sent).await;
+            if !w.mac_has("on-mac").await {
+                failed.clear();
+                break;
+            }
+        }
+        failed = text;
+    }
+    assert!(failed.is_empty(), "the Mac never took it: {failed}");
+    assert!(!w.mac_has("on-mac").await);
+    let listed = w.listing_the_mac_answered(&mut c).await;
     assert!(!listed.contains("mac:on-mac"), "{listed}");
 }
 
