@@ -65,6 +65,11 @@ public enum VibeRPC {
         PiStatusGet.name,
         PiInstall.name,
         PiForget.name,
+        PiModelsGet.name,
+        PiLoginStart.name,
+        PiLoginGet.name,
+        PiLoginAnswer.name,
+        PiLoginCancel.name,
         DoctorCheckGet.name,
         DoctorFix.name,
         ServicesList.name,
@@ -395,6 +400,25 @@ public enum PiTarget: String, Codable, CaseIterable, Hashable, Sendable {
     case native, vm
 }
 
+/// How a Pi sign-in goes: a provider's own account, or an API key (index:
+/// PiLoginMethod).
+public enum PiLoginMethod: String, Codable, CaseIterable, Hashable, Sendable {
+    case oauth
+    case apiKey = "api_key"
+}
+
+/// Where a Pi sign-in has got to (index: PiLoginState).
+public enum PiLoginState: String, Codable, CaseIterable, Hashable, Sendable {
+    case running, done, failed, cancelled
+}
+
+/// What a question in a Pi sign-in wants (index: PiPromptKind): something that can be
+/// shown as it's typed, something that can't, one of a list, or what a browser ended on.
+public enum PiPromptKind: String, Codable, CaseIterable, Hashable, Sendable {
+    case text, secret, select
+    case manualCode = "manual_code"
+}
+
 /// Whether `model` is safe to give Pi as one argument, which is all that's asked of
 /// a Pi profile's model: `provider/id`, a bare id, whatever Pi may know. Pi says if
 /// it doesn't know it. vibed's `validate_pi_model` is the same rule, and
@@ -407,6 +431,14 @@ public func isValidPiModel(_ model: String) -> Bool {
         !scalar.properties.isWhitespace && scalar.properties.generalCategory != .control
             && !"'\"`$\\".unicodeScalars.contains(scalar)
     }
+}
+
+/// Why `model` can't be a Pi profile's, in words, if it can't: `isValidPiModel`'s rule.
+public func piModelProblem(_ model: String) -> String? {
+    if isValidPiModel(model) { return nil }
+    if model.utf8.first == UInt8(ascii: "-") { return "A model can't start with -." }
+    if model.utf8.count > 200 { return "That's too long for a model: 200 bytes at most." }
+    return "A model can't have spaces or any of ' \" ` $ \\ in it."
 }
 
 /// Claude's `--model` (index: Model). A Pi profile names its own, in `piModel`.
@@ -925,6 +957,46 @@ public enum PiForget: RPCMethod {
     public typealias Params = PiForgetParams
     public typealias Result = PiStatus
     public static let name = "pi.forget"
+}
+
+/// `pi.models`: Pi's own list for this host's native agents, or on a Mac its `linux`
+/// agents: every provider it knows and whether it's signed in, with their models. The
+/// first to ask may wait for Pi to be got. Why there's no list goes in `error`.
+public enum PiModelsGet: RPCMethod {
+    public typealias Params = PiModelsParams
+    public typealias Result = PiModels
+    public static let name = "pi.models"
+}
+
+/// `pi.login.start`: starts Pi's own sign-in to a provider, ending one already under
+/// way, and answers when there's something to show or ask.
+public enum PiLoginStart: RPCMethod {
+    public typealias Params = PiLoginStartParams
+    public typealias Result = PiLogin
+    public static let name = "pi.login.start"
+}
+
+/// `pi.login.get`: how a sign-in stands. If it's still as `seen` says, this answers
+/// when that changes, or after a while with the same.
+public enum PiLoginGet: RPCMethod {
+    public typealias Params = PiLoginGetParams
+    public typealias Result = PiLogin
+    public static let name = "pi.login.get"
+}
+
+/// `pi.login.answer`: answers a question a sign-in asked, and says how it stands once
+/// it's moved on, or after a while.
+public enum PiLoginAnswer: RPCMethod {
+    public typealias Params = PiLoginAnswerParams
+    public typealias Result = PiLogin
+    public static let name = "pi.login.answer"
+}
+
+/// `pi.login.cancel`: gives up on a sign-in. One that's over stays as it ended.
+public enum PiLoginCancel: RPCMethod {
+    public typealias Params = PiLoginParams
+    public typealias Result = PiLogin
+    public static let name = "pi.login.cancel"
 }
 
 /// `doctor.check`: `vibe doctor`, and the first run's checklist. Runs every
@@ -1980,6 +2052,211 @@ public struct PiStatus: Codable, Hashable, Sendable {
 
     public enum CodingKeys: String, CodingKey, CaseIterable {
         case host, native, error, logins, vms
+    }
+}
+
+public struct PiModelsParams: Codable, Hashable, Sendable {
+    public var host: String?
+    /// Whose list. A host with no VMs takes either to mean its own.
+    public var target: PiTarget
+
+    public init(host: String? = nil, target: PiTarget) {
+        self.host = host
+        self.target = target
+    }
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case host, target
+    }
+}
+
+/// Pi's own list, for one host's agents.
+public struct PiModels: Codable, Hashable, Sendable {
+    public var host: String
+    public var target: PiTarget
+    /// Every provider Pi knows, signed-in ones first.
+    public var providers: [PiProvider]?
+    /// Why there's no list, in words: a model can still be typed.
+    public var error: String?
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case host, target, providers, error
+    }
+}
+
+/// One provider Pi knows.
+public struct PiProvider: Codable, Hashable, Sendable {
+    /// What goes before the `/` in a model.
+    public var id: String
+    public var name: String
+    /// Whether Pi has a login or a key for it, there.
+    public var signedIn: Bool
+    /// Whether it can sign in from what's around it, which can't be told from here.
+    public var ambient: Bool
+    public var oauth: Bool
+    /// What Pi calls signing in with an account, if it says.
+    public var oauthLabel: String?
+    public var apiKey: Bool
+    public var models: [PiModel]?
+
+    public init(
+        id: String, name: String, signedIn: Bool, ambient: Bool = false, oauth: Bool = false,
+        oauthLabel: String? = nil, apiKey: Bool = true, models: [PiModel]? = nil
+    ) {
+        self.id = id
+        self.name = name
+        self.signedIn = signedIn
+        self.ambient = ambient
+        self.oauth = oauth
+        self.oauthLabel = oauthLabel
+        self.apiKey = apiKey
+        self.models = models
+    }
+
+    /// Its models, none being as good as an empty list.
+    public var listedModels: [PiModel] { models ?? [] }
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case id, name, oauth, ambient, models
+        case signedIn = "signed_in"
+        case oauthLabel = "oauth_label"
+        case apiKey = "api_key"
+    }
+}
+
+/// One of a provider's models.
+public struct PiModel: Codable, Hashable, Sendable {
+    /// What goes after the `/` in a model.
+    public var id: String
+    /// What it's called, if that's more than its id.
+    public var name: String?
+
+    public init(id: String, name: String? = nil) {
+        self.id = id
+        self.name = name
+    }
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case id, name
+    }
+}
+
+public struct PiLoginStartParams: Codable, Hashable, Sendable {
+    public var host: String?
+    public var target: PiTarget
+    /// The provider, by name.
+    public var provider: String
+    public var method: PiLoginMethod
+
+    public init(host: String? = nil, target: PiTarget, provider: String, method: PiLoginMethod) {
+        self.host = host
+        self.target = target
+        self.provider = provider
+        self.method = method
+    }
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case host, target, provider, method
+    }
+}
+
+public struct PiLoginParams: Codable, Hashable, Sendable {
+    public var host: String?
+    public var id: String
+
+    public init(host: String? = nil, id: String) {
+        self.host = host
+        self.id = id
+    }
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case host, id
+    }
+}
+
+public struct PiLoginGetParams: Codable, Hashable, Sendable {
+    public var host: String?
+    public var id: String
+    /// The `seq` last seen. Absent, it answers at once.
+    public var seen: Int?
+
+    public init(host: String? = nil, id: String, seen: Int? = nil) {
+        self.host = host
+        self.id = id
+        self.seen = seen
+    }
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case host, id, seen
+    }
+}
+
+public struct PiLoginAnswerParams: Codable, Hashable, Sendable {
+    public var host: String?
+    public var id: String
+    /// The question's `id`.
+    public var prompt: String
+    /// Can be an API key.
+    public var value: String
+
+    public init(host: String? = nil, id: String, prompt: String, value: String) {
+        self.host = host
+        self.id = id
+        self.prompt = prompt
+        self.value = value
+    }
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case host, id, prompt, value
+    }
+}
+
+/// How a Pi sign-in stands, whole. No answer given to it, and nothing of the login, is
+/// ever in it.
+public struct PiLogin: Codable, Hashable, Sendable {
+    public var id: String
+    public var host: String
+    public var target: PiTarget
+    public var provider: String
+    public var method: PiLoginMethod
+    /// Goes up with each change.
+    public var seq: Int
+    public var state: PiLoginState
+    /// A page to open, always `https`.
+    public var url: String?
+    public var instructions: String?
+    /// A code to enter at that page.
+    public var code: String?
+    public var progress: String?
+    public var prompt: PiLoginPrompt?
+    public var error: String?
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case id, host, target, provider, method, seq, state, url, instructions, code, progress, prompt, error
+    }
+}
+
+/// A question a Pi sign-in is asking.
+public struct PiLoginPrompt: Codable, Hashable, Sendable {
+    public var id: String
+    public var kind: PiPromptKind
+    public var message: String
+    public var placeholder: String?
+    /// For `select`, what it can be.
+    public var options: [PiLoginOption]?
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case id, kind, message, placeholder, options
+    }
+}
+
+public struct PiLoginOption: Codable, Hashable, Sendable {
+    /// What to answer with.
+    public var id: String
+    public var label: String
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case id, label
     }
 }
 

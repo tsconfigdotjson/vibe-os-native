@@ -455,7 +455,7 @@ impl Golden {
             serde_json::json!([{
                 "provider": "xai",
                 "text": "brave-copper-lynx signed in to xai, and every Pi agent here now uses \
-                         that login. If that wasn't you, sign in to it from the toolbox to \
+                         that login. If that wasn't you, sign in to it in Settings → Agents to \
                          replace it.",
                 "at_ms": vibe_env::pi_logins::now_ms(),
                 "first": true,
@@ -504,6 +504,7 @@ impl Golden {
         config.label = "mac-mini".into();
         config.gh = self.gh.clone().into();
         config.shim = workspace_bin("vibe-shim").into_os_string();
+        config.pi_driver = Some(self.claude.with_file_name("pi"));
         config.backends = Backends::all(Arc::new(Seeding {
             backend: TestBackend::new(&self.claude)
                 .with_pi_copies(

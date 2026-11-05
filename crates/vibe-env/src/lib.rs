@@ -44,6 +44,7 @@ pub mod native;
 pub mod pi;
 pub mod pi_logins;
 pub mod pi_release;
+pub mod pi_setup;
 pub mod sparse;
 pub mod testing;
 pub mod toolbox;

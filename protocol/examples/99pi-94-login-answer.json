@@ -1,0 +1,39 @@
+{
+  "description": "The key goes to Pi, which writes it to its own auth.json, and is nowhere in what comes back.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 174,
+    "method": "pi.login.answer",
+    "params": {
+      "host": "local",
+      "id": "404142434445464748494a4b4c4d4e4f",
+      "prompt": "p1",
+      "value": "sk-opencode-key"
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 174,
+    "result": {
+      "host": "local",
+      "id": "404142434445464748494a4b4c4d4e4f",
+      "method": "api_key",
+      "provider": "opencode",
+      "seq": 5,
+      "state": "done",
+      "target": "native"
+    }
+  },
+  "events": [
+    {
+      "jsonrpc": "2.0",
+      "method": "events.event",
+      "params": {
+        "at": "2026-10-30T12:00:00Z",
+        "host": "local",
+        "kind": "pi.changed",
+        "seq": 44
+      }
+    }
+  ]
+}

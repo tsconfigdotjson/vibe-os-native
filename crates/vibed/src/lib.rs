@@ -17,6 +17,7 @@ pub mod logging;
 pub mod mcp;
 pub mod memory;
 pub mod pi;
+pub mod pi_setup;
 pub mod power;
 pub mod pressure;
 pub mod projects;

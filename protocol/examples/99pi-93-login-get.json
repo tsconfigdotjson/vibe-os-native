@@ -1,0 +1,31 @@
+{
+  "description": "How it stands: at once if it's moved on from `seen`, or when it does, or after a while with the same.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 173,
+    "method": "pi.login.get",
+    "params": {
+      "host": "local",
+      "id": "404142434445464748494a4b4c4d4e4f",
+      "seen": 0
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 173,
+    "result": {
+      "host": "local",
+      "id": "404142434445464748494a4b4c4d4e4f",
+      "method": "api_key",
+      "prompt": {
+        "id": "p1",
+        "kind": "secret",
+        "message": "API key"
+      },
+      "provider": "opencode",
+      "seq": 1,
+      "state": "running",
+      "target": "native"
+    }
+  }
+}

@@ -212,7 +212,11 @@ async fn not_signed_in_is_said_at_once_and_undone() {
         .await
         .unwrap_err();
     assert_eq!(e.code, ErrorCode::Conflict.code());
-    assert!(e.message.contains("/login"), "{}", e.message);
+    assert!(e.message.contains("Settings → Agents"), "{}", e.message);
+    // What the app offers that sign-in from.
+    let offer = &e.data.as_ref().unwrap()["pi_sign_in"];
+    assert_eq!(offer["provider"], "xai");
+    assert!(offer["target"].is_string());
     // Nothing of it is left behind: no record, worktree or branch.
     assert!(
         w.core
@@ -284,7 +288,7 @@ async fn what_cant_answer_for_this_model_is_refused() {
     let e = refused(Arc::clone(&w.core)).await;
     assert_eq!(e.code, ErrorCode::Conflict.code());
     assert!(e.message.contains("signed in to xai"), "{}", e.message);
-    assert!(e.message.contains("/login"), "{}", e.message);
+    assert!(e.message.contains("Settings → Agents"), "{}", e.message);
     fs::write(dir.join("auth.json"), "{}").unwrap();
     // An unrelated line of pi.env.
     let file = w.layout.pi_env_file();
@@ -807,7 +811,7 @@ async fn a_first_sign_in_in_an_agent_is_told_to_the_owner() {
     w.core.pi_watch(&mut seen).await;
     let said = events.try_recv().unwrap().message.unwrap();
     assert!(said.contains(&a) && said.contains("xai"), "{said}");
-    assert!(said.contains("toolbox"), "{said}");
+    assert!(said.contains("Settings → Agents"), "{said}");
     assert_eq!(
         vibe_env::pi::logins_in(&w.layout.linux_pi_logins_dir()),
         ["mock", "xai"]

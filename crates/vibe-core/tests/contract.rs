@@ -10,9 +10,9 @@ use serde::{Serialize, forward_to_deserialize_any};
 use serde_json::Value;
 use vibe_core::model::{
     Activity, AdminNeed, AgentKind, AgentState, Certainty, CheckId, CheckState, Environment,
-    EventKind, GhState, HostLink, LoginTool, MessageRole, Mode, Model, PiTarget, ProjectSource,
-    Reasoning, ServiceRole, ServiceState, SessionState, StopReason, ToolboxAction, ToolboxState,
-    TunnelState, WakeupKind,
+    EventKind, GhState, HostLink, LoginTool, MessageRole, Mode, Model, PiLoginMethod, PiLoginState,
+    PiPromptKind, PiTarget, ProjectSource, Reasoning, ServiceRole, ServiceState, SessionState,
+    StopReason, ToolboxAction, ToolboxState, TunnelState, WakeupKind,
 };
 use vibe_core::paths;
 use vibe_core::rpc::*;
@@ -224,6 +224,17 @@ fn rust_types() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
         entry::<PiInstallParams>(),
         entry::<PiForgetParams>(),
         entry::<PiOffered>(),
+        entry::<PiModelsParams>(),
+        entry::<PiModels>(),
+        entry::<PiProvider>(),
+        entry::<PiModel>(),
+        entry::<PiLoginStartParams>(),
+        entry::<PiLoginParams>(),
+        entry::<PiLoginGetParams>(),
+        entry::<PiLoginAnswerParams>(),
+        entry::<PiLogin>(),
+        entry::<PiLoginPrompt>(),
+        entry::<PiLoginOption>(),
         entry::<DoctorReport>(),
         entry::<DoctorCheck>(),
         entry::<DoctorFixParams>(),
@@ -321,6 +332,11 @@ fn rust_methods() -> BTreeMap<&'static str, MethodTypes> {
         method::<ToolboxLoginsGet>(),
         method::<ToolboxClose>(),
         method::<PiStatusGet>(),
+        method::<PiModelsGet>(),
+        method::<PiLoginStart>(),
+        method::<PiLoginGet>(),
+        method::<PiLoginAnswer>(),
+        method::<PiLoginCancel>(),
         method::<PiInstall>(),
         method::<PiForget>(),
         method::<DoctorCheckGet>(),
@@ -355,6 +371,18 @@ fn rust_enums() -> BTreeMap<&'static str, Vec<&'static str>> {
         ("Environment", names(Environment::ALL, Environment::as_str)),
         ("AgentKind", names(AgentKind::ALL, AgentKind::as_str)),
         ("PiTarget", names(PiTarget::ALL, PiTarget::as_str)),
+        (
+            "PiLoginMethod",
+            names(PiLoginMethod::ALL, PiLoginMethod::as_str),
+        ),
+        (
+            "PiLoginState",
+            names(PiLoginState::ALL, PiLoginState::as_str),
+        ),
+        (
+            "PiPromptKind",
+            names(PiPromptKind::ALL, PiPromptKind::as_str),
+        ),
         ("Model", names(Model::ALL, Model::as_str)),
         ("Reasoning", names(Reasoning::ALL, Reasoning::as_str)),
         ("Mode", names(Mode::ALL, Mode::as_str)),
@@ -774,6 +802,11 @@ fn examples_cover_the_contract() {
         if ty == "PiVms" {
             seen_keys.insert("error");
         }
+        // The examples' world always has a Pi to ask; vibed's own tests cover one
+        // with none to be had.
+        if ty == "PiModels" {
+            seen_keys.insert("error");
+        }
         // Only a key pushed to a Linux host goes stale, and only a linked host with
         // its link down has keys pending; vibed's own tests cover those.
         if ty == "ApiKey" {
@@ -792,6 +825,21 @@ fn examples_cover_the_contract() {
         );
         assert!(declared.get(ty).is_some());
     }
+}
+
+#[test]
+fn an_answer_to_a_pi_sign_in_doesnt_show_in_debug() {
+    let answer = PiLoginAnswerParams {
+        host: Some("vps".into()),
+        id: "login".into(),
+        prompt: "p1".into(),
+        value: "sk-the-key".into(),
+    };
+    let shown = format!("{answer:?}");
+    assert!(
+        shown.contains("vps") && !shown.contains("sk-the-key"),
+        "{shown}"
+    );
 }
 
 #[test]

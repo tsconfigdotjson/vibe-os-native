@@ -22,6 +22,9 @@ struct NewAgentView: View {
     @State private var name = ""
     @State private var starting = false
     @State private var error: String?
+    /// What was refused for want of a Pi login, to offer that sign-in.
+    @State private var piSignIn: PiSignInRequest?
+    @State private var signingIn: PiSignInRequest?
     @FocusState private var promptFocused: Bool
 
     private var profiles: [Profile] {
@@ -46,6 +49,13 @@ struct NewAgentView: View {
         .frame(width: 540)
         // Escape closes it, whichever state it's in.
         .onExitCommand { dismissWindow(id: WindowID.newAgent) }
+        .sheet(item: $signingIn) { request in
+            // Signed in, what was refused can simply be started again.
+            PiSignInSheet(model: model, request: request) {
+                error = nil
+                piSignIn = nil
+            }
+        }
         .task(id: host) { await loadProjects() }
         .onChange(of: model.settingsRevision) { Task { await loadProjects() } }
         .onChange(of: project) { pickProfile() }
@@ -101,6 +111,11 @@ struct NewAgentView: View {
             .disabled(starting)
 
             ErrorText(error: error)
+            if let piSignIn {
+                Button(piSignIn.provider.map { "Sign In to \($0)…" } ?? "Sign In to a Provider…") {
+                    signingIn = piSignIn
+                }
+            }
 
             HStack {
                 if starting {
@@ -186,9 +201,13 @@ struct NewAgentView: View {
             prompt = ""
             name = ""
             error = nil
+            piSignIn = nil
             dismissWindow(id: WindowID.newAgent)
         } catch {
             self.error = describe(error)
+            piSignIn = piSignInOffer(from: error).map {
+                PiSignInRequest(host: host, target: $0.target, provider: $0.provider)
+            }
         }
     }
 }

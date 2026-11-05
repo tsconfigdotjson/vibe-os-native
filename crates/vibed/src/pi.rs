@@ -1,8 +1,8 @@
 //! Pi on this host (PRD: Who gets which credentials; What's inside `linux`):
 //! what's installed and which providers it's signed in to, for Settings, and
 //! installing it, once a profile here runs it, with nobody asked. VibeOS doesn't
-//! sign anyone in: `/login` is Pi's own, and only the providers' names are ever
-//! read here.
+//! sign anyone in: that's Pi's own, whether from `/login` or the app
+//! ([`crate::pi_setup`]), and only the providers' names are ever read here.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -373,6 +373,7 @@ impl Core {
         self: &Arc<Self>,
         every: std::time::Duration,
     ) -> tokio::task::JoinHandle<()> {
+        crate::pi_setup::clear_scratch(&self.layout);
         let core = Arc::clone(self);
         tokio::spawn(async move {
             let mut ticks = tokio::time::interval(every);

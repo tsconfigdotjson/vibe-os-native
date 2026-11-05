@@ -180,6 +180,17 @@ let swiftTypes: [String: Set<String>] = [
     "PiInstallParams": keys(PiInstallParams.CodingKeys.self),
     "PiForgetParams": keys(PiForgetParams.CodingKeys.self),
     "PiOffered": keys(PiOffered.CodingKeys.self),
+    "PiModelsParams": keys(PiModelsParams.CodingKeys.self),
+    "PiModels": keys(PiModels.CodingKeys.self),
+    "PiProvider": keys(PiProvider.CodingKeys.self),
+    "PiModel": keys(PiModel.CodingKeys.self),
+    "PiLoginStartParams": keys(PiLoginStartParams.CodingKeys.self),
+    "PiLoginParams": keys(PiLoginParams.CodingKeys.self),
+    "PiLoginGetParams": keys(PiLoginGetParams.CodingKeys.self),
+    "PiLoginAnswerParams": keys(PiLoginAnswerParams.CodingKeys.self),
+    "PiLogin": keys(PiLogin.CodingKeys.self),
+    "PiLoginPrompt": keys(PiLoginPrompt.CodingKeys.self),
+    "PiLoginOption": keys(PiLoginOption.CodingKeys.self),
     "DoctorReport": keys(DoctorReport.CodingKeys.self),
     "DoctorCheck": keys(DoctorCheck.CodingKeys.self),
     "DoctorFixParams": keys(DoctorFixParams.CodingKeys.self),
@@ -205,6 +216,9 @@ let swiftEnums: [String: [String]] = [
     "Model": ClaudeModel.allCases.map(\.rawValue),
     "AgentKind": AgentKind.allCases.map(\.rawValue),
     "PiTarget": PiTarget.allCases.map(\.rawValue),
+    "PiLoginMethod": PiLoginMethod.allCases.map(\.rawValue),
+    "PiLoginState": PiLoginState.allCases.map(\.rawValue),
+    "PiPromptKind": PiPromptKind.allCases.map(\.rawValue),
     "Reasoning": ReasoningLevel.allCases.map(\.rawValue),
     "Mode": PermissionMode.allCases.map(\.rawValue),
     "ProjectSource": ProjectSource.allCases.map(\.rawValue),
@@ -295,6 +309,11 @@ func methodChecks() -> [String: MethodCheck] {
         check(PiStatusGet.self),
         check(PiInstall.self),
         check(PiForget.self),
+        check(PiModelsGet.self),
+        check(PiLoginStart.self),
+        check(PiLoginGet.self),
+        check(PiLoginAnswer.self),
+        check(PiLoginCancel.self),
         check(DoctorCheckGet.self),
         check(DoctorFix.self),
         check(ServicesList.self),
@@ -394,6 +413,11 @@ let swiftErrorData: [RPCErrorCode: String] = [.protocolMismatch: "ProtocolMismat
         #expect(isValidPiModel(longest))
         #expect(!isValidPiModel(longest + "x"))
         #expect(!isValidPiModel(String(longest.dropFirst()) + "é"))
+        // What's refused says why, and only that is.
+        #expect(piModelProblem("openai/gpt-5") == nil)
+        #expect(piModelProblem("-x")?.contains("-") == true)
+        #expect(piModelProblem("a b")?.contains("spaces") == true)
+        #expect(piModelProblem(longest + "x")?.contains("200") == true)
     }
 
     @Test func examplesRoundTripThroughTheTypes() throws {

@@ -20,7 +20,7 @@
       },
       "vms": {
         "alerts": [
-          "brave-copper-lynx signed in to xai, and every Pi agent here now uses that login. If that wasn't you, sign in to it from the toolbox to replace it."
+          "brave-copper-lynx signed in to xai, and every Pi agent here now uses that login. If that wasn't you, sign in to it in Settings → Agents to replace it."
         ],
         "logins": [
           "anthropic",

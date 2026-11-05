@@ -43,6 +43,113 @@ if [ "$1" = auth ]; then
   printf '{"status":"not_ready","provider":"%s","reason":"credentials_not_configured"}\n' "$provider"
   exit 1
 fi
+if [ "$1" = --mode ] && [ "$2" = rpc ]; then
+  # What vibed runs for Pi's list and its sign-in (`vibe_env::pi_setup`), speaking
+  # as `vibe-setup.ts` makes Pi speak, with the login it's given written as Pi
+  # would. What it was started with goes in the agent dir, for tests to look at.
+  dir=${PI_CODING_AGENT_DIR:?}
+  printf '%s\n' "$@" >"$dir/rpc.args"
+  env >"$dir/rpc.env"
+  pwd -P >"$dir/rpc.cwd"
+  say() { printf '{"type":"extension_ui_request","id":"n","method":"notify","message":"%s"}\n' "$(printf '%s' "$1" | sed 's/"/\\"/g')"; }
+  # ask ID JSON: a question, and leaves its answer in $answer. No answer at all is
+  # being cancelled, or told it's over.
+  ask() {
+    printf '{"type":"extension_ui_request","id":"%s","method":"input","title":"%s","placeholder":""}\n' \
+      "$1" "$(printf '%s' "$2" | sed 's/"/\\"/g')"
+    IFS= read -r reply || exit 0
+    answer=$(printf '%s' "$reply" | sed -n 's/.*"value":"\(.*\)"}$/\1/p')
+    say '{"vibe":"prompt_over"}'
+  }
+  # sign_in PROVIDER KIND VALUE: what Pi's own store would then hold.
+  sign_in() {
+    if [ -f "$dir/auth.json" ]; then
+      rest=$(sed -e 's/^{//' -e 's/}$//' "$dir/auth.json")
+    else
+      rest=
+    fi
+    [ -n "$rest" ] && rest=",$rest"
+    case $2 in
+      oauth) entry=$(printf '{"type":"oauth","access":"%s","refresh":"r","expires":4102444800000}' "$3") ;;
+      odd) entry='{"type":"api_key","key":"k","more":1}' ;;
+      *) entry=$(printf '{"type":"api_key","key":"%s"}' "$3") ;;
+    esac
+    printf '{"%s":%s%s}' "$1" "$entry" "$rest" >"$dir/auth.json.new"
+    chmod 600 "$dir/auth.json.new"
+    mv "$dir/auth.json.new" "$dir/auth.json"
+  }
+  has() { grep -q "\"$1\"" "$dir/auth.json" 2>/dev/null && echo true || echo false; }
+  IFS= read -r line || exit 0
+  case $line in
+    *'/vibe-catalog'*)
+      opencode_key=false
+      [ -n "$OPENCODE_API_KEY" ] && opencode_key=true
+      opencode=$(has opencode)
+      [ "$opencode_key" = true ] && opencode=true
+      say "{\"vibe\":\"catalog\",\"providers\":[\
+{\"id\":\"anthropic\",\"name\":\"Anthropic\",\"oauth\":true,\"api_key\":true,\"configured\":$(has anthropic),\"models\":[{\"id\":\"claude-sonnet-4\",\"name\":\"Claude Sonnet 4\"}]},\
+{\"id\":\"openai\",\"name\":\"OpenAI\",\"oauth\":true,\"oauth_label\":\"Sign in with ChatGPT\",\"api_key\":true,\"configured\":$(has openai),\"models\":[{\"id\":\"gpt-5\",\"name\":\"GPT-5\"},{\"id\":\"gpt-5-mini\",\"name\":\"gpt-5-mini\"}]},\
+{\"id\":\"opencode\",\"name\":\"OpenCode Zen\",\"oauth\":false,\"api_key\":true,\"configured\":$opencode,\"models\":[{\"id\":\"deepseek-v4.1-flash\",\"name\":\"DeepSeek V4.1 Flash\"},{\"id\":\"gpt-5\",\"name\":\"GPT-5\"},{\"id\":\"has space\",\"name\":\"Not one to give back\"}]},\
+{\"id\":\"amazon-bedrock\",\"name\":\"Amazon Bedrock\",\"oauth\":false,\"api_key\":true,\"configured\":false,\"models\":[]}\
+]}"
+      while IFS= read -r line; do :; done
+      ;;
+    *'/vibe-login '*)
+      words=${line#*/vibe-login }
+      provider=${words%% *}
+      method=${words#* }
+      method=${method%%\"*}
+      case $provider in
+        no-such) say '{"vibe":"failed","message":"Unknown provider: no-such"}' ;;
+        goes-away) exit 3 ;;
+        slow)
+          # Never answers, so it can be given up on, as a browser never came back.
+          say '{"vibe":"event","type":"progress","message":"Waiting for your browser"}'
+          while IFS= read -r line; do :; done
+          ;;
+        *)
+          case $method in
+            api_key)
+              ask p1 '{"vibe":"prompt","type":"secret","message":"API key"}'
+              if [ "$answer" = refused ]; then
+                say '{"vibe":"failed","message":"That key was refused"}'
+              elif [ "$answer" = odd-shape ]; then
+                sign_in "$provider" odd
+                say '{"vibe":"done"}'
+              else
+                sign_in "$provider" api_key "$answer"
+                say '{"vibe":"event","type":"progress","message":"Getting its models…"}'
+                say '{"vibe":"done"}'
+              fi
+              ;;
+            *)
+              ask p1 '{"vibe":"prompt","type":"select","message":"Select login method:","options":[{"id":"browser","label":"Browser login (default)"},{"id":"device_code","label":"Device code login (headless)"}]}'
+              if [ "$answer" = device_code ]; then
+                ask p2 '{"vibe":"prompt","type":"text","message":"Enterprise domain (blank for none)","placeholder":"company.example"}'
+                say '{"vibe":"event","type":"device_code","userCode":"ABCD-1234","verificationUri":"https://auth.example/device?user_code=ABCD-1234","intervalSeconds":5,"expiresInSeconds":600}'
+                sign_in "$provider" oauth device-token
+                say '{"vibe":"done"}'
+              else
+                say '{"vibe":"event","type":"progress","message":"Listening for the callback"}'
+                port=$(cat "$dir/redirect-port" 2>/dev/null || echo 53692)
+                say '{"vibe":"event","type":"auth_url","url":"https://claude.ai/oauth/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A'"$port"'%2Fcallback&state=the-state","instructions":"Complete sign-in in your browser."}'
+                ask p3 '{"vibe":"prompt","type":"manual_code","message":"Paste the redirect URL here:","placeholder":"http://localhost/callback"}'
+                case $answer in
+                  *code=good*)
+                    sign_in "$provider" oauth "$answer"
+                    say '{"vibe":"done"}'
+                    ;;
+                  *) say '{"vibe":"failed","message":"State mismatch"}' ;;
+                esac
+              fi
+              ;;
+          esac
+          ;;
+      esac
+      ;;
+  esac
+  exit 0
+fi
 id= prompt= extension=
 # Whole or not at all, as a test reads them as soon as they're there.
 printf '%s\n' "$@" >"$PI_CODING_AGENT_SESSION_DIR.args.new"

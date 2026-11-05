@@ -67,6 +67,11 @@ pub const FORWARDED: &[&str] = &[
     "pi.status",
     "pi.install",
     "pi.forget",
+    "pi.models",
+    "pi.login.start",
+    "pi.login.get",
+    "pi.login.answer",
+    "pi.login.cancel",
 ];
 
 /// How long a forwarded call may take. Starting an agent fetches, cuts a
@@ -75,9 +80,9 @@ pub const FORWARDED: &[&str] = &[
 /// long as they need here, within reason. A send may wake an agent first.
 pub(crate) fn call_timeout(method: &str) -> Duration {
     match method {
-        "agents.start" | "projects.add" | "projects.remove" | "agents.delete" | "pi.install" => {
-            Duration::from_secs(60 * 60)
-        }
+        // The Pi for a list or a sign-in may have to be got first.
+        "agents.start" | "projects.add" | "projects.remove" | "agents.delete" | "pi.install"
+        | "pi.models" | "pi.login.start" => Duration::from_secs(60 * 60),
         "agents.send" | "sessions.attach" => Duration::from_secs(5 * 60),
         _ => Duration::from_secs(2 * 60),
     }

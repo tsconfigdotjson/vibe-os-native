@@ -120,6 +120,11 @@ pub struct Config {
     pub checks: Arc<dyn crate::doctor::HostChecks>,
     /// Where Pi's releases are, for `pi.install`.
     pub pi_releases: String,
+    /// What runs as Pi for its list and its sign-in, in place of the pinned one, in
+    /// tests.
+    pub pi_driver: Option<std::path::PathBuf>,
+    /// How long a Pi sign-in lasts with no client heard from.
+    pub pi_login_idle: Duration,
     /// The Linux images kept current in the background, on a Mac that
     /// runs `linux` agents in VMs: the doctor's `linux` check.
     pub linux_images: Option<Arc<crate::linux::Watch>>,
@@ -184,6 +189,8 @@ impl Config {
             },
             checks,
             pi_releases: crate::pi::releases_from_env(),
+            pi_driver: None,
+            pi_login_idle: Duration::from_secs(2 * 60),
             linux_images: None,
             vibe_cli: find_vibe(std::env::current_exe().ok().as_deref()),
             services: None,
@@ -404,6 +411,10 @@ pub struct Core {
     /// One edit of Claude's state at a time: agents may share its file.
     pub(crate) claude_lock: Arc<Mutex<()>>,
     pub(crate) pi_releases: String,
+    pub(crate) pi_driver: Option<std::path::PathBuf>,
+    pub(crate) pi_login_idle: Duration,
+    /// Pi's list and its sign-in, for the app.
+    pub(crate) pi_setup: crate::pi_setup::PiSetup,
     /// Held while Pi is being installed.
     pub(crate) pi_installing: tokio::sync::Mutex<()>,
     /// Why Pi couldn't be installed, the last time.
@@ -628,6 +639,9 @@ impl Core {
             agents_busy: Mutex::new(HashSet::new()),
             claude_lock: Arc::new(Mutex::new(())),
             pi_releases: config.pi_releases,
+            pi_driver: config.pi_driver,
+            pi_login_idle: config.pi_login_idle,
+            pi_setup: crate::pi_setup::PiSetup::default(),
             pi_installing: tokio::sync::Mutex::new(()),
             pi_install_failures: Mutex::default(),
             port_grant_tried: std::sync::atomic::AtomicBool::new(false),
@@ -752,6 +766,25 @@ impl Core {
     /// Numbers `event` and sends it to every subscriber.
     pub fn publish(&self, event: Event) {
         self.events.publish(event);
+    }
+
+    /// What says Pi's logins changed, for a task with no core to say it through.
+    pub(crate) fn pi_changed_publisher(&self) -> Box<dyn Fn() + Send + Sync> {
+        let (events, clock) = (Arc::clone(&self.events), Arc::clone(&self.clock));
+        Box::new(move || {
+            events.publish(Event {
+                seq: 0,
+                at: rfc3339(clock()),
+                host: LOCAL_HOST.into(),
+                kind: EventKind::PiChanged,
+                project: None,
+                agent: None,
+                state: None,
+                limit: None,
+                message: None,
+                status: None,
+            });
+        })
     }
 
     /// A new subscription, and the `seq` of the last event before it.

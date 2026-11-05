@@ -1,0 +1,80 @@
+{
+  "description": "The owner's own Pi, asked for its list: every provider it knows with whether it's signed in, those that are first. It comes from running Pi, offline, and changes no login. What can't be given back to Pi as one argument is left out.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 170,
+    "method": "pi.models",
+    "params": {
+      "host": "local",
+      "target": "native"
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 170,
+    "result": {
+      "host": "local",
+      "providers": [
+        {
+          "ambient": false,
+          "api_key": true,
+          "id": "openai",
+          "models": [
+            {
+              "id": "gpt-5",
+              "name": "GPT-5"
+            },
+            {
+              "id": "gpt-5-mini"
+            }
+          ],
+          "name": "OpenAI",
+          "oauth": true,
+          "oauth_label": "Sign in with ChatGPT",
+          "signed_in": true
+        },
+        {
+          "ambient": true,
+          "api_key": true,
+          "id": "amazon-bedrock",
+          "name": "Amazon Bedrock",
+          "oauth": false,
+          "signed_in": false
+        },
+        {
+          "ambient": false,
+          "api_key": true,
+          "id": "anthropic",
+          "models": [
+            {
+              "id": "claude-sonnet-4",
+              "name": "Claude Sonnet 4"
+            }
+          ],
+          "name": "Anthropic",
+          "oauth": true,
+          "signed_in": false
+        },
+        {
+          "ambient": false,
+          "api_key": true,
+          "id": "opencode",
+          "models": [
+            {
+              "id": "deepseek-v4.1-flash",
+              "name": "DeepSeek V4.1 Flash"
+            },
+            {
+              "id": "gpt-5",
+              "name": "GPT-5"
+            }
+          ],
+          "name": "OpenCode Zen",
+          "oauth": false,
+          "signed_in": false
+        }
+      ],
+      "target": "native"
+    }
+  }
+}

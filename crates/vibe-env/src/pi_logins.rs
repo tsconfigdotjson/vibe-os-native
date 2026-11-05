@@ -138,6 +138,18 @@ pub fn toolbox_copy(dir: &Path, store_dir: &Path) -> Copy {
     }
 }
 
+/// What a sign-in from the app left, in a directory made for it that nothing else
+/// has seen: the owner's own, as the toolbox's is, and fresh, so all that's in it is
+/// new. It's looked at once, by [`Broker::sync`], and then it's gone.
+pub fn sign_in_copy(dir: &Path, state: &Path) -> Copy {
+    Copy {
+        name: "the app's sign-in".to_owned(),
+        dir: dir.to_owned(),
+        state: state.to_owned(),
+        owner: true,
+    }
+}
+
 /// What [`Broker::sync`] found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Synced {
@@ -235,7 +247,7 @@ pub fn parse_plain(text: &str) -> Result<Map<String, Value>, String> {
 /// Whether `entry` is a login for a provider of this name, and if not, what to
 /// tell the owner. A name that isn't one is never repeated: it's a guest's text,
 /// on its way to the owner's terminal and Settings.
-fn plain_login(name: &str, entry: &Value) -> Result<(), String> {
+pub fn plain_login(name: &str, entry: &Value) -> Result<(), String> {
     if !pi::provider_name_ok(name) {
         return Err(if pi::name_means_only_itself(name) {
             ODD_NAME.to_owned()
@@ -322,6 +334,12 @@ fn plain_map(value: &Value) -> Result<(), &'static str> {
         plain_text(item.as_str().ok_or("holds more than plain values")?, false)?;
     }
     Ok(())
+}
+
+/// Why `key` couldn't be a login a VM is given, if it couldn't: what to say before Pi
+/// is ever given it, as Pi on the Mac runs a `!command` as soon as it's saved.
+pub fn plain_key(key: &str) -> Result<(), &'static str> {
+    plain_text(key, true)
 }
 
 /// Whether `text` means only itself. Pi runs one starting with `!`, and fills in
@@ -806,7 +824,7 @@ impl Broker {
                             provider: name.clone(),
                             text: format!(
                                 "{} signed in to {name}, and every Pi agent here now uses that \
-                                 login. If that wasn't you, sign in to it from the toolbox to \
+                                 login. If that wasn't you, sign in to it in Settings → Agents to \
                                  replace it.",
                                 copy.name
                             ),

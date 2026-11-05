@@ -1,0 +1,35 @@
+{
+  "description": "A browser login gives a page to open, and asks for where it ends in case nothing comes back to Pi.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 176,
+    "method": "pi.login.answer",
+    "params": {
+      "id": "606162636465666768696a6b6c6d6e6f",
+      "prompt": "p1",
+      "value": "browser"
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 176,
+    "result": {
+      "host": "local",
+      "id": "606162636465666768696a6b6c6d6e6f",
+      "instructions": "Complete sign-in in your browser.",
+      "method": "oauth",
+      "progress": "Listening for the callback",
+      "prompt": {
+        "id": "p3",
+        "kind": "manual_code",
+        "message": "Paste the redirect URL here:",
+        "placeholder": "http://localhost/callback"
+      },
+      "provider": "anthropic",
+      "seq": 6,
+      "state": "running",
+      "target": "native",
+      "url": "https://claude.ai/oauth/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A53692%2Fcallback&state=the-state"
+    }
+  }
+}
