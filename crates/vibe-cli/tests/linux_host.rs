@@ -1441,10 +1441,13 @@ fn real_linux_host() {
     // by VIBE_TEST_LINUX_PROJECT, start one, in a cgroup of its own, and
     // see it in the menu's listing.
     if let Ok(project) = std::env::var("VIBE_TEST_LINUX_PROJECT") {
+        // Unique to the run, as a delete keeps its agent's branch, and a name that has one
+        // is taken.
+        let name = format!("real-host-test-{}", std::process::id());
         let started = mcp.call(
             "vibe_start_agent",
             json!({"project": project, "profile": "software-eng-linux", "prompt": "Say hi",
-                   "host": "testhost", "name": "real-host-test"}),
+                   "host": "testhost", "name": name}),
         );
         eprintln!("{started}");
         assert!(started.contains("testhost:"), "{started}");
@@ -1455,8 +1458,9 @@ fn real_linux_host() {
         );
         mcp.call(
             "vibe_delete_agent",
-            json!({"agent": "testhost:real-host-test", "force": true}),
+            json!({"agent": format!("testhost:{name}"), "force": true}),
         );
+        drop_test_branches(&dest, &project, &[&name]);
     }
     // A hung connection, as a pulled cable would make it.
     let (_, events) = mac.core.subscribe();
@@ -1755,6 +1759,13 @@ impl Relays {
             let _ = Command::new("kill").args([which, pid]).status();
         }
     }
+
+    /// Lets them go on, and forgets them: a pid kept past now could be anyone's by the
+    /// end of the test.
+    fn resume(mut self) {
+        self.signal("-CONT");
+        self.0.clear();
+    }
 }
 
 impl Drop for Relays {
@@ -1763,59 +1774,127 @@ impl Drop for Relays {
     }
 }
 
-/// One round of every tool a host's own agents need, as a caller makes them, or the first
-/// that took 5 s or more. `name` is this round's agent.
-fn one_round_of_local_tools(c: &mut Outside, name: &str) -> Result<(), String> {
-    let mut timed = |tool: &str, args: Value| {
-        let begun = Instant::now();
-        let said = c.call(tool, args);
-        let took = begun.elapsed();
-        if took < Duration::from_secs(5) {
-            Ok(said)
-        } else {
-            Err(format!("{tool} took {took:?}: {said}"))
-        }
-    };
-    let listed = timed("vibe_list_agents", json!({}))?;
-    assert!(listed.contains("on-vps"), "{listed}");
-    let projects = timed("vibe_list_projects", json!({}))?;
-    assert!(projects.contains("host-only (on local)"), "{projects}");
-    // A project only this host has, with no host named.
-    let started = timed(
-        "vibe_start_agent",
-        json!({"project": "host-only", "profile": "small", "prompt": "talk", "name": name}),
-    )?;
-    assert!(started.contains(&format!("started {name}")), "{started}");
+/// The most a tool for a host's own agents may take, whatever's become of the Mac (#59).
+const PROMPTLY: Duration = Duration::from_secs(5);
+
+/// `tool`, on the stopwatch, with what it took said whether it passes or not.
+fn timed_within(
+    c: &mut Outside,
+    limit: Duration,
+    when: &str,
+    tool: &str,
+    args: Value,
+) -> Result<String, String> {
+    let begun = Instant::now();
+    let (error, said) = c.tool(tool, args);
+    let took = begun.elapsed();
+    eprintln!("{when}: {tool} took {took:?}");
+    if error {
+        Err(format!("{when}: {tool} failed: {said}"))
+    } else if took >= limit {
+        Err(format!("{when}: {tool} took {took:?}: {said}"))
+    } else {
+        Ok(said)
+    }
+}
+
+/// The first listing after the Mac goes, before the host's next look at its tunnel has
+/// told it so. It's timed, and it says the Mac's agent is unavailable.
+fn first_listing_with_the_mac_away(c: &mut Outside, when: &str, mac_agent: &str) -> String {
+    let listed = timed_within(c, PROMPTLY, when, "vibe_list_agents", json!({}))
+        .unwrap_or_else(|why| panic!("{why}"));
+    let mac_row = listed
+        .lines()
+        .find(|l| l.starts_with(mac_agent))
+        .unwrap_or_else(|| panic!("{when}: no {mac_agent} in {listed}"));
+    assert!(mac_row.contains("unavailable"), "{when}: {listed}");
+    listed
+}
+
+/// What a round of tools starts its agent in.
+struct Round<'a> {
+    project: &'a str,
+    profile: &'a str,
+    prompt: &'a str,
+    /// The host to name, when it's not to be found from the project.
+    host: Option<&'a str>,
+    /// The agent's name, and so its branch, which a delete keeps.
+    name: String,
+}
+
+/// One round of every tool a host's own agents need, as a caller makes them, each on the
+/// stopwatch, once: a second go would hide what waits on the Mac only some of the time.
+/// What it started doesn't outlast it, however it ends.
+fn every_local_tool_answers_promptly(c: &mut Outside, when: &str, round: &Round) {
+    if let Err(why) = one_round_of_local_tools(c, when, round) {
+        let _ = c.tool(
+            "vibe_delete_agent",
+            json!({"agent": round.name, "force": true}),
+        );
+        panic!("{why}");
+    }
+}
+
+fn one_round_of_local_tools(c: &mut Outside, when: &str, round: &Round) -> Result<(), String> {
+    let name = round.name.as_str();
+    timed_within(c, PROMPTLY, when, "vibe_list_agents", json!({}))?;
+    let projects = timed_within(c, PROMPTLY, when, "vibe_list_projects", json!({}))?;
+    if !projects.contains(&format!("{} (on local)", round.project)) {
+        return Err(format!("{when}: {projects}"));
+    }
+    let mut start = json!({"project": round.project, "profile": round.profile,
+                           "prompt": round.prompt, "name": name});
+    if let Some(host) = round.host {
+        start["host"] = json!(host);
+    }
+    let started = timed_within(c, PROMPTLY, when, "vibe_start_agent", start)?;
+    if !started.contains(&format!("started {name}")) {
+        return Err(format!("{when}: {started}"));
+    }
     // A bare ref on this host, through all of it.
-    let sent = timed("vibe_send", json!({"agent": name, "text": "hello"}))?;
-    assert!(sent.contains("sent to"), "{sent}");
-    timed("vibe_wait", json!({"agents": name, "timeout": 4}))?;
-    timed("vibe_read_output", json!({"agent": name}))?;
-    timed("vibe_read_messages", json!({"agent": name, "last": 1}))?;
-    let deleted = timed("vibe_delete_agent", json!({"agent": name, "force": true}))?;
-    assert!(deleted.contains("deleted"), "{deleted}");
+    let sent = timed_within(
+        c,
+        PROMPTLY,
+        when,
+        "vibe_send",
+        json!({"agent": name, "text": "hello"}),
+    )?;
+    if !sent.contains("sent to") {
+        return Err(format!("{when}: {sent}"));
+    }
+    // It's the answer that's timed here, not how long it's let wait.
+    let wait = json!({"agents": name, "timeout": 2});
+    timed_within(c, PROMPTLY, when, "vibe_wait", wait)?;
+    let read = json!({"agent": name});
+    timed_within(c, PROMPTLY, when, "vibe_read_output", read)?;
+    let read = json!({"agent": name, "last": 1});
+    timed_within(c, PROMPTLY, when, "vibe_read_messages", read)?;
+    let delete = json!({"agent": name, "force": true});
+    let deleted = timed_within(c, PROMPTLY, when, "vibe_delete_agent", delete)?;
+    if !deleted.contains("deleted") {
+        return Err(format!("{when}: {deleted}"));
+    }
     Ok(())
 }
 
-/// Every local tool under 5 s, whatever's become of the Mac. A busy machine can stall
-/// any of them, with a healthy Mac too, so a slow round gets another go. Anything waiting
-/// on the Mac would be slow every time, and so fail.
-fn every_local_tool_answers_promptly(c: &mut Outside, when: &str) {
-    let mut last = String::new();
-    for round in 0..3 {
-        let name = format!("while-{when}-{round}");
-        match one_round_of_local_tools(c, &name) {
-            Ok(()) => return,
-            Err(why) => {
-                eprintln!("{when}, round {round}: {why}");
-                last = why;
-                // What it started may be left: it's only in the way of nothing.
-                // Or it was never started, if a listing was what was slow.
-                let _ = c.tool("vibe_delete_agent", json!({"agent": name, "force": true}));
-            }
-        }
+/// Takes the branches a real test's agents kept out of `project` on `dest`: a delete keeps
+/// its agent's branch, and they're no one's work. It's said if they can't be.
+fn drop_test_branches(dest: &str, project: &str, branches: &[&str]) {
+    let script = format!(
+        "dir=$(.local/lib/vibeos/vibe project | awk -v p='{project}' '$1 == p {{ print $2 }}') \
+         && git -C \"$dir\" branch -q -D {}",
+        branches.join(" ")
+    );
+    let out = Command::new("ssh")
+        .args(["-o", "BatchMode=yes", "--", dest, &script])
+        .in_files()
+        .unwrap();
+    if !out.status.success() {
+        eprintln!(
+            "left the branches {branches:?} in {project} on {dest}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
-    panic!("{when}: every round had something slow, the last: {last}");
 }
 
 /// #59's integration, in real processes: a Mac and a Linux host's `vibed`, with the
@@ -1945,18 +2024,29 @@ fn external_access_answers_with_the_mac_asleep_or_stopped_body(watch: &Watch) {
     relays.signal("-STOP");
     // First, as a Mac still up restarts a tunnel gone quiet for a minute, which forgets
     // what it listed, and that's not what's being shown here.
-    let listed = c.call("vibe_list_agents", json!({}));
-    let mac_row = listed
-        .lines()
-        .find(|l| l.starts_with("mac:on-mac"))
-        .unwrap_or_else(|| panic!("{listed}"));
-    assert!(mac_row.contains("unavailable"), "{listed}");
-    every_local_tool_answers_promptly(&mut c, "asleep");
+    // What's this host's own comes first of all, before anything's found the Mac gone,
+    // and in less than a call that's waiting on the Mac gets given up on.
+    let read = json!({"agent": "on-vps", "last": 1});
+    let limit = Duration::from_secs(vibe_core::limits::PEER_READ);
+    timed_within(&mut c, limit, "asleep", "vibe_read_messages", read)
+        .unwrap_or_else(|why| panic!("{why}"));
+    let round = |when: &str| Round {
+        project: "host-only",
+        profile: "small",
+        prompt: "talk",
+        host: None,
+        name: format!("while-{when}"),
+    };
+    let listed = first_listing_with_the_mac_away(&mut c, "asleep", "mac:on-mac");
+    assert!(listed.contains("on-vps"), "{listed}");
+    every_local_tool_answers_promptly(&mut c, "asleep", &round("asleep"));
 
     // It wakes, and it all merges back with nothing done.
     watch.at("the Mac waking");
-    relays.signal("-CONT");
+    relays.resume();
+    let woke = Instant::now();
     wait_for("the Mac back", Duration::from_secs(60), || merged(&mut c));
+    eprintln!("the Mac was back {:?} after it woke", woke.elapsed());
     let read = c.call(
         "vibe_read_messages",
         json!({"agent": "mac:on-mac", "last": 1}),
@@ -1967,13 +2057,9 @@ fn external_access_answers_with_the_mac_asleep_or_stopped_body(watch: &Watch) {
     watch.at("the Mac stopping");
     drop(mac.rt);
     watch.at("the Mac stopped");
-    let listed = c.call("vibe_list_agents", json!({}));
-    let mac_row = listed
-        .lines()
-        .find(|l| l.starts_with("mac:on-mac"))
-        .unwrap_or_else(|| panic!("{listed}"));
-    assert!(mac_row.contains("unavailable"), "{listed}");
-    every_local_tool_answers_promptly(&mut c, "stopped");
+    let listed = first_listing_with_the_mac_away(&mut c, "stopped", "mac:on-mac");
+    assert!(listed.contains("on-vps"), "{listed}");
+    every_local_tool_answers_promptly(&mut c, "stopped", &round("stopped"));
 }
 
 /// `scripts/keep-host-state.sh`, against a real `vibed` on a stand-in host, doing what a
@@ -2138,8 +2224,15 @@ fn a_hosts_state_is_kept_body(watch: &Watch) {
 /// Encrypt: a client on the internet with the URL and a key starts and
 /// talks to an agent on this Mac, and one on the server when
 /// `VIBE_TEST_LINUX_PROJECT` names a project there; it gets nothing
-/// without a key; and nothing listens publicly on the Mac.
+/// without a key; and nothing listens publicly on the Mac. With its `ssh -R` stopped, as
+/// with a Mac asleep, the first listing and, with that project, every tool for the
+/// server's own agents answer in under 5 s, and the Mac merges back on its own.
 /// scripts/check-full.sh runs it on the Mac.
+///
+/// A host has one tunnel's end. So beside a real Mac linked to the same host, this test's
+/// tunnel takes it for as long as it runs, and the real one has it back about a minute
+/// after that began. Measured, a run takes 11 s, or 35 s with that project. One that takes
+/// over a minute loses it to the real Mac partway, and fails as that refuses its key.
 #[test]
 #[ignore = "needs a real Linux server with a public name: VIBE_TEST_LINUX_HOST, VIBE_HOST_BUNDLE and VIBE_TEST_EXTERNAL_DOMAIN"]
 fn real_external_access() {
@@ -2228,52 +2321,60 @@ fn real_external_access() {
     // with a Mac asleep: the server goes on answering, with the Mac's agents as last
     // seen, and has them back when it resumes.
     c.call("vibe_list_agents", json!({}));
-    let tunnel = my_ssh("ssh .*-R .*mac\\.sock").trim().to_owned();
-    assert!(!tunnel.is_empty(), "the Mac's ssh -R isn't running");
-    let signal = |which: &str| {
-        for pid in tunnel.lines() {
-            assert!(
-                Command::new("kill")
-                    .args([which, pid])
-                    .status()
-                    .unwrap()
-                    .success()
-            );
-        }
-    };
-    signal("-STOP");
-    let begun = Instant::now();
-    let listed = c.call("vibe_list_agents", json!({}));
-    let took = begun.elapsed();
-    signal("-CONT");
-    assert!(took < Duration::from_secs(10), "{took:?}");
-    assert!(listed.contains("mac:external-mac"), "{listed}");
-    assert!(listed.contains("unavailable"), "{listed}");
+    let tunnel = Relays(
+        my_ssh("ssh .*-R .*mac\\.sock")
+            .lines()
+            .map(str::to_owned)
+            .collect(),
+    );
+    assert!(!tunnel.0.is_empty(), "the Mac's ssh -R isn't running");
+    tunnel.signal("-STOP");
+    first_listing_with_the_mac_away(&mut c, "asleep", "mac:external-mac");
+    // Unique to the run, as a delete keeps its agent's branch, and a name that has one is
+    // taken.
+    let names = (
+        format!("while-asleep-{}", std::process::id()),
+        format!("external-vps-{}", std::process::id()),
+    );
+    let project = std::env::var("VIBE_TEST_LINUX_PROJECT").ok();
+    match &project {
+        // Named, as a real project may be on the Mac too.
+        Some(project) => every_local_tool_answers_promptly(
+            &mut c,
+            "asleep",
+            &Round {
+                project,
+                profile: "software-eng-linux",
+                prompt: "Say hi",
+                host: Some("local"),
+                name: names.0.clone(),
+            },
+        ),
+        None => eprintln!(
+            "asleep: only that listing's timed: VIBE_TEST_LINUX_PROJECT names no project for the rest"
+        ),
+    }
+    tunnel.resume();
+    let woke = Instant::now();
     wait_for("the Mac back", Duration::from_secs(60), || {
-        !c.call("vibe_list_agents", json!({}))
-            .contains("unavailable")
+        let listed = c.call("vibe_list_agents", json!({}));
+        listed.contains("mac:external-mac") && !listed.contains("unavailable")
     });
-    if let Ok(project) = std::env::var("VIBE_TEST_LINUX_PROJECT") {
+    eprintln!("the Mac was back {:?} after it woke", woke.elapsed());
+    if let Some(project) = &project {
+        let vps = names.1.as_str();
         let started = c.call(
             "vibe_start_agent",
             json!({"project": project, "profile": "software-eng-linux", "prompt": "Say hi",
-                   "host": "local", "name": "external-vps"}),
+                   "host": "local", "name": vps}),
         );
-        assert!(started.contains("started external-vps"), "{started}");
-        let waited = c.call(
-            "vibe_wait",
-            json!({"agents": "external-vps", "timeout": 240}),
-        );
+        assert!(started.contains(&format!("started {vps}")), "{started}");
+        let waited = c.call("vibe_wait", json!({"agents": vps, "timeout": 240}));
         eprintln!("{waited}");
-        let read = c.call(
-            "vibe_read_messages",
-            json!({"agent": "external-vps", "last": 2}),
-        );
+        let read = c.call("vibe_read_messages", json!({"agent": vps, "last": 2}));
         eprintln!("{read}");
-        c.call(
-            "vibe_delete_agent",
-            json!({"agent": "external-vps", "force": true}),
-        );
+        c.call("vibe_delete_agent", json!({"agent": vps, "force": true}));
+        drop_test_branches(&dest, project, &[&names.0, vps]);
     }
     c.call(
         "vibe_delete_agent",

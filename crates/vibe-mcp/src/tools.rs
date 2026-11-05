@@ -790,8 +790,11 @@ impl<D: Daemon> Server<D> {
                 async move { d.agents(&c, &h).await }
             })
             .await;
-        // After them: another host's can come with its agents.
-        let memory = tokio::time::timeout(self.daemon.peer_deadline(), self.daemon.memory(c))
+        // After them: another host's can come with its agents. The daemon gives up on a
+        // host at the deadline and keeps the rest, this host's own among them; this is
+        // for one that doesn't, so it mustn't go first.
+        let limit = self.daemon.peer_deadline() + PEER_GRACE;
+        let memory = tokio::time::timeout(limit, self.daemon.memory(c))
             .await
             .unwrap_or_default();
         for (h, answer) in answers {
