@@ -56,6 +56,9 @@ look() {
   printf '\n'
 }
 
+# What's installed there, for saying if a test changed it.
+vibed_version() { ssh_to ".local/lib/vibeos/vibed --version" 2>/dev/null; }
+
 first_line() { printf '%s\n' "$1" | sed -n 1p; }
 second_line() { printf '%s\n' "$1" | sed -n 2p; }
 
@@ -71,11 +74,11 @@ look_soon() {
 
 # serving DOMAIN: whether it answers there at all. Without a key, that's a 401.
 serving() {
-  local url=${KEEP_HOST_URL:-https://$1/mcp} code i
+  local url=${KEEP_HOST_URL:-https://$1/mcp} i
   for i in $(seq 1 30); do
     # shellcheck disable=SC2086
-    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 ${KEEP_HOST_CURL_ARGS:-} "$url") || true
-    case $code in 2* | 4*) return 0 ;; esac
+    serving_said=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 ${KEEP_HOST_CURL_ARGS:-} "$url") || true
+    case $serving_said in 2* | 4*) return 0 ;; esac
     sleep 2
   done
   return 1
@@ -91,7 +94,8 @@ before=$(look) || {
 }
 was_domain=$(first_line "$before")
 was_keys=$(second_line "$before")
-echo "keep-host-state: $dest before: external address $was_domain; keys: ${was_keys:-none}"
+was_vibed=$(vibed_version)
+echo "keep-host-state: $dest before: external address $was_domain; keys: ${was_keys:-none}; vibed: ${was_vibed:-none}"
 
 child=
 stop_child() {
@@ -109,7 +113,7 @@ stop_child() {
 
 status=0
 put_back() {
-  local code=$? now now_domain now_keys k line name wrong=
+  local code=$? now now_domain now_keys k line name said i looked now_vibed wrong=
   # Not `trap -`: another Ctrl-C, or the terminal closing, mustn't stop this halfway.
   trap '' INT TERM HUP
   trap - EXIT
@@ -122,17 +126,27 @@ put_back() {
   now_domain=$(first_line "$now")
   if [ "$now_domain" != "$was_domain" ]; then
     echo "keep-host-state: $dest's external address is $now_domain: putting back $was_domain"
-    # What it says is no use, and our output may have nowhere to go: it's looked at next.
-    ssh_to "$vibe host external local $was_domain" >/dev/null 2>&1 || wrong=1
-    now=$(look_soon) || wrong=1
-    now_domain=$(first_line "$now")
+    # More than once, as its vibed may be restarting, or just slow to answer, but not
+    # for ever: signals are ignored here, so nothing else would end it.
+    i=$((SECONDS + 300))
+    while :; do
+      said=$(ssh_to "$vibe host external local $was_domain" 2>&1) && said=
+      if looked=$(look_soon); then
+        now=$looked
+        now_domain=$(first_line "$now")
+      fi
+      [ "$now_domain" != "$was_domain" ] || { said=; break; }
+      [ "$SECONDS" -lt "$i" ] || break
+      sleep 5
+    done
+    [ -z "$said" ] || echo "keep-host-state: putting it back, $dest said: $said" >&2
   fi
   if [ "$now_domain" != "$was_domain" ]; then
     wrong=1
     echo "keep-host-state: $dest's external address should be $was_domain, and is $now_domain" >&2
   elif [ "$was_domain" != off ] && ! serving "$was_domain"; then
     wrong=1
-    echo "keep-host-state: $dest's external address is $was_domain, and nothing answers there" >&2
+    echo "keep-host-state: $dest's external address is $was_domain, and nothing answers there: the last try got HTTP ${serving_said:-nothing}" >&2
   fi
   now_keys=$(second_line "$now")
   for k in $was_keys; do
@@ -160,7 +174,13 @@ put_back() {
     esac
   done
   [ -z "$wrong" ] || exit 1
-  echo "keep-host-state: $dest is as it was"
+  now_vibed=$(vibed_version)
+  if [ "$now_vibed" != "$was_vibed" ]; then
+    # Not put back: a newer one's registry can't be read by an older one.
+    echo "keep-host-state: $dest's external address and keys are as they were; its vibed isn't: it was ${was_vibed:-none} and is ${now_vibed:-none}, which a test can't undo"
+  else
+    echo "keep-host-state: $dest is as it was"
+  fi
   exit "$status"
 }
 trap put_back EXIT

@@ -472,10 +472,20 @@ impl Core {
             }
         });
         // Settled before anyone's told, so the row they read is as it stands now.
+        let left_on = self.store().host(&link.name).ok().and_then(|h| h.version);
         {
             let mut upgrade = lock(&link.upgrade);
             upgrade.running = false;
             upgrade.error = done.as_ref().err().map(|e| e.message.clone());
+            upgrade.went_back_to = left_on.filter(|_| {
+                done.as_ref()
+                    .is_err_and(|e| e.message.contains(crate::remote::WENT_BACK))
+            });
+            // It worked, and no link's coming up to say so: nothing holds off the next.
+            if done.is_ok() && link.connected() {
+                upgrade.tried_at = None;
+                upgrade.reconnected = false;
+            }
         }
         let done = done.and_then(|installed| {
             self.record_install(link, &installed)?;
@@ -791,18 +801,36 @@ impl Core {
         self.reconcile_external(link);
         let theirs = self.store().host(&link.name).ok().and_then(|h| h.version);
         // Only up: a newer vibed's registry is one an older one can't read.
-        let behind = theirs.is_some_and(|v| older(&v, &self.info().version));
+        let behind = theirs
+            .as_deref()
+            .is_some_and(|v| older(v, &self.info().version));
         link.behind.store(behind, Ordering::SeqCst);
         if behind {
-            lock(&link.upgrade).reconnected = true;
+            // A try the network cut short needn't wait out the hour. One whose build
+            // wouldn't start does: a reconnect makes it no better, and each try cuts
+            // the host off for half a minute.
+            {
+                let mut upgrade = lock(&link.upgrade);
+                let bad_build = upgrade.went_back_to.is_some() && upgrade.went_back_to == theirs;
+                upgrade.reconnected = !bad_build;
+            }
             self.upgrade_in_background(link);
         } else {
             // It's what it should be, however that came about: nothing's left to say.
+            // Unless a try is under way, which this says nothing about, or this is what a
+            // build that wouldn't start went back to. Forgetting that would let the next
+            // look that finds no `vibed` put the same bad build straight back.
             let had = {
                 let mut upgrade = lock(&link.upgrade);
-                upgrade.tried_at = None;
-                upgrade.reconnected = false;
-                upgrade.error.take().is_some()
+                let bad_build = upgrade.went_back_to.is_some() && upgrade.went_back_to == theirs;
+                if upgrade.running || bad_build {
+                    false
+                } else {
+                    upgrade.tried_at = None;
+                    upgrade.reconnected = false;
+                    upgrade.went_back_to = None;
+                    upgrade.error.take().is_some()
+                }
             };
             if had {
                 self.host_link_changed(link);

@@ -1133,6 +1133,10 @@ pub fn unit_file(path: &str) -> String {
     )
 }
 
+/// What an install says of a build that wouldn't start, having put back the one before.
+/// It's how this Mac knows its own build is what's wrong: reinstalling it would do harm.
+pub const WENT_BACK: &str = "it went back to the one before";
+
 /// Puts the uploaded binaries in place, checked against their sums, writes
 /// the service if it changed, turns lingering on, and (re)starts `vibed`
 /// until it answers. Then says its version and which tools are missing on
@@ -1233,6 +1237,12 @@ fn configure_script(uploads: &[(&str, String)], unit: &str, path: &str) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_install_says_it_went_back_in_the_words_that_are_looked_for() {
+        let script = configure_script(&[("vibed", "sum".to_owned())], "unit", "/bin");
+        assert!(script.contains(WENT_BACK), "{script}");
+    }
 
     /// A channel to a far end the test plays, and that far end.
     fn a_channel() -> (Channel, tokio::io::DuplexStream) {

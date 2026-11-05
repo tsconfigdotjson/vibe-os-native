@@ -49,6 +49,8 @@ struct Wires {
     install_fails: Mutex<Option<String>>,
     /// The Mac's bundle holds an older build than the Mac.
     older_bundle: AtomicBool,
+    /// It holds just what the Mac runs, the Mac's being [`upgrades::MAC`].
+    macs_bundle: AtomicBool,
 }
 
 impl Wires {
@@ -60,6 +62,7 @@ impl Wires {
             installs: Mutex::new(0),
             install_fails: Mutex::new(None),
             older_bundle: AtomicBool::new(false),
+            macs_bundle: AtomicBool::new(false),
         })
     }
 
@@ -155,6 +158,8 @@ impl Remote for Wires {
                 label: "vps-1".into(),
                 version: if self.older_bundle.load(Ordering::SeqCst) {
                     "0.0.5".into()
+                } else if self.macs_bundle.load(Ordering::SeqCst) {
+                    upgrades::MAC.into()
                 } else {
                     env!("CARGO_PKG_VERSION").into()
                 },
@@ -1354,7 +1359,7 @@ mod upgrades {
     use super::*;
 
     /// The Mac's version, whatever this build's is.
-    const MAC: &str = "0.1.0";
+    pub(super) const MAC: &str = "0.1.0";
 
     async fn behind(timing: Timing) -> World {
         world_timed(timing, |c| c.info.version = "0.0.1".into()).await
@@ -1534,6 +1539,85 @@ mod upgrades {
             tries,
             "again at every ping"
         );
+    }
+
+    /// A build that wouldn't start is no better for a reconnect, and each try cuts the
+    /// host off for half a minute: it waits out the hour, and goes on saying why.
+    #[tokio::test]
+    async fn a_build_that_went_back_isnt_put_back_at_every_reconnect() {
+        let w = behind(Timing {
+            upgrade_retry: Duration::from_secs(60),
+            ..quick()
+        })
+        .await;
+        w.add_host().await;
+        installs_reach(&w, 2).await;
+        *w.wires.install_fails.lock().unwrap() = Some(format!(
+            "vibed didn't start on this build, so {}: it exited",
+            vibed::remote::WENT_BACK
+        ));
+        // It's behind again at a reconnect, and tries, and that build won't start.
+        w.wires.pull();
+        w.wait_link(HostLink::Down).await;
+        w.wires.plug_in();
+        installs_reach(&w, 3).await;
+        for _ in 0..500 {
+            if w.link().await.upgrade_error.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let installs = *w.wires.installs.lock().unwrap();
+        for _ in 0..5 {
+            w.wires.pull();
+            w.wait_link(HostLink::Down).await;
+            w.wires.plug_in();
+            w.wait_link(HostLink::Connected).await;
+            // Well past `quick`'s gap for a reconnect.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        assert_eq!(
+            *w.wires.installs.lock().unwrap(),
+            installs,
+            "it put it back"
+        );
+        let said = w.link().await.upgrade_error.expect("it still says why");
+        assert!(said.contains(vibed::remote::WENT_BACK), "{said}");
+    }
+
+    /// An install that worked holds nothing off, with no link coming up to say so: if the
+    /// host's `vibed` goes missing straight after, it's installed again.
+    #[tokio::test]
+    async fn one_that_worked_doesnt_hold_off_the_next() {
+        let w = world_timed(
+            Timing {
+                upgrade_retry: Duration::from_secs(60),
+                ..quick()
+            },
+            |c| c.info.version = MAC.into(),
+        )
+        .await;
+        w.wires.macs_bundle.store(true, Ordering::SeqCst);
+        w.add_host().await;
+        w.wait_link(HostLink::Connected).await;
+        w.mac
+            .upgrade_host(HostNameParams { host: "vps".into() })
+            .await
+            .unwrap();
+        let installs = *w.wires.installs.lock().unwrap();
+        let socket = w
+            .wires
+            .sockets
+            .lock()
+            .unwrap()
+            .get("me@vps.example.com")
+            .cloned()
+            .unwrap();
+        std::fs::rename(&socket, socket.with_extension("aside")).unwrap();
+        w.wires.pull();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        w.wires.plug_in();
+        installs_reach(&w, installs + 1).await;
     }
 
     /// A false alarm isn't left in the row of a host that's fine.
