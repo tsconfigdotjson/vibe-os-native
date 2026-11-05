@@ -44,9 +44,20 @@ if [ -f "$WORLD/ssh-no-key" ]; then
   echo 'git@github.com: Permission denied (publickey).' >&2
   exit 255
 fi
-# Past the host key, and let in: `git-upload-pack 'owner/name.git'`.
+# Past the host key, and let in. As OpenSSH reads them: options, as git sends
+# `-o SendEnv=GIT_PROTOCOL`, then the host, then `git-upload-pack 'owner/name.git'`.
+while [ $# -gt 0 ]; do
+  case $1 in
+  --) shift; break ;;
+  -[BDEFIJLOPQRSWbceilmopw]) shift 2 ;;
+  -*) shift ;;
+  *) break ;;
+  esac
+done
 shift
-name=${*##*/}
+# Joined first: `${*##*/}` is each argument's in some shells, macOS's `sh` among them.
+command=$*
+name=${command##*/}
 name=${name%.git\'}
 exec git-upload-pack "$WORLD/remotes/$name"
 "#;
