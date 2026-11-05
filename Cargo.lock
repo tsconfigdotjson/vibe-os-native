@@ -1663,14 +1663,14 @@ checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
 name = "vibe-bind"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "vibe-cli"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "libc",
  "rcgen",
@@ -1687,7 +1687,7 @@ dependencies = [
 
 [[package]]
 name = "vibe-core"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "libc",
  "rusqlite",
@@ -1700,7 +1700,7 @@ dependencies = [
 
 [[package]]
 name = "vibe-env"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "libc",
  "serde",
@@ -1716,7 +1716,7 @@ dependencies = [
 
 [[package]]
 name = "vibe-guest"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "libc",
  "serde",
@@ -1728,7 +1728,7 @@ dependencies = [
 
 [[package]]
 name = "vibe-mcp"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "bytes",
  "http",
@@ -1751,7 +1751,7 @@ dependencies = [
 
 [[package]]
 name = "vibe-relay"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "serde_json",
  "tempfile",
@@ -1759,7 +1759,7 @@ dependencies = [
 
 [[package]]
 name = "vibe-services"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "bytes",
  "http",
@@ -1780,7 +1780,7 @@ dependencies = [
 
 [[package]]
 name = "vibe-shim"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "libc",
  "serde_json",
@@ -1794,7 +1794,7 @@ dependencies = [
 
 [[package]]
 name = "vibe-status"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "agent-tail",
  "libc",
@@ -1806,7 +1806,7 @@ dependencies = [
 
 [[package]]
 name = "vibe-testguest"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "libc",
  "serde_json",
@@ -1814,7 +1814,7 @@ dependencies = [
 
 [[package]]
 name = "vibed"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "instant-acme",
  "libc",
