@@ -12,10 +12,12 @@
 #[path = "../../vibed/tests/common/mod.rs"]
 mod common;
 
+use std::cell::RefCell;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
+use std::panic::Location;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Output, Stdio};
 use std::sync::mpsc::{self, Receiver};
@@ -480,7 +482,9 @@ fn mac_with(
     }
 }
 
+#[track_caller]
 fn vibe(socket: &Path, args: &[&str]) -> Output {
+    step(&format!("vibe {}", args.join(" ")));
     common::output_in_files(Command::new(VIBE).arg("--socket").arg(socket).args(args)).unwrap()
 }
 
@@ -509,6 +513,10 @@ impl InFiles for Command {
 /// machine; a call they make can wait far longer than that, and a run that stops
 /// here stops a whole `check-full.sh` with it.
 const DEADLINE: Duration = Duration::from_secs(6 * 60);
+
+/// The same, against a real server and Let's Encrypt, with real models answering: what
+/// they wait for comes to around twenty minutes, at the longest.
+const REAL_DEADLINE: Duration = Duration::from_secs(30 * 60);
 
 /// What a test here tells [`bounded`] about itself.
 #[derive(Clone)]
@@ -543,6 +551,23 @@ impl Watch {
     }
 }
 
+thread_local! {
+    /// The [`Watch`] of the test [`bounded`] is running on this thread.
+    static WATCH: RefCell<Option<Watch>> = const { RefCell::new(None) };
+}
+
+/// Notes what the running test is doing and on which of its lines, so that every test
+/// says where it stuck, with no more said than the calls it makes.
+#[track_caller]
+fn step(what: &str) {
+    let line = Location::caller().line();
+    WATCH.with_borrow(|watch| {
+        if let Some(watch) = watch {
+            watch.at(&format!("{what} (line {line})"));
+        }
+    });
+}
+
 /// A temporary directory's own name: unique, and the same whether or not its
 /// path has been through a link, as `/tmp` is on a Mac.
 fn unique_name(dir: &Path) -> String {
@@ -562,6 +587,7 @@ fn bounded(within: Duration, test: impl FnOnce(&Watch) + Send + 'static) {
         std::thread::spawn(move || {
             // Gone however the test ends, a panic included.
             let _finished = finished;
+            WATCH.set(Some(watch.clone()));
             test(&watch);
         })
     };
@@ -632,6 +658,19 @@ fn a_stuck_test_fails_by_its_deadline() {
     })
     .unwrap_err();
     assert_eq!(panicked.downcast_ref::<&str>(), Some(&"its own failure"));
+}
+
+/// A test that says nothing of where it's got to is still told on by the calls it makes.
+#[test]
+fn a_test_past_its_deadline_says_what_it_was_waiting_for() {
+    let failed = std::panic::catch_unwind(|| {
+        bounded(Duration::from_millis(100), |_| {
+            wait_for("what never comes", Duration::from_secs(1), || false);
+        });
+    })
+    .unwrap_err();
+    let said = failed.downcast_ref::<String>().unwrap();
+    assert!(said.contains("at: what never comes (line "), "{said}");
 }
 
 /// The relays running out of `hosts`.
@@ -706,7 +745,9 @@ fn a_test_leaves_no_relay_behind_however_it_ends() {
     }
 }
 
+#[track_caller]
 fn wait_for(what: &str, within: Duration, mut done: impl FnMut() -> bool) {
+    step(what);
     let deadline = Instant::now() + within;
     while !done() {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
@@ -785,7 +826,9 @@ impl Bridge {
     }
 
     /// A tool's text.
+    #[track_caller]
     fn call(&mut self, tool: &str, arguments: Value) -> String {
+        step(tool);
         let r = self.request("tools/call", json!({"name": tool, "arguments": arguments}));
         r["result"]["content"][0]["text"]
             .as_str()
@@ -899,24 +942,7 @@ fn a_linux_host_added_over_ssh_runs_agents_the_mac_drives_body(watch: &Watch) {
     assert!(started.contains("vps:remote-one"), "{started}");
 
     // It shows in the menu's listing, with the line that attaches to it.
-    let listed: Value = serde_json::from_str(&ok(Command::new(VIBE)
-        .arg("--socket")
-        .arg(&mac.socket)
-        .arg("rpc")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .map(|mut c| {
-            writeln!(
-                c.stdin.take().unwrap(),
-                "{}",
-                json!({"jsonrpc": "2.0", "id": 1, "method": "agents.list", "params": {"host": "vps"}})
-            )
-            .unwrap();
-            c.wait_with_output().unwrap()
-        })
-        .unwrap()))
-    .unwrap();
+    let listed = on_mac(&mac, "agents.list", json!({"host": "vps"}));
     let agent = &listed["result"]["agents"][0];
     assert_eq!(agent["host"], "vps", "{listed}");
     assert_eq!(agent["ref"], "remote-one");
@@ -1067,7 +1093,9 @@ fn wait_for_link_down(
 }
 
 /// One JSON-RPC call on the Mac, as the app makes it.
+#[track_caller]
 fn on_mac(mac: &Mac, method: &str, params: Value) -> Value {
+    step(method);
     let line = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).to_string();
     let answer = mac.rt.block_on(vibed::dispatch::handle_message(
         &mac.core,
@@ -1407,6 +1435,10 @@ fn an_unreachable_server_is_refused_with_why_body(watch: &Watch) {
 #[ignore = "needs a real Linux server: VIBE_TEST_LINUX_HOST and VIBE_HOST_BUNDLE"]
 fn real_linux_host() {
     the_real_hosts_state_is_kept();
+    bounded(REAL_DEADLINE, real_linux_host_body);
+}
+
+fn real_linux_host_body(watch: &Watch) {
     let dest = std::env::var("VIBE_TEST_LINUX_HOST")
         .ok()
         .filter(|d| !d.is_empty())
@@ -1416,6 +1448,7 @@ fn real_linux_host() {
             .expect("VIBE_HOST_BUNDLE: the Linux builds to install"),
     );
     let golden = common::Golden::new();
+    watch.owns(golden.dir.path());
     let mac = mac(&golden, Path::new("ssh"), bundle);
     let added = ok(vibe(&mac.socket, &["host", "add", "testhost", &dest]));
     eprintln!("{added}");
@@ -1534,7 +1567,9 @@ impl Outside {
         (code, body.to_owned())
     }
 
+    #[track_caller]
     fn tool(&mut self, name: &str, arguments: Value) -> (bool, String) {
+        step(name);
         let (code, body) =
             self.request("tools/call", json!({"name": name, "arguments": arguments}));
         assert_eq!(code, 200, "{name}: {body}");
@@ -1546,6 +1581,7 @@ impl Outside {
         )
     }
 
+    #[track_caller]
     fn call(&mut self, name: &str, arguments: Value) -> String {
         let (error, text) = self.tool(name, arguments.clone());
         assert!(!error, "{name} {arguments}: {text}");
@@ -2098,10 +2134,10 @@ fn a_hosts_state_is_kept_body(watch: &Watch) {
     let prefix = key.key.prefix.clone();
     let host_vibe = host.home.join(".local/lib/vibeos/vibe");
     // Serving, as the host we mustn't break is, and asked for on the host itself.
-    let on_there = |args: &[&str]| ok(on_host(&host).args(args).output().unwrap());
+    let on_there = |args: &[&str]| ok(on_host(&host).args(args).in_files().unwrap());
     on_there(&["host", "external", "local", "vps.test"]);
     let domain_there = || {
-        ok(on_host(&host).arg("host").output().unwrap())
+        ok(on_host(&host).arg("host").in_files().unwrap())
             .lines()
             .find(|l| l.starts_with("local "))
             .unwrap()
@@ -2237,6 +2273,10 @@ fn a_hosts_state_is_kept_body(watch: &Watch) {
 #[ignore = "needs a real Linux server with a public name: VIBE_TEST_LINUX_HOST, VIBE_HOST_BUNDLE and VIBE_TEST_EXTERNAL_DOMAIN"]
 fn real_external_access() {
     the_real_hosts_state_is_kept();
+    bounded(REAL_DEADLINE, real_external_access_body);
+}
+
+fn real_external_access_body(watch: &Watch) {
     let need = |name: &str| {
         std::env::var(name)
             .ok()
@@ -2247,6 +2287,7 @@ fn real_external_access() {
     let domain = need("VIBE_TEST_EXTERNAL_DOMAIN");
     let bundle = PathBuf::from(need("VIBE_HOST_BUNDLE"));
     let golden = common::Golden::new();
+    watch.owns(golden.dir.path());
     let mac = mac(&golden, Path::new("ssh"), bundle);
     eprintln!(
         "{}",
