@@ -1273,7 +1273,9 @@ async fn git_maintenance_clears_only_a_stale_lock() {
 /// Item 2 of #69. Agents get `gc.auto=0`, as they leave gc to `vibed`. A `vibed` started
 /// from an agent's terminal has that too, and it mustn't turn its own gc off. So: the
 /// git_maintenance tests, in a process of their own, with what an agent has in its
-/// environment. `cargo test` clears these for every test, which is why this sets them.
+/// environment, and with the same setting the way `git -c` hands it on, as either
+/// alone turns gc off. `cargo test` clears these for every test, which is why this
+/// sets them.
 #[test]
 fn an_agents_git_settings_dont_turn_off_git_maintenance() {
     let mut run = std::process::Command::new(std::env::current_exe().unwrap());
@@ -1289,7 +1291,8 @@ fn an_agents_git_settings_dont_turn_off_git_maintenance() {
     .env("GIT_CONFIG_KEY_1", "gc.auto")
     .env("GIT_CONFIG_VALUE_1", "0")
     .env("GIT_CONFIG_KEY_2", "maintenance.auto")
-    .env("GIT_CONFIG_VALUE_2", "false");
+    .env("GIT_CONFIG_VALUE_2", "false")
+    .env("GIT_CONFIG_PARAMETERS", "'gc.auto=0'");
     let out = common::output_in_files(&mut run).unwrap();
     let said = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "{said}");
