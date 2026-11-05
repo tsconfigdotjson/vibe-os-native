@@ -1270,6 +1270,47 @@ async fn git_maintenance_clears_only_a_stale_lock() {
     assert_eq!(loose(), 0, "and the repo is packed");
 }
 
+/// Item 2 of #69. Agents get `gc.auto=0`, as they leave gc to `vibed`. A `vibed` started
+/// from an agent's terminal has that too, and it mustn't turn its own gc off. So: the
+/// git_maintenance tests, in a process of their own, with what an agent has in its
+/// environment. `cargo test` clears these for every test, which is why this sets them.
+#[test]
+fn an_agents_git_settings_dont_turn_off_git_maintenance() {
+    let mut run = std::process::Command::new(std::env::current_exe().unwrap());
+    run.args([
+        "git_maintenance_",
+        "--skip",
+        "an_agents_git_settings",
+        "--test-threads=1",
+    ])
+    .env("GIT_CONFIG_COUNT", "3")
+    .env("GIT_CONFIG_KEY_0", "push.autoSetupRemote")
+    .env("GIT_CONFIG_VALUE_0", "true")
+    .env("GIT_CONFIG_KEY_1", "gc.auto")
+    .env("GIT_CONFIG_VALUE_1", "0")
+    .env("GIT_CONFIG_KEY_2", "maintenance.auto")
+    .env("GIT_CONFIG_VALUE_2", "false");
+    let out = common::output_in_files(&mut run).unwrap();
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{said}");
+    // That it ran them, and not nothing.
+    assert!(
+        said.contains("git_maintenance_runs_no_hook_in_the_project ... ok"),
+        "{said}"
+    );
+}
+
+/// What's in a git config file is someone's choice: `gc.auto=0` there does stop it.
+#[tokio::test]
+async fn git_maintenance_goes_by_gc_auto_in_a_config_file() {
+    let w = world().await;
+    commit_loose_objects(&w.project);
+    git(&["-C", w.project.to_str().unwrap(), "config", "gc.auto", "0"]);
+    let before = loose_objects(&w.project);
+    w.core.maintain_if_quiet("local", "app", &w.project).await;
+    assert_eq!(loose_objects(&w.project), before, "it went by the setting");
+}
+
 #[tokio::test]
 async fn git_maintenance_runs_no_hook_in_the_project() {
     let w = world().await;

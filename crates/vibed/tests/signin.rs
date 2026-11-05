@@ -10,10 +10,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::{Golden, golden_checks, write_script};
-use vibe_core::model::{CheckId, CheckState, GhState, SignInState, SignInWhat, ToolboxState};
+#[cfg(target_os = "linux")]
+use vibe_core::model::{CheckId, CheckState};
+use vibe_core::model::{GhState, SignInState, SignInWhat, ToolboxState};
+#[cfg(target_os = "linux")]
+use vibe_core::rpc::DoctorFixParams;
 use vibe_core::rpc::{
-    DoctorFixParams, ErrorCode, NoParams, SignIn, SignInAnswerParams, SignInGetParams,
-    SignInParams, SignInStartParams,
+    ErrorCode, NoParams, SignIn, SignInAnswerParams, SignInGetParams, SignInParams,
+    SignInStartParams,
 };
 use vibe_env::testing::TestToolbox;
 use vibed::core::Core;
@@ -425,6 +429,7 @@ async fn a_flow_that_cant_start_leaves_nothing_behind() {
 
 // Tools.
 
+#[cfg(target_os = "linux")]
 fn publish_gh(root: &Path) {
     use std::os::unix::fs::PermissionsExt;
     let version = vibe_env::tools::GH_PINNED;
