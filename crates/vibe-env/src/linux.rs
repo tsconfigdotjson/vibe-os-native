@@ -49,6 +49,7 @@ use vibe_core::units::MIB;
 use crate::claude::{CONFIG_DIR_ENV, ClaudeHome};
 use crate::guest::{self, GuestState, boot, proto};
 use crate::images::{Images, Layers};
+use crate::toolbox::{GITHUB_OVER_HTTPS, GUEST_HOME, output_tail};
 use crate::tree::SessionTree;
 use crate::vm::{self, Disk, Share, VmConfig, VmError};
 use crate::{
@@ -140,6 +141,10 @@ pub trait Machine: Send + Sync + fmt::Debug {
 
 /// How long dialing a port in the guest may take.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long seeing to git's way to GitHub may take as a VM comes up: it runs a few
+/// small commands, none over the network.
+const GITHUB_SETUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The real thing: `vibe-vm` and the guest behind it.
 #[derive(Debug, Clone)]
@@ -589,7 +594,33 @@ impl LinuxVm {
             let _ = self.machine.stop(&socket);
             return Err(e);
         }
+        self.see_to_github(h);
         Ok(())
+    }
+
+    /// Has git in this agent's VM reach GitHub with the Linux home's `gh` login, whenever
+    /// that home was signed in ([`GITHUB_OVER_HTTPS`]). Nothing stops for it: a push that
+    /// can't get through says so at the time.
+    fn see_to_github(&self, h: &Handle) {
+        let ran = self.machine.run(
+            &self.socket(h),
+            &proto::Run {
+                command: vec!["/bin/bash".into(), "-c".into(), GITHUB_OVER_HTTPS.into()],
+                env: Default::default(),
+                cwd: Some(GUEST_HOME.into()),
+                timeout_ms: GITHUB_SETUP_TIMEOUT.as_millis() as u64,
+            },
+        );
+        let why = match ran {
+            Ok(ran) if ran.code == Some(0) => return,
+            Ok(ran) if ran.timed_out => "it ran out of time".to_owned(),
+            Ok(ran) => output_tail(&ran.output),
+            Err(e) => e.to_string(),
+        };
+        eprintln!(
+            "vibe-env: can't set {}'s git up for GitHub: {why}",
+            h.agent_ref
+        );
     }
 
     fn unsupervise(&self, h: &Handle) {
@@ -855,8 +886,12 @@ impl Compartment for LinuxVm {
             }
         }
         command.extend(launch.args.iter().cloned());
-        self.ensure_running(h)?;
         let socket = self.socket(h);
+        // A VM that's up came up before this build, perhaps, or the home's sign-in.
+        if self.machine.running(&socket) {
+            self.see_to_github(h);
+        }
+        self.ensure_running(h)?;
         self.machine.launch(
             &socket,
             &guest::Launch {
@@ -1085,6 +1120,7 @@ impl Sleeper for LinuxVm {
                     *lock(&s.paused) = None;
                 }
             }
+            self.see_to_github(h);
             return Ok(match status.state {
                 GuestState::Running if LinuxVm::shim_alive(h) => Woke::Exact,
                 // Claude goes on in the VM; a new shim reconnects to it.
@@ -1115,6 +1151,7 @@ impl Sleeper for LinuxVm {
         }
         self.machine.ready(&socket, RESTORE_PATIENCE)?;
         self.machine.thaw(&socket, SystemTime::now())?;
+        self.see_to_github(h);
         Ok(Woke::Reattach(end))
     }
 

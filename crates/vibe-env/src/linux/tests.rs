@@ -222,7 +222,7 @@ fn launch_boots_and_starts_claude_with_the_token() {
         }
     );
     // The clock is set as soon as the guest answers.
-    assert_eq!(s.fake.calls(), ["create", "boot", "clock", "launch"]);
+    assert_eq!(s.fake.calls(), ["create", "boot", "clock", "run", "launch"]);
     let launch = lock(&s.fake.state).launches[0].clone();
     assert_eq!(launch.command, ["claude", "--session-id", "s", "--", "hi"]);
     assert_eq!(launch.cwd.as_deref(), h.worktree.to_str());
@@ -350,8 +350,9 @@ fn sleep_saves_and_wake_restores_on_a_new_shim() {
     assert!(!snapshot.exists(), "a snapshot is never restored twice");
     let calls = s.fake.calls();
     assert_eq!(
-        &calls[calls.len() - 4..],
-        ["freeze", "sleep", "restore", "thaw"]
+        &calls[calls.len() - 5..],
+        // Then git's way to GitHub is seen to, on a guest that's thawed.
+        ["freeze", "sleep", "restore", "thaw", "run"]
     );
     assert!(!s.fake.vm(&s.socket("quiet-amber-otter")).frozen);
 
@@ -443,10 +444,11 @@ fn a_command_runs_to_completion_inside_beside_claude() {
     assert_eq!(
         s.fake.calls(),
         // The clock before `.vibe/setup.sh`, which comes before the launch.
-        ["create", "boot", "clock", "run"],
+        // After seeing to git's way to GitHub.
+        ["create", "boot", "clock", "run", "run"],
         "it boots the VM first"
     );
-    let sent = lock(&s.fake.state).runs[0].clone();
+    let sent = lock(&s.fake.state).runs.last().unwrap().clone();
     assert_eq!(sent.command, ["/bin/sh", ".vibe/setup.sh"]);
     assert_eq!(sent.cwd.as_deref(), h.worktree.to_str());
     assert_eq!(sent.timeout_ms, 10_000);
@@ -465,6 +467,61 @@ fn a_command_runs_to_completion_inside_beside_claude() {
     let vm = s.fake.vm(&s.socket("quiet-amber-otter"));
     assert!(vm.running && vm.session == Some(None), "Claude goes on");
     assert_eq!(s.fake.calls().last().unwrap(), "run");
+}
+
+/// The runs that saw to git's way to GitHub, so far.
+fn github_setups(s: &Setup) -> Vec<proto::Run> {
+    lock(&s.fake.state)
+        .runs
+        .iter()
+        .filter(|r| r.command.last().map(String::as_str) == Some(GITHUB_OVER_HTTPS))
+        .cloned()
+        .collect()
+}
+
+#[test]
+fn git_is_seen_to_for_github_whenever_an_agents_vm_comes_up() {
+    let s = Setup::new();
+    let h = s.backend.create(&s.spec("quiet-amber-otter")).unwrap();
+    lock(&s.fake.state).run_output = Some((String::new(), 0));
+    assert!(github_setups(&s).is_empty(), "nothing's up yet");
+
+    // A first boot: before `.vibe/setup.sh`, or Claude, can want it, and the clock's set.
+    s.launch(&h).unwrap();
+    assert_eq!(s.fake.calls(), ["create", "boot", "clock", "run", "launch"]);
+    let setups = github_setups(&s);
+    assert_eq!(setups.len(), 1);
+    assert_eq!(setups[0].cwd.as_deref(), Some(GUEST_HOME));
+    assert!(setups[0].env.is_empty(), "it gets nothing of the launch's");
+
+    // A launch in a VM that was up, which may have come up before the home's sign-in.
+    s.fake.exit(&s.socket("quiet-amber-otter"), 0);
+    s.launch(&h).unwrap();
+    assert_eq!(github_setups(&s).len(), 2);
+
+    // Woken from a snapshot.
+    s.backend.sleep(&h).unwrap();
+    assert!(matches!(s.backend.wake(&h).unwrap(), Woke::Reattach(_)));
+    assert_eq!(github_setups(&s).len(), 3);
+
+    // Woken where it's been running all along.
+    s.backend.wake(&h).unwrap();
+    assert_eq!(github_setups(&s).len(), 4);
+}
+
+#[test]
+fn an_agent_starts_whatever_seeing_to_github_finds() {
+    let s = Setup::new();
+    let h = s.backend.create(&s.spec("quiet-amber-otter")).unwrap();
+    // It says it failed, and then that it ran out of time.
+    lock(&s.fake.state).run_output = Some(("could not lock config file\n".into(), 1));
+    s.launch(&h).unwrap();
+    assert_eq!(s.fake.calls().last().unwrap(), "launch");
+    s.fake.exit(&s.socket("quiet-amber-otter"), 0);
+    lock(&s.fake.state).run_output = None;
+    s.launch(&h).unwrap();
+    assert_eq!(s.fake.calls().last().unwrap(), "launch");
+    assert_eq!(github_setups(&s).len(), 2);
 }
 
 #[test]
