@@ -95,7 +95,13 @@ impl Conn {
             match (&self.stream).write(&bytes[sent..]) {
                 Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
                 Ok(n) => sent += n,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                // `WouldBlock` is the socket's send timeout, with nothing
+                // taken: only the deadline says the shim has gone.
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                    ) => {}
                 Err(e) => return Err(e),
             }
         }
@@ -421,7 +427,7 @@ impl Agent {
         s.screen.process(bytes);
         // Written with the lock held, so output, a redraw and the exit
         // reach the shim in order. A shim that stops reading is dropped
-        // after the socket's send timeout.
+        // after `SEND_TIMEOUT`.
         if let Some(conn) = s.conn.clone()
             && let Err(e) = conn.send_output(bytes)
         {

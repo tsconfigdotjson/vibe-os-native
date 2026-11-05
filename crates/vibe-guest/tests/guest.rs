@@ -365,6 +365,32 @@ fn the_command_runs_on_when_the_shim_goes_and_the_next_one_sees_the_screen() {
     assert!(alive(pid));
 }
 
+/// A shim that stops reading for a moment under a flood, as a busy host's will,
+/// is kept: dropping it costs its clients their connection, and it would end with
+/// no record. One that stays stopped goes after `SEND_TIMEOUT`.
+#[test]
+fn a_shim_that_stalls_under_a_flood_is_given_a_few_seconds() {
+    let g = Guest::start("stall", false, &[]);
+    let pid = g.launch(&["sh"]);
+    let mut t = g.attach(None);
+    t.send("while :; do echo spam; done\n");
+    t.expect("spam");
+    // Over the 1 s one write may block, well under the 5 s a frame has.
+    std::thread::sleep(Duration::from_secs(2));
+    let reading = Instant::now();
+    while reading.elapsed() < Duration::from_secs(1) {
+        assert!(t.pump(WAIT), "dropped after a stall: {}", g.log());
+    }
+    assert!(!g.log().contains("dropped"), "{}", g.log());
+
+    let stopped = Instant::now();
+    wait_until("the guest to drop the shim", || {
+        g.log().contains("the shim fell behind")
+    });
+    assert!(stopped.elapsed() > Duration::from_secs(4), "{}", g.log());
+    assert!(alive(pid));
+}
+
 #[test]
 fn the_environment_reaches_the_command_and_never_the_log() {
     let g = Guest::start("env", false, &[]);

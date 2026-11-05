@@ -11,6 +11,7 @@ use std::os::unix::net::UnixStream as StdUnixStream;
 use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -53,9 +54,18 @@ const BACKLOG: usize = 256;
 /// which a command's end would then have to wait for.
 const OUTPUT_QUEUE: usize = 8;
 
-/// Input chunks waiting for a command that isn't reading, such as one that's
-/// stopped. Past this, input is dropped rather than held.
-const INPUT_BACKLOG: usize = 1024;
+/// How much input may wait for a command that isn't reading, such as one that's
+/// stopped. Past this, input is dropped rather than held. Counted in bytes, as a
+/// chunk may be a keystroke or a whole frame; two frames' worth, so a queue with
+/// room for little else still takes the largest there is.
+const INPUT_BACKLOG: usize = 2 * shim::MAX_FRAME;
+
+/// What anything waiting for the terminal counts for beyond its bytes, so that a
+/// client sending them one at a time can't hold much more than [`INPUT_BACKLOG`].
+const QUEUED_COST: usize = 64;
+
+/// After `accept` fails, how long before trying it again.
+const ACCEPT_RETRY: Duration = Duration::from_millis(100);
 
 /// How long writing to a client may block before it counts as gone. A
 /// terminal that stops reading mustn't stay attached forever.
@@ -131,7 +141,11 @@ struct State {
     screen: Screen,
     size: Size,
     end: End,
-    input: std::sync::mpsc::SyncSender<ToTerm>,
+    input: std::sync::mpsc::Sender<ToTerm>,
+    /// What the input queue holds, as [`ToTerm::cost`] counts it.
+    input_waiting: Arc<AtomicUsize>,
+    /// Bytes of input dropped since any was last taken.
+    input_dropped: usize,
     out: broadcast::Sender<Out>,
     clients: BTreeMap<u64, Attached>,
     next_id: u64,
@@ -166,7 +180,7 @@ impl State {
                 }
             }
             End::Guest => {
-                if self.input.try_send(ToTerm::Resize(size)).is_err() {
+                if !self.queue(ToTerm::Resize(size)) {
                     log!("can't pass a resize to {size} on to the guest");
                     return;
                 }
@@ -174,6 +188,38 @@ impl State {
         }
         self.size = size;
         self.screen.resize(size);
+    }
+
+    /// Queues something for the terminal; false if too much is waiting already.
+    fn queue(&self, m: ToTerm) -> bool {
+        let cost = m.cost();
+        if self.input_waiting.load(Ordering::Relaxed) + cost > INPUT_BACKLOG {
+            return false;
+        }
+        self.input_waiting.fetch_add(cost, Ordering::Relaxed);
+        // It fails only once the terminal can't be written to at all.
+        let _ = self.input.send(m);
+        true
+    }
+
+    /// Queues input. What's lost is logged once for a run of drops, as a paste
+    /// can come to thousands.
+    fn queue_input(&mut self, bytes: Vec<u8>) {
+        let len = bytes.len();
+        if !self.queue(ToTerm::Input(bytes)) {
+            if self.input_dropped == 0 {
+                log!("the command isn't reading its input; dropping what doesn't fit");
+            }
+            self.input_dropped += len;
+            return;
+        }
+        if self.input_dropped > 0 {
+            log!(
+                "dropped {} bytes of input the command wasn't reading",
+                self.input_dropped
+            );
+            self.input_dropped = 0;
+        }
     }
 
     fn touch(&mut self, id: u64) {
@@ -255,11 +301,7 @@ impl State {
                 if let Some(id) = id {
                     self.touch(id);
                 }
-                if let Err(std::sync::mpsc::TrySendError::Full(_)) =
-                    self.input.try_send(ToTerm::Input(bytes))
-                {
-                    log!("the command isn't reading its input; dropped some");
-                }
+                self.queue_input(bytes);
             }
             Event::Resize(id, size) => {
                 if size.is_valid()
@@ -342,6 +384,16 @@ enum ToTerm {
     Resize(Size),
 }
 
+impl ToTerm {
+    /// What it counts for in the queue.
+    fn cost(&self) -> usize {
+        match self {
+            ToTerm::Input(bytes) => bytes.len() + QUEUED_COST,
+            ToTerm::Resize(_) => QUEUED_COST,
+        }
+    }
+}
+
 /// Which terminal the shim holds.
 #[derive(Debug, Clone, Copy)]
 enum End {
@@ -363,11 +415,19 @@ pub(crate) enum TerminalEnd {
 
 /// Writes input to the terminal, in order. A command that stops reading
 /// blocks this thread only.
-fn write_pty(mut master: File, input: std::sync::mpsc::Receiver<ToTerm>) {
+fn write_pty(
+    mut master: File,
+    input: std::sync::mpsc::Receiver<ToTerm>,
+    waiting: Arc<AtomicUsize>,
+) {
     while let Ok(m) = input.recv() {
-        if let ToTerm::Input(bytes) = m
-            && master.write_all(&bytes).is_err()
-        {
+        let cost = m.cost();
+        let written = match m {
+            ToTerm::Input(bytes) => master.write_all(&bytes),
+            ToTerm::Resize(_) => Ok(()),
+        };
+        waiting.fetch_sub(cost, Ordering::Relaxed);
+        if written.is_err() {
             return;
         }
     }
@@ -407,8 +467,13 @@ fn read_guest(mut stream: StdUnixStream, events: mpsc::Sender<Event>) {
 }
 
 /// Writes input and resizes to the guest's terminal, in order.
-fn write_guest(mut stream: StdUnixStream, input: std::sync::mpsc::Receiver<ToTerm>) {
+fn write_guest(
+    mut stream: StdUnixStream,
+    input: std::sync::mpsc::Receiver<ToTerm>,
+    waiting: Arc<AtomicUsize>,
+) {
     while let Ok(m) = input.recv() {
+        let cost = m.cost();
         let sent = match m {
             ToTerm::Input(bytes) => guest::output_frames(guest::FrameKind::Input, &bytes)
                 .try_for_each(|f| guest::write_frame(&mut stream, &f)),
@@ -423,6 +488,7 @@ fn write_guest(mut stream: StdUnixStream, input: std::sync::mpsc::Receiver<ToTer
                 )
             }
         };
+        waiting.fetch_sub(cost, Ordering::Relaxed);
         if sent.is_err() {
             return;
         }
@@ -445,7 +511,9 @@ pub(crate) async fn run(
     // slow enough that requests behind a queue of them take seconds, and `vibed`
     // takes a shim that slow to answer for a broken one.
     let (output_tx, mut output) = mpsc::channel::<Event>(OUTPUT_QUEUE);
-    let (input_tx, input_rx) = std::sync::mpsc::sync_channel(INPUT_BACKLOG);
+    // Capped by `State::queue_input`, in bytes.
+    let (input_tx, input_rx) = std::sync::mpsc::channel();
+    let input_waiting = Arc::new(AtomicUsize::new(0));
     // Keep a PTY's master open for the resize ioctl until the end.
     let (end_kind, _master) = match end {
         TerminalEnd::Pty(Pty { master, mut child }) => {
@@ -459,9 +527,10 @@ pub(crate) async fn run(
             }
             {
                 let writer = master.try_clone()?;
+                let waiting = input_waiting.clone();
                 std::thread::Builder::new()
                     .name("pty-write".into())
-                    .spawn(move || write_pty(writer, input_rx))?;
+                    .spawn(move || write_pty(writer, input_rx, waiting))?;
             }
             {
                 let tx = events_tx.clone();
@@ -492,9 +561,10 @@ pub(crate) async fn run(
                     .name("guest-read".into())
                     .spawn(move || read_guest(reader, tx))?;
             }
+            let waiting = input_waiting.clone();
             std::thread::Builder::new()
                 .name("guest-write".into())
-                .spawn(move || write_guest(stream, input_rx))?;
+                .spawn(move || write_guest(stream, input_rx, waiting))?;
             (End::Guest, None)
         }
     };
@@ -515,6 +585,8 @@ pub(crate) async fn run(
         size,
         end: end_kind,
         input: input_tx,
+        input_waiting,
+        input_dropped: 0,
         out,
         clients: BTreeMap::new(),
         next_id: 1,
@@ -528,16 +600,13 @@ pub(crate) async fn run(
     let mut hup = signal(SignalKind::hangup())?;
     let mut tasks = JoinSet::new();
     let mut kill_at: Option<tokio::time::Instant> = None;
+    let mut accept_at: Option<tokio::time::Instant> = None;
     let mut pty_closed = false;
     let guest = matches!(end_kind, End::Guest);
 
     let exit = loop {
-        let kill_timer = async {
-            match kill_at {
-                Some(at) => tokio::time::sleep_until(at).await,
-                None => std::future::pending().await,
-            }
-        };
+        let kill_timer = until(kill_at);
+        let accept_timer = until(accept_at);
         // In this order, with the terminal's output last (see `output`).
         let event = tokio::select! {
             biased;
@@ -568,14 +637,21 @@ pub(crate) async fn run(
                 continue;
             }
             event = events.recv() => event,
-            accepted = listener.accept() => {
+            () = accept_timer => {
+                accept_at = None;
+                continue;
+            }
+            accepted = listener.accept(), if accept_at.is_none() => {
                 match accepted {
                     Ok((stream, _)) => {
                         tasks.spawn(connection(stream, events_tx.clone(), welcome.clone()));
                     }
                     Err(e) => {
                         log!("accept failed: {e}");
-                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        // Left alone till then, rather than slept on here: out
+                        // of descriptors, it would fail again on every pass,
+                        // and nothing after it here would ever be reached.
+                        accept_at = Some(tokio::time::Instant::now() + ACCEPT_RETRY);
                     }
                 }
                 continue;
@@ -661,6 +737,14 @@ pub(crate) async fn run(
     })
     .await;
     Ok(Some(exit))
+}
+
+/// Waits for a time, or for ever if there's none.
+async fn until(at: Option<tokio::time::Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
 }
 
 fn stop_leaving_guest() -> Option<SessionExit> {
