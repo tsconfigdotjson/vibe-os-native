@@ -1,0 +1,17 @@
+# What scripts/advisories.sh holds Cargo.lock to (PRD: Auth, security and trust,
+# Dependencies), with cargo-deny's advisories check alone: every crate in the
+# lockfile, dev-dependencies and every platform's included, against RustSec.
+[advisories]
+# Unmaintained and unsound crates fail it as a vulnerable one does, all of them,
+# not only direct dependencies, as most of what faces the network is indirect.
+unmaintained = "all"
+unsound = "all"
+# A crate its own author pulled is one to move off, whatever the reason was.
+yanked = "deny"
+# An exception that no longer matches anything goes, so this list stays true.
+unused-ignored-advisory = "deny"
+# Every exception is listed with why it can't be fixed yet, and why it's safe
+# until it can:
+#   { id = "RUSTSEC-0000-0000", reason = "..." },
+# None today.
+ignore = []

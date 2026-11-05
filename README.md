@@ -23,7 +23,7 @@ truth.
 | `swift/VibeOS` | `VibeOS.app`, the SwiftUI menu bar app, and `VibeRPC`, its socket client |
 | `swift/vibe-vm` | `vibe-vm`, the Virtualization.framework helper |
 | `protocol/` | The socket contract both sides are tested against, `vibe-vm`'s in `protocol/vibe-vm/` and `vibe-guest`'s in `protocol/vibe-guest/`; see the READMEs |
-| `scripts/` | `check-full.sh` runs every check; `sign-macos.sh` signs for local use; `test-guest.sh` builds the test guest; `base-image.sh` builds the Linux base image (with Docker); `vm-reboot-test.sh` checks a saved VM survives a reboot; `host-bundle.sh` builds the Linux `vibed` that Add Linux Host installs, with `zig-tools.sh` fetching what that takes on first use; `release-macos.sh` builds a release DMG; `sparkle.py` signs it for Sparkle and writes the appcast |
+| `scripts/` | `check-full.sh` runs every check; `advisories.sh` holds `Cargo.lock` to RustSec, by `deny.toml`'s rules; `sign-macos.sh` signs for local use; `test-guest.sh` builds the test guest; `base-image.sh` builds the Linux base image (with Docker); `vm-reboot-test.sh` checks a saved VM survives a reboot; `host-bundle.sh` builds the Linux `vibed` that Add Linux Host installs, with `zig-tools.sh` fetching what that takes on first use; `release-macos.sh` builds a release DMG; `sparkle.py` signs it for Sparkle and writes the appcast |
 
 Every crate builds on macOS and Linux (x86_64 and arm64); `vibe-guest` and
 `vibe-testguest` do their work only as static `aarch64-unknown-linux-musl`
@@ -120,8 +120,8 @@ socket. The app's rows attach Terminal with `/usr/local/bin/vibe`, or
 scripts/check-full.sh
 ```
 
-One command for everything: Rust fmt, clippy, build and test; the
-`vibe-guest` cross-build; a `vibed` smoke test; on a Mac, both Swift packages,
+One command for everything: Rust fmt, clippy, build and test; `Cargo.lock`
+against RustSec; the `vibe-guest` cross-build; a `vibed` smoke test; on a Mac, both Swift packages,
 the Swift contract tests, signing with the virtualization entitlement,
 smoke tests of `vibe-vm` and `VibeOS.app` against a live `vibed`, the menu
 following a live agent and two clicks giving one Terminal tab; a Linux host
@@ -145,8 +145,10 @@ then `scripts/vm-reboot-test.sh restore`.
 Push a tag `vX.Y.Z`, where `X.Y.Z` is the version in `Cargo.toml` and
 `swift/VibeOS/Support/Info.plist` (both of its version keys; check-full.sh
 checks they agree). `.github/workflows/release.yml` runs on version tags
-only. It publishes the Linux base image as release `base-<n>` if that isn't
-out yet, then builds the app with `scripts/release-macos.sh`: signed with
+only. It holds `Cargo.lock` to RustSec as it stands that day
+(`scripts/advisories.sh`), and with an advisory open publishes nothing. Fix it,
+or list it in `deny.toml` with its reason, on `main`, and tag that. It publishes
+the Linux base image as release `base-<n>` if that isn't out yet, then builds the app with `scripts/release-macos.sh`: signed with
 the Developer ID under the hardened runtime, notarized and stapled, in a
 notarized DMG, with Sparkle and its appcast. It publishes those as release
 `vX.Y.Z`, marked latest, where Sparkle looks for updates. It reads these

@@ -2,6 +2,9 @@
 # Every check in one command:
 #
 #   - the Rust workspace: fmt, clippy (warnings denied), build, test
+#   - Cargo.lock against RustSec (scripts/advisories.sh, by deny.toml's rules):
+#     no advisory open but those deny.toml lists with a reason. It reads
+#     today's advisories, so it needs the network
 #   - the vibe-guest cross-build: a static aarch64-unknown-linux-musl binary,
 #     and clippy for that target over it and the test guest, as musl's libc
 #     differs
@@ -373,6 +376,8 @@ s_tools() {
 }
 
 s_fmt() { cargo fmt --all --check; }
+
+s_advisories() { scripts/advisories.sh; }
 
 s_clippy() { cargo clippy --workspace --all-targets --locked -- -D warnings; }
 
@@ -1300,6 +1305,21 @@ ci = read(".github/workflows/ci.yml")
 if "tags" in ci.split("jobs:")[0]:
     fail.append("ci.yml runs on tags")
 
+# Nothing is published with an advisory open: the base image, which the rest
+# waits on, waits on the check.
+if "run: scripts/advisories.sh" not in wf or not re.search(r"^  base-image:\n    name: .*\n    needs: advisories$", wf, re.M):
+    fail.append("release.yml doesn't hold its publishing to scripts/advisories.sh")
+# Every exception says why, which cargo-deny itself leaves optional.
+deny = "\n".join(l for l in read("deny.toml").splitlines() if not l.lstrip().startswith("#"))
+ignore = re.search(r"^ignore = \[(.*?)\]", deny, re.M | re.S)
+if not ignore:
+    fail.append("deny.toml has no ignore list")
+else:
+    tables = re.findall(r"\{[^}]*\}", ignore.group(1))
+    bare = re.sub(r"\{[^}]*\}", "", ignore.group(1))
+    if '"' in bare or any(not re.search(r'\breason\s*=\s*"[^"\s][^"]*"', t) for t in tables):
+        fail.append("deny.toml lists an exception with no reason")
+
 # The secrets it reads are the ones the release needs, and none is printed:
 # each one echoed or printed goes straight into a pipe or a file.
 want = {"MACOS_CERT_P12", "MACOS_CERT_PASSWORD", "APPLE_TEAM_ID", "NOTARY_KEY_ID", "NOTARY_ISSUER_ID",
@@ -1504,6 +1524,7 @@ s_cgroups() {
 
 step tools "toolchain versions" s_tools
 step fmt "cargo fmt --check" s_fmt
+step advisories "Cargo.lock against RustSec, by deny.toml" s_advisories
 step clippy "cargo clippy, warnings denied" s_clippy
 step build "cargo build" s_build
 step test "cargo test (incl. the Rust contract tests)" s_test

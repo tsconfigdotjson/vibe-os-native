@@ -544,6 +544,27 @@ mod tests {
         s.parse().unwrap()
     }
 
+    /// What the public endpoint offers stays current through a bump of rustls:
+    /// TLS 1.2 and 1.3 alone, and only AEAD ciphers, with forward secrecy on 1.2.
+    #[test]
+    fn tls_offers_nothing_deprecated() {
+        use rustls::ProtocolVersion::{TLSv1_2, TLSv1_3};
+        let versions: Vec<_> = rustls::DEFAULT_VERSIONS.iter().map(|v| v.version).collect();
+        assert_eq!(versions, [TLSv1_3, TLSv1_2]);
+
+        let config = server_config(Arc::new(rustls::server::ResolvesServerCertUsingSni::new()));
+        let suites = &config.crypto_provider().cipher_suites;
+        assert!(!suites.is_empty());
+        for suite in suites {
+            let name = format!("{:?}", suite.suite());
+            assert!(
+                (name.starts_with("TLS13_") || name.starts_with("TLS_ECDHE_"))
+                    && (name.contains("_GCM_") || name.contains("_CHACHA20_POLY1305_")),
+                "{name}"
+            );
+        }
+    }
+
     #[test]
     fn a_burst_then_a_steady_rate() {
         let l = Limiter::new(limits());
