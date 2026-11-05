@@ -18,7 +18,8 @@ use rusqlite::types::Type;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use crate::model::{
-    AgentKind, AgentState, Environment, HostLink, Mode, Model, Profile, ProjectSource, Reasoning,
+    AdminNeed, AgentKind, AgentState, Environment, HostLink, Mode, Model, Profile, ProjectSource,
+    Reasoning,
 };
 use crate::rpc::{ApiKey, HostInfo, KeyHash, Project};
 use crate::time::rfc3339;
@@ -151,6 +152,11 @@ const MIGRATIONS: &[&str] = &[
     CREATE TABLE revoked_pushed_keys (
         hash TEXT PRIMARY KEY
     ) STRICT;
+    ",
+    // 8: what a Linux host last said it needs `sudo` for (#74), kept for while its
+    // link is down.
+    "
+    ALTER TABLE hosts ADD COLUMN needs_admin TEXT NOT NULL DEFAULT '';
     ",
 ];
 
@@ -358,7 +364,7 @@ impl Store {
     /// Whether it's the external address, and at what URL, is recorded.
     pub fn hosts(&self) -> Result<Vec<HostInfo>> {
         let mut stmt = self.conn.prepare(
-            "SELECT name, os, label, address, version, missing, external FROM hosts \
+            "SELECT name, os, label, address, version, missing, external, needs_admin FROM hosts \
                  ORDER BY address IS NOT NULL, name",
         )?;
         let hosts = stmt
@@ -366,6 +372,7 @@ impl Store {
                 let address: Option<String> = r.get(3)?;
                 let missing: String = r.get(5)?;
                 let external: Option<String> = r.get(6)?;
+                let needs_admin: String = r.get(7)?;
                 Ok(HostInfo {
                     name: r.get(0)?,
                     os: r.get(1)?,
@@ -385,6 +392,11 @@ impl Store {
                     tunnel: None,
                     external_detail: None,
                     memory: None,
+                    // Any this build doesn't know are left out.
+                    needs_admin: split_list(&needs_admin)
+                        .iter()
+                        .filter_map(|n| n.parse().ok())
+                        .collect(),
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
@@ -420,8 +432,8 @@ impl Store {
             )));
         }
         tx.execute(
-            "INSERT INTO hosts (name, os, label, address, added_at, version, missing)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO hosts (name, os, label, address, added_at, version, missing, needs_admin)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 host.name,
                 host.os,
@@ -429,7 +441,8 @@ impl Store {
                 address,
                 now,
                 host.version,
-                host.missing.join(",")
+                host.missing.join(","),
+                admin_needs_text(&host.needs_admin),
             ],
         )?;
         tx.commit()?;
@@ -440,14 +453,15 @@ impl Store {
     /// version and missing tools.
     pub fn set_host_report(&mut self, host: &HostInfo) -> Result<()> {
         let n = self.conn.execute(
-            "UPDATE hosts SET os = ?2, label = ?3, version = ?4, missing = ?5
+            "UPDATE hosts SET os = ?2, label = ?3, version = ?4, missing = ?5, needs_admin = ?6
              WHERE name = ?1 AND address IS NOT NULL",
             params![
                 host.name,
                 host.os,
                 host.label,
                 host.version,
-                host.missing.join(",")
+                host.missing.join(","),
+                admin_needs_text(&host.needs_admin),
             ],
         )?;
         if n == 0 {
@@ -1133,6 +1147,12 @@ const KEY_COLUMNS: &str = "name, prefix, created_at, last_used_at";
 const PUSHED_KEY_COLUMNS: &str = "name, prefix, created_at, last_used_at";
 
 /// A comma-separated list, as `hosts.missing` is kept; empty for none.
+/// A host's needs as [`split_list`] reads them back.
+fn admin_needs_text(needs: &[AdminNeed]) -> String {
+    let names: Vec<&str> = needs.iter().map(|n| n.as_str()).collect();
+    names.join(",")
+}
+
 fn split_list(s: &str) -> Vec<String> {
     s.split(',')
         .filter(|w| !w.is_empty())
@@ -1377,6 +1397,7 @@ mod tests {
                 tunnel: None,
                 external_detail: None,
                 memory: None,
+                needs_admin: vec![],
             }]
         );
         assert!(s.has_host("local").unwrap());
@@ -1399,6 +1420,7 @@ mod tests {
             tunnel: None,
             external_detail: None,
             memory: None,
+            needs_admin: vec![],
         }
     }
 
@@ -1460,6 +1482,13 @@ mod tests {
         report.label = "renamed".into();
         s.set_host_report(&report).unwrap();
         assert_eq!(s.host("vps").unwrap(), report);
+        let needing = HostInfo {
+            needs_admin: vec![AdminNeed::Linger],
+            ..report.clone()
+        };
+        s.set_host_report(&needing).unwrap();
+        assert_eq!(s.host("vps").unwrap(), needing);
+        s.set_host_report(&report).unwrap();
         let mut local = report.clone();
         local.name = "local".into();
         assert!(s.set_host_report(&local).is_err(), "only Linux hosts");

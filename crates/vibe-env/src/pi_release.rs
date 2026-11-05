@@ -12,7 +12,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use crate::images::{ImageError, Result, Version, fetch, sha256_file};
+use crate::images::{ImageError, Result, Version, fetch_bounded as fetch, sha256_file};
 
 /// Where Pi's releases are published.
 pub const RELEASES: &str = "https://github.com/earendil-works/pi/releases";
@@ -198,6 +198,21 @@ pub fn is_ours(path: &Path, root: &Path) -> bool {
     name_ok(path) || fs::read_link(path).is_ok_and(|to| name_ok(&to))
 }
 
+/// Whether the `pi` agents find at `found` is the one [`install`] linked at `link`,
+/// under `root`, of a version but `version`: the build VibeOS pins has moved on
+/// since, and it keeps what's its own in step. Links are followed all the way, so
+/// one of the owner's to that link still follows it. A `pi` that's anything else
+/// is left alone, as moving `link` wouldn't change what runs.
+pub fn needs_update(found: &Path, link: &Path, root: &Path, version: &str) -> bool {
+    let real = |p: &Path| fs::canonicalize(p).ok();
+    let (Some(found), Some(linked), Some(root)) = (real(found), real(link), real(root)) else {
+        return false;
+    };
+    found == linked
+        && is_ours(&linked, &root)
+        && linked != root.join(format!("pi-{version}")).join("pi")
+}
+
 /// Installs `version` for this machine for the owner's own use, on a Mac or a
 /// Linux host: `<root>/pi-<version>/` and a link at `<home>/.local/bin/pi`. A
 /// `pi` there that isn't one of these is the owner's, and is left alone:
@@ -298,6 +313,51 @@ fn prune(root: &Path, keep: &str) {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn only_vibeos_own_older_install_needs_updating() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("data");
+        let bin = tmp.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        for v in ["1.4.0", "1.5.0"] {
+            fs::create_dir_all(root.join(format!("pi-{v}"))).unwrap();
+            fs::write(root.join(format!("pi-{v}/pi")), "").unwrap();
+        }
+        let link = bin.join("pi");
+        let point = |to: &str| {
+            let _ = fs::remove_file(&link);
+            symlink(root.join(format!("pi-{to}/pi")), &link).unwrap();
+        };
+        let needs = |found: &Path| needs_update(found, &link, &root, "1.5.0");
+        point("1.4.0");
+        assert!(needs(&link));
+        point("1.5.0");
+        assert!(!needs(&link));
+
+        // A link of the owner's to VibeOS's link follows it.
+        point("1.4.0");
+        let chain = bin.join("chain");
+        symlink(&link, &chain).unwrap();
+        assert!(needs(&chain));
+
+        // A link of the owner's to one old build, earlier on the PATH, is theirs:
+        // moving VibeOS's link wouldn't change it, so it must not be tried forever.
+        point("1.5.0");
+        let theirs = bin.join("theirs");
+        symlink(root.join("pi-1.4.0/pi"), &theirs).unwrap();
+        assert!(!needs(&theirs));
+
+        // The owner's own, wherever it is, is left alone.
+        let own = bin.join("own");
+        fs::write(&own, "").unwrap();
+        assert!(!needs(&own));
+        fs::remove_file(&link).unwrap();
+        fs::write(&link, "").unwrap();
+        assert!(!needs(&link));
+        assert!(!needs(&bin.join("nothing")));
+    }
     use crate::images::sha256_file;
 
     /// Publishes `version` of `platform` under `root` as a `file://` release,

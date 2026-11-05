@@ -491,8 +491,9 @@ async fn session(core: &Weak<Core>, link: &Arc<Link>, timing: Timing) -> Result<
                         .and_then(|l| l.hosts.into_iter().find(|h| h.name == LOCAL_HOST));
                     if let Some(c) = core.upgrade() {
                         if let Some(own) = own
-                            && link.set_report(own)
+                            && link.set_report(own.clone())
                         {
+                            c.host_reported(link, Some(&own), None);
                             c.host_link_changed(link);
                         }
                         // A push that failed is tried again.

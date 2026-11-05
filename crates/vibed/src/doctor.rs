@@ -1,17 +1,20 @@
 //! `vibe doctor` and the first run's checklist (PRD: Key user flows,
 //! Install and setup): what this host needs for agents to work, as `vibed`
 //! sees it. git; `gh`'s login, and git using `gh` for GitHub (`gh auth
-//! setup-git`, which `vibed` runs itself); the `claude` macos agents run, and its login; system sleep
-//! off; Tailscale, which is optional; on a Mac, the Linux images; and Pi,
-//! optional too. The
-//! checks that look at the machine go through [`HostChecks`], so tests can
-//! give fixed answers. VibeOS.app adds its own permission to control
-//! Terminal, which only the app can see.
+//! setup-git`, which `vibed` runs itself); the `claude` macos agents run, and
+//! its login; system sleep off, on a Mac; on a Linux host, `vibed` staying up
+//! while the owner's logged out, which `vibed` also sets up itself; Tailscale,
+//! which is optional; on a Mac, the Linux images; and Pi, optional too, and
+//! installed by `vibed` once a profile runs it. The checks that look at the
+//! machine go through [`HostChecks`], so tests can give fixed answers.
+//! VibeOS.app adds its own permission to control Terminal, which only the app
+//! can see.
 
 use std::ffi::OsStr;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use vibe_core::keychain;
@@ -52,6 +55,24 @@ pub trait HostChecks: Send + Sync + fmt::Debug {
     /// Minutes of idleness before the system sleeps, `Some(0)` for never;
     /// `None` where there's nothing to check, as on a Linux host.
     fn system_sleep(&self) -> Result<Option<u32>, String>;
+    /// Whether this user's services run while they're logged out; `None` where
+    /// there's nothing to check, as on a Mac. Only a look at a file, so it can be
+    /// asked often.
+    fn linger(&self) -> Result<Option<bool>, String>;
+    /// Turns that on, every way there is that needs no password. Fails with what
+    /// was said if none works. What it tries that an admin may see in a log, it
+    /// tries once a run.
+    fn enable_linger(&self) -> Result<(), String>;
+}
+
+/// Where systemd keeps who lingers: an empty file named for each user.
+const LINGER_DIR: &str = "/var/lib/systemd/linger";
+
+/// The user lingering is about, and the directory their file would be in.
+#[derive(Debug, Clone)]
+struct LingerFor {
+    user: String,
+    dir: PathBuf,
 }
 
 /// The real machine: `HOME`'s, with the `PATH` its native agents get (on a
@@ -64,6 +85,11 @@ pub struct Machine {
     /// `VIBE_PI`, if it names the `pi` agents run.
     pi: Option<PathBuf>,
     path: Mutex<Option<String>>,
+    /// Set by [`Machine::with_linger`], and otherwise found once.
+    linger_for: OnceLock<Option<LingerFor>>,
+    /// `sudo -n` was tried for lingering. A refused try is in the server's
+    /// logs, and can mail its admin, so once a run is enough.
+    sudo_tried: AtomicBool,
 }
 
 impl Machine {
@@ -77,7 +103,37 @@ impl Machine {
                 .filter(|v| !v.is_empty())
                 .map(PathBuf::from),
             path: Mutex::new(None),
+            linger_for: OnceLock::new(),
+            sudo_tried: AtomicBool::new(false),
         }
+    }
+
+    /// Looks for `user`'s lingering in `dir`, rather than as this machine's own
+    /// user's.
+    pub fn with_linger(self, user: impl Into<String>, dir: impl Into<PathBuf>) -> Machine {
+        let _ = self.linger_for.set(Some(LingerFor {
+            user: user.into(),
+            dir: dir.into(),
+        }));
+        self
+    }
+
+    /// Whose lingering there is to look at: this user's on a Linux host with
+    /// systemd. None on a Mac, or for a `vibed` whose `HOME` isn't its user's own,
+    /// which is a test's, whose settings for the real user are none of its business.
+    fn lingers(&self) -> Option<&LingerFor> {
+        self.linger_for
+            .get_or_init(|| {
+                if !cfg!(target_os = "linux") {
+                    return None;
+                }
+                let (user, home) = passwd_entry()?;
+                (home == self.home).then(|| LingerFor {
+                    user,
+                    dir: PathBuf::from(LINGER_DIR),
+                })
+            })
+            .as_ref()
     }
 
     /// Runs this `claude` rather than looking for one, as `VIBE_CLAUDE`
@@ -278,6 +334,78 @@ impl HostChecks for Machine {
             (false, text) => Err(format!("pmset -g failed: {}", first_line(&text))),
         }
     }
+
+    fn linger(&self) -> Result<Option<bool>, String> {
+        let Some(l) = self.lingers() else {
+            return Ok(None);
+        };
+        // No logind, no lingering to want: such a host can't run vibed's service.
+        if self.which("loginctl").is_none() {
+            return Ok(None);
+        }
+        Ok(Some(l.dir.join(&l.user).exists()))
+    }
+
+    fn enable_linger(&self) -> Result<(), String> {
+        let Some(l) = self.lingers() else {
+            return Ok(());
+        };
+        let loginctl = self
+            .which("loginctl")
+            .ok_or("this server has no loginctl")?
+            .to_string_lossy()
+            .into_owned();
+        let (ok, said) = self.run(&[&loginctl, "enable-linger", &l.user])?;
+        if ok {
+            return Ok(());
+        }
+        // A server without polkit turns the user down. Passwordless sudo, for this
+        // one command, is the least that does it.
+        if !self.sudo_tried.swap(true, Ordering::SeqCst)
+            && let Some(sudo) = self.which("sudo")
+        {
+            let (ok, _) = self.run(&[
+                &sudo.to_string_lossy(),
+                "-n",
+                &loginctl,
+                "enable-linger",
+                &l.user,
+            ])?;
+            if ok {
+                return Ok(());
+            }
+        }
+        Err(format!(
+            "loginctl enable-linger was refused: {}",
+            first_line(&said)
+        ))
+    }
+}
+
+/// This process's user's name and home, as the system has them.
+fn passwd_entry() -> Option<(String, PathBuf)> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut buffer = vec![0u8; 16 * 1024];
+    // SAFETY: zeroed is a valid passwd, for getpwuid_r to fill; the buffer outlives
+    // the strings it points them into, which are copied out before it goes.
+    unsafe {
+        let mut entry = std::mem::zeroed::<libc::passwd>();
+        let mut found = std::ptr::null_mut();
+        let failed = libc::getpwuid_r(
+            libc::getuid(),
+            &raw mut entry,
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            &raw mut found,
+        );
+        if failed != 0 || found.is_null() {
+            return None;
+        }
+        let text = |p: *const libc::c_char| std::ffi::CStr::from_ptr(p).to_bytes().to_vec();
+        let user = String::from_utf8(text(entry.pw_name)).ok()?;
+        let home = PathBuf::from(OsStr::from_bytes(&text(entry.pw_dir)));
+        Some((user, home))
+    }
 }
 
 /// Fixed answers, for tests and the golden examples. `setup_git` makes
@@ -290,6 +418,9 @@ pub struct FixedChecks {
     pub claude_login: Result<String, String>,
     pub pi: Result<(PathBuf, String), String>,
     pub system_sleep: Result<Option<u32>, String>,
+    pub linger: Mutex<Result<Option<bool>, String>>,
+    /// What turning lingering on does: `Ok` turns it on.
+    pub enable_linger: Result<(), String>,
 }
 
 impl HostChecks for FixedChecks {
@@ -318,6 +449,15 @@ impl HostChecks for FixedChecks {
     }
     fn system_sleep(&self) -> Result<Option<u32>, String> {
         self.system_sleep.clone()
+    }
+    fn linger(&self) -> Result<Option<bool>, String> {
+        lock(&self.linger).clone()
+    }
+    fn enable_linger(&self) -> Result<(), String> {
+        if self.enable_linger.is_ok() {
+            *lock(&self.linger) = Ok(Some(true));
+        }
+        self.enable_linger.clone()
     }
 }
 
@@ -350,7 +490,9 @@ fn first_line(text: &str) -> String {
 
 /// Commands a sentence may start with, kept in lowercase, as the menu
 /// keeps them (swift/VibeOS's `commandNames`).
-const COMMANDS: [&str; 7] = ["git", "gh", "claude", "pi", "vibe", "pmset", "curl"];
+const COMMANDS: [&str; 8] = [
+    "git", "gh", "claude", "pi", "vibe", "vibed", "pmset", "curl",
+];
 
 /// `s` as a sentence: capitalized unless it starts with a command's name,
 /// with a full stop.
@@ -409,6 +551,30 @@ pub(crate) fn git_through_gh(checks: &dyn HostChecks, gh: &OsStr) -> Result<bool
     checks.git_uses_gh()
 }
 
+/// Whether this user's services run while they're logged out, having turned that
+/// on if not: nobody's asked to. `Err` with why, if it's off and stays off.
+pub(crate) fn lingering(checks: &dyn HostChecks) -> Result<Option<bool>, String> {
+    if checks.linger()? != Some(false) {
+        return checks.linger();
+    }
+    checks.enable_linger()?;
+    crate::log!("vibed: lingering is on, so vibed runs while you're logged out");
+    checks.linger()
+}
+
+/// Where Pi stands for this host's agents, as far as it's VibeOS's to install.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PiWanted {
+    /// No profile here runs it, so nothing needs it.
+    No,
+    /// A profile runs it, and it's on its way.
+    Installing,
+    /// A profile runs it, and installing or updating it failed for this reason.
+    Failed(String),
+    /// A profile runs it, and one's there that VibeOS leaves alone.
+    Present,
+}
+
 /// What the machine said, before any of it is put into checks.
 #[derive(Debug, Clone)]
 pub(crate) struct Found {
@@ -418,6 +584,7 @@ pub(crate) struct Found {
     claude_login: Result<String, String>,
     pi: Result<(PathBuf, String), String>,
     system_sleep: Result<Option<u32>, String>,
+    linger: Result<Option<bool>, String>,
 }
 
 /// The checks, in [`CheckId`]'s order, from what was found.
@@ -427,6 +594,7 @@ fn report(
     tailscale: &[std::net::IpAddr],
     linux: Option<DoctorCheck>,
     mac: bool,
+    pi_wanted: &PiWanted,
 ) -> DoctorReport {
     let mut checks = Vec::new();
     let install_git = if mac {
@@ -546,6 +714,31 @@ fn report(
             "Run `pmset -g` in Terminal to see this Mac's sleep settings.",
         )),
     }
+    // VibeOS's to set up, and it has tried by now. What it can't do without a
+    // password takes one button, on the Mac.
+    let lingering_off = |why: String| DoctorCheck {
+        fixable: true,
+        ..fail(
+            CheckId::Linger,
+            why,
+            "It takes someone with sudo here, once: Settings → Hosts on the Mac has a button that \
+             asks for the password. VibeOS tries again by itself meanwhile. With no Mac linked, \
+             ask whoever has sudo here to turn lingering on for you.",
+        )
+    };
+    match &found.linger {
+        Ok(None) => {}
+        Ok(Some(true)) => checks.push(pass(
+            CheckId::Linger,
+            "vibed runs while you're logged out, and starts again after a reboot",
+        )),
+        Ok(Some(false)) => checks.push(lingering_off(
+            "Lingering is off, so vibed stops when you log out of this server".to_owned(),
+        )),
+        Err(why) => checks.push(lingering_off(format!(
+            "Lingering is off, so vibed stops when you log out of this server: {why}"
+        ))),
+    }
     checks.push(match tailscale.first() {
         Some(ip) => pass(
             CheckId::Tailscale,
@@ -563,8 +756,17 @@ fn report(
         },
     });
     checks.extend(linux);
-    checks.push(match &found.pi {
-        Ok((path, version)) => pass(
+    checks.push(match (&found.pi, pi_wanted) {
+        // Whether or not an older one is there to go on with.
+        (_, PiWanted::Failed(why)) => DoctorCheck {
+            fixable: true,
+            ..fail(
+                CheckId::Pi,
+                format!("A profile here runs Pi, and it can't be installed or updated yet: {why}"),
+                "VibeOS tries again every hour, and whenever a Pi agent starts.",
+            )
+        },
+        (Ok((path, version)), _) => pass(
             CheckId::Pi,
             format!(
                 "Pi {} is at {}",
@@ -572,21 +774,31 @@ fn report(
                 path.display()
             ),
         ),
-        Err(why) => DoctorCheck {
+        (Err(why), PiWanted::No) => DoctorCheck {
             id: CheckId::Pi,
             state: CheckState::Optional,
-            detail: sentence(why),
-            hint: Some(
-                if mac {
-                    "Only agents whose profile runs Pi need it: install it in Settings → Agents."
-                } else {
-                    "Only agents whose profile runs Pi need it: run `vibe pi install`."
-                }
-                .into(),
+            detail: format!(
+                "{} VibeOS installs it by itself when an agent here needs it.",
+                sentence(why)
             ),
+            hint: None,
             fixable: false,
             progress: None,
         },
+        (Err(_), PiWanted::Installing) => DoctorCheck {
+            id: CheckId::Pi,
+            state: CheckState::Working,
+            detail: "Installing Pi, as a profile here runs it.".to_owned(),
+            hint: None,
+            fixable: false,
+            progress: None,
+        },
+        (Err(why), PiWanted::Present) => fail(
+            CheckId::Pi,
+            format!("A profile here runs Pi, and the pi it would run doesn't: {why}"),
+            "It isn't one VibeOS will replace: remove it or put it right, and VibeOS takes it \
+             from there.",
+        ),
     });
     DoctorReport { checks }
 }
@@ -612,6 +824,7 @@ impl Core {
         let linux = self.linux_images.clone();
         let logged_in = gh.state == GhState::LoggedIn;
         let program = self.gh_program().await;
+        let pi_wanted = self.pi_wanted().await;
         let found = tokio::task::spawn_blocking(move || {
             let found = cached.unwrap_or_else(|| {
                 let git = checks.git();
@@ -630,6 +843,7 @@ impl Core {
                     claude_login: checks.claude_login(),
                     pi: checks.pi(),
                     system_sleep: checks.system_sleep(),
+                    linger: lingering(&*checks),
                 }
             });
             (found, linux.map(|w| w.check()))
@@ -648,6 +862,7 @@ impl Core {
             &(self.tailscale)(),
             linux,
             self.info().os == "macos",
+            &pi_wanted,
         )
     }
 
@@ -660,13 +875,14 @@ impl Core {
                 claude: Err(why.clone()),
                 claude_login: Err(why.clone()),
                 pi: Err(why.clone()),
-                system_sleep: Err(why),
+                system_sleep: Err(why.clone()),
+                linger: Err(why),
             }
         }
     }
 
-    /// `doctor.fix`: `gh_git` and `linux` are VibeOS's to fix; the rest are
-    /// refused, with what to do.
+    /// `doctor.fix`: tries now what VibeOS does by itself anyway: `gh_git`,
+    /// `linger`, `pi` and `linux`. The rest are refused, with what to do.
     pub async fn doctor_fix(&self, p: DoctorFixParams) -> Result<DoctorReport, ErrorObject> {
         match p.check {
             CheckId::GhGit => {
@@ -685,6 +901,20 @@ impl Core {
                     .map_err(|e| error(ErrorCode::CommandFailed, e))?;
                 crate::log!("vibed: git now asks gh for GitHub's credentials (gh auth setup-git)");
                 *lock(&self.doctor_found) = None;
+            }
+            CheckId::Linger => {
+                let checks = Arc::clone(&self.checks);
+                tokio::task::spawn_blocking(move || lingering(&*checks))
+                    .await
+                    .map_err(|e| error(ErrorCode::InternalError, e.to_string()))?
+                    .map_err(|e| error(ErrorCode::CommandFailed, e))?;
+                *lock(&self.doctor_found) = None;
+            }
+            CheckId::Pi => {
+                self.repair_pi().await;
+                if let PiWanted::Failed(why) = self.pi_wanted().await {
+                    return Err(error(ErrorCode::CommandFailed, why));
+                }
             }
             CheckId::Linux => match &self.linux_images {
                 Some(watch) => watch.kick(),
@@ -783,7 +1013,19 @@ mod tests {
             claude_login: Ok("Claude Code is signed in".into()),
             pi: Err("Pi isn't on your login shell's PATH".into()),
             system_sleep: Ok(Some(0)),
+            linger: Ok(None),
         }
+    }
+
+    /// The report for a host, with no one wanting Pi.
+    fn report(
+        found: Found,
+        gh: &GhStatus,
+        tailscale: &[std::net::IpAddr],
+        linux: Option<DoctorCheck>,
+        mac: bool,
+    ) -> DoctorReport {
+        super::report(found, gh, tailscale, linux, mac, &PiWanted::No)
     }
 
     fn logged_in() -> GhStatus {
@@ -832,6 +1074,7 @@ mod tests {
             claude_login: Err("Claude Code isn't signed in".into()),
             pi: Err("Pi isn't on your login shell's PATH".into()),
             system_sleep: Ok(Some(10)),
+            linger: Ok(None),
         };
         let gh = GhStatus {
             state: GhState::NotInstalled,
@@ -900,6 +1143,8 @@ mod tests {
             claude_login: Err(String::new()),
             pi: Err(String::new()),
             system_sleep: Ok(None),
+            linger: Mutex::new(Ok(None)),
+            enable_linger: Ok(()),
         };
         assert_eq!(git_through_gh(&checks, tmp.path().as_os_str()), Ok(true));
     }
@@ -917,10 +1162,8 @@ mod tests {
             .find(|c| c.id == CheckId::Tailscale)
             .unwrap();
         assert_eq!((ts.id, ts.state), (CheckId::Tailscale, CheckState::Pass));
-        // A Linux host's way to get Pi is its own command.
         let pi = r.checks.last().unwrap();
         assert_eq!((pi.id, pi.state), (CheckId::Pi, CheckState::Optional));
-        assert!(pi.hint.as_ref().unwrap().contains("vibe pi install"));
         assert!(ts.detail.contains("100.64.0.7"));
     }
 
@@ -936,12 +1179,178 @@ mod tests {
         assert_eq!(ids, sorted, "checks come in CheckId's order");
     }
 
+    /// #74: nothing about Pi is ever the owner's chore. Nobody wanting it asks
+    /// nothing, wanting it shows as under way, and only a failure is on the list,
+    /// with a button to try again.
     #[test]
-    fn pi_is_optional_and_says_where_it_is_when_it_is_there() {
-        let r = report(found(), &logged_in(), &[], None, true);
+    fn pi_asks_nothing_of_the_owner() {
+        let r = report(found(), &logged_in(), &[], None, false);
         let pi = r.checks.last().unwrap();
         assert_eq!((pi.id, pi.state), (CheckId::Pi, CheckState::Optional));
-        assert!(pi.hint.as_ref().unwrap().contains("Settings"));
+        assert_eq!(pi.hint, None, "{pi:?}");
+        assert!(!pi.fixable);
+        assert!(pi.detail.contains("installs it by itself"), "{pi:?}");
+        assert!(!pi.detail.contains("vibe pi"), "{pi:?}");
+
+        let installing = super::report(
+            found(),
+            &logged_in(),
+            &[],
+            None,
+            false,
+            &PiWanted::Installing,
+        );
+        let pi = installing.checks.last().unwrap();
+        assert_eq!(pi.state, CheckState::Working);
+        assert_eq!(pi.hint, None);
+
+        let failed = super::report(
+            found(),
+            &logged_in(),
+            &[],
+            None,
+            false,
+            &PiWanted::Failed("the network is down".into()),
+        );
+        let pi = failed.checks.last().unwrap();
+        assert_eq!((pi.state, pi.fixable), (CheckState::Fail, true));
+        assert!(pi.detail.contains("the network is down"), "{pi:?}");
+        assert!(pi.hint.as_ref().unwrap().contains("tries again"), "{pi:?}");
+
+        // A move to a new pin that failed is said, with the old Pi still there.
+        let mut has_pi = found();
+        has_pi.pi = Ok(("/h/.local/bin/pi".into(), "1.4.0".into()));
+        let failed = super::report(
+            has_pi,
+            &logged_in(),
+            &[],
+            None,
+            false,
+            &PiWanted::Failed("the network is down".into()),
+        );
+        assert_eq!(failed.checks.last().unwrap().state, CheckState::Fail);
+
+        // One that's there and doesn't run isn't called something VibeOS will fix.
+        let mut broken = found();
+        broken.pi = Err("pi --version failed: bad".into());
+        let r = super::report(broken, &logged_in(), &[], None, false, &PiWanted::Present);
+        let pi = r.checks.last().unwrap();
+        assert_eq!((pi.state, pi.fixable), (CheckState::Fail, false));
+        assert!(pi.detail.contains("pi --version failed"), "{pi:?}");
+    }
+
+    #[test]
+    fn lingering_is_only_a_linux_hosts_and_says_what_it_costs() {
+        // Nothing to check on a Mac.
+        let r = report(found(), &logged_in(), &[], None, true);
+        assert!(r.checks.iter().all(|c| c.id != CheckId::Linger));
+        let with = |linger| Found { linger, ..found() };
+        let row = |r: &DoctorReport| r.checks.iter().find(|c| c.id == CheckId::Linger).cloned();
+        let on = report(with(Ok(Some(true))), &logged_in(), &[], None, false);
+        assert_eq!(row(&on).unwrap().state, CheckState::Pass);
+        for off in [Ok(Some(false)), Err("polkit said no".to_owned())] {
+            let r = report(with(off), &logged_in(), &[], None, false);
+            let c = row(&r).unwrap();
+            assert_eq!((c.state, c.fixable), (CheckState::Fail, true), "{c:?}");
+            assert!(c.detail.contains("stops when you log out"), "{c:?}");
+            let hint = c.hint.unwrap();
+            assert!(hint.contains("Settings → Hosts"), "{hint}");
+            // A button, never a command.
+            assert!(!hint.contains('`'), "{hint}");
+        }
+        // Where it comes in the list.
+        let ids: Vec<CheckId> = on.checks.iter().map(|c| c.id).collect();
+        let mut sorted = ids.clone();
+        sorted.sort_by_key(|id| CheckId::ALL.iter().position(|x| x == id));
+        assert_eq!(ids, sorted);
+    }
+
+    /// The real checks, on a stand-in `loginctl` that does as the real one does and
+    /// a `sudo` that asks nothing, or is refused.
+    #[test]
+    fn lingering_turns_itself_on_every_way_that_needs_no_password() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (home, bin, dir) = (
+            tmp.path().join("home"),
+            tmp.path().join("bin"),
+            tmp.path().join("linger"),
+        );
+        for d in [&home, &bin, &dir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let path = format!("{}:/usr/bin:/bin", bin.display());
+        let machine = || Machine::new(&home).with_path(&path).with_linger("me", &dir);
+        // Allowed as the user: that's all it takes, and sudo isn't touched.
+        let log = tmp.path().join("sudo-log");
+        let sudo_body = format!(
+            "echo \"$*\" >> \"{log}\"\nshift\nexec \"$@\"",
+            log = log.display()
+        );
+        script(&bin, "sudo", &sudo_body);
+        script(
+            &bin,
+            "loginctl",
+            &format!(
+                "[ -e \"{refuse}\" ] && {{ echo 'Could not enable linger: Access denied' >&2; rm -f \"{refuse}\"; exit 1; }}\n[ \"$1 $2\" = 'enable-linger me' ] && touch \"{dir}/me\"",
+                refuse = tmp.path().join("refuse").display(),
+                dir = dir.display(),
+            ),
+        );
+        let m = machine();
+        assert_eq!(m.linger(), Ok(Some(false)));
+        assert_eq!(lingering(&m), Ok(Some(true)));
+        assert!(dir.join("me").exists());
+        assert!(!log.exists(), "sudo wasn't needed");
+        // On already: nothing is run at all.
+        std::fs::remove_file(bin.join("sudo")).unwrap();
+        assert_eq!(lingering(&m), Ok(Some(true)));
+
+        // Refused as the user, as without polkit: passwordless sudo, for that alone.
+        std::fs::remove_file(dir.join("me")).unwrap();
+        std::fs::write(tmp.path().join("refuse"), "").unwrap();
+        script(&bin, "sudo", &sudo_body);
+        let m = machine();
+        assert_eq!(lingering(&m), Ok(Some(true)));
+        let said = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            said.trim(),
+            format!("-n {}/loginctl enable-linger me", bin.display())
+        );
+
+        // Refused both ways: it says so, and sudo's asked no more this run.
+        std::fs::remove_file(dir.join("me")).unwrap();
+        std::fs::remove_file(&log).unwrap();
+        script(
+            &bin,
+            "loginctl",
+            "echo 'Could not enable linger: Access denied' >&2; exit 1",
+        );
+        script(
+            &bin,
+            "sudo",
+            &format!(
+                "echo \"$*\" >> \"{log}\"\necho 'sudo: a password is required' >&2\nexit 1",
+                log = log.display()
+            ),
+        );
+        let m = machine();
+        let why = lingering(&m).unwrap_err();
+        assert!(why.contains("Access denied"), "{why}");
+        lingering(&m).unwrap_err();
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap().lines().count(),
+            1,
+            "a refused sudo is in the server's logs"
+        );
+
+        // A HOME that isn't this user's, as a test's: left alone, whatever's there.
+        let other = Machine::new(&home).with_path(&path);
+        assert_eq!(other.linger(), Ok(None));
+        assert_eq!(lingering(&other), Ok(None));
+    }
+
+    #[test]
+    fn pi_says_where_it_is_when_it_is_there() {
         let mut f = found();
         f.pi = Ok(("/h/.local/bin/pi".into(), "1.5.0".into()));
         let r = report(f, &logged_in(), &[], None, true);

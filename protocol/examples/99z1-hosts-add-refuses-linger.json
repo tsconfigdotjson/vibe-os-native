@@ -1,0 +1,51 @@
+{
+  "description": "A server that refuses lingering both ways there are without a password, as with no polkit and no passwordless sudo. The install says so in `notes`, and the host's row has `needs_admin`, which Settings shows with its one button (hosts.admin).",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 9950,
+    "method": "hosts.add",
+    "params": {
+      "name": "strict",
+      "address": "refuses@strict.example.com"
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 9950,
+    "result": {
+      "changed": true,
+      "host": {
+        "address": "refuses@strict.example.com",
+        "detail": "not connected yet",
+        "external": false,
+        "label": "vps-1",
+        "link": "down",
+        "mcp": false,
+        "missing": [
+          "claude"
+        ],
+        "name": "strict",
+        "needs_admin": [
+          "linger"
+        ],
+        "os": "linux",
+        "version": "0.1.0"
+      },
+      "notes": [
+        "Lingering couldn't be turned on, so vibed stops when you log out of refuses@strict.example.com. Settings → Hosts has a button that does it, asking for the password there once."
+      ]
+    }
+  },
+  "events": [
+    {
+      "jsonrpc": "2.0",
+      "method": "events.event",
+      "params": {
+        "at": "2026-10-30T12:00:00Z",
+        "host": "strict",
+        "kind": "host.added",
+        "seq": 44
+      }
+    }
+  ]
+}

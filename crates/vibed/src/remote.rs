@@ -22,6 +22,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
 };
+use vibe_core::model::AdminNeed;
 use vibe_core::rpc::{CALL_ACCEPTED, ErrorObject, MAX_MESSAGE_BYTES, Outcome, Response};
 
 /// A future a [`Remote`] returns.
@@ -63,6 +64,8 @@ pub struct Installed {
     pub version: String,
     /// What it lacks of [`TOOLS`].
     pub missing: Vec<String>,
+    /// What it needs someone with `sudo` there to allow, as the install found.
+    pub needs_admin: Vec<AdminNeed>,
     /// Whether anything on the server changed.
     pub changed: bool,
     /// What the owner should know, in sentences.
@@ -111,6 +114,25 @@ pub trait Remote: Send + Sync + fmt::Debug {
     /// Closes the connection `address`'s commands share, if there is one,
     /// once it has stopped answering: the next command makes a new one.
     fn drop_shared(&self, _address: &str) {}
+
+    /// The command a terminal here runs to do what `needs` take on `address`, with
+    /// `sudo` asking for its password there. What each takes is written here,
+    /// never given by the host, and the password goes to `sudo` alone.
+    fn admin_line(&self, address: &str, needs: &[AdminNeed]) -> String {
+        let mut steps: Vec<&str> = needs
+            .iter()
+            .map(|need| match need {
+                AdminNeed::Linger => "sudo loginctl enable-linger \"$(id -un)\"",
+            })
+            .collect();
+        steps.push("echo \"VibeOS: done. You can close this window.\"");
+        // Through `sh`, as the login shell there may be one that reads this otherwise.
+        format!(
+            "ssh -t {} {}",
+            shell_quote(address),
+            shell_quote(&format!("sh -c {}", shell_quote(&steps.join(" && "))))
+        )
+    }
 
     /// The command a terminal here runs to attach to `agent` on `address`
     /// (PRD: The link, "Clicking a remote agent opens Terminal with …").
@@ -653,12 +675,15 @@ impl Ssh {
                 .await?,
         );
         let mut notes = Vec::new();
+        let mut needs_admin = Vec::new();
         match done.get("linger").map(String::as_str) {
-            Some("off") => notes.push(format!(
+            Some("off") => {
+                needs_admin.push(AdminNeed::Linger);
+                notes.push(format!(
                 "Lingering couldn't be turned on, so vibed stops when you log out of {address}. \
-                 To keep it running, run `sudo loginctl enable-linger {}` there.",
-                probe.get("user").map_or("$USER", String::as_str)
-            )),
+                 Settings → Hosts has a button that does it, asking for the password there once."
+            ));
+            }
             Some("on") => notes.push(format!(
                 "Lingering is on for you on {address}, so vibed runs when you're logged out \
                  and starts again after a reboot."
@@ -686,6 +711,7 @@ impl Ssh {
                         .collect()
                 })
                 .unwrap_or_default(),
+            needs_admin,
             changed: done.get("changed").map(String::as_str) == Some("yes"),
             notes,
         })
@@ -950,7 +976,6 @@ const PROBE: &str = r#"
 echo "os=$(uname -s)"
 echo "arch=$(uname -m)"
 echo "label=$(hostname 2>/dev/null || uname -n)"
-echo "user=$(id -un)"
 echo "home=$HOME"
 lib="$HOME/.local/lib/vibeos"
 for f in vibed vibe vibe-shim; do
@@ -1055,7 +1080,8 @@ fn configure_script(uploads: &[(&str, String)], unit: &str, path: &str) -> Strin
          fi\n\
          me=$(id -un)\n\
          if [ \"$(loginctl show-user \"$me\" -p Linger 2>/dev/null)\" != Linger=yes ]; then\n  \
-           if loginctl enable-linger \"$me\" >/dev/null 2>&1; then echo linger=on; else echo linger=off; fi\n\
+           if loginctl enable-linger \"$me\" >/dev/null 2>&1 || sudo -n loginctl enable-linger \"$me\" >/dev/null 2>&1; then \
+             echo linger=on; else echo linger=off; fi\n\
          fi\n\
          systemctl --user daemon-reload || { echo \"error=systemctl --user daemon-reload failed\"; exit 1; }\n\
          systemctl --user enable vibed.service >/dev/null 2>&1 || \
@@ -1210,6 +1236,58 @@ mod tests {
         assert_eq!(shell_quote("a b"), "'a b'");
         assert_eq!(shell_quote("it's"), r"'it'\''s'");
         assert_eq!(shell_quote(""), "''");
+    }
+
+    #[test]
+    fn an_admin_line_is_ssh_and_sudo_and_nothing_a_host_said() {
+        let ssh = Ssh {
+            program: "ssh".into(),
+            bundle: None,
+            shared: None,
+        };
+        let line = ssh.admin_line("me@vps", &[AdminNeed::Linger]);
+        assert!(line.starts_with("ssh -t me@vps 'sh -c "), "{line}");
+        // A destination with anything odd in it can't reach the shell here.
+        let odd = ssh.admin_line("me@vps; rm -rf ~", &[AdminNeed::Linger]);
+        assert!(
+            odd.starts_with("ssh -t 'me@vps; rm -rf ~' 'sh -c "),
+            "{odd}"
+        );
+
+        // Run for real, by a shell here and one standing in for the server's: sudo
+        // is asked for just that, for this user.
+        let tmp = tempfile::tempdir().unwrap();
+        let write = |name: &str, body: &str| {
+            use std::os::unix::fs::PermissionsExt;
+            let p = tmp.path().join(name);
+            std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        write("ssh", "shift 2\nexec /bin/sh -c \"$*\"");
+        write(
+            "sudo",
+            &format!("printf '%s\\n' \"$*\" > {}/asked", tmp.path().display()),
+        );
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&line)
+            .env("PATH", format!("{}:/usr/bin:/bin", tmp.path().display()))
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        assert!(String::from_utf8_lossy(&out.stdout).contains("VibeOS: done"));
+        let me = String::from_utf8(
+            std::process::Command::new("id")
+                .arg("-un")
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("asked")).unwrap(),
+            format!("loginctl enable-linger {me}")
+        );
     }
 
     #[test]

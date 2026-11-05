@@ -394,6 +394,18 @@ pub trait Compartment {
         None
     }
 
+    /// The `pi` this backend's agents run, where they run this machine's own:
+    /// `Err` with why if they'd want one and it isn't there. None where Pi comes
+    /// from elsewhere, as a VM's does from its layer.
+    fn native_pi(&self) -> Option<std::result::Result<PathBuf, String>> {
+        None
+    }
+
+    /// Whether this backend's Pi agents need a layer that isn't there yet.
+    fn pi_layer_missing(&self) -> bool {
+        false
+    }
+
     /// Starts its coding agent, and returns the end of its terminal for the shim:
     /// a command for the shim's PTY, or a VM's stream.
     fn launch(&self, h: &Handle, launch: &Launch) -> Result<TerminalEnd>;

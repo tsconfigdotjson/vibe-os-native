@@ -15,11 +15,11 @@ use common::{Conn, Golden, TestServer, serve};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::watch;
-use vibe_core::model::{AgentState, EventKind, HostLink};
+use vibe_core::model::{AdminNeed, AgentState, CheckId, CheckState, EventKind, HostLink};
 use vibe_core::paths::Layout;
 use vibe_core::rpc::{
-    AgentStartParams, ErrorCode, HostAddParams, HostParams, KeyCreateParams, KeyParams,
-    MAX_MESSAGE_BYTES, MemoryUse,
+    AgentStartParams, ErrorCode, HostAddParams, HostNameParams, HostParams, KeyCreateParams,
+    KeyParams, MAX_MESSAGE_BYTES, MemoryUse,
 };
 use vibe_core::units::GIB;
 use vibe_mcp::{Daemon, Input, Target};
@@ -146,6 +146,7 @@ impl Remote for Wires {
                 label: "vps-1".into(),
                 version: env!("CARGO_PKG_VERSION").into(),
                 missing: vec!["gh".into()],
+                needs_admin: Vec::new(),
                 changed: true,
                 notes: vec![],
             })
@@ -1182,4 +1183,80 @@ async fn a_mac_restarted_keeps_its_hosts_and_links_again() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     panic!("the restarted Mac didn't link to vps");
+}
+
+/// #74: what truly needs `sudo` on a host is one button on the Mac: the host only
+/// says which need it has, and the Mac writes what that takes.
+#[tokio::test]
+async fn what_a_host_needs_sudo_for_is_one_line_from_the_mac_and_goes_when_its_done() {
+    let checks = Arc::new(vibed::doctor::FixedChecks {
+        linger: Mutex::new(Ok(Some(false))),
+        enable_linger: Err("loginctl enable-linger was refused: Access denied".into()),
+        ..common::golden_checks()
+    });
+    let held = Arc::clone(&checks);
+    let w = world_with(move |c| c.checks = held).await;
+    w.add_host().await;
+    assert_eq!(w.link().await.needs_admin, [AdminNeed::Linger]);
+
+    let params = || HostNameParams { host: "vps".into() };
+    let line = w.mac.host_admin(params()).unwrap().command;
+    assert!(
+        line.starts_with("ssh -t me@vps.example.com 'sh -c "),
+        "{line}"
+    );
+    assert!(line.contains("sudo loginctl enable-linger"), "{line}");
+
+    // The host's doctor asks nothing the host could do, and names the button.
+    let report = w.host.doctor().await;
+    let row = report
+        .checks
+        .iter()
+        .find(|c| c.id == CheckId::Linger)
+        .unwrap();
+    assert_eq!(row.state, CheckState::Fail, "{row:?}");
+    assert!(row.detail.contains("Access denied"), "{row:?}");
+    assert!(row.hint.as_ref().unwrap().contains("Settings → Hosts"));
+
+    // Done, by the button or anyone else: the next ping says so.
+    *checks.linger.lock().unwrap() = Ok(Some(true));
+    for _ in 0..500 {
+        if w.link().await.needs_admin.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(w.link().await.needs_admin, []);
+    let refused = w.mac.host_admin(params()).unwrap_err();
+    assert_eq!(refused.code, ErrorCode::Conflict.code());
+    // This host has no such thing, nor a host that isn't there.
+    let local = HostNameParams {
+        host: "local".into(),
+    };
+    assert_eq!(
+        w.mac.host_admin(local).unwrap_err().code,
+        ErrorCode::InvalidParams.code()
+    );
+}
+
+/// What VibeOS can do itself isn't on anyone's list at all.
+#[tokio::test]
+async fn lingering_turns_itself_on_at_the_hosts_next_look() {
+    let checks = Arc::new(vibed::doctor::FixedChecks {
+        linger: Mutex::new(Ok(Some(false))),
+        enable_linger: Ok(()),
+        ..common::golden_checks()
+    });
+    let held = Arc::clone(&checks);
+    let w = world_with(move |c| c.checks = held).await;
+    w.add_host().await;
+    w.host.repair_setup().await;
+    assert_eq!(*checks.linger.lock().unwrap(), Ok(Some(true)));
+    for _ in 0..500 {
+        if w.link().await.needs_admin.is_empty() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("the Mac still thinks it needs sudo");
 }

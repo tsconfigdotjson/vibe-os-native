@@ -366,9 +366,10 @@ names! {
     /// What `vibe doctor` checks (PRD: Key user flows, Install and setup),
     /// in the order it reports them: git; `gh`'s login, and git using `gh`
     /// for GitHub (`gh auth setup-git`); the `claude` macos agents run, and
-    /// its login; system sleep off; Tailscale, which is optional; on a
-    /// Mac, the Linux base image and Claude Code for linux agents; and Pi,
-    /// which is optional too.
+    /// its login; system sleep off, on a Mac; on a Linux host, `vibed` staying
+    /// up while the owner's logged out (lingering); Tailscale, which is
+    /// optional; on a Mac, the Linux base image and Claude Code for linux
+    /// agents; and Pi, which is optional too.
     CheckId {
         Git = "git",
         Gh = "gh",
@@ -376,10 +377,18 @@ names! {
         Claude = "claude",
         ClaudeLogin = "claude_login",
         Power = "power",
+        Linger = "linger",
         Tailscale = "tailscale",
         Linux = "linux",
         Pi = "pi",
     }
+}
+
+names! {
+    /// What a Linux host needs someone with `sudo` there to allow, once, because
+    /// VibeOS tried every way it has without a password and none worked:
+    /// `linger`, `vibed` staying up while the owner's logged out.
+    AdminNeed { Linger = "linger" }
 }
 
 names! {

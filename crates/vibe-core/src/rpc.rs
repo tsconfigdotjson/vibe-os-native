@@ -17,10 +17,10 @@ use serde_json::Value;
 
 pub use crate::limits::HostLimits;
 pub use crate::model::{
-    Activity, AgentKind, AgentState, Certainty, CheckId, CheckState, Environment, EventKind,
-    GhState, HostLink, LoginTool, MessageRole, Mode, Model, PiTarget, Profile, ProjectSource,
-    Reasoning, ServiceRole, ServiceState, SessionState, StopReason, ToolboxAction, ToolboxState,
-    TunnelState, WakeupKind,
+    Activity, AdminNeed, AgentKind, AgentState, Certainty, CheckId, CheckState, Environment,
+    EventKind, GhState, HostLink, LoginTool, MessageRole, Mode, Model, PiTarget, Profile,
+    ProjectSource, Reasoning, ServiceRole, ServiceState, SessionState, StopReason, ToolboxAction,
+    ToolboxState, TunnelState, WakeupKind,
 };
 
 /// Bumped on any incompatible change to the contract. Clients send theirs in
@@ -357,6 +357,7 @@ pub const METHODS: &[&str] = &[
     HostsList::NAME,
     HostsAdd::NAME,
     HostsUpgrade::NAME,
+    HostsAdmin::NAME,
     HostsRemove::NAME,
     HostsExternal::NAME,
     TunnelPrepare::NAME,
@@ -482,6 +483,12 @@ method! {
     /// `hosts.upgrade`: installs this build's `vibed` on a host added
     /// already, if it runs another, and checks its tools again.
     HostsUpgrade = "hosts.upgrade", HostNameParams => HostInstall
+}
+
+method! {
+    /// `hosts.admin`: the one button for what a Linux host needs `sudo` for
+    /// (`needs_admin` in its row): the line to run in a Terminal.
+    HostsAdmin = "hosts.admin", HostNameParams => HostAdmin
 }
 
 method! {
@@ -838,6 +845,21 @@ pub struct HostInfo {
     /// is up.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<MemoryUse>,
+    /// What this Linux host needs someone with `sudo` there to allow, once;
+    /// `hosts.admin` says how. Empty almost always: only what VibeOS couldn't do
+    /// itself. A need this build doesn't know, from a newer host, is left out.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "known_admin_needs"
+    )]
+    pub needs_admin: Vec<AdminNeed>,
+}
+
+/// The needs this build knows of those a host names.
+fn known_admin_needs<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<AdminNeed>, D::Error> {
+    let names = <Vec<String> as Deserialize>::deserialize(d)?;
+    Ok(names.iter().filter_map(|n| n.parse().ok()).collect())
 }
 
 /// A host's memory as its kernel measures it (#47). Nothing is admitted or
@@ -983,6 +1005,17 @@ pub struct HostInstall {
     /// What the owner should know, in sentences: such as that lingering
     /// couldn't be turned on, and how to.
     pub notes: Vec<String>,
+}
+
+/// `hosts.admin`'s answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostAdmin {
+    /// The line a Terminal here runs: `ssh -t` to the host, `sudo` there asks
+    /// for its password on that terminal. Built on this side from what's known
+    /// to be needed, never from anything the host said. VibeOS never sees the
+    /// password.
+    pub command: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1495,6 +1528,9 @@ pub struct PiStatus {
     /// agent on a Linux host. None if it has none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native: Option<PiBinary>,
+    /// Why VibeOS couldn't install or update that, the last time it tried.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
     /// The providers the owner's own `~/.pi/agent` is signed in to, by name.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub logins: Vec<String>,

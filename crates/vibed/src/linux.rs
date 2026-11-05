@@ -248,7 +248,7 @@ impl Watch {
             return check(
                 CheckState::Fail,
                 sentence(e),
-                Some("Check this Mac is online, then try again."),
+                Some("VibeOS tries again every hour. Check this Mac is online."),
                 None,
             );
         }

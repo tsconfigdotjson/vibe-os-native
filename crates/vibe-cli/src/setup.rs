@@ -366,13 +366,16 @@ pub(crate) fn describe_pi(p: &PiStatus) -> String {
     };
     let native = match &p.native {
         Some(n) => format!("Pi {} at {}", n.version, n.path),
-        None => "Pi isn't installed (vibe pi install)".to_owned(),
+        None => match &p.error {
+            Some(why) => format!("Pi isn't installed yet: {why}"),
+            None => "Pi isn't installed (VibeOS installs it once a profile runs it)".to_owned(),
+        },
     };
     let mut out = format!("{native}, {}", logins(&p.logins));
     if let Some(vms) = &p.vms {
         let layer = match &vms.version {
             Some(v) => format!("Pi {v}"),
-            None => "Pi isn't downloaded (vibe pi install --vm)".to_owned(),
+            None => "Pi isn't downloaded (VibeOS fetches it once a profile runs it)".to_owned(),
         };
         out.push_str(&format!(
             "\nlinux agents: {layer}, {}",
@@ -452,6 +455,9 @@ pub(crate) fn describe_host(h: &HostInfo) -> String {
     }
     if !h.missing.is_empty() {
         out.push_str(&format!("  missing {}", h.missing.join(", ")));
+    }
+    if !h.needs_admin.is_empty() {
+        out.push_str("  needs sudo there once: Settings → Hosts has the button");
     }
     if h.external {
         out.push_str("  external address");
@@ -898,6 +904,7 @@ mod tests {
             tunnel: None,
             external_detail: None,
             memory: None,
+            needs_admin: vec![],
         };
         assert_eq!(
             describe_host(&h),
@@ -999,12 +1006,16 @@ mod tests {
         let mut status = PiStatus {
             host: "local".into(),
             native: None,
+            error: None,
             logins: Vec::new(),
             vms: Some(vibe_core::rpc::PiVms::default()),
         };
         let none = describe_pi(&status);
-        assert!(none.contains("vibe pi install\x29"), "{none}");
-        assert!(none.contains("vibe pi install --vm"), "{none}");
+        assert!(
+            none.contains("installs it once a profile runs it"),
+            "{none}"
+        );
+        assert!(none.contains("fetches it once a profile runs it"), "{none}");
         assert!(none.contains("Copy code login (headless)"), "{none}");
         assert!(none.contains("Don't choose Browser login"), "{none}");
         status.vms = Some(vibe_core::rpc::PiVms {

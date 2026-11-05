@@ -34,11 +34,11 @@ commands:
   ls          list the sessions on this host
   hello       check that vibed is up, and print what it reports
   doctor      check what agents here need: git, gh's login and git using it,
-              claude and its login, system sleep off, Tailscale (optional),
-              and on a Mac the Linux images; exits 1 if one needs you.
-              vibed sets git up to use gh itself. --fix has it try now what
-              it can, such as the download. VibeOS.app checks its own Terminal
-              permission
+              claude and its login, system sleep off, on a Linux host that
+              vibed stays up while you're logged out, Tailscale (optional), on
+              a Mac the Linux images, and Pi; exits 1 if one needs you. vibed
+              sets up all it can by itself, and asking has it try again.
+              VibeOS.app checks its own Terminal permission
   rpc         the vibed socket API on stdin and stdout, one JSON-RPC message per line
   setup-token log linux agents in to Claude: runs `claude setup-token` and keeps
               its long-lived token in the Keychain, for vibed to hand each VM
@@ -129,9 +129,7 @@ enum Command {
     Attach(String),
     Ls,
     Hello,
-    Doctor {
-        fix: bool,
-    },
+    Doctor,
     Rpc,
     SetupToken,
     Toolbox(toolbox::Command),
@@ -173,11 +171,12 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
             "ls" => Command::Ls,
             "hello" => Command::Hello,
             "doctor" => {
-                let fix = iter.as_slice().first().is_some_and(|w| w == "--fix");
-                if fix {
+                // Asking fixes what can be fixed, so this means nothing now. An
+                // old habit or script still works.
+                if iter.as_slice().first().is_some_and(|w| w == "--fix") {
                     iter.next();
                 }
-                Command::Doctor { fix }
+                Command::Doctor
             }
             "rpc" => Command::Rpc,
             "mcp-proxy" => Command::McpProxy {
@@ -358,8 +357,8 @@ fn main() -> ExitCode {
         }
         Command::Ls => ls(&socket),
         Command::Hello => hello(&socket),
-        Command::Doctor { fix } => {
-            return match doctor::run(&socket, fix) {
+        Command::Doctor => {
+            return match doctor::run(&socket) {
                 Ok(true) => ExitCode::SUCCESS,
                 Ok(false) => ExitCode::FAILURE,
                 Err(e) => {
@@ -560,14 +559,14 @@ mod tests {
             parse(&["doctor"]),
             Ok(Args::Run {
                 socket: None,
-                command: Command::Doctor { fix: false }
+                command: Command::Doctor
             })
         );
         assert_eq!(
             parse(&["doctor", "--fix", "--socket", "/s"]),
             Ok(Args::Run {
                 socket: Some("/s".into()),
-                command: Command::Doctor { fix: true }
+                command: Command::Doctor
             })
         );
         assert!(parse(&["doctor", "--fxi"]).is_err());

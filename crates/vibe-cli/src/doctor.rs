@@ -1,7 +1,7 @@
 //! `vibe doctor`: what this host needs for agents to work, as `vibed` sees
 //! it (PRD: Key user flows, Install and setup), one line a check, with
-//! what to do about each that isn't right. `--fix` has `vibed` do what it
-//! can: git using `gh` for GitHub, and the Linux images' download.
+//! what's left to do about each that isn't right. There's no step to fix things:
+//! asking has `vibed` try at once whatever's its to do, and list what isn't.
 //! VibeOS.app checks its own permission to control Terminal, which only
 //! the app can see.
 
@@ -27,6 +27,7 @@ pub(crate) fn title(id: CheckId) -> &'static str {
         CheckId::Claude => "Claude Code",
         CheckId::ClaudeLogin => "Claude login",
         CheckId::Power => "system sleep",
+        CheckId::Linger => "stays up",
         CheckId::Tailscale => "Tailscale",
         CheckId::Linux => "Linux images",
         CheckId::Pi => "Pi",
@@ -62,12 +63,7 @@ pub(crate) fn render(report: &DoctorReport) -> String {
             title(c.id),
         ));
         if let Some(hint) = &c.hint {
-            let fix = if c.fixable && c.state == CheckState::Fail {
-                " `vibe doctor --fix` can do it."
-            } else {
-                ""
-            };
-            out.push_str(&format!("    {:width$}  {hint}{fix}\n", ""));
+            out.push_str(&format!("    {:width$}  {hint}\n", ""));
         }
     }
     let failed = failures(report).count();
@@ -89,23 +85,25 @@ fn failures(report: &DoctorReport) -> impl Iterator<Item = &DoctorCheck> {
     report.checks.iter().filter(|c| c.state == CheckState::Fail)
 }
 
-/// Runs the checks, and with `fix` fixes what `vibed` can first. Ok(true)
-/// when nothing needs the owner.
-pub(crate) fn run(socket: &Path, fix: bool) -> Result<bool, ClientError> {
+/// Whether asking the doctor tries `check` again now. Not the Linux images: that
+/// would read as under way rather than say why it failed, and start another large
+/// download each time. `vibed` tries those again by itself, and the app has a button.
+fn tried_on_asking(check: CheckId) -> bool {
+    check != CheckId::Linux
+}
+
+/// Runs the checks, with `vibed` first trying now whatever it does by itself.
+/// Ok(true) when nothing needs the owner.
+pub(crate) fn run(socket: &Path) -> Result<bool, ClientError> {
     let mut report = client::call::<DoctorCheckGet>(socket, &NoParams {}, TIMEOUT)?;
-    if fix {
-        let fixable: Vec<CheckId> = failures(&report)
-            .filter(|c| c.fixable)
-            .map(|c| c.id)
-            .collect();
-        for check in fixable {
-            match client::call::<DoctorFix>(socket, &DoctorFixParams { check }, TIMEOUT) {
-                Ok(r) => {
-                    println!("fixed: {}", title(check));
-                    report = r;
-                }
-                Err(e) => eprintln!("vibe: can't fix {}: {e}", title(check)),
-            }
+    let fixable: Vec<CheckId> = failures(&report)
+        .filter(|c| c.fixable && tried_on_asking(c.id))
+        .map(|c| c.id)
+        .collect();
+    for check in fixable {
+        // What's still wrong is in the report, in its own words.
+        if let Ok(r) = client::call::<DoctorFix>(socket, &DoctorFixParams { check }, TIMEOUT) {
+            report = r;
         }
     }
     print!("{}", render(&report));
@@ -125,6 +123,14 @@ mod tests {
             fixable,
             progress: None,
         }
+    }
+
+    #[test]
+    fn a_failed_download_is_said_and_not_started_again_on_asking() {
+        assert!(!tried_on_asking(CheckId::Linux));
+        assert!(tried_on_asking(CheckId::GhGit));
+        assert!(tried_on_asking(CheckId::Linger));
+        assert!(tried_on_asking(CheckId::Pi));
     }
 
     #[test]
@@ -161,7 +167,7 @@ mod tests {
             "\
 ok  git             git said so.
 !!  git through gh  gh_git said so.
-                    VibeOS sets this up itself. `vibe doctor --fix` can do it.
+                    VibeOS sets this up itself.
 --  Tailscale       tailscale said so.
                     Install it, if you want it.
 ..  Linux images    linux said so (40%).

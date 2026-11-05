@@ -849,7 +849,7 @@ public struct SetupProgress: Equatable, Sendable {
     public var steps: [Step] {
         var steps: [Step] = []
         if let command = commandStep { steps.append(command) }
-        // Pi is optional and nothing starts without asking for it, so the
+        // Pi is optional and VibeOS installs it once a profile runs it, so the
         // welcome doesn't bring it up: Settings → Agents has it. Nor git using gh
         // while gh isn't logged in: vibed sets that up itself once it is.
         let machine = doctor.filter {
@@ -983,6 +983,9 @@ public struct SetupProgress: Equatable, Sendable {
         case .power:
             step.action = .terminal("sudo pmset -c sleep 0")
             step.actionTitle = "Turn Off…"
+        case .linger:
+            // Only a Linux host's, and a Mac's welcome is about the Mac.
+            break
         case .tailscale:
             step.action = .open("https://tailscale.com/download/mac")
             step.actionTitle = "Get Tailscale"
@@ -1014,7 +1017,7 @@ public struct SetupProgress: Equatable, Sendable {
         case .claudeLogin: return claudeReady ? "Sign in once, in Terminal, with /login." : "Once Claude Code is installed."
         case .power: return "Agents can't answer while this Mac sleeps. Turning it off asks for your password."
         case .tailscale: return "Lets your other machines reach MCP here."
-        case .linux, .pi: return check.detail
+        case .linger, .linux, .pi: return check.detail
         }
     }
 
@@ -1069,6 +1072,8 @@ public func checkTitle(_ id: CheckId, passed: Bool) -> String {
     case (.claudeLogin, false): "Sign in to Claude Code"
     case (.power, true): "Sleep off"
     case (.power, false): "Keep this Mac awake"
+    case (.linger, true): "vibed stays up"
+    case (.linger, false): "Keep vibed up when you log out"
     case (.tailscale, true): "Tailscale"
     case (.tailscale, false): "Tailscale"
     case (.linux, true): "Linux"

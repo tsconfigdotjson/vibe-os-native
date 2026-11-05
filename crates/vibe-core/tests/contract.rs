@@ -9,10 +9,10 @@ use serde::de::{self, DeserializeOwned, Deserializer, Visitor};
 use serde::{Serialize, forward_to_deserialize_any};
 use serde_json::Value;
 use vibe_core::model::{
-    Activity, AgentKind, AgentState, Certainty, CheckId, CheckState, Environment, EventKind,
-    GhState, HostLink, LoginTool, MessageRole, Mode, Model, PiTarget, ProjectSource, Reasoning,
-    ServiceRole, ServiceState, SessionState, StopReason, ToolboxAction, ToolboxState, TunnelState,
-    WakeupKind,
+    Activity, AdminNeed, AgentKind, AgentState, Certainty, CheckId, CheckState, Environment,
+    EventKind, GhState, HostLink, LoginTool, MessageRole, Mode, Model, PiTarget, ProjectSource,
+    Reasoning, ServiceRole, ServiceState, SessionState, StopReason, ToolboxAction, ToolboxState,
+    TunnelState, WakeupKind,
 };
 use vibe_core::paths;
 use vibe_core::rpc::*;
@@ -164,6 +164,7 @@ fn rust_types() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
         entry::<HostAddParams>(),
         entry::<HostNameParams>(),
         entry::<HostInstall>(),
+        entry::<HostAdmin>(),
         entry::<HostExternalParams>(),
         entry::<TunnelPrepared>(),
         entry::<Project>(),
@@ -281,6 +282,7 @@ fn rust_methods() -> BTreeMap<&'static str, MethodTypes> {
         method::<HostsList>(),
         method::<HostsAdd>(),
         method::<HostsUpgrade>(),
+        method::<HostsAdmin>(),
         method::<HostsRemove>(),
         method::<HostsExternal>(),
         method::<TunnelPrepare>(),
@@ -383,6 +385,7 @@ fn rust_enums() -> BTreeMap<&'static str, Vec<&'static str>> {
         ),
         ("LoginTool", names(LoginTool::ALL, LoginTool::as_str)),
         ("CheckId", names(CheckId::ALL, CheckId::as_str)),
+        ("AdminNeed", names(AdminNeed::ALL, AdminNeed::as_str)),
         ("CheckState", names(CheckState::ALL, CheckState::as_str)),
         (
             "ServiceState",
@@ -778,6 +781,10 @@ fn examples_cover_the_contract() {
         }
         if ty == "KeyList" {
             seen_keys.insert("pending_on");
+        }
+        // Only a download that fails says so; vibed's own tests cover it.
+        if ty == "PiStatus" {
+            seen_keys.insert("error");
         }
         assert_eq!(
             seen_keys, fields,
