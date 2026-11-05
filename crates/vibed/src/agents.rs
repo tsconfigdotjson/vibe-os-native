@@ -1863,7 +1863,9 @@ impl Core {
 /// `--auto`, git takes a lock that's there to mean another run is under way,
 /// and quietly does nothing, for good. vibed's own run can't be older than
 /// its timeout. Someone else's could be, and then only overlaps with this
-/// one, which git allows for: gc has its own lock, `gc.pid`.
+/// one, which git allows for: gc has its own lock, `gc.pid`. A lock dated
+/// ahead of now counts the same way, as a clock that's been set back leaves
+/// one, and no run under way is that far off.
 async fn clear_stale_maintenance_lock(project_name: &str, project: &Path) {
     // Where the lock is from any checkout, linked ones too. It can be
     // relative to the checkout.
@@ -1875,7 +1877,7 @@ async fn clear_stale_maintenance_lock(project_name: &str, project: &Path) {
     // The link itself if it's one: `.git` is agents' to write to.
     let stale = fs::symlink_metadata(&lock)
         .and_then(|m| m.modified())
-        .is_ok_and(|at| at.elapsed().is_ok_and(|age| age > FETCH_TIMEOUT));
+        .is_ok_and(|at| at.elapsed().unwrap_or_else(|ahead| ahead.duration()) > FETCH_TIMEOUT);
     if !stale {
         return;
     }
