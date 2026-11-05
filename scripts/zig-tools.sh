@@ -49,52 +49,53 @@ sha256_of() {
 }
 
 # fetch_zig <dir>: puts zig in <dir>, whole or not at all. A tarball that isn't
-# the one named here is never unpacked.
-fetch_zig() {
-  local dir=$1 platform want tarball tmp got
+# the one named here is never unpacked. It's a subshell for a trap of its own, which
+# leaves the caller's alone: its temp dir goes however it ends, an interrupt included.
+fetch_zig() (
+  dir=$1
   platform=$(zig_platform)
   want=$(zig_checksum "$platform") || {
     echo "zig-tools: no zig named here for $platform" >&2
-    return 1
+    exit 1
   }
   tarball="zig-$platform-$ZIG_VERSION.tar.xz"
   mkdir -p "$(dirname "$dir")"
-  tmp=$(mktemp -d "$dir.XXXXXX") || return 1
+  tmp=$(mktemp -d "$dir.XXXXXX") || exit 1
+  trap 'rm -rf "$tmp"' EXIT
   echo "zig-tools: fetching zig $ZIG_VERSION, once" >&2
   if ! curl -fsSL --retry 3 --connect-timeout 30 --max-time 900 -o "$tmp/$tarball" \
     "https://ziglang.org/download/$ZIG_VERSION/$tarball"; then
     echo "zig-tools: can't download zig from ziglang.org" >&2
-    rm -rf "$tmp"
-    return 1
+    exit 1
   fi
   got=$(sha256_of "$tmp/$tarball")
   if [ "$got" != "$want" ]; then
     echo "zig-tools: $tarball isn't the expected one: its SHA-256 is $got, not $want" >&2
-    rm -rf "$tmp"
-    return 1
+    exit 1
   fi
   mkdir "$tmp/unpacked"
   if ! tar -xJf "$tmp/$tarball" -C "$tmp/unpacked" --strip-components=1 ||
     ! [ -x "$tmp/unpacked/zig" ]; then
     echo "zig-tools: can't unpack $tarball" >&2
-    rm -rf "$tmp"
-    return 1
+    exit 1
   fi
   # Another run may have got there first, and its copy will do. mv into a
   # directory that exists would put this one inside it, so it goes if it did.
   [ -e "$dir" ] || mv "$tmp/unpacked" "$dir" 2>/dev/null
-  rm -rf "$tmp" "$dir/unpacked"
+  rm -rf "$dir/unpacked"
   [ -x "$dir/zig" ] || {
     echo "zig-tools: $dir is there, and has no zig in it: remove it to fetch it again" >&2
-    return 1
+    exit 1
   }
-}
+)
 
 ensure_zigbuild() {
   if command -v cargo-zigbuild >/dev/null && command -v zig >/dev/null; then
     return 0
   fi
   local tools=${VIBE_TOOLS_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/vibeos/tools}
+  # Whole, as it goes on PATH: what cargo runs doesn't run from here.
+  case $tools in /*) ;; *) tools=$PWD/$tools ;; esac
   local zig_dir="$tools/zig-$ZIG_VERSION"
   local zigbuild_root="$tools/cargo-zigbuild-$CARGO_ZIGBUILD_VERSION"
   [ -x "$zig_dir/zig" ] || fetch_zig "$zig_dir" || return 1

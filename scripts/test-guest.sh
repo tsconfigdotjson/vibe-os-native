@@ -91,6 +91,7 @@ mv "$OUT/Image.part" "$OUT/Image"
 
 rustup target add "$TARGET" >/dev/null
 cargo build -p vibe-testguest -p vibe-guest --locked --release --target "$TARGET"
+RUST=${CARGO_TARGET_DIR:-target}/$TARGET/release
 
 # Loads the drivers both guests need, on Alpine's netboot initramfs with its
 # busybox: from the initramfs, then from the disk whose serial is `modloop`.
@@ -132,7 +133,7 @@ initrd() {
   local root="$OUT/root"
   rm -rf "$root"
   mkdir -p "$root"
-  cp "target/$TARGET/release/vibe-testguest" "target/$TARGET/release/vibe-guest" "$root/"
+  cp "$RUST/vibe-testguest" "$RUST/vibe-guest" "$root/"
   if [ "$1" = initrd-guest ]; then
     mkdir -p "$root/usr/lib"
     for apk in "$CACHE"/libgcc-*.apk "$CACHE"/libstdc++-*.apk; do

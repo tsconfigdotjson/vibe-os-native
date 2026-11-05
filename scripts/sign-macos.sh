@@ -3,9 +3,9 @@
 # development. vibe-vm gets the com.apple.security.virtualization
 # entitlement it needs to run VMs. The app is bundled as a release is
 # (scripts/release-macos.sh, which signs with a Developer ID): vibe-vm in
-# Contents/MacOS, with vibed, vibe and vibe-shim from target/ when they're
-# built, and vibed's LaunchAgent. Only a copy in Applications registers it;
-# build/VibeOS.app installs nothing.
+# Contents/MacOS, with vibed, vibe and vibe-shim from target/ (or
+# CARGO_TARGET_DIR) when they're built, and vibed's LaunchAgent. Only a copy
+# in Applications registers it; build/VibeOS.app installs nothing.
 #
 #   scripts/sign-macos.sh             debug build
 #   CONFIG=release scripts/sign-macos.sh
@@ -20,6 +20,7 @@ fi
 
 CONFIG=${CONFIG:-debug}
 OUT=build
+RUST=${CARGO_TARGET_DIR:-target}/$CONFIG
 ENTITLEMENT=com.apple.security.virtualization
 mkdir -p "$OUT"
 
@@ -71,11 +72,11 @@ esac
 # when this build has them. Each is signed before the bundle that seals it.
 cp "$OUT/vibe-vm" "$APP/Contents/MacOS/vibe-vm"
 for b in vibed vibe vibe-shim; do
-  if [ -x "target/$CONFIG/$b" ]; then
-    cp "target/$CONFIG/$b" "$APP/Contents/MacOS/$b"
+  if [ -x "$RUST/$b" ]; then
+    cp "$RUST/$b" "$APP/Contents/MacOS/$b"
     codesign --force --sign - --timestamp=none "$APP/Contents/MacOS/$b"
   else
-    echo "sign-macos.sh: no target/$CONFIG/$b (cargo build first); the app has none" >&2
+    echo "sign-macos.sh: no $RUST/$b (cargo build first); the app has none" >&2
   fi
 done
 codesign --force --sign - --timestamp=none \

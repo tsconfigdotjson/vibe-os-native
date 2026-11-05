@@ -209,6 +209,11 @@ set -o pipefail
 cd "$(dirname "$0")/.." || exit 1
 ROOT=$(pwd)
 OS=$(uname -s)
+# Where cargo builds, whole, so what's run below is what cargo just built: with
+# CARGO_TARGET_DIR set, target/ holds nothing, or an old build that would still pass.
+TARGET_DIR=${CARGO_TARGET_DIR:-target}
+case $TARGET_DIR in /*) ;; *) TARGET_DIR=$ROOT/$TARGET_DIR ;; esac
+[ -z "${CARGO_TARGET_DIR:-}" ] || export CARGO_TARGET_DIR="$TARGET_DIR"
 export PATH="$HOME/.cargo/bin:$PATH"
 export CARGO_TERM_COLOR=never
 # Whatever this shell allows, what's checked stays out of the login Keychain
@@ -312,12 +317,12 @@ mac_step() {
   fi
 }
 
-# start_vibed <socket> <log>: starts target/debug/vibed and waits for it. Its
+# start_vibed <socket> <log>: starts the built vibed and waits for it. Its
 # $HOME is the socket's grandparent's home/, so it never touches the real
 # state; a restart on the same socket finds the same state.
 start_vibed() {
   VIBED_SOCKET=$1
-  HOME="$(dirname "$(dirname "$1")")/home" target/debug/vibed --socket "$1" 2>"$2" &
+  HOME="$(dirname "$(dirname "$1")")/home" "$TARGET_DIR/debug/vibed" --socket "$1" 2>"$2" &
   VIBED_PID=$!
   echo "$VIBED_PID" >>"$WORK/pids"
   local i
@@ -396,7 +401,7 @@ s_guest() {
   local target=aarch64-unknown-linux-musl info
   rustup target add "$target"
   cargo build -p vibe-guest --locked --release --target "$target"
-  info=$(file "target/$target/release/vibe-guest")
+  info=$(file "$TARGET_DIR/$target/release/vibe-guest")
   echo "$info"
   case $info in *"ARM aarch64"*) ;; *) echo "not an aarch64 binary"; return 1 ;; esac
   case $info in *"statically linked"*) ;; *) echo "not statically linked"; return 1 ;; esac
@@ -450,14 +455,14 @@ STUB
 s_smoke() {
   local log="$WORK/smoke-vibed.log" out protocol
   start_vibed "$WORK/smoke/run/vibed.sock" "$log"
-  out=$(target/debug/vibe --socket "$VIBED_SOCKET" hello)
+  out=$("$TARGET_DIR/debug/vibe" --socket "$VIBED_SOCKET" hello)
   echo "$out"
   # What this build speaks, so a protocol bump can't leave this behind.
   protocol=$(printf '%s\n' "$out" | sed -n 's/.* protocol \([0-9][0-9]*\) .*/\1/p')
   [ -n "$protocol" ] || { echo "vibe hello gave no protocol"; return 1; }
   out=$(printf '%s\n' \
     '{"jsonrpc":"2.0","id":1,"method":"daemon.hello","params":{"client":"check-full","protocol":'"$protocol"'}}' \
-    | target/debug/vibe --socket "$VIBED_SOCKET" rpc)
+    | "$TARGET_DIR/debug/vibe" --socket "$VIBED_SOCKET" rpc)
   echo "vibe rpc: $out"
   case $out in *'"daemon":"vibed"'*) ;; *) echo "vibe rpc gave no hello result"; return 1 ;; esac
   stop_vibed
@@ -467,7 +472,7 @@ s_smoke() {
 }
 
 # rpc <message>...: one connection through `vibe rpc`, printing the replies.
-rpc() { printf '%s\n' "$@" | target/debug/vibe --socket "$VIBED_SOCKET" rpc; }
+rpc() { printf '%s\n' "$@" | "$TARGET_DIR/debug/vibe" --socket "$VIBED_SOCKET" rpc; }
 
 # expect <text> <what>: fails unless $out contains <text>.
 expect() {
@@ -510,7 +515,7 @@ s_registry() {
 }
 
 # vibe ls, against the daemon start_vibed started, with its home.
-ls_sessions() { HOME="$1" target/debug/vibe --socket "$VIBED_SOCKET" ls; }
+ls_sessions() { HOME="$1" "$TARGET_DIR/debug/vibe" --socket "$VIBED_SOCKET" ls; }
 
 s_sessions() {
   local socket="$WORK/sessions/run/vibed.sock" home="$WORK/sessions/home" run shim i
@@ -520,7 +525,7 @@ s_sessions() {
     run="$home/.local/share/vibeos/run"
   fi
   start_vibed "$socket" "$WORK/sessions-vibed-1.log"
-  shim=$(PS1='$ ' target/debug/vibe-shim --ref smoke-shell --socket "$run/smoke-shell.sock" \
+  shim=$(PS1='$ ' "$TARGET_DIR/debug/vibe-shim" --ref smoke-shell --socket "$run/smoke-shell.sock" \
     --state "$home/VibeOS/agents/smoke-shell" --cwd "$WORK" -- sh)
   echo "$shim" >>"$WORK/pids"
   echo "vibe-shim started as pid $shim"
@@ -719,12 +724,12 @@ s_mcp() {
   grep -q '^mcp_tailscale = true' "$home/.config/vibeos/host.toml" || { echo "not in host.toml"; return 1; }
   out=$(rpc '{"jsonrpc":"2.0","id":5,"method":"mcp.set","params":{"tailscale":false}}')
   expect '"tailscale_urls":[]' "Tailscale turned off"
-  key=$(HOME="$home" target/debug/vibe --socket "$socket" key create check)
+  key=$(HOME="$home" "$TARGET_DIR/debug/vibe" --socket "$socket" key create check)
   case $key in vk_*) ;; *) echo "no key made: $key"; return 1 ;; esac
 
   MCP_OUT="$WORK/mc-bridge.out"
   mkfifo "$WORK/mc-in"
-  HOME="$home" VIBE_API_KEY="$key" target/debug/vibe mcp <"$WORK/mc-in" >"$MCP_OUT" 2>"$WORK/mc-bridge.err" &
+  HOME="$home" VIBE_API_KEY="$key" "$TARGET_DIR/debug/vibe" mcp <"$WORK/mc-in" >"$MCP_OUT" 2>"$WORK/mc-bridge.err" &
   bridge=$!
   echo "$bridge" >>"$WORK/pids"
   exec 7>"$WORK/mc-in"
@@ -759,7 +764,7 @@ s_mcp() {
       return 1
     fi
   fi
-  out=$(HOME="$home" target/debug/vibe --socket "$socket" key list)
+  out=$(HOME="$home" "$TARGET_DIR/debug/vibe" --socket "$socket" key list)
   echo "keys: $out"
   case $out in *"check  vk_"*"last used"*) ;; *) echo "the key doesn't say it was used"; return 1 ;; esac
   # The log names the key that called, and never holds the key itself.
@@ -788,7 +793,7 @@ claude_token() {
     return 1
   fi
   token=$(security find-generic-password -s VibeOS -a claude-setup-token -w 2>/dev/null) || {
-    echo "no Claude token: run \`VIBE_LOGIN_KEYCHAIN=allow target/debug/vibe setup-token\` or set CLAUDE_CODE_OAUTH_TOKEN"
+    echo "no Claude token: run \`VIBE_LOGIN_KEYCHAIN=allow $TARGET_DIR/debug/vibe setup-token\` or set CLAUDE_CODE_OAUTH_TOKEN"
     return 1
   }
 }
@@ -832,7 +837,7 @@ s_macos_agents() {
   chmod 700 "$(dirname "$socket")"
   env -i HOME="$home" USER="$USER" LOGNAME="$USER" PATH=/usr/bin:/bin:/usr/sbin:/sbin \
     VIBE_CLAUDE="$ROOT/crates/vibe-env/src/stand-in.sh" \
-    target/debug/vibed --socket "$socket" 2>"$WORK/ma-vibed.log" &
+    "$TARGET_DIR/debug/vibed" --socket "$socket" 2>"$WORK/ma-vibed.log" &
   VIBED_PID=$! VIBED_SOCKET=$socket
   echo "$VIBED_PID" >>"$WORK/pids"
   wait_file "$socket"
@@ -1049,7 +1054,7 @@ s_vm_cycle() {
   cargo test -p vibe-env --locked --test vm_cycle --no-run
   settle
   VIBE_VM_BIN="$ROOT/build/vibe-vm" VIBE_VM_GUEST="$ROOT/build/test-guest" VIBE_VM_MARKER="$marker" \
-    VIBE_SHIM_BIN="$ROOT/target/debug/vibe-shim" \
+    VIBE_SHIM_BIN="$TARGET_DIR/debug/vibe-shim" \
     cargo test -p vibe-env --locked --test vm_cycle -- --test-threads=1 --nocapture
   local required=(boot_save_restore three_vms_at_once guest_question_survives_sleep
     guest_shim_reaches_the_broker_over_the_relay_across_a_sleep
@@ -1200,7 +1205,7 @@ s_terminal_attach() {
   case $out in *'"error"'*) echo "a call failed"; return 1 ;; esac
   ref=$(json_field "$out" 4 ref)
   [ -n "$ref" ] || { echo "no agent"; return 1; }
-  export VIBE_SOCKET="$VIBED_SOCKET" VIBE_CLI="$ROOT/target/debug/vibe"
+  export VIBE_SOCKET="$VIBED_SOCKET" VIBE_CLI="$TARGET_DIR/debug/vibe"
   terminal_up
   before=$(terminal_tabs)
   # Two clicks in a row, as fast as one process makes them.
@@ -1263,7 +1268,7 @@ s_app_launch() {
 s_doctor() {
   local rc=0 lines
   start_vibed "$WORK/doctor/run/vibed.sock" "$WORK/doctor-vibed.log"
-  out=$(HOME="$WORK/doctor/home" target/debug/vibe --socket "$VIBED_SOCKET" doctor) || rc=$?
+  out=$(HOME="$WORK/doctor/home" "$TARGET_DIR/debug/vibe" --socket "$VIBED_SOCKET" doctor) || rc=$?
   echo "$out"
   echo "exit $rc"
   [ $rc -eq 0 ] || [ $rc -eq 1 ] || { echo "vibe doctor exited $rc"; return 1; }
