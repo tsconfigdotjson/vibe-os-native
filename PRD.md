@@ -93,7 +93,7 @@ An agent, its worktree and its compartment are one unit. They're created togethe
 | Managed layers | Tools the daemon keeps for `linux` VMs: Claude Code, kept current, for every agent that runs it, and in a layer of its own the Pi version this build pins, for those that run Pi. | Host disk images |
 | Toolbox shell | A Terminal session in a writable Linux VM, for changing the template and the Linux home. | Settings → Linux Toolbox, or `vibe toolbox` |
 | Host limits | Everything that isn't per profile: cores kept for macOS, CPU cores per agent, agents awake at once, process count, disk. | Settings → Host, or `~/.config/vibeos/host.toml` |
-| Snapshot | A sleeping `linux` agent's whole VM, RAM included, saved to disk. Restoring it resumes the agent exactly. | `~/VibeOS/snapshots/<ref>` |
+| Snapshot | A sleeping `linux` agent's whole VM, RAM included, saved to disk. Restoring it resumes the agent exactly, but for what its processes held on a share (Going to sleep). | `~/VibeOS/snapshots/<ref>` |
 | Session | The PTY the agent runs in. A shim holds it, so it outlives every client. | `…/run/<ref>.sock` |
 | Transcript | The session file the agent writes on its own. agent-tail reads it to get status. | Claude: `macos` and Linux hosts, `~/.claude/projects/`; `linux` on the Mac, the agent's own Claude home on the Mac. Pi: `macos` and Linux hosts, `~/.pi/agent/sessions/`; `linux` on the Mac, the agent's own `pi-sessions/` on the Mac |
 | Client | Anything attached to an agent or calling `vibed`: Terminal via `vibe attach`, an MCP client, or the menu bar app. | — |
@@ -627,9 +627,11 @@ Only transcripts of agents this app spawned are read. agent-tail is fed specific
 
 | Where | Sleep | Cost while asleep | Wake |
 | --- | --- | --- | --- |
-| `linux` on the Mac | `vibe-vm` pauses the VM, writes its state to the snapshot file and exits. The shim exits too | Disk, up to the VM's RAM. No RAM, no CPU | Restore the snapshot and start a shim. Exact, about 0.5 to 4 s |
+| `linux` on the Mac | `vibe-vm` pauses the VM, writes its state to the snapshot file and exits. The shim exits too | Disk, up to the VM's RAM. No RAM, no CPU | Restore the snapshot and start a shim. Exact but for what's held on a share (below), about 0.5 to 4 s |
 | `macos` | `SIGSTOP` the whole tree | No CPU. Memory stays allocated, and macOS compresses or swaps it under pressure | `SIGCONT`. Exact and instant |
 | Linux host | Freeze the agent's cgroup | No CPU. Memory stays allocated, and may swap | Thaw the cgroup. Exact and instant |
+
+**What a `linux` wake doesn't keep.** What a process in the VM holds on a share doesn't survive a save and restore. Afterwards, a file it held open for writing or reading gives errors or nothing new, `tail -f` stops following, and its working directory on a share no longer works, which is where an agent's worktree is. The process itself carries on, and opening things again by their paths works, including going back to the directory with `cd`. So a program left running across a sleep has to reopen what it holds on a share. Sleep isn't refused for this. The agent's terminal isn't affected, as it goes through pipes to its shim rather than through a share. What this does to Claude's or Pi's own working directory isn't known yet. `macos` agents and Linux hosts don't have this limit: freezing a process closes nothing. A test pins it, `files_held_on_a_share_fail_after_a_sleep`, so a change either way shows up.
 
 Waking is proven safe in agent-tail's CI (agent-tail#122). Claude Code sessions frozen while `done`, `awaiting_answer` and `awaiting_approval` were woken and continued the same session with the right status. That includes a variant that drops open connections and jumps the clock an hour forward, standing in for a VM restore. The same holds for Codex, Copilot CLI, OpenCode, Pi and Gemini CLI.
 
@@ -694,6 +696,7 @@ Virtualization.framework's save and restore works for this design. The spike ran
 | Memory the guest freed | Still saved (1.09 GB after freeing that 1 GB), unless the balloon reclaims it first. Inflating and releasing the balloon before saving cut the same snapshot to 41 MB |
 | A file changed on the host while the VM slept | Seen with its new contents after restore, not stale |
 | Shared folder right after a restore | Missing (`No such file or directory`) for about 0.9 s, then fine |
+| A file or working directory held on a shared folder across a save and restore (Nov 4, on a Mac) | Fails afterwards: write, read, `tail -f` and working directory. Opening again by path is how to go on |
 | Guest clock | Stops while the VM sleeps and stays behind until reset |
 | Network after a restore | Same IP; the gateway and the internet were reachable |
 | Configuration | A restore fails ("invalid argument") unless the configuration matches the saved one exactly. The NIC's random default MAC address broke it until it was fixed |
