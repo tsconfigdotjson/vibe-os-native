@@ -134,29 +134,51 @@ git config --global --replace-all url.https://github.com/.insteadOf ssh://git@gi
 /// login`, say, which no button is left to redo, as it shows as signed in. It's run as
 /// each agent's VM comes up, on that agent's own copy of the home, so neither the
 /// home's image nor the project's config changes, and an agent still on an older home
-/// has it too.
+/// has it too. It writes to git's other user file, which is read as well as
+/// `~/.gitconfig`: a copy of that in the agent's disk would hide whatever the owner
+/// changes in it from then on.
 ///
-/// It stands back wherever SSH may be what the owner meant: with a key or an SSH config
-/// in `~/.ssh`, or no login for `gh` to give. Without those SSH to GitHub can't work, so
-/// no `origin` needs looking at: one that's HTTPS isn't rewritten, and only an SSH one
-/// is helped. A rewrite already there, the owner's own included, is left, and so is a
-/// helper of the owner's for GitHub. With nothing to do, it writes nothing, and asks
-/// nothing of the network.
-pub(crate) const GITHUB_OVER_HTTPS: &str = r#"for k in "$HOME"/.ssh/*; do
-  [ -f "$k" ] || continue
-  case ${k##*/} in *.pub | known_hosts* | authorized_keys*) continue ;; esac
+/// It stands back where SSH may work: `core.sshCommand` is set, or `~/.ssh` has a key or
+/// a config and either that config has its own way with host keys or GitHub's is known.
+/// With no host key, an agent can't answer SSH's question, so nothing SSH was doing is
+/// lost. What this put there before comes out again then. No `origin` needs looking at:
+/// an HTTPS one isn't rewritten, and only an SSH one is helped. With `gh` signed out it
+/// does nothing. A rewrite already there, the owner's own included, is left, and so is any
+/// helper git has for GitHub. With nothing to do, it writes nothing. It never needs the
+/// network.
+pub(crate) const GITHUB_OVER_HTTPS: &str = r#"config=${XDG_CONFIG_HOME:-$HOME/.config}/git/config
+ssh_may_work() {
+  git config --get core.sshCommand >/dev/null && return 0
+  for k in "$HOME"/.ssh/*; do
+    [ -f "$k" ] || continue
+    case ${k##*/} in *.pub | known_hosts* | authorized_keys*) continue ;; esac
+    grep -qsiE 'stricthostkeychecking|userknownhostsfile' "$HOME/.ssh/config" && return 0
+    for host in github.com '[ssh.github.com]:443'; do
+      ssh-keygen -F "$host" -f "$HOME/.ssh/known_hosts" 2>/dev/null | grep -q . && return 0
+    done
+    return 1
+  done
+  return 1
+}
+if ssh_may_work; then
+  if [ -f "$config" ]; then
+    git config --file "$config" --unset-all url.https://github.com/.insteadOf '^git@github\.com:$'
+    git config --file "$config" --unset-all url.https://github.com/.insteadOf '^ssh://git@github\.com/$'
+  fi
   exit 0
-done
+fi
 missing=
 for form in git@github.com: ssh://git@github.com/; do
   [ "$(git ls-remote --get-url "${form}r")" = "${form}r" ] && missing="$missing $form"
 done
-[ -n "$missing" ] || exit 0
+helper=$(git config --get-urlmatch credential.helper https://github.com)
+[ -n "$missing" ] || [ -z "$helper" ] || exit 0
 gh auth token --hostname github.com >/dev/null 2>&1 || exit 0
-git config --get-all credential.https://github.com.helper | grep -q . ||
-  gh auth setup-git --hostname github.com || exit 1
+mkdir -p "${config%/*}" || exit 1
+[ -n "$helper" ] ||
+  git config --file "$config" --replace-all credential.https://github.com.helper '!gh auth git-credential' '^!gh auth git-credential$' || exit 1
 for form in $missing; do
-  git config --global --add url.https://github.com/.insteadOf "$form" || exit 1
+  git config --file "$config" --add url.https://github.com/.insteadOf "$form" || exit 1
 done"#;
 
 /// How long the look at the Linux home's logins may take: it reads a few
