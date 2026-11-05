@@ -548,6 +548,91 @@ async fn a_real_pi_lives_a_whole_life_on_a_mock_model() {
         })
         .await
         .unwrap();
+
+    // `/` and `!` as its real editor sorts them. One that's answered and has since
+    // lost its key reads as done, so only the screen can say a later turn failed. Its
+    // own `/session` owes no answer, but a path or a lone `!` goes to the model.
+    let models_file = w.layout.linux_pi_dir().join("models.json");
+    let models = fs::read_to_string(&models_file).unwrap();
+    for prompt in ["/tmp/notes.txt is empty", "!"] {
+        fs::write(&models_file, &models).unwrap();
+        let a = w
+            .core
+            .start_agent(AgentStartParams {
+                project: "app".into(),
+                profile: "pi-linux".into(),
+                prompt: "hello".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let r = a.agent.clone();
+        let activity = async || {
+            let list = w.core.agents(HostParams { host: None }).await.unwrap();
+            let a = list.agents.iter().find(|x| x.agent == r).unwrap();
+            (a.status.activity, a.status.error.clone())
+        };
+        let until = async |wanted: Activity| {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                let (now, _) = activity().await;
+                if now == wanted {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "{prompt:?}: it's {now}, not {wanted}; its screen:\n{}",
+                    w.screen(&r).await
+                );
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        };
+        let send = async |text: &str| {
+            w.core
+                .send_input(
+                    None,
+                    &r,
+                    vibe_mcp::Input::Text {
+                        text: text.into(),
+                        submit: true,
+                        force: false,
+                    },
+                )
+                .await
+                .unwrap();
+        };
+        until(Activity::Done).await;
+        let mut no_key: serde_json::Value = serde_json::from_str(&models).unwrap();
+        no_key["providers"]["mock"]
+            .as_object_mut()
+            .unwrap()
+            .remove("apiKey");
+        fs::write(&models_file, no_key.to_string()).unwrap();
+        let socket = w.layout.session_socket(&r);
+        let vibed::sessions::Probe::Running(session) = vibed::sessions::probe(&socket).await else {
+            panic!("its session runs");
+        };
+        vibe_env::tree::SessionTree::new(session.pid).end(Duration::from_secs(5));
+        wait_until("it to exit", || !socket.exists());
+        w.core.resume_agent(None, &r).await.unwrap();
+        send("/session").await;
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let (now, _) = activity().await;
+        assert_eq!(now, Activity::Done, "{}", w.screen(&r).await);
+        send(prompt).await;
+        until(Activity::Errored).await;
+        let (_, error) = activity().await;
+        let error = error.unwrap_or_default();
+        assert!(error.contains("No API key found for mock"), "{error}");
+        w.core
+            .delete_agent(AgentDeleteParams {
+                host: None,
+                agent: r,
+                force: Some(true),
+            })
+            .await
+            .unwrap();
+    }
     mark();
 }
 
