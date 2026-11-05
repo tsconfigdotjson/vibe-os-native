@@ -1,0 +1,41 @@
+{
+  "description": "An account with a device code.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 178,
+    "method": "pi.login.start",
+    "params": {
+      "target": "vm",
+      "provider": "xai",
+      "method": "oauth"
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 178,
+    "result": {
+      "host": "local",
+      "id": "808182838485868788898a8b8c8d8e8f",
+      "method": "oauth",
+      "prompt": {
+        "id": "p1",
+        "kind": "select",
+        "message": "Select login method:",
+        "options": [
+          {
+            "id": "browser",
+            "label": "Browser login (default)"
+          },
+          {
+            "id": "device_code",
+            "label": "Device code login (headless)"
+          }
+        ]
+      },
+      "provider": "xai",
+      "seq": 1,
+      "state": "running",
+      "target": "vm"
+    }
+  }
+}

@@ -24,10 +24,12 @@ pub fn clean_alert(alert: &str) -> String {
     }
 }
 
-/// How to sign in to Pi in the toolbox, which has no browser, and where a browser
+/// How to sign in to Pi for `linux` agents: the app does it, and for whoever's only
+/// at a terminal there's the toolbox, which has no browser, and where a browser
 /// login's localhost callback can't be reached from the Mac's. Each option named
 /// is what Pi 1.5 calls it (`auth/oauth/`, in its source): check them when the pin moves.
-pub const PI_TOOLBOX_SIGN_IN: &str = "In the Linux toolbox (`vibe toolbox`), run `pi`, then /login. \
+pub const PI_TOOLBOX_SIGN_IN: &str = "Sign in from the VibeOS app, in Settings → Agents. At a \
+    terminal, in the Linux toolbox (`vibe toolbox`), run `pi`, then /login. \
     Don't choose Browser login: the toolbox has no browser, and that login can't call back to \
     it. Choose an API key, or for a subscription Anthropic's \"Copy code login (headless)\" or \
     OpenAI's \"Device code login (headless)\". Open the link Pi shows in your Mac's browser, and \
@@ -110,6 +112,23 @@ names! {
     /// Which Pi `pi.install` installs: the `pi` this host's native agents run,
     /// or the layer `linux` agents boot in their VMs on a Mac.
     PiTarget { Native = "native", Vm = "vm" }
+}
+
+names! {
+    /// How a Pi sign-in goes: a provider's own account, through a browser or a
+    /// code, or an API key.
+    PiLoginMethod { Oauth = "oauth", ApiKey = "api_key" }
+}
+
+names! {
+    /// Where a Pi sign-in has got to.
+    PiLoginState { Running = "running", Done = "done", Failed = "failed", Cancelled = "cancelled" }
+}
+
+names! {
+    /// What a question in a Pi sign-in wants: something that can be shown as it's
+    /// typed, something that can't, one of a list, or what a browser ended on.
+    PiPromptKind { Text = "text", Secret = "secret", Select = "select", ManualCode = "manual_code" }
 }
 
 names! {

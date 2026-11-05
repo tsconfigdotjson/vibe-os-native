@@ -1,0 +1,25 @@
+{
+  "description": "Gives up on a sign-in. Pi is ended, and nothing it held stays.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 181,
+    "method": "pi.login.cancel",
+    "params": {
+      "host": "local",
+      "id": "808182838485868788898a8b8c8d8e8f"
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 181,
+    "result": {
+      "host": "local",
+      "id": "808182838485868788898a8b8c8d8e8f",
+      "method": "oauth",
+      "provider": "xai",
+      "seq": 8,
+      "state": "cancelled",
+      "target": "vm"
+    }
+  }
+}

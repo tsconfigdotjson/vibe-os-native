@@ -71,6 +71,22 @@ public final class FixtureDaemon: DaemonConnection, @unchecked Sendable {
             return ["checks": doctor]
         case ToolboxStatusGet.name, ToolboxClose.name:
             return ["state": "closed", "template": 3, "home": 2, "base": 1, "newest_base": 2]
+        case PiModelsGet.name:
+            return [
+                "host": host, "target": params["target"] as? String ?? "native",
+                "providers": [
+                    [
+                        "id": "anthropic", "name": "Anthropic", "signed_in": true, "ambient": false, "oauth": true,
+                        "api_key": true,
+                        "models": [["id": "claude-sonnet-4", "name": "Claude Sonnet 4"]],
+                    ],
+                    [
+                        "id": "opencode", "name": "OpenCode Zen", "signed_in": false, "ambient": false, "oauth": false,
+                        "api_key": true,
+                        "models": [["id": "deepseek-v4.1-flash", "name": "DeepSeek V4.1 Flash"]],
+                    ],
+                ],
+            ]
         case PiStatusGet.name, PiInstall.name, PiForget.name:
             // As the doctor's Pi check says of this Mac.
             if scenario == .firstRun || scenario == .freshMac {

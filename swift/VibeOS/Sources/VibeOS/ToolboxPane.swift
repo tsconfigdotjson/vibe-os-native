@@ -66,8 +66,7 @@ struct ToolboxPane: View {
             } footer: {
                 Text("A Linux shell in Terminal. What you install or log in to there, every new Linux agent "
                     + "starts with. Exit the shell or close its window to save; Control-\\ leaves it open. "
-                    + "Pi signs in here too: run pi, then /login, and choose an API key or a headless "
-                    + "option, not Browser login. Settings → Agents says more.")
+                    + "Pi signs in from Settings → Agents, with no shell at all.")
                     .foregroundStyle(.secondary)
             }
             logInsSection

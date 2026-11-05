@@ -212,7 +212,7 @@ async fn not_signed_in_is_said_at_once_and_undone() {
         .await
         .unwrap_err();
     assert_eq!(e.code, ErrorCode::Conflict.code());
-    assert!(e.message.contains("/login"), "{}", e.message);
+    assert!(e.message.contains("Settings → Agents"), "{}", e.message);
     // Nothing of it is left behind: no record, worktree or branch.
     assert!(
         w.core
@@ -284,7 +284,7 @@ async fn what_cant_answer_for_this_model_is_refused() {
     let e = refused(Arc::clone(&w.core)).await;
     assert_eq!(e.code, ErrorCode::Conflict.code());
     assert!(e.message.contains("signed in to xai"), "{}", e.message);
-    assert!(e.message.contains("/login"), "{}", e.message);
+    assert!(e.message.contains("Settings → Agents"), "{}", e.message);
     fs::write(dir.join("auth.json"), "{}").unwrap();
     // An unrelated line of pi.env.
     let file = w.layout.pi_env_file();

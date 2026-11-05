@@ -296,6 +296,66 @@ async fn rpc(core: &Core, method: &str, params: Value) -> Value {
     serde_json::from_str(&reply).unwrap()
 }
 
+/// A browser login for a host opens on the Mac, and comes back to `localhost` there.
+/// The Mac's `vibed` catches that and hands it on, so nobody pastes an address.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hosts_browser_login_comes_back_through_the_macs_loopback() {
+    let w = world().await;
+    w.add_host().await;
+    let own = w.host_world.home.join(".pi/agent");
+    std::fs::create_dir_all(&own).unwrap();
+    // A port nothing has, for this sign-in's page to come back to.
+    let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    std::fs::write(own.join("redirect-port"), port.to_string()).unwrap();
+    let begun = w
+        .rpc(
+            "pi.login.start",
+            json!({"host": "vps", "target": "vm", "provider": "anthropic", "method": "oauth"}),
+        )
+        .await;
+    let login = &begun["result"];
+    assert_eq!(login["host"], "vps", "{begun}");
+    assert_eq!(login["target"], "native", "a host has no VMs: {begun}");
+    let page = w
+        .rpc(
+            "pi.login.answer",
+            json!({"host": "vps", "id": login["id"], "prompt": login["prompt"]["id"], "value": "browser"}),
+        )
+        .await;
+    assert_eq!(page["result"]["prompt"]["kind"], "manual_code", "{page}");
+
+    /// One request to the Mac's loopback, as a browser makes it.
+    async fn browse(port: u16, target: &str) -> String {
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        stream
+            .write_all(format!("GET {target} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut got = String::new();
+        stream.read_to_string(&mut got).await.unwrap();
+        got
+    }
+    // What isn't that sign-in's answer doesn't end it.
+    assert!(browse(port, "/favicon.ico").await.contains("404"));
+    assert!(browse(port, "/callback?nothing=1").await.contains("404"));
+    let got = browse(port, "/callback?code=good&state=s").await;
+    assert!(got.contains("You can close this tab"), "{got}");
+    let auth = std::fs::read_to_string(own.join("auth.json")).unwrap();
+    assert!(auth.contains("code=good"), "{auth}");
+    let over = w
+        .rpc("pi.login.get", json!({"host": "vps", "id": login["id"]}))
+        .await;
+    assert_eq!(over["result"]["state"], "done", "{over}");
+    // And it's let go of its port, once the Mac hears that.
+    assert!(std::net::TcpListener::bind(("127.0.0.1", port)).is_ok());
+}
+
 /// Section C, on the host: keys the Mac pushed say so when it's been away a while, and
 /// one that's leaked can be shut out here, and stays out when the Mac's back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

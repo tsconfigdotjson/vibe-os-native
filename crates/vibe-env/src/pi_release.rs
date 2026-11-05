@@ -226,30 +226,42 @@ pub fn install(
     home: &Path,
     prune_older: bool,
 ) -> Result<Installed> {
-    fs::create_dir_all(root).map_err(|e| err(format!("create {}: {e}", root.display())))?;
     let link = home.join(".local/bin/pi");
     check_link(&link, root)?;
+    let binary = keep(releases, version, platform, root)?;
+    point_link(&link, &binary)?;
+    if prune_older {
+        prune(root, version);
+    }
+    Ok(Installed {
+        version: version.to_owned(),
+        binary,
+        link,
+    })
+}
+
+/// Where [`keep`] puts `version` under `root`.
+pub fn kept_binary(root: &Path, version: &str) -> PathBuf {
+    root.join(format!("pi-{version}")).join("pi")
+}
+
+/// Has `version` for this machine under `root`, checked, downloading it if it isn't
+/// there, and says where. No link: a `pi` of the owner's own stays what they run.
+pub fn keep(releases: &str, version: &str, platform: &str, root: &Path) -> Result<PathBuf> {
+    fs::create_dir_all(root).map_err(|e| err(format!("create {}: {e}", root.display())))?;
+    let binary = kept_binary(root, version);
+    if binary.is_file() {
+        return Ok(binary);
+    }
     let scratch = root.join(".pi-download");
     let _ = fs::remove_dir_all(&scratch);
     fs::create_dir_all(&scratch).map_err(|e| err(format!("create {}: {e}", scratch.display())))?;
     let result = (|| {
         let dest = root.join(format!("pi-{version}"));
-        if !dest.join("pi").is_file() {
-            let build = download(releases, version, platform, &scratch)?;
-            let _ = fs::remove_dir_all(&dest);
-            fs::rename(&build.dir, &dest)
-                .map_err(|e| err(format!("keep {}: {e}", dest.display())))?;
-        }
-        let binary = dest.join("pi");
-        point_link(&link, &binary)?;
-        if prune_older {
-            prune(root, version);
-        }
-        Ok(Installed {
-            version: version.to_owned(),
-            binary,
-            link,
-        })
+        let build = download(releases, version, platform, &scratch)?;
+        let _ = fs::remove_dir_all(&dest);
+        fs::rename(&build.dir, &dest).map_err(|e| err(format!("keep {}: {e}", dest.display())))?;
+        Ok(binary)
     })();
     let _ = fs::remove_dir_all(&scratch);
     result

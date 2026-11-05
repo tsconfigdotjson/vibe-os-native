@@ -95,9 +95,10 @@ commands:
               share, such as one an agent offered; stop that agent as well
   pi install [--vm]
               download Pi, checksummed, and link it at ~/.local/bin/pi; on a
-              Mac, --vm for the layer linux agents boot instead. Signing in
-              is Pi's own: run `pi`, then /login (for linux agents on a Mac,
-              in `vibe toolbox`, with a headless option: `vibe pi` says which)
+              Mac, --vm for the layer linux agents boot instead. Sign in from
+              the app, in Settings → Agents. At a terminal, it's Pi's own: run
+              `pi`, then /login (for linux agents on a Mac, in `vibe toolbox`,
+              with a headless option: `vibe pi` says which)
               pi takes --host NAME for a Linux host this one is linked to
   host        the hosts this one knows, and their links
   host add NAME SSH-DESTINATION

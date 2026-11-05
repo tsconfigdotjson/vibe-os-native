@@ -5,7 +5,7 @@ import VibeRPC
 /// Settings → Agents (PRD: Who gets which credentials; What's inside
 /// `linux`): the coding agents besides Claude, on each host. For Pi, the
 /// `pi` a host's native agents run, the layer `linux` agents boot on this Mac,
-/// and who's signed in. Signing in is Pi's own, with `/login`, as Claude's is:
+/// and who's signed in. Signing in is Pi's own, guided here with no terminal:
 /// VibeOS picks no provider, supplies no key, and shows only providers' names.
 struct AgentsPane: View {
     @ObservedObject var model: MenuModel
@@ -13,6 +13,7 @@ struct AgentsPane: View {
     @State private var status: PiStatus?
     @State private var installing: PiTarget?
     @State private var error: String?
+    @State private var signIn: PiSignInRequest?
 
     private var local: Bool { host == VibeRPC.localHost }
 
@@ -33,6 +34,9 @@ struct AgentsPane: View {
         .formStyle(.grouped)
         .navigationTitle("Agents")
         .task(id: "\(host)#\(model.settingsRevision)") { await load() }
+        .sheet(item: $signIn) { request in
+            PiSignInSheet(model: model, request: request) { Task { await load() } }
+        }
     }
 
     /// The `pi` that runs natively: on the Mac for `macos` agents, on a server
@@ -60,6 +64,8 @@ struct AgentsPane: View {
                     Working(text: "Downloading Pi…")
                 }
                 Spacer()
+                Button("Sign In…") { signIn = PiSignInRequest(host: host, target: .native) }
+                    .help("Sign in to a provider, for these agents, with an account or an API key. No terminal.")
                 // A `pi` of the owner's own is theirs to update.
                 if status.native == nil || status.native?.managed == true {
                     Button(status.error != nil ? "Try Again" : status.native == nil ? "Install Pi" : "Update Pi") {
@@ -123,14 +129,9 @@ struct AgentsPane: View {
                 }
                 Spacer()
                 // For signing in, or in again over what an agent's left: an alert
-                // above may be sending the owner here. The toolbox runs the same
-                // layer, so that comes first.
-                Button("Open Toolbox") { Task { await model.openToolbox() } }
-                    .disabled(!model.toolboxCanOpen || vms.version == nil)
-                    .help(
-                        vms.version == nil
-                            ? "Download Pi first: the toolbox runs the same one."
-                            : "Opens the Linux toolbox in Terminal. Run pi there, then /login.")
+                // above may be sending the owner here.
+                Button("Sign In…") { signIn = PiSignInRequest(host: host, target: .vm) }
+                    .help("Sign in to a provider, for every Linux agent, with an account or an API key. No terminal.")
                 // The version is this VibeOS's own: a new one comes with an update.
                 if vms.version == nil {
                     Button("Download Pi") {
@@ -144,12 +145,8 @@ struct AgentsPane: View {
             Text("Linux agents")
         } footer: {
             Text(
-                "Sign in once, in the Linux toolbox: run pi, then /login. Don't choose Browser login: the toolbox "
-                    + "has no browser, and that login can't call back to it. Choose an API key, or for a subscription "
-                    + "Anthropic's \"Copy code login (headless)\" or OpenAI's \"Device code login (headless)\". Open "
-                    + "the link Pi shows in your Mac's browser, then give Pi the code, or paste back the address you "
-                    + "end up on if it asks for a redirect URL. Within seconds every Linux Pi agent has that login. "
-                    + "Settings and extensions for them live in ~/VibeOS/linux-pi on this Mac."
+                "Sign in once, here. Within seconds every Linux Pi agent has that login, each VM holding its own "
+                    + "copy. Settings and extensions for them live in ~/VibeOS/linux-pi on this Mac."
             )
             .foregroundStyle(.secondary)
         }
@@ -168,8 +165,8 @@ struct AgentsPane: View {
     private var signInNote: some View {
         Section {
             Text(
-                "Pi's login is your own, from its /login: a subscription or an API key, with whichever provider "
-                    + "you choose. Your Claude sign-in never reaches Pi, nor does a key in VibeOS's environment. A "
+                "Pi's login is your own: a subscription or an API key, with whichever provider you choose. Pi "
+                    + "itself signs in, and its choices are the ones it offers in /login. Your Claude sign-in never reaches Pi, nor does a key in VibeOS's environment. A "
                     + "key you do want Pi to use goes in ~/.config/vibeos/pi.env. A login to the same provider "
                     + "takes the place of that key."
             )

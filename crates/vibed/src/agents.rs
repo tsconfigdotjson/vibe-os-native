@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use vibe_core::limits::{self, HostLimits};
 use vibe_core::model::{
-    AgentKind, AgentState, Environment, EventKind, LOCAL_HOST, Mode, ref_from_bytes,
+    AgentKind, AgentState, Environment, EventKind, LOCAL_HOST, Mode, PiTarget, ref_from_bytes,
     validate_new_ref, validate_ref,
 };
 use vibe_core::rpc::{
@@ -1002,20 +1002,32 @@ impl Core {
         let Some(missing) = missing else {
             return Ok(());
         };
-        let how = if backend.capabilities().file_containment {
-            format!(
-                "{}. Every linux Pi agent gets that one login",
-                vibe_core::model::PI_TOOLBOX_SIGN_IN
-            )
-        } else {
-            "Run `pi` on this host and sign in with /login. Every Pi agent here shares that one \
-             login"
-                .to_owned()
+        // The app offers that sign-in from what's here (`PiSignInOffer`). Whoever
+        // else reads this has the words.
+        let vm = backend.capabilities().file_containment;
+        let provider = model
+            .and_then(|m| m.split_once('/'))
+            .map(|(provider, _)| provider);
+        let how = match provider {
+            Some(p) => format!("Sign in to {p} in the VibeOS app, in Settings → Agents"),
+            None => "Sign in to one in the VibeOS app, in Settings → Agents".to_owned(),
         };
-        Err(error(
+        let shared = if vm {
+            "Every linux Pi agent gets that one login"
+        } else {
+            "Every Pi agent here shares that one login"
+        };
+        let mut refused = error(
             ErrorCode::Conflict,
-            format!("{missing}, so it couldn't answer. {how}"),
-        ))
+            format!("{missing}, so it couldn't answer. {how}. {shared}"),
+        );
+        refused.data = Some(serde_json::json!({
+            "pi_sign_in": {
+                "provider": provider,
+                "target": if vm { PiTarget::Vm } else { PiTarget::Native },
+            }
+        }));
+        Err(refused)
     }
 
     /// What a Pi agent gets in its environment on top of the compartment's:

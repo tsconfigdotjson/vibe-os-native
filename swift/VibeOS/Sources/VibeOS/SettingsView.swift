@@ -526,14 +526,12 @@ struct ProfileRow: View {
                     .pickerStyle(.segmented)
                 } else {
                     LabeledContent("Model") {
-                        CommitField(
-                            title: "Model", value: profile.piModel ?? "", prompt: "Pi's default", width: 240,
-                            help: "Any model Pi has, such as openai/gpt-5 or deepseek-v4.1-flash. Pi says if it can't use it. "
-                                + "Empty uses Pi's own default.",
-                            trailing: false, isValid: validPiModel
-                        ) { text in
-                            let model = text.trimmingCharacters(in: .whitespaces)
-                            return await update { $0.piModel = model }
+                        PiModelPicker(
+                            model: model, host: host,
+                            target: piTarget(host: host, environment: shown.environment),
+                            value: profile.piModel ?? ""
+                        ) { chosen in
+                            await update { $0.piModel = chosen }
                         }
                     }
                 }
@@ -671,13 +669,6 @@ struct ProfileRow: View {
         stepping = false
         stepTarget = nil
         pending = nil
-    }
-
-    /// Empty for Pi's own default, or anything safe to give Pi as it is; Pi says
-    /// if it can't use it.
-    private func validPiModel(_ text: String) -> Bool {
-        let model = text.trimmingCharacters(in: .whitespaces)
-        return model.isEmpty || isValidPiModel(model)
     }
 
     /// Pi on this Mac is the owner's call, as Claude's bypass is, and is said
@@ -1302,7 +1293,7 @@ struct HostRow: View {
                     Label("Still needs \(host.missing.joined(separator: ", ")) on the server", systemImage: "wrench.and.screwdriver")
                         .font(.caption)
                         .foregroundStyle(Palette.attention)
-                        .help("Install it on \(host.name), then log in there: gh auth login, and claude with /login. Pi, if you'll run it, signs in the same way: pi, then /login")
+                        .help("Install it on \(host.name), then log in there: gh auth login, and claude with /login. Pi, if you'll run it, signs in here, from Settings → Agents.")
                 }
                 if let needs = host.needsAdmin, !needs.isEmpty {
                     Label(adminNeedsText(needs, host: host.name), systemImage: "lock")

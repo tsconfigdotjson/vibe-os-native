@@ -517,6 +517,11 @@ pub fn providers_with_keys(env: &[(String, String)]) -> Vec<String> {
 /// here: Vertex from a file of `gcloud`'s, Bedrock from a role or a profile.
 const AMBIENT_PROVIDERS: &[&str] = &["google-vertex", "amazon-bedrock"];
 
+/// Whether `provider` is one of those.
+pub fn can_sign_in_from_around(provider: &str) -> bool {
+    AMBIENT_PROVIDERS.contains(&provider)
+}
+
 /// The owner's own agent dir: `~/.pi/agent`, unless `PI_CODING_AGENT_DIR` moves
 /// it in `vibed`'s environment, as it moves it for the owner's own `pi`.
 pub fn own_dir(home: &Path) -> PathBuf {

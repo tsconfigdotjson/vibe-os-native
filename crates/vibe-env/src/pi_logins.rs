@@ -138,6 +138,18 @@ pub fn toolbox_copy(dir: &Path, store_dir: &Path) -> Copy {
     }
 }
 
+/// What a sign-in from the app left, in a directory made for it that nothing else
+/// has seen: the owner's own, as the toolbox's is, and fresh, so all that's in it is
+/// new. It's looked at once, by [`Broker::sync`], and then it's gone.
+pub fn sign_in_copy(dir: &Path, state: &Path) -> Copy {
+    Copy {
+        name: "the app's sign-in".to_owned(),
+        dir: dir.to_owned(),
+        state: state.to_owned(),
+        owner: true,
+    }
+}
+
 /// What [`Broker::sync`] found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Synced {
@@ -806,7 +818,7 @@ impl Broker {
                             provider: name.clone(),
                             text: format!(
                                 "{} signed in to {name}, and every Pi agent here now uses that \
-                                 login. If that wasn't you, sign in to it from the toolbox to \
+                                 login. If that wasn't you, sign in to it in Settings → Agents to \
                                  replace it.",
                                 copy.name
                             ),
