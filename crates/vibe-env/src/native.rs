@@ -76,6 +76,8 @@ fn run_in(r: &Run, env: &[(String, String)], clean: bool) -> Result<RunOutput> {
         let inherited = std::env::vars_os()
             .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)));
         cmd.env_clear().envs(pi::allowed_env(inherited));
+    } else {
+        vibe_core::keychain::withhold_allow(&mut cmd);
     }
     cmd.args(args)
         .current_dir(&r.cwd)
@@ -360,6 +362,30 @@ mod tests {
         assert!(!c.clean_env, "as it was: on top of vibed's");
         // No `-e`: the extension is Pi's, whatever its environment holds.
         assert_eq!(c.command, ["/bin/claude", "--", "hi"]);
+    }
+
+    /// `vibed`'s `allow` isn't for a `.vibe/setup.sh`. Run again by itself, with
+    /// `allow` around it, as this can't be changed for a process with other
+    /// threads. What runs is a plain `sh`, with nothing here reaching for a Keychain.
+    #[test]
+    fn allow_isnt_passed_on() {
+        use vibe_core::keychain::GUARD_ENV;
+        const AGAIN: &str = "VIBE_TEST_ALLOW_AROUND";
+        if std::env::var_os(AGAIN).is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["native::tests::allow_isnt_passed_on", "--exact"])
+                .env(AGAIN, "1")
+                .env(GUARD_ENV, "allow")
+                .output()
+                .unwrap();
+            let said = String::from_utf8_lossy(&out.stdout);
+            assert!(out.status.success(), "{said}");
+            assert!(said.contains("1 passed"), "{said}");
+            return;
+        }
+        assert_eq!(std::env::var(GUARD_ENV).as_deref(), Ok("allow"));
+        let out = sh(&format!("echo \"[${GUARD_ENV}]\""), Duration::from_secs(10));
+        assert_eq!(String::from_utf8_lossy(&out.output).trim(), "[]");
     }
 
     #[test]

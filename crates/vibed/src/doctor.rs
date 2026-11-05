@@ -335,9 +335,11 @@ impl HostChecks for Machine {
     }
 
     fn claude_login(&self) -> Result<String, String> {
-        if cfg!(target_os = "macos") && keychain::login_open() {
+        let mac = cfg!(target_os = "macos");
+        let security = keychain::login_program().filter(|_| mac);
+        if let Some(security) = security {
             let (ok, _) = self.run(&[
-                keychain::SECURITY,
+                security,
                 "find-generic-password",
                 "-s",
                 CLAUDE_KEYCHAIN_SERVICE,
@@ -349,7 +351,7 @@ impl HostChecks for Machine {
         if self.home.join(".claude/.credentials.json").is_file() {
             return Ok("Claude Code is signed in".into());
         }
-        Err("Claude Code isn't signed in".into())
+        no_claude_login(mac && security.is_none())
     }
 
     fn system_sleep(&self) -> Result<Option<u32>, String> {
@@ -1071,6 +1073,21 @@ impl Core {
     }
 }
 
+/// What comes of finding no Claude login, when the one place it may be on a Mac
+/// went `unseen`, as this build is kept out of the login Keychain. That's no reason
+/// to ask for a sign-in, which no look from here could ever see.
+fn no_claude_login(unseen: bool) -> Result<String, String> {
+    if unseen {
+        Ok(format!(
+            "Claude Code's login can't be seen, as this build stays out of the login Keychain \
+             ({}=allow lets it look)",
+            keychain::GUARD_ENV
+        ))
+    } else {
+        Err("Claude Code isn't signed in".into())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1630,10 +1647,15 @@ rmdir "{h}""#,
                 .unwrap_err()
                 .contains("isn't on your login shell's PATH")
         );
-        if !cfg!(target_os = "macos") {
+        if cfg!(target_os = "macos") {
+            assert_eq!(m.claude_login(), no_claude_login(true));
+        } else {
             assert_eq!(m.claude_login().unwrap_err(), "Claude Code isn't signed in");
             assert_eq!(m.system_sleep(), Ok(None));
         }
+        // Not said to be signed out, or asked to sign in, when no one could look.
+        assert!(no_claude_login(true).unwrap().contains(keychain::GUARD_ENV));
+        assert!(no_claude_login(false).is_err());
 
         // git that answers as git does, and keeps its global config in
         // the home, as real git would.

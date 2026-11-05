@@ -79,6 +79,12 @@ target/debug/vibe pi            # Pi: what's installed, and who it's signed in t
 VIBE_LOGIN_KEYCHAIN=allow VIBE_BASE_RELEASES=file://$PWD/build/base-image target/debug/vibed
 ```
 
+A build outside an app stays out of the login Keychain unless it's run with
+`VIBE_LOGIN_KEYCHAIN=allow`, which `cargo run` can't pass on, as `cargo` forces
+`never`, and which `vibed` doesn't pass on to its agents. Without it, a debug `vibed`
+keeps shared services' logins in `services/` in its state directory, removed when a
+later run uses the Keychain, and can't see a Claude login that's in the Keychain.
+
 Pi is pinned (`vibe_env::pi_release::PINNED`). Moving the pin means looking again
 at what the new version reads, runs and writes in its agent dir, at what the login
 broker accepts (`vibe_env::pi_logins`), and at the provider keys and screen
@@ -134,7 +140,8 @@ VMs booted, saved and restored through `vibe-vm`, the Linux base image, and
 a sleep; `vibe doctor` against a live `vibed`; and a release DMG, built ad
 hoc with Sparkle and checked inside and out. It prints a
 PASS/FAIL table and leaves logs in `build/check/`. On Linux the macOS steps
-are skipped. CI runs the same script.
+are skipped. CI runs the same script. It reads the Claude token from the Keychain
+only with `VIBE_CHECK_KEYCHAIN_TOKEN=1`.
 
 A saved VM must also survive a reboot of the Mac. That takes a reboot, so
 it's two commands around one: `scripts/vm-reboot-test.sh save`, reboot,

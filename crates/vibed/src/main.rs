@@ -74,7 +74,7 @@ environment:
   VIBE_LOGIN_KEYCHAIN
                   never keeps this vibed out of the login Keychain; allow lets
                   one outside an app bundle in, which is otherwise kept out so
-                  that no test reaches it
+                  that no test reaches it; the agents it starts aren't given allow
   VIBE_EXTERNAL_PORT, VIBE_EXTERNAL_LISTEN, VIBE_ACME_DIRECTORY
                   for tests only: the port the external address is served
                   on (default 443), the one address it listens on (default
@@ -509,20 +509,13 @@ fn services_config(layout: &Layout) -> ServicesConfig {
             vibed::log!("vibed: VIBE_TEST_SERVICES_DIR is set: logins are kept in {dir}");
             Arc::new(FileStore(PathBuf::from(dir)))
         }
-        None if place == Place::Mac && (!cfg!(debug_assertions) || keychain::login_open()) => {
-            Arc::new(Keychain::default())
-        }
         None => {
             let dir = layout.data_dir().join("services");
             if place == Place::Mac {
-                vibed::log!(
-                    "vibed: this debug build stays out of the login Keychain: logins are kept in \
-                     {} ({}=allow lets it in)",
-                    dir.display(),
-                    keychain::GUARD_ENV
-                );
+                mac_store(dir, cfg!(debug_assertions), keychain::login_open())
+            } else {
+                Arc::new(FileStore(dir))
             }
-            Arc::new(FileStore(dir))
         }
     };
     ServicesConfig {
@@ -531,6 +524,37 @@ fn services_config(layout: &Layout) -> ServicesConfig {
         place,
         token_wait: vibe_services::broker::TOKEN_WAIT,
     }
+}
+
+/// A Mac's logins, for a `debug` build or a release, with the login Keychain
+/// `open` to it or not. Logins a debug build once kept in `dir` go once the
+/// Keychain's in use, as nothing would read or renew them and they're live.
+fn mac_store(dir: PathBuf, debug: bool, open: bool) -> Arc<dyn SecretStore> {
+    let file = FileStore(dir);
+    if debug && !open {
+        vibed::log!(
+            "vibed: this debug build stays out of the login Keychain: logins are kept in \
+             {} ({}=allow lets it in)",
+            file.0.display(),
+            keychain::GUARD_ENV
+        );
+        return Arc::new(file);
+    }
+    if open {
+        match file.remove_all() {
+            Ok(0) => {}
+            Ok(n) => vibed::log!(
+                "vibed: removed {n} login(s) a debug build left in {}: logins are in the \
+                 Keychain now, so connect again if one's missing",
+                file.0.display()
+            ),
+            Err(e) => vibed::log!(
+                "vibed: can't remove the logins a debug build left in {}: {e}",
+                file.0.display()
+            ),
+        }
+    }
+    Arc::new(Keychain::default())
 }
 
 /// An environment variable's value, if it's set to text.
@@ -553,6 +577,31 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Args, String> {
         parse_args(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn a_mac_keeps_logins_in_the_keychain_and_clears_up_after_a_debug_build() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("services");
+        std::fs::create_dir(&dir).unwrap();
+        let login = dir.join("linear.login");
+        std::fs::write(&login, "live").unwrap();
+        let kind = |store: Arc<dyn SecretStore>| {
+            let kind = format!("{store:?}");
+            kind[..kind.find(['(', ' ']).unwrap()].to_owned()
+        };
+
+        // A debug build kept out uses the file, and a release kept out only
+        // reports the Keychain's refusal: neither takes the login away.
+        assert_eq!(kind(mac_store(dir.clone(), true, false)), "FileStore");
+        assert_eq!(kind(mac_store(dir.clone(), false, false)), "Keychain");
+        assert!(login.exists());
+        // With the Keychain in use, debug or release, it's gone.
+        assert_eq!(kind(mac_store(dir.clone(), true, true)), "Keychain");
+        assert!(!login.exists());
+        std::fs::write(&login, "live").unwrap();
+        assert_eq!(kind(mac_store(dir.clone(), false, true)), "Keychain");
+        assert!(!login.exists());
     }
 
     #[test]

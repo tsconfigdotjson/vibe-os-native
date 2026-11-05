@@ -14,6 +14,9 @@
 //!   `never`, in `.cargo/config.toml`, so a shell that exported `allow` is beaten.
 //!
 //! The variable can only open or close the Keychain, never send a login elsewhere.
+//! `allow` is for the program it was said to: an agent `vibed` starts, and what it
+//! runs in an agent's compartment, don't get it ([`withhold_allow`]), so a debug
+//! binary an agent runs finds the door shut.
 //! A test that wants the real `security` uses a keychain file of its own:
 //! [`TempKeychain`].
 
@@ -24,7 +27,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 /// The program every Keychain call runs.
-pub const SECURITY: &str = "/usr/bin/security";
+const SECURITY: &str = "/usr/bin/security";
 
 /// `never` closes the login Keychain to anything; `allow` opens it to a program
 /// outside an app bundle.
@@ -48,13 +51,14 @@ impl Target {
         self.command_with(Path::new(SECURITY))
     }
 
-    /// `program`, pointed here. Only the real `security` is guarded, as nothing
-    /// else can reach a Keychain: a stand-in for it can run freely.
+    /// `program`, pointed here. Only what would run the real `security` is
+    /// guarded, as nothing else can reach a Keychain: a stand-in for it can run
+    /// freely.
     pub fn command_with(&self, program: &Path) -> io::Result<Command> {
         let mut command = Command::new(program);
         match self {
             Target::Login => {
-                if program == Path::new(SECURITY) && !login_open() {
+                if runs(program, Path::new(SECURITY)) && !login_open() {
                     return Err(closed());
                 }
             }
@@ -75,6 +79,19 @@ impl Target {
             Target::Login => None,
             Target::File(path) => path.to_str(),
         }
+    }
+}
+
+/// Whether `program` would run `real`, however it's spelled. A name that isn't an
+/// absolute path is found through `PATH` or from wherever this is running, so only
+/// a path that plainly leads elsewhere is known not to.
+fn runs(program: &Path, real: &Path) -> bool {
+    if !program.is_absolute() || program == real {
+        return true;
+    }
+    match (fs::canonicalize(program), fs::canonicalize(real)) {
+        (Ok(program), Ok(real)) => program == real,
+        _ => false,
     }
 }
 
@@ -117,6 +134,20 @@ pub fn login_open() -> bool {
     // the app, and a Mac's `current_exe` doesn't follow links.
     let exe = std::env::current_exe().and_then(fs::canonicalize).ok();
     decide(std::env::var_os(GUARD_ENV).as_deref(), exe.as_deref())
+}
+
+/// The real `security` by name, if [`login_open`], for a caller that runs it some
+/// way other than [`Target::command`].
+pub fn login_program() -> Option<&'static str> {
+    login_open().then_some(SECURITY)
+}
+
+/// Keeps this process's `allow` from `command`, which runs something for an agent.
+/// `never` goes on, as what's closed should stay closed.
+pub fn withhold_allow(command: &mut Command) {
+    if std::env::var_os(GUARD_ENV).as_deref() == Some(OsStr::new("allow")) {
+        command.env_remove(GUARD_ENV);
+    }
 }
 
 fn decide(guard: Option<&OsStr>, exe: Option<&Path>) -> bool {
@@ -267,6 +298,54 @@ mod tests {
     #[test]
     fn a_stand_in_for_security_needs_no_guard() {
         assert!(Target::Login.command_with(Path::new("/bin/true")).is_ok());
+    }
+
+    /// With the door shut, as in every test.
+    #[test]
+    fn every_way_to_ask_for_security_finds_the_guard() {
+        assert_eq!(login_program(), None);
+        let e = Target::Login
+            .command_with(Path::new("security"))
+            .unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{e}");
+        let e = Target::Login.command_with(Path::new(SECURITY)).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{e}");
+        #[cfg(target_os = "macos")]
+        {
+            let around = Path::new("/usr/bin/../bin/security");
+            let e = Target::Login.command_with(around).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{e}");
+        }
+    }
+
+    #[test]
+    fn a_program_is_known_by_where_it_leads() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fs::canonicalize(dir.path()).unwrap().join("bin");
+        fs::create_dir(&bin).unwrap();
+        let real = bin.join("security");
+        fs::write(&real, "").unwrap();
+        let link = bin.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let same = [
+            real.clone(),
+            bin.join("../bin/security"),
+            bin.join("./security"),
+            link,
+            PathBuf::from("security"),
+            PathBuf::from("./anything"),
+        ];
+        for program in same {
+            assert!(runs(&program, &real), "{}", program.display());
+        }
+        // A stand-in called `security` is still a stand-in, as is what isn't there.
+        let elsewhere = bin.parent().unwrap().join("security");
+        fs::write(&elsewhere, "").unwrap();
+        for program in [elsewhere.as_path(), &bin.join("true"), Path::new("/nope")] {
+            assert!(!runs(program, &real), "{}", program.display());
+        }
+        // Nor is everything that's missing taken for what's missing.
+        assert!(!runs(Path::new("/nope"), Path::new("/also-nope")));
     }
 
     #[test]

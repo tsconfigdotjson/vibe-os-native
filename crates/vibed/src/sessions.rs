@@ -317,6 +317,8 @@ pub async fn spawn_shim(
                 .args(&spec.command);
             if spec.clean_env {
                 cmd.env_clear();
+            } else {
+                vibe_core::keychain::withhold_allow(cmd.as_std_mut());
             }
             cmd.envs(spec.env.iter().map(|(k, v)| (k, v)));
         }

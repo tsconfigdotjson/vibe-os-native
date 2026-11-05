@@ -188,6 +188,10 @@ pub(crate) fn read_hidden(prompt: &str) -> io::Result<String> {
 /// `vibe setup-token`, with `claude` as Claude Code, keeping the token in
 /// `store`.
 pub(crate) fn setup_token(claude: &OsString, store: &TokenStore) -> Result<(), String> {
+    // Before the sign-in: a token that can't be kept is minted, shown and lost.
+    store
+        .ready()
+        .map_err(|e| format!("can't keep a token: {e}"))?;
     let (status, seen) = run_claude(claude).map_err(|e| e.to_string())?;
     let token = match claude_token::find(&seen) {
         Some(token) => token,
