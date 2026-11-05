@@ -3,6 +3,8 @@
 id= resumed=false prompt=
 while [ $# -gt 0 ]; do
   case $1 in
+    # As vibed's doctor asks, from the home directory: no session, so no transcript.
+    --version) echo "2.1.314 (Claude Code)"; exit 0 ;;
     --session-id) id=$2; shift 2 ;;
     --resume) id=$2; resumed=true; shift 2 ;;
     --model|--effort|--permission-mode) shift 2 ;;
