@@ -45,6 +45,10 @@ struct Wires {
     reachable: AtomicBool,
     wire: watch::Sender<Wire>,
     installs: Mutex<u32>,
+    /// What an install fails with, while it does.
+    install_fails: Mutex<Option<String>>,
+    /// The Mac's bundle holds an older build than the Mac.
+    older_bundle: AtomicBool,
 }
 
 impl Wires {
@@ -54,6 +58,8 @@ impl Wires {
             reachable: AtomicBool::new(true),
             wire: watch::channel(Wire::Up).0,
             installs: Mutex::new(0),
+            install_fails: Mutex::new(None),
+            older_bundle: AtomicBool::new(false),
         })
     }
 
@@ -137,6 +143,9 @@ impl Remote for Wires {
     fn install<'a>(&'a self, address: &'a str) -> BoxFuture<'a, Result<Installed, String>> {
         Box::pin(async move {
             *self.installs.lock().unwrap() += 1;
+            if let Some(why) = self.install_fails.lock().unwrap().clone() {
+                return Err(why);
+            }
             if !self.sockets.lock().unwrap().contains_key(address) {
                 return Err(format!("can't reach {address} over SSH: no such host."));
             }
@@ -144,7 +153,11 @@ impl Remote for Wires {
                 os: "linux".into(),
                 arch: "x86_64".into(),
                 label: "vps-1".into(),
-                version: env!("CARGO_PKG_VERSION").into(),
+                version: if self.older_bundle.load(Ordering::SeqCst) {
+                    "0.0.5".into()
+                } else {
+                    env!("CARGO_PKG_VERSION").into()
+                },
                 missing: vec!["gh".into()],
                 needs_admin: Vec::new(),
                 changed: true,
@@ -166,6 +179,7 @@ fn quick() -> Timing {
         ping_timeout: Duration::from_millis(400),
         connect_timeout: Duration::from_secs(5),
         min_backoff: Duration::from_millis(50),
+        upgrade_gap: Duration::from_millis(50),
         max_backoff: Duration::from_millis(300),
         ..Timing::default()
     }
@@ -1022,7 +1036,8 @@ async fn a_host_that_stops_answering_is_down_until_it_answers_again() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hosts_are_added_once_and_removed_without_touching_the_server() {
-    let w = world().await;
+    // On the Mac's own version: a newer one is never installed over.
+    let w = world_with(|c| c.info.version = "0.1.0".into()).await;
     let bad = w
         .mac
         .add_host(HostAddParams {
@@ -1259,4 +1274,269 @@ async fn lingering_turns_itself_on_at_the_hosts_next_look() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     panic!("the Mac still thinks it needs sudo");
+}
+
+/// #74: a host never has to be kept in step by hand.
+mod upgrades {
+    use super::*;
+
+    /// The Mac's version, whatever this build's is.
+    const MAC: &str = "0.1.0";
+
+    async fn behind(timing: Timing) -> World {
+        world_timed(timing, |c| c.info.version = "0.0.1".into()).await
+    }
+
+    async fn installs_reach(w: &World, want: u32) {
+        for _ in 0..500 {
+            if *w.wires.installs.lock().unwrap() >= want {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!(
+            "{want} installs never came: {}",
+            w.wires.installs.lock().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_host_behind_the_mac_is_upgraded_with_nobody_asked() {
+        let w = behind(quick()).await;
+        assert_eq!(w.mac.info().version, MAC);
+        w.add_host().await;
+        // The one in Add Host, then the one for being behind.
+        installs_reach(&w, 2).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(w.link().await.upgrade_error, None);
+        // Once: it's not behind any more, as far as that install said.
+        assert_eq!(*w.wires.installs.lock().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn one_on_this_version_or_newer_is_left_alone() {
+        // Newer than the Mac: its registry is one an older one can't read.
+        let w = world_timed(quick(), |c| c.info.version = "99.0.0".into()).await;
+        w.add_host().await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(*w.wires.installs.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_host_that_was_offline_is_upgraded_when_it_next_connects() {
+        let w = behind(quick()).await;
+        // Installed, and then out of reach.
+        w.wires.pull();
+        w.mac
+            .add_host(HostAddParams {
+                name: "vps".into(),
+                address: "me@vps.example.com".into(),
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(*w.wires.installs.lock().unwrap(), 1, "it can't be reached");
+        w.wires.plug_in();
+        installs_reach(&w, 2).await;
+    }
+
+    #[tokio::test]
+    async fn a_failed_upgrade_says_why_with_retry_and_goes_on_trying() {
+        let w = behind(Timing {
+            upgrade_retry: Duration::from_millis(400),
+            ..quick()
+        })
+        .await;
+        w.add_host().await;
+        installs_reach(&w, 2).await;
+        *w.wires.install_fails.lock().unwrap() = Some("no space left on device".into());
+        // The next one fails, and says what really went wrong.
+        let mut seen = None;
+        for _ in 0..500 {
+            seen = w.link().await.upgrade_error;
+            if seen.is_some() {
+                break;
+            }
+            // It's tried again only if it's still behind: as after a link drop.
+            w.wires.pull();
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            w.wires.plug_in();
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        let said = seen.expect("the failure shows");
+        assert!(said.contains("no space left"), "{said}");
+        // By itself again, in time, while the host is reachable.
+        let tries = *w.wires.installs.lock().unwrap();
+        installs_reach(&w, tries + 1).await;
+        // Retry, as the button does: it says the same, as the call's error.
+        let retried = w.rpc("hosts.upgrade", json!({"host": "vps"})).await;
+        assert!(
+            retried["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("no space left")),
+            "{retried}"
+        );
+        // Put right: Retry clears it.
+        *w.wires.install_fails.lock().unwrap() = None;
+        let retried = w.rpc("hosts.upgrade", json!({"host": "vps"})).await;
+        assert_eq!(retried["result"]["host"]["name"], "vps", "{retried}");
+        assert_eq!(retried["result"]["host"].get("upgrade_error"), None);
+    }
+
+    /// The network going mid-install is a failed try like any other, and a new
+    /// connection is no time to sit out an hour.
+    #[tokio::test]
+    async fn a_try_the_network_cut_short_goes_again_as_soon_as_its_back() {
+        let w = behind(quick()).await;
+        w.add_host().await;
+        installs_reach(&w, 2).await;
+        *w.wires.install_fails.lock().unwrap() = Some("the connection dropped".into());
+        for tries in 3..=4 {
+            w.wires.pull();
+            w.wait_link(HostLink::Down).await;
+            w.wires.plug_in();
+            installs_reach(&w, tries).await;
+        }
+    }
+
+    /// B1 of the review. Installing over a newer vibed would leave a host that can't
+    /// start, however the need for an install came up.
+    #[tokio::test]
+    async fn a_host_on_a_newer_vibed_is_never_installed_over() {
+        let w = world_timed(quick(), |c| c.info.version = "99.0.0".into()).await;
+        w.add_host().await;
+        let before = *w.wires.installs.lock().unwrap();
+        // Its vibed has stopped, which would otherwise be a reason.
+        let socket = w
+            .wires
+            .sockets
+            .lock()
+            .unwrap()
+            .get("me@vps.example.com")
+            .cloned()
+            .unwrap();
+        std::fs::remove_file(&socket).unwrap();
+        w.wires.pull();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        w.wires.plug_in();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(*w.wires.installs.lock().unwrap(), before);
+        // Nor by asking.
+        let asked = w.rpc("hosts.upgrade", json!({"host": "vps"})).await;
+        assert_eq!(
+            asked["error"]["code"],
+            ErrorCode::Conflict.code(),
+            "{asked}"
+        );
+        assert_eq!(*w.wires.installs.lock().unwrap(), before);
+    }
+
+    /// B3 of the review: an install that goes well and changes nothing is no reason to
+    /// go again at the next ping. With the Mac's own bundle behind it, that's said.
+    #[tokio::test]
+    async fn an_install_that_cant_catch_up_says_so_and_isnt_repeated() {
+        let w = world_timed(
+            Timing {
+                upgrade_retry: Duration::from_secs(60),
+                upgrade_gap: Duration::from_secs(60),
+                ..quick()
+            },
+            |c| c.info.version = "0.0.1".into(),
+        )
+        .await;
+        w.wires.older_bundle.store(true, Ordering::SeqCst);
+        w.add_host().await;
+        for _ in 0..500 {
+            if w.link().await.upgrade_error.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let said = w.link().await.upgrade_error.expect("it says so");
+        assert!(said.contains("older than this Mac"), "{said}");
+        let tries = *w.wires.installs.lock().unwrap();
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert_eq!(
+            *w.wires.installs.lock().unwrap(),
+            tries,
+            "again at every ping"
+        );
+    }
+
+    /// A false alarm isn't left in the row of a host that's fine.
+    #[tokio::test]
+    async fn an_error_goes_once_the_host_is_what_it_should_be() {
+        let w = world_timed(quick(), |c| c.info.version = MAC.into()).await;
+        w.add_host().await;
+        *w.wires.install_fails.lock().unwrap() = Some("no route".into());
+        let socket = w
+            .wires
+            .sockets
+            .lock()
+            .unwrap()
+            .get("me@vps.example.com")
+            .cloned()
+            .unwrap();
+        // Its vibed is away for a moment, and the install that sets off fails.
+        let aside = socket.with_extension("aside");
+        std::fs::rename(&socket, &aside).unwrap();
+        w.wires.pull();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        w.wires.plug_in();
+        for _ in 0..500 {
+            if w.link().await.upgrade_error.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(w.link().await.upgrade_error.is_some());
+        // Back by itself: all's well, and nothing's left to say.
+        std::fs::rename(&aside, &socket).unwrap();
+        for _ in 0..500 {
+            let h = w.link().await;
+            if h.link == HostLink::Connected && h.upgrade_error.is_none() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("{:?}", w.link().await);
+    }
+
+    #[test]
+    fn only_finding_no_vibed_is_taken_as_a_reason_to_install() {
+        use vibed::link::vibed_is_missing as missing;
+        assert!(missing(
+            "vibe: can't reach vibed at /x/vibed.sock: Connection refused"
+        ));
+        assert!(missing("sh: 1: .local/lib/vibeos/vibe: not found"));
+        assert!(missing(
+            "bash: line 1: .local/lib/vibeos/vibe: No such file or directory"
+        ));
+        assert!(!missing(
+            "ssh: connect to host vps port 22: Connection refused"
+        ));
+        assert!(!missing("me@vps: Permission denied (publickey)."));
+        assert!(!missing("it stopped answering (no answer for 10 s)"));
+    }
+
+    #[tokio::test]
+    async fn a_host_whose_vibed_has_stopped_is_installed_again() {
+        let w = world_timed(quick(), |c| c.info.version = MAC.into()).await;
+        w.add_host().await;
+        let before = *w.wires.installs.lock().unwrap();
+        // Its vibed is gone, and the machine's still there: ssh works.
+        let socket = w
+            .wires
+            .sockets
+            .lock()
+            .unwrap()
+            .get("me@vps.example.com")
+            .cloned();
+        let socket = socket.unwrap();
+        std::fs::remove_file(&socket).unwrap();
+        w.wires.pull();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        w.wires.plug_in();
+        installs_reach(&w, before + 1).await;
+    }
 }

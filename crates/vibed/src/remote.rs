@@ -664,6 +664,17 @@ impl Ssh {
             .filter(|h| h.starts_with('/'))
             .ok_or_else(|| format!("{address} didn't say where its home directory is"))?
             .clone();
+        // Never down: a newer vibed's registry is one this build's can't read, so it
+        // couldn't start, and the host would be cut off.
+        if let Some(there) = probe.get("ondisk").filter(|v| !v.is_empty()) {
+            let mine = env!("CARGO_PKG_VERSION");
+            if crate::hosts::older(mine, there) {
+                return Err(format!(
+                    "{address} has vibed {there}, newer than this VibeOS's {mine}, so it's left \
+                     as it is: update VibeOS on this Mac"
+                ));
+            }
+        }
         let bundle = self.bundle_for(arch)?;
         // Each binary goes up only if the server doesn't have it already.
         let mut uploads = Vec::new();
@@ -677,7 +688,10 @@ impl Ssh {
             let sum = sha256_hex(&bytes);
             if probe.get(&format!("sum.{name}")) != Some(&sum) {
                 let into = format!("{HOST_LIB}/.{name}.new");
-                let command = format!("mkdir -p {HOST_LIB} && cat > {into}");
+                // Nothing's left to fill a disk that's nearly full.
+                let command = format!(
+                    "mkdir -p {HOST_LIB} && {{ cat > {into} || {{ rm -f {into}; exit 1; }}; }}"
+                );
                 self.run(address, &format!("Uploading {name}"), &command, bytes)
                     .await?;
                 uploads.push((name, sum));
@@ -1007,7 +1021,12 @@ echo "arch=$(uname -m)"
 echo "label=$(hostname 2>/dev/null || uname -n)"
 echo "home=$HOME"
 lib="$HOME/.local/lib/vibeos"
+if [ -x "$lib/vibed" ]; then
+  echo "ondisk=$("$lib/vibed" --version 2>/dev/null | cut -d ' ' -f 2)"
+fi
 for f in vibed vibe vibe-shim vibe-bind; do
+  # What an upload cut short left behind.
+  rm -f "$lib/.$f.new"
   if [ -f "$lib/$f" ] && command -v sha256sum >/dev/null 2>&1; then
     echo "sum.$f=$(sha256sum "$lib/$f" | cut -d ' ' -f 1)"
   fi
@@ -1132,6 +1151,8 @@ fn configure_script(uploads: &[(&str, String)], unit: &str, path: &str) -> Strin
              if [ \"$got\" != {sum} ] && command -v sha256sum >/dev/null 2>&1; then\n  \
                echo \"error={name} didn't arrive whole\"; exit 1\n\
              fi\n\
+             rm -f \"$lib/.{name}.prev\"\n\
+             if [ -f \"$lib/{name}\" ]; then cp -p \"$lib/{name}\" \"$lib/.{name}.prev\"; fi\n\
              chmod 755 \"$lib/.{name}.new\" && mv -f \"$lib/.{name}.new\" \"$lib/{name}\" || \
              {{ echo \"error=can't put {name} in place\"; exit 1; }}\n\
              changed=yes\n"
@@ -1165,6 +1186,12 @@ fn configure_script(uploads: &[(&str, String)], unit: &str, path: &str) -> Strin
          systemctl --user daemon-reload || { echo \"error=systemctl --user daemon-reload failed\"; exit 1; }\n\
          systemctl --user enable vibed.service >/dev/null 2>&1 || \
            { echo \"error=systemctl --user enable vibed.service failed\"; exit 1; }\n\
+         # An upgrade cut short after its files went in, whose vibed is still the one\n\
+         # before: nothing's new to go up, and it still has to come to the new one.\n\
+         main=$(systemctl --user show -p MainPID --value vibed.service 2>/dev/null)\n\
+         case \"$(readlink \"/proc/$main/exe\" 2>/dev/null)\" in\n  \
+           *\" (deleted)\") changed=yes ;;\n\
+         esac\n\
          if [ \"$changed\" = yes ]; then action=restart; else action=start; fi\n\
          systemctl --user \"$action\" vibed.service || \
            { echo \"error=systemctl --user $action vibed.service failed\"; exit 1; }\n\
@@ -1172,11 +1199,23 @@ fn configure_script(uploads: &[(&str, String)], unit: &str, path: &str) -> Strin
          until \"$lib/vibe\" hello >/dev/null 2>&1; do\n  \
            i=$((i + 1))\n  \
            if [ \"$i\" -gt 30 ]; then\n    \
-             echo \"error=vibed didn't start: $(journalctl --user -u vibed.service -n 1 --no-pager -o cat 2>/dev/null)\"\n    \
+             why=$(journalctl --user -u vibed.service -t vibed -n 1 --no-pager -o cat 2>/dev/null)\n    \
+             # A build that won't start isn't left to cut the host off.\n    \
+             back=no\n    \
+             for f in vibed vibe vibe-shim vibe-bind; do\n      \
+               if [ -f \"$lib/.$f.prev\" ]; then mv -f \"$lib/.$f.prev\" \"$lib/$f\"; back=yes; fi\n    \
+             done\n    \
+             if [ \"$back\" = yes ]; then\n      \
+               systemctl --user restart vibed.service\n      \
+               echo \"error=vibed didn't start on this build, so it went back to the one before: $why\"\n    \
+             else\n      \
+               echo \"error=vibed didn't start: $why\"\n    \
+             fi\n    \
              exit 1\n  \
            fi\n  \
            sleep 1\n\
          done\n\
+         rm -f \"$lib\"/.*.prev\n\
          echo \"version=$(\"$lib/vibed\" --version | cut -d ' ' -f 2)\"\n\
          echo \"changed=$changed\"\n",
     );

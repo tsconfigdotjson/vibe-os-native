@@ -786,6 +786,10 @@ fn examples_cover_the_contract() {
         if ty == "PiStatus" {
             seen_keys.insert("error");
         }
+        // The same of an upgrade.
+        if ty == "HostInfo" {
+            seen_keys.insert("upgrade_error");
+        }
         assert_eq!(
             seen_keys, fields,
             "the examples don't use exactly the fields of {ty}"

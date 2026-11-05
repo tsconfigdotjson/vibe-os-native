@@ -1309,6 +1309,13 @@ struct HostRow: View {
                         .font(.caption)
                         .foregroundStyle(Palette.attention)
                 }
+                if let why = host.upgradeError {
+                    Label("Can't update vibed: \(sentence(why))", systemImage: "exclamationmark.triangle")
+                        .font(.caption)
+                        .foregroundStyle(Palette.attention)
+                        .lineLimit(3)
+                        .textSelection(.enabled)
+                }
             }
             Spacer()
             if updating {
@@ -1318,9 +1325,11 @@ struct HostRow: View {
                     Button("Allow…", action: allow)
                         .help("Opens Terminal, where sudo on \(host.name) asks for its password. VibeOS never sees it.")
                 }
+                if host.upgradeError != nil {
+                    Button("Retry", action: upgrade)
+                        .help("VibeOS tries again by itself every hour too.")
+                }
                 Menu {
-                    Button("Update vibed", action: upgrade)
-                    Divider()
                     Button("Remove \(host.name)…", role: .destructive, action: remove)
                 } label: {
                     Image(systemName: "ellipsis.circle")
@@ -1329,7 +1338,7 @@ struct HostRow: View {
                 .buttonStyle(.borderless)
                 .menuIndicator(.hidden)
                 .fixedSize()
-                .help("Update or remove \(host.name)")
+                .help("Remove \(host.name)")
                 .accessibilityLabel("Actions for \(host.name)")
             }
         }

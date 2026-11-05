@@ -44,6 +44,41 @@ const IDLE_FOR: Duration = Duration::from_secs(30);
 /// What a channel for calls says it is, in its hello.
 const LINK_CALLS: &str = "vibed link calls from";
 
+/// How long after one try a host's `vibed` is upgraded by itself again, as long as
+/// its link is up or trying: often enough to come right soon after what was wrong
+/// is, and rarely enough that it's no load on either side.
+const UPGRADE_RETRY: Duration = Duration::from_secs(60 * 60);
+
+/// How long between tries at the least, for a link that keeps coming back.
+const UPGRADE_GAP: Duration = Duration::from_secs(5 * 60);
+
+/// How upgrading a host's `vibed` stands, on this Mac, for this run.
+#[derive(Debug, Default)]
+pub(crate) struct Upgrade {
+    /// One's under way or asked for.
+    pub(crate) running: bool,
+    /// When the last one began, however it went: nothing short of that holds a
+    /// host from being installed on over and over.
+    pub(crate) tried_at: Option<Instant>,
+    /// A link's come up since then. A try the network cut short is no reason to wait
+    /// out the hour once it's back, only [`Timing::upgrade_gap`].
+    pub(crate) reconnected: bool,
+    /// What went wrong the last time, until something's gone right.
+    pub(crate) error: Option<String>,
+}
+
+impl Upgrade {
+    /// Whether it's too soon for another by itself.
+    pub(crate) fn too_soon(&self, timing: &Timing) -> bool {
+        let wait = if self.reconnected {
+            timing.upgrade_gap
+        } else {
+            timing.upgrade_retry
+        };
+        self.tried_at.is_some_and(|at| at.elapsed() < wait)
+    }
+}
+
 /// How the link is timed, and the tunnel that follows it; tests make it
 /// quicker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +92,10 @@ pub struct Timing {
     /// it began or since the host last did, before it's started anew
     /// ([`crate::tunnel::QUIET`]).
     pub tunnel_quiet: Duration,
+    /// How long after one try the host's `vibed` is upgraded by itself again.
+    pub upgrade_retry: Duration,
+    /// How long, at the least, if its link has come back since.
+    pub upgrade_gap: Duration,
 }
 
 impl Default for Timing {
@@ -68,6 +107,8 @@ impl Default for Timing {
             min_backoff: MIN_BACKOFF,
             max_backoff: MAX_BACKOFF,
             tunnel_quiet: crate::tunnel::QUIET,
+            upgrade_retry: UPGRADE_RETRY,
+            upgrade_gap: UPGRADE_GAP,
         }
     }
 }
@@ -94,8 +135,12 @@ pub struct Link {
     /// Wakes the supervisor from its backoff, to reconnect now.
     kick: Notify,
     task: Mutex<Option<JoinHandle<()>>>,
-    /// Whether this run has tried to upgrade the host already.
-    pub(crate) upgrade_tried: AtomicBool,
+    /// How upgrading the host's `vibed` stands.
+    pub(crate) upgrade: Mutex<Upgrade>,
+    /// One install at a time, whoever asked.
+    pub(crate) installing: tokio::sync::Mutex<()>,
+    /// It runs an older `vibed` than this one, as of when its link last came up.
+    pub(crate) behind: AtomicBool,
     /// A read of its agents is wanted: one runs at a time.
     pub(crate) refresh_wanted: AtomicBool,
     /// It hasn't had this host's latest keys, as far as this `vibed` knows: the last
@@ -164,7 +209,9 @@ impl Link {
             idle: Mutex::new(Vec::new()),
             kick: Notify::new(),
             task: Mutex::new(None),
-            upgrade_tried: AtomicBool::new(false),
+            upgrade: Mutex::new(Upgrade::default()),
+            installing: tokio::sync::Mutex::new(()),
+            behind: AtomicBool::new(false),
             refresh_wanted: AtomicBool::new(false),
             keys_stale: AtomicBool::new(true),
             projects_seen: Mutex::new(Vec::new()),
@@ -426,6 +473,10 @@ async fn supervise(core: Weak<Core>, link: Weak<Link>, timing: Timing) {
             Ok(()) => "the link closed".to_owned(),
             Err(why) => why.clone(),
         };
+        if vibed_is_missing(&why) {
+            c.upgrade_in_background(&l);
+            c.note_still_missing(&l, &why);
+        }
         let was_up = l.connected();
         if l.set_down(Some(why.clone())) {
             if was_up {
@@ -496,6 +547,10 @@ async fn session(core: &Weak<Core>, link: &Arc<Link>, timing: Timing) -> Result<
                             c.host_reported(link, Some(&own), None);
                             c.host_link_changed(link);
                         }
+                        // One that failed is tried again, in time.
+                        if link.behind.load(Ordering::SeqCst) {
+                            c.upgrade_in_background(link);
+                        }
                         // A push that failed is tried again.
                         if link.keys_stale.load(Ordering::SeqCst) {
                             c.push_keys_to(link);
@@ -514,6 +569,13 @@ async fn session(core: &Weak<Core>, link: &Arc<Link>, timing: Timing) -> Result<
             }
             // A ping unanswered for `ping_timeout` ends it, then and there.
             () = overdue(waiting.map(|(_, since)| since + timing.ping_timeout)) => {
+                // An install shares this connection, and a big upload can hold a
+                // ping up on a slow line. Dropping it would cut that short, to start
+                // again from nothing. If the line's really gone, the install says so.
+                if lock(&link.upgrade).running {
+                    waiting = waiting.map(|(id, _)| (id, Instant::now()));
+                    continue;
+                }
                 // The connection under it is likely gone, as from a pulled
                 // network: the next dial starts a new one rather than wait
                 // for ssh's keepalives to give up on the shared one.
@@ -582,7 +644,7 @@ async fn opening(core: &Arc<Core>, link: &Arc<Link>, timing: Timing) -> Result<C
                 if theirs.is_some_and(|p| p < u64::from(PROTOCOL_VERSION)) {
                     core.upgrade_in_background(link);
                     return Err(format!(
-                        "its vibed is older, and speaks protocol {}; it's being upgraded",
+                        "its vibed is older, and speaks protocol {}",
                         theirs.unwrap_or_default()
                     ));
                 }
@@ -646,6 +708,21 @@ pub(crate) fn relabel_event(name: &str, mut params: Value) -> Option<Event> {
     Some(event)
 }
 
-pub(crate) fn tried_upgrade(link: &Link) -> bool {
-    link.upgrade_tried.swap(true, Ordering::SeqCst)
+/// Whether what a link's `ssh` said means it reached the server and found no `vibed`
+/// to talk to: it's stopped, or isn't there, or won't run. Installing is what puts
+/// that right, and changes nothing that's in order. Shells word this differently, but
+/// all name the file, which sets it apart from anything of `ssh`'s own.
+pub fn vibed_is_missing(why: &str) -> bool {
+    let lower = why.to_ascii_lowercase();
+    why.contains("can't reach vibed")
+        || (why.contains(crate::remote::HOST_VIBE)
+            && [
+                "not found",
+                "no such file",
+                "unknown command",
+                "permission denied",
+                "exec format error",
+            ]
+            .iter()
+            .any(|sign| lower.contains(sign)))
 }

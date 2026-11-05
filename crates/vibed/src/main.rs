@@ -234,6 +234,12 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
     let (listener, guard) = server::bind(&path)?;
     let listener = UnixListener::from_std(listener)?;
     let mut config = Config::new(DaemonInfo::current(), layout);
+    // For tests only, in debug builds: a host running behind this build.
+    if cfg!(debug_assertions)
+        && let Some(version) = env_text("VIBE_TEST_VERSION")
+    {
+        config.info.version = version;
+    }
     config.state_lock = Some(state_lock);
     if let Some(gh) = std::env::var_os("VIBE_GH").filter(|v| !v.is_empty()) {
         config.gh = gh;

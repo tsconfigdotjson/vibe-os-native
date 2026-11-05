@@ -28,7 +28,7 @@ use crate::core::{Core, error, invalid, lock, store_error};
 const KEYS_ASK: Duration = Duration::from_secs(3);
 use std::sync::atomic::Ordering;
 
-use crate::link::{Link, tried_upgrade};
+use crate::link::Link;
 use crate::remote::{Installed, Remote, TOOLS};
 
 /// The methods that act on one host, by its `host` param, and so go to a
@@ -173,6 +173,15 @@ impl Core {
                     h.memory = own.memory;
                     h.needs_admin = own.needs_admin;
                 }
+                let upgrade = lock(&link.upgrade);
+                h.upgrade_error.clone_from(&upgrade.error);
+                if h.link == HostLink::Down {
+                    if upgrade.running {
+                        h.detail = Some("VibeOS is upgrading its vibed".to_owned());
+                    } else if let Some(why) = &upgrade.error {
+                        h.detail = Some(format!("VibeOS can't upgrade its vibed: {why}"));
+                    }
+                }
                 self.describe_external(h, &link);
             }
         }
@@ -306,6 +315,7 @@ impl Core {
             external_detail: None,
             memory: None,
             needs_admin: installed.needs_admin.clone(),
+            upgrade_error: None,
         };
         self.store()
             .add_host(&info, self.now())
@@ -341,17 +351,82 @@ impl Core {
         })
     }
 
-    /// Installs this build's `vibed` on a host added already, and checks
-    /// its tools again.
+    /// Installs this build's `vibed` on a host added already, and checks its tools
+    /// again, now. It happens by itself; this is **Retry**, for one that failed.
     pub async fn upgrade_host(&self, p: HostNameParams) -> Result<HostInstall, ErrorObject> {
         let link = self.linux_host(&p.host)?;
-        let installed = self.install_on(&link.name, &link.address).await?;
-        self.record_install(&link, &installed)?;
+        if self.host_is_newer(&link) {
+            return Err(error(
+                ErrorCode::Conflict,
+                format!(
+                    "{} runs a newer vibed than this Mac, so it's left as it is: update VibeOS \
+                     on this Mac",
+                    link.name
+                ),
+            ));
+        }
+        {
+            let mut upgrade = lock(&link.upgrade);
+            upgrade.running = true;
+            upgrade.tried_at = Some(std::time::Instant::now());
+            upgrade.reconnected = false;
+        }
+        let installed = self.upgrade_now(&link).await?;
         Ok(HostInstall {
             host: self.host_info(&link.name)?,
             changed: installed.changed,
             notes: installed.notes,
         })
+    }
+
+    /// One install on `link`'s host, the next in line, and how it went for
+    /// [`Link::upgrade`]. Agents there keep running: their shims are out of reach
+    /// of the restart (PRD: Restarts).
+    async fn upgrade_now(&self, link: &Arc<Link>) -> Result<Installed, ErrorObject> {
+        let done = {
+            let _one_at_a_time = link.installing.lock().await;
+            self.install_on(&link.name, &link.address).await
+        };
+        let mine = self.info().version.clone();
+        // A build older than this Mac's can't put right that it's behind.
+        let done = done.and_then(|installed| {
+            if older(&installed.version, &mine) {
+                let why = format!(
+                    "this VibeOS's build for it is vibed {}, older than this Mac's {mine}",
+                    installed.version
+                );
+                let _ = self.record_install(link, &installed);
+                Err(error(ErrorCode::CommandFailed, why))
+            } else {
+                Ok(installed)
+            }
+        });
+        // Settled before anyone's told, so the row they read is as it stands now.
+        {
+            let mut upgrade = lock(&link.upgrade);
+            upgrade.running = false;
+            upgrade.error = done.as_ref().err().map(|e| e.message.clone());
+        }
+        let done = done.and_then(|installed| {
+            self.record_install(link, &installed)?;
+            Ok(installed)
+        });
+        if let Err(e) = &done {
+            lock(&link.upgrade).error = Some(e.message.clone());
+            self.host_link_changed(link);
+        }
+        done
+    }
+
+    /// Whether `link`'s host last said it runs a newer `vibed` than this one. A newer
+    /// `vibed`'s registry is one an older one can't read, so nothing here ever installs
+    /// over it: it would leave the host unable to start.
+    fn host_is_newer(&self, link: &Link) -> bool {
+        self.store()
+            .host(&link.name)
+            .ok()
+            .and_then(|h| h.version)
+            .is_some_and(|v| older(&self.info().version, &v))
     }
 
     fn record_install(&self, link: &Arc<Link>, installed: &Installed) -> Result<(), ErrorObject> {
@@ -362,6 +437,10 @@ impl Core {
         info.missing = installed.missing.clone();
         info.needs_admin = installed.needs_admin.clone();
         self.store().set_host_report(&info).map_err(store_error)?;
+        link.behind.store(
+            older(&installed.version, &self.info().version),
+            Ordering::SeqCst,
+        );
         crate::log!(
             "vibed: {} runs vibed {}{}",
             link.name,
@@ -616,6 +695,7 @@ impl Core {
             external_detail: None,
             memory: None,
             needs_admin: Vec::new(),
+            upgrade_error: None,
         });
         e.state = Some(info.link.to_string());
         e.message = info.detail;
@@ -631,33 +711,62 @@ impl Core {
         self.reconcile_external(link);
         let theirs = self.store().host(&link.name).ok().and_then(|h| h.version);
         // Only up: a newer vibed's registry is one an older one can't read.
-        if theirs.is_some_and(|v| older(&v, &self.info().version)) {
+        let behind = theirs.is_some_and(|v| older(&v, &self.info().version));
+        link.behind.store(behind, Ordering::SeqCst);
+        if behind {
+            lock(&link.upgrade).reconnected = true;
             self.upgrade_in_background(link);
+        } else {
+            // It's what it should be, however that came about: nothing's left to say.
+            let had = {
+                let mut upgrade = lock(&link.upgrade);
+                upgrade.tried_at = None;
+                upgrade.reconnected = false;
+                upgrade.error.take().is_some()
+            };
+            if had {
+                self.host_link_changed(link);
+            }
         }
     }
 
-    /// Installs this build on `link`'s host, once per run, as when it runs
-    /// another version or speaks another protocol.
+    /// Installs this build on `link`'s host, with nobody asked, as when it runs an
+    /// older version, speaks an older protocol or has no `vibed` to talk to: unless
+    /// that's under way, or too soon after the last try, however that went, or the host
+    /// runs a newer one. What went wrong shows in its row, with **Retry**.
     pub(crate) fn upgrade_in_background(&self, link: &Arc<Link>) {
-        if tried_upgrade(link) {
+        if self.host_is_newer(link) {
             return;
+        }
+        {
+            let mut upgrade = lock(&link.upgrade);
+            if upgrade.running || upgrade.too_soon(&self.link_timing) {
+                return;
+            }
+            upgrade.running = true;
+            upgrade.tried_at = Some(std::time::Instant::now());
+            upgrade.reconnected = false;
         }
         let link = Arc::clone(link);
         self.in_background(|core| async move {
             crate::log!(
-                "vibed: {} runs another vibed than this one ({}); upgrading it",
+                "vibed: {} needs this vibed ({}); upgrading it",
                 link.name,
                 core.info().version
             );
-            match core.remote.install(&link.address).await {
-                Ok(installed) => {
-                    if let Err(e) = core.record_install(&link, &installed) {
-                        crate::log!("vibed: can't record {}'s upgrade: {}", link.name, e.message);
-                    }
-                }
-                Err(e) => crate::log!("vibed: can't upgrade {}: {e}", link.name),
+            if let Err(e) = core.upgrade_now(&link).await {
+                crate::log!("vibed: can't upgrade {}: {}", link.name, e.message);
             }
         });
+    }
+
+    /// The link's still finding no `vibed`, with nothing under way to put that right
+    /// for now: an install that went well didn't. That's said, not left to look fine.
+    pub(crate) fn note_still_missing(&self, link: &Link, why: &str) {
+        let mut upgrade = lock(&link.upgrade);
+        if !upgrade.running && upgrade.tried_at.is_some() && upgrade.error.is_none() {
+            upgrade.error = Some(why.to_owned());
+        }
     }
 
     /// An event from `link`'s host, onto this host's stream under its name.

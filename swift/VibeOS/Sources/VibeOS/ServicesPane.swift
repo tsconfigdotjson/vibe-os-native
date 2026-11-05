@@ -267,7 +267,7 @@ private struct ServiceHostRow: View {
                         Text(status.status)
                         if let note = status.note { Text("· \(note)") }
                     } else {
-                        Text("Not answering. If its link is up, it may need updating: Settings → Hosts → Update vibed.")
+                        Text("Not answering. If it's behind this Mac, VibeOS is updating it: Settings → Hosts says how that's going.")
                             .lineLimit(2)
                     }
                 }

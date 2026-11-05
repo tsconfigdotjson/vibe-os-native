@@ -480,8 +480,9 @@ method! {
 }
 
 method! {
-    /// `hosts.upgrade`: installs this build's `vibed` on a host added
-    /// already, if it runs another, and checks its tools again.
+    /// `hosts.upgrade`: installs this build's `vibed` on a host added already, if
+    /// it runs another, and checks its tools again, now. A host runs behind by
+    /// itself for no longer than it takes to reach it, so this is **Retry**.
     HostsUpgrade = "hosts.upgrade", HostNameParams => HostInstall
 }
 
@@ -854,6 +855,10 @@ pub struct HostInfo {
         deserialize_with = "known_admin_needs"
     )]
     pub needs_admin: Vec<AdminNeed>,
+    /// Why upgrading this Linux host's `vibed` failed, the last time this Mac tried.
+    /// It tries again by itself; `hosts.upgrade` is **Retry**.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upgrade_error: Option<String>,
 }
 
 /// The needs this build knows of those a host names.

@@ -202,6 +202,7 @@ case "$1" in
   daemon-reload) ;;
   enable) touch "$HOME.d/enabled" ;;
   start) if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then :; else start; fi ;;
+  show) cat "$pidfile" 2>/dev/null ;;
   restart) stop; start ;;
   stop) stop ;;
   *) echo "fake systemctl: $*" >&2; exit 1 ;;
@@ -413,6 +414,8 @@ fn mac_with(
         .build()
         .unwrap();
     let mut config = golden.config();
+    // What a real Mac is: on the build its bundle holds.
+    config.info.version = env!("CARGO_PKG_VERSION").into();
     // Sharing a connection per host as the app's vibed does: with real ssh
     // (the real-host tests), that's what's tested.
     config.remote = Arc::new(Ssh {
@@ -426,6 +429,7 @@ fn mac_with(
         connect_timeout: Duration::from_secs(20),
         min_backoff: Duration::from_millis(200),
         max_backoff: Duration::from_secs(1),
+        upgrade_gap: Duration::from_millis(500),
         ..Timing::default()
     };
     if services.is_some() {
@@ -2090,4 +2094,215 @@ fn a_host_that_refuses_lingering_gets_a_button_not_a_command_body(watch: &Watch)
     assert!(added.contains("Settings → Hosts"), "{added}");
     assert!(!added.contains("sudo loginctl"), "{added}");
     assert!(!state.join("linger").exists());
+}
+
+/// #74: a Mac that's moved on upgrades a host behind it, with nobody asked and the
+/// host offline at first, and the host's agent keeps running through the restart.
+/// All real processes: the Mac's `vibed`, the install's script, the host's `vibed`
+/// under its unit's `KillMode=process`, and the agent's shim.
+#[test]
+fn a_host_behind_the_mac_upgrades_itself_and_its_agent_keeps_running() {
+    bounded(
+        DEADLINE,
+        a_host_behind_the_mac_upgrades_itself_and_its_agent_keeps_running_body,
+    );
+}
+
+fn a_host_behind_the_mac_upgrades_itself_and_its_agent_keeps_running_body(watch: &Watch) {
+    let golden = common::Golden::new();
+    let hosts = common::short_tempdir();
+    watch.owns(golden.dir.path());
+    let ssh = fake_ssh(watch, hosts.path());
+    let host = FakeHost::new(hosts.path(), "me@vps", &golden.claude);
+    // It says it runs what an older build would, however often it's restarted.
+    let env = host.d.join("env");
+    let mut setup = fs::read_to_string(&env).unwrap();
+    setup.push_str("export VIBE_TEST_VERSION=0.0.1\n");
+    fs::write(&env, setup).unwrap();
+    let bundled = bundle(golden.dir.path());
+    let mac = mac(&golden, &ssh, bundled.clone());
+    ok(vibe(&mac.socket, &["host", "add", "vps", "me@vps"]));
+    let link_is = |want: &str| {
+        ok(vibe(&mac.socket, &["host"]))
+            .lines()
+            .any(|l| l.starts_with("vps  ") && l.contains(want))
+    };
+    wait_for("the link", Duration::from_secs(30), || {
+        link_is("  connected")
+    });
+    // It's behind, so it's upgraded at once: to the same build as yet, which changes
+    // nothing there, and it says so.
+    wait_for("the first upgrade", Duration::from_secs(60), || {
+        link_is(&format!("vibed {}", env!("CARGO_PKG_VERSION")))
+    });
+
+    // An agent running there.
+    let app = host.home.join("src/app");
+    ok(vibe(
+        &mac.socket,
+        &["project", "add", "--host", "vps", app.to_str().unwrap()],
+    ));
+    ok(vibe(
+        &mac.socket,
+        &[
+            "profile", "create", "app", "small", "--memory", "1G", "--host", "vps",
+        ],
+    ));
+    let key = mac
+        .core
+        .create_key(KeyCreateParams {
+            name: "laptop".into(),
+        })
+        .unwrap()
+        .secret;
+    let mut mcp = Bridge::start(mac.mcp, &key);
+    let started = mcp.call(
+        "vibe_start_agent",
+        json!({"project": "app", "profile": "small", "prompt": "hello",
+               "host": "vps", "name": "stays-up"}),
+    );
+    assert!(started.contains("vps:stays-up"), "{started}");
+    let socket = host.socket();
+    let sessions = ok(vibe(&socket, &["ls"]));
+    assert!(sessions.contains("stays-up"), "{sessions}");
+    let before = host.pid().unwrap();
+
+    // The app's updated: this Mac now has a new build for it, and the host's away
+    // for the moment.
+    let arch = bundled.join(std::env::consts::ARCH);
+    let mut new_build = fs::read(arch.join("vibed")).unwrap();
+    new_build.extend_from_slice(b"\n# a new release\n");
+    fs::remove_file(arch.join("vibed")).unwrap();
+    fs::write(arch.join("vibed"), &new_build).unwrap();
+    fs::set_permissions(arch.join("vibed"), fs::Permissions::from_mode(0o755)).unwrap();
+    host.pull();
+    wait_for("the link to go down", Duration::from_secs(30), || {
+        link_is("  down")
+    });
+    assert_eq!(host.pid(), Some(before), "nothing's reached it yet");
+
+    // Back: it gets the new build, and restarts on it, with nobody asked.
+    host.plug_in();
+    let installed = host.home.join(".local/lib/vibeos/vibed");
+    wait_for("the new build there", Duration::from_secs(60), || {
+        fs::read(&installed).is_ok_and(|b| b == new_build)
+    });
+    wait_for("its vibed to restart", Duration::from_secs(30), || {
+        host.pid().is_some_and(|p| p != before)
+    });
+    wait_for("the link to come back", Duration::from_secs(30), || {
+        link_is("  connected")
+    });
+
+    // Its agent carried on through that, and the new vibed found it.
+    wait_for("the agent found again", Duration::from_secs(30), || {
+        ok(vibe(&socket, &["ls"])).contains("stays-up")
+    });
+    let all = mcp.call("vibe_list_agents", json!({}));
+    assert!(all.contains("vps:stays-up"), "{all}");
+    assert!(!all.contains("exited"), "{all}");
+    assert!(!ok(vibe(&mac.socket, &["host"])).contains("upgrading it failed"));
+}
+
+/// B2 of the review. An upgrade cut short once its files are in has a `vibed` still
+/// on the build before, with nothing new to go up. The next try still restarts it.
+#[test]
+fn an_upgrade_cut_short_after_its_files_went_in_is_finished_by_the_next() {
+    bounded(
+        DEADLINE,
+        an_upgrade_cut_short_after_its_files_went_in_is_finished_by_the_next_body,
+    );
+}
+
+fn an_upgrade_cut_short_after_its_files_went_in_is_finished_by_the_next_body(watch: &Watch) {
+    let golden = common::Golden::new();
+    let hosts = common::short_tempdir();
+    watch.owns(golden.dir.path());
+    let ssh = fake_ssh(watch, hosts.path());
+    let host = FakeHost::new(hosts.path(), "me@vps", &golden.claude);
+    let mac = mac(&golden, &ssh, bundle(golden.dir.path()));
+    ok(vibe(&mac.socket, &["host", "add", "vps", "me@vps"]));
+    let before = host.pid().unwrap();
+    // As the upload does: the same bytes, a new file, the old one gone from under
+    // the vibed that's running.
+    let installed = host.home.join(".local/lib/vibeos/vibed");
+    let moved = installed.with_extension("moved");
+    fs::copy(&installed, &moved).unwrap();
+    fs::rename(&moved, &installed).unwrap();
+    let again = ok(vibe(&mac.socket, &["host", "upgrade", "vps"]));
+    assert!(again.contains("just installed"), "{again}");
+    assert_ne!(host.pid(), Some(before), "the old build is still running");
+}
+
+/// S6 of the review: a build that won't start, now that nobody's there to see it,
+/// isn't left to cut the host off. It goes back, says so, and agents never knew.
+#[test]
+fn a_build_that_wont_start_goes_back_to_the_one_before_and_says_so() {
+    bounded(
+        DEADLINE,
+        a_build_that_wont_start_goes_back_to_the_one_before_and_says_so_body,
+    );
+}
+
+fn a_build_that_wont_start_goes_back_to_the_one_before_and_says_so_body(watch: &Watch) {
+    let golden = common::Golden::new();
+    let hosts = common::short_tempdir();
+    watch.owns(golden.dir.path());
+    let ssh = fake_ssh(watch, hosts.path());
+    let host = FakeHost::new(hosts.path(), "me@vps", &golden.claude);
+    let bundled = bundle(golden.dir.path());
+    let mac = mac(&golden, &ssh, bundled.clone());
+    ok(vibe(&mac.socket, &["host", "add", "vps", "me@vps"]));
+    let installed = host.home.join(".local/lib/vibeos/vibed");
+    let good = fs::read(&installed).unwrap();
+    let arch = bundled.join(std::env::consts::ARCH);
+    fs::remove_file(arch.join("vibed")).unwrap();
+    write_exe(
+        &arch.join("vibed"),
+        &format!(
+            "#!/bin/sh\n[ \"$1\" = --version ] && {{ echo vibed {}; exit 0; }}\nexit 3\n",
+            env!("CARGO_PKG_VERSION")
+        ),
+    );
+    let out = vibe(&mac.socket, &["host", "upgrade", "vps"]);
+    assert!(!out.status.success(), "{out:?}");
+    let said = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(said.contains("went back to the one before"), "{said}");
+    assert_eq!(
+        fs::read(&installed).unwrap(),
+        good,
+        "the good build is back"
+    );
+    let lib = host.home.join(".local/lib/vibeos");
+    assert!(!lib.join(".vibed.prev").exists());
+    // It's running on it again, and the Mac reaches it.
+    wait_for("the link", Duration::from_secs(30), || {
+        ok(vibe(&mac.socket, &["host"]))
+            .lines()
+            .any(|l| l.starts_with("vps  ") && l.contains("  connected"))
+    });
+}
+
+/// B1 of the review, by the real install's own look at what's there.
+#[test]
+fn the_install_never_goes_over_a_newer_vibed() {
+    bounded(DEADLINE, the_install_never_goes_over_a_newer_vibed_body);
+}
+
+fn the_install_never_goes_over_a_newer_vibed_body(watch: &Watch) {
+    let golden = common::Golden::new();
+    let hosts = common::short_tempdir();
+    watch.owns(golden.dir.path());
+    let ssh = fake_ssh(watch, hosts.path());
+    let host = FakeHost::new(hosts.path(), "me@vps", &golden.claude);
+    let lib = host.home.join(".local/lib/vibeos");
+    fs::create_dir_all(&lib).unwrap();
+    let newer = "#!/bin/sh\necho vibed 99.0.0\n";
+    write_exe(&lib.join("vibed"), newer);
+    let mac = mac(&golden, &ssh, bundle(golden.dir.path()));
+    let out = vibe(&mac.socket, &["host", "add", "vps", "me@vps"]);
+    assert!(!out.status.success(), "{out:?}");
+    let said = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(said.contains("newer than this VibeOS"), "{said}");
+    assert_eq!(fs::read_to_string(lib.join("vibed")).unwrap(), newer);
 }

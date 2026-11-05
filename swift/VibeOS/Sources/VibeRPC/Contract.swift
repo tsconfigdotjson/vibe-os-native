@@ -1022,12 +1022,16 @@ public struct HostInfo: Codable, Hashable, Sendable {
     /// What this Linux host needs someone with sudo there to allow, once;
     /// `hosts.admin` says how. Missing when there's nothing.
     public var needsAdmin: [AdminNeed]?
+    /// Why upgrading this Linux host's vibed failed, the last time this Mac tried.
+    /// It tries again by itself; `hosts.upgrade` is Retry.
+    public var upgradeError: String?
 
     public enum CodingKeys: String, CodingKey, CaseIterable {
         case name, os, label, link, external, mcp, address, version, missing, detail, url, tunnel
         case externalDetail = "external_detail"
         case memory
         case needsAdmin = "needs_admin"
+        case upgradeError = "upgrade_error"
     }
 }
 
