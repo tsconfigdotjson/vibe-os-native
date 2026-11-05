@@ -88,6 +88,11 @@ serving() {
 # A handler, not an ignore, as what's run should get what it would have got.
 trap : PIPE
 
+# say LINE: says it in a subshell of its own, whether anyone's reading or not. A Mac's
+# stdio keeps what it couldn't write, and a shell holding that writes it ahead of the
+# next thing, which `look` would then read as what the host said.
+say() { (printf '%s\n' "$1") 2>/dev/null; }
+
 before=$(look) || {
   echo "keep-host-state: can't tell how $dest is, so nothing was run" >&2
   exit 1
@@ -95,7 +100,7 @@ before=$(look) || {
 was_domain=$(first_line "$before")
 was_keys=$(second_line "$before")
 was_vibed=$(vibed_version)
-echo "keep-host-state: $dest before: external address $was_domain; keys: ${was_keys:-none}; vibed: ${was_vibed:-none}"
+say "keep-host-state: $dest before: external address $was_domain; keys: ${was_keys:-none}; vibed: ${was_vibed:-none}"
 
 child=
 stop_child() {
@@ -120,12 +125,12 @@ put_back() {
   [ "$status" -ne 0 ] || status=$code
   stop_child
   if ! now=$(look_soon); then
-    echo "keep-host-state: can't tell how $dest is now. It was: external address $was_domain; keys: ${was_keys:-none}" >&2
+    say "keep-host-state: can't tell how $dest is now. It was: external address $was_domain; keys: ${was_keys:-none}" >&2
     exit 1
   fi
   now_domain=$(first_line "$now")
   if [ "$now_domain" != "$was_domain" ]; then
-    echo "keep-host-state: $dest's external address is $now_domain: putting back $was_domain"
+    say "keep-host-state: $dest's external address is $now_domain: putting back $was_domain"
     # More than once, as its vibed may be restarting, or just slow to answer, but not
     # for ever: signals are ignored here, so nothing else would end it.
     i=$((SECONDS + 300))
@@ -139,20 +144,20 @@ put_back() {
       [ "$SECONDS" -lt "$i" ] || break
       sleep 5
     done
-    [ -z "$said" ] || echo "keep-host-state: putting it back, $dest said: $said" >&2
+    [ -z "$said" ] || say "keep-host-state: putting it back, $dest said: $said" >&2
   fi
   if [ "$now_domain" != "$was_domain" ]; then
     wrong=1
-    echo "keep-host-state: $dest's external address should be $was_domain, and is $now_domain" >&2
+    say "keep-host-state: $dest's external address should be $was_domain, and is $now_domain" >&2
   elif [ "$was_domain" != off ] && ! serving "$was_domain"; then
     wrong=1
-    echo "keep-host-state: $dest's external address is $was_domain, and nothing answers there: the last try got HTTP ${serving_said:-nothing}" >&2
+    say "keep-host-state: $dest's external address is $was_domain, and nothing answers there: the last try got HTTP ${serving_said:-nothing}" >&2
   fi
   now_keys=$(second_line "$now")
   for k in $was_keys; do
     case " $now_keys " in
       *" $k "*) ;;
-      *) wrong=1; echo "keep-host-state: $dest has lost the API key $k" >&2 ;;
+      *) wrong=1; say "keep-host-state: $dest has lost the API key $k" >&2 ;;
     esac
   done
   for k in $now_keys; do
@@ -161,15 +166,15 @@ put_back() {
     name=${line%%  "$k"…*}
     case " $test_keys " in
       *" $name "*)
-        echo "keep-host-state: revoking $name, which a test left on $dest"
+        say "keep-host-state: revoking $name, which a test left on $dest"
         ssh_to "$vibe key revoke $k" >/dev/null || {
           wrong=1
-          echo "keep-host-state: can't revoke $name ($k) on $dest" >&2
+          say "keep-host-state: can't revoke $name ($k) on $dest" >&2
         }
         ;;
       *)
         wrong=1
-        echo "keep-host-state: $dest has a key it didn't have, left as it may be someone's: $name ($k)" >&2
+        say "keep-host-state: $dest has a key it didn't have, left as it may be someone's: $name ($k)" >&2
         ;;
     esac
   done
@@ -177,9 +182,9 @@ put_back() {
   now_vibed=$(vibed_version)
   if [ "$now_vibed" != "$was_vibed" ]; then
     # Not put back: a newer one's registry can't be read by an older one.
-    echo "keep-host-state: $dest's external address and keys are as they were; its vibed isn't: it was ${was_vibed:-none} and is ${now_vibed:-none}, which a test can't undo"
+    say "keep-host-state: $dest's external address and keys are as they were; its vibed isn't: it was ${was_vibed:-none} and is ${now_vibed:-none}, which a test can't undo"
   else
-    echo "keep-host-state: $dest is as it was"
+    say "keep-host-state: $dest is as it was"
   fi
   exit "$status"
 }

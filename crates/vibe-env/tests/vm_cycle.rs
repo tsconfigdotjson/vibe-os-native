@@ -1299,10 +1299,15 @@ impl Screen {
     fn pump(&mut self, timeout: Duration) -> bool {
         use vibe_core::shim::{FrameKind, read_frame};
         // Never zero, which a socket refuses: a deadline just past gives
-        // one last short read.
-        self.stream
+        // one last short read. So a refusal is macOS's `EINVAL` for a shim
+        // that has closed, as with `vm::set_timeouts`, and the read will say.
+        match self
+            .stream
             .set_read_timeout(Some(timeout.max(Duration::from_millis(1))))
-            .unwrap();
+        {
+            Err(e) if e.kind() != std::io::ErrorKind::InvalidInput => panic!("{e}"),
+            _ => {}
+        }
         match read_frame(&mut self.stream) {
             Ok(Some(f)) => {
                 match f.kind {
