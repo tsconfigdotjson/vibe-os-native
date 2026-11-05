@@ -91,6 +91,13 @@ case "$1 $2" in
   exec git config --global --add credential.https://github.com.helper '!gh auth git-credential' ;;
 "auth git-credential")
   exit 0 ;;
+"api meta")
+  if [ -f "$WORLD/network-down" ] || [ -f "$WORLD/bad-token" ] || [ ! -f "$WORLD/logged-in" ]; then
+    echo 'gh: Requires authentication (HTTP 401)' >&2
+    exit 1
+  fi
+  echo "ran" >>"$WORLD/asked-meta"
+  exec cat "$WORLD/published-keys" ;;
 "api user")
   if [ -f "$WORLD/network-down" ]; then
     echo 'Get "https://api.github.com/user": dial tcp: connect: connection refused' >&2
@@ -176,6 +183,12 @@ fn fresh_host(protocol: &str, logged_in: bool) -> Fresh {
     if logged_in {
         fs::write(world.join("logged-in"), "").unwrap();
     }
+    // What GitHub publishes, as `gh api meta` would say.
+    fs::write(
+        world.join("published-keys"),
+        GITHUB_HOST_KEYS.join("\n") + "\n",
+    )
+    .unwrap();
     // `gh` and `ssh` find what they need, wherever `vibed` runs them from, and see
     // this fresh home as a real gh and ssh would see the real one.
     let env = format!(
@@ -341,6 +354,14 @@ async fn a_helper_of_the_owners_own_for_github_stays() {
     w.add().await.unwrap();
     assert_eq!(fs::read_to_string(&config).unwrap(), mine);
     assert_eq!(w.read("setup-git"), "");
+
+    // And it's called what it is.
+    use vibe_core::model::CheckId;
+    let report = w.core.doctor().await;
+    let check = report.checks.iter().find(|c| c.id == CheckId::GhGit);
+    let detail = &check.unwrap().detail;
+    assert!(detail.contains("of your own"), "{detail}");
+    assert!(!detail.contains("asks gh"), "{detail}");
 }
 
 /// A host key that doesn't match what's pinned, as a rotation or someone in the way
@@ -384,15 +405,17 @@ async fn logged_out_says_so_with_what_gh_said() {
         !w.golden.home.join("projects/web").exists()
             && !w.golden.home.join("VibeOS/projects/web").exists()
     );
-    // The app learns it too, and its keys are in for when that's put right.
+    // The app learns it too. GitHub can't be asked which of its keys still stand, so
+    // none goes in yet.
     let status = w.core.gh_status(GhStatusParams::default()).await;
     assert_eq!(status.state, GhState::LoggedOut);
-    assert!(w.known_hosts().contains("github.com ssh-ed25519"));
+    assert_eq!(w.known_hosts(), "");
 
     // Signed in, the very same thing just works.
     fs::write(w.world.join("logged-in"), "").unwrap();
     w.add().await.unwrap();
     w.assert_git_uses_gh();
+    assert!(w.known_hosts().contains("github.com ssh-ed25519"));
 }
 
 /// A token gone bad reads as a working login to whoever trusts gh's exit, on a gh as
@@ -496,12 +519,49 @@ async fn a_check_of_gh_sets_it_all_up_by_itself() {
     );
     assert_eq!(w.read("setup-git"), "ran\n");
 
-    // Logged out, the keys go in, and git waits for it.
+    assert_eq!(w.read("asked-meta"), "ran\n", "only while one was missing");
+
+    // Logged out, the keys and git wait for it.
     let w = fresh_host("https", false);
     w.core.check_gh().await;
-    assert!(w.known_hosts().contains("github.com ssh-ed25519"));
+    assert_eq!(w.known_hosts(), "");
     assert!(!w.golden.home.join(".gitconfig").exists());
     assert_eq!(w.read("setup-git"), "");
+}
+
+/// A build in the field, after GitHub rotates a key: the one it no longer publishes
+/// stays out, and a clone over SSH goes on as it would have.
+#[tokio::test]
+async fn a_key_github_has_dropped_is_not_pinned_by_a_build_still_carrying_it() {
+    let w = fresh_host("ssh", true);
+    let [ed25519, ecdsa, rsa] = GITHUB_HOST_KEYS;
+    fs::write(
+        w.world.join("published-keys"),
+        format!("{ed25519}\n{ecdsa}\n"),
+    )
+    .unwrap();
+    let project = w.add().await.unwrap();
+    let known = w.known_hosts();
+    assert!(
+        known.contains(&format!("github.com {ed25519}\n")),
+        "{known}"
+    );
+    assert!(!known.contains(rsa), "{known}");
+    assert_eq!(w.origin(&project.path), "git@github.com:me/web.git");
+    w.assert_ssh_checks_host_keys();
+}
+
+/// GitHub can't be asked: nothing goes in on the strength of what the build remembers,
+/// and SSH refusing an unknown host still leaves HTTPS.
+#[tokio::test]
+async fn no_answer_from_github_pins_nothing_and_the_clone_goes_on() {
+    let w = fresh_host("ssh", true);
+    fs::write(w.world.join("published-keys"), "").unwrap();
+    let project = w.add().await.unwrap();
+    assert_eq!(w.known_hosts(), "");
+    assert_eq!(w.origin(&project.path), "https://github.com/me/web.git");
+    w.assert_gh_left_alone();
+    w.assert_ssh_checks_host_keys();
 }
 
 /// `vibe doctor` has nothing to say about what's been done for the owner.
