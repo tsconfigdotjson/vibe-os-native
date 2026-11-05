@@ -2046,7 +2046,10 @@ fn real_external_access() {
 /// and only then one button on the Mac. Never a command to copy.
 #[test]
 fn lingering_is_turned_on_any_way_that_needs_no_password() {
-    bounded(DEADLINE, lingering_is_turned_on_any_way_that_needs_no_password_body);
+    bounded(
+        DEADLINE,
+        lingering_is_turned_on_any_way_that_needs_no_password_body,
+    );
 }
 
 fn lingering_is_turned_on_any_way_that_needs_no_password_body(watch: &Watch) {
@@ -2067,7 +2070,10 @@ fn lingering_is_turned_on_any_way_that_needs_no_password_body(watch: &Watch) {
 
 #[test]
 fn a_host_that_refuses_lingering_gets_a_button_not_a_command() {
-    bounded(DEADLINE, a_host_that_refuses_lingering_gets_a_button_not_a_command_body);
+    bounded(
+        DEADLINE,
+        a_host_that_refuses_lingering_gets_a_button_not_a_command_body,
+    );
 }
 
 fn a_host_that_refuses_lingering_gets_a_button_not_a_command_body(watch: &Watch) {
