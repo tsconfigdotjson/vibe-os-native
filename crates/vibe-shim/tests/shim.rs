@@ -428,18 +428,27 @@ fn stopped_on_a_raw_terminal(then: &str) -> Vec<String> {
         .collect()
 }
 
+/// Lets a command from [`stopped_on_a_raw_terminal`] go on, once it has stopped.
 fn carry_on(shim: &Shim) {
-    let pid = shim.control().status().unwrap().child_pid;
+    let pid = shim.control().status().unwrap().child_pid.to_string();
+    wait_until("the command to stop", || {
+        Command::new("ps")
+            .args(["-o", "state=", "-p", &pid])
+            .output()
+            .is_ok_and(|out| out.stdout.starts_with(b"T"))
+    });
     // SAFETY: a signal to the command this test started.
-    unsafe { libc::kill(pid as i32, libc::SIGCONT) };
+    unsafe { libc::kill(pid.parse().unwrap(), libc::SIGCONT) };
 }
 
 /// A paste comes in as `vibe attach` reads it from a terminal, 4 KB at a time,
-/// and it all waits for a command that's busy.
+/// and it all waits for a command that's busy. What's been read makes room again:
+/// the two together are more than may wait at once.
 #[test]
 fn a_big_paste_waits_for_a_command_that_isnt_reading() {
-    const PASTE: usize = 8 << 20;
-    let command = stopped_on_a_raw_terminal(&format!("head -c {PASTE} | wc -c"));
+    const PASTE: usize = 20 << 20;
+    let read = format!("head -c {PASTE} | wc -c");
+    let command = stopped_on_a_raw_terminal(&format!("{read}; {read}"));
     let command: Vec<&str> = command.iter().map(String::as_str).collect();
     let shim = Shim::start(&command);
     let mut a = shim.attach(None);
@@ -448,6 +457,11 @@ fn a_big_paste_waits_for_a_command_that_isnt_reading() {
         a.send(FrameKind::Input, &[b'x'; 4096]);
     }
     carry_on(&shim);
+    a.expect(&PASTE.to_string());
+    a.clear();
+    for _ in 0..PASTE / 4096 {
+        a.send(FrameKind::Input, &[b'x'; 4096]);
+    }
     a.expect(&PASTE.to_string());
     assert!(!shim.log().contains("input"), "{}", shim.log());
 }
@@ -468,7 +482,7 @@ fn input_past_the_limit_is_dropped_and_said_so_once() {
     wait_until("the drop to be logged", || {
         shim.log().contains("isn't reading its input")
     });
-    carry_on(&shim);
+    // Something small still fits, and ends the run of drops.
     wait_until("the total to be logged", || {
         a.send(FrameKind::Input, b"x");
         std::thread::sleep(Duration::from_millis(20));

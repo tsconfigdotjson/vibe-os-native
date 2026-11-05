@@ -56,8 +56,8 @@ const OUTPUT_QUEUE: usize = 8;
 
 /// How much input may wait for a command that isn't reading, such as one that's
 /// stopped. Past this, input is dropped rather than held. Counted in bytes, as a
-/// chunk may be a keystroke or a whole frame; two frames' worth, so a queue with
-/// room for little else still takes the largest there is.
+/// chunk may be a keystroke or a whole frame; twice the largest frame, so a queue
+/// up to half full still takes one.
 const INPUT_BACKLOG: usize = 2 * shim::MAX_FRAME;
 
 /// What anything waiting for the terminal counts for beyond its bytes, so that a
@@ -511,7 +511,7 @@ pub(crate) async fn run(
     // slow enough that requests behind a queue of them take seconds, and `vibed`
     // takes a shim that slow to answer for a broken one.
     let (output_tx, mut output) = mpsc::channel::<Event>(OUTPUT_QUEUE);
-    // Capped by `State::queue_input`, in bytes.
+    // Capped by `State::queue`, in bytes.
     let (input_tx, input_rx) = std::sync::mpsc::channel();
     let input_waiting = Arc::new(AtomicUsize::new(0));
     // Keep a PTY's master open for the resize ioctl until the end.

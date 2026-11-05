@@ -78,9 +78,10 @@ impl Conn {
         Conn { id, client, stream }
     }
 
-    /// Sends a frame whole within [`SEND_TIMEOUT`], or fails: output and
-    /// the state wait on it, so a shim that drains slowly is as gone as one
-    /// that stopped. Each write blocks at most the socket's send timeout.
+    /// Sends a frame whole, or fails once it's been [`SEND_TIMEOUT`] at it, plus
+    /// the write under way, which blocks at most the socket's send timeout.
+    /// Output and the state wait on it, so a shim that takes that long over a
+    /// frame is as gone as one that stopped.
     fn send(&self, frame: &Frame) -> io::Result<()> {
         let bytes = frame.encode();
         let deadline = Instant::now() + SEND_TIMEOUT;
