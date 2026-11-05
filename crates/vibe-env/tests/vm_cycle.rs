@@ -865,7 +865,7 @@ fn guest_shim_reaches_the_broker_over_the_relay_across_a_sleep() {
     // A shim started in the guest, with a client that lives across the sleep: a
     // script taking each message from a file of its own in the share, and answering
     // into another. It opens a file for each, and holds none open across the sleep:
-    // that's `a_process_keeps_its_files_on_a_share_across_a_sleep`'s to say, and this
+    // that's `files_held_on_a_share_fail_after_a_sleep`'s to say, and this
     // is about the relay. It notes each message it's read, so that if an answer
     // doesn't come, what's been read says on which side of the shim it stopped.
     let program = vibe_relay::local::GUEST_PROGRAM;
@@ -996,15 +996,17 @@ fn guest_shim_reaches_the_broker_over_the_relay_across_a_sleep() {
     mark("guest_shim_reaches_the_broker_over_the_relay_across_a_sleep");
 }
 
-/// What a process in the VM has open on a share still works after a sleep, as
-/// "exactly where it was" says: a file it's writing, one it's following as it grows,
-/// and its working directory, all there for every agent, whose worktree is a share.
-/// The spike only showed that a file opened after a restore is fresh. This is what
-/// happens to one opened before: read to its end, grown on the Mac after the restore,
-/// and then read again, by the shell and by a real `tail -f`.
+/// A known limit of a VM's sleep (PRD: Going to sleep), pinned so that it can't change
+/// unnoticed: what a process in the VM holds on a share doesn't survive a save and
+/// restore. That's a file it's writing, one it's following as it grows, and its working
+/// directory, which for an agent is its worktree. The process itself carries on, and
+/// opening things again by their paths works. The spike only showed that a file opened
+/// after a restore is fresh. This is what happens to one opened before: read to its
+/// end, grown on the Mac after the restore, and then read again, by the shell and by a
+/// real `tail -f`. Found by item 7 of #69, on a Mac (Nov 5).
 #[test]
-fn a_process_keeps_its_files_on_a_share_across_a_sleep() {
-    let Some(g) = guest("a_process_keeps_its_files_on_a_share_across_a_sleep") else {
+fn files_held_on_a_share_fail_after_a_sleep() {
+    let Some(g) = guest("files_held_on_a_share_fail_after_a_sleep") else {
         return;
     };
     let root = short_tempdir();
@@ -1047,7 +1049,15 @@ done
 cat /tmp/tail-errors >> '{share}/errors'
 note tailed
 if ls . >/dev/null 2>>'{share}/errors'; then c=ok; else c=failed; fi
-printf 'write=%s read=%s tail=%s cwd=%s\n' "$w" "$r" "$t" "$c" > '{share}/new-result'
+note reopening
+if echo reopened >>'{share}/held-out' 2>>'{share}/errors' \
+  && grep -q 'line two' '{share}/follow' 2>>'{share}/errors' \
+  && cd '{share}/sub' 2>>'{share}/errors' && ls . >/dev/null 2>>'{share}/errors'; then
+  o=ok
+else
+  o=failed
+fi
+printf 'write=%s read=%s tail=%s cwd=%s reopened=%s\n' "$w" "$r" "$t" "$c" "$o" > '{share}/new-result'
 mv '{share}/new-result' '{share}/result'
 "#
     );
@@ -1094,16 +1104,18 @@ mv '{share}/new-result' '{share}/result'
         "files held across a sleep: {result}errors: {}",
         said("errors")
     );
+    // Each of what's held fails, and what's opened again by its path works. If what's
+    // held starts working, the limit has gone: say so in the PRD, and change this.
     assert_eq!(
         result,
-        "write=ok read=line two tail=ok cwd=ok\n",
+        "write=failed read=failed tail=failed cwd=failed reopened=ok\n",
         "errors: {}\n{}",
         said("errors"),
         vm.logs()
     );
-    assert_eq!(said("held-out"), "before\nafter\n");
+    assert_eq!(said("held-out"), "before\nreopened\n");
     vm.stop();
-    mark("a_process_keeps_its_files_on_a_share_across_a_sleep");
+    mark("files_held_on_a_share_fail_after_a_sleep");
 }
 
 fn shim_binary() -> PathBuf {

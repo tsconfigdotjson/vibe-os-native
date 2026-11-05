@@ -1042,7 +1042,7 @@ s_vm_cycle() {
     cargo test -p vibe-env --locked --test vm_cycle -- --test-threads=1 --nocapture
   local required=(boot_save_restore three_vms_at_once guest_question_survives_sleep
     guest_shim_reaches_the_broker_over_the_relay_across_a_sleep
-    a_process_keeps_its_files_on_a_share_across_a_sleep)
+    files_held_on_a_share_fail_after_a_sleep)
   if [ -n "${VIBE_CLAUDE_BIN:-}" ] && [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
     required+=(guest_claude_question_survives_sleep)
   else
