@@ -1107,9 +1107,19 @@ fn fill(from: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
     Ok(got)
 }
 
+/// How far past what it has written an unpack keeps a file's end.
+const UNPACK_AHEAD: u64 = 64 << 20;
+
 /// Unpacks a gzip file with `gzip -dc`, writing only blocks that aren't all
 /// zeros, and then punching holes where the filesystem wrote zeros anyway,
 /// so an ext4 image stays as sparse as it was made.
+///
+/// How long it will be isn't known until gzip ends, but no write is ever the
+/// file's last block. An unpack that extended the file only as far as each write
+/// could end up holding whole MiBs on APFS, more often on a loaded machine, as if
+/// the block had been flushed at the file's end with room taken past it. Those
+/// blocks read as a hole and `F_PUNCHHOLE` doesn't free them, so nothing could give
+/// them back afterwards. An image built here is given its length before it's written.
 fn gunzip_sparse(src: &Path, dest: &Path) -> Result<()> {
     let out = OpenOptions::new()
         .read(true)
@@ -1135,7 +1145,7 @@ fn gunzip_sparse(src: &Path, dest: &Path) -> Result<()> {
     let mut buf = vec![0u8; ext4::BLOCK as usize];
     let mut at = 0u64;
     // How far the file reaches.
-    let mut written = 0u64;
+    let mut end = 0u64;
     let copied = (|| -> io::Result<()> {
         loop {
             let got = fill(&mut stdout, &mut buf)?;
@@ -1143,13 +1153,13 @@ fn gunzip_sparse(src: &Path, dest: &Path) -> Result<()> {
                 break;
             }
             if buf[..got].iter().any(|&b| b != 0) {
-                // The file reaches this far first, so the write leaves no
-                // gap behind it to fill.
-                if written < at {
-                    out.set_len(at)?;
+                // The file reaches past this first, so the write leaves no gap
+                // behind it to fill and isn't the file's last block.
+                if end <= at + got as u64 {
+                    end = at + got as u64 + UNPACK_AHEAD;
+                    out.set_len(end)?;
                 }
                 out.write_all_at(&buf[..got], at)?;
-                written = at + got as u64;
             }
             at += got as u64;
             if got < buf.len() {
@@ -1645,6 +1655,65 @@ mod tests {
         fs::write(tmp.path().join("bad.gz"), "not gzip").unwrap();
         assert!(gunzip_sparse(&tmp.path().join("bad.gz"), &tmp.path().join("bad")).is_err());
         assert!(!tmp.path().join("bad").exists());
+    }
+
+    /// As a real image is, with data all through it. On APFS this took whole MiBs more
+    /// in most runs, on an idle machine too, while a write could be a file's last block.
+    #[test]
+    fn an_image_with_data_all_through_it_stays_sparse() {
+        const SIZE: u64 = 256 << 20;
+        let tmp = tempfile::tempdir().unwrap();
+        let raw = tmp.path().join("raw");
+        let f = File::create(&raw).unwrap();
+        f.set_len(SIZE).unwrap();
+        for at in (4 << 20..SIZE).step_by(4 << 20) {
+            f.write_all_at(b"data", at).unwrap();
+        }
+        f.write_all_at(b"tail", SIZE - 4).unwrap();
+        drop(f);
+        let zipped = Command::new("gzip").arg("-k").arg(&raw).output().unwrap();
+        assert!(zipped.status.success(), "gzip -k: {zipped:?}");
+        let out = tmp.path().join("out");
+        gunzip_sparse(&tmp.path().join("raw.gz"), &out)
+            .unwrap_or_else(|e| panic!("{e}\n{}", about_the_disk(tmp.path())));
+        let taken = on_disk(&out);
+        assert!(
+            taken < 1 << 20,
+            "{taken} bytes on disk of a file with 256 KiB of data. {}",
+            why_not_sparse(&out, tmp.path())
+        );
+        // Its end is where the data ended, not where the unpack kept it ahead.
+        assert_eq!(fs::metadata(&out).unwrap().len(), SIZE);
+        let (mut a, mut b) = (File::open(&raw).unwrap(), File::open(&out).unwrap());
+        let (mut x, mut y) = (vec![0u8; 1 << 20], vec![0u8; 1 << 20]);
+        loop {
+            let got = fill(&mut a, &mut x).unwrap();
+            assert_eq!(fill(&mut b, &mut y).unwrap(), got);
+            assert!(x[..got] == y[..got], "the contents differ");
+            if got == 0 {
+                break;
+            }
+        }
+    }
+
+    /// An image that ends in zeros ends where the zeros do, and one of only zeros, or
+    /// shorter than the room an unpack keeps ahead, comes out the size it went in.
+    #[test]
+    fn an_unpack_ends_where_the_data_did() {
+        let tmp = tempfile::tempdir().unwrap();
+        let zeros = vec![0u8; 3 * ext4::BLOCK as usize];
+        let mut one = zeros.clone();
+        one[ext4::BLOCK as usize] = 1;
+        let short = b"short".to_vec();
+        for (i, bytes) in [one, zeros, short, Vec::new()].iter().enumerate() {
+            let raw = tmp.path().join(format!("raw{i}"));
+            fs::write(&raw, bytes).unwrap();
+            let zipped = Command::new("gzip").arg("-k").arg(&raw).output().unwrap();
+            assert!(zipped.status.success(), "gzip -k: {zipped:?}");
+            let out = tmp.path().join(format!("out{i}"));
+            gunzip_sparse(&tmp.path().join(format!("raw{i}.gz")), &out).unwrap();
+            assert!(fs::read(&out).unwrap() == *bytes, "image {i} differs");
+        }
     }
 
     fn on_disk(path: &Path) -> u64 {

@@ -10,6 +10,11 @@
 //! file first, as APFS writes those zeros out only then. Reads of a hole
 //! return zeros, so the file's contents don't change.
 //!
+//! What it can't give back: blocks APFS can hold in a file that was extended as it
+//! was written, a write at a time. They count in `st_blocks` but read as a hole, and
+//! `F_PUNCHHOLE` returns success without freeing them. So an image's end stays past
+//! what's being written to it.
+//!
 //! [`clone_file`] makes a new image from an old one without copying it: an
 //! APFS clone on a Mac (`clonefile`), a reflink where Linux has one, and
 //! otherwise a copy of only the parts on disk.
