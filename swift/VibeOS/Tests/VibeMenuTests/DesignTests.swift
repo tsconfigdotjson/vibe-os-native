@@ -687,6 +687,9 @@ typealias StepStatus = SetupProgress.Step.Status
         let waiting = SetupProgress(hasProject: false, hasKey: false, doctor: fresh)
         let ghGitStep: SetupProgress.Step? = SetupTests.step(waiting, StepID.check(CheckId.ghGit))
         #expect(ghGitStep == nil)
+        // Nor is lingering: it's a Linux host's, and the welcome is about the Mac.
+        let lingerStep: SetupProgress.Step? = SetupTests.step(waiting, StepID.check(CheckId.linger))
+        #expect(lingerStep == nil)
         #expect(fresh.last?.id == CheckId.pi)
         #expect(fresh.last?.state == CheckState.optional)
         // What Settings shows of Pi agrees with the doctor, either way.
