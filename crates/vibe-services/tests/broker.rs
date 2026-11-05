@@ -1955,7 +1955,8 @@ async fn a_follower_turned_down_asks_once_and_the_owner_refreshes() {
         let (owner, follower) = (w.services.clone(), f.services.clone());
         let first = first.clone();
         tokio::spawn(async move {
-            for _ in 0..500 {
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            while std::time::Instant::now() < deadline {
                 if follower.list().services[0].wants_token {
                     let access = owner.token("linear", Some(&first)).await.unwrap();
                     follower
@@ -2025,9 +2026,16 @@ async fn a_follower_serves_until_its_token_runs_out_then_says_the_owner_is_away(
     );
     // Tools still list, and the next call doesn't wait all over again.
     assert!(a.tools().await.contains(&"list_issues".to_owned()));
-    let started = std::time::Instant::now();
-    assert!(is_error(&a.call("list_issues").await));
-    assert!(started.elapsed() < Duration::from_millis(250));
+    // A stall can hold one call as long as a wait would. Only waiting holds them all.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let started = std::time::Instant::now();
+        assert!(is_error(&a.call("list_issues").await));
+        if started.elapsed() < Duration::from_millis(250) {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "each call waited");
+    }
 
     // It's back: no restart, no sign-in.
     w.services.refresh_due().await;

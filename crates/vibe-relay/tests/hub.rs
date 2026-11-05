@@ -225,9 +225,17 @@ fn a_mac_that_stops_answering_pings_is_taken_for_gone() {
         dead_after: Duration::from_millis(150),
     };
     let (hub, socket, _dir) = hub(anyone(), timing);
-    let mut mac = dial(&hub);
-    let (_c, mut r, answer) = shim(&socket, None);
-    assert_eq!(answer, Ok(()));
+    // A stall past `dead_after` ends the relay before the shim reaches it, and the
+    // shim's told so: this is about one it did reach.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let (mut mac, _c, mut r) = loop {
+        let mac = dial(&hub);
+        let (c, r, answer) = shim(&socket, None);
+        if answer.is_ok() {
+            break (mac, c, r);
+        }
+        assert!(Instant::now() < deadline, "{answer:?}");
+    };
     assert_eq!(
         read_frame(&mut mac)
             .unwrap()

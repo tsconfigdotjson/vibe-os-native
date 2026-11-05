@@ -1325,8 +1325,8 @@ struct Pair {
     _dir: tempfile::TempDir,
 }
 
-/// A Mac and a host, with the Mac's calls waiting as long as a token that's
-/// coming could take: they go on the moment it lands.
+/// A Mac and a host, with the Mac's calls in no hurry for a token that's coming:
+/// they go on the moment it lands.
 async fn pair(fake: &FakeService) -> Pair {
     pair_waiting(fake, Duration::from_secs(60)).await
 }

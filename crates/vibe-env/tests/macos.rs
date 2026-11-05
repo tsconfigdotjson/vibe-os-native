@@ -645,27 +645,27 @@ fn cpu_is_held_to_its_cap() {
         }
         let cores = (cpu(&a) - before) as f64 / t.elapsed().as_millis() as f64;
         let under = cores < 1.35;
-        let since = if under {
-            *under_since.get_or_insert(t)
-        } else {
-            t
-        };
         if !under {
             under_since = None;
+        } else if under_since.is_none() {
+            under_since = Some(t);
         }
+        let duty = h.backend.duty(&a.handle);
         // A stop this short may fall between two looks.
-        let cycling = h.backend.duty(&a.handle) < 0.9;
+        let cycling = duty < 0.9;
         let settled = if cycled {
             applied.elapsed() >= Duration::from_secs(7)
         } else {
-            since.elapsed() >= Duration::from_secs(20)
+            under_since.is_some_and(|t| t.elapsed() >= Duration::from_secs(20))
         };
-        if under && settled && (!cycling || seen_stopped) {
+        // Two spinners held to one core want a duty near a half: much less is
+        // holding it to far less than its cap, whatever the machine is doing.
+        if under && settled && (!cycling || seen_stopped) && duty > 0.2 {
             break cores;
         }
         assert!(
             applied.elapsed() < Duration::from_secs(120),
-            "{cores:.2} cores against a cap of 1, cycling {cycling}, seen stopped {seen_stopped}"
+            "{cores:.2} cores against a cap of 1, duty {duty:.2}, seen stopped {seen_stopped}"
         );
     };
     eprintln!(
