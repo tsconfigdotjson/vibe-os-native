@@ -115,7 +115,10 @@ struct ServicesTests {
         // The base that has them isn't down yet: a rebuild would change nothing.
         #expect(!servicesNeedRebuild(try toolbox(#""base":2,"newest_base":2"#)))
         let old = try toolbox(#""template":1,"home":1,"base":2,"newest_base":3"#)
-        #expect(ToolboxSummary(old).notes.contains { $0.contains("no shared services") })
+        let notes = ToolboxSummary(old).notes
+        #expect(notes.contains { $0.contains("no shared services") })
+        // Plain words for the base image, in the notes too.
+        #expect(!notes.contains { $0.lowercased().contains("base") })
     }
 
     @Test func aProfileHasThemOnUnlessItSaysOtherwise() throws {

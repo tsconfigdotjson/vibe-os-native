@@ -25,7 +25,6 @@ struct AgentsPane: View {
             if let status {
                 nativeSection(status)
                 if let vms = status.vms { vmSection(vms) }
-                signInNote
             } else if error == nil {
                 ProgressView().frame(maxWidth: .infinity)
             }
@@ -77,13 +76,6 @@ struct AgentsPane: View {
             }
         } header: {
             Text(local ? "macOS agents" : "Agents on \(host)")
-        } footer: {
-            Text(
-                local
-                    ? "macOS agents use your own Pi and your own agent directory, as they do your own Claude."
-                    : "Agents on this server use its own Pi and its own ~/.pi/agent."
-            )
-            .foregroundStyle(.secondary)
         }
     }
 
@@ -143,12 +135,6 @@ struct AgentsPane: View {
             }
         } header: {
             Text("Linux agents")
-        } footer: {
-            Text(
-                "Sign in once, here. Within seconds every Linux Pi agent has that login, each VM holding its own "
-                    + "copy. Settings and extensions for them live in ~/VibeOS/linux-pi on this Mac."
-            )
-            .foregroundStyle(.secondary)
         }
     }
 
@@ -159,19 +145,6 @@ struct AgentsPane: View {
             } else {
                 Text(logins.joined(separator: ", ")).textSelection(.enabled)
             }
-        }
-    }
-
-    private var signInNote: some View {
-        Section {
-            Text(
-                "Pi's login is your own: a subscription or an API key, with whichever provider you choose. Pi "
-                    + "itself signs in, and its choices are the ones it offers in /login. Your Claude sign-in never reaches Pi, nor does a key in VibeOS's environment. A "
-                    + "key you do want Pi to use goes in ~/.config/vibeos/pi.env. A login to the same provider "
-                    + "takes the place of that key."
-            )
-            .foregroundStyle(.secondary)
-            .fixedSize(horizontal: false, vertical: true)
         }
     }
 

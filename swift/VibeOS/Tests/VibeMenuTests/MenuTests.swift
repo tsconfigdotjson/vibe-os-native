@@ -132,7 +132,7 @@ import VibeRPC
                         ["tool": "git", "account": "Octo Cat <octo@example.com>"],
                     ],
                 ] as [String: Any]))
-        #expect(known.headline == "New Linux agents start with these, from Linux home 2.")
+        #expect(known.headline == "New Linux agents start with these.")
         #expect(known.rows.map(\.tool) == ["GitHub (gh)", "Git identity"])
         #expect(known.rows.map(\.account) == ["octocat on github.com", "Octo Cat <octo@example.com>"])
         #expect(known.rows.map(\.symbol) == ["chevron.left.forwardslash.chevron.right", "person.text.rectangle"])
@@ -140,7 +140,7 @@ import VibeRPC
         #expect(known.signInHint == nil)
 
         let empty = LoginsSummary(try decode(ToolboxLogins.self, ["home": 2, "logins": [Any](), "claude": false] as [String: Any]))
-        #expect(empty.headline == "No logins in Linux home 2 yet.")
+        #expect(empty.headline == "No GitHub or other tool logins saved yet.")
         #expect(empty.rows.isEmpty)
         // Not signed in: a hint, no walk-through.
         #expect(empty.signInHint == "Linux agents aren't signed in yet.")
@@ -149,11 +149,12 @@ import VibeRPC
                 ToolboxLogins.self,
                 ["home": 3, "claude": false, "claude_problem": "can't read the Claude login for linux agents: locked"]
                     as [String: Any]))
-        #expect(unknown.headline.contains("couldn't tell which logins Linux home 3 holds"))
+        #expect(unknown.headline.contains("couldn't tell which logins are saved"))
         // vibed's clause, as a sentence.
         #expect(unknown.signInHint == "Can't read the Claude login for linux agents: locked")
         let none = LoginsSummary(try decode(ToolboxLogins.self, ["logins": [Any](), "claude": true] as [String: Any]))
-        #expect(none.headline.hasPrefix("No Linux home yet."))
+        // Claude's login isn't among these, so this must not say nothing's saved.
+        #expect(none.headline.hasPrefix("No GitHub or other tool logins saved yet."))
         #expect(LoginTool.allCases.map(toolName) == ["GitHub (gh)", "Google Cloud", "Git identity", "SSH key"])
     }
 
@@ -172,8 +173,12 @@ import VibeRPC
         // Closed says closed: only an open shell says to exit it (#46).
         #expect(summary.state == "Closed")
         #expect(!summary.working && !summary.closable)
-        #expect(summary.versions == "Template v3 · Linux home v2 · Base 1")
-        #expect(summary.notes == ["Base 2 is installed. VibeOS moves the template to it by itself.", "Not in toolbox.toml: apt: htop"])
+        #expect(summary.versions == "Tools v3 · Logins & settings v2 · Linux v1")
+        #expect(
+            summary.notes == [
+                "A newer Linux is ready. VibeOS updates new agents to it by itself.",
+                "Left behind, as your install recipe doesn't cover them: apt: htop",
+            ])
         status.state = .open
         status.newestBase = 1
         status.last?.error = "installing gcloud exited with code 3"
@@ -181,15 +186,15 @@ import VibeRPC
         // Not counted (a boot, a slow shim, an older vibed): as before.
         #expect(summary.state == "Open: exit the shell to save")
         #expect(summary.closable)
-        #expect(summary.notes == ["The last rebuild failed: installing gcloud exited with code 3"])
+        #expect(summary.notes == ["The last Linux update failed: installing gcloud exited with code 3"])
         // Open with no Terminal attached says so, not just "Open" (#54).
         status.clients = 0
         summary = ToolboxSummary(status)
-        #expect(summary.state == "Open in the background, no Terminal attached")
+        #expect(summary.state == "Open in the background, with no Terminal window")
         #expect(summary.closable)
         status.clients = 2
         summary = ToolboxSummary(status)
-        #expect(summary.state == "Attached in Terminal")
+        #expect(summary.state == "Open in Terminal")
         #expect(summary.closable)
         status.state = .saving
         #expect(ToolboxSummary(status).state == "Saving…")
@@ -242,6 +247,23 @@ import VibeRPC
         #expect(
             keysPending(on: ["a", "b"])
                 == "Key changes are pending on a, b. A key revoked here still works there until they're next reachable.")
+    }
+
+    @Test func theKeysWarningSaysWhatAKeyReaches() {
+        let alone = keysWarning(linuxHosts: false, externalHost: nil)
+        #expect(alone.contains("do whatever you can do on this Mac."))
+        #expect(!alone.contains("internet"))
+        #expect(alone.contains("revoke it and it stops working at once."))
+        let hosts = keysWarning(linuxHosts: true, externalHost: nil)
+        #expect(hosts.contains("on this Mac and your Linux hosts."))
+        // A revoke doesn't reach a host that's away, so this can't say it does.
+        #expect(hosts.contains("a Linux host that's away goes on accepting it"))
+        #expect(
+            keysWarning(linuxHosts: true, externalHost: "vps")
+                .contains("Because vps has a public address, a key works from anywhere on the internet."))
+        // vibed's socket takes no key, and only this login can reach it.
+        #expect(alone.contains("already using your Mac login can control VibeOS without a key"))
+        #expect(!alone.contains("anyone on this Mac"))
     }
 
     @Test func aKeySaysWhenItWasLastUsed() {
@@ -696,7 +718,7 @@ import VibeRPC
         }
         let model = makeModel(daemon)
         await model.refresh()
-        #expect(ToolboxSummary(model.toolbox).state == "Open in the background, no Terminal attached")
+        #expect(ToolboxSummary(model.toolbox).state == "Open in the background, with no Terminal window")
         #expect(model.toolboxCanOpen)
         await model.closeToolbox()
         #expect(model.toolbox?.state == .closed)

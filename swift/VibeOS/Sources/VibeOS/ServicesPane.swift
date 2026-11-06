@@ -28,9 +28,8 @@ struct ServicesPane: View {
             if servicesNeedRebuild(model.toolbox) {
                 Section {
                     Label(
-                        "Linux agents on this Mac have no shared services yet: the Linux template is on an older "
-                            + "base image, and they need base \(VibeRPC.sharedServicesBase). Settings → Linux Toolbox "
-                            + "says how its move there is going. macOS agents have them now.",
+                        "Linux agents on this Mac have no shared services until their Linux is updated. "
+                            + "Settings → Linux Toolbox says how that's going. macOS agents have them now.",
                         systemImage: "exclamationmark.triangle"
                     )
                     .foregroundStyle(Palette.attention)
@@ -46,9 +45,16 @@ struct ServicesPane: View {
                             changed: { await load() })
                     }
                 } header: {
-                    Text(service.title)
+                    HStack(spacing: 6) {
+                        if service.name == "linear" {
+                            LinearLogo()
+                                .frame(width: 14, height: 14)
+                                .accessibilityHidden(true)
+                        }
+                        Text(service.title)
+                    }
                 } footer: {
-                    Text(footer(service)).foregroundStyle(.secondary)
+                    Text(warning(service)).foregroundStyle(.secondary)
                 }
             }
         }
@@ -65,12 +71,9 @@ struct ServicesPane: View {
         }
     }
 
-    private func footer(_ service: ServiceOverview) -> String {
-        "Every agent can use \(service.title), unless its profile has shared services off. There's one login, on the "
-            + "host that owns it, and only that host can renew it. Other hosts use a short-lived access token it gives "
-            + "them by way of this Mac, so with this Mac away they go on until theirs runs out. Calls that write go "
-            + "through each agent's own permission prompts, and any agent in bypass mode, or that doesn't prompt, can "
-            + "act in \(service.title) as you."
+    private func warning(_ service: ServiceOverview) -> String {
+        "Agents can use \(service.title) by default. Those that don't ask for permission, such as agents in Bypass "
+            + "mode, can act in \(service.title) as you."
     }
 
     private func load() async {
@@ -80,6 +83,55 @@ struct ServicesPane: View {
         } catch {
             failure = describe(error)
         }
+    }
+}
+
+/// Linear's logomark, unaltered, to say which service this is. The path is
+/// logo-light.svg's, from Linear-Brand-Assets.zip on https://linear.app/brand
+/// (viewBox 0 0 100 100). It takes the foreground colour, as Linear prefers it
+/// monochrome.
+private struct LinearLogo: Shape {
+    func path(in rect: CGRect) -> Path {
+        let scale = min(rect.width, rect.height) / 100
+        func at(_ x: CGFloat, _ y: CGFloat) -> CGPoint {
+            CGPoint(x: rect.minX + x * scale, y: rect.minY + y * scale)
+        }
+        var p = Path()
+        p.move(to: at(1.2254, 61.5228))
+        p.addCurve(to: at(2.8218, 60.6658), control1: at(1.0029, 60.5743), control2: at(2.1329, 59.9769))
+        p.addLine(to: at(39.3342, 97.1782))
+        p.addCurve(to: at(38.4772, 98.7746), control1: at(40.0231, 97.8671), control2: at(39.4257, 98.9971))
+        p.addCurve(to: at(1.2254, 61.5228), control1: at(20.0515, 94.4522), control2: at(5.5478, 79.9485))
+        p.closeSubpath()
+        p.move(to: at(0.0019, 46.8891))
+        p.addCurve(to: at(0.2915, 47.6497), control1: at(-0.0158, 47.1724), control2: at(0.0908, 47.449))
+        p.addLine(to: at(52.3503, 99.7085))
+        p.addCurve(to: at(53.1109, 99.9981), control1: at(52.551, 99.9092), control2: at(52.8276, 100.016))
+        p.addCurve(to: at(60.0733, 99.0722), control1: at(55.4801, 99.8505), control2: at(57.8047, 99.5381))
+        p.addCurve(to: at(60.5515, 97.4241), control1: at(60.8378, 98.9152), control2: at(61.1034, 97.9759))
+        p.addLine(to: at(2.576, 39.4485))
+        p.addCurve(to: at(0.9278, 39.9267), control1: at(2.0241, 38.8966), control2: at(1.0848, 39.1622))
+        p.addCurve(to: at(0.0019, 46.8891), control1: at(0.4619, 42.1953), control2: at(0.1495, 44.5199))
+        p.closeSubpath()
+        p.move(to: at(4.2109, 29.7054))
+        p.addCurve(to: at(4.4186, 30.8054), control1: at(4.0444, 30.0792), control2: at(4.1292, 30.516))
+        p.addLine(to: at(69.1946, 95.5814))
+        p.addCurve(to: at(70.2946, 95.7891), control1: at(69.484, 95.8708), control2: at(69.9208, 95.9556))
+        p.addCurve(to: at(75.4801, 93.1051), control1: at(72.0807, 94.9935), control2: at(73.8117, 94.0964))
+        p.addCurve(to: at(75.6633, 91.5644), control1: at(76.0322, 92.7771), control2: at(76.1174, 92.0184))
+        p.addLine(to: at(8.4357, 24.3367))
+        p.addCurve(to: at(6.8949, 24.5199), control1: at(7.9816, 23.8826), control2: at(7.223, 23.9678))
+        p.addCurve(to: at(4.2109, 29.7054), control1: at(5.9036, 26.1883), control2: at(5.0065, 27.9193))
+        p.closeSubpath()
+        p.move(to: at(12.6587, 18.074))
+        p.addCurve(to: at(12.6144, 16.7199), control1: at(12.2886, 17.7039), control2: at(12.2657, 17.1103))
+        p.addCurve(to: at(49.9519, 0), control1: at(21.7795, 6.4593), control2: at(35.1114, 0))
+        p.addCurve(to: at(100, 50.0481), control1: at(77.5927, 0), control2: at(100, 22.4073))
+        p.addCurve(to: at(83.2801, 87.3856), control1: at(100, 64.8886), control2: at(93.5407, 78.2205))
+        p.addCurve(to: at(81.9259, 87.3413), control1: at(82.8898, 87.7343), control2: at(82.2961, 87.7114))
+        p.addLine(to: at(12.6587, 18.074))
+        p.closeSubpath()
+        return p
     }
 }
 
