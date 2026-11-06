@@ -148,7 +148,7 @@ fn rpc_bridges_the_whole_contract() {
         // And an agent call on a link is said to be taken before it's answered.
         if said_link
             && let Some(frame) = vibe_core::rpc::accepted_frame(&line, |method| {
-                vibe_core::rpc::ACCEPTED_METHODS.contains(&method)
+                vibe_core::rpc::TUNNEL_METHODS.contains(&method)
             })
         {
             let frame: Value = serde_json::from_str(&frame).unwrap();

@@ -102,6 +102,12 @@ pub struct Config {
     /// Where MCP can be served on Tailscale: this machine's addresses in
     /// its ranges, by default.
     pub tailscale: TailscaleAddresses,
+    /// Whether a Mac's tunnel can end here: on a Linux host, and a stand-in for one in
+    /// tests. [`Config::new`] says which by its OS. Nothing is served for it but the
+    /// private socket sshd makes.
+    pub serves_mac_peer: bool,
+    /// How often the tunnel's end is looked at for a Mac.
+    pub mac_probe_every: Duration,
     /// How Linux hosts are reached: over SSH, by default.
     pub remote: Arc<dyn Remote>,
     /// How their links are timed.
@@ -178,6 +184,8 @@ impl Config {
             pressure: Arc::new(crate::pressure::HostPressure),
             toolbox: None,
             tailscale: Arc::new(vibe_mcp::net::tailscale_addresses),
+            serves_mac_peer: info.os == "linux",
+            mac_probe_every: Duration::from_secs(5),
             remote: Arc::new(Ssh::new().sharing_in(run_dir)),
             link_timing: Timing::default(),
             power: Arc::new(crate::power::HostPower::default()),
@@ -507,6 +515,14 @@ pub struct Core {
     /// The runtime those tasks run on, as a call may come from a thread
     /// outside it.
     pub(crate) runtime: OnceLock<tokio::runtime::Handle>,
+    /// On a Linux host, whether a Mac's tunnel can end here.
+    pub(crate) serves_mac_peer: bool,
+    pub(crate) mac_probe_every: Duration,
+    pub(crate) mac_probe: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// On a Linux host, the Mac behind it, at the tunnel's end.
+    pub(crate) peer: crate::mac_peer::MacPeer,
+    /// On a Mac, the tunnel to each Linux host linked to it.
+    pub(crate) tunnels: Mutex<HashMap<String, crate::tunnel::Tunnel>>,
     _state_lock: StateLock,
 }
 
@@ -611,6 +627,7 @@ impl Core {
                 }),
             )
         });
+        let tunnel_end = config.layout.run_dir().join(crate::mac_peer::TUNNEL_END);
         let core = Core {
             info: config.info,
             label: config.label,
@@ -685,6 +702,11 @@ impl Core {
             adding_hosts: Mutex::new(HashSet::new()),
             me: OnceLock::new(),
             runtime: OnceLock::new(),
+            serves_mac_peer: config.serves_mac_peer,
+            mac_probe_every: config.mac_probe_every,
+            mac_probe: Mutex::new(None),
+            peer: crate::mac_peer::MacPeer::new(tunnel_end),
+            tunnels: Mutex::new(HashMap::new()),
             _state_lock: state_lock,
         };
         core.load_pressure_pauses();

@@ -56,14 +56,17 @@
 #     Mac's MCP shows in the Mac's listing with its ssh attach line, the
 #     Mac's API key is pushed to the host, whose own MCP serves it with that
 #     key, and a pulled network shows the host down and its agent
-#     unavailable until it reconnects on its own. Then the host alone (#143):
-#     with no Tailscale asked for, a client on the host with curl and a key
-#     starts an agent there and talks to it on loopback, gets 401 without a key,
-#     and nothing listens beyond loopback on the host or the Mac. With the Mac
-#     stopped, every tool for the host's own agents answers in under 5 s and the
-#     line to attach over SSH is still given. (crates/vibed/tests/mcp.rs, in the
-#     test step, covers a Linux host's Tailscale setting from host.toml, as far as
-#     no tailnet can; crates/vibed/tests/hosts.rs what External Address left.)
+#     unavailable until it reconnects on its own. Then the one MCP (#143): with no
+#     Tailscale asked for, a client on the host with curl and a key starts agents on the
+#     host and on the Mac and talks to both, reached by `ssh -R` (a stand-in relay), gets
+#     401 without a key, and nothing listens beyond loopback on the host or the Mac. With
+#     the relay stopped as with a Mac asleep, and then the Mac stopped, every tool for the
+#     host's own agents answers in under 5 s and the Mac's show unavailable; when it
+#     resumes the listing merges back. (crates/vibed/tests/mac_peer.rs, in the test step,
+#     covers the same in one process, plus another host reached through the Mac, the Mac
+#     refusing a host's own key and a revoked one even before the host hears, and the
+#     tunnel's supervision; crates/vibed/tests/mcp.rs a Linux host's Tailscale setting;
+#     crates/vibed/tests/hosts.rs what External Address left.)
 #   - a real Linux server, when VIBE_TEST_LINUX_HOST is an SSH destination
 #     that logs in with a key (N/A otherwise): the Linux builds of vibed
 #     (scripts/host-bundle.sh, which fetches zig and cargo-zigbuild on first
@@ -726,8 +729,10 @@ s_mcp() {
   wait "$bridge" || { echo "vibe mcp exited with $?"; cat "$WORK/mc-bridge.err"; return 1; }
   [ ! -e "$home/VibeOS/worktrees/app/mcp-check" ] || { echo "the worktree is left"; return 1; }
   git -C "$repo" rev-parse --verify --quiet refs/heads/mcp-check >/dev/null || { echo "the branch went"; return 1; }
-  # Nothing listens beyond loopback.
-  local listening
+  # With no host linked, no tunnel's socket is there at all, and nothing listens beyond
+  # loopback.
+  local tunnels="$home/Library/Application Support/VibeOS/run/t" listening
+  [ -z "$(ls -A "$tunnels" 2>/dev/null)" ] || { echo "$tunnels isn't empty with no host linked"; return 1; }
   if [ "$OS" = Darwin ] && ! command -v lsof >/dev/null; then
     echo "no lsof to see what vibed listens on"
     return 1
@@ -1423,7 +1428,7 @@ PY
 }
 
 s_linux_host() {
-  cargo test -p vibe-cli --test linux_host --locked -- a_linux_host an_unreachable --test-threads=1
+  cargo test -p vibe-cli --test linux_host --locked -- a_linux_host an_unreachable a_test_leaves_no_relay --test-threads=1
 }
 
 s_real_host() {

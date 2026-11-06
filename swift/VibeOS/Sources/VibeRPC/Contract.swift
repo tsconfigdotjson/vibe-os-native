@@ -30,6 +30,7 @@ public enum VibeRPC {
         SignInAnswer.name,
         SignInCancel.name,
         HostsRemove.name,
+        TunnelPrepare.name,
         ProjectsList.name,
         ProjectsAdd.name,
         ProjectsRemove.name,
@@ -595,6 +596,17 @@ public enum CheckId: String, Codable, CaseIterable, Hashable, Sendable {
     case power, linger, tailscale, linux, pi
 }
 
+/// The Mac's tunnel to a Linux host, for that host's MCP to reach it: on the Mac, the
+/// tunnel it keeps; in that host's own row, whether a Mac answers through it.
+public enum TunnelState: String, Codable, CaseIterable, Hashable, Sendable {
+    /// ssh is starting, or the host hasn't come through it yet.
+    case connecting
+    /// The host reaches the Mac through it.
+    case up
+    /// It isn't up; `tunnelDetail` says why. It's tried again.
+    case down
+}
+
 /// What a Linux host needs someone with sudo there to allow, once, as VibeOS
 /// tried every way it has without a password: `linger`, vibed staying up while
 /// the owner's logged out; `git`, which agents can't do without.
@@ -698,6 +710,14 @@ public enum HostsRemove: RPCMethod {
     public typealias Params = HostRemoveParams
     public typealias Result = HostInfo
     public static let name = "hosts.remove"
+}
+
+/// `tunnel.prepare`: on a Linux host, where the Mac's tunnel ends. Only
+/// vibed calls it, over the link.
+public enum TunnelPrepare: RPCMethod {
+    public typealias Params = NoParams
+    public typealias Result = TunnelPrepared
+    public static let name = "tunnel.prepare"
 }
 
 /// `projects.list`: a host's projects, with their profiles.
@@ -1095,6 +1115,10 @@ public struct HostInfo: Codable, Hashable, Sendable {
     public var missing: [String]
     /// For a host whose link is down, why.
     public var detail: String?
+    /// The Mac's tunnel to it, for its MCP to reach this Mac.
+    public var tunnel: TunnelState?
+    /// Why the tunnel isn't up, or what it waits for, and how to fix it.
+    public var tunnelDetail: String?
     /// What its memory is doing now: this host's own, and a Linux host's
     /// from its last ping while its link is up.
     public var memory: MemoryUse?
@@ -1112,7 +1136,8 @@ public struct HostInfo: Codable, Hashable, Sendable {
     public var upgradeHeld: Bool?
 
     public enum CodingKeys: String, CodingKey, CaseIterable {
-        case name, os, label, link, external, mcp, address, version, missing, detail
+        case name, os, label, link, external, mcp, address, version, missing, detail, tunnel
+        case tunnelDetail = "tunnel_detail"
         case memory
         case needsAdmin = "needs_admin"
         case signIns = "sign_ins"
@@ -1179,6 +1204,16 @@ public struct HostNameParams: Codable, Hashable, Sendable {
 
     public enum CodingKeys: String, CodingKey, CaseIterable {
         case host
+    }
+}
+
+/// Where the Mac's tunnel ends on a Linux host.
+public struct TunnelPrepared: Codable, Hashable, Sendable {
+    /// The socket's absolute path on the host.
+    public var socket: String
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case socket
     }
 }
 

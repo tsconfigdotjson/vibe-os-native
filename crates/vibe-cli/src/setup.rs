@@ -457,6 +457,12 @@ pub(crate) fn describe_host(h: &HostInfo) -> String {
     if !h.needs_admin.is_empty() {
         out.push_str("  needs sudo there once: Settings → Hosts has the button");
     }
+    if let Some(t) = h.tunnel {
+        out.push_str(&format!("  tunnel {t}"));
+        if let Some(why) = &h.tunnel_detail {
+            out.push_str(&format!(": {why}"));
+        }
+    }
     if let Some(why) = &h.upgrade_error {
         if h.upgrade_held {
             out.push_str(&format!("  not updated: {why}"));
@@ -890,6 +896,8 @@ mod tests {
             version: Some("0.1.0".into()),
             missing: vec!["claude".into()],
             detail: Some("it stopped answering".into()),
+            tunnel: None,
+            tunnel_detail: None,
             memory: None,
             needs_admin: vec![],
             upgrade_error: None,

@@ -149,8 +149,8 @@ async fn read_frame(stream: &mut UnixStream) -> io::Result<Frame> {
 /// The refs that have a shim's socket in `run/`, sorted: every `<ref>.sock`
 /// with its lock beside it, as every shim binds it, but `vibed`'s own.
 ///
-/// A socket with no lock was never a shim's: sshd makes `mac.sock` for an older
-/// Mac's `ssh -R` and leaves none, so it's not taken for a dead session and removed
+/// A socket with no lock was never a shim's: sshd makes a Linux host's tunnel end,
+/// `mac.sock`, and leaves none, so it's not taken for a dead session and removed
 /// (issue #45). The ones that do have one, `vibed.sock` and the `tunnel.sock` an older
 /// Mac's `vibed` left, are skipped by name, as any of
 /// [`vibe_core::model::RESERVED_REFS`] is, unless `is_agent` says an agent has that
@@ -206,7 +206,7 @@ pub fn read_record(layout: &Layout, agent_ref: &str) -> Option<Record> {
 /// one holds the socket's lock for its whole life. A socket with no lock
 /// beside it was never a shim's (every shim binds through
 /// [`vibe_core::socket::bind`], which leaves one), so it's kept: sshd's end
-/// of an older Mac's `ssh -R` is such a one (issue #45). Returns whether it removed it.
+/// of a tunnel is such a one (issue #45). Returns whether it removed it.
 pub fn remove_stale(socket_path: &Path) -> io::Result<bool> {
     let lock_path = socket::lock_path(socket_path);
     let lock = match OpenOptions::new().write(true).open(&lock_path) {

@@ -30,8 +30,10 @@ pub use tools::{MAX_RESULT_CHARS, MAX_WAIT_SECS, Server, clip};
 /// The path MCP is served at.
 pub const PATH: &str = "/mcp";
 
-/// Who's calling: the name of the API key the request carried, and the key. It
-/// never reaches a log: its `Debug` shows the key's first characters only.
+/// Who's calling: the name of the API key the request carried, and the key.
+/// A call for an agent on the Mac carries the key down the tunnel, so the
+/// Mac checks it itself (keys are checked where the agent lives). It never reaches a log: its `Debug` shows the key's
+/// first characters only.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Caller {
     name: String,
@@ -140,6 +142,8 @@ pub struct AgentView {
     /// False while its host's link is down: it's the agent as its host
     /// last listed it, and calls for it fail until the link is back.
     pub available: bool,
+    /// When it was last seen, if it's unavailable and that's known.
+    pub last_seen: Option<String>,
 }
 
 /// A message of an agent's conversation.
@@ -164,7 +168,9 @@ pub fn check_request_id(id: &str) -> Result<(), String> {
 
 /// What the MCP server needs from `vibed`: the core handlers, by host.
 /// Hosts other than `local` are Linux hosts this one is linked to, reached
-/// over their links. Each call has its [`Caller`].
+/// over their links, or, on a Linux host, the Mac behind it (`mac`) and the other
+/// hosts linked to that Mac, reached down its tunnel. Each call has its
+/// [`Caller`], whose key a host checks again where an agent lives.
 pub trait Daemon: Send + Sync + 'static {
     /// Writes a line to the daemon's log.
     fn log(&self, line: &str) {
@@ -197,11 +203,12 @@ pub trait Daemon: Send + Sync + 'static {
         std::time::Duration::from_secs(vibe_core::limits::PEER_READ)
     }
 
-    /// Every host this one can reach now, itself (`local`) first.
-    fn hosts(&self) -> impl Future<Output = Result<Vec<String>, Error>> + Send;
+    /// Every host `c` can reach from here now, this one (`local`) first.
+    fn hosts(&self, c: &Caller) -> impl Future<Output = Result<Vec<String>, Error>> + Send;
 
     /// Each host's memory as its kernel measures it, where it's known
-    /// (`HostInfo.memory`), by host: every host [`Daemon::hosts`] names.
+    /// (`HostInfo.memory`), by host: every host [`Daemon::hosts`] names,
+    /// the Mac behind this one included, as `c` may see it.
     fn memory(
         &self,
         _c: &Caller,

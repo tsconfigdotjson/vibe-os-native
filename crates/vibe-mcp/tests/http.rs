@@ -163,7 +163,7 @@ impl Daemon for Fake {
             .unwrap_or_default()
     }
 
-    async fn hosts(&self) -> Result<Vec<String>, ErrorObject> {
+    async fn hosts(&self, _c: &Caller) -> Result<Vec<String>, ErrorObject> {
         let mut hosts = vec!["local".to_owned(), "vps".to_owned(), "down".to_owned()];
         if self.third_host.load(Ordering::SeqCst) {
             hosts.push("vps2".to_owned());
@@ -221,6 +221,7 @@ impl Daemon for Fake {
             .map(|a| AgentView {
                 attach_remote: format!("ssh -t mac {}", a.attach),
                 available: true,
+                last_seen: None,
                 agent: a,
             })
             .collect())

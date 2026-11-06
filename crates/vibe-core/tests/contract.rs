@@ -12,7 +12,7 @@ use vibe_core::model::{
     Activity, AdminNeed, AgentKind, AgentState, Certainty, CheckId, CheckState, Environment,
     EventKind, GhState, HostLink, LoginTool, MessageRole, Mode, Model, PiLoginMethod, PiLoginState,
     PiPromptKind, PiTarget, ProjectSource, Reasoning, ServiceRole, ServiceState, SessionState,
-    SignInState, SignInWhat, StopReason, ToolboxAction, ToolboxState, WakeupKind,
+    SignInState, SignInWhat, StopReason, ToolboxAction, ToolboxState, TunnelState, WakeupKind,
 };
 use vibe_core::paths;
 use vibe_core::rpc::*;
@@ -164,6 +164,7 @@ fn rust_types() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
         entry::<HostAddParams>(),
         entry::<HostNameParams>(),
         entry::<HostRemoveParams>(),
+        entry::<TunnelPrepared>(),
         entry::<HostInstall>(),
         entry::<HostAdmin>(),
         entry::<SignInStartParams>(),
@@ -303,6 +304,7 @@ fn rust_methods() -> BTreeMap<&'static str, MethodTypes> {
         method::<SignInAnswer>(),
         method::<SignInCancel>(),
         method::<HostsRemove>(),
+        method::<TunnelPrepare>(),
         method::<ProjectsList>(),
         method::<ProjectsAdd>(),
         method::<ProjectsRemove>(),
@@ -399,6 +401,7 @@ fn rust_enums() -> BTreeMap<&'static str, Vec<&'static str>> {
         ("GhState", names(GhState::ALL, GhState::as_str)),
         ("EventKind", names(EventKind::ALL, EventKind::as_str)),
         ("HostLink", names(HostLink::ALL, HostLink::as_str)),
+        ("TunnelState", names(TunnelState::ALL, TunnelState::as_str)),
         (
             "SessionState",
             names(SessionState::ALL, SessionState::as_str),
@@ -763,12 +766,17 @@ fn the_call_accepted_example_is_what_a_peer_sends() {
     let example = read_json(&protocol_dir().join("examples/frames/call-accepted.json"));
     let line = example["request"].to_string();
     let frame = vibe_core::rpc::accepted_frame(line.as_bytes(), |m| {
-        vibe_core::rpc::ACCEPTED_METHODS.contains(&m)
+        m == <vibe_core::rpc::TunnelCall as vibe_core::rpc::Method>::NAME
     })
-    .expect("an agent call gets the frame");
+    .expect("a tunnel call gets the frame");
     let frame: Value = serde_json::from_str(&frame).unwrap();
     assert_eq!(frame, example["frame"]);
     assert_eq!(frame["method"], vibe_core::rpc::CALL_ACCEPTED);
+    // The call it's for has the shape a tunnel takes.
+    serde_json::from_value::<vibe_core::rpc::TunnelCallParams>(
+        example["request"]["params"].clone(),
+    )
+    .unwrap();
 }
 
 #[test]
@@ -850,6 +858,9 @@ fn examples_cover_the_contract() {
         if ty == "HostInfo" {
             seen_keys.insert("upgrade_error");
             seen_keys.insert("upgrade_held");
+            // Only a linked host with a tunnel has these, which the examples' hosts don't.
+            seen_keys.insert("tunnel");
+            seen_keys.insert("tunnel_detail");
             // Only one still to be signed in to says so; the examples' hosts have no
             // live link.
             seen_keys.insert("sign_ins");
@@ -931,7 +942,7 @@ fn a_sign_ins_code_and_a_personal_key_dont_show_in_debug() {
     }
     // And they go only between `vibed`s: nothing from outside can ask for one.
     for method in [ServicesToken::NAME, ServicesFollow::NAME] {
-        assert!(!ACCEPTED_METHODS.contains(&method), "{method}");
+        assert!(!TUNNEL_METHODS.contains(&method), "{method}");
     }
 }
 
@@ -954,7 +965,7 @@ fn a_hosts_row_reads_across_external_addresss_retirement() {
     })
     .unwrap();
     assert_eq!(ours["external"], false);
-    for gone in ["url", "tunnel", "external_changed_at", "external_detail"] {
+    for gone in ["url", "external_changed_at", "external_detail"] {
         assert!(ours.get(gone).is_none(), "{gone}: {ours}");
     }
 }

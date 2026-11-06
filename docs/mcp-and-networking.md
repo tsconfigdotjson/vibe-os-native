@@ -59,6 +59,30 @@ the Mac over SSH, so nothing new is opened on the server. Its agents then appear
 in the Mac's menu and MCP. Clicking one attaches with `ssh -t HOST vibe attach
 REF`.
 
+### One MCP for every host
+
+A Linux host's MCP reaches the whole hub, not only that host. While the Mac is reachable,
+the same URL and key give you:
+
+- that host's own agents
+- the Mac's agents, as `mac:<ref>`
+- agents on the Mac's other Linux hosts, by their names, such as `edge:<ref>`
+
+The Mac keeps a private `ssh -R` tunnel to each linked host, so nothing is opened on the Mac
+and nothing listens on a public address. The tunnel ends at a Unix socket in the host's
+private `run/`. Calls for another host go through the Mac, so your Linux hosts don't need SSH
+to each other.
+
+The Mac checks every call that comes down a tunnel with its own key list. A key made on the
+Mac works everywhere it's been pushed. A key made on a Linux host with `vibe key create` only
+works for that host's own agents.
+
+This needs `AllowStreamLocalForwarding` on the server's sshd, which is on by default.
+**Settings → Hosts** says if a tunnel can't come up.
+
+If more than one Mac links to the same host, they share its one tunnel end, so the host's
+`mac` can move between them. Use the Mac's own MCP in that setup.
+
 ### Other machines, over Tailscale
 
 If you want a laptop or another machine to reach MCP, we suggest
@@ -81,13 +105,13 @@ What to expect:
 - The URL is plain HTTP inside your tailnet, which Tailscale encrypts. API keys
   are still required.
 - It only reaches your own tailnet. It isn't a way to open MCP to the internet.
-- Tailscale can't reach a Mac that's asleep or off. Its agents are unavailable
-  until it's back.
+- Tailscale can't reach a Mac that's asleep or off. Its agents, and anything reached through
+  it, are unavailable until it's back.
 
 ### When the Mac is off
 
-A Linux host doesn't need the Mac to keep working. Its agents keep running, and
-it serves its own MCP for its own agents:
+A Linux host doesn't need the Mac to keep working. Its agents keep running, and its MCP
+keeps answering for them:
 
 - From the server itself, use `http://127.0.0.1:7878/mcp` with an API key.
 - From elsewhere, use `ssh -t HOST vibe attach REF` for a terminal, or the host's
@@ -95,7 +119,10 @@ it serves its own MCP for its own agents:
 - On the server, `vibe project`, `vibe profile` and `vibe key` replace the
   Settings screens.
 
-The Mac's own agents are unavailable until it's back.
+Everything that goes through the Mac, its own agents and those on its other hosts, shows as
+unavailable, as last seen, until it's back. It's never reported as reachable while it isn't.
+You can't start or send to those agents until then. It all merges back by itself when the
+tunnel returns.
 
 ### Your own networking
 
@@ -106,32 +133,30 @@ unprotected.
 
 ## If you used External Address
 
-External Address served MCP publicly from a Linux host at `https://<domain>/mcp`,
-with a Let's Encrypt certificate on port 443 and an `ssh -R` tunnel back to the Mac.
-It's retired ([#143](https://github.com/tsconfigdotjson/vibe-os-native/issues/143)),
-and nothing replaces it as a public path.
+External Address served MCP publicly from a Linux host at `https://<domain>/mcp`, with a
+Let's Encrypt certificate on port 443. That public listener is retired
+([#143](https://github.com/tsconfigdotjson/vibe-os-native/issues/143)), and nothing replaces
+it as a public path. The private path to the Mac stays, and is now on for every linked host:
+see [One MCP for every host](#one-mcp-for-every-host).
 
 > [!WARNING]
-> Upgrading the Mac ends the tunnel at once, so outside clients lose the Mac's agents. A
-> linked host that still serves External Address is **not** upgraded by itself: it goes on
-> serving its own agents publicly, and Settings → Hosts says it's waiting for you. Choosing
-> **Update…** there, or `vibe host upgrade NAME`, ends its `https://<domain>/mcp`. Move
-> anything that uses that URL first.
+> A linked host that still serves External Address is **not** upgraded by itself. It goes on
+> serving, and **Settings → Hosts** says it's waiting for you. Choosing **Update…** there, or
+> running `vibe host upgrade NAME`, ends its `https://<domain>/mcp`. Move anything that uses
+> that URL first.
 
 **What changes:**
 
-- An upgraded `vibed` no longer listens on port 443, asks Let's Encrypt for a certificate
-  or keeps an `ssh -R` tunnel. The old tunnel ends with the old `vibed` on the Mac.
-- A client on another machine can no longer reach the Mac's agents through a Linux
-  host. Agents named `mac:<ref>` are gone from a host's MCP.
-- `vibe host external` and the Settings controls are gone.
+- An upgraded `vibed` no longer listens on port 443 or asks Let's Encrypt for a certificate.
+- `vibe host external` and its Settings controls are gone. The tunnel no longer needs turning
+  on, or a public name.
 
-**What doesn't:** API keys, SSH hosts and their links, agents, loopback MCP and the
-Tailscale option all carry on as they were.
+**What doesn't:** API keys, SSH hosts and their links, agents, `mac:<ref>`, loopback MCP and
+the Tailscale option all carry on as they were.
 
-**Moving a client:** use one of the [ways to connect](#ways-to-connect) above. Tailscale
-is the closest match for a client on another machine. For a client on the server
-itself, use its loopback URL.
+**Moving a client:** give it the host's loopback URL if it runs on that server, or its
+Tailscale URL if it runs elsewhere, with the same key. It keeps reaching the same agents.
+Set up [Tailscale](#other-machines-over-tailscale) on the host first if you need that.
 
 **Forgetting a host that may still serve it:** VibeOS refuses while the host's link is down
 or it won't take your API keys off, because they'd go on working there, out of reach of a
@@ -150,14 +175,13 @@ remove once the new build has settled:
 | Linux host, if the helper was installed | The root-owned helper, which can open port 443 | `sudo rm /usr/local/lib/vibeos/vibe-bind-1 && sudo rmdir /usr/local/lib/vibeos` |
 | Linux host, if the fallback was used | A setting that lets any user there open ports from 443 up | `sudo rm /etc/sysctl.d/60-vibeos.conf && sudo sysctl -w net.ipv4.ip_unprivileged_port_start=1024` |
 | Your DNS and firewall | The name pointing at the host, and port 443 open to it | Remove them if nothing else uses them |
+| The Mac | The old tunnel socket | `rm "$HOME/Library/Application Support/VibeOS/run/tunnel.sock"*` |
 
-Any `mac.sock` or `tunnel.sock` left in `run/` does no harm, and you can delete it. If your
-API keys were used from the internet, consider replacing them.
+If your API keys were used from the internet, consider replacing them.
 
-**Going back.** The registry keeps its External Address settings, so the build before
-this one can still read it, and that build **starts serving publicly again** if the
-setting was on. To turn it off for good, run `vibe host external local off` on the host
-before you upgrade.
+**Going back.** A host's registry keeps its External Address setting, so the build before this
+one can still read it, and that build **starts serving publicly again** if the setting was on.
+To turn it off for good, run `vibe host external local off` on the host before you upgrade.
 
 ## MCP tools
 

@@ -41,23 +41,69 @@ fn write_exe(path: &Path, body: &str) {
     common::write_script(path, body);
 }
 
+/// `ssh -R`'s forward, for [`fake_ssh`]: binds the host's end of the
+/// tunnel, refusing one that's there as sshd does, and relays each
+/// connection to it to the socket here. It says `ready` once it's bound.
+const RELAY: &str = r#"
+import os, socket, sys, threading
+remote, local = sys.argv[1], sys.argv[2]
+if os.path.exists(remote):
+    print("Error: remote port forwarding failed for listen path " + remote, flush=True)
+    sys.exit(1)
+srv = socket.socket(socket.AF_UNIX)
+srv.bind(remote)
+os.chmod(remote, 0o600)
+srv.listen(16)
+print("ready", flush=True)
+def pipe(a, b):
+    try:
+        while True:
+            d = a.recv(65536)
+            if not d:
+                break
+            b.sendall(d)
+    except OSError:
+        pass
+    for s in (a, b):
+        try:
+            s.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+while True:
+    c, _ = srv.accept()
+    l = socket.socket(socket.AF_UNIX)
+    try:
+        l.connect(local)
+    except OSError:
+        c.close()
+        continue
+    threading.Thread(target=pipe, args=(c, l), daemon=True).start()
+    threading.Thread(target=pipe, args=(l, c), daemon=True).start()
+"#;
+
 /// `ssh` for the test: options are taken and ignored, and the command runs
 /// here, with `$HOME` the host's own home, `<hosts>/<destination>`, and
-/// the host's tools first on `PATH`. While `<hosts>/<destination>.d/down` exists, it
-/// can't connect, and what it carries is dropped.
+/// the host's tools first on `PATH`. With `-R remote:local`, a relay
+/// forwards the host's socket to the one here, failing as
+/// `ExitOnForwardFailure` does when it can't. While
+/// `<hosts>/<destination>.d/down` exists, it can't connect, and what it
+/// carries is dropped.
 ///
-/// What it starts can outlive it, so this takes the test's [`Watch`], which only
+/// A relay outlives whatever starts it, so this takes the test's [`Watch`], which only
 /// [`bounded`] makes, and which ends it however the test goes.
 fn fake_ssh(watch: &Watch, hosts: &Path) -> PathBuf {
     watch.owns(hosts);
+    fs::write(hosts.join("relay.py"), RELAY).unwrap();
     let ssh = hosts.join("ssh");
     write_exe(
         &ssh,
         &format!(
             r#"#!/bin/sh
+fwd=
 while [ $# -gt 0 ]; do
   case "$1" in
     -o) shift 2 ;;
+    -R) fwd=$2; shift 2 ;;
     --) shift; break ;;
     -*) shift ;;
     *) break ;;
@@ -72,6 +118,17 @@ fi
 if [ -e "$d/down" ]; then
   echo "ssh: connect to host $dest port 22: Network is unreachable" >&2; exit 255
 fi
+relay=
+if [ -n "$fwd" ]; then
+  said=$(mktemp)
+  python3 "{hosts}/relay.py" "${{fwd%%:*}}" "${{fwd#*:}}" >"$said" 2>&1 &
+  relay=$!
+  until grep -q ready "$said"; do
+    if ! kill -0 "$relay" 2>/dev/null; then cat "$said" >&2; rm -f "$said"; exit 255; fi
+    sleep 0.05
+  done
+  rm -f "$said"
+fi
 export HOME="$home" SHELL="$d/bin/login-shell" PATH="$d/bin:$PATH"
 . "$d/env"
 cd "$HOME" || exit 255
@@ -83,11 +140,13 @@ while kill -0 "$child" 2>/dev/null; do
   if [ -e "$d/down" ]; then
     pkill -TERM -P "$child" 2>/dev/null
     kill "$child" 2>/dev/null
+    [ -n "$relay" ] && kill "$relay" 2>/dev/null
     echo "Connection to $dest closed by remote host." >&2
     exit 255
   fi
   sleep 0.1
 done
+[ -n "$relay" ] && kill "$relay" 2>/dev/null
 wait "$child"
 "#,
             hosts = hosts.display()
@@ -229,7 +288,7 @@ AS_ROOT=1 exec "$@"
         fs::write(
             d.join("env"),
             format!(
-                "export VIBE_TEST_HOST_BROKER=1 VIBE_TEST_BACKEND='{}' VIBE_GH='{}'\n",
+                "export VIBE_TEST_HOST_BROKER=1 VIBE_TEST_MAC_PEER=1 VIBE_TEST_BACKEND='{}' VIBE_GH='{}'\n",
                 claude.display(),
                 tools.join("gh").display()
             ),
@@ -372,6 +431,7 @@ fn mac_with(
     {
         let _in = rt.enter();
         core.spawn_links();
+        core.spawn_tunnels();
         drop(core.spawn_services());
     }
     let listener = rt
@@ -584,6 +644,78 @@ fn a_test_past_its_deadline_says_what_it_was_waiting_for() {
     .unwrap_err();
     let said = failed.downcast_ref::<String>().unwrap();
     assert!(said.contains("at: what never comes (line "), "{said}");
+}
+
+/// The relays running out of `hosts`.
+fn relays_of(hosts: &str) -> Vec<String> {
+    let found = Command::new("pgrep")
+        .args(["-f", &format!("{hosts}/relay.py")])
+        .in_files()
+        .unwrap();
+    String::from_utf8_lossy(&found.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// A real relay from `ssh -R`, started the way a tunnel starts one, is gone when the
+/// test that made it is, whether it passed or failed (#67). The relay's seen running
+/// first, so this can't pass by not finding one.
+#[test]
+fn a_test_leaves_no_relay_behind_however_it_ends() {
+    for fails in [false, true] {
+        let hosts = common::short_tempdir();
+        let name = unique_name(hosts.path());
+        let path = hosts.path().to_owned();
+        let looking_for = name.clone();
+        let ended = std::panic::catch_unwind(move || {
+            bounded(Duration::from_secs(60), move |watch| {
+                let ssh = fake_ssh(watch, &path);
+                fs::create_dir_all(path.join("me@vps")).unwrap();
+                fs::create_dir_all(path.join("me@vps.d/bin")).unwrap();
+                fs::write(path.join("me@vps.d/env"), "").unwrap();
+                let end = path.join("forwarded.sock");
+                // Past the relay's start, and the stand-in's tidying up after it.
+                let up = path.join("up");
+                let mut started = Command::new(&ssh);
+                started
+                    .arg("-R")
+                    .arg(format!(
+                        "{}:{}",
+                        end.display(),
+                        path.join("here.sock").display()
+                    ))
+                    .args(["me@vps", &format!("touch '{}'; sleep 30", up.display())])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+                // Left running on purpose, as a tunnel is, and reaped when it goes.
+                let mut tunnel = started.spawn().unwrap();
+                std::thread::spawn(move || tunnel.wait());
+                wait_for("the relay", Duration::from_secs(20), || up.exists());
+                assert!(!relays_of(&looking_for).is_empty(), "no relay to end");
+                assert!(!fails, "forced, with the relay up");
+            });
+        });
+        match ended {
+            Ok(()) => assert!(!fails),
+            // This failure, with the relay up, and not one before it started.
+            Err(panicked) => {
+                let said = panicked
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or(panicked.downcast_ref::<&str>().copied())
+                    .unwrap_or_default();
+                assert!(
+                    fails && said.contains("forced, with the relay up"),
+                    "{said}"
+                );
+            }
+        }
+        wait_for("the relay to go", Duration::from_secs(5), || {
+            relays_of(&name).is_empty()
+        });
+    }
 }
 
 #[track_caller]
@@ -1457,6 +1589,13 @@ impl Stopped {
             let _ = Command::new("kill").args([which, pid]).status();
         }
     }
+
+    /// Lets them go on, and forgets them: a pid kept past now could be anyone's by the
+    /// end of the test.
+    fn resume(mut self) {
+        self.signal("-CONT");
+        self.0.clear();
+    }
 }
 
 impl Drop for Stopped {
@@ -1487,6 +1626,19 @@ fn timed_within(
     } else {
         Ok(said)
     }
+}
+
+/// The first listing after the Mac goes, before the host's next look at its tunnel has
+/// told it so. It's timed, and it says the Mac's agent is unavailable.
+fn first_listing_with_the_mac_away(c: &mut OnHost, when: &str, mac_agent: &str) -> String {
+    let listed = timed_within(c, PROMPTLY, when, "vibe_list_agents", json!({}))
+        .unwrap_or_else(|why| panic!("{why}"));
+    let mac_row = listed
+        .lines()
+        .find(|l| l.starts_with(mac_agent))
+        .unwrap_or_else(|| panic!("{when}: no {mac_agent} in {listed}"));
+    assert!(mac_row.contains("unavailable"), "{when}: {listed}");
+    listed
 }
 
 /// What a round of tools starts its agent in.
@@ -1576,9 +1728,11 @@ fn drop_test_branches(dest: &str, project: &str, branches: &[&str]) {
     }
 }
 
-/// #143's promise in real processes: a Linux host added over plain SSH, with no
-/// Tailscale asked for, answers for its own agents on its own loopback MCP once the Mac
-/// has gone, with an API key required and nothing listening beyond loopback.
+/// #143's promise in real processes: a Linux host added over plain SSH, with no Tailscale
+/// asked for, reaches its own agents and the Mac's on one loopback MCP, with an API key
+/// required and nothing listening beyond loopback or on 443. With the tunnel's relay stopped
+/// as with a Mac asleep, and then the Mac gone, the Mac's are unavailable and never claimed,
+/// and the host's own go on.
 #[test]
 fn a_linux_hosts_own_mcp_answers_with_the_mac_gone() {
     bounded(
@@ -1652,10 +1806,89 @@ fn a_linux_hosts_own_mcp_answers_with_the_mac_gone_body(watch: &Watch) {
     assert_eq!(code, 200, "{body}");
     let started = c.call(
         "vibe_start_agent",
-        json!({"project": "app", "profile": "small", "prompt": "talk", "name": "on-vps"}),
+        json!({"project": "app", "profile": "small", "prompt": "talk", "host": "local",
+               "name": "on-vps"}),
     );
     assert!(started.contains("started"), "{started}");
     c.talk("on-vps");
+
+    // The same MCP reaches the Mac, down the tunnel it opened.
+    watch.at("the tunnel");
+    let vps_line = |socket: &Path| {
+        ok(vibe(socket, &["host"]))
+            .lines()
+            .find(|l| l.starts_with("vps  "))
+            .unwrap_or_default()
+            .to_owned()
+    };
+    wait_for("the tunnel", Duration::from_secs(60), || {
+        vps_line(&mac.socket).contains("tunnel up")
+    });
+    let app = golden.home.join("src/app");
+    ok(vibe(
+        &mac.socket,
+        &["project", "add", app.to_str().unwrap()],
+    ));
+    watch.at("an agent on the Mac");
+    let started = c.call(
+        "vibe_start_agent",
+        json!({"project": "app", "profile": "software-eng-mac", "prompt": "talk", "host": "mac",
+               "name": "on-mac"}),
+    );
+    assert!(started.contains("started mac:on-mac"), "{started}");
+    c.talk("mac:on-mac");
+    let merged = |c: &mut OnHost| {
+        let listed = c.call("vibe_list_agents", json!({}));
+        listed.contains("on-vps")
+            && listed.contains("mac:on-mac")
+            && !listed.contains("unavailable")
+    };
+    wait_for("both in one listing", Duration::from_secs(30), || {
+        merged(&mut c)
+    });
+
+    // The Mac sleeps: its tunnel's relay stops, with its socket on the host still there. By
+    // its directory's own name, as `/tmp` is a link on a Mac.
+    watch.at("the Mac asleep");
+    let relay = format!("{}/relay.py", unique_name(hosts.path()));
+    let found = Command::new("pgrep")
+        .args(["-f", &relay])
+        .in_files()
+        .unwrap();
+    let relays: Vec<String> = String::from_utf8_lossy(&found.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert!(!relays.is_empty(), "the tunnel's relay isn't running");
+    let relays = Stopped(relays);
+    relays.signal("-STOP");
+    let limit = Duration::from_secs(vibe_core::limits::PEER_READ);
+    let read = json!({"agent": "on-vps", "last": 1});
+    timed_within(&mut c, limit, "asleep", "vibe_read_messages", read)
+        .unwrap_or_else(|why| panic!("{why}"));
+    let listed = first_listing_with_the_mac_away(&mut c, "asleep", "mac:on-mac");
+    assert!(listed.contains("on-vps"), "{listed}");
+    every_local_tool_answers_promptly(
+        &mut c,
+        "asleep",
+        &Round {
+            project: "host-only",
+            profile: "small",
+            prompt: "talk",
+            host: None,
+            name: "while-asleep".into(),
+        },
+    );
+
+    // It wakes, and it all merges back with nothing done.
+    watch.at("the Mac waking");
+    relays.resume();
+    wait_for("the Mac back", Duration::from_secs(60), || merged(&mut c));
+    let read = c.call(
+        "vibe_read_messages",
+        json!({"agent": "mac:on-mac", "last": 1}),
+    );
+    assert!(!read.contains("unavailable"), "{read}");
 
     // Nothing's open beyond loopback, on the host or here, with Tailscale not asked for.
     let host_pid = host.pid().expect("the host's vibed") as u32;
@@ -1678,12 +1911,14 @@ fn a_linux_hosts_own_mcp_answers_with_the_mac_gone_body(watch: &Watch) {
     let read = json!({"agent": "on-vps", "last": 1});
     timed_within(&mut c, limit, "stopped", "vibe_read_messages", read)
         .unwrap_or_else(|why| panic!("{why}"));
-    let listed = timed_within(&mut c, PROMPTLY, "stopped", "vibe_list_agents", json!({}))
-        .unwrap_or_else(|why| panic!("{why}"));
-    assert!(listed.contains("on-vps"), "{listed}");
-    assert!(!listed.contains("unavailable"), "{listed}");
+    let listed = first_listing_with_the_mac_away(&mut c, "stopped", "mac:on-mac");
+    let own_row = listed
+        .lines()
+        .find(|l| l.starts_with("on-vps"))
+        .unwrap_or_else(|| panic!("no on-vps in {listed}"));
+    assert!(!own_row.contains("unavailable"), "{listed}");
     // The line that attaches over SSH, with nothing of the Mac's in the way.
-    assert!(listed.contains("attach: ssh -t "), "{listed}");
+    assert!(own_row.contains("attach: ssh -t "), "{listed}");
     c.talk("on-vps");
     every_local_tool_answers_promptly(
         &mut c,

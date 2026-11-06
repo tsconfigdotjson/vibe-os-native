@@ -396,6 +396,8 @@ impl Store {
                     version: r.get(4)?,
                     missing: split_list(&missing),
                     detail: None,
+                    tunnel: None,
+                    tunnel_detail: None,
                     memory: None,
                     // Any this build doesn't know are left out.
                     needs_admin: split_list(&needs_admin)
@@ -1498,6 +1500,8 @@ mod tests {
                 version: None,
                 missing: vec![],
                 detail: None,
+                tunnel: None,
+                tunnel_detail: None,
                 memory: None,
                 needs_admin: vec![],
                 upgrade_error: None,
@@ -1521,6 +1525,8 @@ mod tests {
             version: Some("0.1.0".into()),
             missing: vec!["gh".into(), "claude".into()],
             detail: None,
+            tunnel: None,
+            tunnel_detail: None,
             memory: None,
             needs_admin: vec![],
             upgrade_error: None,

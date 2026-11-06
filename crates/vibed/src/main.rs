@@ -73,6 +73,9 @@ environment:
                   never keeps this vibed out of the login Keychain; allow lets
                   one outside an app bundle in, which is otherwise kept out so
                   that no test reaches it; the agents it starts aren't given allow
+  VIBE_TEST_MAC_PEER
+                  for tests only, with VIBE_TEST_BACKEND: 1 lets a Mac's tunnel end
+                  here whatever the OS, as a stand-in Linux host on a Mac
   VIBE_TEST_BACKEND
                   for tests only: run every environment's agents natively,
                   unlimited but for a supervisor, with this program as
@@ -245,6 +248,11 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
         config.vibe_cli = vibe;
     }
     config.services = Some(services_config(&config.layout));
+    config.serves_mac_peer = serves_mac_peer(
+        &config.info.os,
+        env_text("VIBE_TEST_BACKEND").is_some(),
+        env_text("VIBE_TEST_MAC_PEER").as_deref(),
+    );
     if let Some(claude) = std::env::var_os("VIBE_TEST_BACKEND").filter(|v| !v.is_empty()) {
         vibed::log!(
             "vibed: VIBE_TEST_BACKEND is set: agents run under the test backend, with {} as \
@@ -372,6 +380,9 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
     let sleep = core.spawn_sleep_watch();
     // The links to Linux hosts, each kept up on its own.
     core.spawn_links();
+    // The tunnels that let a Linux host's MCP reach this Mac; and on a Linux host, a look at
+    // its end of one. Each call through one has its API key checked here.
+    core.spawn_tunnels();
     if let Some(note) = core.retired_external_note() {
         vibed::log!("vibed: {note}");
     }
@@ -391,6 +402,7 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
     };
     server::serve(listener, Arc::clone(&core), MAX_MESSAGE_BYTES, shutdown).await;
     core.stop_links();
+    core.stop_tunnels();
     for task in services {
         task.abort();
     }
@@ -422,6 +434,13 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
     drop(guard);
     vibed::log!("vibed: stopped");
     Ok(())
+}
+
+/// Whether a Mac's tunnel can end here: on a Linux host, never a Mac; except, in tests, a
+/// stand-in Linux host on a Mac, which runs the test backend and asks with
+/// `VIBE_TEST_MAC_PEER=1`.
+fn serves_mac_peer(os: &str, test_backend: bool, stand_in: Option<&str>) -> bool {
+    os == "linux" || (test_backend && stand_in == Some("1"))
 }
 
 /// Which services this host's broker offers, and where it keeps what it holds:
@@ -547,6 +566,18 @@ mod tests {
         std::fs::write(&login, "live").unwrap();
         assert_eq!(kind(mac_store(dir.clone(), false, true)), "Keychain");
         assert!(!login.exists());
+    }
+
+    #[test]
+    fn a_macs_tunnel_only_ends_on_a_linux_host() {
+        assert!(serves_mac_peer("linux", false, None));
+        assert!(!serves_mac_peer("macos", false, None));
+        // The variable alone does nothing: only a test's stand-in host,
+        // on the test backend, may.
+        assert!(!serves_mac_peer("macos", false, Some("1")));
+        assert!(!serves_mac_peer("macos", true, None));
+        assert!(!serves_mac_peer("macos", true, Some("yes")));
+        assert!(serves_mac_peer("macos", true, Some("1")));
     }
 
     #[test]

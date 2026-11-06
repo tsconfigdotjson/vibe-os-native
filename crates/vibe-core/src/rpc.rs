@@ -20,7 +20,8 @@ pub use crate::model::{
     Activity, AdminNeed, AgentKind, AgentState, Certainty, CheckId, CheckState, Environment,
     EventKind, GhState, HostLink, LoginTool, MessageRole, Mode, Model, PiLoginMethod, PiLoginState,
     PiPromptKind, PiTarget, Profile, ProjectSource, Reasoning, ServiceRole, ServiceState,
-    SessionState, SignInState, SignInWhat, StopReason, ToolboxAction, ToolboxState, WakeupKind,
+    SessionState, SignInState, SignInWhat, StopReason, ToolboxAction, ToolboxState, TunnelState,
+    WakeupKind,
 };
 
 /// Bumped on any incompatible change to the contract. Clients send theirs in
@@ -215,7 +216,8 @@ pub enum ErrorCode {
     /// The call is for a Linux host whose link is down: its agents are
     /// unavailable until the link is back.
     HostUnavailable,
-    /// The call is only for another host's link, and didn't come over one.
+    /// The call is only for another host's link, and didn't come over one; or it came
+    /// through a tunnel with no API key this Mac knows: unknown, revoked, or a host's own.
     Unauthorized,
 }
 
@@ -361,6 +363,7 @@ pub const METHODS: &[&str] = &[
     SignInAnswer::NAME,
     SignInCancel::NAME,
     HostsRemove::NAME,
+    TunnelPrepare::NAME,
     ProjectsList::NAME,
     ProjectsAdd::NAME,
     ProjectsRemove::NAME,
@@ -522,6 +525,14 @@ method! {
     /// `hosts.remove`: forgets a Linux host and ends its link. Nothing on
     /// the server changes: its `vibed` and agents run on, on their own.
     HostsRemove = "hosts.remove", HostRemoveParams => HostInfo
+}
+
+method! {
+    /// `tunnel.prepare`: on a Linux host, where the Mac's reverse tunnel
+    /// is to end, a Unix socket in its private `run/`, with any left by an
+    /// earlier tunnel cleared. The Mac calls it over the link before each
+    /// `ssh -R`, and when it forgets the host, so no `mac` is left there.
+    TunnelPrepare = "tunnel.prepare", NoParams => TunnelPrepared
 }
 
 method! {
@@ -875,6 +886,13 @@ pub struct HostInfo {
     /// For a host whose link is down, why.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// The Mac's tunnel to it, for its MCP to reach the Mac. In a host's own row, whether
+    /// a Mac answers through it, once one has opened one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tunnel: Option<TunnelState>,
+    /// Why the tunnel isn't up, or what it waits for, and how to fix it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tunnel_detail: Option<String>,
     /// What its memory is doing now, as its kernel measures it: this
     /// host's own, and a Linux host's from its last ping while its link
     /// is up.
@@ -941,14 +959,33 @@ pub struct MemoryUse {
     pub pressure: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TunnelPrepared {
+    /// The absolute path, on the host, of the socket the tunnel ends at.
+    pub socket: String,
+}
+
+/// `tunnel.call`, which only the Mac's tunnel sockets take (keys are checked where the
+/// agent lives): one of the agent calls MCP makes, on this Mac, with the API key the
+/// caller of a host's MCP sent, which the Mac checks itself. Its result is the call's.
+#[derive(Debug)]
+pub enum TunnelCall {}
+
+impl Method for TunnelCall {
+    const NAME: &'static str = "tunnel.call";
+    type Params = TunnelCallParams;
+    type Result = Value;
+}
+
 /// The notification a peer sends as soon as it has a call it will run: `{id}`,
 /// the call's id. What's listening knows within seconds that the far side is there,
 /// however long the call itself goes on to take, so it needn't wait out a long
 /// timeout on a Mac that's asleep. A client that isn't looking for it passes over it.
 pub const CALL_ACCEPTED: &str = "call.accepted";
 
-/// In a `daemon.hello` answer on a link: this peer sends [`CALL_ACCEPTED`]. One without
-/// it is older, and isn't held to the accept deadline.
+/// In a `daemon.hello` answer on a tunnel's socket or a link: this peer sends
+/// [`CALL_ACCEPTED`], and on a tunnel's socket gives its memory with `agents.list`.
+/// One without it is older, and isn't held to the accept deadline.
 pub const ACCEPTS_CALLS: &str = "accepts_calls";
 
 /// The [`CALL_ACCEPTED`] line for a message, if it's a call to a `method` that `wanted`
@@ -962,9 +999,10 @@ pub fn accepted_frame(line: &[u8], wanted: impl FnOnce(&str) -> bool) -> Option<
     })
 }
 
-/// The calls that get [`CALL_ACCEPTED`] on a link: the ones MCP makes of a host, which
-/// can run for a long time.
-pub const ACCEPTED_METHODS: &[&str] = &[
+/// The calls a tunnel takes, each for this Mac's own agents only; and `hosts.list`,
+/// answered with this Mac's own row alone, for a host older than its memory coming with
+/// `agents.list`. On a link, these are the calls that get [`CALL_ACCEPTED`].
+pub const TUNNEL_METHODS: &[&str] = &[
     "hosts.list",
     "projects.list",
     "agents.list",
@@ -975,6 +1013,30 @@ pub const ACCEPTED_METHODS: &[&str] = &[
     "agents.output",
     "agents.messages",
 ];
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TunnelCallParams {
+    /// The caller's API key, as it sent it.
+    pub key: String,
+    /// One of [`TUNNEL_METHODS`].
+    pub method: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<Value>,
+    /// When the host sent it, in Unix seconds. A send, start or delete that arrives
+    /// long after, as one held in the tunnel while a Mac slept does, doesn't run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sent_at: Option<i64>,
+}
+
+impl fmt::Debug for TunnelCallParams {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TunnelCallParams")
+            .field("key", &crate::keys::shown_prefix(&self.key))
+            .field("method", &self.method)
+            .finish_non_exhaustive()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

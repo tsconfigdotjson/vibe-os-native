@@ -43,6 +43,10 @@ use crate::units::{GIB, MIB, TIB};
 /// under (#16), such as `vps`, which is how `vps:quiet-amber-otter` reads.
 pub const LOCAL_HOST: &str = "local";
 
+/// What the Mac goes by on a Linux host, for callers of that host's MCP: its agents there
+/// are `mac:<ref>`.
+pub const MAC_HOST: &str = "mac";
+
 /// Declares a closed set of names, as serialized on the socket and stored in
 /// the registry, with the list `protocol/vibed-rpc.json` checks it against.
 macro_rules! names {
@@ -254,6 +258,19 @@ names! {
         /// Another host, whose link is up.
         Connected = "connected",
         /// Another host, whose link is down: its agents are unavailable.
+        Down = "down",
+    }
+}
+
+names! {
+    /// The Mac's tunnel to a Linux host, for that host's MCP to reach it. On the Mac, the
+    /// tunnel it keeps; on that host, its own row says whether a Mac answers through it.
+    TunnelState {
+        /// `ssh` is starting, or up but the host hasn't come through it yet.
+        Connecting = "connecting",
+        /// The host reaches the Mac through it.
+        Up = "up",
+        /// It isn't up: `tunnel_detail` says why. It's tried again.
         Down = "down",
     }
 }
@@ -674,9 +691,8 @@ pub fn validate_ssh_destination(dest: &str) -> Result<(), String> {
 pub const MAX_REF_LEN: usize = 32;
 
 /// The names a session's socket can't have in `run/`: `vibed.sock`, the daemon's,
-/// and `mac.sock` and `tunnel.sock`, which a `vibed` from before External Address
-/// was retired (#143) may have left there, the first with an old Mac's `ssh -R`
-/// still holding it. A new agent may not take one, in any case, as the Mac's file
+/// `mac.sock`, where the Mac's tunnel ends on a Linux host, and `tunnel.sock`, the
+/// Mac's end of it before each host had its own (#143). A new agent may not take one, in any case, as the Mac's file
 /// system ignores case: its session would be that socket (issue #45). Only `vibed`
 /// was reserved before 0.1.3, so an agent may already be called `mac` or `tunnel`;
 /// it's still a ref, and can be used and deleted ([`validate_ref`]).

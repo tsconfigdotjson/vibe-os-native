@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use vibe_core::model::{
-    AdminNeed, AgentState, EventKind, HostLink, LOCAL_HOST, validate_host_name, validate_ref,
-    validate_ssh_destination,
+    AdminNeed, AgentState, EventKind, HostLink, LOCAL_HOST, TunnelState, validate_host_name,
+    validate_ref, validate_ssh_destination,
 };
 use vibe_core::rpc::{
     Agent, AgentList, AgentsList, ApiKey, ErrorCode, ErrorObject, HostAddParams, HostAdmin,
@@ -175,6 +175,14 @@ impl Core {
                 h.memory = self.memory_use();
                 h.needs_admin = self.admin_needs();
                 h.sign_ins = self.sign_ins_needed();
+                // Whether a Mac answers through its tunnel, once one has opened one.
+                if let Some(mac) = self.mac() {
+                    h.tunnel = Some(if mac.is_up() {
+                        TunnelState::Up
+                    } else {
+                        TunnelState::Down
+                    });
+                }
             } else if let Some(link) = self.link(&h.name) {
                 *h = link.describe(h.clone());
                 if let Some(own) = link.reported() {
@@ -191,6 +199,11 @@ impl Core {
                     } else if let Some(why) = &upgrade.error {
                         h.detail = Some(format!("VibeOS can't upgrade its vibed: {why}"));
                     }
+                }
+                drop(upgrade);
+                if let Some(view) = self.tunnel_view(&h.name) {
+                    h.tunnel = Some(view.state);
+                    h.tunnel_detail = view.detail;
                 }
             }
         }
@@ -313,6 +326,8 @@ impl Core {
             version: Some(installed.version.clone()),
             missing: installed.missing.clone(),
             detail: None,
+            tunnel: None,
+            tunnel_detail: None,
             memory: None,
             needs_admin: installed.needs_admin.clone(),
             upgrade_error: None,
@@ -325,6 +340,7 @@ impl Core {
         let link = Arc::new(Link::new(&p.name, &p.address));
         lock(&self.links).insert(p.name.clone(), Arc::clone(&link));
         self.start_link(&link);
+        self.sync_tunnel();
         crate::log!(
             "vibed: added {} ({}, vibed {}{})",
             p.name,
@@ -533,6 +549,7 @@ impl Core {
                 e.message
             );
         }
+        self.close_tunnel_to(&link).await;
         self.services_host_leaving(&p.host).await;
         self.store().remove_host(&p.host).map_err(store_error)?;
         lock(&self.links).remove(&p.host);
@@ -576,8 +593,8 @@ impl Core {
             String::new()
         };
         Some(format!(
-            "External Address is retired{was}: this vibed serves no public HTTPS and keeps no \
-             ssh -R tunnel. MCP is on loopback, and on Tailscale if mcp_tailscale is on.{left} \
+            "External Address is retired{was}: this vibed serves no public HTTPS. MCP is on \
+             loopback, and on Tailscale if mcp_tailscale is on.{left} \
              Nothing was removed: see the migration notes in docs/mcp-and-networking.md"
         ))
     }
@@ -753,6 +770,8 @@ impl Core {
             version: None,
             missing: Vec::new(),
             detail: None,
+            tunnel: None,
+            tunnel_detail: None,
             memory: None,
             needs_admin: Vec::new(),
             upgrade_error: None,
@@ -1096,6 +1115,8 @@ impl Core {
         self.store()
             .sync_pushed_keys(p.from.as_deref().unwrap_or_default(), &p.keys)
             .map_err(store_error)?;
+        // What keys saw through the Mac goes with them.
+        self.peer.forget_all();
         crate::log!(
             "vibed: {} API key{} pushed here",
             p.keys.len(),

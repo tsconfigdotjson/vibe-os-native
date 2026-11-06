@@ -1263,6 +1263,13 @@ struct HostRow: View {
                         .font(.caption)
                         .foregroundStyle(Palette.attention)
                 }
+                if host.tunnel == .down, let why = host.tunnelDetail {
+                    Label("Its MCP can't reach this Mac: \(sentence(why))", systemImage: "exclamationmark.triangle")
+                        .font(.caption)
+                        .foregroundStyle(Palette.attention)
+                        .lineLimit(3)
+                        .textSelection(.enabled)
+                }
                 if let why = host.upgradeError {
                     Label(
                         host.upgradeHeld == true ? sentence(why) : "Can't update vibed: \(sentence(why))",

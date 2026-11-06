@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
 use vibe_core::model::{HostLink, LOCAL_HOST};
-use vibe_core::rpc::{ACCEPTED_METHODS, ACCEPTS_CALLS};
+use vibe_core::rpc::{ACCEPTS_CALLS, TUNNEL_METHODS};
 use vibe_core::rpc::{
     ErrorCode, ErrorObject, Event, Hello, HostInfo, HostList, HostsList, Method, PROTOCOL_VERSION,
 };
@@ -85,7 +85,8 @@ impl Upgrade {
     }
 }
 
-/// How the link is timed; tests make it quicker.
+/// How the link is timed, and the tunnel that follows it; tests make it
+/// quicker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Timing {
     pub ping_every: Duration,
@@ -93,6 +94,10 @@ pub struct Timing {
     pub connect_timeout: Duration,
     pub min_backoff: Duration,
     pub max_backoff: Duration,
+    /// How long a tunnel may go without the host coming through it, since
+    /// it began or since the host last did, before it's started anew
+    /// ([`crate::tunnel::QUIET`]).
+    pub tunnel_quiet: Duration,
     /// How long after one try the host's `vibed` is upgraded by itself again.
     pub upgrade_retry: Duration,
     /// How long, at the least, if its link has come back since.
@@ -107,6 +112,7 @@ impl Default for Timing {
             connect_timeout: CONNECT_TIMEOUT,
             min_backoff: MIN_BACKOFF,
             max_backoff: MAX_BACKOFF,
+            tunnel_quiet: crate::tunnel::QUIET,
             upgrade_retry: UPGRADE_RETRY,
             upgrade_gap: UPGRADE_GAP,
         }
@@ -187,7 +193,7 @@ pub fn unavailable(name: &str, why: Option<&str>) -> ErrorObject {
 
 /// What to do about a call that changes something, once it's gone out and nobody
 /// has heard how it ended. Nothing, for one that doesn't.
-fn check_after(method: &str) -> Option<&'static str> {
+pub(crate) fn check_after(method: &str) -> Option<&'static str> {
     match method {
         "agents.send" => Some("check vibe_read_messages before resending"),
         "agents.start" | "agents.delete" => Some("check vibe_list_agents before trying again"),
@@ -369,7 +375,7 @@ impl Link {
             }
             // Only the agent calls are said to be taken. Others, as a clone in
             // `projects.add` is, take their time with no word till they're done.
-            if self.accepts_calls.load(Ordering::SeqCst) && ACCEPTED_METHODS.contains(&method) {
+            if self.accepts_calls.load(Ordering::SeqCst) && TUNNEL_METHODS.contains(&method) {
                 channel.call_accepted(method, params, ACCEPT_WITHIN).await
             } else {
                 channel.call(method, params).await

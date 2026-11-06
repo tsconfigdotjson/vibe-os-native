@@ -500,8 +500,8 @@ fn remove(path: &Path) -> io::Result<()> {
 
 /// Removes a session's socket and its lock, unless a shim holds the lock.
 /// A socket with no lock beside it was never a shim's, so it's kept: on a
-/// Linux host, `run/mac.sock` with no lock is sshd's, for an older Mac's `ssh -R`,
-/// even for an agent named `mac` (issue #45).
+/// Linux host, `run/mac.sock` with no lock is sshd's end of the Mac's tunnel, even for
+/// an agent named `mac` (issue #45).
 pub(crate) fn remove_session_files(socket_path: &Path) -> io::Result<()> {
     let lock_path = socket::lock_path(socket_path);
     let lock = match OpenOptions::new().write(true).open(&lock_path) {

@@ -805,7 +805,10 @@ async fn a_linux_hosts_agents_join_the_macs_view_over_the_link() {
     let views = Daemon::agents(&*w.mac, &caller(), "vps").await.unwrap();
     assert!(views[0].available);
     assert_eq!(views[0].attach_remote, views[0].agent.attach);
-    assert_eq!(Daemon::hosts(&*w.mac).await.unwrap(), ["local", "vps"]);
+    assert_eq!(
+        Daemon::hosts(&*w.mac, &caller()).await.unwrap(),
+        ["local", "vps"]
+    );
     let attach = w
         .rpc(
             "sessions.attach",
@@ -1819,20 +1822,18 @@ async fn what_external_address_left_is_kept_and_serves_nothing() {
     assert!(note.contains(certs.to_str().unwrap()), "{note}");
     assert!(note.contains("docs/mcp-and-networking.md"), "{note}");
 
-    // Neither's a way back in, nor does the host read as serving it.
-    for method in ["hosts.external", "tunnel.prepare"] {
-        let refused = rpc(
-            &core,
-            method,
-            json!({"on": true, "domain": "vps.example.com"}),
-        )
-        .await;
-        assert_eq!(
-            refused["error"]["code"],
-            vibe_core::rpc::ErrorCode::MethodNotFound.code(),
-            "{refused}"
-        );
-    }
+    // It's no way back in, nor does the host read as serving it.
+    let refused = rpc(
+        &core,
+        "hosts.external",
+        json!({"on": true, "domain": "vps.example.com"}),
+    )
+    .await;
+    assert_eq!(
+        refused["error"]["code"],
+        vibe_core::rpc::ErrorCode::MethodNotFound.code(),
+        "{refused}"
+    );
     let listed = rpc(&core, "hosts.list", json!({})).await;
     let own = &listed["result"]["hosts"][0];
     assert_eq!(own["external"], false, "{listed}");

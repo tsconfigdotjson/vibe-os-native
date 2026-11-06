@@ -380,6 +380,9 @@ fn agent_json(v: &AgentView) -> Value {
     if let Value::Object(m) = &mut j {
         m.insert("attach_remote".into(), json!(v.attach_remote));
         m.insert("available".into(), json!(v.available));
+        if let Some(at) = &v.last_seen {
+            m.insert("last_seen".into(), json!(at));
+        }
     }
     j
 }
@@ -423,8 +426,12 @@ fn agent_line(v: &AgentView) -> String {
     }
     parts.push(format!("attach: {}", v.attach_remote));
     if !v.available {
+        let at = v
+            .last_seen
+            .as_ref()
+            .map_or(String::new(), |at| format!(" at {at}"));
         parts.push(format!(
-            "unavailable: {} can't be reached now, so this is how it was last seen",
+            "unavailable: {} can't be reached now, so this is how it was last seen{at}",
             a.host
         ));
     }
@@ -584,7 +591,7 @@ impl<D: Daemon> Server<D> {
         if let Some(h) = host {
             return Ok(target(h));
         }
-        let hosts = self.daemon.hosts().await.map_err(|e| e.message)?;
+        let hosts = self.daemon.hosts(c).await.map_err(|e| e.message)?;
         if hosts.len() <= 1 {
             return Ok(target(hosts.first().map_or(LOCAL_HOST, String::as_str)));
         }
@@ -630,7 +637,7 @@ impl<D: Daemon> Server<D> {
         let only = string(args, "host")?;
         let hosts = match &only {
             Some(h) => vec![h.clone()],
-            None => self.daemon.hosts().await.map_err(|e| e.message)?,
+            None => self.daemon.hosts(c).await.map_err(|e| e.message)?,
         };
         let mut projects = Vec::new();
         let mut unreachable = Vec::new();
@@ -717,7 +724,7 @@ impl<D: Daemon> Server<D> {
 
     /// The one host `project` is on.
     async fn project_host(&self, c: &Caller, project: &str) -> Result<String, String> {
-        let hosts = self.daemon.hosts().await.map_err(|e| e.message)?;
+        let hosts = self.daemon.hosts(c).await.map_err(|e| e.message)?;
         let caller = c.clone();
         let answers = self
             .ask_all(&hosts, move |d, h| {
@@ -772,7 +779,7 @@ impl<D: Daemon> Server<D> {
         };
         let hosts = match &only {
             Some(h) => vec![h.clone()],
-            None => self.daemon.hosts().await.map_err(|e| e.message)?,
+            None => self.daemon.hosts(c).await.map_err(|e| e.message)?,
         };
         let mut agents = Vec::new();
         let mut unreachable = Vec::new();
