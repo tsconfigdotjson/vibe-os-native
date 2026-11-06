@@ -1623,7 +1623,7 @@ mod upgrades {
         w.add_host().await;
         installs_reach(&w, 2).await;
         *w.wires.install_fails.lock().unwrap() = Some(format!(
-            "vibed didn't start on this build, so {}: it exited",
+            "VibeOS didn't start on this build, so {}: it exited",
             vibed::remote::WENT_BACK
         ));
         // It's behind again at a reconnect, and tries, and that build won't start.

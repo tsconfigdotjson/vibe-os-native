@@ -836,10 +836,7 @@ fn a_linux_host_added_over_ssh_runs_agents_the_mac_drives_body(watch: &Watch) {
     // Menu → Add Linux host…, as the CLI does it.
     let added = ok(vibe(&mac.socket, &["host", "add", "vps", "me@vps"]));
     assert!(added.contains(", just installed."), "{added}");
-    assert!(
-        added.contains("Lingering is on for you on me@vps"),
-        "{added}"
-    );
+    assert!(added.contains("VibeOS keeps running on me@vps"), "{added}");
     // Its login shell's PATH has git and gh: those aren't missing.
     let needed = added
         .lines()
@@ -2122,7 +2119,7 @@ fn lingering_is_turned_on_any_way_that_needs_no_password_body(watch: &Watch) {
     fs::write(state.join("sudo-ok"), "").unwrap();
     let mac = mac(&golden, &ssh, bundle(golden.dir.path()));
     let added = ok(vibe(&mac.socket, &["host", "add", "vps", "me@vps"]));
-    assert!(added.contains("Lingering is on for you"), "{added}");
+    assert!(added.contains("VibeOS keeps running on"), "{added}");
     assert!(state.join("linger").exists());
     assert!(!state.join("sudo-prompted").exists(), "sudo must never ask");
 }
@@ -2145,7 +2142,10 @@ fn a_host_that_refuses_lingering_gets_a_button_not_a_command_body(watch: &Watch)
     fs::write(state.join("refuse-linger"), "").unwrap();
     let mac = mac(&golden, &ssh, bundle(golden.dir.path()));
     let added = ok(vibe(&mac.socket, &["host", "add", "vps", "me@vps"]));
-    assert!(added.contains("Lingering couldn't be turned on"), "{added}");
+    assert!(
+        added.contains("VibeOS couldn't be set to keep running"),
+        "{added}"
+    );
     assert!(added.contains("Settings → Hosts"), "{added}");
     assert!(!added.contains("sudo loginctl"), "{added}");
     assert!(!state.join("linger").exists());

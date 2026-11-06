@@ -189,7 +189,7 @@ public final class SystemInstaller: Installer {
         try launchctl.run()
         launchctl.waitUntilExit()
         guard launchctl.terminationStatus == 0 else {
-            throw InstallError("launchctl couldn't restart vibed (exit \(launchctl.terminationStatus))")
+            throw InstallError("VibeOS couldn't restart its background service (launchctl exit \(launchctl.terminationStatus))")
         }
     }
 
@@ -391,11 +391,11 @@ public struct InstallNote: Equatable, Sendable {
             actionTitle = "Show in Finder"
         } else if install.service == .requiresApproval {
             title = "Let VibeOS run in the background"
-            detail = "vibed, which runs your agents, is turned off in Login Items. Turn on VibeOS there."
+            detail = "VibeOS's background service, which runs your agents, is turned off in Login Items. Turn on VibeOS there."
             action = .loginItems
             actionTitle = "Open Login Items"
         } else if let why = install.registerFailure {
-            title = "VibeOS couldn't start vibed"
+            title = "VibeOS couldn't start its background service"
             detail = sentence(why)
             action = .register
             actionTitle = "Try Again"

@@ -216,13 +216,9 @@ impl Watch {
                     fixable: false,
                     ..check(
                         CheckState::Optional,
-                        format!(
-                            "Linux agents have no shared MCP services yet: the template is on \
-                             base image {}, and they need {}. Settings → Linux Toolbox says how \
-                             its move there is going.",
-                            boots.unwrap_or(0),
-                            images::SERVICES_BASE
-                        ),
+                        "Linux agents have no shared MCP services yet, as their Linux is out of \
+                         date. Settings → Linux Toolbox says how updating is going."
+                            .to_owned(),
                         None,
                         None,
                     )
@@ -230,10 +226,7 @@ impl Watch {
             }
             return check(
                 CheckState::Pass,
-                format!(
-                    "Linux base image {} and Claude Code {claude} are ready for linux agents.",
-                    base.version
-                ),
+                format!("Linux and Claude Code {claude} are ready for Linux agents."),
                 None,
                 None,
             );
@@ -527,7 +520,7 @@ mod tests {
         );
         assert_eq!(
             c.detail,
-            "Linux base image 1 and Claude Code 2.1.314 are ready for linux agents."
+            "Linux and Claude Code 2.1.314 are ready for Linux agents."
         );
     }
 

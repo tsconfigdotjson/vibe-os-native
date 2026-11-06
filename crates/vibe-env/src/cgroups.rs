@@ -781,7 +781,7 @@ impl Cgroups {
             .find(|c| is_executable(c))
             .ok_or_else(|| {
                 EnvError::new(format!(
-                    "can't find claude on this server's PATH ({}). VibeOS installs it by itself: try again in \
+                    "can't find Claude Code on this server (looked in {}). VibeOS installs it by itself: try again in \
                      a moment, and Settings → Hosts signs in with one click",
                     self.path
                 ))
@@ -798,7 +798,7 @@ impl Cgroups {
             .find(|c| is_executable(c))
             .ok_or_else(|| {
                 EnvError::new(format!(
-                    "can't find pi on this server's PATH ({}). VibeOS installs it by itself when \
+                    "can't find Pi on this server (looked in {}). VibeOS installs it by itself when \
                      a profile here runs Pi",
                     self.path
                 ))

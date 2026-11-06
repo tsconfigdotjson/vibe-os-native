@@ -72,7 +72,7 @@ struct AddHostView: View {
                 IconTile(symbol: "server.rack", color: .indigo, size: 36)
                 VStack(alignment: .leading, spacing: 3) {
                     Text("Add a Linux Host").font(.headline)
-                    Text("VibeOS signs in with your SSH keys, installs vibed there as a service of your own, and "
+                    Text("VibeOS signs in with your SSH keys, installs itself there under your own account, and "
                         + "links it to this Mac. Its agents then show in this menu as \(shownName):quiet-amber-otter.")
                         .font(.callout)
                         .foregroundStyle(.secondary)
@@ -104,7 +104,7 @@ struct AddHostView: View {
                 if installing {
                     Working(
                         text: localNetworkOff == nil
-                            ? "Installing vibed on \(trimmedAddress)…" : "Waiting for Local Network access…")
+                            ? "Installing VibeOS on \(trimmedAddress)…" : "Waiting for Local Network access…")
                 }
                 Spacer()
                 Button("Cancel") { close() }
@@ -206,7 +206,7 @@ struct AddedHost: View {
                     .symbolEffect(.bounce, value: appeared)
                 VStack(alignment: .leading, spacing: 3) {
                     Text("\(host.name) is added").font(.headline)
-                    Text("\(host.label) runs vibed \(host.version ?? "")"
+                    Text("\(host.label) runs VibeOS \(host.version ?? "")"
                         + (installed.changed ? ", just installed." : ", as it already did."))
                         .font(.callout)
                         .foregroundStyle(.secondary)

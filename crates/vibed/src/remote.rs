@@ -641,7 +641,7 @@ impl Ssh {
             Some("aarch64" | "arm64") => "aarch64",
             other => {
                 return Err(format!(
-                    "{address} has a {} CPU; vibed is built for x86_64 and aarch64",
+                    "{address} has a {} CPU; VibeOS is built for x86_64 and aarch64",
                     other.unwrap_or("unknown")
                 ));
             }
@@ -695,7 +695,7 @@ impl Ssh {
         let script = configure_script(&uploads, &unit_file(&path), &path);
         let done = report(
             &self
-                .run(address, "Setting up vibed", "sh -s", script.into_bytes())
+                .run(address, "Setting up VibeOS", "sh -s", script.into_bytes())
                 .await?,
         );
         let mut notes = Vec::new();
@@ -704,13 +704,13 @@ impl Ssh {
             Some("off") => {
                 needs_admin.push(AdminNeed::Linger);
                 notes.push(format!(
-                "Lingering couldn't be turned on, so vibed stops when you log out of {address}. \
+                "VibeOS couldn't be set to keep running on {address}, so it stops when you log out. \
                  Settings → Hosts has a button that does it, asking for the password there once."
             ));
             }
             Some("on") => notes.push(format!(
-                "Lingering is on for you on {address}, so vibed runs when you're logged out \
-                 and starts again after a reboot."
+                "VibeOS keeps running on {address} when you're logged out, and starts again \
+                 after a reboot."
             )),
             _ => {}
         }
@@ -725,7 +725,7 @@ impl Ssh {
             version: done
                 .get("version")
                 .cloned()
-                .ok_or_else(|| format!("vibed on {address} didn't say its version"))?,
+                .ok_or_else(|| format!("VibeOS on {address} didn't say its version"))?,
             missing: done
                 .get("missing")
                 .map(|m| {
@@ -1158,9 +1158,9 @@ fn configure_script(uploads: &[(&str, String)], unit: &str, path: &str) -> Strin
              done\n    \
              if [ \"$back\" = yes ]; then\n      \
                systemctl --user restart vibed.service\n      \
-               echo \"error=vibed didn't start on this build, so it went back to the one before: $why\"\n    \
+               echo \"error=VibeOS didn't start on this build, so it went back to the one before: $why\"\n    \
              else\n      \
-               echo \"error=vibed didn't start: $why\"\n    \
+               echo \"error=VibeOS didn't start: $why\"\n    \
              fi\n    \
              exit 1\n  \
            fi\n  \

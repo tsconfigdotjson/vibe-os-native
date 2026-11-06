@@ -195,9 +195,9 @@ impl Core {
                 h.upgrade_held = upgrade.held;
                 if h.link == HostLink::Down {
                     if upgrade.running {
-                        h.detail = Some("VibeOS is upgrading its vibed".to_owned());
+                        h.detail = Some("VibeOS is updating it".to_owned());
                     } else if let Some(why) = &upgrade.error {
-                        h.detail = Some(format!("VibeOS can't upgrade its vibed: {why}"));
+                        h.detail = Some(format!("VibeOS can't update it: {why}"));
                     }
                 }
                 drop(upgrade);
@@ -412,7 +412,7 @@ impl Core {
         let done = done.and_then(|installed| {
             if older(&installed.version, &mine) {
                 let why = format!(
-                    "this VibeOS's build for it is vibed {}, older than this Mac's {mine}",
+                    "this VibeOS's build for it is version {}, older than this Mac's {mine}",
                     installed.version
                 );
                 let _ = self.record_install(link, &installed);
@@ -896,7 +896,7 @@ impl Core {
     fn upgrade_hold(&self, link: &Link) -> Option<String> {
         let name = &link.name;
         let serving = format!(
-            "{name} still serves External Address on an older vibed, and updating it would end \
+            "{name} still serves External Address on an older version of VibeOS, and updating it would end \
              that, so it isn't updated by itself. Move its MCP clients, then update it from \
              Settings → Hosts or with vibe host upgrade {name}"
         );

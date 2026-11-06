@@ -564,7 +564,7 @@ struct ProfileRow: View {
                     Label(
                         shown.environment == .macos
                             ? "Approvals: none. Pi never asks before running a tool, and a macOS agent acts as you."
-                            : "Approvals: none. Pi never asks before running a tool; its compartment is its limit.",
+                            : "Approvals: none. Pi never asks before running a tool; its Linux environment is its limit.",
                         systemImage: "exclamationmark.shield"
                     )
                     .font(.callout)
@@ -573,7 +573,7 @@ struct ProfileRow: View {
                     Label(
                         shown.environment == .macos
                             ? "Bypass skips every permission prompt, and a macOS agent acts as you."
-                            : "Bypass skips every permission prompt; the VM is its sandbox.",
+                            : "Bypass skips every permission prompt; its Linux environment is its limit.",
                         systemImage: "exclamationmark.shield"
                     )
                     .font(.callout)
@@ -655,7 +655,7 @@ struct ProfileRow: View {
         confirm(
             "Run Pi on this Mac, unsandboxed?",
             detail: "Pi never asks before running a tool, and a macOS agent can do anything you can. A "
-                + "Linux environment keeps it in a VM.",
+                + "Linux environment keeps it contained.",
             action: "Run on macOS")
     }
 
@@ -768,7 +768,7 @@ struct KeysPane: View {
                 if keys.isEmpty, let error {
                     ErrorText(error: error)
                 } else if keys.isEmpty {
-                    Text(loaded ? "No keys yet. An MCP client needs one to reach your agents." : "Loading…")
+                    Text(loaded ? "No keys yet. An MCP client, such as Claude Code on another machine, needs one to reach your agents." : "Loading…")
                         .foregroundStyle(.secondary)
                 }
                 ForEach(keys, id: \.name) { key in
@@ -1158,7 +1158,7 @@ struct HostsPane: View {
             confirm(
                 "Remove \(name)?",
                 detail: "This Mac forgets it and its agents, and takes its API keys off it if it can. Otherwise nothing "
-                    + "changes on the server: vibed and its agents run on there, with their own MCP, and you can add "
+                    + "changes on the server: VibeOS and its agents keep running there, with their own MCP, and you can add "
                     + "it again later.",
                 action: "Remove")
         else { return }
@@ -1232,7 +1232,7 @@ struct HostRow: View {
                         }
                     }
                     if !local { Text(host.mcp ? "MCP on" : "MCP off") }
-                    if let version = host.version { Text("vibed \(version)") }
+                    if let version = host.version { Text("VibeOS \(version)") }
                     if let address = host.address { Text(address).lineLimit(1).truncationMode(.middle) }
                 }
                 .font(.caption)
@@ -1241,7 +1241,7 @@ struct HostRow: View {
                     Label("Not there yet: \(host.missing.joined(separator: ", "))", systemImage: "wrench.and.screwdriver")
                         .font(.caption)
                         .foregroundStyle(Palette.attention)
-                        .help("VibeOS installs gh and Claude Code by itself, and git where it can")
+                        .help("VibeOS installs GitHub's gh tool and Claude Code by itself, and git where it can")
                 }
                 if let needs = host.needsAdmin, !needs.isEmpty {
                     Label(adminNeedsText(needs, host: host.name), systemImage: "lock")
@@ -1257,7 +1257,7 @@ struct HostRow: View {
                 }
                 if let why = host.upgradeError {
                     Label(
-                        host.upgradeHeld == true ? sentence(why) : "Can't update vibed: \(sentence(why))",
+                        host.upgradeHeld == true ? sentence(why) : "Can't update VibeOS: \(sentence(why))",
                         systemImage: "exclamationmark.triangle")
                         .font(.caption)
                         .foregroundStyle(Palette.attention)
@@ -1308,7 +1308,7 @@ struct HostRow: View {
 private func adminNeedsText(_ needs: [AdminNeed], host: String) -> String {
     let what = needs.map { need -> String in
         switch need {
-        case .linger: "keep vibed running while you're logged out"
+        case .linger: "keep VibeOS running while you're logged out"
         case .git: "install git, which its agents need"
         }
     }
@@ -1357,21 +1357,21 @@ struct LimitsPane: View {
         FieldGroup(
             title: "Agents and CPU",
             fields: [
-                Field(key: "reserve_cores", label: "Cores kept for macOS", kind: .count,
+                Field(key: "reserve_cores", label: "Cores kept for this Mac", kind: .count,
                       value: \.reserveCores, set: \.reserveCores, onLinux: "Cores kept for the server"),
                 Field(key: "cpu_cores", label: "CPU cores per agent", kind: .count,
                       value: \.cpuCores, set: \.cpuCores),
                 Field(key: "max_awake_agents", label: "Most agents awake at once", kind: .count,
                       value: \.maxAwakeAgents, set: \.maxAwakeAgents),
-                Field(key: "max_processes", label: "Processes per macOS agent", kind: .count,
-                      value: \.maxProcesses, set: \.maxProcesses, onLinux: "Processes per agent"),
+                Field(key: "max_processes", label: "Most running programs per macOS agent", kind: .count,
+                      value: \.maxProcesses, set: \.maxProcesses, onLinux: "Most running programs per agent"),
             ]),
         FieldGroup(
             title: "Disk",
             fields: [
-                Field(key: "disk_soft", label: "Worktree disk: warn past", kind: .bytes,
+                Field(key: "disk_soft", label: "Working copy disk: warn past", kind: .bytes,
                       value: \.diskSoft, set: \.diskSoft),
-                Field(key: "disk_hard", label: "Worktree disk: pause past", kind: .bytes,
+                Field(key: "disk_hard", label: "Working copy disk: pause past", kind: .bytes,
                       value: \.diskHard, set: \.diskHard),
                 Field(key: "vm_disk", label: "A Linux agent's own disk", kind: .bytes,
                       value: \.vmDisk, set: \.vmDisk, onLinux: .some(nil)),
@@ -1517,7 +1517,7 @@ struct GeneralPane: View {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("VibeOS").font(.headline)
                         Text("Version \(version)").font(.caption).foregroundStyle(.secondary)
-                        Text("Quitting the menu leaves vibed and every agent running.")
+                        Text("Quitting the menu leaves VibeOS and every agent running.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }

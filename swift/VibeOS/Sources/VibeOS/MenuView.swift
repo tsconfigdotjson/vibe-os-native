@@ -42,7 +42,7 @@ struct MenuView: View {
     private var content: some View {
         switch model.connection {
         case .connecting:
-            Working(text: "Connecting to vibed…")
+            Working(text: "Connecting to VibeOS…")
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 28)
         case .unavailable(let why):
@@ -53,7 +53,7 @@ struct MenuView: View {
             } else {
                 // The last rows vibed gave, all unavailable, under a note.
                 InlineMessage(
-                    text: "Can't reach vibed. Your agents keep running; the menu reconnects on its own.",
+                    text: "Can't reach VibeOS's background service. Your agents keep running; the menu reconnects on its own.",
                     symbol: "bolt.horizontal.circle")
                     .padding(.horizontal, 10)
                     .padding(.top, 8)
@@ -489,7 +489,7 @@ struct AgentRow: View {
             Button("Interrupt", systemImage: "stop.circle") { Task { await model.interrupt(agent) } }
                 .disabled(!canInterrupt)
             Divider()
-            Button("Reveal Worktree in Finder", systemImage: "folder") { WorktreeActions.reveal(agent.worktree) }
+            Button("Reveal Working Copy in Finder", systemImage: "folder") { WorktreeActions.reveal(agent.worktree) }
                 .disabled(!agent.isLocal)
             Button("Open in Editor", systemImage: "chevron.left.forwardslash.chevron.right") {
                 WorktreeActions.openInEditor(agent.worktree, preferred: editor.isEmpty ? nil : editor)
@@ -512,7 +512,7 @@ struct AgentRow: View {
         guard
             confirm(
                 "Delete \(agent.ref)?",
-                detail: "This ends the agent and removes its worktree, transcripts and compartment. "
+                detail: "This ends the agent and removes its working copy, transcripts and environment. "
                     + "Its branch, \(agent.branch), is kept.",
                 action: "Delete")
         else { return }
@@ -607,7 +607,7 @@ struct EmptyMenuView: View {
                 do {
                     try await model.setMCPTailscale(true)
                 } catch {
-                    model.message = "Can't serve MCP on Tailscale: \(describe(error))"
+                    model.message = "Can't turn on MCP over Tailscale: \(describe(error))"
                 }
                 model.setupMayHaveChanged()
             }
@@ -838,7 +838,7 @@ struct OfflineView: View {
             BrandMark(lit: 0, size: 44)
                 .saturation(0)
                 .opacity(0.6)
-            Text("Can't reach vibed").font(.headline)
+            Text("Can't reach VibeOS's background service").font(.headline)
             Text("Your agents keep running. The menu reconnects on its own.")
                 .font(.callout)
                 .multilineTextAlignment(.center)
@@ -902,7 +902,7 @@ struct FooterView: View {
             }
             .buttonStyle(MenuRowStyle())
             .keyboardShortcut("q")
-            .help("Closes this menu. vibed and every agent keep running.")
+            .help("Closes this menu. VibeOS and every agent keep running in the background.")
         }
     }
 }

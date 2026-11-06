@@ -113,12 +113,9 @@ impl Core {
     }
 
     fn broker(&self) -> Result<&Arc<Services>, ErrorObject> {
-        self.services.as_ref().ok_or_else(|| {
-            error(
-                ErrorCode::CommandFailed,
-                "This vibed runs no shared services broker",
-            )
-        })
+        self.services
+            .as_ref()
+            .ok_or_else(|| error(ErrorCode::CommandFailed, "This host has no shared services"))
     }
 
     pub fn services_list(&self, p: HostParams) -> Result<ServiceList, ErrorObject> {

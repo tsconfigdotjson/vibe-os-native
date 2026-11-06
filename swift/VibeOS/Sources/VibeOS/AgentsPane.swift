@@ -64,14 +64,14 @@ struct AgentsPane: View {
                 }
                 Spacer()
                 Button("Sign In…") { signIn = PiSignInRequest(host: host, target: .native) }
-                    .help("Sign in to a provider, for these agents, with an account or an API key. No terminal.")
+                    .help("Sign in to a provider, for these agents, with an account or an API key.")
                 // A `pi` of the owner's own is theirs to update.
                 if status.native == nil || status.native?.managed == true {
                     Button(status.error != nil ? "Try Again" : status.native == nil ? "Install Pi" : "Update Pi") {
                         Task { await install(.native) }
                     }
                     .disabled(installing != nil)
-                    .help("Downloads the version of Pi VibeOS is tested with, checks it against its release's checksums, and links it at ~/.local/bin/pi. No Node, no Homebrew.")
+                    .help("Downloads the version of Pi VibeOS is tested with, and checks it before installing.")
                 }
             }
         } header: {
@@ -123,14 +123,14 @@ struct AgentsPane: View {
                 // For signing in, or in again over what an agent's left: an alert
                 // above may be sending the owner here.
                 Button("Sign In…") { signIn = PiSignInRequest(host: host, target: .vm) }
-                    .help("Sign in to a provider, for every Linux agent, with an account or an API key. No terminal.")
+                    .help("Sign in to a provider, for every Linux agent, with an account or an API key.")
                 // The version is this VibeOS's own: a new one comes with an update.
                 if vms.version == nil {
                     Button("Download Pi") {
                         Task { await install(.vm) }
                     }
                     .disabled(installing != nil)
-                    .help("Downloads the version of Pi VibeOS is tested with, checksummed, as a layer for Linux Pi agents.")
+                    .help("Downloads the version of Pi VibeOS is tested with, and checks it, for Linux Pi agents.")
                 }
             }
         } header: {

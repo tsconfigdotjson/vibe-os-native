@@ -176,7 +176,7 @@ import VibeRPC
         #expect(
             summary.notes == [
                 "A newer Linux is ready. VibeOS updates new agents to it by itself.",
-                "Left behind, as your install recipe doesn't cover them: apt: htop",
+                "Left behind, as VibeOS can't put them back: apt: htop",
             ])
         status.state = .open
         status.newestBase = 1
@@ -207,6 +207,28 @@ import VibeRPC
             // vibed still says the versions, but people aren't shown them (#150).
             #expect(words.range(of: #"\bv\d"#, options: .regularExpression) == nil, "\(state)")
         }
+    }
+
+    /// One reader, not a technical one: setup and the toolbox say what's
+    /// happening, not what's underneath (#150).
+    @Test func setupAndTheToolboxKeepToPlainWords() throws {
+        for id in [CheckId.gh, .ghGit, .linger] {
+            for passed in [true, false] {
+                let title = checkTitle(id, passed: passed)
+                #expect(!title.contains("vibed"), "\(id)")
+                #expect(!title.contains("Log in"), "\(id)")
+                #expect(!title.contains("through gh"), "\(id)")
+            }
+        }
+        let status = try decode(
+            ToolboxStatus.self,
+            [
+                "state": "closed", "base": 1, "newest_base": 2, "rebuild_held": ["apt: htop"],
+                "last": ["action": "rebuild", "at": "2026-10-30T12:00:00Z", "uncovered": ["apt: htop"]] as [String: Any],
+            ] as [String: Any])
+        let notes = ToolboxSummary(status).notes
+        #expect(notes.contains { $0.contains("VibeOS can't put back: apt: htop") })
+        #expect(!notes.joined(separator: " ").contains("recipe"))
     }
 
     /// Settings → Projects → a project, then a click in the sidebar: the
@@ -309,7 +331,7 @@ import VibeRPC
 /// The word for Tailscale, which must stay a suggestion and not promise it just works.
 @Suite struct TailscaleSuggestionTests {
     @Test func itSuggestsAndSaysWhatItNeeds() {
-        #expect(tailscaleSuggestion.contains("we suggest [Tailscale](https://tailscale.com)"))
+        #expect(tailscaleSuggestion.contains("you can use [Tailscale](https://tailscale.com)"))
         #expect(tailscaleSuggestion.contains("optional"))
         #expect(tailscaleSuggestion.contains("both machines need it installed and signed in"))
     }

@@ -482,7 +482,7 @@ async fn what_a_host_lacks_goes_in_by_itself() {
         claude: format!("file://{}", claude_releases.display()),
     };
     config.checks = Arc::new(FixedChecks {
-        claude: Err("claude isn't on your login shell's PATH".into()),
+        claude: Err("Claude Code isn't installed, or your login shell can't find it".into()),
         installs_tools: true,
         ..golden_checks()
     });

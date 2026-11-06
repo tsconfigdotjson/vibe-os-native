@@ -915,10 +915,7 @@ impl Compartment for LinuxVm {
         self.ensure_running(h)?;
         let status = self.machine.status(&self.socket(h))?;
         Ok((!status.services).then(|| {
-            format!(
-                "its VM's guest, vibe-guest {}, is too old for shared services: new agents get them once the template has moved to a base image that has them: Settings → Linux Toolbox says how that is going",
-                status.version
-            )
+            "this agent's Linux is too old for shared services: new agents get them once Linux is updated: Settings → Linux Toolbox says how that is going".to_owned()
         }))
     }
 
