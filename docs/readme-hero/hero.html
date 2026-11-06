@@ -1,21 +1,159 @@
-<!doctype html><html><head><meta charset="utf-8"><style>
-@font-face{font-family:G;src:url(__GEIST__) format("truetype");font-weight:100 900}
-@font-face{font-family:GM;src:url(__GMONO__) format("truetype");font-weight:100 900}
-html,body{margin:0;padding:0;background:#141a3a}
-#hero{position:relative;width:2560px;height:1280px;overflow:hidden;background:#1b2150 url(__ART__) center/cover no-repeat;font-family:G,sans-serif;color:#fff}
-#hero:before{content:"";position:absolute;inset:0;background:linear-gradient(90deg,rgba(14,18,48,.62) 0%,rgba(14,18,48,.34) 32%,rgba(14,18,48,0) 50%)}
-.copy{position:absolute;left:190px;top:50%;transform:translateY(-52%);width:1150px}
-.brand{display:flex;align-items:center;gap:30px;margin-bottom:70px}
-.brand img{width:104px;height:104px;border-radius:24px;box-shadow:0 0 0 2px rgba(255,255,255,.14),0 18px 40px rgba(5,8,30,.45)}
-.brand span{font-size:58px;font-weight:600;letter-spacing:-.02em;opacity:.95}
-h1{margin:0;font-size:176px;line-height:.97;font-weight:650;letter-spacing:-.045em;filter:drop-shadow(0 6px 30px rgba(10,12,40,.45))}
-h1 em{font-style:normal;background:linear-gradient(100deg,#ffe9dc 0%,#ffd3ea 40%,#a9f3fb 100%);-webkit-background-clip:text;background-clip:text;color:transparent}
-p{margin:56px 0 0;font-size:45px;line-height:1.4;font-weight:400;color:rgba(236,236,255,.80);letter-spacing:-.008em;max-width:1060px}
-.meta{margin-top:64px;font-family:GM,monospace;font-size:30px;letter-spacing:.14em;text-transform:uppercase;color:rgba(220,222,255,.58)}
-.meta b{color:#7fdde9;font-weight:500;margin:0 18px}
-</style></head><body><div id="hero"><div class="copy">
-<div class="brand"><img src="__ICON__"><span>VibeOS</span></div>
-<h1>Cloud agents<br>on your <em>Mac</em><br>and <em>VPS.</em></h1>
-<p>Hand coding work to agents that run on machines you&nbsp;control. Watch them from the menu bar, open a terminal when you want, and keep&nbsp;going.</p>
-<div class="meta">Native macOS<b>·</b>Open source<b>·</b>MIT</div>
-</div></div></body></html>
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>VibeOS README hero</title>
+<!--
+  Source of docs/images/hero.png. Hand-authored HTML, CSS and inline SVG: no raster
+  art apart from the app's own icon. Render with render.py beside this file.
+  The canvas is 1280x720 CSS pixels, captured at 2x.
+-->
+<style>
+@font-face{font-family:Fraunces;src:url(fonts/Fraunces.woff2) format("woff2");font-weight:100 900}
+@font-face{font-family:"Instrument Sans";src:url(fonts/InstrumentSans.woff2) format("woff2");font-weight:400 700}
+@font-face{font-family:"JetBrains Mono";src:url(fonts/JetBrainsMono.woff2) format("woff2");font-weight:100 800}
+:root{
+  --paper:#f5efe0; --paper-2:#e9e0ca; --ink:#17161c; --ink-2:#2a2932; --ink-3:#3a3945;
+  --red:#e5482d; --blue:#3f66f2; --gold:#f4b41a; --cyan:#5bd3e3; --brass:#c9a35a; --muted:#5c5848;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{background:transparent}
+#hero{position:relative;width:1280px;height:720px;overflow:hidden;border-radius:22px;background:var(--paper);color:var(--ink);
+  font-family:"Instrument Sans",sans-serif;-webkit-font-smoothing:antialiased}
+.abs{position:absolute}
+
+/* Masthead */
+.brand{left:56px;top:38px;display:flex;align-items:center;gap:12px;font-weight:600;font-size:25px;letter-spacing:-.01em}
+.brand img{width:38px;height:38px;border-radius:9px;display:block}
+.tag{right:56px;top:49px;font:500 15px "JetBrains Mono",monospace;letter-spacing:.09em;text-transform:uppercase;color:var(--muted)}
+h1{left:53px;top:82px;font:600 100px/1.05 Fraunces,serif;letter-spacing:-.035em;
+  font-variation-settings:"opsz" 144,"SOFT" 40,"WONK" 1}
+h1 i{display:inline-block;position:relative;width:24px;height:24px;margin-left:5px;border-radius:50%;background:var(--red);border:3px solid var(--ink)}
+h1 i:after{content:"";position:absolute;left:3px;top:3px;width:6px;height:6px;border-radius:50%;background:#fff;opacity:.5}
+.dek{left:776px;top:112px;width:448px;font-size:29px;line-height:1.26;font-weight:500;letter-spacing:-.012em}
+.dek b{font-weight:700}
+.rule{left:56px;right:56px;top:310px;height:2px;background:var(--ink)}
+
+/* Step captions */
+.step{top:326px;font:600 15px "JetBrains Mono",monospace;letter-spacing:.09em;text-transform:uppercase;color:var(--muted)}
+
+/* Grok Bot's request */
+.bubble{left:56px;top:352px;width:318px;padding:20px 24px 22px;background:var(--gold);border-radius:22px}
+.bubble:before{content:"";position:absolute;left:34px;bottom:-20px;border-left:0 solid transparent;border-right:30px solid transparent;border-top:22px solid var(--gold)}
+.alt{left:56px;top:640px;width:330px;font-size:21px;line-height:1.24;font-weight:500;letter-spacing:-.008em;color:var(--muted)}
+.bubble strong{display:block;font-size:32px;font-weight:700;letter-spacing:-.02em;line-height:1.05}
+.bubble span{display:block;margin-top:12px;font:500 27px/1.16 Fraunces,serif;letter-spacing:-.012em;
+  font-variation-settings:"opsz" 40,"SOFT" 60,"WONK" 1}
+
+/* The switchboard */
+.panel{left:430px;top:352px;width:404px;height:340px;background:var(--ink);border-radius:18px}
+.plate{left:452px;top:370px;width:360px;height:66px;background:var(--paper);border-radius:7px;display:flex;align-items:center;gap:14px;padding:0 20px}
+.plate i{display:block;width:16px;height:30px;border-radius:2px;background:#22b5c9}
+.plate strong{font-size:33px;font-weight:700;letter-spacing:-.02em;white-space:nowrap}
+.screw{width:10px;height:10px;border-radius:50%;background:var(--ink-3)}
+
+/* Machines */
+.machine{left:934px;width:290px;border-radius:14px;background:var(--ink);padding:12px 14px 14px 14px}
+.machine h2{font-size:27px;font-weight:700;letter-spacing:-.018em;color:var(--paper);padding:0 2px 9px;display:flex;align-items:center;justify-content:space-between}
+.row{height:42px;margin-top:7px;border-radius:7px;background:var(--ink-2);display:flex;align-items:center;padding-left:44px;
+  font:600 22px "JetBrains Mono",monospace;letter-spacing:-.025em;color:var(--paper)}
+.row:after{content:"";width:10px;height:22px;margin-left:9px;border-radius:1px;background:var(--cyan)}
+.mac{top:352px}
+.base{left:908px;top:520px;width:342px;height:14px;background:var(--ink);border-radius:2px 2px 12px 12px}
+.base:after{content:"";position:absolute;left:141px;top:0;width:60px;height:5px;border-radius:0 0 6px 6px;background:var(--ink-3)}
+.vps{top:546px;border-radius:6px;padding-top:7px;padding-bottom:9px;height:146px}
+.vps h2{padding-bottom:4px}
+.vps .row{height:37px;margin-top:5px}
+.vents{display:block;width:92px;height:16px;background:repeating-linear-gradient(90deg,var(--ink-3) 0 3px,transparent 3px 8px)}
+svg{left:0;top:0}
+</style>
+</head>
+<body>
+<div id="hero">
+  <div class="abs brand"><img src="../../swift/VibeOS/Support/AppIcon.iconset/icon_128x128@2x.png" alt="">VibeOS</div>
+  <div class="abs tag">Open source · MIT</div>
+
+  <h1 class="abs">Run your own<br>cloud agents<i></i></h1>
+  <p class="abs dek">On your Mac and your VPS, with one private <b>MCP connection</b> to all of them. Put <b>Grok Bot</b> through to <b>Claude&nbsp;Code</b> or <b>Pi</b>.</p>
+  <div class="abs rule"></div>
+
+  <div class="abs step" style="left:56px">Ask from your bot</div>
+  <div class="abs step" style="left:430px">One connection</div>
+  <div class="abs step" style="left:934px">Your machines</div>
+
+  <div class="abs bubble"><strong>Grok Bot</strong><span>“Fix the flaky tests<br>on my VPS.”</span></div>
+
+  <div class="abs alt">Or any MCP client that<br>can use an API key.</div>
+
+  <div class="abs panel"></div>
+  <div class="abs plate"><i></i><strong>VibeOS MCP</strong></div>
+  <div class="abs screw" style="left:437px;top:359px"></div>
+  <div class="abs screw" style="left:817px;top:359px"></div>
+  <div class="abs screw" style="left:437px;top:675px"></div>
+  <div class="abs screw" style="left:817px;top:675px"></div>
+
+  <div class="abs machine mac"><h2>Your Mac</h2><div class="row">Claude Code</div><div class="row">Pi</div></div>
+  <div class="abs base"></div>
+  <div class="abs machine vps"><h2>Your VPS<span class="vents"></span></h2><div class="row">Claude Code</div><div class="row">Pi</div></div>
+
+  <svg class="abs" width="1280" height="720" viewBox="0 0 1280 720" fill="none">
+    <defs>
+      <g id="jack"><circle r="21" fill="#c9a35a"/><circle r="15" fill="#0c0b10"/></g>
+      <g id="port"><circle r="12" fill="#c9a35a"/><circle r="7" fill="#0c0b10"/></g>
+    </defs>
+
+    <!-- Jack field: rows at 496, 568, 640; a lamp above each jack. -->
+    <g id="field">
+      <use href="#jack" x="492" y="496"/><use href="#jack" x="584" y="496"/><use href="#jack" x="676" y="496"/><use href="#jack" x="768" y="496"/>
+      <use href="#jack" x="492" y="568"/><use href="#jack" x="584" y="568"/><use href="#jack" x="676" y="568"/><use href="#jack" x="768" y="568"/>
+      <use href="#jack" x="492" y="640"/><use href="#jack" x="584" y="640"/><use href="#jack" x="676" y="640"/><use href="#jack" x="768" y="640"/>
+    </g>
+    <g fill="#3a3945">
+      <circle cx="492" cy="461" r="5"/><circle cx="584" cy="461" r="5" /><circle cx="676" cy="461" r="5" fill="#e5482d"/><circle cx="768" cy="461" r="5" fill="#3f66f2"/>
+      <circle cx="492" cy="533" r="5" fill="#f4b41a"/><circle cx="584" cy="533" r="5"/><circle cx="676" cy="533" r="5" fill="#e5482d"/><circle cx="768" cy="533" r="5" fill="#3f66f2"/>
+      <circle cx="492" cy="605" r="5"/><circle cx="584" cy="605" r="5"/><circle cx="676" cy="605" r="5"/><circle cx="768" cy="605" r="5"/>
+    </g>
+
+    <!-- Ports on the machines -->
+    <use href="#port" x="934" y="418"/><use href="#port" x="934" y="467"/>
+    <use href="#port" x="934" y="607"/><use href="#port" x="934" y="649"/>
+
+    <!-- Outgoing cords: outline, colour, highlight. -->
+    <g stroke-linecap="round">
+      <g id="cords-under" stroke="#17161c" stroke-width="12">
+        <path d="M676 496 C 690 538, 774 532, 830 502 C 872 478, 900 428, 934 418"/>
+        <path d="M768 496 C 806 538, 896 526, 934 467"/>
+        <path d="M676 568 C 684 622, 836 628, 934 607"/>
+        <path d="M768 568 C 806 596, 846 694, 934 649"/>
+      </g>
+      <path stroke="#e5482d" stroke-width="8" d="M676 496 C 690 538, 774 532, 830 502 C 872 478, 900 428, 934 418"/>
+      <path stroke="#3f66f2" stroke-width="8" d="M768 496 C 806 538, 896 526, 934 467"/>
+      <path stroke="#e5482d" stroke-width="8" d="M676 568 C 684 622, 836 628, 934 607"/>
+      <path stroke="#3f66f2" stroke-width="8" d="M768 568 C 806 596, 846 694, 934 649"/>
+    </g>
+
+    <!-- Incoming cord from Grok Bot, with one loop for the joy of it. -->
+    <g stroke-linecap="round">
+      <path stroke="#17161c" stroke-width="13" d="M170 504 C 172 590, 292 628, 342 586 C 388 546, 336 506, 314 552 C 296 594, 424 632, 492 568"/>
+      <path stroke="#f4b41a" stroke-width="9" d="M170 504 C 172 590, 292 628, 342 586 C 388 546, 336 506, 314 552 C 296 594, 424 632, 492 568"/>
+    </g>
+
+    <!-- The collar where the cord leaves the bubble. -->
+    <rect x="152" y="493" width="36" height="17" rx="3" fill="#17161c"/>
+
+    <!-- Plug heads, front-on in each jack, and in each machine's port. -->
+    <g>
+      <circle cx="492" cy="568" r="16" fill="#f4b41a" stroke="#17161c" stroke-width="3"/><circle cx="487" cy="563" r="4" fill="#fff" opacity=".55"/>
+      <circle cx="676" cy="496" r="16" fill="#e5482d" stroke="#17161c" stroke-width="3"/><circle cx="671" cy="491" r="4" fill="#fff" opacity=".45"/>
+      <circle cx="768" cy="496" r="16" fill="#3f66f2" stroke="#17161c" stroke-width="3"/><circle cx="763" cy="491" r="4" fill="#fff" opacity=".45"/>
+      <circle cx="676" cy="568" r="16" fill="#e5482d" stroke="#17161c" stroke-width="3"/><circle cx="671" cy="563" r="4" fill="#fff" opacity=".45"/>
+      <circle cx="768" cy="568" r="16" fill="#3f66f2" stroke="#17161c" stroke-width="3"/><circle cx="763" cy="563" r="4" fill="#fff" opacity=".45"/>
+      <circle cx="934" cy="418" r="11" fill="#e5482d" stroke="#17161c" stroke-width="3"/>
+      <circle cx="934" cy="467" r="11" fill="#3f66f2" stroke="#17161c" stroke-width="3"/>
+      <circle cx="934" cy="607" r="11" fill="#e5482d" stroke="#17161c" stroke-width="3"/>
+      <circle cx="934" cy="649" r="11" fill="#3f66f2" stroke="#17161c" stroke-width="3"/>
+    </g>
+  </svg>
+</div>
+</body>
+</html>
