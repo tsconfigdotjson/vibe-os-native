@@ -301,7 +301,13 @@ impl Command {
 
     /// From the words after `host`.
     pub(crate) fn parse_host(words: &[String]) -> Result<Command, String> {
-        let (plain, _) = flags(words, &[])?;
+        // The one flag here with no value, so it's out before `flags` looks for one.
+        let force = words.iter().any(|w| w == "--force");
+        let rest: Vec<String> = words.iter().filter(|w| *w != "--force").cloned().collect();
+        let (plain, _) = flags(&rest, &[])?;
+        if force && !matches!(plain.first(), Some(&"remove" | &"rm")) {
+            return Err("--force only goes with host remove".into());
+        }
         match plain.as_slice() {
             [] | ["list" | "ls"] => Ok(Command::Hosts),
             ["add", name, address] => Ok(Command::AddHost {
@@ -311,14 +317,8 @@ impl Command {
             ["upgrade", name] => Ok(Command::UpgradeHost((*name).to_owned())),
             ["remove" | "rm", name] => Ok(Command::RemoveHost {
                 host: (*name).to_owned(),
-                force: false,
+                force,
             }),
-            ["remove" | "rm", name, "--force"] | ["remove" | "rm", "--force", name] => {
-                Ok(Command::RemoveHost {
-                    host: (*name).to_owned(),
-                    force: true,
-                })
-            }
             _ => Err(
                 "host takes list, add NAME SSH-DESTINATION, upgrade NAME, or remove NAME [--force]"
                     .into(),
@@ -914,6 +914,18 @@ mod tests {
                 force: false
             })
         );
+        assert_eq!(
+            Command::parse_host(&words(&["rm", "--force", "vps"])),
+            Ok(Command::RemoveHost {
+                host: "vps".into(),
+                force: true
+            })
+        );
+        // It's for nothing else, and takes no value.
+        assert!(Command::parse_host(&words(&["upgrade", "vps", "--force"])).is_err());
+        assert!(Command::parse_host(&words(&["--force"])).is_err());
+        assert!(Command::parse_host(&words(&["remove", "vps", "--force=yes"])).is_err());
+        assert!(Command::parse_host(&words(&["remove", "--force"])).is_err());
         // A retired command is an error, not a way back in.
         assert!(Command::parse_host(&words(&["external", "vps", "vps.example.com"])).is_err());
         assert!(Command::parse_host(&words(&["external", "vps", "off"])).is_err());

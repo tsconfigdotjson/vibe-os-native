@@ -1858,6 +1858,11 @@ fn a_hosts_state_is_kept_body(watch: &Watch) {
     assert!(said(&out).contains("nothing was run"), "{}", said(&out));
     assert!(said(&out).contains("vps.test"), "{}", said(&out));
     assert!(!ran.exists());
+
+    // `--force` gets from the command line to vibed, which takes it.
+    let forgot = ok(vibe(&mac.socket, &["host", "remove", "vps", "--force"]));
+    assert!(forgot.contains("removed vps"), "{forgot}");
+    assert!(!ok(vibe(&mac.socket, &["host"])).contains("vps  "));
     drop(mac.rt);
 }
 

@@ -681,6 +681,16 @@ mod tests {
             })
         );
         assert_eq!(
+            parse(&["host", "remove", "vps", "--force", "--socket=/s"]),
+            Ok(Args::Run {
+                socket: Some("/s".into()),
+                command: Command::Setup(setup::Command::RemoveHost {
+                    host: "vps".into(),
+                    force: true,
+                }),
+            })
+        );
+        assert_eq!(
             parse(&["--socket=/s", "host", "add", "vps", "me@vps"]),
             Ok(Args::Run {
                 socket: Some("/s".into()),
