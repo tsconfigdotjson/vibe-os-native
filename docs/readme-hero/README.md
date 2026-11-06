@@ -1,5 +1,5 @@
-# README hero source
+# README hero sources
 
-- `banner.html` — presentation HTML/CSS framing real gallery screenshots (not a mocked UI).
-- Built PNG in repo: `../images/hero-retina.png` (2560×1280, Playwright `#banner` capture, device scale).
-- Demo screenshots are FixtureDaemon `--demo` only (Larkfield Labs).
+- `hero.png` (in `../images/`): composed illustration for the README hero (not a Retina app capture).
+- `art-b-2560.jpg`, `hero.html`: source art and HTML used to produce the hero.
+- App screenshots elsewhere in `../images/` are genuine built-in-display Retina gallery captures (`--demo` fixtures).
