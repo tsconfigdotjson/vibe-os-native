@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use vibe_core::model::{AgentKind, Environment, Mode, Model, PiTarget, Reasoning};
 use vibe_core::rpc::{
-    HostAddParams, HostInfo, HostInstall, HostLink, HostNameParams, HostParams, HostsAdd,
-    HostsList, HostsRemove, HostsUpgrade, NoParams, PiForget, PiForgetParams, PiInstall,
+    HostAddParams, HostInfo, HostInstall, HostLink, HostNameParams, HostParams, HostRemoveParams,
+    HostsAdd, HostsList, HostsRemove, HostsUpgrade, NoParams, PiForget, PiForgetParams, PiInstall,
     PiInstallParams, PiStatus, PiStatusGet, Profile, ProfileCreateParams, ProfileParams,
     ProfileUpdateParams, ProfilesCreate, ProfilesDelete, ProfilesList, ProfilesUpdate, Project,
     ProjectAddParams, ProjectParams, ProjectRemoveParams, ProjectsAdd, ProjectsList,
@@ -94,7 +94,10 @@ pub(crate) enum Command {
         address: String,
     },
     UpgradeHost(String),
-    RemoveHost(String),
+    RemoveHost {
+        host: String,
+        force: bool,
+    },
 }
 
 /// Words, and `--flag value` pairs, from a command line.
@@ -306,9 +309,19 @@ impl Command {
                 address: (*address).to_owned(),
             }),
             ["upgrade", name] => Ok(Command::UpgradeHost((*name).to_owned())),
-            ["remove" | "rm", name] => Ok(Command::RemoveHost((*name).to_owned())),
+            ["remove" | "rm", name] => Ok(Command::RemoveHost {
+                host: (*name).to_owned(),
+                force: false,
+            }),
+            ["remove" | "rm", name, "--force"] | ["remove" | "rm", "--force", name] => {
+                Ok(Command::RemoveHost {
+                    host: (*name).to_owned(),
+                    force: true,
+                })
+            }
             _ => Err(
-                "host takes list, add NAME SSH-DESTINATION, upgrade NAME, or remove NAME".into(),
+                "host takes list, add NAME SSH-DESTINATION, upgrade NAME, or remove NAME [--force]"
+                    .into(),
             ),
         }
     }
@@ -445,7 +458,11 @@ pub(crate) fn describe_host(h: &HostInfo) -> String {
         out.push_str("  needs sudo there once: Settings → Hosts has the button");
     }
     if let Some(why) = &h.upgrade_error {
-        out.push_str(&format!("  upgrading it failed: {why}"));
+        if h.upgrade_held {
+            out.push_str(&format!("  not updated: {why}"));
+        } else {
+            out.push_str(&format!("  upgrading it failed: {why}"));
+        }
     }
     out
 }
@@ -664,9 +681,12 @@ pub(crate) fn run(socket: &Path, command: Command) -> Result<(), String> {
                 .map_err(e)?;
             print!("{}", describe_install(&i));
         }
-        Command::RemoveHost(host) => {
-            let h = client::call::<HostsRemove>(socket, &HostNameParams { host }, TIMEOUT)
-                .map_err(e)?;
+        Command::RemoveHost { host, force } => {
+            let params = HostRemoveParams {
+                host,
+                force: force.then_some(true),
+            };
+            let h = client::call::<HostsRemove>(socket, &params, TIMEOUT).map_err(e)?;
             println!(
                 "removed {}; vibed and its agents run on there, on their own",
                 h.name
@@ -822,7 +842,10 @@ mod tests {
         );
         assert_eq!(
             Command::parse_host(&words(&["rm", "vps"])),
-            Ok(Command::RemoveHost("vps".into()))
+            Ok(Command::RemoveHost {
+                host: "vps".into(),
+                force: false
+            })
         );
         assert!(Command::parse_host(&words(&["add", "vps"])).is_err());
     }
@@ -870,11 +893,26 @@ mod tests {
             memory: None,
             needs_admin: vec![],
             upgrade_error: None,
+            upgrade_held: false,
             sign_ins: vec![],
         };
         assert_eq!(
             describe_host(&h),
             "vps  vps-1 (linux)  down: it stopped answering  ssh me@vps  vibed 0.1.0  missing claude"
+        );
+        assert_eq!(
+            Command::parse_host(&words(&["remove", "vps", "--force"])),
+            Ok(Command::RemoveHost {
+                host: "vps".into(),
+                force: true
+            })
+        );
+        assert_eq!(
+            Command::parse_host(&words(&["rm", "vps"])),
+            Ok(Command::RemoveHost {
+                host: "vps".into(),
+                force: false
+            })
         );
         // A retired command is an error, not a way back in.
         assert!(Command::parse_host(&words(&["external", "vps", "vps.example.com"])).is_err());

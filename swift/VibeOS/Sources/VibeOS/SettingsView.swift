@@ -1121,7 +1121,7 @@ struct HostsPane: View {
                 ForEach(model.hosts, id: \.name) { host in
                     HostRow(
                         host: host, updating: updating == host.name,
-                        upgrade: { Task { await upgrade(host.name) } },
+                        upgrade: { Task { await upgrade(host) } },
                         allow: { Task { await model.allowOnHost(host.name) } },
                         signIn: { what in
                             model.signInRequest = SignInRequest(
@@ -1148,11 +1148,20 @@ struct HostsPane: View {
         return "This Mac has no Tailscale address now; MCP is served there once it has one."
     }
 
-    private func upgrade(_ name: String) async {
-        updating = name
+    private func upgrade(_ host: HostInfo) async {
+        if host.upgradeHeld == true {
+            guard
+                confirm(
+                    "Update \(host.name)?",
+                    detail: "Its public MCP address stops answering as soon as it's updated, and nothing replaces "
+                        + "it. Move anything that uses that address first.",
+                    action: "Update")
+            else { return }
+        }
+        updating = host.name
         defer { updating = nil }
         do {
-            _ = try await model.upgradeHost(name)
+            _ = try await model.upgradeHost(host.name)
             error = nil
         } catch {
             self.error = describe(error)
@@ -1163,13 +1172,36 @@ struct HostsPane: View {
         guard
             confirm(
                 "Remove \(name)?",
-                detail: "This Mac forgets it and its agents, and its API keys stop working there. Otherwise nothing "
+                detail: "This Mac forgets it and its agents, and takes its API keys off it if it can. Otherwise nothing "
                     + "changes on the server: vibed and its agents run on there, with their own MCP, and you can add "
                     + "it again later.",
                 action: "Remove")
         else { return }
         do {
             try await model.removeHost(name)
+            error = nil
+        } catch VibedClientError.rpc(let refused) where refused.code == RPCErrorCode.conflict.rawValue {
+            await removeAnyway(name, refused: refused.message)
+        } catch {
+            self.error = describe(error)
+        }
+    }
+
+    /// vibed won't forget a host that may still serve publicly with this Mac's keys out of
+    /// reach. If it's gone for good, that's for someone to say, knowing what's left.
+    private func removeAnyway(_ name: String, refused: String) async {
+        guard
+            confirm(
+                "Remove \(name) anyway?",
+                detail: "\(sentence(refused)) This Mac's API keys may go on working there until you revoke them "
+                    + "on the host with vibe key revoke.",
+                action: "Remove Anyway")
+        else {
+            error = sentence(refused)
+            return
+        }
+        do {
+            try await model.removeHost(name, force: true)
             error = nil
         } catch {
             self.error = describe(error)
@@ -1232,7 +1264,9 @@ struct HostRow: View {
                         .foregroundStyle(Palette.attention)
                 }
                 if let why = host.upgradeError {
-                    Label("Can't update vibed: \(sentence(why))", systemImage: "exclamationmark.triangle")
+                    Label(
+                        host.upgradeHeld == true ? sentence(why) : "Can't update vibed: \(sentence(why))",
+                        systemImage: "exclamationmark.triangle")
                         .font(.caption)
                         .foregroundStyle(Palette.attention)
                         .lineLimit(3)
@@ -1254,8 +1288,11 @@ struct HostRow: View {
                         .help("Opens Terminal, where sudo on \(host.name) asks for its password. VibeOS never sees it.")
                 }
                 if host.upgradeError != nil {
-                    Button("Retry", action: upgrade)
-                        .help("VibeOS tries again by itself every hour too.")
+                    Button(host.upgradeHeld == true ? "Update…" : "Retry", action: upgrade)
+                        .help(
+                            host.upgradeHeld == true
+                                ? "VibeOS won't update it by itself, as that would end its public MCP address."
+                                : "VibeOS tries again by itself every hour too.")
                 }
                 Menu {
                     Button("Remove \(host.name)…", role: .destructive, action: remove)

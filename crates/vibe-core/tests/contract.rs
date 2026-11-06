@@ -163,6 +163,7 @@ fn rust_types() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
         entry::<HostList>(),
         entry::<HostAddParams>(),
         entry::<HostNameParams>(),
+        entry::<HostRemoveParams>(),
         entry::<HostInstall>(),
         entry::<HostAdmin>(),
         entry::<SignInStartParams>(),
@@ -848,9 +849,15 @@ fn examples_cover_the_contract() {
         // The same of an upgrade.
         if ty == "HostInfo" {
             seen_keys.insert("upgrade_error");
+            seen_keys.insert("upgrade_held");
             // Only one still to be signed in to says so; the examples' hosts have no
             // live link.
             seen_keys.insert("sign_ins");
+        }
+        // Only a host that may still serve External Address needs it; vibed's own tests
+        // cover it.
+        if ty == "HostRemoveParams" {
+            seen_keys.insert("force");
         }
         // Only a flow that's said something has these, which takes a real person.
         if ty == "SignIn" {

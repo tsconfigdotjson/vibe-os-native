@@ -16,8 +16,8 @@ use vibe_core::model::{
 };
 use vibe_core::rpc::{
     Agent, AgentList, AgentsList, ApiKey, ErrorCode, ErrorObject, HostAddParams, HostAdmin,
-    HostInfo, HostInstall, HostList, HostNameParams, KeyList, KeySyncParams, KeysList, KeysSync,
-    Method, NoParams,
+    HostInfo, HostInstall, HostList, HostNameParams, HostRemoveParams, KeyList, KeySyncParams,
+    KeysList, KeysSync, Method, NoParams,
 };
 use vibe_core::time::parse_rfc3339;
 
@@ -184,6 +184,7 @@ impl Core {
                 }
                 let upgrade = lock(&link.upgrade);
                 h.upgrade_error.clone_from(&upgrade.error);
+                h.upgrade_held = upgrade.held;
                 if h.link == HostLink::Down {
                     if upgrade.running {
                         h.detail = Some("VibeOS is upgrading its vibed".to_owned());
@@ -315,6 +316,7 @@ impl Core {
             memory: None,
             needs_admin: installed.needs_admin.clone(),
             upgrade_error: None,
+            upgrade_held: false,
             sign_ins: Vec::new(),
         };
         self.store()
@@ -368,6 +370,8 @@ impl Core {
         {
             let mut upgrade = lock(&link.upgrade);
             upgrade.running = true;
+            // Someone's chosen, which is all a hold was waiting for.
+            upgrade.held = false;
             upgrade.tried_at = Some(std::time::Instant::now());
             upgrade.reconnected = false;
         }
@@ -468,15 +472,38 @@ impl Core {
     }
 
     /// Forgets a Linux host. It runs on there, on its own.
-    pub async fn remove_host(&self, p: HostNameParams) -> Result<HostInfo, ErrorObject> {
+    pub async fn remove_host(&self, p: HostRemoveParams) -> Result<HostInfo, ErrorObject> {
         let link = self.linux_host(&p.host)?;
         let info = self.host_info(&p.host)?;
-        // A host on a build from before External Address was retired can still be
-        // serving publicly, and with its link down it keeps this Mac's keys.
-        if !link.connected() && self.store().host_had_external(&p.host).unwrap_or(false) {
+        // It may still serve publicly, on a build from before External Address was retired,
+        // with the keys this Mac pushed. Forgotten with those still there, a revoke here
+        // could never reach it, so it has to be told first. If it's gone for good, `force`
+        // says that's understood.
+        let public = link.reported().is_some_and(|own| own.external)
+            || self
+                .store()
+                .host_had_external(&p.host)
+                .map_err(store_error)?;
+        let force = p.force == Some(true);
+        let cant_tell = |why: String| {
+            error(
+                ErrorCode::Conflict,
+                format!(
+                    "{} may still serve publicly with this Mac's API keys and {why}, so they'd go \
+                     on working there: remove it once it's back. If it's gone for good, remove \
+                     it anyway, and revoke them on the host with vibe key revoke if it ever \
+                     comes back",
+                    p.host
+                ),
+            )
+        };
+        if public && !link.connected() {
+            if !force {
+                return Err(cant_tell("its link is down".into()));
+            }
             crate::log!(
-                "vibed: forgetting {} with its link down: if it's still on an older build, it \
-                 may go on serving publicly with this Mac's API keys, out of reach of a revoke",
+                "vibed: {} forgotten with its link down, as asked: it may go on serving publicly \
+                 with this Mac's API keys until they're revoked there",
                 p.host
             );
         }
@@ -494,6 +521,12 @@ impl Core {
                 )
                 .await
         {
+            if public && !force {
+                return Err(cant_tell(format!(
+                    "it wouldn't take them off: {}",
+                    e.message
+                )));
+            }
             crate::log!(
                 "vibed: can't take this Mac's keys off {}: {}; revoke them there with vibe key",
                 link.name,
@@ -691,6 +724,9 @@ impl Core {
             info.label = own.label.clone();
             info.missing = own.missing.clone();
             info.needs_admin = own.needs_admin.clone();
+            if let Err(e) = self.store().note_host_external(&link.name, own.external) {
+                crate::log!("vibed: can't record what {} said: {e}", link.name);
+            }
         }
         if version.is_some() {
             info.version = version;
@@ -720,6 +756,7 @@ impl Core {
             memory: None,
             needs_admin: Vec::new(),
             upgrade_error: None,
+            upgrade_held: false,
             sign_ins: Vec::new(),
         });
         e.state = Some(info.link.to_string());
@@ -763,6 +800,7 @@ impl Core {
                     upgrade.tried_at = None;
                     upgrade.reconnected = false;
                     upgrade.went_back_to = None;
+                    upgrade.held = false;
                     upgrade.error.take().is_some()
                 }
             };
@@ -775,13 +813,35 @@ impl Core {
     /// Installs this build on `link`'s host, with nobody asked, as when it runs an
     /// older version, speaks an older protocol or has no `vibed` to talk to: unless
     /// that's under way, or too soon after the last try, however that went, or the host
-    /// runs a newer one. What went wrong shows in its row, with **Retry**.
-    pub(crate) fn upgrade_in_background(&self, link: &Arc<Link>) {
+    /// runs a newer one, or may still serve External Address, which this build would end
+    /// ([`Self::upgrade_hold`]). What went wrong shows in its row, with **Retry**.
+    pub fn upgrade_in_background(&self, link: &Arc<Link>) {
         if self.host_is_newer(link) {
+            return;
+        }
+        if let Some(why) = self.upgrade_hold(link) {
+            let changed = {
+                let mut upgrade = lock(&link.upgrade);
+                if upgrade.running {
+                    return;
+                }
+                let changed = !upgrade.held || upgrade.error.as_deref() != Some(why.as_str());
+                upgrade.held = true;
+                upgrade.error = Some(why.clone());
+                changed
+            };
+            if changed {
+                crate::log!("vibed: not upgrading {}: {why}", link.name);
+                self.host_link_changed(link);
+            }
             return;
         }
         {
             let mut upgrade = lock(&link.upgrade);
+            if upgrade.held {
+                upgrade.held = false;
+                upgrade.error = None;
+            }
             if upgrade.running || upgrade.too_soon(&self.link_timing) {
                 return;
             }
@@ -800,6 +860,37 @@ impl Core {
                 crate::log!("vibed: can't upgrade {}: {}", link.name, e.message);
             }
         });
+    }
+
+    /// Why `link`'s host mustn't be upgraded with nobody asked, if it mustn't: upgrading a
+    /// host still on a build from before External Address was retired (#143) would end
+    /// what its clients reach it by, with no one told. Nothing's known to say it's safe
+    /// counts as not safe, but for a host with no link to say anything, which has no
+    /// `vibed` to speak of and nothing on record.
+    fn upgrade_hold(&self, link: &Link) -> Option<String> {
+        let name = &link.name;
+        let serving = format!(
+            "{name} still serves External Address on an older vibed, and updating it would end \
+             that, so it isn't updated by itself. Move its MCP clients, then update it from \
+             Settings → Hosts or with vibe host upgrade {name}"
+        );
+        let unknown = format!(
+            "VibeOS can't tell whether {name} still serves External Address, which updating it \
+             would end, so it isn't updated by itself. Update it from Settings → Hosts or with \
+             vibe host upgrade {name} if nothing depends on that"
+        );
+        if let Some(own) = link.reported() {
+            return own.external.then_some(serving);
+        }
+        match self.store().host_had_external(name) {
+            Ok(true) => Some(serving),
+            Ok(false) if link.connected() => Some(unknown),
+            Ok(false) => None,
+            Err(e) => {
+                crate::log!("vibed: can't read what's recorded of {name}: {e}");
+                Some(unknown)
+            }
+        }
     }
 
     /// The link's still finding no `vibed`, with nothing under way to put that right

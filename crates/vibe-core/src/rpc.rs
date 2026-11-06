@@ -521,7 +521,7 @@ method! {
 method! {
     /// `hosts.remove`: forgets a Linux host and ends its link. Nothing on
     /// the server changes: its `vibed` and agents run on, on their own.
-    HostsRemove = "hosts.remove", HostNameParams => HostInfo
+    HostsRemove = "hosts.remove", HostRemoveParams => HostInfo
 }
 
 method! {
@@ -901,6 +901,10 @@ pub struct HostInfo {
     /// It tries again by itself; `hosts.upgrade` is **Retry**.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upgrade_error: Option<String>,
+    /// `upgrade_error` says why it's held from upgrading by itself: this build would
+    /// end what it serves, so `hosts.upgrade` is for someone to choose.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub upgrade_held: bool,
 }
 
 /// The sign-ins this build knows of those a host names.
@@ -987,6 +991,16 @@ pub struct HostAddParams {
 #[serde(deny_unknown_fields)]
 pub struct HostNameParams {
     pub host: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostRemoveParams {
+    pub host: String,
+    /// Forgets it though it may still serve External Address, on an older build, with
+    /// this Mac's API keys, which then stay there until revoked with `vibe key revoke`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub force: Option<bool>,
 }
 
 /// How an install over SSH went.

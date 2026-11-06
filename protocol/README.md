@@ -98,7 +98,11 @@ While the link is down such a call fails with `host_unavailable`, except
 it runs, what it's `missing` of `git`, `gh` and `claude`, and whether it serves
 MCP now, on loopback at least, for the menu's header. `external` is retired: it's
 always `false`, and only sent for an older Mac that can't read a host's row
-without it. `mcp.changed` says when that changes, and
+without it. A host that still says `external: true`, on a build from before that, isn't
+upgraded by itself: its `upgrade_error` says why and `upgrade_held` is true, and
+`hosts.upgrade` is how someone chooses to. `hosts.remove` is refused with `conflict`
+while such a host's link is down or it won't take this Mac's keys off, unless `force`
+says that's understood. `mcp.changed` says when that changes, and
 `host.added`, `host.removed` and `host.link` when the hosts or their links
 do. A Linux host's events come onto the Mac's stream under its name. The Mac
 pushes its API keys to each linked host by their hashes (`keys.sync`), so

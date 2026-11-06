@@ -112,14 +112,16 @@ It's retired ([#143](https://github.com/tsconfigdotjson/vibe-os-native/issues/14
 and nothing replaces it as a public path.
 
 > [!WARNING]
-> Upgrading ends it, with no prompt. A Mac upgrades its linked hosts by itself, and a
-> host's `https://<domain>/mcp` stops answering as soon as its `vibed` is the new one.
-> Move anything that uses that URL first.
+> Upgrading the Mac ends the tunnel at once, so outside clients lose the Mac's agents. A
+> linked host that still serves External Address is **not** upgraded by itself: it goes on
+> serving its own agents publicly, and Settings → Hosts says it's waiting for you. Choosing
+> **Update…** there, or `vibe host upgrade NAME`, ends its `https://<domain>/mcp`. Move
+> anything that uses that URL first.
 
 **What changes:**
 
-- `vibed` no longer listens on port 443, asks Let's Encrypt for a certificate or
-  keeps an `ssh -R` tunnel. The old tunnel ends with the old `vibed` on the Mac.
+- An upgraded `vibed` no longer listens on port 443, asks Let's Encrypt for a certificate
+  or keeps an `ssh -R` tunnel. The old tunnel ends with the old `vibed` on the Mac.
 - A client on another machine can no longer reach the Mac's agents through a Linux
   host. Agents named `mac:<ref>` are gone from a host's MCP.
 - `vibe host external` and the Settings controls are gone.
@@ -131,9 +133,11 @@ Tailscale option all carry on as they were.
 is the closest match for a client on another machine. For a client on the server
 itself, use its loopback URL.
 
-**Before you forget a host:** let it upgrade first, or run `vibe host external local off`
-on it. A host that's still on an older build, with its link down, can go on serving
-publicly with your API keys, where a revoke from the Mac can't reach it.
+**Forgetting a host that may still serve it:** VibeOS refuses while the host's link is down
+or it won't take your API keys off, because they'd go on working there, out of reach of a
+revoke from the Mac. Once it's back, remove it again. If it's gone for good, choose **Remove
+Anyway** or use `vibe host remove NAME --force`, and if it ever comes back, revoke those keys
+on it with `vibe key revoke`.
 
 **Clearing up.** `vibed` deletes nothing. If it finds External Address settings or
 certificates, it logs a note at each start. What's left is inert, and these are yours to

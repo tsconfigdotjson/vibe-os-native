@@ -695,7 +695,7 @@ public enum SignInCancel: RPCMethod {
 /// `hosts.remove`: forgets a Linux host and ends its link; nothing on the
 /// server changes.
 public enum HostsRemove: RPCMethod {
-    public typealias Params = HostNameParams
+    public typealias Params = HostRemoveParams
     public typealias Result = HostInfo
     public static let name = "hosts.remove"
 }
@@ -1106,6 +1106,10 @@ public struct HostInfo: Codable, Hashable, Sendable {
     /// Why upgrading this Linux host's vibed failed, the last time this Mac tried.
     /// It tries again by itself; `hosts.upgrade` is Retry.
     public var upgradeError: String?
+    /// `upgradeError` says why it's held from upgrading by itself: updating it would end
+    /// External Address, which an older build there may still serve. It waits for someone
+    /// to choose `hosts.upgrade`.
+    public var upgradeHeld: Bool?
 
     public enum CodingKeys: String, CodingKey, CaseIterable {
         case name, os, label, link, external, mcp, address, version, missing, detail
@@ -1113,6 +1117,7 @@ public struct HostInfo: Codable, Hashable, Sendable {
         case needsAdmin = "needs_admin"
         case signIns = "sign_ins"
         case upgradeError = "upgrade_error"
+        case upgradeHeld = "upgrade_held"
     }
 }
 
@@ -1174,6 +1179,23 @@ public struct HostNameParams: Codable, Hashable, Sendable {
 
     public enum CodingKeys: String, CodingKey, CaseIterable {
         case host
+    }
+}
+
+/// Names a Linux host to forget.
+public struct HostRemoveParams: Codable, Hashable, Sendable {
+    public var host: String
+    /// Forgets it though it may still serve External Address, with this Mac's API keys,
+    /// which then stay there until revoked with `vibe key revoke`.
+    public var force: Bool?
+
+    public init(host: String, force: Bool? = nil) {
+        self.host = host
+        self.force = force
+    }
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case host, force
     }
 }
 

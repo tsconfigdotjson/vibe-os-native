@@ -1378,6 +1378,73 @@ mod upgrades {
         );
     }
 
+    /// #143. A host still serving External Address isn't upgraded with nobody asked, as that
+    /// would end what its clients reach it by. It says why, someone can choose to, and once
+    /// it's stopped serving it's upgraded as any other.
+    #[tokio::test]
+    async fn a_host_still_serving_publicly_waits_for_someone_to_choose() {
+        let w = behind(quick()).await;
+        let older = w.older_host();
+        w.add_host().await;
+        let held = wait_held(&w).await;
+        let said = held.upgrade_error.expect("it says why");
+        assert!(said.contains("External Address"), "{said}");
+        assert!(said.contains("vibe host upgrade vps"), "{said}");
+        // Past any retry's gap, and many pings: Add Host's install is the only one.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(*w.wires.installs.lock().unwrap(), 1);
+        assert!(w.link().await.upgrade_held);
+
+        // Someone chooses: it's done, whatever the host says.
+        let chosen = w.rpc("hosts.upgrade", json!({"host": "vps"})).await;
+        assert_eq!(chosen["result"]["host"]["name"], "vps", "{chosen}");
+        assert_eq!(*w.wires.installs.lock().unwrap(), 2);
+        assert!(!w.link().await.upgrade_held);
+        drop(older);
+    }
+
+    #[tokio::test]
+    async fn a_held_host_is_upgraded_by_itself_once_it_stops_serving() {
+        let w = behind(quick()).await;
+        let older = w.older_host();
+        w.add_host().await;
+        wait_held(&w).await;
+        assert_eq!(*w.wires.installs.lock().unwrap(), 1);
+        older.serving.store(false, Ordering::SeqCst);
+        installs_reach(&w, 2).await;
+        let row = w.link().await;
+        assert!(!row.upgrade_held, "{row:?}");
+    }
+
+    /// What's on record holds it too, once its link is down and it can't say: a dial that
+    /// finds no `vibed` there, which otherwise installs one, doesn't.
+    #[tokio::test]
+    async fn a_host_on_record_as_serving_is_held_with_no_word_from_it() {
+        let w = behind(quick()).await;
+        let _older = w.older_host();
+        w.add_host().await;
+        wait_held(&w).await;
+        w.wires.pull();
+        w.wait_link(HostLink::Down).await;
+        let link = w.mac.link("vps").unwrap();
+        assert!(link.reported().is_none());
+        w.mac.upgrade_in_background(&link);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(*w.wires.installs.lock().unwrap(), 1);
+        assert!(w.link().await.upgrade_held);
+    }
+
+    async fn wait_held(w: &World) -> vibe_core::rpc::HostInfo {
+        for _ in 0..500 {
+            let row = w.link().await;
+            if row.upgrade_held {
+                return row;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("it was never held: {:?}", w.link().await);
+    }
+
     #[tokio::test]
     async fn a_host_behind_the_mac_is_upgraded_with_nobody_asked() {
         let w = behind(quick()).await;
@@ -1910,4 +1977,208 @@ async fn forgetting_a_host_takes_only_this_macs_keys_off_it() {
     w.wait_link(HostLink::Down).await;
     let removed = w.rpc("hosts.remove", json!({"host": "vps"})).await;
     assert!(removed.get("result").is_some(), "{removed}");
+}
+
+/// A host on a build from before External Address was retired (#143), as the Mac sees one:
+/// the real host, with a stand-in between that says what such a host says of itself, and
+/// can refuse to have keys taken off.
+struct OlderHost {
+    serving: Arc<AtomicBool>,
+    refuses_keys: Arc<AtomicBool>,
+    _dir: tempfile::TempDir,
+}
+
+impl World {
+    /// Puts an [`OlderHost`] on the wire in front of the host. Before [`World::add_host`].
+    fn older_host(&self) -> OlderHost {
+        let dir = common::short_tempdir();
+        let path = dir.path().join("older.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let real = self
+            .wires
+            .sockets
+            .lock()
+            .unwrap()
+            .insert("me@vps.example.com".into(), path)
+            .unwrap();
+        let serving = Arc::new(AtomicBool::new(true));
+        let refuses_keys = Arc::new(AtomicBool::new(false));
+        let (says, refuses) = (Arc::clone(&serving), Arc::clone(&refuses_keys));
+        tokio::spawn(async move {
+            loop {
+                let Ok((mac, _)) = listener.accept().await else {
+                    return;
+                };
+                let Ok(host) = tokio::net::UnixStream::connect(&real).await else {
+                    continue;
+                };
+                let (from_mac, mut to_mac) = mac.into_split();
+                let (from_host, mut to_host) = host.into_split();
+                let (says, refuses) = (Arc::clone(&says), Arc::clone(&refuses));
+                tokio::spawn(async move {
+                    use tokio::io::AsyncBufReadExt;
+                    let mut lines = BufReader::new(from_mac).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        // A method it doesn't know stands for a host that won't.
+                        let line = if refuses.load(Ordering::SeqCst) {
+                            line.replace("\"keys.sync\"", "\"keys.refused\"")
+                        } else {
+                            line
+                        };
+                        if to_host.write_all(line.as_bytes()).await.is_err()
+                            || to_host.write_all(b"\n").await.is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+                let says = Arc::clone(&says);
+                tokio::spawn(async move {
+                    use tokio::io::AsyncBufReadExt;
+                    let mut lines = BufReader::new(from_host).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let mut message: Value = serde_json::from_str(&line).unwrap();
+                        if let Some(rows) = message["result"]["hosts"].as_array_mut() {
+                            for row in rows {
+                                row["external"] = json!(says.load(Ordering::SeqCst));
+                            }
+                        }
+                        let out = format!("{message}\n");
+                        if to_mac.write_all(out.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        OlderHost {
+            serving,
+            refuses_keys,
+            _dir: dir,
+        }
+    }
+
+    /// Pushes a key to the host, and waits for it there.
+    async fn pushed_key(&self) {
+        self.mac
+            .create_key(KeyCreateParams {
+                name: "laptop".into(),
+            })
+            .unwrap();
+        for _ in 0..500 {
+            if self
+                .host
+                .keys()
+                .unwrap()
+                .keys
+                .iter()
+                .any(|k| k.name == "laptop")
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("the key never reached the host");
+    }
+
+    fn set_mac_row(&self, column: &str) {
+        let layout = Layout::new(&self._mac_world.home, "macos");
+        rusqlite::Connection::open(layout.db())
+            .unwrap()
+            .execute(
+                &format!("UPDATE hosts SET {column} = 'vps.example.com' WHERE name = 'vps'"),
+                [],
+            )
+            .unwrap();
+    }
+}
+
+/// #100, for what's left of it after #143. Forgotten with its link down, a host that may
+/// still serve publicly would go on taking this Mac's keys, where no revoke could reach
+/// them, so that's refused until the Mac can tell it, or someone has said it's gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_public_host_isnt_forgotten_with_this_macs_keys_on_it() {
+    let w = world().await;
+    let older = w.older_host();
+    w.add_host().await;
+    assert!(older.serving.load(Ordering::SeqCst));
+    w.set_mac_row("external");
+    w.pushed_key().await;
+    w.wires.pull();
+    w.wait_link(HostLink::Down).await;
+    let refused = w.rpc("hosts.remove", json!({"host": "vps"})).await;
+    assert_eq!(
+        refused["error"]["code"],
+        ErrorCode::Conflict.code(),
+        "{refused}"
+    );
+    let said = refused["error"]["message"].as_str().unwrap();
+    assert!(
+        said.contains("API keys") && said.contains("gone for good"),
+        "{refused}"
+    );
+    assert_eq!(w.link().await.name, "vps", "it's still here");
+    // Gone for good, then, as far as anyone here can tell.
+    let removed = w
+        .rpc("hosts.remove", json!({"host": "vps", "force": true}))
+        .await;
+    assert!(removed.get("result").is_some(), "{removed}");
+}
+
+/// #100, the same for a host serving on its own, which this Mac only heard of from the
+/// host, though with its link down it can't say so now.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_serving_on_its_own_isnt_forgotten_with_this_macs_keys_on_it() {
+    let w = world().await;
+    let _older = w.older_host();
+    w.add_host().await;
+    w.pushed_key().await;
+    w.wires.pull();
+    w.wait_link(HostLink::Down).await;
+    let refused = w.rpc("hosts.remove", json!({"host": "vps"})).await;
+    let said = refused["error"]["message"].as_str().unwrap();
+    assert!(
+        said.contains("API keys") && said.contains("gone for good"),
+        "{refused}"
+    );
+    let removed = w
+        .rpc("hosts.remove", json!({"host": "vps", "force": true}))
+        .await;
+    assert!(removed.get("result").is_some(), "{removed}");
+}
+
+/// A host that may serve publicly and won't take this Mac's keys off is refused too, with
+/// its link up; and one that says it's stopped serving is forgotten as any other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn keys_a_public_host_wont_give_up_hold_it_until_its_forced_or_its_stopped() {
+    let w = world().await;
+    let older = w.older_host();
+    w.add_host().await;
+    w.pushed_key().await;
+    older.refuses_keys.store(true, Ordering::SeqCst);
+    let refused = w.rpc("hosts.remove", json!({"host": "vps"})).await;
+    let said = refused["error"]["message"].as_str().unwrap();
+    assert!(said.contains("wouldn't take them off"), "{refused}");
+
+    // It stops serving, and the next ping says so: what was on record of it goes too, so
+    // it can be forgotten with its link down.
+    older.serving.store(false, Ordering::SeqCst);
+    for _ in 0..500 {
+        if !w.link_says_external() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!w.link_says_external(), "the host's word never came");
+    w.wires.pull();
+    w.wait_link(HostLink::Down).await;
+    let removed = w.rpc("hosts.remove", json!({"host": "vps"})).await;
+    assert!(removed.get("result").is_some(), "{removed}");
+}
+
+impl World {
+    fn link_says_external(&self) -> bool {
+        let link = self.mac.link("vps").unwrap();
+        link.reported().is_none_or(|own| own.external)
+    }
 }

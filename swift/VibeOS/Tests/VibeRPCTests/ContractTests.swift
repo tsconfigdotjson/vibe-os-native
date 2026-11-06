@@ -119,6 +119,7 @@ let swiftTypes: [String: Set<String>] = [
     "HostList": keys(HostList.CodingKeys.self),
     "HostAddParams": keys(HostAddParams.CodingKeys.self),
     "HostNameParams": keys(HostNameParams.CodingKeys.self),
+    "HostRemoveParams": keys(HostRemoveParams.CodingKeys.self),
     "HostInstall": keys(HostInstall.CodingKeys.self),
     "HostAdmin": keys(HostAdmin.CodingKeys.self),
     "SignInStartParams": keys(SignInStartParams.CodingKeys.self),

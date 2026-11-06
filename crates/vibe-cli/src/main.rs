@@ -106,7 +106,10 @@ commands:
               does) and link it, as NAME
   host upgrade NAME    install this build's vibed there now, unless it runs a newer
                        one; it happens by itself, so this is to try again sooner
-  host remove NAME     forget a Linux host; it runs on there, on its own
+  host remove NAME [--force]
+                       forget a Linux host; it runs on there, on its own. --force is
+                       for one that may still serve External Address and can't be
+                       reached: this Mac's keys may stay there until revoked on it
 
 options:
   --socket PATH   vibed's socket (default: $VIBE_SOCKET, or the platform default)

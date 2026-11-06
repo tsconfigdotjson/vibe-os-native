@@ -403,6 +403,7 @@ impl Store {
                         .filter_map(|n| n.parse().ok())
                         .collect(),
                     upgrade_error: None,
+                    upgrade_held: false,
                     sign_ins: Vec::new(),
                 })
             })?
@@ -505,8 +506,8 @@ impl Store {
         Ok(host)
     }
 
-    /// Whether a `vibed` from before External Address was retired (#143) recorded that
-    /// `name` was, or said it was, serving it.
+    /// Whether `name` may still serve External Address, from a build before it was
+    /// retired (#143), as far as this registry knows: this Mac chose it, or it last said so.
     pub fn host_had_external(&self, name: &str) -> Result<bool> {
         Ok(self.conn.query_row(
             "SELECT external IS NOT NULL OR external_seen IS NOT NULL FROM hosts WHERE name = ?1",
@@ -515,10 +516,25 @@ impl Store {
         )?)
     }
 
+    /// Notes what a linked host just said of External Address, for when its link is down
+    /// and it can't say. One that doesn't serve it has nothing left to go by, and a Mac's
+    /// old choice of it goes.
+    pub fn note_host_external(&mut self, name: &str, serving: bool) -> Result<()> {
+        let sql = if serving {
+            "UPDATE hosts SET external_seen = COALESCE(external, '') \
+             WHERE name = ?1 AND external_seen IS NULL"
+        } else {
+            "UPDATE hosts SET external = NULL, external_seen = NULL \
+             WHERE name = ?1 AND (external IS NOT NULL OR external_seen IS NOT NULL)"
+        };
+        self.conn.execute(sql, [name])?;
+        Ok(())
+    }
+
     /// The public names a `vibed` from before External Address was retired (#143)
-    /// recorded here, as this build no longer uses them. The columns are left as they
-    /// were, so a build that's gone back to the one before still reads its database:
-    /// they say only what to tell whoever had it on.
+    /// recorded here, as this build no longer serves them. A host's own row is left as it
+    /// was, so a build that's gone back to the one before still reads its database: it
+    /// says only what to tell whoever had it on.
     pub fn retired_external_domains(&self) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare(
             "SELECT DISTINCT external FROM hosts WHERE external IS NOT NULL ORDER BY external",
@@ -1485,6 +1501,7 @@ mod tests {
                 memory: None,
                 needs_admin: vec![],
                 upgrade_error: None,
+                upgrade_held: false,
                 sign_ins: vec![],
             }]
         );
@@ -1507,6 +1524,7 @@ mod tests {
             memory: None,
             needs_admin: vec![],
             upgrade_error: None,
+            upgrade_held: false,
             sign_ins: vec![],
         }
     }
@@ -1532,10 +1550,24 @@ mod tests {
             ["vps.example.com".to_owned()]
         );
         assert!(s.host_had_external("vps").unwrap());
+        // A host that says it serves it is noted, and one that says it doesn't is clear.
+        s.add_host(&linux_host("edge"), 3).unwrap();
+        assert!(!s.host_had_external("edge").unwrap());
+        s.note_host_external("edge", true).unwrap();
+        assert!(s.host_had_external("edge").unwrap());
+        s.note_host_external("edge", false).unwrap();
+        assert!(!s.host_had_external("edge").unwrap());
         // No host reads as serving it, and the row stays as it was for a build that
         // goes back.
         assert!(s.hosts().unwrap().iter().all(|h| !h.external));
         assert_eq!(s.schema_version().unwrap(), SCHEMA_VERSION as i64);
+        // A linked host that says it doesn't serve it is clear; a host's own row stays.
+        s.note_host_external("vps", false).unwrap();
+        assert!(!s.host_had_external("vps").unwrap());
+        assert_eq!(
+            s.retired_external_domains().unwrap(),
+            ["vps.example.com".to_owned()]
+        );
     }
 
     #[test]

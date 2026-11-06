@@ -915,6 +915,16 @@ import VibeRPC
         #expect(model.otherHosts.isEmpty)
     }
 
+    @Test func forgettingAHostOnlySaysForceWhenAsked() async throws {
+        let daemon = fakeDaemon()
+        daemon.on(HostsRemove.name) { _ in hostJSON("vps", link: .down) }
+        let model = makeModel(daemon)
+        try await model.removeHost("vps")
+        #expect(daemon.params(of: HostsRemove.name).last?["force"] == nil)
+        try await model.removeHost("vps", force: true)
+        #expect(daemon.params(of: HostsRemove.name).last?["force"] as? Bool == true)
+    }
+
     @Test func aFailedInstallSaysWhy() async throws {
         let daemon = fakeDaemon()
         daemon.on(HostsAdd.name) { _ in
