@@ -16,29 +16,21 @@
   &nbsp;·&nbsp; Apple Silicon · macOS 26 or later · <a href="LICENSE">MIT</a>
 </p>
 
-<p align="center">
-  <img src="docs/images/hero-retina.png" width="960" alt="VibeOS Native hero: cloud agents on your Mac and VPS, with the menu, New Agent sheet, and hosts overview from a fictional demo workspace">
-</p>
-
-<p align="center"><sub>Hero and screenshots show the real app on a fictional demo workspace (Larkfield Labs).</sub></p>
-
 ## What you get
 
-**Agents on machines you control.** Run them on your Mac and on Linux servers you add — including a rented VPS. No VibeOS cloud in the middle.
+**Agents on machines you control.** Run them on your Mac and on Linux servers you add — including a rented VPS. There is no VibeOS cloud in the middle.
 
-**A terminal when you want one.** Click an agent and Terminal opens on its live session. Step away; come back; the work is still there.
+**A terminal when you want one.** Click an agent and Terminal opens on its live session. Step away and come back; the work is still there.
 
 **Progress at a glance.** The menu bar shows what each agent is doing and when it needs you.
 
-**Your assistant can drive them too.** Compatible assistants can start agents and check in on them. Setup details are in the docs if you want that path.
+**Your assistant can help drive them.** Compatible assistants can start agents and check in. How to connect one is in the docs — you don't need that for day one.
 
 ## Get started
 
 1. **[Download the latest release](https://github.com/tsconfigdotjson/vibe-os-native/releases/latest)** and open the DMG.
 2. Drag VibeOS into Applications and launch it. Follow the welcome checklist.
-3. Add a project, then start an agent from **New Agent…** in the menu.
-
-Connecting an assistant is optional — see [MCP and networking](docs/mcp-and-networking.md) when you're ready.
+3. Add a project, then choose **New Agent…** in the menu.
 
 ## Keep in mind
 
