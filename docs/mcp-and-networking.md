@@ -175,60 +175,6 @@ stand in their way. It also doesn't test or support them. Whatever you put in
 front of MCP, keep API keys required and don't put it on the open internet
 unprotected.
 
-## If you used External Address
-
-External Address served MCP publicly from a Linux host at `https://<domain>/mcp`, with a
-Let's Encrypt certificate on port 443. VibeOS 0.1.7 was the last release with it: that public
-listener is retired ([#143](https://github.com/tsconfigdotjson/vibe-os-native/issues/143)),
-and nothing replaces it as a public path. The private path to the Mac stays, and is now on for every linked host:
-see [One MCP for every host](#one-mcp-for-every-host).
-
-> [!WARNING]
-> A linked host that still serves External Address, or that VibeOS can't tell about, is **not**
-> upgraded by itself. It goes on serving, and **Settings → Hosts** says it's waiting for you. Choosing **Update…** there, or
-> running `vibe host upgrade NAME`, ends its `https://<domain>/mcp`. Move anything that uses
-> that URL first.
-
-**What changes:**
-
-- An upgraded `vibed` no longer listens on port 443 or asks Let's Encrypt for a certificate.
-- `vibe host external` and its Settings controls are gone. The tunnel no longer needs turning
-  on, or a public name.
-
-**What doesn't:** API keys, SSH hosts and their links, agents, `mac:<ref>`, loopback MCP and
-the Tailscale option all carry on as they were.
-
-**Moving a client:** give it the host's loopback URL if it runs on that server, or its
-Tailscale URL if it runs elsewhere, with the same key. It keeps reaching the same agents.
-Set up [Tailscale](#other-machines-over-tailscale) on the host first if you need that.
-
-**Forgetting a host that may still serve it:** VibeOS refuses while the host's link is down
-or it won't take your API keys off, because they'd go on working there, out of reach of a
-revoke from the Mac. Once it's back, remove it again. If it's gone for good, choose **Remove
-Anyway** or use `vibe host remove NAME --force`, and if it ever comes back, revoke those keys
-on it with `vibe key revoke`.
-
-**Clearing up.** `vibed` deletes nothing. If it finds External Address settings or
-certificates, it logs a note at each start. VibeOS no longer uses what's left, but the helper
-and the port setting below stay in effect until you remove them. These are yours to remove
-once the new build has settled:
-
-| On | What | How |
-| --- | --- | --- |
-| Linux host | The certificate, its private key and the ACME account key | `rm -r ~/.local/share/vibeos/external` |
-| Linux host | The helper's unprivileged copy | `rm ~/.local/lib/vibeos/vibe-bind` |
-| Linux host, if the helper was installed | The root-owned helper, which can open port 443 | `sudo rm /usr/local/lib/vibeos/vibe-bind-1 && sudo rmdir /usr/local/lib/vibeos` |
-| Linux host, if the fallback was used | A setting that lets any user there open ports from 443 up | `sudo rm /etc/sysctl.d/60-vibeos.conf && sudo sysctl -w net.ipv4.ip_unprivileged_port_start=1024` |
-| Your DNS and firewall | The name pointing at the host, and port 443 open to it | Remove them if nothing else uses them |
-| The Mac | The old tunnel socket | `rm "$HOME/Library/Application Support/VibeOS/run/tunnel.sock"*` |
-
-If your API keys were used from the internet, consider replacing them.
-
-**Going back.** A host's registry keeps its External Address setting, so 0.1.7 can still read
-it, and that build **starts serving publicly again** if the setting was on. To turn it off for
-good, run `vibe host external local off` on the host before you upgrade. The command is gone
-from 0.1.8 on.
-
 ## MCP tools
 
 | Tool | Does |
