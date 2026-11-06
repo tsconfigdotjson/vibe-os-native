@@ -569,8 +569,13 @@ impl Daemon for Core {
             return Ok(agents
                 .into_iter()
                 .map(|agent| AgentView {
-                    // It attaches from a terminal on the Mac.
-                    attach_remote: format!("on the Mac: {}", agent.attach),
+                    // It attaches from a terminal on the Mac, or on the host it's on,
+                    // which is what its line says.
+                    attach_remote: if host == MAC_HOST {
+                        format!("on the Mac: {}", agent.attach)
+                    } else {
+                        agent.attach.clone()
+                    },
                     available,
                     last_seen: (!available).then(|| mac.seen_at(&seen)).flatten(),
                     agent,

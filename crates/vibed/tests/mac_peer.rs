@@ -12,7 +12,7 @@
 
 mod common;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -58,6 +58,9 @@ struct Wires {
     tunnels: Mutex<u32>,
     /// Whether tunnels may be made (sshd might refuse to forward).
     forwarding: AtomicBool,
+    /// The addresses cut off from the Mac: dials to them fail and those up end, while
+    /// every other's and the tunnels carry on.
+    cut: watch::Sender<HashSet<String>>,
 }
 
 impl Wires {
@@ -72,6 +75,7 @@ impl Wires {
             hang_up: watch::channel(0).0,
             tunnels: Mutex::new(0),
             forwarding: AtomicBool::new(true),
+            cut: watch::channel(HashSet::new()).0,
         })
     }
 
@@ -85,6 +89,16 @@ impl Wires {
 
     fn freeze(&self, frozen: bool) {
         self.frozen.send_replace(frozen);
+    }
+
+    fn cut_off(&self, address: &str, cut: bool) {
+        self.cut.send_modify(|all| {
+            if cut {
+                all.insert(address.to_owned());
+            } else {
+                all.remove(address);
+            }
+        });
     }
 
     fn hang_up_dials(&self) {
@@ -187,6 +201,11 @@ impl Remote for Wires {
                     "ssh: connect to host {address} port 22: Network is unreachable"
                 ));
             }
+            if self.cut.borrow().contains(address) {
+                return Err(format!(
+                    "ssh: connect to host {address} port 22: Network is unreachable"
+                ));
+            }
             let socket = self.sockets.lock().unwrap().get(address).cloned();
             let socket =
                 socket.ok_or_else(|| format!("ssh: Could not resolve hostname {address}"))?;
@@ -197,8 +216,11 @@ impl Remote for Wires {
             let up = self.up.subscribe();
             let frozen = self.frozen.subscribe();
             let mut hang_up = self.hang_up.subscribe();
+            let mut cut = self.cut.subscribe();
+            let this_address = address.to_owned();
             tokio::spawn(async move {
                 tokio::select! {
+                    _ = cut.wait_for(|all| all.contains(&this_address)) => {}
                     () = pump(host, theirs, up, frozen, Arc::new(AtomicBool::new(false)), None, None) => {}
                     _ = hang_up.changed() => {}
                 }
@@ -1929,6 +1951,27 @@ async fn one_ingress_reaches_every_host_in_the_macs_hub() {
         .collect();
     assert_eq!(names, ["local", "edge"], "{rows}");
     assert!(!rows.to_string().contains("example.com"), "{rows}");
+    // Nor in what's said of its agents: the line attaches on that host, wherever it is.
+    let agents = down_the_tunnel(&end, "agents.list", &key, json!({"host": "edge"})).await;
+    assert!(!agents.to_string().contains("example.com"), "{agents}");
+    assert_eq!(
+        agents["result"]["agents"][0]["attach"], "on edge: vibe attach on-edge",
+        "{agents}"
+    );
+    let checked = down_the_tunnel(
+        &end,
+        "agents.check",
+        &key,
+        json!({"host": "edge", "agent": "on-edge"}),
+    )
+    .await;
+    assert!(!checked.to_string().contains("example.com"), "{checked}");
+    let listed = c.call("vibe_list_agents", json!({})).await;
+    assert!(!listed.contains("example.com"), "{listed}");
+    assert!(
+        listed.contains("attach: on edge: vibe attach on-edge"),
+        "{listed}"
+    );
     let back = down_the_tunnel(&end, "agents.list", &key, json!({"host": "vps"})).await;
     assert_eq!(
         back["error"]["code"],
@@ -2079,4 +2122,129 @@ async fn a_host_with_no_mac_only_has_itself() {
         next: 0,
     };
     assert_eq!(nobody.request("tools/list", json!({})).await.status, 401);
+}
+
+/// Another host's link cut, with the Mac there: its agents are unavailable through this MCP,
+/// not as the Mac last kept them and called fine, and nothing says where it is. The Mac and
+/// this host's own are untouched, and it merges back with the link.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_the_mac_cant_reach_is_unavailable_with_the_mac_there() {
+    let w = world().await;
+    let edge = w.add_edge().await;
+    w.turn_on().await;
+    let key = w.key("laptop");
+    w.pushed(&key).await;
+    for _ in 0..500 {
+        if edge.core.verify_key(&key).unwrap().is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    w.mac_reachable(&key).await;
+    let mut c = w.client(&key);
+    for (host, profile, name, shown) in [
+        ("local", "software-eng-linux", "on-vps", "on-vps"),
+        ("mac", "software-eng-mac", "on-mac", "mac:on-mac"),
+        ("edge", "software-eng-linux", "on-edge", "edge:on-edge"),
+    ] {
+        let started = c
+            .call(
+                "vibe_start_agent",
+                json!({"project": "app", "profile": profile, "prompt": "talk", "host": host,
+                       "name": name}),
+            )
+            .await;
+        assert!(started.contains(&format!("started {shown}")), "{started}");
+    }
+    let row = |listed: &str, shown: &str| {
+        listed
+            .lines()
+            .find(|l| l.starts_with(shown))
+            .unwrap_or_else(|| panic!("no {shown} in {listed}"))
+            .to_owned()
+    };
+    // A listing with all of it there, for what's kept of each.
+    let listed = w.listing_the_mac_answered(&mut c).await;
+    assert!(
+        !row(&listed, "edge:on-edge").contains("unavailable"),
+        "{listed}"
+    );
+
+    // Only edge's link goes: its address no longer dials, and what's on it ends. Nothing
+    // else's does, and sshd holds the tunnels.
+    let address = "me@edge.example.com";
+    w.wires.cut_off(address, true);
+    let link_is = |name: &str, want: HostLink| {
+        w.mac
+            .hosts()
+            .unwrap()
+            .hosts
+            .iter()
+            .any(|h| h.name == name && h.link == want)
+    };
+    for _ in 0..500 {
+        if link_is("edge", HostLink::Down) && link_is("vps", HostLink::Connected) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(link_is("edge", HostLink::Down), "{:?}", w.mac.hosts());
+    assert!(w.host.hosts().unwrap().hosts[0].tunnel == Some(TunnelState::Up));
+
+    // Through the tunnel it says so, whatever the Mac has kept, and not where it was.
+    let end = w.tunnel_end();
+    let asked = down_the_tunnel(&end, "agents.list", &key, json!({"host": "edge"})).await;
+    assert_eq!(
+        asked["error"]["code"],
+        ErrorCode::HostUnavailable.code(),
+        "{asked}"
+    );
+    assert!(!asked.to_string().contains("example.com"), "{asked}");
+
+    // So here it's as last seen, and unavailable; what's there is as it was.
+    let listed = c.call("vibe_list_agents", json!({})).await;
+    assert!(
+        row(&listed, "edge:on-edge").contains("unavailable"),
+        "{listed}"
+    );
+    assert!(
+        !row(&listed, "mac:on-mac").contains("unavailable"),
+        "{listed}"
+    );
+    assert!(!row(&listed, "on-vps").contains("unavailable"), "{listed}");
+    assert!(!listed.contains("example.com"), "{listed}");
+    // A call for it fails, and says nothing of where it is either.
+    let refused = c
+        .fails(
+            "vibe_read_messages",
+            json!({"agent": "edge:on-edge", "last": 1}),
+        )
+        .await;
+    assert!(refused.contains("unavailable"), "{refused}");
+    assert!(!refused.contains("example.com"), "{refused}");
+    let checked = down_the_tunnel(
+        &end,
+        "agents.check",
+        &key,
+        json!({"host": "edge", "agent": "on-edge"}),
+    )
+    .await;
+    assert!(!checked.to_string().contains("example.com"), "{checked}");
+
+    // Its link's back, and so is it.
+    w.wires.cut_off(address, false);
+    let mut back = false;
+    for _ in 0..300 {
+        let listed = c.call("vibe_list_agents", json!({})).await;
+        if !row(&listed, "edge:on-edge").contains("unavailable") {
+            back = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(back, "edge never came back");
+    for agent in ["on-vps", "mac:on-mac", "edge:on-edge"] {
+        c.call("vibe_delete_agent", json!({"agent": agent, "force": true}))
+            .await;
+    }
 }

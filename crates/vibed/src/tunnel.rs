@@ -227,7 +227,27 @@ async fn tunnel_call(
             ),
         ));
     }
-    let mut answer = crate::dispatch::call_here(core, &p.method, Value::Object(params)).await?;
+    let link = through.as_deref().and_then(|h| core.link(h));
+    let mut answer = match &link {
+        // What it says now or nothing: the Mac's copy would read as an answer, and the host
+        // asking would call its agents available.
+        Some(link) if p.method == AgentsList::NAME => {
+            let agents = core
+                .remote_agents_now(link)
+                .await
+                .map_err(|e| unavailable_without_address(link, e))?;
+            json!({ "agents": agents })
+        }
+        _ => crate::dispatch::call_here(core, &p.method, Value::Object(params))
+            .await
+            .map_err(|e| match &link {
+                Some(link) => without_address(link, e),
+                None => e,
+            })?,
+    };
+    if let Some(link) = &link {
+        attach_lines_there(&mut answer, &link.name);
+    }
     // Its memory comes with its agents, so a listing needs one call and not two; and which
     // other hosts there are, so a host's MCP keeps up with what's linked here.
     if p.method == AgentsList::NAME {
@@ -266,6 +286,52 @@ async fn tunnel_call(
         }
     }
     Ok(answer)
+}
+
+/// What a host's MCP gets of an agent on another host, whose attach line here is over SSH
+/// to its address: the line that attaches on that host, which says nothing of where it is.
+fn attach_lines_there(value: &mut Value, host: &str) {
+    match value {
+        Value::Object(map) => {
+            if map.contains_key("attach")
+                && let Some(agent) = map.get("ref").and_then(Value::as_str)
+            {
+                let line = format!("on {host}: vibe attach {agent}");
+                map.insert("attach".into(), json!(line));
+            }
+            map.values_mut().for_each(|v| attach_lines_there(v, host));
+        }
+        Value::Array(items) => items.iter_mut().for_each(|v| attach_lines_there(v, host)),
+        _ => {}
+    }
+}
+
+/// `e`, with what ssh said of `link`'s address put by its name: a link's errors quote it.
+fn without_address(link: &Link, mut e: ErrorObject) -> ErrorObject {
+    let bare = link
+        .address
+        .trim_start_matches("ssh://")
+        .rsplit('@')
+        .next()
+        .unwrap_or_default()
+        .split(':')
+        .next()
+        .unwrap_or_default();
+    e.message = e.message.replace(&link.address, &link.name);
+    if bare.contains('.') {
+        e.message = e.message.replace(bare, &link.name);
+    }
+    e
+}
+
+/// What a listing gets that couldn't be answered now: always unavailable, whatever went
+/// wrong, so what's asking goes by what it last saw.
+fn unavailable_without_address(link: &Link, e: ErrorObject) -> ErrorObject {
+    let e = without_address(link, e);
+    if e.code == ErrorCode::HostUnavailable.code() {
+        return e;
+    }
+    crate::link::unavailable(&link.name, Some(&e.message))
 }
 
 /// Serves one connection to the tunnel's socket: one message per line,

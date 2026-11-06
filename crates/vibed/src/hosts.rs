@@ -655,18 +655,25 @@ impl Core {
     /// or as it last listed them while it's down.
     pub async fn remote_agents(&self, link: &Link) -> Vec<Agent> {
         if link.connected() {
-            match self
-                .forward_typed::<AgentsList>(link, &Default::default())
-                .await
-            {
-                Ok(list) => {
-                    self.keep_agents(link, &list.agents);
-                    return list.agents;
-                }
+            match self.remote_agents_now(link).await {
+                Ok(agents) => return agents,
                 Err(e) => crate::log!("vibed: can't list {}'s agents: {}", link.name, e.message),
             }
         }
         self.kept_agents(link)
+    }
+
+    /// What `link`'s host says of its agents now, which is kept; never what it said before.
+    /// For whoever has to tell the two apart, as a host's MCP does through a tunnel.
+    pub(crate) async fn remote_agents_now(&self, link: &Link) -> Result<Vec<Agent>, ErrorObject> {
+        if !link.connected() {
+            return Err(crate::link::unavailable(&link.name, None));
+        }
+        let list = self
+            .forward_typed::<AgentsList>(link, &Default::default())
+            .await?;
+        self.keep_agents(link, &list.agents);
+        Ok(list.agents)
     }
 
     pub(crate) fn kept_agents(&self, link: &Link) -> Vec<Agent> {

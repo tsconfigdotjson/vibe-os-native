@@ -130,7 +130,9 @@ stand on: `hosts.list`, `projects.list`, `agents.list`, `agents.start`, `agents.
 `agents.send`, `agents.check`, `agents.output`, `agents.messages`; anything else is
 `method_not_found`. Its result is that call's. `agents.list` also says that host's `memory` and
 `linked_hosts`, the other hosts there are. `hosts.list` leaves out the asking host, and
-everyone's address and what's only for the Mac's own Settings. On the host, the Mac goes by
+everyone's address and what's only for the Mac's own Settings. For another host, `agents.list`
+is `host_unavailable` if that host can't answer now, never what the Mac kept of it; an agent's
+`attach` is the line for that host's own terminal, and nothing through a tunnel gives an address. On the host, the Mac goes by
 `mac`, so its agents are `mac:<ref>`, and another host keeps its name. As soon as it has a
 call, the socket says so with a notification, `call.accepted {id}`, and a host fails one that
 hasn't that or an answer within 5 s, however long it may run after that. A Mac that does this
