@@ -273,7 +273,7 @@ mcp_tailscale    = false   # MCP on this host's Tailscale address too
 peer_read        = 3       # seconds another host gets to answer a listing or lookup
 ```
 
-`package_caches` is the opt-out from the shared caches (Mounts, below). It and `mcp_port` are set in this file only, not over the socket. `mcp_tailscale` is also set over the socket, by Settings.
+`package_caches` is the opt-out from the shared caches (Mounts, below). It and `mcp_port` are set in this file only, not over the socket. `mcp_tailscale` is also set over the socket, by Settings. On a Linux host, Settings sets it together with `/mcp` on Tailscale Serve (`mcp.serve.set`).
 
 There's no admission by memory. A start or a wake never reserves the profile's memory and is never refused for memory, whatever the other agents' profiles add up to or the host's memory pressure: each agent's memory is only its ceiling, and the host swaps if its agents use more than it has. What's checked is disk (Failures, Low disk) and `max_awake_agents`: past it, agents still inside their idle debounce go to sleep early, oldest first, and if none is idle the start is refused with a clear reason. Starts never queue. `reserve_memory`, from earlier versions, means nothing now: a `host.toml` that still sets it is read as if it didn't, and `limits.get` reports it as 0 for an older `vibed`.
 
@@ -392,7 +392,7 @@ A Linux server runs the same `vibed`, so it joins the Mac as another host. Its a
 
 ### Reaching MCP from elsewhere
 
-VibeOS offers no public path to MCP. External Address's public listener, certificate and port-443 helper were retired (#143, Lee, Nov 5). Other machines reach MCP over optional Tailscale, which binds only addresses in Tailscale's ranges: on the Mac from Settings or the welcome, and on a Linux host with `mcp_tailscale = true` in `host.toml`. VibeOS doesn't install or configure Tailscale, and it isn't required: an ordinary VPS over SSH stays supported.
+VibeOS offers no public path to MCP. External Address's public listener, certificate and port-443 helper were retired (#143, Lee, Nov 5). Other machines reach MCP over optional Tailscale, which binds only addresses in Tailscale's ranges: on the Mac from Settings or the welcome, and on a Linux host from its toggle in Settings → Hosts, or with `mcp_tailscale = true` in `host.toml`. That toggle also serves MCP at `https://<machine>.<tailnet>.ts.net/mcp` through Tailscale Serve. It's the only thing VibeOS configures in Tailscale: only the `/mcp` path, and it stops at a `/mcp` that points elsewhere or at Funnel on that name, which it never turns on or off. VibeOS doesn't install or log in to Tailscale, and it isn't required: an ordinary VPS over SSH stays supported.
 
 ```
 caller ──API key──▶ Linux host's MCP (loopback or Tailscale) ══ tunnel the Mac opened ══▶ Mac (vibed) ══ link ══▶ other Linux hosts
@@ -419,7 +419,7 @@ caller ──API key──▶ Linux host's MCP (loopback or Tailscale) ══ tu
 
 MCP is the product. It keeps the shape of VibeOS's MCP, which already drives a working orchestrator: start an agent with a prompt, `vibe_wait`, read what it said, and answer its questions with `vibe_send`. Where VibeOS split one job across a workspace and its windows, this server has one tool, because each worktree has exactly one agent. Every call needs an API key. Host setup (API keys, projects, profiles, host limits, the Linux template) is in the menu on the Mac, and in the `vibe` CLI on a Linux host.
 
-**Transport.** Streamable HTTP at `http://127.0.0.1:7878/mcp` (the port is `mcp_port` in `host.toml`). The Tailscale interface can be turned on in Settings on the Mac, or in `host.toml` on a Linux host (`mcp_tailscale`). There's also stdio through `vibe mcp` for clients that can only launch a command: a bridge to that endpoint, with the key in `VIBE_API_KEY`. Built with `rmcp`.
+**Transport.** Streamable HTTP at `http://127.0.0.1:7878/mcp` (the port is `mcp_port` in `host.toml`). The Tailscale interface can be turned on in Settings on the Mac, or on a Linux host from Settings → Hosts, which also sets up `/mcp` on Tailscale Serve, or in `host.toml` (`mcp_tailscale`). There's also stdio through `vibe mcp` for clients that can only launch a command: a bridge to that endpoint, with the key in `VIBE_API_KEY`. Built with `rmcp`.
 
 **Auth is always on.** There's no unauthenticated mode, not even on loopback.
 
