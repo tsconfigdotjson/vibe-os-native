@@ -106,13 +106,10 @@ commands:
               does) and link it, as NAME
   host upgrade NAME    install this build's vibed there now, unless it runs a newer
                        one; it happens by itself, so this is to try again sooner
-  host remove NAME     forget a Linux host; it runs on there, on its own
-  host external NAME DOMAIN
-              make a Linux host the external address: it serves
-              https://DOMAIN/mcp to outside MCP callers, and this Mac keeps
-              a tunnel to it (on a Linux host on its own, NAME is local)
-  host external NAME off
-              stop it being the external address
+  host remove NAME [--force]
+                       forget a Linux host; it runs on there, on its own. --force is
+                       for one that may still serve External Address and can't be
+                       reached: this Mac's keys may stay there until revoked on it
 
 options:
   --socket PATH   vibed's socket (default: $VIBE_SOCKET, or the platform default)
@@ -680,6 +677,16 @@ mod tests {
                         model: Some(vibe_core::model::Model::Sonnet),
                         ..Default::default()
                     },
+                }),
+            })
+        );
+        assert_eq!(
+            parse(&["host", "remove", "vps", "--force", "--socket=/s"]),
+            Ok(Args::Run {
+                socket: Some("/s".into()),
+                command: Command::Setup(setup::Command::RemoveHost {
+                    host: "vps".into(),
+                    force: true,
                 }),
             })
         );

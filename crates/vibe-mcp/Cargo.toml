@@ -18,15 +18,12 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 libc.workspace = true
 # Only the server side, over Streamable HTTP; `vibe mcp` bridges stdio to it.
 rmcp = { version = "3.8", default-features = false, features = ["server", "transport-streamable-http-server"] }
-rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
-tokio-rustls.workspace = true
 tower-service = "0.3"
 
 [dev-dependencies]
-rcgen.workspace = true
 tempfile.workspace = true
 
 [lints]

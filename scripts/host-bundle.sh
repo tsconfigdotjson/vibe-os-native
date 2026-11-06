@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The Linux builds a Mac installs on a Linux host (PRD: Adding a Linux host):
-# vibed, vibe, vibe-shim and vibe-bind, in <out>/<arch>/, which is what vibed reads from
+# vibed, vibe and vibe-shim, in <out>/<arch>/, which is what vibed reads from
 # VIBE_HOST_BUNDLE (or from linux/ beside it, or the app's Resources/linux).
 #
 #   scripts/host-bundle.sh [--out DIR] [--target x86_64|aarch64]... [--native]
@@ -27,9 +27,9 @@ while [ $# -gt 0 ]; do
     *) echo "host-bundle: unexpected $1" >&2; exit 2 ;;
   esac
 done
-BINS=(vibed vibe vibe-shim vibe-bind)
+BINS=(vibed vibe vibe-shim)
 TARGET_DIR=${CARGO_TARGET_DIR:-target}
-PACKAGES=(-p vibed -p vibe-cli -p vibe-shim -p vibe-bind)
+PACKAGES=(-p vibed -p vibe-cli -p vibe-shim)
 
 place() { # place <arch> <dir the binaries are in>
   mkdir -p "$OUT/$1"

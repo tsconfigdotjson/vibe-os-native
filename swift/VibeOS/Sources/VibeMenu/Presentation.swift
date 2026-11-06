@@ -436,98 +436,24 @@ public func keysPending(on hosts: [String]) -> String? {
 /// lock on this Mac's own login, as vibed's socket answers that login without
 /// one. Other accounts on this Mac can't reach that socket, so this says "your
 /// Mac login", not "anyone on this Mac".
-public func keysWarning(linuxHosts: Bool, externalHost: String?) -> String {
+public func keysWarning(linuxHosts: Bool) -> String {
     let reach = linuxHosts ? "this Mac and your Linux hosts" : "this Mac"
-    let internet = externalHost.map { " Because \($0) has a public address, a key works from anywhere on the internet." }
     // A host that's away hasn't heard of a revoke yet (`keysPending`).
     let revoke = linuxHosts
         ? " If you stop trusting a key, revoke it. It stops working at once, though a Linux host that's away goes on "
             + "accepting it until VibeOS reaches it again."
         : " If you stop trusting a key, revoke it and it stops working at once."
     return "Keep API keys private, like passwords. Anyone with a key can have VibeOS agents do whatever you can "
-        + "do on \(reach)." + (internet ?? "") + revoke + " Anyone or anything already using your Mac login can "
+        + "do on \(reach)." + revoke + " Anyone or anything already using your Mac login can "
         + "control VibeOS without a key, so keep that login private too."
 }
 
-// MARK: External access
+// MARK: Reaching MCP from elsewhere
 
-/// How the external address is doing, as the menu and Settings say it
-/// (PRD: External access).
-public struct ExternalStatus: Equatable, Sendable {
-    public enum Tone: Equatable, Sendable {
-        /// Outside clients reach it.
-        case working
-        /// On its way: the tunnel is opening, or a certificate is coming.
-        case pending
-        /// Something keeps it from working; `detail` says what.
-        case trouble
-    }
-
-    /// A few words, for the menu: "public", "connecting…".
-    public var short: String
-    /// A sentence, for Settings.
-    public var summary: String
-    /// What's wrong or what it waits for, and how to fix it, as the host or
-    /// the tunnel says.
-    public var detail: String?
-    /// An SF Symbol.
-    public var symbol: String
-    public var tone: Tone
-}
-
-/// How `host` is doing as the external address, if it is the one.
-public func externalStatus(_ host: HostInfo) -> ExternalStatus? {
-    guard host.external else { return nil }
-    let detail = host.externalDetail
-    switch host.tunnel {
-    case .up? where detail == nil:
-        return ExternalStatus(
-            short: "public", summary: "Outside MCP clients reach agents on \(host.name) and on this Mac.",
-            detail: nil, symbol: "globe", tone: .working)
-    case .up?:
-        return ExternalStatus(
-            short: "almost public", summary: "The tunnel is up; \(host.name) isn't serving yet.",
-            detail: detail, symbol: "globe", tone: .pending)
-    case .connecting?:
-        return ExternalStatus(
-            short: "connecting…", summary: "Opening the tunnel from this Mac to \(host.name)…",
-            detail: detail, symbol: "globe", tone: .pending)
-    case .down?, nil:
-        return ExternalStatus(
-            short: "not reachable", summary: "Outside clients can't reach this Mac's agents through \(host.name) yet.",
-            detail: detail, symbol: "exclamationmark.triangle.fill", tone: .trouble)
-    }
-}
-
-/// The public name a server is likely reached at, from its SSH destination:
-/// `me@vps.example.com:22` gives `vps.example.com`. Empty when it's an IP
-/// address or a single name from `~/.ssh/config`.
-public func suggestedDomain(fromSSH address: String) -> String {
-    var host = address
-    if host.hasPrefix("ssh://") { host.removeFirst("ssh://".count) }
-    if let at = host.lastIndex(of: "@") { host = String(host[host.index(after: at)...]) }
-    if host.hasPrefix("[") { return "" }
-    if let colon = host.firstIndex(of: ":") { host = String(host[..<colon]) }
-    return normalizedDomain(host) ?? ""
-}
-
-/// `text` as the public DNS name Let's Encrypt can certify, in lowercase,
-/// or nil if it isn't one: as vibed checks it (`validate_domain`).
-public func normalizedDomain(_ text: String) -> String? {
-    var name = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-    if name.hasSuffix(".") { name.removeLast() }
-    let labels = name.split(separator: ".", omittingEmptySubsequences: false)
-    guard name.count <= 253, labels.count >= 2 else { return nil }
-    let allowed = Set("abcdefghijklmnopqrstuvwxyz0123456789-")
-    for label in labels {
-        guard !label.isEmpty, label.count <= 63, !label.hasPrefix("-"), !label.hasSuffix("-"),
-            label.allSatisfy(allowed.contains)
-        else { return nil }
-    }
-    // An IPv4 address's last part is all digits; a name's never is.
-    if let last = labels.last, last.allSatisfy(\.isNumber) { return nil }
-    return name
-}
+/// A word for Tailscale where MCP's settings are. It's optional, and VibeOS doesn't set it up.
+public let tailscaleSuggestion =
+    "To reach MCP from another machine, we suggest [Tailscale](https://tailscale.com). It's optional, "
+    + "and both machines need it installed and signed in."
 
 // MARK: Rows, in words and symbols
 
@@ -874,9 +800,8 @@ public struct SetupProgress: Equatable, Sendable {
     public var install: InstallStatus
     /// Whether gh is installed at all, which the gh check's button needs.
     public var ghInstalled: Bool
-    /// Whether other machines can reach MCP here: on Tailscale, or through
-    /// a Linux host that's the external address. Nil where Tailscale isn't
-    /// up, so there's nothing to turn on.
+    /// Whether other machines can reach MCP here, on Tailscale. Nil where
+    /// Tailscale isn't up, so there's nothing to turn on.
     public var remoteMCP: Bool?
 
     public init(
@@ -1149,9 +1074,8 @@ public enum StatusTone: Equatable, Sendable {
     case normal, attention, trouble
 }
 
-/// Something in the header that needs the owner: a host that's down, a
-/// `gh` login missing, an external address outside clients can't reach.
-/// Each gets a row of its own.
+/// Something in the header that needs the owner: a host that's down, or a
+/// `gh` login missing. Each gets a row of its own.
 public struct HeaderAlert: Equatable, Sendable, Identifiable {
     public var id: String
     /// An SF Symbol.
@@ -1171,8 +1095,7 @@ public struct HeaderAlert: Equatable, Sendable, Identifiable {
 }
 
 /// A steady fact about the hosts: the Mac's memory, `gh`, MCP, each Linux
-/// host's link and external address. They show together, on request, under
-/// the header.
+/// host's link. They show together, on request, under the header.
 public struct HeaderFact: Equatable, Sendable, Identifiable {
     /// `memory`, `gh`, `mcp`, or `host:<name>`: a host may be named anything.
     public var id: String
@@ -1203,14 +1126,6 @@ public func headerAlerts(gh: GhStatus?, hosts: [HostInfo]) -> [HeaderAlert] {
                 headline: isMac ? "This Mac is short of memory" : "is short of memory",
                 detail: "Agents keep running, and it swaps. Delete agents you're done with to free some.",
                 reason: sentence(why), tone: .attention))
-    }
-    for host in hosts where host.link == .connected {
-        guard let external = externalStatus(host), external.tone == .trouble else { continue }
-        alerts.append(
-            HeaderAlert(
-                id: "external:\(host.name)", symbol: "globe", name: host.name,
-                headline: "isn't reachable from outside",
-                detail: external.summary, reason: external.detail.map(sentence), tone: .attention))
     }
     let ghAlert: (String, String)?
     switch gh?.state {
@@ -1265,10 +1180,6 @@ public func headerFacts(memory: HostMemory?, gh: GhStatus?, mcp: Bool, hosts: [H
     for host in hosts where host.link != .local {
         var value = host.link == .down ? "Down" : "Connected"
         var tone: StatusTone = host.link == .down ? .trouble : .normal
-        if let external = externalStatus(host) {
-            value += ", \(external.short)"
-            if tone == .normal, external.tone == .trouble { tone = .attention }
-        }
         if host.link == .connected, let memory = host.memory {
             value += " · \(memorySummary(memory))"
             if tone == .normal, memory.pressure != nil { tone = .attention }

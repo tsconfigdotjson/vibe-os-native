@@ -216,9 +216,8 @@ pub enum ErrorCode {
     /// The call is for a Linux host whose link is down: its agents are
     /// unavailable until the link is back.
     HostUnavailable,
-    /// A call that came through the external address's tunnel carried no
-    /// API key this Mac knows: unknown, revoked, or a host's own. Only the
-    /// tunnel's socket answers with it.
+    /// The call is only for another host's link, and didn't come over one; or it came
+    /// through a tunnel with no API key this Mac knows: unknown, revoked, or a host's own.
     Unauthorized,
 }
 
@@ -364,7 +363,6 @@ pub const METHODS: &[&str] = &[
     SignInAnswer::NAME,
     SignInCancel::NAME,
     HostsRemove::NAME,
-    HostsExternal::NAME,
     TunnelPrepare::NAME,
     ProjectsList::NAME,
     ProjectsAdd::NAME,
@@ -526,24 +524,14 @@ method! {
 method! {
     /// `hosts.remove`: forgets a Linux host and ends its link. Nothing on
     /// the server changes: its `vibed` and agents run on, on their own.
-    HostsRemove = "hosts.remove", HostNameParams => HostInfo
-}
-
-method! {
-    /// `hosts.external`: Settings → Hosts → *Use as external address*. On
-    /// the Mac, for a Linux host added to it: records the choice, tells the
-    /// host (now, or once its link is back), and keeps an SSH tunnel to it
-    /// while it's on. On a Linux host, for `local`: serves MCP publicly at
-    /// `https://<domain>/mcp`, with a certificate from Let's Encrypt. A Mac
-    /// never serves it itself.
-    HostsExternal = "hosts.external", HostExternalParams => HostInfo
+    HostsRemove = "hosts.remove", HostRemoveParams => HostInfo
 }
 
 method! {
     /// `tunnel.prepare`: on a Linux host, where the Mac's reverse tunnel
     /// is to end, a Unix socket in its private `run/`, with any left by an
     /// earlier tunnel cleared. The Mac calls it over the link before each
-    /// `ssh -R`.
+    /// `ssh -R`, and when it forgets the host, so no `mac` is left there.
     TunnelPrepare = "tunnel.prepare", NoParams => TunnelPrepared
 }
 
@@ -879,7 +867,9 @@ pub struct HostInfo {
     /// How this daemon reaches it: `local` for itself; for another host,
     /// whether its SSH link is up.
     pub link: HostLink,
-    /// Whether it's the external address for outside MCP callers (#18).
+    /// Always false: External Address is retired (#143). It's still sent because a
+    /// Mac from before that needs it to read a host's row, as a host shared by two
+    /// Macs may have one, and an older host's `true` is ignored.
     pub external: bool,
     /// Whether it serves MCP now: on loopback, at least.
     pub mcp: bool,
@@ -896,33 +886,13 @@ pub struct HostInfo {
     /// For a host whose link is down, why.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
-    /// While it's the external address, where outside MCP callers reach
-    /// it: `https://<domain>/mcp`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub url: Option<String>,
-    /// While it's the external address, the Mac's tunnel to it.
+    /// The Mac's tunnel to it, for its MCP to reach the Mac. In a host's own row, whether
+    /// a Mac answers through it, once one has opened one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tunnel: Option<TunnelState>,
-    /// On a Linux host's own row, when its external address last changed, so a Mac
-    /// can tell whether a request it couldn't deliver is still news.
+    /// Why the tunnel isn't up, or what it waits for, and how to fix it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub external_changed_at: Option<i64>,
-    /// What to know about its external address that isn't trouble: who turned it
-    /// off and when, or that it serves on its own, with this Mac not using it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub external_note: Option<String>,
-    /// The name it serves, while this Mac isn't using it: what to use with one click.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub external_serves: Option<String>,
-    /// The name this Mac chose for it, while it no longer serves that: what to turn on
-    /// again with one click.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub external_last: Option<String>,
-    /// While it's the external address and something keeps it from
-    /// working, or holds it up, what and how to fix it: such as port 443,
-    /// or Let's Encrypt not reaching the domain.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub external_detail: Option<String>,
+    pub tunnel_detail: Option<String>,
     /// What its memory is doing now, as its kernel measures it: this
     /// host's own, and a Linux host's from its last ping while its link
     /// is up.
@@ -949,6 +919,10 @@ pub struct HostInfo {
     /// It tries again by itself; `hosts.upgrade` is **Retry**.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upgrade_error: Option<String>,
+    /// `upgrade_error` says why it's held from upgrading by itself: this build would
+    /// end what it serves, so `hosts.upgrade` is for someone to choose.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub upgrade_held: bool,
 }
 
 /// The sign-ins this build knows of those a host names.
@@ -986,33 +960,14 @@ pub struct MemoryUse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct HostExternalParams {
-    /// A Linux host this Mac added; or, absent or `local`, the Linux host
-    /// this is.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub host: Option<String>,
-    pub on: bool,
-    /// The public DNS name it's reached at, such as `vps.example.com`,
-    /// pointing at the host. Needed to turn it on; ignored to turn it off.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub domain: Option<String>,
-    /// Who's asking, for the host to log and say: a Mac's name, when a Mac passes
-    /// this on.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub by: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TunnelPrepared {
     /// The absolute path, on the host, of the socket the tunnel ends at.
     pub socket: String,
 }
 
-/// `tunnel.call`, which only the Mac's tunnel socket takes (PRD: External
-/// access, keys are checked where the agent lives): one of the agent calls
-/// MCP makes, on this Mac, with the API key the outside caller sent, which
-/// the Mac checks itself. Its result is the call's.
+/// `tunnel.call`, which only the Mac's tunnel sockets take (keys are checked where the
+/// agent lives): one of the agent calls MCP makes, on this Mac, with the API key the
+/// caller of a host's MCP sent, which the Mac checks itself. Its result is the call's.
 #[derive(Debug)]
 pub enum TunnelCall {}
 
@@ -1028,8 +983,8 @@ impl Method for TunnelCall {
 /// timeout on a Mac that's asleep. A client that isn't looking for it passes over it.
 pub const CALL_ACCEPTED: &str = "call.accepted";
 
-/// In a `daemon.hello` answer on the tunnel's socket or a link: this peer sends
-/// [`CALL_ACCEPTED`], and on the tunnel's socket gives its memory with `agents.list`.
+/// In a `daemon.hello` answer on a tunnel's socket or a link: this peer sends
+/// [`CALL_ACCEPTED`], and on a tunnel's socket gives its memory with `agents.list`.
 /// One without it is older, and isn't held to the accept deadline.
 pub const ACCEPTS_CALLS: &str = "accepts_calls";
 
@@ -1044,7 +999,7 @@ pub fn accepted_frame(line: &[u8], wanted: impl FnOnce(&str) -> bool) -> Option<
     })
 }
 
-/// The calls the tunnel takes, each for this Mac's own agents only; and `hosts.list`,
+/// The calls a tunnel takes, each for this Mac's own agents only; and `hosts.list`,
 /// answered with this Mac's own row alone, for a host older than its memory coming with
 /// `agents.list`. On a link, these are the calls that get [`CALL_ACCEPTED`].
 pub const TUNNEL_METHODS: &[&str] = &[
@@ -1062,7 +1017,7 @@ pub const TUNNEL_METHODS: &[&str] = &[
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TunnelCallParams {
-    /// The outside caller's API key, as it sent it.
+    /// The caller's API key, as it sent it.
     pub key: String,
     /// One of [`TUNNEL_METHODS`].
     pub method: String,
@@ -1098,6 +1053,16 @@ pub struct HostAddParams {
 #[serde(deny_unknown_fields)]
 pub struct HostNameParams {
     pub host: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostRemoveParams {
+    pub host: String,
+    /// Forgets it though it may still serve External Address, on an older build, with
+    /// this Mac's API keys, which then stay there until revoked with `vibe key revoke`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub force: Option<bool>,
 }
 
 /// How an install over SSH went.

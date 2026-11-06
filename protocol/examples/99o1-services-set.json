@@ -44,7 +44,7 @@
         "host": "local",
         "kind": "service.changed",
         "message": "linear",
-        "seq": 30,
+        "seq": 28,
         "state": "needs_reconnect"
       }
     }

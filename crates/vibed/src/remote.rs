@@ -42,7 +42,7 @@ pub const HOST_VIBE: &str = ".local/lib/vibeos/vibe";
 pub const HOST_ATTACH_VIBE: &str = HOST_VIBE;
 
 /// What an install puts on a Linux host, from the bundle for its CPU.
-pub const BINARIES: [&str; 4] = ["vibed", "vibe", "vibe-shim", "vibe-bind"];
+pub const BINARIES: [&str; 3] = ["vibed", "vibe", "vibe-shim"];
 
 /// The tools a Linux host's agents need, which the owner installs and logs
 /// in to on the server (PRD: Adding a Linux host).
@@ -95,7 +95,7 @@ pub trait Remote: Send + Sync + fmt::Debug {
 
     /// Forwards the Unix socket `remote` on the host at `address` to the
     /// socket `local` here (`ssh -R remote:local`), until the tunnel ends or
-    /// is dropped (PRD: External access, the Mac dials out).
+    /// is dropped (the Mac dials out).
     fn tunnel<'a>(
         &'a self,
         address: &'a str,
@@ -115,12 +115,6 @@ pub trait Remote: Send + Sync + fmt::Debug {
     /// once it has stopped answering: the next command makes a new one.
     fn drop_shared(&self, _address: &str) {}
 
-    /// The SHA-256 of the build of `vibe-bind` this VibeOS installs, for each CPU a
-    /// host may have: `x86_64` and `aarch64`. What a root-owned copy of it is held to.
-    fn bind_sums(&self) -> Vec<(&'static str, String)> {
-        Vec::new()
-    }
-
     /// The command a terminal here runs to do what `needs` take on `address`, with
     /// `sudo` asking for its password there. What each takes is written here,
     /// never given by the host, and the password goes to `sudo` alone.
@@ -129,7 +123,6 @@ pub trait Remote: Send + Sync + fmt::Debug {
         for need in needs {
             let step = match need {
                 AdminNeed::Linger => "sudo loginctl enable-linger \"$(id -un)\"\n".to_owned(),
-                AdminNeed::Port443 => port_443_step(&self.bind_sums()),
                 AdminNeed::Git => crate::tool_install::GIT_WITH_SUDO.replace("{sudo}", "sudo"),
             };
             script.push_str(&format!(
@@ -774,19 +767,6 @@ impl Default for Ssh {
 }
 
 impl Remote for Ssh {
-    fn bind_sums(&self) -> Vec<(&'static str, String)> {
-        let Some(bundle) = &self.bundle else {
-            return Vec::new();
-        };
-        ["x86_64", "aarch64"]
-            .into_iter()
-            .filter_map(|arch| {
-                let bytes = std::fs::read(bundle.join(arch).join(crate::bind_helper::SOURCE));
-                Some((arch, sha256_hex(&bytes.ok()?)))
-            })
-            .collect()
-    }
-
     fn dial<'a>(&'a self, address: &'a str) -> BoxFuture<'a, Result<Channel, String>> {
         self.dial_over(address, false)
     }
@@ -819,7 +799,6 @@ impl Remote for Ssh {
             });
         }
     }
-
     fn tunnel<'a>(
         &'a self,
         address: &'a str,
@@ -1025,7 +1004,7 @@ lib="$HOME/.local/lib/vibeos"
 if [ -x "$lib/vibed" ]; then
   echo "ondisk=$("$lib/vibed" --version 2>/dev/null | cut -d ' ' -f 2)"
 fi
-for f in vibed vibe vibe-shim vibe-bind; do
+for f in vibed vibe vibe-shim; do
   # What an upload cut short left behind.
   rm -f "$lib/.$f.new"
   if [ -f "$lib/$f" ] && command -v sha256sum >/dev/null 2>&1; then
@@ -1056,39 +1035,6 @@ fn base64(bytes: &[u8]) -> String {
         }
     }
     out
-}
-
-/// What gets port 443 usable on a server, with `sudo`'s prompt: the helper, held to
-/// this VibeOS's own sum for the server's CPU. With no sum for it, it stops: nothing
-/// unchecked is made privileged, and that's no reason to go the wider way.
-fn port_443_step(sums: &[(&'static str, String)]) -> String {
-    let want = |arch: &str| {
-        sums.iter()
-            .find(|(a, _)| *a == arch)
-            .map_or("", |(_, sum)| sum.as_str())
-            .to_owned()
-    };
-    let grant = crate::bind_helper::grant_lines(
-        "sudo",
-        &format!("\"$HOME/{HOST_LIB}/{}\"", crate::bind_helper::SOURCE),
-        "\"$want\"",
-        std::path::Path::new(crate::bind_helper::HELPER),
-    );
-    format!(
-        "case \"$(uname -m)\" in\n\
-           x86_64|amd64) want={} ;;\n\
-           aarch64|arm64) want={} ;;\n\
-           *) want= ;;\n\
-         esac\n\
-         if [ -z \"$want\" ]; then\n\
-           echo \"This VibeOS has no build of vibe-bind for this server.\" >&2\n\
-           false\n\
-         else\n\
-           {grant}\
-         fi\n",
-        shell_quote(&want("x86_64")),
-        shell_quote(&want("aarch64")),
-    )
 }
 
 /// The `PATH` `vibed` runs with on the server: the owner's login shell's,
@@ -1207,7 +1153,7 @@ fn configure_script(uploads: &[(&str, String)], unit: &str, path: &str) -> Strin
              why=$(journalctl --user -u vibed.service -t vibed -n 1 --no-pager -o cat 2>/dev/null)\n    \
              # A build that won't start isn't left to cut the host off.\n    \
              back=no\n    \
-             for f in vibed vibe vibe-shim vibe-bind; do\n      \
+             for f in vibed vibe vibe-shim; do\n      \
                if [ -f \"$lib/.$f.prev\" ]; then mv -f \"$lib/.$f.prev\" \"$lib/$f\"; back=yes; fi\n    \
              done\n    \
              if [ \"$back\" = yes ]; then\n      \
@@ -1458,53 +1404,6 @@ mod tests {
         let said = String::from_utf8_lossy(&out.stdout);
         assert!(!said.contains("done"), "{said}");
         assert!(said.contains("didn't work"), "{said}");
-    }
-
-    /// The port's step, on stand-ins: the helper first, with this CPU's sum, and
-    /// never the wider way for a `sudo` that refused or a CPU with no build.
-    #[test]
-    fn the_port_step_holds_the_helper_to_its_sum_and_goes_no_wider_than_it_must() {
-        struct Summed(Vec<(&'static str, String)>);
-        impl std::fmt::Debug for Summed {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("Summed")
-            }
-        }
-        impl Remote for Summed {
-            fn dial<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Result<Channel, String>> {
-                Box::pin(async { Err(String::new()) })
-            }
-            fn install<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Result<Installed, String>> {
-                Box::pin(async { Err(String::new()) })
-            }
-            fn bind_sums(&self) -> Vec<(&'static str, String)> {
-                self.0.clone()
-            }
-        }
-        let sums = vec![("x86_64", "a".repeat(64)), ("aarch64", "b".repeat(64))];
-        let line = Summed(sums).admin_line("me@vps", &[AdminNeed::Port443]);
-        let (out, asked) = run_admin_line(&line, "exit 1");
-        assert!(!out.status.success(), "{out:?}");
-        // Only the one try: not the fallback, for a password refused.
-        let mut lines = asked.split("\n").filter(|l| l.starts_with("sh -c "));
-        assert!(lines.next().is_some(), "{asked}");
-        assert!(lines.next().is_none(), "{asked}");
-        assert!(asked.contains("/.local/lib/vibeos/vibe-bind "), "{asked}");
-        let sum = if cfg!(target_arch = "x86_64") {
-            "a"
-        } else {
-            "b"
-        }
-        .repeat(64);
-        assert!(asked.contains(&sum), "{asked}");
-        assert!(asked.contains(crate::bind_helper::HELPER), "{asked}");
-
-        // No build for it: sudo isn't asked at all.
-        let bare = Summed(Vec::new()).admin_line("me@vps", &[AdminNeed::Port443]);
-        let (out, asked) = run_admin_line(&bare, "exit 0");
-        assert!(!out.status.success(), "{out:?}");
-        assert_eq!(asked, "");
-        assert!(String::from_utf8_lossy(&out.stderr).contains("no build of vibe-bind"));
     }
 
     #[test]

@@ -38,7 +38,7 @@
         "host": "local",
         "kind": "service.changed",
         "message": "linear",
-        "seq": 31,
+        "seq": 29,
         "state": "connected"
       }
     },
@@ -50,7 +50,7 @@
         "host": "local",
         "kind": "service.changed",
         "message": "linear",
-        "seq": 32,
+        "seq": 30,
         "state": "connected"
       }
     }

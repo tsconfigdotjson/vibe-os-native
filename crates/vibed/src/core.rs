@@ -102,6 +102,12 @@ pub struct Config {
     /// Where MCP can be served on Tailscale: this machine's addresses in
     /// its ranges, by default.
     pub tailscale: TailscaleAddresses,
+    /// Whether a Mac's tunnel can end here: on a Linux host, and a stand-in for one in
+    /// tests. [`Config::new`] says which by its OS. Nothing is served for it but the
+    /// private socket sshd makes.
+    pub serves_mac_peer: bool,
+    /// How often the tunnel's end is looked at for a Mac.
+    pub mac_probe_every: Duration,
     /// How Linux hosts are reached: over SSH, by default.
     pub remote: Arc<dyn Remote>,
     /// How their links are timed.
@@ -113,8 +119,6 @@ pub struct Config {
     pub free_disk: FreeDisk,
     /// How the sleep watch is timed.
     pub sleep_timing: crate::sleep::Timing,
-    /// How a Linux host serves the external address.
-    pub external: crate::external::ExternalConfig,
     /// What `vibe doctor` asks of the machine: the machine itself, by
     /// default.
     pub checks: Arc<dyn crate::doctor::HostChecks>,
@@ -180,15 +184,13 @@ impl Config {
             pressure: Arc::new(crate::pressure::HostPressure),
             toolbox: None,
             tailscale: Arc::new(vibe_mcp::net::tailscale_addresses),
+            serves_mac_peer: info.os == "linux",
+            mac_probe_every: Duration::from_secs(5),
             remote: Arc::new(Ssh::new().sharing_in(run_dir)),
             link_timing: Timing::default(),
             power: Arc::new(crate::power::HostPower::default()),
             free_disk: Arc::new(crate::sleep::free_space),
             sleep_timing: crate::sleep::Timing::default(),
-            external: crate::external::ExternalConfig {
-                serve_here: info.os == "linux",
-                ..crate::external::ExternalConfig::default()
-            },
             checks,
             pi_releases: crate::pi::releases_from_env(),
             tool_releases: crate::tool_install::ToolReleases::from_env(),
@@ -434,9 +436,6 @@ pub struct Core {
     pub(crate) git_needs_admin: std::sync::atomic::AtomicBool,
     /// Claude Code's here, and not signed in, as last looked at.
     pub(crate) claude_signed_out: std::sync::atomic::AtomicBool,
-    /// `sudo -n` was tried for port 443. A refused try is in the server's logs, and
-    /// can mail its admin, so once a run is enough.
-    pub(crate) port_grant_tried: std::sync::atomic::AtomicBool,
     /// One admission at a time, so two starts can't both take the last
     /// room under `max_awake_agents`.
     pub(crate) admitting: tokio::sync::Mutex<()>,
@@ -516,20 +515,14 @@ pub struct Core {
     /// The runtime those tasks run on, as a call may come from a thread
     /// outside it.
     pub(crate) runtime: OnceLock<tokio::runtime::Handle>,
-    /// How a Linux host serves the external address.
-    pub(crate) external: crate::external::ExternalConfig,
-    /// On a Linux host, its public endpoint while it's the external address.
-    pub(crate) public: Mutex<Option<crate::external::Public>>,
+    /// On a Linux host, whether a Mac's tunnel can end here.
+    pub(crate) serves_mac_peer: bool,
+    pub(crate) mac_probe_every: Duration,
+    pub(crate) mac_probe: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// On a Linux host, the Mac behind it, at the tunnel's end.
-    pub(crate) peer: crate::external::MacPeer,
-    /// On a Mac, the tunnel to the Linux host that's its external address.
-    pub(crate) tunnel: Mutex<Option<crate::tunnel::Tunnel>>,
-    /// On a Mac, the tunnel's socket, served while a host is the external
-    /// address.
-    pub(crate) tunnel_socket_served:
-        Mutex<Option<(tokio::task::JoinHandle<()>, vibe_core::socket::SocketGuard)>>,
-    /// On a Mac, when a host last came through the tunnel.
-    pub(crate) tunnel_seen: Mutex<Option<std::time::Instant>>,
+    pub(crate) peer: crate::mac_peer::MacPeer,
+    /// On a Mac, the tunnel to each Linux host linked to it.
+    pub(crate) tunnels: Mutex<HashMap<String, crate::tunnel::Tunnel>>,
     _state_lock: StateLock,
 }
 
@@ -634,7 +627,7 @@ impl Core {
                 }),
             )
         });
-        let tunnel_end = config.layout.run_dir().join(crate::external::TUNNEL_END);
+        let tunnel_end = config.layout.run_dir().join(crate::mac_peer::TUNNEL_END);
         let core = Core {
             info: config.info,
             label: config.label,
@@ -667,7 +660,6 @@ impl Core {
             tool_releases: config.tool_releases,
             git_needs_admin: std::sync::atomic::AtomicBool::new(false),
             claude_signed_out: std::sync::atomic::AtomicBool::new(false),
-            port_grant_tried: std::sync::atomic::AtomicBool::new(false),
             admitting: tokio::sync::Mutex::new(()),
             starting: Mutex::new(0),
             fetching: Mutex::new(HashMap::new()),
@@ -710,12 +702,11 @@ impl Core {
             adding_hosts: Mutex::new(HashSet::new()),
             me: OnceLock::new(),
             runtime: OnceLock::new(),
-            peer: crate::external::MacPeer::new(tunnel_end),
-            external: config.external,
-            public: Mutex::new(None),
-            tunnel: Mutex::new(None),
-            tunnel_socket_served: Mutex::new(None),
-            tunnel_seen: Mutex::new(None),
+            serves_mac_peer: config.serves_mac_peer,
+            mac_probe_every: config.mac_probe_every,
+            mac_probe: Mutex::new(None),
+            peer: crate::mac_peer::MacPeer::new(tunnel_end),
+            tunnels: Mutex::new(HashMap::new()),
             _state_lock: state_lock,
         };
         core.load_pressure_pauses();
@@ -1512,7 +1503,7 @@ impl Core {
         // for an agent made with it before it was reserved.
         let is_agent = |r: &str| {
             self.store().agent(LOCAL_HOST, r).is_ok()
-                && !self.serves_itself(&self.layout.session_socket(r))
+                && self.layout.session_socket(r) != self.layout.socket()
         };
         for r in sessions::socket_refs(&self.layout.run_dir(), is_agent) {
             let path = self.layout.session_socket(&r);

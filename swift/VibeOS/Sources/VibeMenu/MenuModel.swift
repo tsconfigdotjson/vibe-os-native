@@ -478,23 +478,11 @@ public final class MenuModel: ObservableObject {
         }
     }
 
-    /// The Linux host that's the external address, if one is.
-    public var externalHost: HostInfo? { hosts.first { $0.external } }
-
-    /// Settings → Hosts → Use as External Address: `host` serves
-    /// `https://<domain>/mcp` and this Mac keeps a tunnel to it; with no
-    /// domain, it stops. Turning it on for one host turns it off for any
-    /// other.
-    public func setExternal(_ host: String, domain: String?) async throws -> HostInfo {
-        let info = try await call(
-            HostsExternal.self, HostExternalParams(host: host, on: domain != nil, domain: domain), timeout: 60)
-        await refresh()
-        return info
-    }
-
-    /// Forgets a Linux host; it runs on there, on its own.
-    public func removeHost(_ name: String) async throws {
-        _ = try await call(HostsRemove.self, HostNameParams(host: name))
+    /// Forgets a Linux host; it runs on there, on its own. vibed refuses one that may still
+    /// serve External Address with this Mac's keys out of reach, unless `force` says that's
+    /// understood.
+    public func removeHost(_ name: String, force: Bool = false) async throws {
+        _ = try await call(HostsRemove.self, HostRemoveParams(host: name, force: force ? true : nil))
         agents.removeAll { $0.host == name }
         settingsRevision += 1
         await refresh()

@@ -14,18 +14,15 @@ vibe-mcp.workspace = true
 vibe-relay.workspace = true
 vibe-services.workspace = true
 vibe-status.workspace = true
-instant-acme.workspace = true
 libc.workspace = true
-rcgen.workspace = true
-rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+rusqlite.workspace = true
 tempfile.workspace = true
-tokio-rustls.workspace = true
 
 [lints]
 workspace = true

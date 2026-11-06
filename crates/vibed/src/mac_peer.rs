@@ -1,19 +1,15 @@
-//! External access (PRD: Linux hosts and external access, External
-//! access), on both ends.
+//! The Mac, from a Linux host (PRD: Reaching MCP from elsewhere): a key-authenticated MCP
+//! on the host, on loopback or its Tailscale address, reaches agents on the Mac too.
 //!
-//! On a Linux host that's the external address, `vibed` serves MCP
-//! publicly at `https://<domain>/mcp`, with a certificate from Let's
-//! Encrypt (see [`crate::acme`]), every call rate-limited and logged (see
-//! [`vibe_mcp::public`]). Behind it is the Mac, which keeps an SSH reverse
-//! tunnel to a Unix socket in the host's private `run/` (see
-//! [`crate::tunnel`]). Outside callers see the Mac's agents as `mac:<ref>`;
-//! a call for one goes down the tunnel with the caller's key, and the Mac
-//! checks the key itself, so a host that's been taken over can't drive the
-//! Mac without one. While the Mac can't be reached, the host answers for
-//! its own agents, and the Mac's are unavailable.
+//! The Mac keeps an SSH reverse tunnel to a Unix socket in the host's private `run/` (see
+//! [`crate::tunnel`]). Callers of the host's MCP see the Mac's agents as `mac:<ref>`; a
+//! call for one goes down the tunnel with the caller's key, and the Mac checks the key
+//! itself, so a host that's been taken over can't drive the Mac without one. While the
+//! Mac can't be reached, the host answers for its own agents, and the Mac's are
+//! unavailable, as they were last seen.
 //!
-//! On the Mac, `hosts.external` records which Linux host is the external
-//! address (one at most), tells the host, and keeps the tunnel to it.
+//! Nothing here listens on the network. The tunnel's end exists only once a Mac has
+//! opened one, so a Linux host with no Mac has no `mac` to speak of.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -23,102 +19,17 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tokio::io::BufReader;
-use tokio::net::{TcpListener, UnixStream};
-use tokio::task::JoinHandle;
-use vibe_core::model::{EventKind, LOCAL_HOST, MAC_HOST, TunnelState, validate_domain};
+use tokio::net::UnixStream;
+use vibe_core::model::{EventKind, LOCAL_HOST, MAC_HOST};
 use vibe_core::rpc::{ACCEPTS_CALLS, MemoryUse};
-use vibe_core::rpc::{
-    Agent, ErrorCode, ErrorObject, HostExternalParams, HostInfo, HostsExternal, Method, Project,
-    TunnelPrepared,
-};
-use vibe_mcp::public::{Limiter, Limits};
+use vibe_core::rpc::{Agent, ErrorCode, ErrorObject, Method, Project, TunnelPrepared};
 
-use crate::acme::{self, Certs, Disk};
-use crate::core::{Core, error, invalid, lock, store_error};
+use crate::core::{Core, error, lock};
+use crate::link::check_after;
 use crate::remote::{ACCEPT_WITHIN, Channel};
-
-/// The port the public endpoint listens on: 443, which Let's Encrypt's
-/// TLS-ALPN-01 challenge comes to.
-pub const HTTPS_PORT: u16 = 443;
 
 /// Where the Mac's tunnel ends on a Linux host, in its private `run/`.
 pub const TUNNEL_END: &str = "mac.sock";
-
-/// How the external address is served on a Linux host. Tests change all of
-/// it; `vibed` takes the port, the ACME server and a fixed certificate from
-/// the environment (see its `--help`).
-#[derive(Debug, Clone)]
-pub struct ExternalConfig {
-    /// Whether this host may serve the external address: a Linux host may,
-    /// a Mac never ([`crate::core::Config::new`] says which by its OS).
-    pub serve_here: bool,
-    pub port: u16,
-    /// The one address to listen on; every address by default. Tests keep
-    /// to loopback.
-    pub listen: Option<std::net::IpAddr>,
-    /// The ACME directory certificates come from: Let's Encrypt's.
-    pub acme_directory: String,
-    /// A PEM certificate chain and key to serve instead of one from ACME.
-    pub fixed_cert: Option<(PathBuf, PathBuf)>,
-    /// How often the tunnel's end is looked at for a Mac.
-    pub probe_every: Duration,
-    /// How hard the public endpoint is on each client.
-    pub limits: Limits,
-    /// Where the root-owned helper that opens port 443 is, for a `vibed` that
-    /// can't itself ([`crate::bind_helper`]).
-    pub bind_helper: PathBuf,
-    /// The build of it to put there; by default, the one beside `vibed`.
-    pub bind_source: Option<PathBuf>,
-    /// The `PATH` for doing that, for a test's stand-in `sudo`.
-    pub bind_path: Option<std::ffi::OsString>,
-    /// For tests: acts as if the kernel refused this user the port.
-    pub deny_direct: bool,
-}
-
-impl Default for ExternalConfig {
-    fn default() -> Self {
-        ExternalConfig {
-            serve_here: false,
-            port: HTTPS_PORT,
-            listen: None,
-            acme_directory: acme::LETS_ENCRYPT.into(),
-            fixed_cert: None,
-            probe_every: Duration::from_secs(5),
-            limits: Limits::default(),
-            bind_helper: PathBuf::from(crate::bind_helper::HELPER),
-            bind_source: None,
-            bind_path: None,
-            deny_direct: false,
-        }
-    }
-}
-
-/// The public endpoint, while this Linux host is the external address.
-#[derive(Debug)]
-pub(crate) struct Public {
-    domain: String,
-    task: JoinHandle<()>,
-    /// What keeps it from working, or holds it up, if anything does.
-    detail: Arc<Mutex<Option<String>>>,
-    /// The kernel keeps its port from this user, and nothing that needs no password
-    /// has got round that yet. It goes with this, so never outlasts it.
-    port_denied: Arc<AtomicBool>,
-}
-
-impl Drop for Public {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
-/// Aborts a task when it's dropped, as when the task that started it is.
-struct AbortOnDrop(JoinHandle<()>);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
 
 // The Mac, from the host.
 
@@ -150,6 +61,8 @@ pub(crate) struct MacPeer {
     refs_seen: Mutex<HashMap<String, HashSet<String>>>,
     /// The Mac's memory as it came with each key's last listing.
     memory_seen: Mutex<HashMap<String, MemoryUse>>,
+    /// The other hosts linked to the Mac, reached through it, as each key last heard.
+    linked_seen: Mutex<HashMap<String, Vec<String>>>,
 }
 
 /// How long a call waits its turn at the Mac, as stuck calls mustn't queue new
@@ -173,16 +86,6 @@ const MAX_SEEN: usize = 64;
 
 /// Calls to the Mac at once: the Mac's tunnel socket serves 16.
 const MAX_CALLS: usize = 8;
-
-/// What to do about a call that changes something, once it's gone out and nobody
-/// has heard how it ended. Nothing, for one that doesn't.
-pub(crate) fn check_after(method: &str) -> Option<&'static str> {
-    match method {
-        "agents.send" => Some("check vibe_read_messages before resending"),
-        "agents.start" | "agents.delete" => Some("check vibe_list_agents before trying again"),
-        _ => None,
-    }
-}
 
 /// What a call gets that never went out.
 fn not_sent(method: &str, why: &str) -> ErrorObject {
@@ -215,11 +118,12 @@ fn mac_unavailable(why: &str) -> ErrorObject {
     )
 }
 
-/// The Mac's answer, as this host says it: every `host` in it is `mac`.
+/// The Mac's answer, as this host says it: its own `local` is `mac`, and a host linked to
+/// it goes by its own name.
 fn relabel(value: &mut Value) {
     match value {
         Value::Object(map) => {
-            if map.contains_key("host") {
+            if map.get("host").and_then(Value::as_str) == Some(LOCAL_HOST) {
                 map.insert("host".into(), json!(MAC_HOST));
             }
             map.values_mut().for_each(relabel);
@@ -242,20 +146,12 @@ impl MacPeer {
             projects_seen: Mutex::new(HashMap::new()),
             refs_seen: Mutex::new(HashMap::new()),
             memory_seen: Mutex::new(HashMap::new()),
+            linked_seen: Mutex::new(HashMap::new()),
         }
     }
 
     pub(crate) fn is_up(&self) -> bool {
         self.up.load(Ordering::SeqCst)
-    }
-
-    /// Forgets everything about the Mac, as when the tunnel's end is made
-    /// anew or external access goes off.
-    pub(crate) fn reset(&self) {
-        lock(&self.idle).clear();
-        self.forget_all();
-        self.up.store(false, Ordering::SeqCst);
-        self.misses.store(GONE_AFTER, Ordering::SeqCst);
     }
 
     /// What a look at the tunnel found. A miss stops new calls at once; only
@@ -334,7 +230,13 @@ impl MacPeer {
         timeout: Duration,
         sent_at: Option<i64>,
     ) -> Result<Value, ErrorObject> {
-        if let Some(map) = params.as_object_mut() {
+        // `mac` is what it goes by here, not there; a host linked to it keeps its name.
+        if let Some(map) = params.as_object_mut()
+            && matches!(
+                map.get("host").and_then(Value::as_str),
+                None | Some(MAC_HOST | LOCAL_HOST)
+            )
+        {
             map.remove("host");
         }
         // Asleep, the end of its tunnel may accept and then say nothing: once the
@@ -433,6 +335,22 @@ impl MacPeer {
         while self.misses.load(Ordering::SeqCst) < GONE_AFTER {
             tokio::time::sleep(STILL_THERE_EVERY).await;
         }
+    }
+
+    /// Notes the other hosts linked to the Mac, as `key` just heard.
+    pub(crate) fn saw_linked(&self, key: &str, hosts: Vec<String>) {
+        let mut seen = lock(&self.linked_seen);
+        if seen.len() >= MAX_SEEN && !seen.contains_key(&vibe_core::keys::hash(key)) {
+            seen.clear();
+        }
+        seen.insert(vibe_core::keys::hash(key), hosts);
+    }
+
+    /// The other hosts linked to the Mac, as `key` last heard, if it has.
+    pub(crate) fn linked(&self, key: &str) -> Option<Vec<String>> {
+        lock(&self.linked_seen)
+            .get(&vibe_core::keys::hash(key))
+            .cloned()
     }
 
     /// Keeps which projects `key` last listed on the Mac.
@@ -537,6 +455,7 @@ impl MacPeer {
 
     /// Forgets what every key listed, as when the keys change.
     pub(crate) fn forget_all(&self) {
+        lock(&self.linked_seen).clear();
         lock(&self.seen).clear();
         lock(&self.projects_seen).clear();
         lock(&self.refs_seen).clear();
@@ -558,297 +477,6 @@ impl MacPeer {
     }
 }
 
-/// Why the public endpoint can't listen yet, and if that's for want of the
-/// privilege, which the owner's one button gives.
-struct BindTrouble {
-    why: String,
-    denied: bool,
-}
-
-/// The public endpoint's listener on `port`: every address, IPv6 and IPv4
-/// alike where the machine has IPv6, else IPv4; or only `listen`. A port the kernel
-/// keeps from this user comes through the helper, which is put in place first if
-/// that can be done without asking anyone (`tried` keeps that to once a run). The
-/// kernel refuses a port that's taken as it does a free one, so what's listening is
-/// looked at first: no privilege would help that.
-async fn bind_public(
-    config: &ExternalConfig,
-    domain: &str,
-    tried: &AtomicBool,
-) -> Result<TcpListener, BindTrouble> {
-    let port = config.port;
-    let bound = match bind_directly(config).await {
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied && listening_on(port) => {
-            Err(std::io::ErrorKind::AddrInUse.into())
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied && config.listen.is_none() => {
-            bind_through_helper(config, tried).await
-        }
-        other => other,
-    };
-    bound.map_err(|e| {
-        let denied = e.kind() == std::io::ErrorKind::PermissionDenied;
-        let why = match e.kind() {
-            std::io::ErrorKind::PermissionDenied => format!(
-                "can't listen on port {port}: this server keeps it for root, and VibeOS can't \
-                 allow it without a password. Allow… in Settings → Hosts does it, asking for the \
-                 password there once. With no Mac linked, ask whoever has sudo here to allow it"
-            ),
-            std::io::ErrorKind::AddrInUse => format!(
-                "can't listen on port {port}: another program on this server has it, such as a \
-                 web server. https://{domain}/mcp needs it"
-            ),
-            _ => format!("can't listen on port {port}: {e}"),
-        };
-        BindTrouble { why, denied }
-    })
-}
-
-/// Whether anything's listening on TCP `port` here, as the kernel lists it: the
-/// fourth field is the state, where `0A` is listening. It's only ever read to say
-/// what's in the way, so anything it can't read says no.
-fn listening_on(port: u16) -> bool {
-    let want = format!(":{port:04X}");
-    ["/proc/net/tcp", "/proc/net/tcp6"].iter().any(|table| {
-        std::fs::read_to_string(table).is_ok_and(|text| {
-            text.lines().skip(1).any(|line| {
-                let mut fields = line.split_whitespace().skip(1);
-                let local = fields.next().unwrap_or("");
-                local.ends_with(&want) && fields.nth(1) == Some("0A")
-            })
-        })
-    })
-}
-
-async fn bind_directly(config: &ExternalConfig) -> std::io::Result<TcpListener> {
-    let port = config.port;
-    if config.deny_direct {
-        return Err(std::io::ErrorKind::PermissionDenied.into());
-    }
-    match config.listen {
-        Some(ip) => TcpListener::bind((ip, port)).await,
-        None => match dual_stack(port) {
-            Ok(l) => Ok(l),
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Err(e),
-            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => Err(e),
-            Err(_) => TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port)).await,
-        },
-    }
-}
-
-/// The port from the helper, having tried putting that in place if it can't help
-/// yet. That can also have opened the port to this user another way.
-async fn bind_through_helper(
-    config: &ExternalConfig,
-    tried: &AtomicBool,
-) -> std::io::Result<TcpListener> {
-    let ask = || async {
-        let helper = config.bind_helper.clone();
-        let test_port = (config.port != HTTPS_PORT).then_some(config.port);
-        tokio::task::spawn_blocking(move || crate::bind_helper::open(&helper, test_port))
-            .await
-            .map_err(std::io::Error::other)?
-    };
-    let denied = |e: &std::io::Error| {
-        matches!(
-            e.kind(),
-            std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
-        )
-    };
-    let listener = match ask().await {
-        Err(e) if denied(&e) && !tried.swap(true, Ordering::SeqCst) => {
-            let Some(source) = config.bind_source.clone().or_else(|| {
-                Some(
-                    std::env::current_exe()
-                        .ok()?
-                        .parent()?
-                        .join(crate::bind_helper::SOURCE),
-                )
-            }) else {
-                return Err(std::io::ErrorKind::PermissionDenied.into());
-            };
-            let (helper, path) = (config.bind_helper.clone(), config.bind_path.clone());
-            let granted = tokio::task::spawn_blocking(move || {
-                crate::bind_helper::grant_quietly(&source, &helper, path.as_deref())
-            })
-            .await
-            .unwrap_or(false);
-            if !granted {
-                return Err(std::io::ErrorKind::PermissionDenied.into());
-            }
-            match bind_directly(config).await {
-                Ok(l) => return Ok(l),
-                Err(_) => ask().await,
-            }
-        }
-        other => other,
-    };
-    match listener {
-        Err(e) if denied(&e) => Err(std::io::ErrorKind::PermissionDenied.into()),
-        Err(e) => Err(e),
-        Ok(l) => TcpListener::from_std(l),
-    }
-}
-
-/// A listener on every IPv6 and IPv4 address at `port`, whatever the
-/// system's default for IPv6 sockets (`bindv6only`) is.
-fn dual_stack(port: u16) -> std::io::Result<TcpListener> {
-    use std::os::fd::AsRawFd;
-    let socket = tokio::net::TcpSocket::new_v6()?;
-    let off: libc::c_int = 0;
-    // SAFETY: setsockopt reads `off`, an int, from a pointer valid for the
-    // call, on a socket this function owns.
-    let r = unsafe {
-        libc::setsockopt(
-            socket.as_raw_fd(),
-            libc::IPPROTO_IPV6,
-            libc::IPV6_V6ONLY,
-            (&off as *const libc::c_int).cast(),
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        )
-    };
-    if r != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    socket.set_reuseaddr(true)?;
-    socket.bind((std::net::Ipv6Addr::UNSPECIFIED, port).into())?;
-    socket.listen(1024)
-}
-
-/// Sets `detail`, and logs it when it changes.
-fn set_detail(detail: &Mutex<Option<String>>, now: Option<String>) {
-    let mut d = lock(detail);
-    if *d != now {
-        match &now {
-            Some(why) => crate::log!("vibed: external address: {why}"),
-            None if d.is_some() => crate::log!("vibed: external address: working again"),
-            None => {}
-        }
-        *d = now;
-    }
-}
-
-/// Serves the public endpoint for `domain` until aborted: binds the port
-/// (again and again until it can), keeps a certificate, and looks for the
-/// Mac at the tunnel's end.
-async fn run_public(
-    core: Weak<Core>,
-    domain: String,
-    config: ExternalConfig,
-    detail: Arc<Mutex<Option<String>>>,
-    port_denied: Arc<AtomicBool>,
-) {
-    let Some(c) = core.upgrade() else { return };
-    let certs = Arc::new(Certs::new(&domain));
-    let disk = Disk::new(c.layout.data_dir().join("external"));
-    drop(c);
-    match &config.fixed_cert {
-        Some((chain, key)) => {
-            let loaded = std::fs::read(chain)
-                .and_then(|ch| Ok((ch, std::fs::read(key)?)))
-                .map_err(|e| e.to_string())
-                .and_then(|(ch, k)| acme::load_pem(&ch, &k));
-            match loaded {
-                Ok(l) => certs.set(l),
-                Err(e) => set_detail(&detail, Some(format!("its certificate: {e}"))),
-            }
-        }
-        None => match disk.load(&domain) {
-            Some(Ok(l)) => certs.set(l),
-            Some(Err(e)) => {
-                crate::log!("vibed: the certificate kept for {domain}: {e}; getting another")
-            }
-            None => {}
-        },
-    }
-    let listener = loop {
-        let Some(c) = core.upgrade() else { return };
-        let bound = bind_public(&config, &domain, &c.port_grant_tried).await;
-        drop(c);
-        match bound {
-            Ok(l) => break l,
-            Err(trouble) => {
-                set_detail(&detail, Some(trouble.why));
-                port_denied.store(trouble.denied, Ordering::SeqCst);
-                // Soon, once it's the one button that's awaited.
-                let wait = if trouble.denied { 5 } else { 30 };
-                tokio::time::sleep(Duration::from_secs(wait)).await;
-            }
-        }
-    };
-    set_detail(&detail, None);
-    port_denied.store(false, Ordering::SeqCst);
-    let Some(c) = core.upgrade() else { return };
-    crate::log!(
-        "vibed: serving https://{domain}/mcp publicly, on port {}",
-        config.port
-    );
-    let tls = vibe_mcp::public::server_config(Arc::clone(&certs) as _);
-    let limiter = Arc::new(Limiter::new(config.limits));
-    let _server = AbortOnDrop(tokio::spawn(vibe_mcp::public::serve(
-        listener,
-        tls,
-        Arc::clone(&c),
-        limiter,
-    )));
-    let _probe = AbortOnDrop(tokio::spawn(probe_mac(core.clone(), config.probe_every)));
-    drop(c);
-    if config.fixed_cert.is_some() {
-        if certs.current().is_some() {
-            set_detail(&detail, None);
-        }
-        std::future::pending::<()>().await;
-    }
-    // Let's Encrypt allows 5 failed checks an hour for a name: the first
-    // retries are 5, 15 and 45 minutes apart. Turning it off and on again
-    // tries at once, as after fixing DNS.
-    let first_retry = Duration::from_secs(5 * 60);
-    let mut backoff = first_retry;
-    loop {
-        let now = vibe_core::time::now();
-        let current = certs.current().map(|l| l.validity);
-        if let Some(v) = current
-            && v.renew_at() > now
-        {
-            set_detail(&detail, None);
-            let wait = u64::try_from(v.renew_at() - now).unwrap_or(0);
-            tokio::time::sleep(Duration::from_secs(wait.min(12 * 3600))).await;
-            continue;
-        }
-        let serving = current.is_some_and(|v| v.not_after > now);
-        if !serving {
-            set_detail(
-                &detail,
-                Some(format!(
-                    "getting a certificate for {domain} from Let's Encrypt"
-                )),
-            );
-        }
-        crate::log!("vibed: asking Let's Encrypt for a certificate for {domain}");
-        match acme::obtain(&config.acme_directory, &disk, &certs).await {
-            Ok(v) => {
-                crate::log!(
-                    "vibed: got a certificate for {domain}, good until {}",
-                    vibe_core::time::rfc3339(v.not_after)
-                );
-                set_detail(&detail, None);
-                backoff = first_retry;
-                // Never another order straight after one, whatever the
-                // clock or the certificate's life says.
-                tokio::time::sleep(Duration::from_secs(3600)).await;
-            }
-            Err(why) => {
-                crate::log!("vibed: no certificate for {domain} yet: {why}");
-                if !serving {
-                    set_detail(&detail, Some(why));
-                }
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 3).min(Duration::from_secs(6 * 3600));
-            }
-        }
-    }
-}
-
 /// Looks for the Mac at the tunnel's end every `every`, and says when it
 /// comes or goes.
 async fn probe_mac(core: Weak<Core>, every: Duration) {
@@ -857,17 +485,16 @@ async fn probe_mac(core: Weak<Core>, every: Duration) {
         let Some(c) = core.upgrade() else { return };
         let up = c.peer.probe().await;
         let look_again = !up && c.peer.misses.load(Ordering::SeqCst) < GONE_AFTER;
-        if was != Some(up) {
-            if was.is_some() || up {
-                crate::log!(
-                    "vibed: the Mac is {} through its tunnel",
-                    if up {
-                        "reachable"
-                    } else {
-                        "no longer reachable"
-                    }
-                );
-            }
+        // A host no Mac has ever tunnelled to has nothing to say of it.
+        if was != Some(up) && (was.is_some() || up) {
+            crate::log!(
+                "vibed: the Mac is {} through its tunnel",
+                if up {
+                    "reachable"
+                } else {
+                    "no longer reachable"
+                }
+            );
             let mut e = c.event(EventKind::HostLink);
             e.state = Some(if up { "up" } else { "down" }.into());
             e.message = Some(format!(
@@ -875,8 +502,8 @@ async fn probe_mac(core: Weak<Core>, every: Duration) {
                 if up { "up" } else { "down" }
             ));
             c.publish(e);
-            was = Some(up);
         }
+        was = Some(up);
         drop(c);
         // A first miss is looked into at once: calls under way are waiting on it.
         if !look_again {
@@ -886,101 +513,27 @@ async fn probe_mac(core: Weak<Core>, every: Duration) {
 }
 
 impl Core {
-    /// The public name this Linux host is the external address at, if it is.
-    pub(crate) fn public_domain(&self) -> Option<String> {
-        if !self.external.serve_here {
-            return None;
-        }
-        self.store().host_external(LOCAL_HOST).ok().flatten()
-    }
-
-    /// The Mac behind this host, while it's the external address.
+    /// The Mac behind this host, once one has opened a tunnel to it. Its end stays in
+    /// `run/` when the Mac sleeps, as sshd leaves it, so the Mac's agents go on being
+    /// listed, unavailable, until it's back or has forgotten this host.
     pub(crate) fn mac(&self) -> Option<&MacPeer> {
-        self.public_domain().map(|_| &self.peer)
+        (self.serves_mac_peer && std::fs::symlink_metadata(&self.peer.socket).is_ok())
+            .then_some(&self.peer)
     }
 
-    /// Fills in what this host's own row says of external access: why it
-    /// isn't working, if it isn't, and whether a Mac answers through the
-    /// tunnel.
-    /// Whether the kernel keeps the public endpoint's port from this user, with
-    /// nothing left to try that needs no password.
-    pub(crate) fn port_denied(&self) -> bool {
-        lock(&self.public)
-            .as_ref()
-            .is_some_and(|p| p.port_denied.load(Ordering::SeqCst))
-    }
-
-    pub(crate) fn describe_public(&self, info: &mut HostInfo) {
-        if let Ok(Some((at, by))) = self.store().host_external_changed(LOCAL_HOST) {
-            info.external_changed_at = Some(at);
-            if !info.external {
-                let by = by.map_or(String::new(), |by| format!(" by {by}"));
-                info.external_note = Some(format!(
-                    "turned off{by} at {}; turn it on again to serve it",
-                    vibe_core::time::rfc3339(at)
-                ));
-            }
+    /// Looks at the tunnel's end from now on, on a host a Mac can tunnel to.
+    pub(crate) fn spawn_mac_probe(&self, me: Weak<Core>, rt: &tokio::runtime::Handle) {
+        if self.serves_mac_peer {
+            let every = self.mac_probe_every;
+            *lock(&self.mac_probe) = Some(rt.spawn(probe_mac(me, every)));
         }
-        if !info.external {
-            return;
-        }
-        let public = lock(&self.public);
-        info.external_detail = public.as_ref().and_then(|p| lock(&p.detail).clone());
-        info.tunnel = Some(if self.peer.is_up() {
-            TunnelState::Up
-        } else {
-            TunnelState::Down
-        });
     }
 
-    /// Serves the public endpoint while the registry says this host is the
-    /// external address, and stops it once it isn't. Nothing until this
-    /// core runs its background tasks (see [`Core::spawn_external`]).
-    pub(crate) fn sync_public(&self) {
-        let want = self.public_domain();
-        let mut public = lock(&self.public);
-        if public.as_ref().map(|p| &p.domain) == want.as_ref() {
-            return;
+    /// Stops looking.
+    pub(crate) fn stop_mac_probe(&self) {
+        if let Some(task) = lock(&self.mac_probe).take() {
+            task.abort();
         }
-        if let Some(old) = public.take() {
-            crate::log!("vibed: no longer serving https://{}/mcp", old.domain);
-        }
-        self.peer.reset();
-        let (Some(domain), Some(me), Some(rt)) = (want, self.me.get(), self.runtime.get()) else {
-            return;
-        };
-        let detail = Arc::new(Mutex::new(None));
-        let port_denied = Arc::new(AtomicBool::new(false));
-        let task = rt.spawn(run_public(
-            me.clone(),
-            domain.clone(),
-            self.external.clone(),
-            Arc::clone(&detail),
-            Arc::clone(&port_denied),
-        ));
-        *public = Some(Public {
-            domain,
-            task,
-            detail,
-            port_denied,
-        });
-    }
-
-    /// Starts external access as the registry has it: on a Linux host, the
-    /// public endpoint; on a Mac, the tunnel. It must be called on the
-    /// runtime they're to run on.
-    pub fn spawn_external(self: &Arc<Self>) {
-        let _ = self.runtime.set(tokio::runtime::Handle::current());
-        let _ = self.me.set(Arc::downgrade(self));
-        self.sync_public();
-        self.sync_tunnel();
-    }
-
-    /// Stops external access's tasks, as `vibed` does when it stops.
-    pub fn stop_external(&self) {
-        lock(&self.public).take();
-        lock(&self.tunnel).take();
-        self.close_tunnel_socket();
     }
 
     // tunnel.prepare
@@ -1050,282 +603,14 @@ impl Core {
     }
 
     // hosts.external
-
-    /// `hosts.external`: on a Mac, makes a Linux host the external address
-    /// (or not); on a Linux host, serves it here (or not).
-    pub async fn set_external(&self, p: HostExternalParams) -> Result<HostInfo, ErrorObject> {
-        let host = p.host.as_deref().unwrap_or(LOCAL_HOST);
-        let domain = if p.on {
-            let d = p
-                .domain
-                .as_deref()
-                .map(|d| d.trim().trim_end_matches('.').to_ascii_lowercase())
-                .filter(|d| !d.is_empty())
-                .ok_or_else(|| {
-                    invalid("give the public name it's reached at, such as vps.example.com")
-                })?;
-            validate_domain(&d).map_err(invalid)?;
-            Some(d)
-        } else {
-            None
-        };
-        if host == LOCAL_HOST {
-            return self.set_external_here(
-                domain,
-                p.by.as_deref().unwrap_or("something that didn't say who"),
-            );
-        }
-        let link = self.linux_host(host)?;
-        // The host serves it, so it's told first while it can be: a refusal
-        // there changes nothing here. While its link is down, it's told once
-        // the link is back.
-        if link.connected() {
-            let theirs = self
-                .forward_typed::<HostsExternal>(
-                    &link,
-                    &HostExternalParams {
-                        host: None,
-                        on: p.on,
-                        domain: domain.clone(),
-                        by: Some(self.who_asks()),
-                    },
-                )
-                .await?;
-            // What it says of itself now, without waiting for the next ping.
-            link.note_report(theirs);
-            *lock(&link.external_told) = Some(Instant::now());
-            *lock(&link.external_refused) = None;
-        }
-        // Waits for the link if it couldn't be told, as a request, not a standing order.
-        let waiting = (!link.connected()).then(|| self.now());
-        let others: Vec<String> = if domain.is_some() {
-            self.store()
-                .hosts()
-                .map_err(store_error)?
-                .into_iter()
-                .filter(|h| h.external && h.name != host)
-                .map(|h| h.name)
-                .collect()
-        } else {
-            Vec::new()
-        };
-        self.store()
-            .set_host_external(host, domain.as_deref())
-            .map_err(store_error)?;
-        self.store()
-            .set_host_external_asked(host, waiting)
-            .map_err(store_error)?;
-        // Chosen afresh: nothing is to go back to what was chosen before.
-        self.store()
-            .clear_host_external_chosen()
-            .map_err(store_error)?;
-        // Stopped by name, it's not taken to be serving, even if it's gone and can't say.
-        if domain.is_none() {
-            self.store()
-                .set_host_external_seen(host, None)
-                .map_err(store_error)?;
-        }
-        match &domain {
-            Some(d) => crate::log!("vibed: {host} is the external address, at https://{d}/mcp"),
-            None => crate::log!("vibed: {host} is no longer the external address"),
-        }
-        // There's one external address: the one before it stops serving.
-        for other in others {
-            if let Some(l) = self.link(&other) {
-                if l.connected() {
-                    self.tell_external(&l, None);
-                } else {
-                    // A request, like any made with its link down.
-                    self.store()
-                        .set_host_external_asked(&other, Some(self.now()))
-                        .map_err(store_error)?;
-                }
-                self.host_link_changed(&l);
-            }
-        }
-        self.sync_tunnel();
-        self.host_link_changed(&link);
-        self.host_info(host)
-    }
-
-    /// Who to say asked, when this Mac asks a host for something.
-    fn who_asks(&self) -> String {
-        format!("the Mac {}", self.label())
-    }
-
-    fn set_external_here(&self, domain: Option<String>, by: &str) -> Result<HostInfo, ErrorObject> {
-        if !self.external.serve_here {
-            return Err(invalid(
-                "this Mac never listens publicly: make a Linux host with a public address the external address",
-            ));
-        }
-        let was = self
-            .store()
-            .host_external(LOCAL_HOST)
-            .map_err(store_error)?;
-        self.store()
-            .set_host_external(LOCAL_HOST, domain.as_deref())
-            .map_err(store_error)?;
-        // Only a change is one: asking again mustn't make a Mac's request look stale.
-        if was != domain {
-            self.store()
-                .set_host_external_changed(LOCAL_HOST, self.now(), Some(by))
-                .map_err(store_error)?;
-        }
-        match &domain {
-            Some(d) => crate::log!(
-                "vibed: this host is the external address, at https://{d}/mcp, as {by} asked"
-            ),
-            None => {
-                crate::log!("vibed: this host is no longer the external address, as {by} asked")
-            }
-        }
-        self.sync_public();
-        let mut e = self.event(EventKind::HostLink);
-        e.message = Some(match &domain {
-            Some(d) => format!("the external address, at https://{d}/mcp"),
-            None => "no longer the external address".into(),
-        });
-        self.publish(e);
-        self.host_info(LOCAL_HOST)
-    }
-
-    /// Tells `link`'s host, in the background, whether it's the external
-    /// address and at what name, as this Mac has it.
-    pub(crate) fn tell_external(&self, link: &Arc<crate::link::Link>, domain: Option<String>) {
-        let link = Arc::clone(link);
-        self.in_background(|core| async move {
-            let params = HostExternalParams {
-                host: None,
-                on: domain.is_some(),
-                domain,
-                by: Some(core.who_asks()),
-            };
-            *lock(&link.external_told) = Some(Instant::now());
-            match core.forward_typed::<HostsExternal>(&link, &params).await {
-                Ok(theirs) => {
-                    link.note_report(theirs);
-                    *lock(&link.external_refused) = None;
-                    if let Err(e) = core.store().set_host_external_asked(&link.name, None) {
-                        crate::log!("vibed: can't note {} took it: {e}", link.name);
-                    }
-                    core.host_link_changed(&link);
-                }
-                Err(e) => {
-                    crate::log!(
-                        "vibed: can't tell {} whether it's the external address: {}",
-                        link.name,
-                        e.message
-                    );
-                    *lock(&link.external_refused) = Some(e.message);
-                    // Still to be delivered, as it would be with the link down.
-                    if matches!(core.store().host_external_asked(&link.name), Ok(None)) {
-                        let now = core.now();
-                        let _ = core.store().set_host_external_asked(&link.name, Some(now));
-                    }
-                    core.host_link_changed(&link);
-                }
-            }
-        });
-    }
-
-    /// Once `link` is up, and when its host says something new of itself. The
-    /// external address is the host's: what it says wins, and nothing here turns it
-    /// off, so a stale Mac, or a new one that's never heard of it, can't knock over
-    /// what's serving. The exception is what someone chose here while the link was
-    /// down, which goes to it now, unless it has changed there since.
-    pub(crate) fn reconcile_external(&self, link: &Arc<crate::link::Link>) {
-        let name = &link.name;
-        // Nothing to go by, which isn't the same as hearing it's off.
-        let Some(report) = link.reported() else {
-            return;
-        };
-        let want = self.store().host_external(name).ok().flatten();
-        let theirs = link.reported_domain();
-        // Kept, as its link going down shouldn't lose what it might be serving.
-        if self.store().host_external_seen(name).ok().flatten() != theirs {
-            let _ = self.store().set_host_external_seen(name, theirs.as_deref());
-        }
-        let told_lately = {
-            let wait = if lock(&link.external_refused).is_some() {
-                RETRY_REFUSED
-            } else {
-                JUST_TOLD
-            };
-            lock(&link.external_told).is_some_and(|at| at.elapsed() < wait)
-        };
-        let asked = self.store().host_external_asked(name).ok().flatten();
-        if let Some(asked) = asked {
-            if report.external_changed_at.is_none_or(|at| at <= asked) {
-                if want == theirs {
-                    let _ = self.store().set_host_external_asked(name, None);
-                } else if !told_lately {
-                    crate::log!(
-                        "vibed: {name} has a choice made here while it was away; telling it"
-                    );
-                    self.tell_external(link, want);
-                }
-                return;
-            }
-            crate::log!("vibed: {name}'s external address changed there since a choice made here");
-            let _ = self.store().set_host_external_asked(name, None);
-        }
-        // What a ping sent before that says isn't news.
-        if want == theirs || told_lately {
-            return;
-        }
-        if want.is_none() {
-            // Serving what this Mac chose before it stopped: this Mac's choice stands.
-            let chosen = self.store().host_external_chosen(name).ok().flatten();
-            if let (Some(d), true) = (&theirs, theirs == chosen) {
-                crate::log!("vibed: {name} serves https://{d}/mcp again, so it's used again");
-                // In two statements, as each holds the store till its end.
-                let set = self.store().set_host_external(name, Some(d));
-                let set = set.and_then(|()| self.store().set_host_external_chosen(name, None));
-                if let Err(e) = set {
-                    crate::log!("vibed: can't note what {name} said of its external address: {e}");
-                    return;
-                }
-                self.sync_tunnel();
-                self.host_link_changed(link);
-            }
-            // Otherwise it's serving something this Mac never chose: it isn't this
-            // Mac's to change, or to run a tunnel for. It may be another Mac's.
-            return;
-        }
-        match &theirs {
-            Some(d) => crate::log!("vibed: {name} serves https://{d}/mcp, so that's what it is"),
-            None => crate::log!("vibed: {name} isn't the external address any more"),
-        }
-        let keep = if theirs.is_none() {
-            want.as_deref()
-        } else {
-            None
-        };
-        let set = self.store().set_host_external(name, theirs.as_deref());
-        let set = set.and_then(|()| self.store().set_host_external_chosen(name, keep));
-        if let Err(e) = set {
-            crate::log!("vibed: can't note what {name} said of its external address: {e}");
-            return;
-        }
-        self.sync_tunnel();
-        self.host_link_changed(link);
-    }
 }
-
-/// How long after telling a host about its external address a report that says
-/// otherwise is taken for one from before.
-const JUST_TOLD: Duration = Duration::from_secs(10);
-
-/// How long before asking again a host that refused what it was asked.
-const RETRY_REFUSED: Duration = Duration::from_secs(300);
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn the_macs_answers_are_its_own() {
+    fn the_macs_own_answers_are_labelled_mac_and_a_linked_hosts_keep_their_name() {
         let mut v = json!({"agents": [
             {"host": "local", "ref": "quiet-amber-otter", "status": {"activity": "done"}},
             {"host": "vps", "ref": "x"},
@@ -1335,7 +620,7 @@ mod tests {
             v,
             json!({"agents": [
                 {"host": "mac", "ref": "quiet-amber-otter", "status": {"activity": "done"}},
-                {"host": "mac", "ref": "x"},
+                {"host": "vps", "ref": "x"},
             ], "host": "mac"})
         );
     }
@@ -1705,7 +990,7 @@ mod tests {
         peer.saw("vk_a", &[]);
         assert_eq!(peer.last_seen("vk_a"), Some(vec![]));
         assert!(peer.last_seen("vk_b").is_none(), "another key sees nothing");
-        peer.reset();
+        peer.forget_all();
         assert!(peer.last_seen("vk_a").is_none());
     }
 }

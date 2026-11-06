@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use serde::de::{self, DeserializeOwned, Deserializer, Visitor};
 use serde::{Serialize, forward_to_deserialize_any};
-use serde_json::Value;
+use serde_json::{Value, json};
 use vibe_core::model::{
     Activity, AdminNeed, AgentKind, AgentState, Certainty, CheckId, CheckState, Environment,
     EventKind, GhState, HostLink, LoginTool, MessageRole, Mode, Model, PiLoginMethod, PiLoginState,
@@ -163,6 +163,8 @@ fn rust_types() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
         entry::<HostList>(),
         entry::<HostAddParams>(),
         entry::<HostNameParams>(),
+        entry::<HostRemoveParams>(),
+        entry::<TunnelPrepared>(),
         entry::<HostInstall>(),
         entry::<HostAdmin>(),
         entry::<SignInStartParams>(),
@@ -170,8 +172,6 @@ fn rust_types() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
         entry::<SignInGetParams>(),
         entry::<SignInAnswerParams>(),
         entry::<SignIn>(),
-        entry::<HostExternalParams>(),
-        entry::<TunnelPrepared>(),
         entry::<Project>(),
         entry::<ProjectList>(),
         entry::<ProjectAddParams>(),
@@ -304,7 +304,6 @@ fn rust_methods() -> BTreeMap<&'static str, MethodTypes> {
         method::<SignInAnswer>(),
         method::<SignInCancel>(),
         method::<HostsRemove>(),
-        method::<HostsExternal>(),
         method::<TunnelPrepare>(),
         method::<ProjectsList>(),
         method::<ProjectsAdd>(),
@@ -773,7 +772,7 @@ fn the_call_accepted_example_is_what_a_peer_sends() {
     let frame: Value = serde_json::from_str(&frame).unwrap();
     assert_eq!(frame, example["frame"]);
     assert_eq!(frame["method"], vibe_core::rpc::CALL_ACCEPTED);
-    // The call it's for has the shape the tunnel takes.
+    // The call it's for has the shape a tunnel takes.
     serde_json::from_value::<vibe_core::rpc::TunnelCallParams>(
         example["request"]["params"].clone(),
     )
@@ -799,8 +798,8 @@ fn examples_cover_the_contract() {
     }
     for code in ErrorCode::ALL {
         // An internal error can't be provoked on purpose, an invalid
-        // host.toml needs a broken file, and only the tunnel's socket says
-        // unauthorized; vibed's own tests cover those.
+        // host.toml needs a broken file, and only a call that's for another host's
+        // link says unauthorized; vibed's own tests cover those.
         if !matches!(
             code,
             ErrorCode::InternalError | ErrorCode::HostConfigInvalid | ErrorCode::Unauthorized
@@ -851,14 +850,6 @@ fn examples_cover_the_contract() {
         if ty == "ToolboxStatus" {
             seen_keys.insert("rebuild_held");
         }
-        // Only a Linux host says when its external address changed and who turned it
-        // off, and only a linked one's Mac passes that on; vibed's own tests cover it.
-        if ty == "HostInfo" {
-            seen_keys.insert("external_changed_at");
-            seen_keys.insert("external_note");
-            seen_keys.insert("external_serves");
-            seen_keys.insert("external_last");
-        }
         // Only a download that fails says so; vibed's own tests cover it.
         if ty == "PiStatus" {
             seen_keys.insert("error");
@@ -866,9 +857,18 @@ fn examples_cover_the_contract() {
         // The same of an upgrade.
         if ty == "HostInfo" {
             seen_keys.insert("upgrade_error");
+            seen_keys.insert("upgrade_held");
+            // Only a linked host with a tunnel has these, which the examples' hosts don't.
+            seen_keys.insert("tunnel");
+            seen_keys.insert("tunnel_detail");
             // Only one still to be signed in to says so; the examples' hosts have no
             // live link.
             seen_keys.insert("sign_ins");
+        }
+        // Only a host that may still serve External Address needs it; vibed's own tests
+        // cover it.
+        if ty == "HostRemoveParams" {
+            seen_keys.insert("force");
         }
         // Only a flow that's said something has these, which takes a real person.
         if ty == "SignIn" {
@@ -943,5 +943,29 @@ fn a_sign_ins_code_and_a_personal_key_dont_show_in_debug() {
     // And they go only between `vibed`s: nothing from outside can ask for one.
     for method in [ServicesToken::NAME, ServicesFollow::NAME] {
         assert!(!TUNNEL_METHODS.contains(&method), "{method}");
+    }
+}
+
+/// A host on another build. An older one's row, as a new Mac gets it until the host's
+/// upgraded, reads with what's retired left out; and this build's own row says
+/// `external`, as a Mac from before External Address was retired can't read one without.
+#[test]
+fn a_hosts_row_reads_across_external_addresss_retirement() {
+    let older = json!({
+        "name": "local", "os": "linux", "label": "vps", "link": "local", "external": true,
+        "mcp": true, "missing": [], "url": "https://vps.example.com/mcp", "tunnel": "up",
+        "external_changed_at": 1, "external_detail": "can't listen on port 443",
+        "needs_admin": ["port_443", "git"],
+    });
+    let row: HostInfo = serde_json::from_value(older).unwrap();
+    assert_eq!(row.needs_admin, [vibe_core::model::AdminNeed::Git]);
+    let ours = serde_json::to_value(HostInfo {
+        external: false,
+        ..row
+    })
+    .unwrap();
+    assert_eq!(ours["external"], false);
+    for gone in ["url", "external_changed_at", "external_detail"] {
+        assert!(ours.get(gone).is_none(), "{gone}: {ours}");
     }
 }

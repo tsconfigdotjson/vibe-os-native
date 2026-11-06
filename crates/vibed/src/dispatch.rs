@@ -8,10 +8,10 @@ use vibe_core::rpc::{ACCEPTS_CALLS, TUNNEL_METHODS};
 use vibe_core::rpc::{
     AgentsCheck, AgentsDelete, AgentsInterrupt, AgentsList, AgentsMessages, AgentsOutput,
     AgentsSend, AgentsStart, DoctorCheckGet, DoctorFix, ErrorCode, ErrorObject, Event,
-    EventsSubscribe, GhStatusGet, Hello, HelloParams, HelloResult, HostsAdd, HostsAdmin,
-    HostsExternal, HostsList, HostsRemove, HostsUpgrade, Id, KeysCreate, KeysList, KeysRevoke,
-    KeysSync, KeysVerify, LimitsGet, LimitsSet, McpGet, McpSet, Method, PROTOCOL_VERSION, PiForget,
-    PiInstall, PiLoginAnswer, PiLoginCancel, PiLoginGet, PiLoginStart, PiModelsGet, PiStatusGet,
+    EventsSubscribe, GhStatusGet, Hello, HelloParams, HelloResult, HostsAdd, HostsAdmin, HostsList,
+    HostsRemove, HostsUpgrade, Id, KeysCreate, KeysList, KeysRevoke, KeysSync, KeysVerify,
+    LimitsGet, LimitsSet, McpGet, McpSet, Method, PROTOCOL_VERSION, PiForget, PiInstall,
+    PiLoginAnswer, PiLoginCancel, PiLoginGet, PiLoginStart, PiModelsGet, PiStatusGet,
     ProfilesCreate, ProfilesDelete, ProfilesList, ProfilesUpdate, ProjectsAdd, ProjectsList,
     ProjectsRemove, ProtocolMismatchData, Request, Response, ServicesAudit, ServicesComplete,
     ServicesConnect, ServicesDisconnect, ServicesFollow, ServicesList, ServicesOverview,
@@ -226,14 +226,11 @@ async fn call(
             core.sign_in_cancel(decode::<vibe_core::rpc::SignInCancel>(params)?)
                 .await,
         ),
-        HostsRemove::NAME => encode_result(core.remove_host(decode::<HostsRemove>(params)?).await),
-        HostsExternal::NAME => {
-            encode_result(core.set_external(decode::<HostsExternal>(params)?).await)
-        }
         TunnelPrepare::NAME => {
             decode::<TunnelPrepare>(params)?;
             encode_result(core.prepare_tunnel())
         }
+        HostsRemove::NAME => encode_result(core.remove_host(decode::<HostsRemove>(params)?).await),
         ProjectsList::NAME => encode_result(core.projects(decode::<ProjectsList>(params)?)),
         ProjectsAdd::NAME => encode_result(core.add_project(decode::<ProjectsAdd>(params)?).await),
         ProjectsRemove::NAME => {
@@ -375,7 +372,7 @@ async fn call(
 }
 
 /// Calls `method` on this host, with `params`, as a connection of its own
-/// would. The tunnel's socket runs its calls through this, with no `host`
+/// would. A tunnel's socket runs its calls through this, with no `host`
 /// in them, so none goes on to a Linux host.
 pub(crate) async fn call_here(
     core: &Core,

@@ -805,7 +805,10 @@ async fn a_linux_hosts_agents_join_the_macs_view_over_the_link() {
     let views = Daemon::agents(&*w.mac, &caller(), "vps").await.unwrap();
     assert!(views[0].available);
     assert_eq!(views[0].attach_remote, views[0].agent.attach);
-    assert_eq!(Daemon::hosts(&*w.mac).await.unwrap(), ["local", "vps"]);
+    assert_eq!(
+        Daemon::hosts(&*w.mac, &caller()).await.unwrap(),
+        ["local", "vps"]
+    );
     let attach = w
         .rpc(
             "sessions.attach",
@@ -1378,6 +1381,73 @@ mod upgrades {
         );
     }
 
+    /// #143. A host still serving External Address isn't upgraded with nobody asked, as that
+    /// would end what its clients reach it by. It says why, someone can choose to, and once
+    /// it's stopped serving it's upgraded as any other.
+    #[tokio::test]
+    async fn a_host_still_serving_publicly_waits_for_someone_to_choose() {
+        let w = behind(quick()).await;
+        let older = w.older_host();
+        w.add_host().await;
+        let held = wait_held(&w).await;
+        let said = held.upgrade_error.expect("it says why");
+        assert!(said.contains("External Address"), "{said}");
+        assert!(said.contains("vibe host upgrade vps"), "{said}");
+        // Past any retry's gap, and many pings: Add Host's install is the only one.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(*w.wires.installs.lock().unwrap(), 1);
+        assert!(w.link().await.upgrade_held);
+
+        // Someone chooses: it's done, whatever the host says.
+        let chosen = w.rpc("hosts.upgrade", json!({"host": "vps"})).await;
+        assert_eq!(chosen["result"]["host"]["name"], "vps", "{chosen}");
+        assert_eq!(*w.wires.installs.lock().unwrap(), 2);
+        assert!(!w.link().await.upgrade_held);
+        drop(older);
+    }
+
+    #[tokio::test]
+    async fn a_held_host_is_upgraded_by_itself_once_it_stops_serving() {
+        let w = behind(quick()).await;
+        let older = w.older_host();
+        w.add_host().await;
+        wait_held(&w).await;
+        assert_eq!(*w.wires.installs.lock().unwrap(), 1);
+        older.serving.store(false, Ordering::SeqCst);
+        installs_reach(&w, 2).await;
+        let row = w.link().await;
+        assert!(!row.upgrade_held, "{row:?}");
+    }
+
+    /// What's on record holds it too, once its link is down and it can't say: a dial that
+    /// finds no `vibed` there, which otherwise installs one, doesn't.
+    #[tokio::test]
+    async fn a_host_on_record_as_serving_is_held_with_no_word_from_it() {
+        let w = behind(quick()).await;
+        let _older = w.older_host();
+        w.add_host().await;
+        wait_held(&w).await;
+        w.wires.pull();
+        w.wait_link(HostLink::Down).await;
+        let link = w.mac.link("vps").unwrap();
+        assert!(link.reported().is_none());
+        w.mac.upgrade_in_background(&link);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(*w.wires.installs.lock().unwrap(), 1);
+        assert!(w.link().await.upgrade_held);
+    }
+
+    async fn wait_held(w: &World) -> vibe_core::rpc::HostInfo {
+        for _ in 0..500 {
+            let row = w.link().await;
+            if row.upgrade_held {
+                return row;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("it was never held: {:?}", w.link().await);
+    }
+
     #[tokio::test]
     async fn a_host_behind_the_mac_is_upgraded_with_nobody_asked() {
         let w = behind(quick()).await;
@@ -1695,5 +1765,421 @@ mod upgrades {
         tokio::time::sleep(Duration::from_millis(50)).await;
         w.wires.plug_in();
         installs_reach(&w, before + 1).await;
+    }
+}
+
+/// A Linux host's config, as a host that isn't linked yet has it.
+fn linux_config(world: &Golden) -> vibed::core::Config {
+    let mut config = world.config();
+    config.info.os = "linux".into();
+    config.layout = Layout::new(&world.home, "linux");
+    config.toolbox = None;
+    config
+}
+
+/// #143: what a build from before External Address was retired leaves on a host that
+/// had it on. This build serves none of it, says so, and leaves it all where it is, as
+/// the owner's to clear and what a build that's gone back would need.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn what_external_address_left_is_kept_and_serves_nothing() {
+    let world = Golden::new();
+    let layout = Layout::new(&world.home, "linux");
+    drop(Core::open(linux_config(&world)).unwrap());
+    assert!(
+        Core::open(linux_config(&world))
+            .unwrap()
+            .retired_external_note()
+            .is_none(),
+        "a host that never had it hears nothing of it"
+    );
+
+    rusqlite::Connection::open(layout.db())
+        .unwrap()
+        .execute(
+            "UPDATE hosts SET external = 'vps.example.com', external_changed_by = 'a Mac' \
+             WHERE name = 'local'",
+            [],
+        )
+        .unwrap();
+    let certs = layout.data_dir().join("external");
+    std::fs::create_dir_all(&certs).unwrap();
+    let kept = certs.join("vps.example.com.key");
+    std::fs::write(&kept, "a private key").unwrap();
+    // sshd's end of an older Mac's `ssh -R` has no lock; an older Mac's own socket has.
+    let run = layout.run_dir();
+    std::fs::create_dir_all(&run).unwrap();
+    let sshd_end = run.join("mac.sock");
+    let mac_end = run.join("tunnel.sock");
+    drop(std::os::unix::net::UnixListener::bind(&sshd_end).unwrap());
+    drop(std::os::unix::net::UnixListener::bind(&mac_end).unwrap());
+    std::fs::write(vibe_core::socket::lock_path(&mac_end), "").unwrap();
+
+    let core = Arc::new(Core::open(linux_config(&world)).unwrap());
+    let note = core
+        .retired_external_note()
+        .expect("what to tell its owner");
+    assert!(note.contains("vps.example.com"), "{note}");
+    assert!(note.contains(certs.to_str().unwrap()), "{note}");
+    assert!(note.contains("docs/mcp-and-networking.md"), "{note}");
+
+    // It's no way back in, nor does the host read as serving it.
+    let refused = rpc(
+        &core,
+        "hosts.external",
+        json!({"on": true, "domain": "vps.example.com"}),
+    )
+    .await;
+    assert_eq!(
+        refused["error"]["code"],
+        vibe_core::rpc::ErrorCode::MethodNotFound.code(),
+        "{refused}"
+    );
+    let listed = rpc(&core, "hosts.list", json!({})).await;
+    let own = &listed["result"]["hosts"][0];
+    assert_eq!(own["external"], false, "{listed}");
+    assert!(own.get("url").is_none(), "{listed}");
+
+    // A scan finds no session in either socket, and removes neither.
+    let sessions = rpc(&core, "sessions.list", json!({})).await;
+    assert_eq!(sessions["result"]["sessions"], json!([]), "{sessions}");
+    for left in [&sshd_end, &mac_end, &kept] {
+        assert!(left.exists(), "{} went", left.display());
+    }
+    // And the row's as it was, for a build that goes back.
+    let domain: String = rusqlite::Connection::open(layout.db())
+        .unwrap()
+        .query_row("SELECT external FROM hosts WHERE name = 'local'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(domain, "vps.example.com");
+}
+
+/// An agent's row, as one made before 0.1.3 had a name that's since been reserved.
+fn legacy_agent(home: &std::path::Path, os: &str, agent_ref: &str) {
+    let layout = Layout::new(home, os);
+    let mut store = vibe_core::store::Store::open(&layout.db()).unwrap();
+    store
+        .add_agent(&vibe_core::store::AgentRecord {
+            host: vibe_core::model::LOCAL_HOST.into(),
+            agent_ref: agent_ref.into(),
+            project: "app".into(),
+            profile: "software-eng-linux".into(),
+            environment: vibe_core::model::Environment::Linux,
+            model: vibe_core::model::Model::Opus,
+            reasoning: vibe_core::model::Reasoning::High,
+            mode: vibe_core::model::Mode::Auto,
+            memory: 1 << 30,
+            worktree: home
+                .join("VibeOS/worktrees/app")
+                .join(agent_ref)
+                .to_string_lossy()
+                .into_owned(),
+            branch: agent_ref.into(),
+            session_id: "s".into(),
+            shim_socket: None,
+            state: vibe_core::model::AgentState::Exited,
+            created_at: 0,
+            compartment: "{}".into(),
+            starting: false,
+            shared_services: true,
+            agent: Default::default(),
+            pi_model: None,
+        })
+        .unwrap();
+}
+
+/// An agent named `mac` or `tunnel` before 0.1.3 is still listed and can be deleted. Its
+/// name's socket, if an older `vibed` left one, isn't a session's; sshd's has no lock, so
+/// deleting the agent leaves it (issue #45).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agents_named_for_the_retired_tunnel_can_still_be_deleted() {
+    let world = Golden::new();
+    let layout = Layout::new(&world.home, "linux");
+    let first = Core::open(linux_config(&world)).unwrap();
+    let path = world.home.join("src/app");
+    let added = rpc(&first, "projects.add", json!({"path": path})).await;
+    assert!(added.get("result").is_some(), "{added}");
+    drop(first);
+    for name in ["mac", "tunnel"] {
+        legacy_agent(&world.home, "linux", name);
+    }
+    let run = layout.run_dir();
+    std::fs::create_dir_all(&run).unwrap();
+    let sshd_end = run.join("mac.sock");
+    drop(std::os::unix::net::UnixListener::bind(&sshd_end).unwrap());
+    let core = Arc::new(Core::open(linux_config(&world)).unwrap());
+    let listed = rpc(&core, "agents.list", json!({})).await;
+    for name in ["mac", "tunnel"] {
+        let found = listed["result"]["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["ref"] == name);
+        assert!(found, "{name}: {listed}");
+    }
+    let sessions = rpc(&core, "sessions.list", json!({})).await;
+    assert_eq!(sessions["result"]["sessions"], json!([]), "{sessions}");
+    for name in ["mac", "tunnel"] {
+        let deleted = rpc(&core, "agents.delete", json!({"ref": name, "force": true})).await;
+        assert!(deleted.get("result").is_some(), "{name}: {deleted}");
+    }
+    assert!(sshd_end.exists(), "deleting `mac` removed sshd's socket");
+}
+
+/// Forgetting a host takes this Mac's keys off it, and another Mac's stay. With its link
+/// down it's forgotten all the same: there's no public endpoint they could go on opening.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forgetting_a_host_takes_only_this_macs_keys_off_it() {
+    let w = world().await;
+    w.add_host().await;
+    w.host
+        .sync_keys(vibe_core::rpc::KeySyncParams {
+            keys: vec![vibe_core::rpc::KeyHash {
+                name: "another Mac's".into(),
+                prefix: "vk_another".into(),
+                hash: "a".repeat(64),
+                created_at: "2026-10-30T12:00:00Z".into(),
+            }],
+            from: Some("another-mac".into()),
+        })
+        .unwrap();
+    let names = || -> Vec<String> {
+        let mut names: Vec<String> = w
+            .host
+            .keys()
+            .unwrap()
+            .keys
+            .into_iter()
+            .map(|k| k.name)
+            .collect();
+        names.sort();
+        names
+    };
+    w.mac
+        .create_key(vibe_core::rpc::KeyCreateParams {
+            name: "laptop".into(),
+        })
+        .unwrap();
+    for _ in 0..500 {
+        if names().contains(&"laptop".to_owned()) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(names(), ["another Mac's", "laptop"]);
+    let removed = w.rpc("hosts.remove", json!({"host": "vps"})).await;
+    assert!(removed.get("result").is_some(), "{removed}");
+    assert_eq!(names(), ["another Mac's"]);
+
+    // Added again and gone: it's forgotten with its link down.
+    w.add_host().await;
+    w.wires.pull();
+    w.wait_link(HostLink::Down).await;
+    let removed = w.rpc("hosts.remove", json!({"host": "vps"})).await;
+    assert!(removed.get("result").is_some(), "{removed}");
+}
+
+/// A host on a build from before External Address was retired (#143), as the Mac sees one:
+/// the real host, with a stand-in between that says what such a host says of itself, and
+/// can refuse to have keys taken off.
+struct OlderHost {
+    serving: Arc<AtomicBool>,
+    refuses_keys: Arc<AtomicBool>,
+    _dir: tempfile::TempDir,
+}
+
+impl World {
+    /// Puts an [`OlderHost`] on the wire in front of the host. Before [`World::add_host`].
+    fn older_host(&self) -> OlderHost {
+        let dir = common::short_tempdir();
+        let path = dir.path().join("older.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let real = self
+            .wires
+            .sockets
+            .lock()
+            .unwrap()
+            .insert("me@vps.example.com".into(), path)
+            .unwrap();
+        let serving = Arc::new(AtomicBool::new(true));
+        let refuses_keys = Arc::new(AtomicBool::new(false));
+        let (says, refuses) = (Arc::clone(&serving), Arc::clone(&refuses_keys));
+        tokio::spawn(async move {
+            loop {
+                let Ok((mac, _)) = listener.accept().await else {
+                    return;
+                };
+                let Ok(host) = tokio::net::UnixStream::connect(&real).await else {
+                    continue;
+                };
+                let (from_mac, mut to_mac) = mac.into_split();
+                let (from_host, mut to_host) = host.into_split();
+                let (says, refuses) = (Arc::clone(&says), Arc::clone(&refuses));
+                tokio::spawn(async move {
+                    use tokio::io::AsyncBufReadExt;
+                    let mut lines = BufReader::new(from_mac).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        // A method it doesn't know stands for a host that won't.
+                        let line = if refuses.load(Ordering::SeqCst) {
+                            line.replace("\"keys.sync\"", "\"keys.refused\"")
+                        } else {
+                            line
+                        };
+                        if to_host.write_all(line.as_bytes()).await.is_err()
+                            || to_host.write_all(b"\n").await.is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+                let says = Arc::clone(&says);
+                tokio::spawn(async move {
+                    use tokio::io::AsyncBufReadExt;
+                    let mut lines = BufReader::new(from_host).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let mut message: Value = serde_json::from_str(&line).unwrap();
+                        if let Some(rows) = message["result"]["hosts"].as_array_mut() {
+                            for row in rows {
+                                row["external"] = json!(says.load(Ordering::SeqCst));
+                            }
+                        }
+                        let out = format!("{message}\n");
+                        if to_mac.write_all(out.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        OlderHost {
+            serving,
+            refuses_keys,
+            _dir: dir,
+        }
+    }
+
+    /// Pushes a key to the host, and waits for it there.
+    async fn pushed_key(&self) {
+        self.mac
+            .create_key(KeyCreateParams {
+                name: "laptop".into(),
+            })
+            .unwrap();
+        for _ in 0..500 {
+            if self
+                .host
+                .keys()
+                .unwrap()
+                .keys
+                .iter()
+                .any(|k| k.name == "laptop")
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("the key never reached the host");
+    }
+
+    fn set_mac_row(&self, column: &str) {
+        let layout = Layout::new(&self._mac_world.home, "macos");
+        rusqlite::Connection::open(layout.db())
+            .unwrap()
+            .execute(
+                &format!("UPDATE hosts SET {column} = 'vps.example.com' WHERE name = 'vps'"),
+                [],
+            )
+            .unwrap();
+    }
+}
+
+/// #100, for what's left of it after #143. Forgotten with its link down, a host that may
+/// still serve publicly would go on taking this Mac's keys, where no revoke could reach
+/// them, so that's refused until the Mac can tell it, or someone has said it's gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_public_host_isnt_forgotten_with_this_macs_keys_on_it() {
+    let w = world().await;
+    let older = w.older_host();
+    w.add_host().await;
+    assert!(older.serving.load(Ordering::SeqCst));
+    w.set_mac_row("external");
+    w.pushed_key().await;
+    w.wires.pull();
+    w.wait_link(HostLink::Down).await;
+    let refused = w.rpc("hosts.remove", json!({"host": "vps"})).await;
+    assert_eq!(
+        refused["error"]["code"],
+        ErrorCode::Conflict.code(),
+        "{refused}"
+    );
+    let said = refused["error"]["message"].as_str().unwrap();
+    assert!(
+        said.contains("API keys") && said.contains("gone for good"),
+        "{refused}"
+    );
+    assert_eq!(w.link().await.name, "vps", "it's still here");
+    // Gone for good, then, as far as anyone here can tell.
+    let removed = w
+        .rpc("hosts.remove", json!({"host": "vps", "force": true}))
+        .await;
+    assert!(removed.get("result").is_some(), "{removed}");
+}
+
+/// #100, the same for a host serving on its own, which this Mac only heard of from the
+/// host, though with its link down it can't say so now.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_serving_on_its_own_isnt_forgotten_with_this_macs_keys_on_it() {
+    let w = world().await;
+    let _older = w.older_host();
+    w.add_host().await;
+    w.pushed_key().await;
+    w.wires.pull();
+    w.wait_link(HostLink::Down).await;
+    let refused = w.rpc("hosts.remove", json!({"host": "vps"})).await;
+    let said = refused["error"]["message"].as_str().unwrap();
+    assert!(
+        said.contains("API keys") && said.contains("gone for good"),
+        "{refused}"
+    );
+    let removed = w
+        .rpc("hosts.remove", json!({"host": "vps", "force": true}))
+        .await;
+    assert!(removed.get("result").is_some(), "{removed}");
+}
+
+/// A host that may serve publicly and won't take this Mac's keys off is refused too, with
+/// its link up; and one that says it's stopped serving is forgotten as any other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn keys_a_public_host_wont_give_up_hold_it_until_its_forced_or_its_stopped() {
+    let w = world().await;
+    let older = w.older_host();
+    w.add_host().await;
+    w.pushed_key().await;
+    older.refuses_keys.store(true, Ordering::SeqCst);
+    let refused = w.rpc("hosts.remove", json!({"host": "vps"})).await;
+    let said = refused["error"]["message"].as_str().unwrap();
+    assert!(said.contains("wouldn't take them off"), "{refused}");
+
+    // It stops serving, and the next ping says so: what was on record of it goes too, so
+    // it can be forgotten with its link down.
+    older.serving.store(false, Ordering::SeqCst);
+    for _ in 0..500 {
+        if !w.link_says_external() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!w.link_says_external(), "the host's word never came");
+    w.wires.pull();
+    w.wait_link(HostLink::Down).await;
+    let removed = w.rpc("hosts.remove", json!({"host": "vps"})).await;
+    assert!(removed.get("result").is_some(), "{removed}");
+}
+
+impl World {
+    fn link_says_external(&self) -> bool {
+        let link = self.mac.link("vps").unwrap();
+        link.reported().is_none_or(|own| own.external)
     }
 }

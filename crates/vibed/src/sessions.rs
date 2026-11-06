@@ -149,12 +149,12 @@ async fn read_frame(stream: &mut UnixStream) -> io::Result<Frame> {
 /// The refs that have a shim's socket in `run/`, sorted: every `<ref>.sock`
 /// with its lock beside it, as every shim binds it, but `vibed`'s own.
 ///
-/// A socket with no lock was never a shim's: sshd makes a Linux host's
-/// tunnel end, `mac.sock`, and leaves none, so it's not taken for a dead
-/// session and removed (issue #45). The daemon's sockets that do have one,
-/// `vibed.sock` and the Mac's `tunnel.sock`, are skipped by name, as any of
-/// [`vibe_core::model::RESERVED_REFS`] is, unless `is_agent` says an agent
-/// has that name: one made before the name was reserved.
+/// A socket with no lock was never a shim's: sshd makes a Linux host's tunnel end,
+/// `mac.sock`, and leaves none, so it's not taken for a dead session and removed
+/// (issue #45). The ones that do have one, `vibed.sock` and the `tunnel.sock` an older
+/// Mac's `vibed` left, are skipped by name, as any of
+/// [`vibe_core::model::RESERVED_REFS`] is, unless `is_agent` says an agent has that
+/// name: one made before the name was reserved.
 pub fn socket_refs(run_dir: &Path, is_agent: impl Fn(&str) -> bool) -> Vec<String> {
     let Ok(entries) = fs::read_dir(run_dir) else {
         return Vec::new();
@@ -380,11 +380,11 @@ mod tests {
         assert_eq!(socket_refs(&run, none), ["a-ref", "b-ref"]);
         assert!(socket_refs(&tmp.path().join("none"), none).is_empty());
 
-        // The daemon's own sockets: a host's tunnel end, which sshd leaves
-        // with no lock, and the Mac's, with one. Neither is a session, but
+        // What an older `vibed` may have left: a host's tunnel end, which sshd
+        // leaves with no lock, and the Mac's, with one. Neither is a session, but
         // for an agent named so before the name was reserved.
-        socket(crate::external::TUNNEL_END, false);
-        socket(crate::tunnel::TUNNEL_SOCKET, true);
+        socket("mac.sock", false);
+        socket("tunnel.sock", true);
         assert_eq!(socket_refs(&run, none), ["a-ref", "b-ref"]);
         assert_eq!(
             socket_refs(&run, |r| r == "tunnel" || r == "mac"),
@@ -402,11 +402,7 @@ mod tests {
 
     #[test]
     fn the_daemons_sockets_have_reserved_names() {
-        for name in [
-            vibe_core::paths::SOCKET_NAME,
-            crate::external::TUNNEL_END,
-            crate::tunnel::TUNNEL_SOCKET,
-        ] {
+        for name in [vibe_core::paths::SOCKET_NAME, "mac.sock", "tunnel.sock"] {
             let stem = name.strip_suffix(".sock").unwrap();
             assert!(vibe_core::model::RESERVED_REFS.contains(&stem), "{name}");
         }

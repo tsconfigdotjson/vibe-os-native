@@ -2112,7 +2112,10 @@ async fn removing_the_host_that_owns_it_leaves_it_to_be_signed_in_again() {
     let refresh = p.logins.load("linear").unwrap().unwrap().refresh.unwrap();
     p.mac
         .core
-        .remove_host(vibe_core::rpc::HostNameParams { host: "vps".into() })
+        .remove_host(vibe_core::rpc::HostRemoveParams {
+            host: "vps".into(),
+            force: None,
+        })
         .await
         .unwrap();
     // It runs on by itself, and keeps nothing of this install's.

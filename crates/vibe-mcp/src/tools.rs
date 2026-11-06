@@ -591,7 +591,7 @@ impl<D: Daemon> Server<D> {
         if let Some(h) = host {
             return Ok(target(h));
         }
-        let hosts = self.daemon.hosts().await.map_err(|e| e.message)?;
+        let hosts = self.daemon.hosts(c).await.map_err(|e| e.message)?;
         if hosts.len() <= 1 {
             return Ok(target(hosts.first().map_or(LOCAL_HOST, String::as_str)));
         }
@@ -637,7 +637,7 @@ impl<D: Daemon> Server<D> {
         let only = string(args, "host")?;
         let hosts = match &only {
             Some(h) => vec![h.clone()],
-            None => self.daemon.hosts().await.map_err(|e| e.message)?,
+            None => self.daemon.hosts(c).await.map_err(|e| e.message)?,
         };
         let mut projects = Vec::new();
         let mut unreachable = Vec::new();
@@ -724,7 +724,7 @@ impl<D: Daemon> Server<D> {
 
     /// The one host `project` is on.
     async fn project_host(&self, c: &Caller, project: &str) -> Result<String, String> {
-        let hosts = self.daemon.hosts().await.map_err(|e| e.message)?;
+        let hosts = self.daemon.hosts(c).await.map_err(|e| e.message)?;
         let caller = c.clone();
         let answers = self
             .ask_all(&hosts, move |d, h| {
@@ -779,7 +779,7 @@ impl<D: Daemon> Server<D> {
         };
         let hosts = match &only {
             Some(h) => vec![h.clone()],
-            None => self.daemon.hosts().await.map_err(|e| e.message)?,
+            None => self.daemon.hosts(c).await.map_err(|e| e.message)?,
         };
         let mut agents = Vec::new();
         let mut unreachable = Vec::new();

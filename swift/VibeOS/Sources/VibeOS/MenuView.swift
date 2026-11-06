@@ -74,7 +74,7 @@ struct MenuView: View {
 
 /// The count of agents, then only what needs the owner, each on a row of
 /// its own (PRD: Menu bar, Header). The steady facts (the Mac's memory,
-/// `gh`, MCP, each Linux host's link and external address) sit behind one
+/// `gh`, MCP, each Linux host's link) sit behind one
 /// quiet button beside the count, and open in place.
 struct HeaderView: View {
     @ObservedObject var model: MenuModel
@@ -141,16 +141,9 @@ struct HeaderView: View {
         return lines.joined(separator: "\n")
     }
 
-    /// A host's tooltip: why its link is down, or its hostname; and while
-    /// it's the external address, where and how that is.
+    /// A host's tooltip: why its link is down, or its hostname.
     private func hostHelp(_ host: HostInfo) -> String {
-        var lines = [host.link == .down ? sentence(host.detail ?? "its link is down; it reconnects on its own") : host.label]
-        if let external = externalStatus(host) {
-            lines.append(host.url.map { "External address: \($0)" } ?? "External address")
-            lines.append(external.summary)
-            if let detail = external.detail { lines.append(sentence(detail)) }
-        }
-        return lines.joined(separator: "\n")
+        host.link == .down ? sentence(host.detail ?? "its link is down; it reconnects on its own") : host.label
     }
 }
 
@@ -587,9 +580,9 @@ struct EmptyMenuView: View {
             let doctor = (try? await model.call(DoctorCheckGet.self, NoParams(), timeout: 90))?.checks ?? []
             await model.refreshInstall()
             // With Tailscale up, other machines reach MCP through it once
-            // it's on there, or through a Linux host's external address.
+            // it's on there.
             let tailscale = doctor.first { $0.id == .tailscale }?.state == .pass
-            let remote = tailscale ? (model.mcp?.tailscale == true || model.externalHost != nil) : nil
+            let remote = tailscale ? model.mcp?.tailscale == true : nil
             return SetupProgress(
                 hasProject: !projects.isEmpty, hasKey: !keys.isEmpty, linuxGitHub: github,
                 doctor: doctor, install: model.install, ghInstalled: model.gh?.state != .notInstalled,

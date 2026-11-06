@@ -8,12 +8,12 @@ use std::time::Duration;
 
 use vibe_core::model::{AgentKind, Environment, Mode, Model, PiTarget, Reasoning};
 use vibe_core::rpc::{
-    HostAddParams, HostExternalParams, HostInfo, HostInstall, HostLink, HostNameParams, HostParams,
-    HostsAdd, HostsExternal, HostsList, HostsRemove, HostsUpgrade, NoParams, PiForget,
-    PiForgetParams, PiInstall, PiInstallParams, PiStatus, PiStatusGet, Profile,
-    ProfileCreateParams, ProfileParams, ProfileUpdateParams, ProfilesCreate, ProfilesDelete,
-    ProfilesList, ProfilesUpdate, Project, ProjectAddParams, ProjectParams, ProjectRemoveParams,
-    ProjectsAdd, ProjectsList, ProjectsRemove,
+    HostAddParams, HostInfo, HostInstall, HostLink, HostNameParams, HostParams, HostRemoveParams,
+    HostsAdd, HostsList, HostsRemove, HostsUpgrade, NoParams, PiForget, PiForgetParams, PiInstall,
+    PiInstallParams, PiStatus, PiStatusGet, Profile, ProfileCreateParams, ProfileParams,
+    ProfileUpdateParams, ProfilesCreate, ProfilesDelete, ProfilesList, ProfilesUpdate, Project,
+    ProjectAddParams, ProjectParams, ProjectRemoveParams, ProjectsAdd, ProjectsList,
+    ProjectsRemove,
 };
 use vibe_core::units::{format_size, parse_size};
 
@@ -94,11 +94,9 @@ pub(crate) enum Command {
         address: String,
     },
     UpgradeHost(String),
-    RemoveHost(String),
-    /// Makes a host the external address at a domain, or with none not.
-    External {
+    RemoveHost {
         host: String,
-        domain: Option<String>,
+        force: bool,
     },
 }
 
@@ -303,7 +301,13 @@ impl Command {
 
     /// From the words after `host`.
     pub(crate) fn parse_host(words: &[String]) -> Result<Command, String> {
-        let (plain, _) = flags(words, &[])?;
+        // The one flag here with no value, so it's out before `flags` looks for one.
+        let force = words.iter().any(|w| w == "--force");
+        let rest: Vec<String> = words.iter().filter(|w| *w != "--force").cloned().collect();
+        let (plain, _) = flags(&rest, &[])?;
+        if force && !matches!(plain.first(), Some(&"remove" | &"rm")) {
+            return Err("--force only goes with host remove".into());
+        }
         match plain.as_slice() {
             [] | ["list" | "ls"] => Ok(Command::Hosts),
             ["add", name, address] => Ok(Command::AddHost {
@@ -311,18 +315,12 @@ impl Command {
                 address: (*address).to_owned(),
             }),
             ["upgrade", name] => Ok(Command::UpgradeHost((*name).to_owned())),
-            ["remove" | "rm", name] => Ok(Command::RemoveHost((*name).to_owned())),
-            ["external", name, "off"] => Ok(Command::External {
+            ["remove" | "rm", name] => Ok(Command::RemoveHost {
                 host: (*name).to_owned(),
-                domain: None,
-            }),
-            ["external", name, domain] => Ok(Command::External {
-                host: (*name).to_owned(),
-                domain: Some((*domain).to_owned()),
+                force,
             }),
             _ => Err(
-                "host takes list, add NAME SSH-DESTINATION, upgrade NAME, remove NAME, or \
-                 external NAME DOMAIN|off"
+                "host takes list, add NAME SSH-DESTINATION, upgrade NAME, or remove NAME [--force]"
                     .into(),
             ),
         }
@@ -459,22 +457,17 @@ pub(crate) fn describe_host(h: &HostInfo) -> String {
     if !h.needs_admin.is_empty() {
         out.push_str("  needs sudo there once: Settings → Hosts has the button");
     }
-    if let Some(why) = &h.upgrade_error {
-        out.push_str(&format!("  upgrading it failed: {why}"));
-    }
-    if let Some(note) = &h.external_note {
-        out.push_str(&format!("  ({note})"));
-    }
-    if h.external {
-        out.push_str("  external address");
-        if let Some(url) = &h.url {
-            out.push_str(&format!(" {url}"));
-        }
-        if let Some(t) = h.tunnel {
-            out.push_str(&format!(", tunnel {t}"));
-        }
-        if let Some(why) = &h.external_detail {
+    if let Some(t) = h.tunnel {
+        out.push_str(&format!("  tunnel {t}"));
+        if let Some(why) = &h.tunnel_detail {
             out.push_str(&format!(": {why}"));
+        }
+    }
+    if let Some(why) = &h.upgrade_error {
+        if h.upgrade_held {
+            out.push_str(&format!("  not updated: {why}"));
+        } else {
+            out.push_str(&format!("  upgrading it failed: {why}"));
         }
     }
     out
@@ -694,19 +687,12 @@ pub(crate) fn run(socket: &Path, command: Command) -> Result<(), String> {
                 .map_err(e)?;
             print!("{}", describe_install(&i));
         }
-        Command::External { host, domain } => {
-            let params = HostExternalParams {
-                host: Some(host),
-                on: domain.is_some(),
-                domain,
-                by: Some("this host's `vibe`".into()),
+        Command::RemoveHost { host, force } => {
+            let params = HostRemoveParams {
+                host,
+                force: force.then_some(true),
             };
-            let h = client::call::<HostsExternal>(socket, &params, TIMEOUT).map_err(e)?;
-            println!("{}", describe_host(&h));
-        }
-        Command::RemoveHost(host) => {
-            let h = client::call::<HostsRemove>(socket, &HostNameParams { host }, TIMEOUT)
-                .map_err(e)?;
+            let h = client::call::<HostsRemove>(socket, &params, TIMEOUT).map_err(e)?;
             println!(
                 "removed {}; vibed and its agents run on there, on their own",
                 h.name
@@ -862,7 +848,10 @@ mod tests {
         );
         assert_eq!(
             Command::parse_host(&words(&["rm", "vps"])),
-            Ok(Command::RemoveHost("vps".into()))
+            Ok(Command::RemoveHost {
+                host: "vps".into(),
+                force: false
+            })
         );
         assert!(Command::parse_host(&words(&["add", "vps"])).is_err());
     }
@@ -907,53 +896,47 @@ mod tests {
             version: Some("0.1.0".into()),
             missing: vec!["claude".into()],
             detail: Some("it stopped answering".into()),
-            url: None,
             tunnel: None,
-            external_changed_at: None,
-            external_note: None,
-            external_serves: None,
-            external_last: None,
-            external_detail: None,
+            tunnel_detail: None,
             memory: None,
             needs_admin: vec![],
             upgrade_error: None,
+            upgrade_held: false,
             sign_ins: vec![],
         };
         assert_eq!(
             describe_host(&h),
             "vps  vps-1 (linux)  down: it stopped answering  ssh me@vps  vibed 0.1.0  missing claude"
         );
-        let h = HostInfo {
-            link: HostLink::Connected,
-            detail: None,
-            missing: vec![],
-            external: true,
-            url: Some("https://vps.example.com/mcp".into()),
-            tunnel: Some(vibe_core::model::TunnelState::Down),
-            external_detail: Some("can't listen on port 443".into()),
-            memory: None,
-            ..h
-        };
         assert_eq!(
-            describe_host(&h),
-            "vps  vps-1 (linux)  connected  ssh me@vps  vibed 0.1.0  external address \
-             https://vps.example.com/mcp, tunnel down: can't listen on port 443"
-        );
-        assert_eq!(
-            Command::parse_host(&words(&["external", "vps", "vps.example.com"])),
-            Ok(Command::External {
+            Command::parse_host(&words(&["remove", "vps", "--force"])),
+            Ok(Command::RemoveHost {
                 host: "vps".into(),
-                domain: Some("vps.example.com".into())
+                force: true
             })
         );
         assert_eq!(
-            Command::parse_host(&words(&["external", "vps", "off"])),
-            Ok(Command::External {
+            Command::parse_host(&words(&["rm", "vps"])),
+            Ok(Command::RemoveHost {
                 host: "vps".into(),
-                domain: None
+                force: false
             })
         );
-        assert!(Command::parse_host(&words(&["external", "vps"])).is_err());
+        assert_eq!(
+            Command::parse_host(&words(&["rm", "--force", "vps"])),
+            Ok(Command::RemoveHost {
+                host: "vps".into(),
+                force: true
+            })
+        );
+        // It's for nothing else, and takes no value.
+        assert!(Command::parse_host(&words(&["upgrade", "vps", "--force"])).is_err());
+        assert!(Command::parse_host(&words(&["--force"])).is_err());
+        assert!(Command::parse_host(&words(&["remove", "vps", "--force=yes"])).is_err());
+        assert!(Command::parse_host(&words(&["remove", "--force"])).is_err());
+        // A retired command is an error, not a way back in.
+        assert!(Command::parse_host(&words(&["external", "vps", "vps.example.com"])).is_err());
+        assert!(Command::parse_host(&words(&["external", "vps", "off"])).is_err());
     }
 
     #[test]

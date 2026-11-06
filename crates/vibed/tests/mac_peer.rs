@@ -1,20 +1,18 @@
-//! External access, end to end in one process (PRD: External access): a
-//! Mac and a Linux host joined by a link as `ssh <host> vibe rpc` joins
-//! them, and by a reverse tunnel as `ssh -R` makes it, a Unix socket on the
-//! host forwarded to the Mac's tunnel socket. An outside MCP client talks
-//! HTTPS to the host's public endpoint with a key: it starts and talks to
-//! an agent on each, gets nothing without a key, and is cut off on every
-//! host when the key is revoked on the Mac. The Mac checks every call that
-//! comes down the tunnel itself; while the tunnel is down, the host answers
-//! for its own agents and the Mac's are unavailable.
+//! A Linux host's MCP reaching the Mac, and the other hosts linked to it, end to end in one
+//! process: a Mac and Linux hosts joined by links as `ssh <host> vibe rpc` joins them, and by
+//! reverse tunnels as `ssh -R` makes them, a Unix socket on each host forwarded to that
+//! host's socket on the Mac. An MCP client talks to the host's loopback MCP with a key: it
+//! starts and talks to an agent on each, gets nothing without a key, and is cut off on every
+//! host when the key is revoked on the Mac. The Mac checks every call that comes down a
+//! tunnel itself; while it's down, the host answers for its own agents and the Mac's are
+//! unavailable. Nothing listens beyond loopback, and nothing is public.
 //!
-//! The same flow with the real `vibed` binaries and the real install
-//! scripts is vibe-cli's tests/linux_host.rs; against a real server and
-//! Let's Encrypt, scripts/check-full.sh's external step.
+//! The same flow with the real `vibed` binaries and the real install scripts is vibe-cli's
+//! tests/linux_host.rs.
 
 mod common;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -22,7 +20,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use common::{Golden, TestServer, serve};
-use rustls::pki_types::{CertificateDer, ServerName};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpStream, UnixListener, UnixStream};
@@ -32,13 +29,9 @@ use vibe_core::paths::Layout;
 use vibe_core::rpc::{
     ErrorCode, HostAddParams, HostParams, KeyCreateParams, KeyParams, MAX_MESSAGE_BYTES,
 };
-use vibe_mcp::public::Limits;
 use vibed::core::{Core, OpenError};
-use vibed::external::ExternalConfig;
 use vibed::link::Timing;
 use vibed::remote::{BoxFuture, Channel, Installed, Remote, TunnelChild};
-
-const DOMAIN: &str = "vps.test";
 
 /// `ssh`, in process: a dial connects to the host's socket, and a tunnel
 /// relays the host's end to the Mac's tunnel socket. Pulling the network
@@ -65,6 +58,9 @@ struct Wires {
     tunnels: Mutex<u32>,
     /// Whether tunnels may be made (sshd might refuse to forward).
     forwarding: AtomicBool,
+    /// The addresses cut off from the Mac: dials to them fail and those up end, while
+    /// every other's and the tunnels carry on.
+    cut: watch::Sender<HashSet<String>>,
 }
 
 impl Wires {
@@ -79,6 +75,7 @@ impl Wires {
             hang_up: watch::channel(0).0,
             tunnels: Mutex::new(0),
             forwarding: AtomicBool::new(true),
+            cut: watch::channel(HashSet::new()).0,
         })
     }
 
@@ -92,6 +89,16 @@ impl Wires {
 
     fn freeze(&self, frozen: bool) {
         self.frozen.send_replace(frozen);
+    }
+
+    fn cut_off(&self, address: &str, cut: bool) {
+        self.cut.send_modify(|all| {
+            if cut {
+                all.insert(address.to_owned());
+            } else {
+                all.remove(address);
+            }
+        });
     }
 
     fn hang_up_dials(&self) {
@@ -194,6 +201,11 @@ impl Remote for Wires {
                     "ssh: connect to host {address} port 22: Network is unreachable"
                 ));
             }
+            if self.cut.borrow().contains(address) {
+                return Err(format!(
+                    "ssh: connect to host {address} port 22: Network is unreachable"
+                ));
+            }
             let socket = self.sockets.lock().unwrap().get(address).cloned();
             let socket =
                 socket.ok_or_else(|| format!("ssh: Could not resolve hostname {address}"))?;
@@ -204,8 +216,11 @@ impl Remote for Wires {
             let up = self.up.subscribe();
             let frozen = self.frozen.subscribe();
             let mut hang_up = self.hang_up.subscribe();
+            let mut cut = self.cut.subscribe();
+            let this_address = address.to_owned();
             tokio::spawn(async move {
                 tokio::select! {
+                    _ = cut.wait_for(|all| all.contains(&this_address)) => {}
                     () = pump(host, theirs, up, frozen, Arc::new(AtomicBool::new(false)), None, None) => {}
                     _ = hang_up.changed() => {}
                 }
@@ -310,17 +325,6 @@ fn free_port() -> u16 {
         .port()
 }
 
-/// A certificate for the domain, as Let's Encrypt would give, in `dir`.
-fn certificate(dir: &Path) -> (PathBuf, PathBuf, CertificateDer<'static>) {
-    let key = rcgen::KeyPair::generate().unwrap();
-    let params = rcgen::CertificateParams::new(vec![DOMAIN.to_owned()]).unwrap();
-    let cert = params.self_signed(&key).unwrap();
-    let (c, k) = (dir.join("cert.pem"), dir.join("key.pem"));
-    std::fs::write(&c, cert.pem()).unwrap();
-    std::fs::write(&k, key.serialize_pem()).unwrap();
-    (c, k, cert.der().clone())
-}
-
 struct World {
     mac: Arc<Core>,
     host: Arc<Core>,
@@ -330,33 +334,20 @@ struct World {
     /// Seconds the Mac's clock is ahead of the host's, as time passing in the
     /// tunnel looks to it.
     mac_clock_ahead: Arc<AtomicI64>,
+    /// The host's loopback MCP.
     public: SocketAddr,
-    cert: CertificateDer<'static>,
-    /// The host's external config, to start it again with.
-    external: ExternalConfig,
+    mcp: tokio::task::JoinHandle<()>,
     _server: TestServer,
-    _certs: tempfile::TempDir,
 }
 
-/// A Mac and, at `me@vps.example.com`, a Linux host, both with the project
-/// `app` and running agents under the test backend. The host serves its
-/// public endpoint, once it's on, on a port of its own with a fixed
-/// certificate, and a client gets `limits` there.
-async fn world(limits: Limits) -> World {
-    world_timed(limits, quick()).await
+/// A Mac and, at `me@vps.example.com`, a Linux host with the project `app` on each, with
+/// the host's MCP on a loopback port of its own.
+async fn world() -> World {
+    world_timed(quick()).await
 }
 
 /// [`world`], with the Mac's link and tunnel timed by `timing`.
-async fn world_timed(limits: Limits, timing: Timing) -> World {
-    world_external(limits, timing, |_| {}).await
-}
-
-/// [`world_timed`], with how the host serves it changed by `change`.
-async fn world_external(
-    limits: Limits,
-    timing: Timing,
-    change: impl FnOnce(&mut ExternalConfig),
-) -> World {
+async fn world_timed(timing: Timing) -> World {
     let wires = Wires::new();
     let mac_world = Golden::new();
     let mut config = mac_world.config();
@@ -367,24 +358,11 @@ async fn world_external(
     config.clock = Arc::new(move || common::GOLDEN_NOW + ahead.load(Ordering::SeqCst));
     let mac = Arc::new(Core::open(config).unwrap());
     mac.spawn_links();
-    mac.spawn_external();
+    mac.spawn_tunnels();
 
-    let certs = common::short_tempdir();
-    let (cert_pem, key_pem, cert) = certificate(certs.path());
     let port = free_port();
     let host_world = Golden::new();
-    let mut external = ExternalConfig {
-        serve_here: true,
-        port,
-        // Loopback only: the tests open nothing to the network.
-        listen: Some(std::net::Ipv4Addr::LOCALHOST.into()),
-        fixed_cert: Some((cert_pem, key_pem)),
-        probe_every: Duration::from_millis(100),
-        limits,
-        ..ExternalConfig::default()
-    };
-    change(&mut external);
-    let (host, server) = open_host(&host_world, &external, &wires).await;
+    let (host, server, mcp) = open_host(&host_world, port, &wires).await;
     let w = World {
         mac,
         host,
@@ -393,10 +371,8 @@ async fn world_external(
         host_world,
         mac_clock_ahead,
         public: SocketAddr::from(([127, 0, 0, 1], port)),
-        cert,
-        external,
+        mcp,
         _server: server,
-        _certs: certs,
     };
     w.mac
         .add_host(HostAddParams {
@@ -429,9 +405,22 @@ async fn world_external(
 /// `me@vps.example.com`.
 async fn open_host(
     host_world: &Golden,
-    external: &ExternalConfig,
+    port: u16,
     wires: &Wires,
-) -> (Arc<Core>, TestServer) {
+) -> (Arc<Core>, TestServer, tokio::task::JoinHandle<()>) {
+    open_host_at(host_world, port, wires, "me@vps.example.com").await
+}
+
+/// [`open_host`], served at `address`.
+async fn open_host_at(
+    host_world: &Golden,
+    port: u16,
+    wires: &Wires,
+    address: &str,
+) -> (Arc<Core>, TestServer, tokio::task::JoinHandle<()>) {
+    let host_toml = Layout::new(&host_world.home, "linux").host_config();
+    std::fs::create_dir_all(host_toml.parent().unwrap()).unwrap();
+    std::fs::write(&host_toml, format!("mcp_port = {port}\n")).unwrap();
     let config = || {
         let mut config = host_world.config();
         config.info.os = "linux".into();
@@ -451,7 +440,8 @@ async fn open_host(
         config.pressure = Arc::new(vibed::pressure::NoPressure);
         // Its own keys aren't the Mac's.
         config.entropy = Arc::new(vibe_core::keys::random_bytes);
-        config.external = external.clone();
+        config.serves_mac_peer = true;
+        config.mac_probe_every = Duration::from_millis(100);
         config
     };
     let mut host = None;
@@ -470,7 +460,8 @@ async fn open_host(
     let host = host.expect("the last host's vibed let go of its state");
     host.adopt_sessions().await;
     host.spawn_links();
-    host.spawn_external();
+    host.spawn_tunnels();
+    let mcp = host.spawn_mcp(Duration::from_millis(50));
     let server = serve(
         Arc::clone(&host),
         common::short_tempdir(),
@@ -480,8 +471,8 @@ async fn open_host(
         .sockets
         .lock()
         .unwrap()
-        .insert("me@vps.example.com".into(), server.path.clone());
-    (host, server)
+        .insert(address.into(), server.path.clone());
+    (host, server, mcp)
 }
 
 /// One call through `core`'s dispatcher, as a socket client makes it.
@@ -522,26 +513,14 @@ impl World {
     fn client(&self, key: &str) -> Client {
         Client {
             addr: self.public,
-            cert: self.cert.clone(),
             key: Some(key.to_owned()),
             next: 0,
         }
     }
 
-    /// Turns it on, and says nothing of how that goes.
-    async fn ask_for_it(&self) {
-        let on = rpc(
-            &self.mac,
-            "hosts.external",
-            json!({"host": "vps", "on": true, "domain": DOMAIN}),
-        )
-        .await;
-        assert_eq!(on["result"]["external"], true, "{on}");
-        assert_eq!(on["result"]["url"], format!("https://{DOMAIN}/mcp"));
-    }
-
+    /// Waits for the tunnel the Mac opens to every host linked to it. There's nothing to turn
+    /// on, and the host's MCP has `mac` to speak of from then on.
     async fn turn_on(&self) {
-        self.ask_for_it().await;
         self.wait("the tunnel", |h| h.tunnel == Some(TunnelState::Up))
             .await;
     }
@@ -558,16 +537,15 @@ impl World {
             host_world,
             mac_clock_ahead,
             public,
-            cert,
-            external,
+            mcp,
             _server,
-            _certs,
         } = self;
-        host.stop_external();
+        host.stop_tunnels();
+        mcp.abort();
         drop(_server);
         drop(host);
         wires.hang_up_dials();
-        let (host, server) = open_host(&host_world, &external, &wires).await;
+        let (host, server, mcp) = open_host(&host_world, public.port(), &wires).await;
         World {
             mac,
             host,
@@ -576,10 +554,8 @@ impl World {
             host_world,
             mac_clock_ahead,
             public,
-            cert,
-            external,
+            mcp,
             _server: server,
-            _certs,
         }
     }
 
@@ -587,7 +563,7 @@ impl World {
     fn tunnel_end(&self) -> PathBuf {
         Layout::new(&self.host_world.home, "linux")
             .run_dir()
-            .join(vibed::external::TUNNEL_END)
+            .join(vibed::mac_peer::TUNNEL_END)
     }
 
     /// Waits until an outside client with `key` reaches the Mac's
@@ -698,38 +674,18 @@ impl Reply {
     }
 }
 
-/// An MCP client on the internet: HTTPS to the public endpoint, trusting
-/// its certificate as it would Let's Encrypt's.
+/// An MCP client of the host's: plain HTTP to its loopback MCP, as over Tailscale.
 struct Client {
     addr: SocketAddr,
-    cert: CertificateDer<'static>,
     key: Option<String>,
     next: u64,
 }
 
-fn tls(cert: &CertificateDer<'static>, alpn: &[u8]) -> tokio_rustls::TlsConnector {
-    let mut roots = rustls::RootCertStore::empty();
-    roots.add(cert.clone()).unwrap();
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let mut config = rustls::ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    config.alpn_protocols = vec![alpn.to_vec()];
-    tokio_rustls::TlsConnector::from(Arc::new(config))
-}
-
 impl Client {
     async fn post(&self, path: &str, body: &str) -> Reply {
-        let tcp = TcpStream::connect(self.addr).await.unwrap();
-        let name = ServerName::try_from(DOMAIN).unwrap();
-        let mut s = tls(&self.cert, b"http/1.1")
-            .connect(name, tcp)
-            .await
-            .unwrap();
+        let mut s = TcpStream::connect(self.addr).await.unwrap();
         let mut head = format!(
-            "POST {path} HTTP/1.1\r\nHost: {DOMAIN}\r\nContent-Type: application/json\r\n\
+            "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
              Accept: application/json, text/event-stream\r\nMCP-Protocol-Version: 2025-06-18\r\n\
              Content-Length: {}\r\nConnection: close\r\n",
             body.len()
@@ -807,25 +763,17 @@ impl Client {
     }
 }
 
-fn limits() -> Limits {
-    Limits {
-        burst: 1000.0,
-        per_second: 1000.0,
-        ..Limits::default()
-    }
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn one_url_and_one_key_reach_agents_on_the_host_and_the_mac() {
-    let w = world(limits()).await;
+    let w = world().await;
     w.turn_on().await;
     let vps = w.vps();
-    assert_eq!(vps.external_detail, None, "{vps:?}");
+    assert_eq!(vps.tunnel_detail, None, "{vps:?}");
+    assert!(!vps.external, "{vps:?}");
     // The host says so too, of itself.
     let own = w.host.hosts().unwrap().hosts.remove(0);
-    assert!(own.external, "{own:?}");
+    assert!(!own.external, "{own:?}");
     assert_eq!(own.tunnel, Some(TunnelState::Up));
-    assert_eq!(own.url.as_deref(), Some("https://vps.test/mcp"));
 
     // Nothing without a key, or with one that isn't.
     let mut nobody = w.client("");
@@ -997,34 +945,27 @@ async fn one_url_and_one_key_reach_agents_on_the_host_and_the_mac() {
     let r = c.request("tools/list", json!({})).await;
     assert_eq!(r.status, 401, "revoked: {r:?}");
 
-    // Off: the tunnel closes, and the host stops serving.
-    let off = rpc(
-        &w.mac,
-        "hosts.external",
-        json!({"host": "vps", "on": false}),
-    )
-    .await;
-    assert_eq!(off["result"]["external"], false, "{off}");
-    assert_eq!(off["result"].get("tunnel"), None);
-    for _ in 0..500 {
-        if TcpStream::connect(w.public).await.is_err() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert!(TcpStream::connect(w.public).await.is_err(), "still serving");
+    // Forgotten: the tunnel closes, and its end goes, so the host has no `mac` to list. It
+    // serves on, on its own, as nothing about it was this Mac's.
+    let removed = rpc(&w.mac, "hosts.remove", json!({"host": "vps"})).await;
+    assert!(removed.get("result").is_some(), "{removed}");
+    assert!(!w.tunnel_end().exists(), "its end is left on the host");
+    assert_eq!(w.host.hosts().unwrap().hosts[0].tunnel, None);
+    assert!(
+        TcpStream::connect(w.public).await.is_ok(),
+        "it stopped serving"
+    );
     // Nothing of the tunnel is left on the Mac: no socket, no lock.
-    let socket = w.mac.tunnel_socket();
+    let socket = w.mac.tunnel_socket("vps");
     assert!(!socket.exists(), "{} is left", socket.display());
     assert!(!vibe_core::socket::lock_path(&socket).exists());
-    assert!(!w.host.hosts().unwrap().hosts[0].external);
 }
 
 /// The send a caller can't know the fate of: the Mac types it, its answer never
 /// reaches the host, and the caller is told to try again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_send_delivered_with_its_reply_lost_arrives_once_when_retried() {
-    let w = world(limits()).await;
+    let w = world().await;
     w.turn_on().await;
     let key = w.key("laptop");
     w.pushed(&key).await;
@@ -1113,7 +1054,7 @@ async fn answer_from(r: &mut BufReader<UnixStream>) -> Value {
 /// the Mac wakes it lands. A retry with the id it was given types nothing more.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_send_held_up_by_a_sleeping_mac_lands_once_when_retried() {
-    let w = world(limits()).await;
+    let w = world().await;
     w.turn_on().await;
     let key = w.key("laptop");
     w.pushed(&key).await;
@@ -1176,7 +1117,7 @@ async fn a_send_held_up_by_a_sleeping_mac_lands_once_when_retried() {
 /// host has makes none at all; and one on the Mac that this key started needs no lookup.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_mac_is_only_asked_what_only_it_can_say() {
-    let w = world(limits()).await;
+    let w = world().await;
     w.turn_on().await;
     let key = w.key("laptop");
     w.pushed(&key).await;
@@ -1248,7 +1189,7 @@ async fn the_mac_is_only_asked_what_only_it_can_say() {
 /// it says so at once, rather than that it can't be found.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_ref_started_on_the_mac_is_known_while_the_mac_sleeps() {
-    let w = world(limits()).await;
+    let w = world().await;
     w.turn_on().await;
     let key = w.key("laptop");
     w.pushed(&key).await;
@@ -1269,7 +1210,7 @@ async fn a_ref_started_on_the_mac_is_known_while_the_mac_sleeps() {
 /// and not if it wakes past the window, when its caller may well have tried again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_start_held_up_by_a_sleeping_mac_doesnt_run_once_its_too_old() {
-    let w = world(limits()).await;
+    let w = world().await;
     w.turn_on().await;
     let key = w.key("laptop");
     w.pushed(&key).await;
@@ -1316,7 +1257,7 @@ async fn a_start_held_up_by_a_sleeping_mac_doesnt_run_once_its_too_old() {
 /// A delete held the same way: the agent is still there, past the window.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_delete_held_up_by_a_sleeping_mac_doesnt_run_once_its_too_old() {
-    let w = world(limits()).await;
+    let w = world().await;
     w.turn_on().await;
     let key = w.key("laptop");
     w.pushed(&key).await;
@@ -1380,7 +1321,7 @@ async fn a_delete_held_up_by_a_sleeping_mac_doesnt_run_once_its_too_old() {
 /// A send held the same way: nothing's typed, past the window.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_send_held_up_by_a_sleeping_mac_isnt_typed_once_its_too_old() {
-    let w = world(limits()).await;
+    let w = world().await;
     w.turn_on().await;
     let key = w.key("laptop");
     w.pushed(&key).await;
@@ -1413,7 +1354,7 @@ async fn a_send_held_up_by_a_sleeping_mac_isnt_typed_once_its_too_old() {
 /// sleep: it doesn't run. Reads don't care.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_change_too_old_when_it_reaches_the_mac_doesnt_run() {
-    let w = world(limits()).await;
+    let w = world().await;
     w.turn_on().await;
     let key = w.key("laptop");
     w.pushed(&key).await;
@@ -1486,7 +1427,7 @@ async fn a_change_too_old_when_it_reaches_the_mac_doesnt_run() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_sleeping_mac_holds_up_nothing_on_the_host() {
-    let w = world(limits()).await;
+    let w = world().await;
     w.turn_on().await;
     let key = w.key("laptop");
     w.pushed(&key).await;
@@ -1639,7 +1580,7 @@ async fn a_sleeping_mac_holds_up_nothing_on_the_host() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_mac_checks_every_key_itself() {
-    let w = world(limits()).await;
+    let w = world().await;
     w.turn_on().await;
     // A key of the host's own works there, for its agents, but the Mac
     // doesn't take it.
@@ -1745,48 +1686,16 @@ async fn the_mac_checks_every_key_itself() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_public_endpoint_limits_each_client() {
-    let w = world(Limits {
-        burst: 5.0,
-        per_second: 0.5,
-        refused_keys: 3.0,
-        refused_every: Duration::from_secs(600),
-        ..Limits::default()
-    })
-    .await;
-    w.turn_on().await;
-    let key = w.key("laptop");
-    w.pushed(&key).await;
-    // Wrong keys, again and again: past three, the client is locked out,
-    // even with a good key.
-    let mut wrong = w.client(&vibe_core::keys::encode(&[9; 32]));
-    for _ in 0..3 {
-        assert_eq!(wrong.request("tools/list", json!({})).await.status, 401);
-    }
-    let r = wrong.request("tools/list", json!({})).await;
-    assert_eq!(r.status, 429, "{r:?}");
-    assert!(
-        r.headers.to_ascii_lowercase().contains("retry-after:"),
-        "{r:?}"
-    );
-    let mut good = w.client(&key);
-    assert_eq!(good.request("tools/list", json!({})).await.status, 429);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_tunnel_says_why_it_is_down() {
-    let w = world(limits()).await;
+    let w = world().await;
     w.wires.forwarding.store(false, Ordering::SeqCst);
-    let on = rpc(
-        &w.mac,
-        "hosts.external",
-        json!({"host": "vps", "on": true, "domain": "VPS.Test."}),
-    )
-    .await;
-    assert_eq!(on["result"]["url"], "https://vps.test/mcp", "{on}");
+    // It's what the next tunnel finds.
+    w.wires.pull();
+    w.wait("the link down", |h| h.link == HostLink::Down).await;
+    w.wires.plug_in();
     w.wait("the tunnel's trouble", |h| {
         h.tunnel == Some(TunnelState::Down)
-            && h.external_detail
+            && h.tunnel_detail
                 .as_deref()
                 .is_some_and(|d| d.contains("refused to forward"))
     })
@@ -1795,7 +1704,7 @@ async fn the_tunnel_says_why_it_is_down() {
     w.wires.forwarding.store(true, Ordering::SeqCst);
     w.wait("the tunnel", |h| h.tunnel == Some(TunnelState::Up))
         .await;
-    assert_eq!(w.vps().external_detail, None);
+    assert_eq!(w.vps().tunnel_detail, None);
     // A second tunnel replaced the first's end: the host cleared it.
     w.wires.pull();
     w.wait("the tunnel down", |h| h.tunnel == Some(TunnelState::Down))
@@ -1804,344 +1713,6 @@ async fn the_tunnel_says_why_it_is_down() {
     w.wait("the tunnel back", |h| h.tunnel == Some(TunnelState::Up))
         .await;
     assert!(*w.wires.tunnels.lock().unwrap() >= 2);
-    // Removing the host is about this Mac: it goes on serving, as it's its own.
-    let removed = rpc(&w.mac, "hosts.remove", json!({"host": "vps"})).await;
-    assert!(removed.get("result").is_some(), "{removed}");
-    assert!(w.host.hosts().unwrap().hosts[0].external);
-}
-
-/// #100: what the host's own row says of its external address.
-fn own_row(host: &Core) -> vibe_core::rpc::HostInfo {
-    host.hosts().unwrap().hosts.remove(0)
-}
-
-/// #100. A Mac that's never heard of a host's external address, as a test's or a
-/// reinstalled one's, doesn't turn it off when it links: its "off" is only that it
-/// hasn't chosen. Nor does it take it over with a tunnel of its own, as that may be
-/// another Mac's.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_new_mac_leaves_a_hosts_external_address_alone() {
-    let w = world(limits()).await;
-    let on = rpc(
-        &w.host,
-        "hosts.external",
-        json!({"on": true, "domain": "vps.test"}),
-    )
-    .await;
-    assert_eq!(on["result"]["external"], true, "{on}");
-    // Through the link going down and coming up, when a Mac used to say.
-    w.wires.pull();
-    w.wait("the link down", |h| h.link == HostLink::Down).await;
-    w.wires.plug_in();
-    w.wait("what it serves, as a note", |h| {
-        h.link == HostLink::Connected
-            && h.external_note
-                .as_deref()
-                .is_some_and(|n| n.contains("https://vps.test/mcp on its own"))
-    })
-    .await;
-    assert!(own_row(&w.host).external, "it goes on serving");
-    let vps = w.vps();
-    assert!(!vps.external, "{vps:?}");
-    assert_eq!(vps.tunnel, None);
-    assert_eq!(*w.wires.tunnels.lock().unwrap(), 0, "no tunnel of its own");
-}
-
-/// #100. Turned off on the host while this Mac was away: the Mac doesn't turn it on
-/// again, and says who did it. Its old choice was only ever what it last knew.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_host_turned_off_there_stays_off_and_says_who_did_it() {
-    let w = world(limits()).await;
-    w.turn_on().await;
-    w.wires.pull();
-    w.wait("the link down", |h| h.link == HostLink::Down).await;
-    let off = rpc(
-        &w.host,
-        "hosts.external",
-        json!({"on": false, "by": "this host's `vibe`"}),
-    )
-    .await;
-    assert_eq!(off["result"]["external"], false, "{off}");
-    w.wires.plug_in();
-    w.wait("the Mac to go by the host", |h| {
-        !h.external && h.link == HostLink::Connected && h.external_note.is_some()
-    })
-    .await;
-    let vps = w.vps();
-    let note = vps.external_note.as_deref().unwrap();
-    assert!(note.contains("turned off by this host's `vibe`"), "{note}");
-    assert_eq!(
-        vps.external_last.as_deref(),
-        Some(DOMAIN),
-        "what one click turns on"
-    );
-    assert_eq!(vps.external_serves, None);
-    assert!(!own_row(&w.host).external, "it stays off");
-
-    // On again there, at the name this Mac chose: this Mac's choice stands, and its
-    // tunnel comes back, rather than it dropping out for good.
-    let on = rpc(
-        &w.host,
-        "hosts.external",
-        json!({"on": true, "domain": DOMAIN}),
-    )
-    .await;
-    assert_eq!(on["result"]["external"], true, "{on}");
-    w.wait("the Mac to use it again", |h| {
-        h.external && h.tunnel == Some(TunnelState::Up)
-    })
-    .await;
-    assert_eq!(w.vps().external_last, None);
-}
-
-/// #100. One click on what a host serves on its own uses it, and another stops it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn what_a_host_serves_on_its_own_can_be_used_or_stopped_from_here() {
-    let w = world(limits()).await;
-    let on = rpc(
-        &w.host,
-        "hosts.external",
-        json!({"on": true, "domain": DOMAIN}),
-    )
-    .await;
-    assert_eq!(on["result"]["external"], true, "{on}");
-    w.wait("what it serves", |h| {
-        h.external_serves.as_deref() == Some(DOMAIN)
-    })
-    .await;
-    assert!(!w.vps().external);
-    // Stopped from here, by name, though this Mac isn't using it.
-    let off = rpc(
-        &w.mac,
-        "hosts.external",
-        json!({"host": "vps", "on": false}),
-    )
-    .await;
-    assert_eq!(off["result"]["external"], false, "{off}");
-    assert!(!own_row(&w.host).external);
-    let own = own_row(&w.host);
-    assert!(
-        own.external_note
-            .as_deref()
-            .unwrap()
-            .contains("by the Mac "),
-        "{own:?}"
-    );
-    // Asked again of a host that's already off, it isn't another change.
-    let changed = own.external_changed_at;
-    w.mac_clock_ahead.store(0, Ordering::SeqCst);
-    rpc(&w.host, "hosts.external", json!({"on": false})).await;
-    assert_eq!(own_row(&w.host).external_changed_at, changed);
-    // And used with the name it said.
-    let on = rpc(
-        &w.host,
-        "hosts.external",
-        json!({"on": true, "domain": DOMAIN}),
-    )
-    .await;
-    assert_eq!(on["result"]["external"], true, "{on}");
-    w.wait("what it serves again", |h| {
-        h.external_serves.as_deref() == Some(DOMAIN)
-    })
-    .await;
-    let used = rpc(
-        &w.mac,
-        "hosts.external",
-        json!({"host": "vps", "on": true, "domain": DOMAIN}),
-    )
-    .await;
-    assert_eq!(used["result"]["external"], true, "{used}");
-    w.wait("the tunnel", |h| h.tunnel == Some(TunnelState::Up))
-        .await;
-    assert_eq!(w.vps().external_serves, None);
-}
-
-/// #100. Forgotten with its link down, a host serving publicly would go on taking this
-/// Mac's keys, where no revoke could reach them, so that's refused until the Mac can tell
-/// it, or someone has said here that it's gone.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_public_host_isnt_forgotten_with_this_macs_keys_on_it() {
-    let w = world(limits()).await;
-    w.turn_on().await;
-    let key = w.key("laptop");
-    w.pushed(&key).await;
-    w.wires.pull();
-    w.wait("the link down", |h| h.link == HostLink::Down).await;
-    let refused = rpc(&w.mac, "hosts.remove", json!({"host": "vps"})).await;
-    let said = refused["error"]["message"].as_str().unwrap();
-    assert!(
-        said.contains("API keys") && said.contains("gone for good"),
-        "{refused}"
-    );
-    // Gone for good, then, as far as anyone here can tell.
-    let off = rpc(
-        &w.mac,
-        "hosts.external",
-        json!({"host": "vps", "on": false}),
-    )
-    .await;
-    assert_eq!(off["result"]["external"], false, "{off}");
-    let removed = rpc(&w.mac, "hosts.remove", json!({"host": "vps"})).await;
-    assert!(removed.get("result").is_some(), "{removed}");
-}
-
-/// #100. Someone's choice made here while the link was down is a request: it reaches
-/// the host when the link's back. Unless the host has changed since, when it's stale.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_choice_made_while_the_link_was_down_goes_to_the_host_unless_its_stale() {
-    let w = world(limits()).await;
-    w.turn_on().await;
-    w.wires.pull();
-    w.wait("the link down", |h| h.link == HostLink::Down).await;
-    let off = rpc(
-        &w.mac,
-        "hosts.external",
-        json!({"host": "vps", "on": false}),
-    )
-    .await;
-    assert_eq!(off["result"]["external"], false, "{off}");
-    w.wires.plug_in();
-    for _ in 0..500 {
-        if !own_row(&w.host).external {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    let own = own_row(&w.host);
-    assert!(!own.external, "it was asked by name");
-    assert!(
-        own.external_note
-            .as_deref()
-            .unwrap()
-            .contains("by the Mac "),
-        "{own:?}"
-    );
-
-    // Now on from here, turned off while away, in the Mac's past; and then the host
-    // turned on later. What was chosen here is older, so it doesn't win.
-    w.turn_on().await;
-    w.wires.pull();
-    w.wait("the link down again", |h| h.link == HostLink::Down)
-        .await;
-    w.mac_clock_ahead.store(-100, Ordering::SeqCst);
-    rpc(
-        &w.mac,
-        "hosts.external",
-        json!({"host": "vps", "on": false}),
-    )
-    .await;
-    w.mac_clock_ahead.store(0, Ordering::SeqCst);
-    rpc(
-        &w.host,
-        "hosts.external",
-        json!({"on": true, "domain": "vps.test"}),
-    )
-    .await;
-    w.wires.plug_in();
-    w.wait("the link back", |h| h.link == HostLink::Connected)
-        .await;
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    assert!(own_row(&w.host).external, "a stale off stops nothing");
-}
-
-/// #100. With the Mac gone, a host goes on serving across a restart of its `vibed`, with
-/// the keys it has: nothing it needs is the Mac's.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn with_the_mac_gone_a_host_serves_across_a_restart() {
-    let w = world(limits()).await;
-    w.turn_on().await;
-    let key = w.key("laptop");
-    w.pushed(&key).await;
-    w.wires.pull();
-    let w = w.restart_host().await;
-    assert!(own_row(&w.host).external, "its own state says so");
-    let c = w.client(&key);
-    let list = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).to_string();
-    for _ in 0..500 {
-        // Nothing to post to until it's listening again.
-        if TcpStream::connect(w.public).await.is_ok() && c.post("/mcp", &list).await.status == 200 {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("it isn't serving");
-}
-
-/// #100. The same for a host serving on its own, though with its link down it can't say
-/// so now, and what it last said is what's there to stop.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_host_serving_on_its_own_isnt_forgotten_with_this_macs_keys_on_it() {
-    let w = world(limits()).await;
-    let on = rpc(
-        &w.host,
-        "hosts.external",
-        json!({"on": true, "domain": DOMAIN}),
-    )
-    .await;
-    assert_eq!(on["result"]["external"], true, "{on}");
-    w.wait("what it serves", |h| {
-        h.external_serves.as_deref() == Some(DOMAIN)
-    })
-    .await;
-    let key = w.key("laptop");
-    w.pushed(&key).await;
-    w.wires.pull();
-    w.wait("the link down", |h| h.link == HostLink::Down).await;
-    let vps = w.vps();
-    assert_eq!(vps.external_serves.as_deref(), Some(DOMAIN), "{vps:?}");
-    assert!(vps.external_note.unwrap().contains("last said it serves"));
-    let refused = rpc(&w.mac, "hosts.remove", json!({"host": "vps"})).await;
-    let said = refused["error"]["message"].as_str().unwrap();
-    assert!(
-        said.contains("API keys") && said.contains("gone for good"),
-        "{refused}"
-    );
-    let off = rpc(
-        &w.mac,
-        "hosts.external",
-        json!({"host": "vps", "on": false}),
-    )
-    .await;
-    assert_eq!(off["result"]["external"], false, "{off}");
-    assert_eq!(w.vps().external_serves, None);
-    let removed = rpc(&w.mac, "hosts.remove", json!({"host": "vps"})).await;
-    assert!(removed.get("result").is_some(), "{removed}");
-}
-
-/// Item 10 of #69: a real-host test's own Mac, linking and then forgetting a host,
-/// wiped the keys the real Mac had pushed there.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn forgetting_a_host_takes_only_this_macs_keys_off_it() {
-    let w = world(limits()).await;
-    w.host
-        .sync_keys(vibe_core::rpc::KeySyncParams {
-            keys: vec![vibe_core::rpc::KeyHash {
-                name: "another Mac's".into(),
-                prefix: "vk_another".into(),
-                hash: "a".repeat(64),
-                created_at: "2026-10-30T12:00:00Z".into(),
-            }],
-            from: Some("another-mac".into()),
-        })
-        .unwrap();
-    let names = |w: &World| -> Vec<String> {
-        let mut names: Vec<String> = w
-            .host
-            .keys()
-            .unwrap()
-            .keys
-            .into_iter()
-            .map(|k| k.name)
-            .collect();
-        names.sort();
-        names
-    };
-    let key = w.key("laptop");
-    w.pushed(&key).await;
-    assert_eq!(names(&w), ["another Mac's", "laptop"]);
-    let removed = rpc(&w.mac, "hosts.remove", json!({"host": "vps"})).await;
-    assert!(removed.get("result").is_some(), "{removed}");
-    assert_eq!(names(&w), ["another Mac's"]);
 }
 
 /// Issue #45: the host's `vibed` restarted, as an upgrade does, while the
@@ -2149,7 +1720,7 @@ async fn forgetting_a_host_takes_only_this_macs_keys_off_it() {
 /// socket and removed it, and the Mac was unavailable from then on.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_restarted_host_keeps_the_macs_tunnel() {
-    let w = world(limits()).await;
+    let w = world().await;
     w.turn_on().await;
     let key = w.key("laptop");
     w.pushed(&key).await;
@@ -2193,87 +1764,6 @@ async fn a_restarted_host_keeps_the_macs_tunnel() {
     }
 }
 
-/// An agent called as an older `vibed` let one be, `mac` on a Linux host
-/// or `tunnel` on a Mac, before those names were kept for the tunnel's
-/// sockets.
-fn legacy_agent(home: &Path, os: &str, agent_ref: &str) {
-    let layout = Layout::new(home, os);
-    let mut store = vibe_core::store::Store::open(&layout.db()).unwrap();
-    store
-        .add_agent(&vibe_core::store::AgentRecord {
-            host: vibe_core::model::LOCAL_HOST.into(),
-            agent_ref: agent_ref.into(),
-            project: "app".into(),
-            profile: "software-eng-linux".into(),
-            environment: vibe_core::model::Environment::Linux,
-            model: vibe_core::model::Model::Opus,
-            reasoning: vibe_core::model::Reasoning::High,
-            mode: vibe_core::model::Mode::Auto,
-            memory: 1 << 30,
-            worktree: home
-                .join("VibeOS/worktrees/app")
-                .join(agent_ref)
-                .to_string_lossy()
-                .into_owned(),
-            branch: agent_ref.into(),
-            session_id: "s".into(),
-            shim_socket: None,
-            state: vibe_core::model::AgentState::Exited,
-            created_at: 0,
-            compartment: "{}".into(),
-            starting: false,
-            shared_services: true,
-            agent: Default::default(),
-            pi_model: None,
-        })
-        .unwrap();
-}
-
-/// An agent named `mac` or `tunnel` before 0.1.3 is still listed and can
-/// be deleted, and deleting it leaves the tunnel's sockets alone: sshd's
-/// end on the host has no lock, and the Mac's is the Mac's own.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn agents_named_for_the_tunnel_from_before_can_be_deleted() {
-    let w = world(limits()).await;
-    w.turn_on().await;
-    let key = w.key("laptop");
-    w.pushed(&key).await;
-    w.mac_reachable(&key).await;
-    legacy_agent(&w.host_world.home, "linux", "mac");
-    legacy_agent(&w.mac_world.home, "macos", "tunnel");
-    let mac_end = w.mac.tunnel_socket();
-    assert!(mac_end.exists());
-
-    // Each is an agent as any other, and neither socket is a session.
-    for (core, name) in [(&w.host, "mac"), (&w.mac, "tunnel")] {
-        let listed = rpc(core, "agents.list", json!({})).await;
-        let refs: Vec<_> = listed["result"]["agents"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|a| a["ref"].as_str().unwrap().to_owned())
-            .collect();
-        assert!(refs.contains(&name.to_owned()), "{listed}");
-        let sessions = rpc(core, "sessions.list", json!({})).await;
-        assert_eq!(sessions["result"]["sessions"], json!([]), "{sessions}");
-    }
-
-    for (core, name) in [(&w.host, "mac"), (&w.mac, "tunnel")] {
-        let deleted = rpc(core, "agents.delete", json!({"ref": name, "force": true})).await;
-        assert!(deleted.get("result").is_some(), "{name}: {deleted}");
-    }
-    assert!(
-        w.tunnel_end().exists(),
-        "deleting `mac` removed the tunnel's end"
-    );
-    assert!(
-        mac_end.exists(),
-        "deleting `tunnel` removed the Mac's socket"
-    );
-    w.mac_reachable(&key).await;
-    assert_eq!(w.vps().tunnel, Some(TunnelState::Up));
-}
-
 /// A tunnel whose end on the host is gone while `ssh` runs on (a cleanup
 /// of `run/`, or the scan of issue #45) has the host stop coming through
 /// it: the Mac starts it over, so it heals without anyone ending `ssh`.
@@ -2283,7 +1773,7 @@ async fn a_tunnel_whose_end_is_gone_starts_over() {
         tunnel_quiet: Duration::from_secs(2),
         ..quick()
     };
-    let w = world_timed(limits(), timing).await;
+    let w = world_timed(timing).await;
     w.turn_on().await;
     let key = w.key("laptop");
     w.pushed(&key).await;
@@ -2308,285 +1798,453 @@ async fn a_tunnel_whose_end_is_gone_starts_over() {
     w.mac_reachable(&key).await;
 }
 
-/// Reads one HTTP response off a kept-alive connection: its status, or
-/// none once the server has closed it.
-async fn one_response(s: &mut (impl AsyncReadExt + Unpin)) -> Option<u16> {
-    let mut raw = Vec::new();
-    let mut byte = [0u8; 1];
-    while !raw.ends_with(b"\r\n\r\n") {
-        match s.read(&mut byte).await {
-            Ok(1) => raw.push(byte[0]),
-            _ => return None,
-        }
-    }
-    let head = String::from_utf8_lossy(&raw).to_ascii_lowercase();
-    let status = head.split_whitespace().nth(1)?.parse().ok()?;
-    if let Some(len) = head
-        .lines()
-        .find_map(|l| l.strip_prefix("content-length:"))
-        .and_then(|n| n.trim().parse::<usize>().ok())
-    {
-        let mut body = vec![0u8; len];
-        s.read_exact(&mut body).await.ok()?;
-    } else if head.contains("transfer-encoding: chunked") {
-        let mut tail = Vec::new();
-        while !tail.ends_with(b"0\r\n\r\n") {
-            match s.read(&mut byte).await {
-                Ok(1) => tail.push(byte[0]),
-                _ => return None,
-            }
-        }
-    }
-    Some(status)
+/// A second Linux host linked to the same Mac, with the project `app`. It has no SSH to the
+/// first, and needs none.
+struct Edge {
+    core: Arc<Core>,
+    _world: Golden,
+    _server: TestServer,
+    _mcp: tokio::task::JoinHandle<()>,
 }
 
+impl World {
+    async fn add_edge(&self) -> Edge {
+        let world = Golden::new();
+        let (core, server, mcp) =
+            open_host_at(&world, free_port(), &self.wires, "me@edge.example.com").await;
+        let added = rpc(
+            &self.mac,
+            "hosts.add",
+            json!({"name": "edge", "address": "me@edge.example.com"}),
+        )
+        .await;
+        assert!(added.get("result").is_some(), "{added}");
+        for _ in 0..500 {
+            let up = self
+                .mac
+                .hosts()
+                .unwrap()
+                .hosts
+                .iter()
+                .any(|h| h.name == "edge" && h.link == HostLink::Connected);
+            if up {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let path = world.home.join("src/app");
+        let project = rpc(
+            &self.mac,
+            "projects.add",
+            json!({"host": "edge", "path": path}),
+        )
+        .await;
+        assert!(project.get("result").is_some(), "{project}");
+        Edge {
+            core,
+            _world: world,
+            _server: server,
+            _mcp: mcp,
+        }
+    }
+}
+
+/// One line down the tunnel, as what's on the host sends it, and the answer.
+async fn down_the_tunnel(end: &Path, method: &str, key: &str, params: Value) -> Value {
+    let stream = UnixStream::connect(end).await.unwrap();
+    let (read, mut write) = stream.into_split();
+    let line = json!({"jsonrpc": "2.0", "id": 1, "method": "tunnel.call",
+                      "params": {"key": key, "method": method, "params": params}});
+    write
+        .write_all(format!("{line}\n").as_bytes())
+        .await
+        .unwrap();
+    let mut read = BufReader::new(read.reunite(write).unwrap());
+    loop {
+        let answer = answer_from(&mut read).await;
+        if answer.get("id").is_some() {
+            return answer;
+        }
+    }
+}
+
+/// #143, as Lee has it: one MCP on one Linux host reaches every host in the Mac's hub while
+/// the Mac is there, its own, the Mac's and another host's, through the Mac alone. With the
+/// Mac away, what went through it is unavailable and says so, and the host's own goes on.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn turning_it_off_cuts_connections_already_open() {
-    let w = world(limits()).await;
+async fn one_ingress_reaches_every_host_in_the_macs_hub() {
+    let w = world().await;
+    let edge = w.add_edge().await;
     w.turn_on().await;
     let key = w.key("laptop");
     w.pushed(&key).await;
-    // A client with a key keeps its connection open between calls.
-    let tcp = TcpStream::connect(w.public).await.unwrap();
-    let mut s = tls(&w.cert, b"http/1.1")
-        .connect(ServerName::try_from(DOMAIN).unwrap(), tcp)
-        .await
-        .unwrap();
-    let request = |id: u32| {
-        let body =
-            json!({"jsonrpc": "2.0", "id": id, "method": "tools/list", "params": {}}).to_string();
-        format!(
-            "POST /mcp HTTP/1.1\r\nHost: {DOMAIN}\r\nContent-Type: application/json\r\n\
-             Accept: application/json, text/event-stream\r\nMCP-Protocol-Version: 2025-06-18\r\n\
-             Authorization: Bearer {key}\r\nContent-Length: {}\r\n\r\n{body}",
-            body.len()
-        )
-    };
-    s.write_all(request(1).as_bytes()).await.unwrap();
-    assert_eq!(one_response(&mut s).await, Some(200));
-    s.write_all(request(2).as_bytes()).await.unwrap();
-    assert_eq!(one_response(&mut s).await, Some(200), "kept alive");
-    // Off: that connection ends too, not only the listener.
-    let off = rpc(
-        &w.mac,
-        "hosts.external",
-        json!({"host": "vps", "on": false}),
+    for _ in 0..500 {
+        if edge.core.verify_key(&key).unwrap().is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    w.mac_reachable(&key).await;
+    let mut c = w.client(&key);
+
+    // All three, by what they go by here; never this host under the Mac's name for it.
+    let projects = c.call("vibe_list_projects", json!({})).await;
+    assert!(projects.contains("app (on local)"), "{projects}");
+    assert!(projects.contains("app (on mac)"), "{projects}");
+    assert!(projects.contains("app (on edge)"), "{projects}");
+    assert!(!projects.contains("(on vps)"), "{projects}");
+
+    // An agent on each, started and talked to here.
+    for (host, profile, name, shown) in [
+        ("local", "software-eng-linux", "on-vps", "on-vps"),
+        ("mac", "software-eng-mac", "on-mac", "mac:on-mac"),
+        ("edge", "software-eng-linux", "on-edge", "edge:on-edge"),
+    ] {
+        let started = c
+            .call(
+                "vibe_start_agent",
+                json!({"project": "app", "profile": profile, "prompt": "talk", "host": host,
+                       "name": name}),
+            )
+            .await;
+        assert!(started.contains(&format!("started {shown}")), "{started}");
+        c.call("vibe_wait", json!({"agents": shown, "timeout": 60}))
+            .await;
+        let line = format!("hello to {shown}");
+        c.call("vibe_send", json!({"agent": shown, "text": line}))
+            .await;
+        c.call("vibe_wait", json!({"agents": shown, "timeout": 60}))
+            .await;
+        let read = c
+            .call("vibe_read_messages", json!({"agent": shown, "last": 2}))
+            .await;
+        assert!(read.contains(&line), "{shown}: {read}");
+    }
+    // It's the other host's own agent, on that host, with no SSH from this one.
+    let on_edge = edge.core.agents(Default::default()).await.unwrap();
+    assert!(on_edge.agents.iter().any(|a| a.agent == "on-edge"));
+    // A bare ref finds it too.
+    let read = c
+        .call("vibe_read_messages", json!({"agent": "on-edge", "last": 1}))
+        .await;
+    assert!(!read.contains("unavailable"), "{read}");
+    let listed = w.listing_the_mac_answered(&mut c).await;
+    for shown in ["on-vps", "mac:on-mac", "edge:on-edge"] {
+        assert!(listed.contains(shown), "{shown}: {listed}");
+    }
+
+    // The tunnel itself: nothing of what's linked for want of a key, never the host asking,
+    // and no addresses.
+    let end = w.tunnel_end();
+    let refused = down_the_tunnel(&end, "hosts.list", "vk_wrong", json!({})).await;
+    assert_eq!(
+        refused["error"]["code"],
+        ErrorCode::Unauthorized.code(),
+        "{refused}"
+    );
+    let rows = down_the_tunnel(&end, "hosts.list", &key, json!({})).await;
+    let names: Vec<&str> = rows["result"]["hosts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["local", "edge"], "{rows}");
+    assert!(!rows.to_string().contains("example.com"), "{rows}");
+    // Nor in what's said of its agents: the line attaches on that host, wherever it is.
+    let agents = down_the_tunnel(&end, "agents.list", &key, json!({"host": "edge"})).await;
+    assert!(!agents.to_string().contains("example.com"), "{agents}");
+    assert_eq!(
+        agents["result"]["agents"][0]["attach"], "on edge: vibe attach on-edge",
+        "{agents}"
+    );
+    let checked = down_the_tunnel(
+        &end,
+        "agents.check",
+        &key,
+        json!({"host": "edge", "agent": "on-edge"}),
     )
     .await;
-    assert_eq!(off["result"]["external"], false, "{off}");
-    let _ = s.write_all(request(3).as_bytes()).await;
-    let after = tokio::time::timeout(Duration::from_secs(10), one_response(&mut s))
-        .await
-        .expect("the connection should be closed, not left hanging");
-    assert_eq!(after, None, "a call went through after it was turned off");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_refusal_closes_the_connection_and_keeps_no_body() {
-    let w = world(limits()).await;
-    w.turn_on().await;
-    let tcp = TcpStream::connect(w.public).await.unwrap();
-    let mut s = tls(&w.cert, b"http/1.1")
-        .connect(ServerName::try_from(DOMAIN).unwrap(), tcp)
-        .await
-        .unwrap();
-    // A large body without a key: refused, and the connection closes.
-    let body = format!("[{}{{}}]", "{\"a\":0},".repeat(300_000));
-    let head = format!(
-        "POST /mcp HTTP/1.1\r\nHost: {DOMAIN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-        body.len()
+    assert!(!checked.to_string().contains("example.com"), "{checked}");
+    let listed = c.call("vibe_list_agents", json!({})).await;
+    assert!(!listed.contains("example.com"), "{listed}");
+    assert!(
+        listed.contains("attach: on edge: vibe attach on-edge"),
+        "{listed}"
     );
-    s.write_all(head.as_bytes()).await.unwrap();
-    s.write_all(body.as_bytes()).await.unwrap();
-    assert_eq!(one_response(&mut s).await, Some(401));
-    assert_eq!(one_response(&mut s).await, None, "closed after the refusal");
-}
+    let back = down_the_tunnel(&end, "agents.list", &key, json!({"host": "vps"})).await;
+    assert_eq!(
+        back["error"]["code"],
+        ErrorCode::InvalidParams.code(),
+        "{back}"
+    );
+    let no_such = down_the_tunnel(&end, "agents.list", &key, json!({"host": "nope"})).await;
+    assert_eq!(
+        no_such["error"]["code"],
+        ErrorCode::InvalidParams.code(),
+        "{no_such}"
+    );
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_challenge_handshake_gets_the_challenge_and_nothing_else() {
-    let w = world(limits()).await;
-    w.turn_on().await;
-    // A client asking for acme-tls/1 isn't Let's Encrypt here (there's no
-    // challenge pending), so it gets no certificate at all.
-    let tcp = TcpStream::connect(w.public).await.unwrap();
-    let name = ServerName::try_from(DOMAIN).unwrap();
-    let r = tls(&w.cert, vibe_mcp::public::ACME_TLS_ALPN)
-        .connect(name, tcp)
+    // A key of the host's own stays on the host: the Mac doesn't take it, so it hears of no
+    // other host, and can start nothing there.
+    let own = w
+        .host
+        .create_key(KeyCreateParams {
+            name: "host-own".into(),
+        })
+        .unwrap()
+        .secret;
+    let mut only_here = w.client(&own);
+    let projects = only_here.call("vibe_list_projects", json!({})).await;
+    assert!(!projects.contains("(on edge)"), "{projects}");
+    let refused = only_here
+        .fails(
+            "vibe_start_agent",
+            json!({"project": "app", "profile": "software-eng-linux", "prompt": "talk",
+                   "host": "edge", "name": "nope"}),
+        )
         .await;
-    assert!(r.is_err(), "a handshake with no challenge pending");
-    // Another name gets nothing either.
-    let tcp = TcpStream::connect(w.public).await.unwrap();
-    let r = tls(&w.cert, b"http/1.1")
-        .connect(ServerName::try_from("other.test").unwrap(), tcp)
-        .await;
-    assert!(r.is_err());
-}
-
-/// #74: port 443 with nothing run by hand. A kernel that keeps the port from `vibed`
-/// is got round by the root-owned helper; these use the real helper, on a port of
-/// the test's, with the kernel's refusal stood in for.
-#[cfg(target_os = "linux")]
-mod port_443 {
-    use super::*;
-    use std::fs;
-    use std::os::unix::fs::PermissionsExt;
-    use vibe_core::model::AdminNeed;
-    use vibe_core::rpc::HostNameParams;
-
-    /// `sudo` for these, in a directory first on a `PATH`.
-    fn sudo(dir: &std::path::Path, body: &str) -> std::ffi::OsString {
-        let script = dir.join("sudo");
-        fs::write(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
-        format!("{}:/usr/bin:/bin", dir.display()).into()
-    }
-
-    async fn served(w: &World) -> u16 {
-        w.client("vk_wrong")
-            .request("tools/list", json!({}))
+    assert!(refused.contains("edge"), "{refused}");
+    assert!(
+        !edge
+            .core
+            .agents(Default::default())
             .await
-            .status
-    }
-
-    #[tokio::test]
-    async fn a_helper_in_place_serves_the_port_with_nobody_asked() {
-        let helper = common::workspace_bin("vibe-bind");
-        let w = world_external(Limits::default(), quick(), |e| {
-            e.deny_direct = true;
-            e.listen = None;
-            e.bind_helper = helper;
-        })
-        .await;
-        w.turn_on().await;
-        w.wait("nothing wrong", |h| {
-            h.external_detail.is_none() && h.needs_admin.is_empty()
-        })
-        .await;
-        assert_eq!(served(&w).await, 401);
-    }
-
-    #[tokio::test]
-    async fn passwordless_sudo_puts_it_in_place_with_nobody_asked() {
-        let tmp = tempfile::tempdir().unwrap();
-        let installed = tmp.path().join("lib/vibe-bind-1");
-        let log = tmp.path().join("sudo-log");
-        // As `sudo -n sh -c <grant> sh <source> <group> <sum> <helper>` does, but as
-        // this user: only ever asked with `-n`, and holding it to nothing.
-        let path = sudo(
-            tmp.path(),
-            &format!(
-                "echo \"$1 $2\" >> {log}\n[ \"$1\" = -n ] || exit 9\nshift\ncase \"$5\" in *vibe-bind*) \
-                 mkdir -p \"$(dirname \"$8\")\" && cp \"$5\" \"$8\" ;; esac\nexit 0",
-                log = log.display()
-            ),
-        );
-        let (source, target) = (common::workspace_bin("vibe-bind"), installed.clone());
-        let w = world_external(Limits::default(), quick(), |e| {
-            e.deny_direct = true;
-            e.listen = None;
-            e.bind_helper = target;
-            e.bind_source = Some(source);
-            e.bind_path = Some(path);
-        })
-        .await;
-        w.turn_on().await;
-        w.wait("nothing wrong", |h| {
-            h.external_detail.is_none() && h.needs_admin.is_empty()
-        })
-        .await;
-        assert!(installed.is_file());
-        assert_eq!(served(&w).await, 401);
-    }
-
-    #[tokio::test]
-    async fn refused_everywhere_it_takes_one_button_and_then_just_works() {
-        let tmp = tempfile::tempdir().unwrap();
-        let installed = tmp.path().join("lib/vibe-bind-1");
-        let log = tmp.path().join("sudo-log");
-        let path = sudo(
-            tmp.path(),
-            &format!(
-                "printf '%s\\n' \"$1\" >> {log}\necho 'sudo: a password is required' >&2\nexit 1",
-                log = log.display()
-            ),
-        );
-        let (source, target) = (common::workspace_bin("vibe-bind"), installed.clone());
-        let helper = source.clone();
-        let w = world_external(Limits::default(), quick(), |e| {
-            e.deny_direct = true;
-            e.listen = None;
-            e.bind_helper = target;
-            e.bind_source = Some(source);
-            e.bind_path = Some(path);
-        })
-        .await;
-        w.ask_for_it().await;
-        w.wait("the need to reach the Mac", |h| {
-            h.needs_admin == [AdminNeed::Port443]
-        })
-        .await;
-        let detail = w.vps().external_detail.unwrap();
-        assert!(detail.contains("Allow…"), "{detail}");
-        assert!(!detail.contains("sysctl"), "{detail}");
-        // A button, from what the Mac knows.
-        let line = w
-            .mac
-            .host_admin(HostNameParams { host: "vps".into() })
             .unwrap()
-            .command;
-        assert!(line.contains("ssh -t me@vps.example.com"), "{line}");
-        assert!(line.ends_with(" | base64 -d | sh'"), "{line}");
-        // sudo was tried once, however long it's been waiting, and a refusal is no
-        // reason to try the wider way.
-        tokio::time::sleep(Duration::from_secs(6)).await;
-        let tries = fs::read_to_string(&log).unwrap();
-        assert_eq!(tries.lines().collect::<Vec<_>>(), ["-n"], "{tries}");
+            .agents
+            .iter()
+            .any(|a| a.agent == "nope")
+    );
 
-        // The button's been pressed: it's in place. Nobody else does anything.
-        fs::create_dir_all(installed.parent().unwrap()).unwrap();
-        fs::copy(helper, &installed).unwrap();
-        w.wait("the port", |h| {
-            h.external_detail.is_none() && h.needs_admin.is_empty()
-        })
+    // The Mac goes to sleep: what's through it is unavailable, never claimed; the host's own
+    // answers, and new work can start on it.
+    w.wires.freeze(true);
+    w.tunnel_down().await;
+    let listed = c.call("vibe_list_agents", json!({})).await;
+    let row = |listed: &str, shown: &str| {
+        listed
+            .lines()
+            .find(|l| l.starts_with(shown))
+            .unwrap_or_else(|| panic!("no {shown} in {listed}"))
+            .to_owned()
+    };
+    assert!(!row(&listed, "on-vps").contains("unavailable"), "{listed}");
+    assert!(
+        row(&listed, "mac:on-mac").contains("unavailable"),
+        "{listed}"
+    );
+    assert!(
+        row(&listed, "edge:on-edge").contains("unavailable"),
+        "{listed}"
+    );
+    let read = c
+        .call("vibe_read_messages", json!({"agent": "on-vps", "last": 1}))
         .await;
-        assert_eq!(served(&w).await, 401);
+    assert!(read.contains("on-vps"), "{read}");
+    let refused = c
+        .fails(
+            "vibe_start_agent",
+            json!({"project": "app", "profile": "software-eng-linux", "prompt": "talk",
+                   "host": "edge", "name": "while-away"}),
+        )
+        .await;
+    assert!(refused.contains("unavailable"), "{refused}");
+    let started = c
+        .call(
+            "vibe_start_agent",
+            json!({"project": "app", "profile": "software-eng-linux", "prompt": "talk",
+                   "host": "local", "name": "while-away"}),
+        )
+        .await;
+    assert!(started.contains("started while-away"), "{started}");
+
+    // It's back, with nothing done, and it all merges again.
+    w.thaw().await;
+    let listed = w.listing_the_mac_answered(&mut c).await;
+    for shown in ["on-vps", "while-away", "mac:on-mac", "edge:on-edge"] {
+        assert!(listed.contains(shown), "{shown}: {listed}");
     }
+    c.call(
+        "vibe_read_messages",
+        json!({"agent": "edge:on-edge", "last": 1}),
+    )
+    .await;
 
-    #[tokio::test]
-    async fn another_program_on_the_port_is_no_use_of_the_button() {
-        let holder = std::net::TcpListener::bind(("::", 0))
-            .or_else(|_| std::net::TcpListener::bind(("0.0.0.0", 0)))
-            .unwrap();
-        let port = holder.local_addr().unwrap().port();
-        // No helper yet, and the kernel refusing as it does a port that's taken: it
-        // still isn't sudo's to help, and sudo isn't asked.
-        let tmp = tempfile::tempdir().unwrap();
-        let log = tmp.path().join("sudo-log");
-        let path = sudo(
-            tmp.path(),
-            &format!("printf x >> {}\nexit 1", log.display()),
-        );
-        let (nowhere, source) = (
-            tmp.path().join("no-helper"),
-            common::workspace_bin("vibe-bind"),
-        );
-        let w = world_external(Limits::default(), quick(), |e| {
-            e.deny_direct = true;
-            e.listen = None;
-            e.port = port;
-            e.bind_helper = nowhere;
-            e.bind_source = Some(source);
-            e.bind_path = Some(path);
+    // A revoke on the Mac reaches all of it.
+    for agent in ["on-vps", "while-away", "mac:on-mac", "edge:on-edge"] {
+        c.call("vibe_delete_agent", json!({"agent": agent, "force": true}))
+            .await;
+    }
+    w.mac
+        .revoke_key(KeyParams {
+            name: "laptop".into(),
         })
+        .unwrap();
+    let refused = down_the_tunnel(&end, "hosts.list", &key, json!({})).await;
+    assert_eq!(
+        refused["error"]["code"],
+        ErrorCode::Unauthorized.code(),
+        "{refused}"
+    );
+}
+
+/// A Linux host no Mac has opened a tunnel to has no `mac` to speak of, and says nothing's
+/// unavailable, however it's reached. Loopback serves it all the same, with a key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_with_no_mac_only_has_itself() {
+    let wires = Wires::new();
+    let world = Golden::new();
+    let port = free_port();
+    let (host, _server, _mcp) = open_host(&world, port, &wires).await;
+    let key = host
+        .create_key(KeyCreateParams { name: "own".into() })
+        .unwrap()
+        .secret;
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    for _ in 0..500 {
+        if TcpStream::connect(addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let mut c = Client {
+        addr,
+        key: Some(key),
+        next: 0,
+    };
+    let projects = c.call("vibe_list_projects", json!({})).await;
+    assert!(!projects.contains("mac"), "{projects}");
+    assert!(!projects.contains("unavailable"), "{projects}");
+    assert_eq!(host.hosts().unwrap().hosts[0].tunnel, None);
+    let mut nobody = Client {
+        addr,
+        key: None,
+        next: 0,
+    };
+    assert_eq!(nobody.request("tools/list", json!({})).await.status, 401);
+}
+
+/// Another host's link cut, with the Mac there: its agents are unavailable through this MCP,
+/// not as the Mac last kept them and called fine, and nothing says where it is. The Mac and
+/// this host's own are untouched, and it merges back with the link.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_the_mac_cant_reach_is_unavailable_with_the_mac_there() {
+    let w = world().await;
+    let edge = w.add_edge().await;
+    w.turn_on().await;
+    let key = w.key("laptop");
+    w.pushed(&key).await;
+    for _ in 0..500 {
+        if edge.core.verify_key(&key).unwrap().is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    w.mac_reachable(&key).await;
+    let mut c = w.client(&key);
+    for (host, profile, name, shown) in [
+        ("local", "software-eng-linux", "on-vps", "on-vps"),
+        ("mac", "software-eng-mac", "on-mac", "mac:on-mac"),
+        ("edge", "software-eng-linux", "on-edge", "edge:on-edge"),
+    ] {
+        let started = c
+            .call(
+                "vibe_start_agent",
+                json!({"project": "app", "profile": profile, "prompt": "talk", "host": host,
+                       "name": name}),
+            )
+            .await;
+        assert!(started.contains(&format!("started {shown}")), "{started}");
+    }
+    let row = |listed: &str, shown: &str| {
+        listed
+            .lines()
+            .find(|l| l.starts_with(shown))
+            .unwrap_or_else(|| panic!("no {shown} in {listed}"))
+            .to_owned()
+    };
+    // A listing with all of it there, for what's kept of each.
+    let listed = w.listing_the_mac_answered(&mut c).await;
+    assert!(
+        !row(&listed, "edge:on-edge").contains("unavailable"),
+        "{listed}"
+    );
+
+    // Only edge's link goes: its address no longer dials, and what's on it ends. Nothing
+    // else's does, and sshd holds the tunnels.
+    let address = "me@edge.example.com";
+    w.wires.cut_off(address, true);
+    let link_is = |name: &str, want: HostLink| {
+        w.mac
+            .hosts()
+            .unwrap()
+            .hosts
+            .iter()
+            .any(|h| h.name == name && h.link == want)
+    };
+    for _ in 0..500 {
+        if link_is("edge", HostLink::Down) && link_is("vps", HostLink::Connected) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(link_is("edge", HostLink::Down), "{:?}", w.mac.hosts());
+    assert!(w.host.hosts().unwrap().hosts[0].tunnel == Some(TunnelState::Up));
+
+    // Through the tunnel it says so, whatever the Mac has kept, and not where it was.
+    let end = w.tunnel_end();
+    let asked = down_the_tunnel(&end, "agents.list", &key, json!({"host": "edge"})).await;
+    assert_eq!(
+        asked["error"]["code"],
+        ErrorCode::HostUnavailable.code(),
+        "{asked}"
+    );
+    assert!(!asked.to_string().contains("example.com"), "{asked}");
+
+    // So here it's as last seen, and unavailable; what's there is as it was.
+    let listed = c.call("vibe_list_agents", json!({})).await;
+    assert!(
+        row(&listed, "edge:on-edge").contains("unavailable"),
+        "{listed}"
+    );
+    assert!(
+        !row(&listed, "mac:on-mac").contains("unavailable"),
+        "{listed}"
+    );
+    assert!(!row(&listed, "on-vps").contains("unavailable"), "{listed}");
+    assert!(!listed.contains("example.com"), "{listed}");
+    // A call for it fails, and says nothing of where it is either.
+    let refused = c
+        .fails(
+            "vibe_read_messages",
+            json!({"agent": "edge:on-edge", "last": 1}),
+        )
         .await;
-        w.ask_for_it().await;
-        w.wait("what's wrong", |h| {
-            h.external_detail
-                .as_deref()
-                .is_some_and(|d| d.contains("another program"))
-        })
-        .await;
-        assert_eq!(w.vps().needs_admin, []);
-        assert!(!log.exists(), "sudo was asked");
+    assert!(refused.contains("unavailable"), "{refused}");
+    assert!(!refused.contains("example.com"), "{refused}");
+    let checked = down_the_tunnel(
+        &end,
+        "agents.check",
+        &key,
+        json!({"host": "edge", "agent": "on-edge"}),
+    )
+    .await;
+    assert!(!checked.to_string().contains("example.com"), "{checked}");
+
+    // Its link's back, and so is it.
+    w.wires.cut_off(address, false);
+    let mut back = false;
+    for _ in 0..300 {
+        let listed = c.call("vibe_list_agents", json!({})).await;
+        if !row(&listed, "edge:on-edge").contains("unavailable") {
+            back = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(back, "edge never came back");
+    for agent in ["on-vps", "mac:on-mac", "edge:on-edge"] {
+        c.call("vibe_delete_agent", json!({"agent": agent, "force": true}))
+            .await;
     }
 }

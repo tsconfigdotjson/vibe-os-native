@@ -57,16 +57,6 @@ enum Metrics {
     static let rowRadius: CGFloat = 7
 }
 
-extension ExternalStatus.Tone {
-    var color: Color {
-        switch self {
-        case .working: Palette.signal
-        case .pending: .secondary
-        case .trouble: Palette.attention
-        }
-    }
-}
-
 /// An animation, or none under Reduce Motion.
 func motion(_ animation: Animation, reduce: Bool) -> Animation? {
     reduce ? nil : animation
