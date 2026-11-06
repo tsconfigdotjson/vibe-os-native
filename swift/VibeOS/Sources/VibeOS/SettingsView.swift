@@ -982,6 +982,8 @@ struct NewKeySheet: View {
                 appeared = true
             }
         }
+        // A host's tailnet name, for its line, however long it takes to say.
+        .task { await model.refreshHostServes() }
     }
 
     /// The setup lines a client can use (PRD: MCP interface, Auth): this
@@ -998,6 +1000,12 @@ struct NewKeySheet: View {
                 KeySetup(
                     title: "Tailscale", command: MCPSetup.command(secret: secret, url: tailscale),
                     help: "Sets up a client on your tailnet, at \(tailscale)"))
+        }
+        for (host, url) in model.hostServeURLs {
+            setups.append(
+                KeySetup(
+                    title: "\(host) over Tailscale", command: MCPSetup.command(secret: secret, url: url),
+                    help: "Sets up a client on your tailnet, through \(host), at \(url)"))
         }
         return setups
     }
@@ -1114,6 +1122,9 @@ struct HostsPane: View {
                             show(WindowID.signIn, with: openWindow)
                         },
                         remove: { Task { await remove(host.name) } })
+                    if host.link != .local, host.os == "linux" {
+                        HostServeRow(model: model, host: host)
+                    }
                 }
                 Button("Add Linux Host…") { show(WindowID.addHost, with: openWindow) }
             } header: {
@@ -1304,12 +1315,98 @@ struct HostRow: View {
     }
 }
 
+/// A Linux host's MCP on its tailnet name: its toggle, and its URL while it's on. vibed there
+/// runs `tailscale`, which the owner has installed and logged in to, and only touches `/mcp`.
+struct HostServeRow: View {
+    @ObservedObject var model: MenuModel
+    let host: HostInfo
+    @State private var working = false
+    @State private var error: String?
+    /// Tailscale's page for turning HTTPS on, if that's what's wrong.
+    @State private var enableURL: URL?
+
+    private var serve: McpServe? { model.hostServes[host.name] }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if let serve {
+                HStack(spacing: 8) {
+                    Toggle(
+                        "Serve MCP on \(host.name)'s Tailscale name",
+                        isOn: Binding(get: { serve.on }, set: { on in Task { await set(on) } })
+                    )
+                    .disabled(working || host.link != .connected || !serve.available)
+                    if working { Working(text: "Asking Tailscale…") }
+                }
+                if let url = serve.url {
+                    LabeledContent("Tailscale") {
+                        HStack(spacing: 8) {
+                            Text(url).font(.callout.monospaced()).textSelection(.enabled)
+                            CopyButton(title: "Copy", text: url).labelStyle(.iconOnly).buttonStyle(.borderless)
+                        }
+                    }
+                }
+                if let note = serve.note {
+                    Text(note)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            ErrorText(error: error)
+            if let enableURL {
+                Link("Open Tailscale's Page", destination: enableURL)
+                    .font(.callout)
+                    .help(enableURL.absoluteString)
+            }
+        }
+        .task(id: "\(host.name)#\(host.link)#\(model.settingsRevision)") { await load() }
+    }
+
+    /// How it stands now. What a change last said stays until the next change: this runs
+    /// again right after one fails, as the host's event comes in.
+    private func load() async {
+        guard host.link == .connected else { return }
+        do {
+            try await model.loadHostServe(host.name)
+        } catch VibedClientError.rpc(let refused) where refused.code == RPCErrorCode.methodNotFound.rawValue {
+            self.error = "Update vibed on \(host.name) to serve its MCP over Tailscale from here."
+        } catch {
+            // It says what it last said until it answers. Its link says why.
+        }
+    }
+
+    private func set(_ on: Bool) async {
+        if !on {
+            guard
+                confirm(
+                    "Stop serving MCP on \(host.name)'s Tailscale name?",
+                    detail: "Clients using its Tailscale URL stop reaching it. This takes only /mcp off Tailscale Serve, "
+                        + "and leaves anything else it serves.",
+                    action: "Turn Off")
+            else { return }
+        }
+        working = true
+        defer { working = false }
+        error = nil
+        enableURL = nil
+        do {
+            try await model.setHostServe(host.name, on: on)
+        } catch {
+            self.error = describe(error)
+            enableURL = tailscaleEnableURL(from: error)
+        }
+    }
+}
+
 /// What a Linux host needs sudo for, in a line.
 private func adminNeedsText(_ needs: [AdminNeed], host: String) -> String {
     let what = needs.map { need -> String in
         switch need {
         case .linger: "keep VibeOS running while you're logged out"
         case .git: "install git, which its agents need"
+        case .tailscaleOperator: "let VibeOS change what Tailscale serves, then try its toggle again"
         }
     }
     return "\(host) needs your password once to \(what.joined(separator: " and "))"

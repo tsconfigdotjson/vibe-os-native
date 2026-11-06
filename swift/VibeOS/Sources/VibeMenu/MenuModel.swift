@@ -54,6 +54,9 @@ public final class MenuModel: ObservableObject {
     @Published public private(set) var toolboxCloseError: String?
     /// Where this host serves MCP, for the setup command and Settings.
     @Published public private(set) var mcp: McpSettings?
+    /// How each Linux host's MCP stands on its tailnet name, by host, as last asked. It runs
+    /// `tailscale` there, so it's asked for where it's shown, not with every poll.
+    @Published public private(set) var hostServes: [String: McpServe] = [:]
     @Published public private(set) var memory: HostMemory?
     /// Whether events are coming in; without them only the poll updates
     /// the menu.
@@ -418,6 +421,39 @@ public final class MenuModel: ObservableObject {
     /// does.
     public func setMCPTailscale(_ on: Bool) async throws {
         mcp = try await call(McpSet.self, McpSetParams(tailscale: on))
+    }
+
+    /// How long a call about a host's tailnet name may wait: its commands, over its link.
+    public nonisolated static let hostServeTimeout: TimeInterval = 150
+
+    /// Asks `host` how its MCP stands on its tailnet name.
+    public func loadHostServe(_ host: String) async throws {
+        let serve = try await call(McpServeGet.self, HostParams(host: host), timeout: Self.hostServeTimeout)
+        set(\.hostServes, hostServes.merging([host: serve]) { $1 })
+    }
+
+    /// Asks each connected Linux host, for the setup lines. One that doesn't answer keeps
+    /// what it last said.
+    public func refreshHostServes() async {
+        for host in hosts where host.link == .connected && host.os == "linux" {
+            try? await loadHostServe(host.name)
+        }
+    }
+
+    /// The toggle in Settings → Hosts: a Linux host's MCP on its tailnet name, or not.
+    public func setHostServe(_ host: String, on: Bool) async throws {
+        let serve = try await call(
+            McpServeSet.self, McpServeSetParams(host: host, on: on), timeout: Self.hostServeTimeout)
+        set(\.hostServes, hostServes.merging([host: serve]) { $1 })
+    }
+
+    /// The setup lines for hosts with MCP on their tailnet names: a key made here is pushed
+    /// to them, so it works there too.
+    public var hostServeURLs: [(host: String, url: String)] {
+        hosts.compactMap { host in
+            guard host.link != .local, let url = hostServes[host.name]?.url else { return nil }
+            return (host.name, url)
+        }
     }
 
     // MARK: Linux hosts

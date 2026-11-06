@@ -1,0 +1,33 @@
+{
+  "description": "The toggle on: `mcp_tailscale` is written and `/mcp` on Serve is checked. It's this host's already, so Serve isn't written to. Otherwise `tailscale serve --bg --https=443 --set-path=/mcp http://<tailscale-ip>:<mcp_port>/mcp` runs, and what it did is read back. Where a `/mcp` isn't this host's it stops with `conflict`, changing nothing, and so it does with Funnel on that name.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 9962,
+    "method": "mcp.serve.set",
+    "params": {
+      "host": "local",
+      "on": true
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 9962,
+    "result": {
+      "available": true,
+      "on": true,
+      "url": "https://vps.tailnet-example.ts.net/mcp"
+    }
+  },
+  "events": [
+    {
+      "jsonrpc": "2.0",
+      "method": "events.event",
+      "params": {
+        "at": "2026-10-30T12:00:00Z",
+        "host": "local",
+        "kind": "mcp.changed",
+        "seq": 45
+      }
+    }
+  ]
+}

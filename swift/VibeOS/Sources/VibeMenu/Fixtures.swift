@@ -112,6 +112,15 @@ public final class FixtureDaemon: DaemonConnection, @unchecked Sendable {
                 "port": 7878, "tailscale": populated, "url": "http://127.0.0.1:7878/mcp",
                 "tailscale_urls": populated ? ["http://\(tailscaleAddress):7878/mcp"] : [String](),
             ]
+        case McpServeGet.name, McpServeSet.name:
+            // A Linux host's MCP on its tailnet name; a Mac has its own toggle.
+            guard host != VibeRPC.localHost else {
+                return ["on": false, "available": false, "note": "This is for a Linux host."]
+            }
+            let on = params["on"] as? Bool ?? populated
+            var serve: [String: Any] = ["on": on, "available": true]
+            if on { serve["url"] = "https://\(host).tailnet-example.ts.net/mcp" }
+            return serve
         case ProjectsList.name:
             return ["projects": setUp ? projects(on: host) : []]
         case KeysList.name:

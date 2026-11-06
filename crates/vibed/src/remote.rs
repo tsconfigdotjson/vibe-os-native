@@ -124,6 +124,9 @@ pub trait Remote: Send + Sync + fmt::Debug {
             let step = match need {
                 AdminNeed::Linger => "sudo loginctl enable-linger \"$(id -un)\"\n".to_owned(),
                 AdminNeed::Git => crate::tool_install::GIT_WITH_SUDO.replace("{sudo}", "sudo"),
+                AdminNeed::TailscaleOperator => {
+                    "sudo tailscale set --operator=\"$(id -un)\"\n".to_owned()
+                }
             };
             script.push_str(&format!(
                 "{{\n{step}}} || {{\n  echo \"VibeOS: that didn't work, for the reason above. Try \
@@ -1360,6 +1363,27 @@ mod tests {
             let out = child.wait_with_output().unwrap();
             assert_eq!(String::from_utf8(out.stdout).unwrap(), text);
         }
+    }
+
+    #[test]
+    fn the_tailscale_operator_line_sets_only_that() {
+        let ssh = Ssh {
+            program: "ssh".into(),
+            bundle: None,
+            shared: None,
+        };
+        let line = ssh.admin_line("me@vps", &[AdminNeed::TailscaleOperator]);
+        let (out, asked) = run_admin_line(&line, "exit 0");
+        assert!(out.status.success(), "{out:?}");
+        let me = String::from_utf8(
+            std::process::Command::new("id")
+                .arg("-un")
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        assert_eq!(asked, format!("tailscale set --operator={me}"));
     }
 
     #[test]

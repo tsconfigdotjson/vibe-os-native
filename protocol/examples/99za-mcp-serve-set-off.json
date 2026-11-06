@@ -1,0 +1,32 @@
+{
+  "description": "The toggle off: only `/mcp` comes off Serve (`tailscale serve --https=443 --set-path=/mcp off`), the rest of what it serves stays, and `mcp_tailscale` goes off.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 9963,
+    "method": "mcp.serve.set",
+    "params": {
+      "host": "local",
+      "on": false
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 9963,
+    "result": {
+      "available": true,
+      "on": false
+    }
+  },
+  "events": [
+    {
+      "jsonrpc": "2.0",
+      "method": "events.event",
+      "params": {
+        "at": "2026-10-30T12:00:00Z",
+        "host": "local",
+        "kind": "mcp.changed",
+        "seq": 46
+      }
+    }
+  ]
+}

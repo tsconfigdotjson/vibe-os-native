@@ -102,6 +102,13 @@ pub struct Config {
     /// Where MCP can be served on Tailscale: this machine's addresses in
     /// its ranges, by default.
     pub tailscale: TailscaleAddresses,
+    /// The `tailscale` that `/mcp` on Serve is set with (`mcp.serve.set`): on a Linux host.
+    /// None on a Mac, whose toggle is its Tailscale address, and so in the golden world, so
+    /// that no test reaches the machine's own Tailscale.
+    pub tailscale_cli: Option<OsString>,
+    /// How long one `tailscale` command may take, which it can take forever over: `serve`
+    /// waits for HTTPS to be turned on. A forwarded call has longer than a change's commands.
+    pub tailscale_wait: Duration,
     /// Whether a Mac's tunnel can end here: on a Linux host, and a stand-in for one in
     /// tests. [`Config::new`] says which by its OS. Nothing is served for it but the
     /// private socket sshd makes.
@@ -184,6 +191,8 @@ impl Config {
             pressure: Arc::new(crate::pressure::HostPressure),
             toolbox: None,
             tailscale: Arc::new(vibe_mcp::net::tailscale_addresses),
+            tailscale_cli: (info.os == "linux").then(|| "tailscale".into()),
+            tailscale_wait: Duration::from_secs(20),
             serves_mac_peer: info.os == "linux",
             mac_probe_every: Duration::from_secs(5),
             remote: Arc::new(Ssh::new().sharing_in(run_dir)),
@@ -498,6 +507,13 @@ pub struct Core {
     pub(crate) toolbox_op: tokio::sync::Mutex<()>,
     /// This machine's Tailscale addresses, for MCP.
     pub(crate) tailscale: TailscaleAddresses,
+    pub(crate) tailscale_cli: Option<OsString>,
+    pub(crate) tailscale_wait: Duration,
+    /// One change to `/mcp` on Serve at a time: each is a look, a command, and another look.
+    pub(crate) serve_lock: tokio::sync::Mutex<()>,
+    /// A change to Serve was refused until `sudo tailscale set --operator=<user>` allows it,
+    /// and none has worked since.
+    pub(crate) tailscale_needs_operator: std::sync::atomic::AtomicBool,
     /// Tells the MCP listeners to look at their settings again now.
     pub(crate) mcp_kick: Arc<tokio::sync::Notify>,
     /// Whether MCP is served on loopback now, for `hosts.list`.
@@ -694,6 +710,10 @@ impl Core {
             toolbox_state: Mutex::new(vibe_core::model::ToolboxState::Closed),
             toolbox_op: tokio::sync::Mutex::new(()),
             tailscale: config.tailscale,
+            tailscale_cli: config.tailscale_cli,
+            tailscale_wait: config.tailscale_wait,
+            serve_lock: tokio::sync::Mutex::new(()),
+            tailscale_needs_operator: std::sync::atomic::AtomicBool::new(false),
             mcp_kick: Arc::new(tokio::sync::Notify::new()),
             mcp_serving: AtomicBool::new(false),
             remote: config.remote,

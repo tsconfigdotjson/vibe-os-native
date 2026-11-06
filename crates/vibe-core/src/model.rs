@@ -423,8 +423,9 @@ names! {
     /// What a Linux host needs someone with `sudo` there to allow, once, because
     /// VibeOS tried every way it has without a password and none worked:
     /// `linger`, `vibed` staying up while the owner's logged out; `git`, which agents
-    /// can't do without and only a package manager can install.
-    AdminNeed { Linger = "linger", Git = "git" }
+    /// can't do without and only a package manager can install; `tailscale_operator`,
+    /// which lets the owner change what Tailscale serves, once a change was refused.
+    AdminNeed { Linger = "linger", Git = "git", TailscaleOperator = "tailscale_operator" }
 }
 
 names! {

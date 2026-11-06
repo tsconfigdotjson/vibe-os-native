@@ -1,0 +1,34 @@
+{
+  "description": "The owner turned MCP on the Tailscale address off, with `/mcp` still on Tailscale Serve, set up by hand earlier: what the next example finds.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 9960,
+    "method": "mcp.set",
+    "params": {
+      "host": "local",
+      "tailscale": false
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 9960,
+    "result": {
+      "port": 7878,
+      "tailscale": false,
+      "tailscale_urls": [],
+      "url": "http://127.0.0.1:7878/mcp"
+    }
+  },
+  "events": [
+    {
+      "jsonrpc": "2.0",
+      "method": "events.event",
+      "params": {
+        "at": "2026-10-30T12:00:00Z",
+        "host": "local",
+        "kind": "mcp.changed",
+        "seq": 44
+      }
+    }
+  ]
+}

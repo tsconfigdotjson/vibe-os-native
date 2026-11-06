@@ -34,11 +34,11 @@ and Settings → API Keys names any host that's behind.
 | Host | Always | Optional |
 | --- | --- | --- |
 | Mac | `127.0.0.1:7878` | Its Tailscale address, from Settings |
-| Linux host | `127.0.0.1:7878` | Its Tailscale address, from `host.toml` |
+| Linux host | `127.0.0.1:7878` | Its Tailscale address, and `https://<machine>.<tailnet>.ts.net/mcp` through Tailscale Serve, from Settings or by hand |
 
 The port is `mcp_port` in `~/.config/vibeos/host.toml`. These listeners never
 bind `0.0.0.0`, and the Tailscale option only ever binds addresses in Tailscale's
-ranges.
+ranges. Tailscale Serve is Tailscale's, and answers on your tailnet only.
 
 ## Ways to connect
 
@@ -91,19 +91,56 @@ If you want a laptop or another machine to reach MCP, we suggest
 - **On the Mac:** turn on **Settings → Hosts → Also serve MCP on this Mac's
   Tailscale address**, or **Turn On** in the welcome. Then use the Tailscale URL
   Settings shows, with an API key.
-- **On a Linux host:** set `mcp_tailscale = true` in its
-  `~/.config/vibeos/host.toml`. VibeOS picks the change up within seconds. This
-  is a file setting, as Settings only offers the toggle for the Mac. `vibe key
-  create` on the host prints the tailnet setup line once it's serving there.
+- **On a Linux host:** turn on **Settings → Hosts → Serve MCP on HOST's Tailscale
+  name**. You don't need SSH. Tailscale must already be installed and logged in on the
+  host. Settings then shows `https://<machine>.<tailnet>.ts.net/mcp` and adds it to the
+  **Copy Setup Command** menu when you make a key. `vibe key create` on the host prints it
+  too.
+
+### The Linux host toggle
+
+**Turning it on** sets `mcp_tailscale = true` on that host and runs this there:
+
+```sh
+tailscale serve --bg --https=443 --set-path=/mcp http://<tailscale-ip>:<mcp_port>/mcp
+```
+
+Serve must point at the Tailscale listener. Pointing it at `127.0.0.1` gets calls rejected,
+because the loopback listener only accepts loopback `Host` headers and Serve passes the
+`ts.net` name.
+
+**Turning it off** runs `tailscale serve --https=443 --set-path=/mcp off` and sets
+`mcp_tailscale = false`. Anything else you serve stays as it is.
+
+**When it stops and changes nothing:**
+
+| What Settings says | Why | What to do |
+| --- | --- | --- |
+| Tailscale already serves `/mcp` from something else | `/mcp` points anywhere but this host's listener, including `127.0.0.1` or a port it's no longer on. VibeOS won't overwrite it or remove it | If nothing needs it, run `tailscale serve --https=443 --set-path=/mcp off` on the host, then try again |
+| Funnel is on for that name | `/mcp` there would be on the public internet. VibeOS never turns Funnel on, and won't turn yours off | Turn Funnel off for that name yourself, then try again. `tailscale funnel status` on the host shows what it exposes |
+| Tailscale doesn't let you change what it serves | The host's user isn't Tailscale's operator | Choose **Allow…** on the host's row, or run `sudo tailscale set --operator=<user>` on the host. Then turn the toggle on again |
+| Your tailnet needs HTTPS turned on | HTTPS or Serve is off for your tailnet | Open the link Settings shows, which is Tailscale's own, turn it on, and try again |
+| Tailscale isn't installed, logged in or running | VibeOS leaves those to you | Set it up on the host. The toggle is unavailable until then |
+
+If Funnel is turned on later for a name that already serves `/mcp`, MCP is on the public
+internet behind its API keys. Settings warns you, and you can still turn the toggle off.
+
+**On a host with no Mac,** set it up by hand: set `mcp_tailscale = true` in
+`~/.config/vibeos/host.toml`, which VibeOS picks up within seconds, and run the
+`tailscale serve` line above. The toggle recognizes the result as on. With the file setting
+alone, MCP is at `http://<tailscale-ip>:<mcp_port>/mcp`, and `vibe key create` prints that line.
+
+### Reaching MCP over Tailscale
 
 What to expect:
 
-- VibeOS doesn't install, sign in to or configure Tailscale. Both machines need
-  it running and logged in to the same tailnet, and your tailnet's access rules
+- VibeOS doesn't install or sign in to Tailscale. The only thing it configures is the
+  `/mcp` path on a Linux host's Serve, when you turn that toggle on. Both machines need
+  Tailscale running and logged in to the same tailnet, and your tailnet's access rules
   must allow the port. `vibe doctor` reports whether this host has a Tailscale
   address, but not whether another machine can reach it.
-- The URL is plain HTTP inside your tailnet, which Tailscale encrypts. API keys
-  are still required.
+- A `http://<tailscale-ip>:…` URL is plain HTTP inside your tailnet, which Tailscale
+  encrypts. A `https://….ts.net/mcp` URL also has a certificate. API keys are required on both.
 - It only reaches your own tailnet. It isn't a way to open MCP to the internet.
 - Tailscale can't reach a Mac that's asleep or off. Its agents, and anything reached through
   it, are unavailable until it's back.
@@ -115,7 +152,8 @@ keeps answering for them:
 
 - From the server itself, use `http://127.0.0.1:7878/mcp` with an API key.
 - From elsewhere, use `ssh -t HOST vibe attach REF` for a terminal, or the host's
-  Tailscale address if you've turned it on.
+  Tailscale URL if you've turned it on. Serve and `mcp_tailscale` are both kept on the
+  host, so that URL doesn't depend on the Mac.
 - On the server, `vibe project`, `vibe profile` and `vibe key` replace the
   Settings screens.
 
