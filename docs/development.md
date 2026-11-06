@@ -12,7 +12,7 @@ How the repo is laid out, and how to build, check and release it.
 | `crates/vibe-core` | Domain types, the store, and the socket contract (`vibe_core::rpc`) |
 | `crates/vibe-cli` | The `vibe` command |
 | `crates/vibe-status` | The status engine (agent-tail) |
-| `crates/vibe-env` | Environment backends behind `Compartment`, `Limiter`, `Sleeper`: the `linux` VMs on a Mac (`vibe_env::linux`, driving `vibe-vm` and `vibe-guest`), with the images they boot (`vibe_env::images`) |
+| `crates/vibe-env` | Environment backends behind `Compartment`, `Limiter`, `Sleeper`: the `linux` VMs on a Mac (`vibe_env::linux`, driving `vibe-vm` and `vibe-guest`), with the images they boot (`vibe_env::images`); native agents under a governor in `macos` (`vibe_env::macos`); `linux` on a Linux host, in cgroups (`vibe_env::cgroups`); and a backend for tests (`vibe_env::testing`) |
 | `crates/vibe-shim` | Holds one agent's terminal |
 | `crates/vibe-guest` | PID 1 in each `linux` VM; a static `aarch64-unknown-linux-musl` binary. Its library is the protocol `vibed` and `vibe-shim` speak to it |
 | `crates/vibe-testguest` | PID 1 of the small test guest `vibe-vm` is tested with, and a stand-in for Claude in the one `vibe-guest` is; not shipped |
@@ -22,21 +22,24 @@ How the repo is laid out, and how to build, check and release it.
 | `swift/VibeOS` | `VibeOS.app`, the SwiftUI menu bar app, and `VibeRPC`, its socket client |
 | `swift/vibe-vm` | `vibe-vm`, the Virtualization.framework helper |
 | `protocol/` | The socket contract both sides are tested against, `vibe-vm`'s in `protocol/vibe-vm/` and `vibe-guest`'s in `protocol/vibe-guest/`; see the READMEs |
-| `scripts/` | `check-full.sh` runs every check; `advisories.sh` holds `Cargo.lock` to RustSec, by `deny.toml`'s rules; `sign-macos.sh` signs for local use; `test-guest.sh` builds the test guest; `base-image.sh` builds the Linux base image (with Docker); `vm-reboot-test.sh` checks a saved VM survives a reboot; `keep-host-state.sh` puts a real host back as it was after a test of it; `host-bundle.sh` builds the Linux `vibed` that Add Linux Host installs, with `zig-tools.sh` fetching what that takes on first use; `release-macos.sh` builds a release DMG; `sparkle.py` signs it for Sparkle and writes the appcast |
+| `scripts/` | `check-full.sh` runs every check; `advisories.sh` holds `Cargo.lock` to RustSec, by `deny.toml`'s rules; `sign-macos.sh` signs for local use; `test-guest.sh` builds the test guest; `base-image.sh` builds the Linux base image (with Docker); `vm-reboot-test.sh` checks a saved VM survives a reboot; `keep-host-state.sh` puts a real host back as it was after a test of it; `host-bundle.sh` builds the Linux `vibed` that Add Linux Host installs, with `zig-tools.sh` fetching what that takes on first use; `release-macos.sh` builds a release DMG; `sparkle.py` signs it for Sparkle and writes the appcast; `surfaces.sh` screenshots every surface of the app for design review; `app-icon.swift` renders the app icon from its SVG |
 
-Every crate builds on macOS and Linux (x86_64 and arm64); `vibe-guest` and
+Every crate compiles for macOS and Linux (x86_64 and arm64), which `check-full.sh`
+holds with `cargo check` for the targets it isn't running on; `vibe-guest` and
 `vibe-testguest` do their work only as static `aarch64-unknown-linux-musl`
-binaries in a VM. The Swift packages are macOS 26 only.
+binaries in a VM. The Swift packages are macOS 26 only, and a release of the app is
+for Apple Silicon.
 
 ## Develop
 
 You need rustup; on a Mac, also Xcode 26 or its command line tools.
-`rust-toolchain.toml` pins the toolchain and adds the musl target.
+`rust-toolchain.toml` picks the stable channel, with rustfmt, clippy and the musl
+target.
 
 ```sh
 cargo build                     # everything in the workspace
 cargo test
-target/debug/vibed &            # the hello-world daemon on its default socket
+target/debug/vibed &            # the daemon on its default socket
 target/debug/vibe hello         # vibed <version> · protocol <n> · macos/aarch64 · pid …
 cargo build -p vibe-guest --target aarch64-unknown-linux-musl
 
@@ -66,6 +69,10 @@ A build outside an app stays out of the login Keychain unless it's run with
 `never`, and which `vibed` doesn't pass on to its agents. Without it, a debug `vibed`
 keeps shared services' logins in `services/` in its state directory, removed when a
 later run uses the Keychain, and can't see a Claude login that's in the Keychain.
+
+VibeOS signs nobody in to Pi. `vibe pi` reports its logins, and signing in is Pi's own
+`/login`: run `pi` in `vibe toolbox` for `linux` agents on a Mac, and on the machine itself
+otherwise.
 
 Pi is pinned (`vibe_env::pi_release::PINNED`). Moving the pin means looking again
 at what the new version reads, runs and writes in its agent dir, at what the login
@@ -97,7 +104,10 @@ scripts/check-full.sh
 ```
 
 One command for everything: Rust fmt, clippy, build and test; `Cargo.lock`
-against RustSec; the `vibe-guest` cross-build; a `vibed` smoke test; on a Mac, both Swift packages,
+against RustSec; the `vibe-guest` cross-build; `cargo check` for the other macOS and Linux
+targets; a `vibed` smoke test; the registry, sessions, agents, MCP and shared services
+against a live `vibed`; real Pi on a mock model; the `linux` backend on real cgroups; on a
+Mac, the `macos` backend, both Swift packages,
 the Swift contract tests, signing with the virtualization entitlement,
 smoke tests of `vibe-vm` and `VibeOS.app` against a live `vibed`, the menu
 following a live agent and two clicks giving one Terminal tab; a Linux host
@@ -108,9 +118,18 @@ VMs booted, saved and restored through `vibe-vm`, the Linux base image, and
 `linux` agents on it: the backend's conformance suite, and real Claude across
 a sleep; `vibe doctor` against a live `vibed`; and a release DMG, built ad
 hoc with Sparkle and checked inside and out. It prints a
-PASS/FAIL table and leaves logs in `build/check/`. On Linux the macOS steps
-are skipped. CI runs the same script. It reads the Claude token from the Keychain
-only with `VIBE_CHECK_KEYCHAIN_TOKEN=1`.
+table of PASS, FAIL, N/A and SKIP, and leaves logs in `build/check/`. N/A means a step has
+nothing it can check on this machine, such as no real server or real cgroups to use, and
+isn't a pass. On Linux the macOS steps are skipped; on a Mac, a skipped step fails the run.
+
+CI runs the same script on Linux x86_64, Linux arm64 and macOS 26, on merges to `main` or by
+hand, and not on pull requests. Its macOS runner is a VM with no Docker, so it doesn't cover
+what boots real VMs: `vm-cycle` is N/A there, `base-image` fails, and `linux-vm` is skipped
+behind it. Those need a Mac on real hardware. `terminal-attach` has been failing on that
+runner too, as Terminal doesn't answer Apple events there, so the macOS job has been red on
+`main`. Steps that run real Claude take their
+token from `CLAUDE_CODE_OAUTH_TOKEN`, and read it from the Keychain only with
+`VIBE_CHECK_KEYCHAIN_TOKEN=1`.
 
 A saved VM must also survive a reboot of the Mac. That takes a reboot, so
 it's two commands around one: `scripts/vm-reboot-test.sh save`, reboot,
