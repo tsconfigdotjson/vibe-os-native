@@ -1324,6 +1324,8 @@ struct HostServeRow: View {
     @State private var error: String?
     /// Tailscale's page for turning HTTPS on, if that's what's wrong.
     @State private var enableURL: URL?
+    /// Why it can't be asked how it stands, until it can.
+    @State private var unknown: String?
 
     private var serve: McpServe? { model.hostServes[host.name] }
 
@@ -1354,6 +1356,14 @@ struct HostServeRow: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
+            if serve == nil {
+                Text(unknown ?? (host.link == .connected ? "Asking \(host.name) about Tailscale…" : "Tailscale on \(host.name) isn't known while it's down."))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else if let unknown {
+                Text(unknown).font(.caption).foregroundStyle(.secondary)
+            }
             ErrorText(error: error)
             if let enableURL {
                 Link("Open Tailscale's Page", destination: enableURL)
@@ -1370,10 +1380,12 @@ struct HostServeRow: View {
         guard host.link == .connected else { return }
         do {
             try await model.loadHostServe(host.name)
+            unknown = nil
         } catch VibedClientError.rpc(let refused) where refused.code == RPCErrorCode.methodNotFound.rawValue {
-            self.error = "Update vibed on \(host.name) to serve its MCP over Tailscale from here."
+            unknown = "Update vibed on \(host.name) to serve its MCP over Tailscale from here."
         } catch {
-            // It says what it last said until it answers. Its link says why.
+            // It says what it last said until it answers.
+            unknown = serve == nil ? "Can't ask \(host.name) about Tailscale: \(describe(error))" : nil
         }
     }
 

@@ -99,7 +99,7 @@ If you want a laptop or another machine to reach MCP, we suggest
 
 ### The Linux host toggle
 
-**Turning it on** sets `mcp_tailscale = true` on that host and runs this there:
+**Turning it on** runs this on that host, then sets `mcp_tailscale = true` there:
 
 ```sh
 tailscale serve --bg --https=443 --set-path=/mcp http://<tailscale-ip>:<mcp_port>/mcp
@@ -110,13 +110,14 @@ because the loopback listener only accepts loopback `Host` headers and Serve pas
 `ts.net` name.
 
 **Turning it off** runs `tailscale serve --https=443 --set-path=/mcp off` and sets
-`mcp_tailscale = false`. Anything else you serve stays as it is.
+`mcp_tailscale = false`. Anything else you serve stays as it is, including paths under
+`/mcp/`.
 
 **When it stops and changes nothing:**
 
 | What Settings says | Why | What to do |
 | --- | --- | --- |
-| Tailscale already serves `/mcp` from something else | `/mcp` points anywhere but this host's listener, including `127.0.0.1` or a port it's no longer on. VibeOS won't overwrite it or remove it | If nothing needs it, run `tailscale serve --https=443 --set-path=/mcp off` on the host, then try again |
+| Tailscale already serves `/mcp` from something else | `/mcp` or `/mcp/` points anywhere but this host's listener, including `127.0.0.1` or a port it's no longer on. VibeOS won't overwrite it or remove it | If nothing needs it, run the `tailscale serve … off` line Settings gives on the host, then try again |
 | Funnel is on for that name | `/mcp` there would be on the public internet. VibeOS never turns Funnel on, and won't turn yours off | Turn Funnel off for that name yourself, then try again. `tailscale funnel status` on the host shows what it exposes |
 | Tailscale doesn't let you change what it serves | The host's user isn't Tailscale's operator | Choose **Allow…** on the host's row, or run `sudo tailscale set --operator=<user>` on the host. Then turn the toggle on again |
 | Your tailnet needs HTTPS turned on | HTTPS or Serve is off for your tailnet | Open the link Settings shows, which is Tailscale's own, turn it on, and try again |

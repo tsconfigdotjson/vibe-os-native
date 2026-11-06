@@ -106,8 +106,7 @@ pub struct Config {
     /// None on a Mac, whose toggle is its Tailscale address, and so in the golden world, so
     /// that no test reaches the machine's own Tailscale.
     pub tailscale_cli: Option<OsString>,
-    /// How long one `tailscale` command may take, which it can take forever over: `serve`
-    /// waits for HTTPS to be turned on. A forwarded call has longer than a change's commands.
+    /// How long one `tailscale` command may take: [`crate::tailscale::TAILSCALE_WAIT`].
     pub tailscale_wait: Duration,
     /// Whether a Mac's tunnel can end here: on a Linux host, and a stand-in for one in
     /// tests. [`Config::new`] says which by its OS. Nothing is served for it but the
@@ -192,7 +191,7 @@ impl Config {
             toolbox: None,
             tailscale: Arc::new(vibe_mcp::net::tailscale_addresses),
             tailscale_cli: (info.os == "linux").then(|| "tailscale".into()),
-            tailscale_wait: Duration::from_secs(20),
+            tailscale_wait: crate::tailscale::TAILSCALE_WAIT,
             serves_mac_peer: info.os == "linux",
             mac_probe_every: Duration::from_secs(5),
             remote: Arc::new(Ssh::new().sharing_in(run_dir)),

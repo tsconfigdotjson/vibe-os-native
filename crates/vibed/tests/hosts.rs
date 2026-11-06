@@ -2237,6 +2237,20 @@ async fn a_hosts_tailnet_toggle_goes_to_the_host_and_allow_comes_back() {
         "{line}"
     );
 
+    // HTTPS off on the tailnet: Tailscale's link comes across the link, for Settings' button.
+    fake.write(
+        "on-set.sh",
+        "printf 'Serve is not enabled on your tailnet.\\nTo enable, visit:\\n\\n  https://login.tailscale.com/f/serve?node=abc\\n'; exit 0\n",
+    );
+    let refused = w
+        .rpc("mcp.serve.set", json!({"host": "vps", "on": true}))
+        .await;
+    assert_eq!(
+        refused["error"]["data"]["tailscale_enable_url"],
+        json!("https://login.tailscale.com/f/serve?node=abc"),
+        "{refused}"
+    );
+
     // Allowed: on, with the URL for the setup command, and the host's flag set, not the Mac's.
     std::fs::remove_file(fake.dir.join("on-set.sh")).unwrap();
     let on = w

@@ -141,8 +141,7 @@ async fn on_sets_both_and_off_takes_only_mcp_off_and_clears_it() {
     assert_eq!(w.fake.changes(), [set_command()]);
     assert_eq!(events.try_recv().unwrap().kind, EventKind::McpChanged);
     assert!(events.try_recv().is_err(), "one event for the one change");
-    // It's the Tailscale address that's the target, the listener Serve can reach.
-    assert!(set_command().contains(&format!("http://{GOLDEN_TAILSCALE}:{MCP_PORT}/mcp")));
+    // It's the Tailscale address that's the target, the listener Serve can reach, not loopback.
     assert!(!w.fake.calls().iter().any(|c| c.contains("127.0.0.1")));
     let text = std::fs::read_to_string(w.host_toml()).unwrap();
     assert!(text.starts_with("# mine\ncpu_cores = 2\n"), "{text}");
@@ -655,4 +654,185 @@ async fn an_authenticated_call_with_the_tailnet_name_gets_through_only_on_the_ta
     // No key: refused before anything else, wherever.
     let anon = post_raw(tailscale_like, vibe_mcp::PATH, &[host], &call).await;
     assert_eq!(anon.status, 401);
+}
+
+/// The real CLI replaces `/mcp/` when told to set `/mcp`, so the toggle mustn't get that far.
+#[tokio::test]
+async fn a_slashed_mcp_stops_it_and_says_how_to_remove_that_one() {
+    let w = World::new();
+    let serving = format!(
+        r#"{{"TCP":{{"443":{{"HTTPS":true}}}},"Web":{{"{}:443":{{"Handlers":{{"/mcp/":{{"Path":"/srv/www"}}}}}}}}}}"#,
+        FakeTailscale::NAME
+    );
+    w.fake.write("serve.json", &serving);
+    let got = w.get().await;
+    assert!(!got.on && got.available, "{got:?}");
+    assert!(got.note.unwrap().contains("--set-path=/mcp/ off"));
+    let e = w.set(true).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::Conflict.code());
+    assert!(e.message.contains("--set-path=/mcp/ off"), "{}", e.message);
+    assert!(!w.flag());
+    w.set_flag(true);
+    assert_eq!(
+        w.set(false).await.unwrap_err().code,
+        ErrorCode::Conflict.code()
+    );
+    assert_eq!(w.fake.changes(), Vec::<String>::new());
+    assert_eq!(w.fake.read("serve.json"), serving);
+}
+
+/// An address in Tailscale's range on another interface, as a cloud network can have: not
+/// Tailscale's, so not the target, and a `/mcp` pointing at it isn't this host's.
+#[tokio::test]
+async fn only_what_tailscale_says_is_its_own_address_is_the_target_or_ours() {
+    let w = World::with(|c| {
+        c.tailscale = Arc::new(|| {
+            ["100.64.0.5", GOLDEN_TAILSCALE]
+                .iter()
+                .map(|a| a.parse().unwrap())
+                .collect()
+        });
+    });
+    w.fake.write(
+        "serve.json",
+        &FakeTailscale::serving(&[("/mcp", &format!("http://100.64.0.5:{MCP_PORT}/mcp"))]),
+    );
+    assert_eq!(
+        w.set(true).await.unwrap_err().code,
+        ErrorCode::Conflict.code()
+    );
+    w.fake.write("serve.json", "{}");
+    w.set(true).await.unwrap();
+    assert_eq!(w.fake.changes(), [set_command()]);
+
+    // With only such an address, there's nowhere for Serve to reach.
+    let w = World::with(|c| c.tailscale = Arc::new(|| vec!["100.64.0.5".parse().unwrap()]));
+    assert!(!w.get().await.available);
+    assert!(w.set(true).await.is_err());
+    assert_eq!(w.fake.changes(), Vec::<String>::new());
+}
+
+/// The owner put it right by hand after a refusal: the toggle doesn't go on asking for `sudo`.
+#[tokio::test]
+async fn a_toggle_that_ends_up_as_asked_stops_asking_for_allow() {
+    let w = World::new();
+    w.fake.write(
+        "on-set.sh",
+        "echo 'sending serve config: Access denied: serve config denied' >&2; exit 1\n",
+    );
+    assert!(w.set(true).await.is_err());
+    assert!(w.needs_operator());
+    w.fake.write(
+        "serve.json",
+        &FakeTailscale::serving(&[("/mcp", &FakeTailscale::our_target(MCP_PORT))]),
+    );
+    // A read doesn't settle it: refused turning off, it's still on, and still refused.
+    w.get().await;
+    assert!(w.needs_operator());
+    assert!(w.set(true).await.unwrap().on);
+    assert!(!w.needs_operator());
+}
+
+/// Serve goes first: a refused turn-on never opens the listener, and if `vibed` goes down
+/// while `tailscale serve` waits, there's no listener behind a toggle that says off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_change_dropped_while_serve_waits_leaves_the_flag_and_kills_the_command() {
+    let w = World::new();
+    w.fake.write(
+        "on-set.sh",
+        r#"echo $$ > "$d/child"
+exec sleep 300
+"#,
+    );
+    let core = Arc::clone(&w.core);
+    let change = tokio::spawn(async move {
+        core.set_mcp_serve(McpServeSetParams {
+            host: None,
+            on: true,
+        })
+        .await
+    });
+    for _ in 0..200 {
+        if !w.fake.read("child").is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!w.fake.read("child").is_empty(), "serve was never run");
+    assert!(!w.flag(), "not until Serve has it");
+    change.abort();
+    let _ = change.await;
+    assert!(!w.flag());
+    let command = w.fake.read("child").trim().parse::<i32>().unwrap();
+    let mut gone = false;
+    for _ in 0..250 {
+        // SAFETY: signal 0 only asks whether the process is there.
+        if unsafe { libc::kill(command, 0) } != 0 {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(gone, "pid {command} outlived the change");
+}
+
+/// `host.toml` broken between the look and the write: `/mcp` comes back off, as it wasn't on.
+#[tokio::test]
+async fn a_flag_that_cant_be_written_takes_mcp_back_off_serve() {
+    let w = World::new();
+    std::fs::create_dir_all(w.host_toml().parent().unwrap()).unwrap();
+    w.fake.write(
+        "on-set.sh",
+        &format!("echo 'cpu_core = 4' > '{}'\n", w.host_toml().display()),
+    );
+    let e = w.set(true).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::HostConfigInvalid.code(), "{e:?}");
+    assert_eq!(w.fake.changes(), [set_command(), OFF_COMMAND.to_owned()]);
+    assert_eq!(w.fake.read("serve.json"), "{}");
+}
+
+/// The file setting, by hand: said, and the toggle is how to go further.
+#[tokio::test]
+async fn the_flag_alone_is_said_and_isnt_called_on() {
+    let w = World::new();
+    w.set_flag(true);
+    let got = w.get().await;
+    assert!(!got.on && got.url.is_none(), "{got:?}");
+    assert!(got.note.unwrap().contains("mcp_tailscale is on"));
+    assert_eq!(w.fake.changes(), Vec::<String>::new());
+}
+
+/// Funnel on a name with `/mcp` on Serve but its listener off: not called public.
+#[tokio::test]
+async fn funnel_with_the_listener_off_isnt_called_public_mcp() {
+    let w = World::new();
+    let ours = FakeTailscale::our_target(MCP_PORT);
+    w.fake.write(
+        "serve.json",
+        &format!(
+            r#"{{"AllowFunnel":{{"{n}:443":true}},"Web":{{"{n}:443":{{"Handlers":{{"/mcp":{{"Proxy":"{ours}"}}}}}}}}}}"#,
+            n = FakeTailscale::NAME
+        ),
+    );
+    let note = w.get().await.note.unwrap();
+    assert!(
+        !note.contains("this MCP is on the public internet"),
+        "{note}"
+    );
+    assert!(note.contains("Funnel"), "{note}");
+}
+
+/// `tailscale serve` worked, and then Tailscale couldn't be read: not told as a refusal.
+#[tokio::test]
+async fn a_read_back_that_fails_isnt_called_a_refusal() {
+    let w = World::new();
+    // Its own script breaks the status it reads next.
+    w.fake.write(
+        "on-set.sh",
+        r#"printf 'not json' > "$d/status.json"
+"#,
+    );
+    let e = w.set(true).await.unwrap_err();
+    assert!(e.message.contains("can't be read back"), "{}", e.message);
+    assert!(!w.flag());
 }

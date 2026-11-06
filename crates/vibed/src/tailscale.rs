@@ -35,15 +35,22 @@ const SERVE_PORT: u16 = 443;
 const HTTPS_FLAG: &str = "--https=443";
 /// `--set-path=/mcp`, in the commands. `SERVE_PATH` is `/mcp`: a test holds them together.
 const PATH_FLAG: &str = "--set-path=/mcp";
+/// `/mcp/`, which is also `/mcp` to Tailscale: it's what a directory served at `/mcp` is kept
+/// as, and setting `/mcp` replaces it without a word.
+const SLASHED_PATH: &str = "/mcp/";
+/// How long one `tailscale` command may take, as it can take forever: `serve` waits for HTTPS
+/// to be turned on. A change is at most 7 commands (a look, the change, a look, and the look
+/// that answers), which together have to fit in what a forwarded call gets.
+pub const TAILSCALE_WAIT: Duration = Duration::from_secs(15);
 /// How much of what `tailscale` says is kept: more than any status, on any tailnet, as only
 /// this node is asked for. What's cut off doesn't parse, and is treated as unreadable.
 const MAX_OUTPUT: usize = 4 << 20;
 /// How much of what it says goes into a message.
 const MAX_SAID: usize = 2000;
 
-/// The line that takes `/mcp` off Serve by hand, leaving the rest alone.
-fn off_line() -> String {
-    format!("tailscale serve {HTTPS_FLAG} {PATH_FLAG} off")
+/// The line that takes `path` off Serve by hand, leaving the rest alone.
+fn off_line(path: &str) -> String {
+    format!("tailscale serve {HTTPS_FLAG} --set-path={path} off")
 }
 
 /// What `tailscale` did when run.
@@ -141,8 +148,9 @@ enum ServePath {
     Absent,
     /// This host's MCP, by its Tailscale address and port.
     Ours,
-    /// Anything else, as it should be described to the owner.
-    Foreign(String),
+    /// Anything else: as it should be described to the owner, and the path it's at, or none
+    /// if it goes with a command still running.
+    Foreign(String, Option<&'static str>),
 }
 
 /// How things stand with Tailscale here.
@@ -153,6 +161,9 @@ struct Look {
     path: ServePath,
     /// Whether Funnel is on for this node's `:443`. `/mcp` there would be public.
     funnel: bool,
+    /// The address to point Serve at: one MCP can listen on that Tailscale says is its own.
+    /// An address in its range on another interface, as a cloud network can have, isn't.
+    listen_on: Option<IpAddr>,
 }
 
 impl Look {
@@ -214,9 +225,9 @@ fn parse_serve(json: &str, name: &str, targets: &[String]) -> Result<(ServePath,
         return Err("what it serves doesn't read: it isn't an object".to_owned());
     }
     let site = format!("{name}:{SERVE_PORT}");
-    let handler_in = |config: &Value| -> Option<Value> {
+    let handler_in = |config: &Value, path: &str| -> Option<Value> {
         config["Web"][&site]["Handlers"]
-            .get(SERVE_PATH)
+            .get(path)
             .filter(|h| !h.is_null())
             .cloned()
     };
@@ -227,18 +238,26 @@ fn parse_serve(json: &str, name: &str, targets: &[String]) -> Result<(ServePath,
         .map(|sessions| sessions.values().collect())
         .unwrap_or_default();
     let funnel = funnel_in(&serve) || foreground.iter().any(|c| funnel_in(c));
-    if let Some(handler) = foreground.iter().find_map(|c| handler_in(c)) {
+    let in_foreground = foreground
+        .iter()
+        .find_map(|c| handler_in(c, SERVE_PATH).or_else(|| handler_in(c, SLASHED_PATH)));
+    if let Some(handler) = in_foreground {
         let held = format!(
             "{}, from a `tailscale serve` still running in the foreground",
             describe_handler(&handler)
         );
-        return Ok((ServePath::Foreign(held), funnel));
+        return Ok((ServePath::Foreign(held, None), funnel));
     }
-    let path = match handler_in(&serve) {
+    // Never this host's, whatever its target: setting `/mcp` would replace it.
+    if let Some(handler) = handler_in(&serve, SLASHED_PATH) {
+        let what = describe_handler(&handler);
+        return Ok((ServePath::Foreign(what, Some(SLASHED_PATH)), funnel));
+    }
+    let path = match handler_in(&serve, SERVE_PATH) {
         None => ServePath::Absent,
         Some(handler) => match handler["Proxy"].as_str() {
             Some(target) if targets.iter().any(|t| t == target) => ServePath::Ours,
-            _ => ServePath::Foreign(describe_handler(&handler)),
+            _ => ServePath::Foreign(describe_handler(&handler), Some(SERVE_PATH)),
         },
     };
     Ok((path, funnel))
@@ -268,8 +287,15 @@ fn classify(said: &str) -> Refusal {
     {
         return Refusal::Denied;
     }
-    // Only with those words: a link can be to anything, and it prints this node's own.
-    if low.contains("not enabled") || low.contains("enable https") {
+    // Only with these words: a link can be to anything, and it prints this node's own.
+    let https_off = [
+        "serve is not enabled",
+        "https is not enabled",
+        "https cert support is not enabled",
+        "tls certificate support is not enabled",
+        "enable https",
+    ];
+    if https_off.iter().any(|w| low.contains(w)) {
         let link = said
             .split_whitespace()
             .find(|w| w.starts_with("https://") && !w.contains(".ts.net"))
@@ -338,15 +364,23 @@ impl Core {
             }))
         };
         let status = read(&["status", "--json", "--peers=false"]).await?;
-        let (name, mut addresses) = parse_status(&status).map_err(failed)?;
-        addresses.extend(self.listener_addresses());
+        let (name, addresses) = parse_status(&status).map_err(failed)?;
         let targets: Vec<String> = addresses
             .iter()
             .map(|ip| format_target(*ip, port))
             .collect();
+        let listen_on = self
+            .listener_addresses()
+            .into_iter()
+            .find(|ip| addresses.contains(ip));
         let serve = read(&["serve", "status", "--json"]).await?;
         let (path, funnel) = parse_serve(&serve, &name, &targets).map_err(failed)?;
-        Ok(Look { name, path, funnel })
+        Ok(Look {
+            name,
+            path,
+            funnel,
+            listen_on,
+        })
     }
 
     /// `mcp.serve.get`: how this host's MCP stands on its tailnet name, as Tailscale says
@@ -371,7 +405,7 @@ impl Core {
             Err(e) => return Ok(unavailable(e.message)),
         };
         let on = look.path == ServePath::Ours && l.mcp_tailscale;
-        let listening = !self.listener_addresses().is_empty();
+        let listening = look.listen_on.is_some();
         Ok(McpServe {
             on,
             available: listening || on,
@@ -382,7 +416,9 @@ impl Core {
 
     /// `mcp.serve.set`: turns MCP on this host's tailnet name on or off, `mcp_tailscale` and
     /// `/mcp` on Serve together. One change at a time. Whatever stops it leaves things as they
-    /// were: a `/mcp` that isn't this host's stays, and so does `mcp_tailscale`.
+    /// were: a `/mcp` that isn't this host's stays, and so does `mcp_tailscale`. Serve is
+    /// changed first, so a refused turn-on never opens the Tailscale listener, and if `vibed`
+    /// goes down between the two, what's left is one the toggle says how to finish.
     pub async fn set_mcp_serve(&self, p: McpServeSetParams) -> Result<McpServe, ErrorObject> {
         self.host(p.host.as_deref())?;
         let _one_at_a_time = self.serve_lock.lock().await;
@@ -395,6 +431,8 @@ impl Core {
             self.serve_off(&program, l.mcp_port, l.mcp_tailscale)
                 .await?;
         }
+        // It's as asked, so whatever was refused before isn't waiting for `sudo` any more.
+        self.operator_allowed();
         self.publish(self.event(EventKind::McpChanged));
         self.mcp_serve(HostParams::default()).await
     }
@@ -413,34 +451,37 @@ impl Core {
             Program::At(program) => program,
         };
         let look = self.serve_look(program, port).await?;
-        if let ServePath::Foreign(what) = &look.path {
-            return Err(error(ErrorCode::Conflict, foreign_note(what)));
+        if let ServePath::Foreign(what, path) = &look.path {
+            return Err(error(ErrorCode::Conflict, foreign_note(what, *path)));
         }
         if look.funnel {
             return Err(error(ErrorCode::Conflict, funnel_note(&look)));
         }
-        let Some(ip) = self.listener_addresses().first().copied() else {
+        let Some(ip) = look.listen_on else {
             return Err(error(ErrorCode::CommandFailed, NO_ADDRESS));
         };
-        if !was_on {
-            self.write_mcp_tailscale(true)?;
+        // As it should be already, Serve isn't written to.
+        let adding = look.path != ServePath::Ours;
+        if adding {
+            let target = format_target(ip, port);
+            let set = ["serve", "--bg", HTTPS_FLAG, PATH_FLAG, target.as_str()];
+            self.change_serve(program, &set, port, ServePath::Ours)
+                .await?;
         }
-        if look.path == ServePath::Ours {
-            // As it should be already: Serve isn't written to.
-            return Ok(());
-        }
-        let target = format_target(ip, port);
-        let set = ["serve", "--bg", HTTPS_FLAG, PATH_FLAG, target.as_str()];
-        let done = self
-            .change_serve(program, &set, port, ServePath::Ours)
-            .await;
-        if done.is_err() && !was_on {
-            // Back as it was. Its error is the one to report.
-            if let Err(e) = self.write_mcp_tailscale(false) {
-                crate::log!("vibed: can't turn MCP on Tailscale back off: {}", e.message);
+        if !was_on && let Err(e) = self.write_mcp_tailscale(true) {
+            if adding {
+                // Back as it was. The write's error is the one to report.
+                let off = ["serve", HTTPS_FLAG, PATH_FLAG, "off"];
+                if let Err(undone) = self
+                    .change_serve(program, &off, port, ServePath::Absent)
+                    .await
+                {
+                    crate::log!("vibed: can't take /mcp back off Serve: {}", undone.message);
+                }
             }
+            return Err(e);
         }
-        done
+        Ok(())
     }
 
     async fn serve_off(
@@ -456,8 +497,8 @@ impl Core {
             Program::At(program) => {
                 let look = self.serve_look(program, port).await?;
                 match &look.path {
-                    ServePath::Foreign(what) => {
-                        return Err(error(ErrorCode::Conflict, foreign_note(what)));
+                    ServePath::Foreign(what, path) => {
+                        return Err(error(ErrorCode::Conflict, foreign_note(what, *path)));
                     }
                     ServePath::Absent => {}
                     ServePath::Ours => {
@@ -493,13 +534,12 @@ impl Core {
         match &after {
             Ok(look) if look.path == want => {
                 crate::log!("vibed: tailscale serve {}", args[args.len() - 1]);
-                self.operator_allowed();
                 Ok(())
             }
             Ok(Look {
-                path: ServePath::Foreign(what),
+                path: ServePath::Foreign(what, path),
                 ..
-            }) => Err(error(ErrorCode::Conflict, foreign_note(what))),
+            }) => Err(error(ErrorCode::Conflict, foreign_note(what, *path))),
             _ => Err(self.serve_refused(&ran, after.err())),
         }
     }
@@ -541,6 +581,13 @@ impl Core {
                 ),
             ),
             Refusal::Other => match unread {
+                Some(e) if ran.ok => error(
+                    ErrorCode::CommandFailed,
+                    format!(
+                        "tailscale serve ran, but what it did can't be read back. {}",
+                        e.message
+                    ),
+                ),
                 Some(e) if said.is_empty() => e,
                 _ if said.is_empty() => error(
                     ErrorCode::CommandFailed,
@@ -590,11 +637,18 @@ const NOT_INSTALLED: &str =
 const NO_ADDRESS: &str = "This host has no Tailscale address on its network interfaces, so MCP \
                           has nowhere to listen for Tailscale to reach it.";
 
-fn foreign_note(what: &str) -> String {
+fn foreign_note(what: &str, path: Option<&str>) -> String {
+    let at = path.unwrap_or(SERVE_PATH);
+    let remedy = match path {
+        Some(path) => format!(
+            "If nothing needs it, remove it with `{}`, then try again.",
+            off_line(path)
+        ),
+        None => "If nothing needs it, stop that command, then try again.".to_owned(),
+    };
     format!(
-        "Tailscale already serves /mcp here, from {what}, which isn't this host's MCP. VibeOS \
-         leaves it alone. If nothing needs it, remove it with `{}`, then try again.",
-        off_line()
+        "Tailscale already serves {at} here, from {what}, which isn't this host's MCP. VibeOS \
+         leaves it alone. {remedy}"
     )
 }
 
@@ -610,8 +664,8 @@ fn funnel_note(look: &Look) -> String {
 /// What the toggle should say of how things stand, if anything.
 fn stands_note(look: &Look, flag: bool, listening: bool) -> Option<String> {
     Some(match &look.path {
-        ServePath::Foreign(what) => foreign_note(what),
-        ServePath::Ours if look.funnel => format!(
+        ServePath::Foreign(what, path) => foreign_note(what, *path),
+        ServePath::Ours if look.funnel && flag => format!(
             "Tailscale Funnel is on for {}:{SERVE_PORT}, so this MCP is on the public internet, \
              behind its API keys. Turn Funnel off, or turn this off.",
             look.name
@@ -620,10 +674,14 @@ fn stands_note(look: &Look, flag: bool, listening: bool) -> Option<String> {
         ServePath::Ours if !flag => format!(
             "Tailscale serves /mcp for this host, but mcp_tailscale is off, so it can't answer. \
              Turn this on to finish, or remove it with `{}`.",
-            off_line()
+            off_line(SERVE_PATH)
         ),
         ServePath::Ours if !listening => NO_ADDRESS.to_owned(),
         ServePath::Absent if !listening => NO_ADDRESS.to_owned(),
+        ServePath::Absent if flag => "MCP answers on this host's Tailscale address, as \
+             mcp_tailscale is on, but not on Tailscale Serve. Turn this on for its https URL. \
+             Turning it off after that turns mcp_tailscale off too."
+            .to_owned(),
         _ => return None,
     })
 }
@@ -706,22 +764,84 @@ mod tests {
         ] {
             assert_eq!(
                 parse(&site(&format!(r#""/mcp":{{"Proxy":"{target}"}}"#))),
-                (ServePath::Foreign(target.to_owned()), false),
+                (ServePath::Foreign(target.to_owned(), Some("/mcp")), false),
                 "{target}"
             );
         }
         assert_eq!(
             parse(&site(r#""/mcp":{"Path":"/srv/www"}"#)),
-            (ServePath::Foreign("the path /srv/www".to_owned()), false)
+            (
+                ServePath::Foreign("the path /srv/www".to_owned(), Some("/mcp")),
+                false
+            )
         );
         assert_eq!(
             parse(&site(r#""/mcp":{"Text":"hello"}"#)),
-            (ServePath::Foreign("some text".to_owned()), false)
+            (
+                ServePath::Foreign("some text".to_owned(), Some("/mcp")),
+                false
+            )
         );
         assert_eq!(
             parse(&site(r#""/mcp":{}"#)),
-            (ServePath::Foreign("something else".to_owned()), false)
+            (
+                ServePath::Foreign("something else".to_owned(), Some("/mcp")),
+                false
+            )
         );
+    }
+
+    /// What the real CLI keeps a directory at `/mcp` as, and replaces with no complaint.
+    #[test]
+    fn a_slashed_mcp_is_never_this_hosts_and_a_path_under_it_is_no_business_of_this() {
+        let site =
+            |handlers: &str| format!(r#"{{"Web":{{"{NAME}:443":{{"Handlers":{{{handlers}}}}}}}}}"#);
+        let parse = |json: &str| parse_serve(json, NAME, &targets()).unwrap();
+        assert_eq!(
+            parse(&site(r#""/mcp/":{"Path":"/srv/www"}"#)),
+            (
+                ServePath::Foreign("the path /srv/www".to_owned(), Some("/mcp/")),
+                false
+            )
+        );
+        assert_eq!(
+            parse(&site(
+                r#""/mcp/":{"Proxy":"http://100.101.102.103:7878/mcp"}"#
+            )),
+            (
+                ServePath::Foreign("http://100.101.102.103:7878/mcp".to_owned(), Some("/mcp/")),
+                false
+            ),
+            "even at this host's target"
+        );
+        assert_eq!(
+            parse(&site(
+                r#""/mcp":{"Proxy":"http://100.101.102.103:7878/mcp"},"/mcp/":{"Path":"/srv/www"}"#
+            ))
+            .0,
+            ServePath::Foreign("the path /srv/www".to_owned(), Some("/mcp/"))
+        );
+        assert_eq!(
+            parse(&site(r#""/mcp/sub":{"Proxy":"http://127.0.0.1:3000"}"#)),
+            (ServePath::Absent, false),
+            "the real CLI leaves that where it is"
+        );
+        // In a foreground command too.
+        let foreground = format!(
+            r#"{{"Foreground":{{"abc":{{"Web":{{"{NAME}:443":{{"Handlers":{{"/mcp/":{{"Path":"/srv/www"}}}}}}}}}}}}}}"#
+        );
+        assert!(matches!(
+            parse(&foreground).0,
+            ServePath::Foreign(what, None) if what.contains("foreground")
+        ));
+        // The line to remove it names the path it's at: `--set-path=/mcp off` doesn't reach it.
+        let note = foreign_note("the path /srv/www", Some("/mcp/"));
+        assert!(note.contains("--set-path=/mcp/ off"), "{note}");
+    }
+
+    #[test]
+    fn a_change_fits_in_what_a_forwarded_call_gets() {
+        assert!(TAILSCALE_WAIT * 7 < crate::hosts::call_timeout("mcp.serve.set"));
     }
 
     #[test]
@@ -742,7 +862,7 @@ mod tests {
         let (path, funnel) = parse(&foreground);
         assert!(funnel);
         assert!(
-            matches!(path, ServePath::Foreign(what) if what.contains("foreground")),
+            matches!(path, ServePath::Foreign(what, None) if what.contains("foreground")),
             "a session's, even at this target, ends with it"
         );
     }
@@ -778,6 +898,10 @@ mod tests {
             Refusal::NoHttps(None)
         );
         assert_eq!(classify("port 443 is in use"), Refusal::Other);
+        assert_eq!(
+            classify("MagicDNS is not enabled for this tailnet"),
+            Refusal::Other
+        );
         assert_eq!(
             classify("bad target; see https://tailscale.com/kb/1247"),
             Refusal::Other
