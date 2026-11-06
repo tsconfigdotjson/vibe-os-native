@@ -375,6 +375,8 @@ pub const METHODS: &[&str] = &[
     LimitsSet::NAME,
     McpGet::NAME,
     McpSet::NAME,
+    McpServeGet::NAME,
+    McpServeSet::NAME,
     KeysList::NAME,
     KeysCreate::NAME,
     KeysRevoke::NAME,
@@ -597,6 +599,22 @@ method! {
     /// written to `host.toml` and applied at once, and the settings that
     /// result are returned.
     McpSet = "mcp.set", McpSetParams => McpSettings
+}
+
+method! {
+    /// `mcp.serve.get`: how a Linux host's MCP stands on its tailnet name
+    /// (`https://<machine>.<tailnet>.ts.net/mcp`), as Tailscale says now, for its toggle in
+    /// Settings. It only reads.
+    McpServeGet = "mcp.serve.get", HostParams => McpServe
+}
+
+method! {
+    /// `mcp.serve.set`: turns MCP on a Linux host's tailnet name on or off: `mcp_tailscale`
+    /// in `host.toml`, and only the `/mcp` path on Tailscale Serve. It stops, changing
+    /// nothing, at a `/mcp` that isn't this host's own, or Funnel on that name when turning
+    /// on. Refused where Tailscale has HTTPS off, its error's data can have
+    /// `{"tailscale_enable_url": <url>}`, Tailscale's link to turn it on.
+    McpServeSet = "mcp.serve.set", McpServeSetParams => McpServe
 }
 
 method! {
@@ -1364,6 +1382,32 @@ pub struct McpSetParams {
     pub host: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tailscale: Option<bool>,
+}
+
+/// How a Linux host's MCP stands on its tailnet name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpServe {
+    /// Whether it's served there: `/mcp` on Tailscale Serve points at this host's Tailscale
+    /// listener, and `mcp_tailscale` is on.
+    pub on: bool,
+    /// Whether it can be changed now: Tailscale is here, up and logged in.
+    pub available: bool,
+    /// `https://<machine>.<tailnet>.ts.net/mcp`, while it's on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// What the owner should know of how it stands, if anything: why it's unavailable, or
+    /// what's in the way.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// Which way to turn MCP on a Linux host's tailnet name.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpServeSetParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    pub on: bool,
 }
 
 impl LimitsSetParams {

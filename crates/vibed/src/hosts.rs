@@ -44,6 +44,8 @@ pub const FORWARDED: &[&str] = &[
     "limits.set",
     "mcp.get",
     "mcp.set",
+    "mcp.serve.get",
+    "mcp.serve.set",
     // How a host stands with a service, and its own settings for it, go to it.
     // A sign-in starts on the host that's to own the login. `services.complete`
     // and `services.disconnect` also go to a host, but aren't here as there's more
@@ -250,6 +252,9 @@ impl Core {
         }
         if self.git_waits_for_admin() {
             needs.push(AdminNeed::Git);
+        }
+        if self.tailscale_waits_for_admin() {
+            needs.push(AdminNeed::TailscaleOperator);
         }
         needs
     }

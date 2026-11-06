@@ -2183,3 +2183,93 @@ impl World {
         link.reported().is_none_or(|own| own.external)
     }
 }
+
+/// The toggle in Settings → Hosts names a host: `tailscale` runs there, its answer comes back,
+/// and what it needs `sudo` for reaches the Mac's Allow button (#151).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hosts_tailnet_toggle_goes_to_the_host_and_allow_comes_back() {
+    let dir = common::short_tempdir();
+    let fake = common::FakeTailscale::new(dir.path());
+    let ours = common::FakeTailscale::our_target(vibe_core::limits::MCP_PORT);
+    fake.write(
+        "after-set.json",
+        &common::FakeTailscale::serving(&[("/mcp", &ours)]),
+    );
+    fake.write(
+        "on-set.sh",
+        "echo 'sending serve config: Access denied: serve config denied' >&2; exit 1\n",
+    );
+    let program = fake.program.clone().into_os_string();
+    let w = world_with(|c| c.tailscale_cli = Some(program)).await;
+    w.add_host().await;
+
+    // Off, as the host says.
+    let got = w.rpc("mcp.serve.get", json!({"host": "vps"})).await;
+    assert_eq!(
+        got["result"],
+        json!({"on": false, "available": true}),
+        "{got}"
+    );
+
+    // Refused for want of the operator: the host's error, and the Mac's button.
+    let refused = w
+        .rpc("mcp.serve.set", json!({"host": "vps", "on": true}))
+        .await;
+    let message = refused["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("sudo tailscale set --operator="),
+        "{refused}"
+    );
+    for _ in 0..500 {
+        if !w.link().await.needs_admin.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(w.link().await.needs_admin, [AdminNeed::TailscaleOperator]);
+    let line = w
+        .mac
+        .host_admin(HostNameParams { host: "vps".into() })
+        .unwrap()
+        .command;
+    assert!(
+        line.starts_with("ssh -t me@vps.example.com 'echo "),
+        "{line}"
+    );
+
+    // HTTPS off on the tailnet: Tailscale's link comes across the link, for Settings' button.
+    fake.write(
+        "on-set.sh",
+        "printf 'Serve is not enabled on your tailnet.\\nTo enable, visit:\\n\\n  https://login.tailscale.com/f/serve?node=abc\\n'; exit 0\n",
+    );
+    let refused = w
+        .rpc("mcp.serve.set", json!({"host": "vps", "on": true}))
+        .await;
+    assert_eq!(
+        refused["error"]["data"]["tailscale_enable_url"],
+        json!("https://login.tailscale.com/f/serve?node=abc"),
+        "{refused}"
+    );
+
+    // Allowed: on, with the URL for the setup command, and the host's flag set, not the Mac's.
+    std::fs::remove_file(fake.dir.join("on-set.sh")).unwrap();
+    let on = w
+        .rpc("mcp.serve.set", json!({"host": "vps", "on": true}))
+        .await;
+    assert_eq!(
+        on["result"],
+        json!({"on": true, "available": true, "url": "https://vps.tailnet-example.ts.net/mcp"}),
+        "{on}"
+    );
+    assert!(w.host.mcp_settings().unwrap().1);
+    assert!(!w.mac.mcp_settings().unwrap().1);
+    // The Mac's own stays as it was, and its toggle's still its own.
+    let mac = w.rpc("mcp.get", json!({})).await;
+    assert_eq!(mac["result"]["tailscale"], json!(false), "{mac}");
+
+    let off = w
+        .rpc("mcp.serve.set", json!({"host": "vps", "on": false}))
+        .await;
+    assert_eq!(off["result"]["on"], json!(false), "{off}");
+    assert!(!w.host.mcp_settings().unwrap().1);
+}

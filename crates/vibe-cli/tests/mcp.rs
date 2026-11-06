@@ -398,3 +398,47 @@ fn keys_from_the_command_line() {
         "{stderr}"
     );
 }
+
+/// With MCP on its tailnet name, that's the line for another machine (#151).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn key_create_names_the_tailnet_url_while_its_on() {
+    let golden = common::Golden::new();
+    let fake = common::FakeTailscale::new(&golden.dir.path().canonicalize().unwrap().join("ts"));
+    let ours = common::FakeTailscale::our_target(vibe_core::limits::MCP_PORT);
+    fake.write(
+        "after-set.json",
+        &common::FakeTailscale::serving(&[("/mcp", &ours)]),
+    );
+    let mut config = golden.config();
+    config.tailscale_cli = Some(fake.program.clone().into_os_string());
+    let core = std::sync::Arc::new(vibed::core::Core::open(config).unwrap());
+    core.set_mcp_serve(vibe_core::rpc::McpServeSetParams {
+        host: None,
+        on: true,
+    })
+    .await
+    .unwrap();
+    let server = common::serve(
+        std::sync::Arc::clone(&core),
+        common::short_tempdir(),
+        vibe_core::rpc::MAX_MESSAGE_BYTES,
+    );
+    let socket = server.path.clone();
+    let out = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_vibe"))
+            .args(["key", "create", "laptop"])
+            .env("VIBE_SOCKET", socket)
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(
+            "from another machine on your tailnet:\n\n  claude mcp add --transport http vibeos https://vps.tailnet-example.ts.net/mcp"
+        ),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("http://100."), "{stderr}");
+}

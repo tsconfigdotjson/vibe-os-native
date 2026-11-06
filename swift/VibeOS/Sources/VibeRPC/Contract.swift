@@ -42,6 +42,8 @@ public enum VibeRPC {
         LimitsSet.name,
         McpGet.name,
         McpSet.name,
+        McpServeGet.name,
+        McpServeSet.name,
         KeysList.name,
         KeysCreate.name,
         KeysRevoke.name,
@@ -609,10 +611,12 @@ public enum TunnelState: String, Codable, CaseIterable, Hashable, Sendable {
 
 /// What a Linux host needs someone with sudo there to allow, once, as VibeOS
 /// tried every way it has without a password: `linger`, vibed staying up while
-/// the owner's logged out; `git`, which agents can't do without.
+/// the owner's logged out; `git`, which agents can't do without;
+/// `tailscale_operator`, which lets the owner change what Tailscale serves.
 public enum AdminNeed: String, Codable, CaseIterable, Hashable, Sendable {
     case linger
     case git
+    case tailscaleOperator = "tailscale_operator"
 }
 
 /// What can be signed in to from the app.
@@ -791,6 +795,21 @@ public enum McpSet: RPCMethod {
     public typealias Params = McpSetParams
     public typealias Result = McpSettings
     public static let name = "mcp.set"
+}
+
+/// How a Linux host's MCP stands on its tailnet name, as Tailscale says now.
+public enum McpServeGet: RPCMethod {
+    public typealias Params = HostParams
+    public typealias Result = McpServe
+    public static let name = "mcp.serve.get"
+}
+
+/// Turns MCP on a Linux host's tailnet name on or off: `mcp_tailscale`, and
+/// only the `/mcp` path on Tailscale Serve.
+public enum McpServeSet: RPCMethod {
+    public typealias Params = McpServeSetParams
+    public typealias Result = McpServe
+    public static let name = "mcp.serve.set"
 }
 
 public enum KeysList: RPCMethod {
@@ -1670,6 +1689,42 @@ public struct McpSetParams: Codable, Hashable, Sendable {
     public enum CodingKeys: String, CodingKey, CaseIterable {
         case host
         case tailscale
+    }
+}
+
+/// How a Linux host's MCP stands on its tailnet name.
+public struct McpServe: Codable, Hashable, Sendable {
+    /// Whether it's served there: `/mcp` on Tailscale Serve points at the
+    /// host's Tailscale listener, and `mcp_tailscale` is on.
+    public var on: Bool
+    /// Whether it can be changed now: Tailscale is there, up and logged in.
+    public var available: Bool
+    /// `https://<machine>.<tailnet>.ts.net/mcp`, while it's on.
+    public var url: String?
+    /// What the owner should know of how it stands, if anything.
+    public var note: String?
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case on
+        case available
+        case url
+        case note
+    }
+}
+
+/// Which way to turn MCP on a Linux host's tailnet name.
+public struct McpServeSetParams: Codable, Hashable, Sendable {
+    public var host: String?
+    public var on: Bool
+
+    public init(host: String? = nil, on: Bool) {
+        self.host = host
+        self.on = on
+    }
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case host
+        case on
     }
 }
 

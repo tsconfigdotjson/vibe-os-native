@@ -1,0 +1,20 @@
+{
+  "description": "How MCP stands on this host's tailnet name, as Tailscale says now: it only reads. In this session a stand-in for `tailscale` answers, as for a Linux host; a real Mac doesn't serve this way, and says so in `note`, with `available` false. Here `/mcp` on Serve is this host's, but `mcp_tailscale` is off, so it can't answer.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 9961,
+    "method": "mcp.serve.get",
+    "params": {
+      "host": "local"
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 9961,
+    "result": {
+      "available": true,
+      "note": "Tailscale serves /mcp for this host, but mcp_tailscale is off, so it can't answer. Turn this on to finish, or remove it with `tailscale serve --https=443 --set-path=/mcp off`.",
+      "on": false
+    }
+  }
+}

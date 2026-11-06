@@ -151,6 +151,14 @@ impl Core {
         let Some(on) = p.tailscale else {
             return Err(invalid("give at least one setting to change"));
         };
+        let l = self.write_mcp_tailscale(on)?;
+        self.publish(self.event(EventKind::McpChanged));
+        Ok(self.mcp_info(l.mcp_port, l.mcp_tailscale))
+    }
+
+    /// Writes `mcp_tailscale` into `host.toml`, keeping the rest of the file, and has the
+    /// listeners follow it at once.
+    pub(crate) fn write_mcp_tailscale(&self, on: bool) -> Result<HostLimits, ErrorObject> {
         let l = {
             let _one_at_a_time = lock(&self.limits_lock);
             limits::set_mcp_tailscale(&self.layout.host_config(), on).map_err(limits_error)?
@@ -159,9 +167,8 @@ impl Core {
             "vibed: MCP on the Tailscale address turned {}",
             if on { "on" } else { "off" }
         );
-        self.publish(self.event(EventKind::McpChanged));
         self.mcp_kick.notify_one();
-        Ok(self.mcp_info(l.mcp_port, l.mcp_tailscale))
+        Ok(l)
     }
 
     /// Serves MCP where `host.toml` says, until the task is aborted, and

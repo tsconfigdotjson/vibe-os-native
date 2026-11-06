@@ -10,13 +10,14 @@ use vibe_core::rpc::{
     AgentsSend, AgentsStart, DoctorCheckGet, DoctorFix, ErrorCode, ErrorObject, Event,
     EventsSubscribe, GhStatusGet, Hello, HelloParams, HelloResult, HostsAdd, HostsAdmin, HostsList,
     HostsRemove, HostsUpgrade, Id, KeysCreate, KeysList, KeysRevoke, KeysSync, KeysVerify,
-    LimitsGet, LimitsSet, McpGet, McpSet, Method, PROTOCOL_VERSION, PiForget, PiInstall,
-    PiLoginAnswer, PiLoginCancel, PiLoginGet, PiLoginStart, PiModelsGet, PiStatusGet,
-    ProfilesCreate, ProfilesDelete, ProfilesList, ProfilesUpdate, ProjectsAdd, ProjectsList,
-    ProjectsRemove, ProtocolMismatchData, Request, Response, ServicesAudit, ServicesComplete,
-    ServicesConnect, ServicesDisconnect, ServicesFollow, ServicesList, ServicesOverview,
-    ServicesSet, ServicesToken, SessionsAttach, SessionsList, Subscribed, ToolboxClose,
-    ToolboxLoginsGet, ToolboxOpen, ToolboxRebuild, ToolboxStatusGet, ToolboxUpdate, TunnelPrepare,
+    LimitsGet, LimitsSet, McpGet, McpServeGet, McpServeSet, McpSet, Method, PROTOCOL_VERSION,
+    PiForget, PiInstall, PiLoginAnswer, PiLoginCancel, PiLoginGet, PiLoginStart, PiModelsGet,
+    PiStatusGet, ProfilesCreate, ProfilesDelete, ProfilesList, ProfilesUpdate, ProjectsAdd,
+    ProjectsList, ProjectsRemove, ProtocolMismatchData, Request, Response, ServicesAudit,
+    ServicesComplete, ServicesConnect, ServicesDisconnect, ServicesFollow, ServicesList,
+    ServicesOverview, ServicesSet, ServicesToken, SessionsAttach, SessionsList, Subscribed,
+    ToolboxClose, ToolboxLoginsGet, ToolboxOpen, ToolboxRebuild, ToolboxStatusGet, ToolboxUpdate,
+    TunnelPrepare,
 };
 
 use crate::core::Core;
@@ -250,6 +251,10 @@ async fn call(
         LimitsSet::NAME => encode_result(core.set_limits(decode::<LimitsSet>(params)?)),
         McpGet::NAME => encode_result(core.mcp(decode::<McpGet>(params)?)),
         McpSet::NAME => encode_result(core.set_mcp(decode::<McpSet>(params)?)),
+        McpServeGet::NAME => encode_result(core.mcp_serve(decode::<McpServeGet>(params)?).await),
+        McpServeSet::NAME => {
+            encode_result(core.set_mcp_serve(decode::<McpServeSet>(params)?).await)
+        }
         KeysList::NAME => {
             decode::<KeysList>(params)?;
             encode_result(core.keys_everywhere().await)

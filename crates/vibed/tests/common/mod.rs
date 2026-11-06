@@ -350,6 +350,106 @@ pub fn publish_pi(root: &Path, version: &str, platform: &str) {
     fs::write(root.join("fd").join(format!("{target}.tar.gz.sha256")), sum).unwrap();
 }
 
+/// A stand-in for `tailscale`, as it's run for `/mcp` on Serve. No test gets the machine's
+/// own: it may be serving something. It logs each command, and takes only the ones VibeOS is
+/// to run, so any other fails. What it serves is `serve.json`, which `serve` puts
+/// `after-set.json` or `after-off.json` in place of; `on-set.sh` and `on-off.sh`, if they're
+/// there, run before that, and can say or do what the real one does instead.
+pub struct FakeTailscale {
+    pub dir: PathBuf,
+    pub program: PathBuf,
+}
+
+impl FakeTailscale {
+    /// This node's name in the fake's status.
+    pub const NAME: &'static str = "vps.tailnet-example.ts.net";
+
+    pub fn new(dir: &Path) -> FakeTailscale {
+        use std::os::unix::fs::PermissionsExt;
+        fs::create_dir_all(dir).unwrap();
+        let program = dir.join("tailscale");
+        let script = format!(
+            r#"#!/bin/sh
+d='{}'
+printf '%s\n' "$*" >> "$d/calls"
+case "$*" in
+"status --json --peers=false") cat "$d/status.json" ;;
+"serve status --json") cat "$d/serve.json" ;;
+"serve --bg --https=443 --set-path=/mcp "*)
+  [ -f "$d/on-set.sh" ] && . "$d/on-set.sh"
+  cp "$d/after-set.json" "$d/serve.json"
+  echo "Serve started and running in the background." ;;
+"serve --https=443 --set-path=/mcp off")
+  [ -f "$d/on-off.sh" ] && . "$d/on-off.sh"
+  cp "$d/after-off.json" "$d/serve.json" ;;
+*) echo "the fake tailscale doesn't take: $*" >&2; exit 64 ;;
+esac
+"#,
+            dir.display()
+        );
+        fs::write(&program, script).unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+        let fake = FakeTailscale {
+            dir: dir.to_owned(),
+            program,
+        };
+        fake.write(
+            "status.json",
+            &format!(
+                r#"{{"BackendState":"Running","TailscaleIPs":["{GOLDEN_TAILSCALE}"],"Self":{{"DNSName":"{}.","TailscaleIPs":["{GOLDEN_TAILSCALE}"]}}}}"#,
+                Self::NAME
+            ),
+        );
+        fake.write("serve.json", "{}");
+        fake.write("after-set.json", "{}");
+        fake.write("after-off.json", "{}");
+        fake
+    }
+
+    pub fn write(&self, file: &str, text: &str) {
+        fs::write(self.dir.join(file), text).unwrap();
+    }
+
+    pub fn read(&self, file: &str) -> String {
+        fs::read_to_string(self.dir.join(file)).unwrap_or_default()
+    }
+
+    /// The commands it's been given, one per line, oldest first.
+    pub fn calls(&self) -> Vec<String> {
+        self.read("calls").lines().map(str::to_owned).collect()
+    }
+
+    /// The commands that weren't only reads.
+    pub fn changes(&self) -> Vec<String> {
+        self.calls()
+            .into_iter()
+            .filter(|c| c != "status --json --peers=false" && c != "serve status --json")
+            .collect()
+    }
+
+    /// `serve status --json`, with `handlers` at `path: proxy target` on this node's `:443`,
+    /// laid out as Tailscale lays it out.
+    pub fn serving(handlers: &[(&str, &str)]) -> String {
+        if handlers.is_empty() {
+            return "{}".to_owned();
+        }
+        let handlers: Vec<String> = handlers
+            .iter()
+            .map(|(path, target)| format!(r#""{path}":{{"Proxy":"{target}"}}"#))
+            .collect();
+        format!(
+            r#"{{"TCP":{{"443":{{"HTTPS":true}}}},"Web":{{"{}:443":{{"Handlers":{{{}}}}}}}}}"#,
+            Self::NAME,
+            handlers.join(",")
+        )
+    }
+
+    /// This host's MCP, as Serve keeps its target.
+    pub fn our_target(port: u16) -> String {
+        format!("http://{GOLDEN_TAILSCALE}:{port}/mcp")
+    }
+}
+
 pub struct Golden {
     pub dir: tempfile::TempDir,
     /// Canonical, so paths vibed canonicalizes match it (macOS's temp dir
@@ -361,6 +461,9 @@ pub struct Golden {
     /// A stand-in for Linear, for the examples. No other test gets a broker.
     pub service: Option<FakeService>,
     logins: Arc<MemoryStore>,
+    /// The stand-in for `tailscale`, for the examples. No other test gets one by default,
+    /// and no test ever reaches the real one.
+    pub fake_tailscale: Option<FakeTailscale>,
 }
 
 impl Golden {
@@ -380,6 +483,7 @@ impl Golden {
             sessions: Vec::new(),
             service: None,
             logins: Arc::default(),
+            fake_tailscale: None,
         }
     }
 
@@ -390,6 +494,11 @@ impl Golden {
     /// agent's worktree has a change it hasn't committed.
     pub fn for_examples(mut self) -> Golden {
         self.seed_services();
+        // `/mcp` set up by hand on Serve, for this host, as the last examples find it.
+        let tailscale = FakeTailscale::new(&self.dir.path().canonicalize().unwrap().join("ts"));
+        let ours = FakeTailscale::our_target(vibe_core::limits::MCP_PORT);
+        tailscale.write("serve.json", &FakeTailscale::serving(&[("/mcp", &ours)]));
+        self.fake_tailscale = Some(tailscale);
         let origin = self.dir.path().canonicalize().unwrap().join("remotes/app");
         fs::create_dir_all(origin.join(".vibe")).unwrap();
         fs::write(
@@ -538,6 +647,10 @@ impl Golden {
         config.remote = Arc::new(GoldenRemote);
         // One Tailscale address, whatever this machine has.
         config.tailscale = Arc::new(|| vec![GOLDEN_TAILSCALE.parse().unwrap()]);
+        config.tailscale_cli = self
+            .fake_tailscale
+            .as_ref()
+            .map(|fake| fake.program.clone().into_os_string());
         // What vibe doctor finds: everything there but git using gh, and a
         // Mac that sleeps after 10 minutes; and the Linux images, with base
         // release 2 on its way (for_examples has it 40% downloaded).

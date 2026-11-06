@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use vibe_core::rpc::{
     ApiKey, HostParams, KeyCreateParams, KeyParams, KeysCreate, KeysList, KeysRevoke, McpGet,
-    NoParams,
+    McpServeGet, NoParams,
 };
 
 use crate::client;
@@ -88,7 +88,15 @@ pub(crate) fn run(socket: &Path, command: Command, url: &str) -> Result<(), Stri
             let served = client::call::<McpGet>(socket, &HostParams::default(), TIMEOUT).ok();
             let local = served.as_ref().map_or(url, |m| m.url.as_str());
             let mut how = format!("  {}", setup_line(local, &made.secret));
-            for ts in served.iter().flat_map(|m| &m.tailscale_urls) {
+            // Its tailnet name while that's on, as Settings gives it; otherwise its address.
+            let named = client::call::<McpServeGet>(socket, &HostParams::default(), TIMEOUT)
+                .ok()
+                .and_then(|serve| serve.url);
+            let tailnet: Vec<&String> = match &named {
+                Some(url) => vec![url],
+                None => served.iter().flat_map(|m| &m.tailscale_urls).collect(),
+            };
+            for ts in tailnet {
                 how.push_str(&format!(
                     "\n\nfrom another machine on your tailnet:\n\n  {}",
                     setup_line(ts, &made.secret)

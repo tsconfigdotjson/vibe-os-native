@@ -27,6 +27,7 @@ pub mod sessions;
 pub mod signin;
 pub mod sleep;
 pub mod status;
+pub mod tailscale;
 pub mod talk;
 pub mod tool_install;
 pub mod toolbox;
