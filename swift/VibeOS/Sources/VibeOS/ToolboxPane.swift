@@ -57,20 +57,12 @@ struct ToolboxPane: View {
                         Text(saving ? "Saving…" : summary.state)
                     }
                 }
-                if let versions = summary.versions {
-                    LabeledContent("New agents use", value: versions)
-                }
                 ForEach(summary.notes, id: \.self) { note in
                     Text(note)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 ErrorText(error: model.toolboxCloseError)
-            } footer: {
-                Text("Open Shell gives you a Linux command line in Terminal. Anything you install or sign in to "
-                    + "there is ready for every new Linux agent. To save, exit the shell or close its window; to "
-                    + "leave it running for later, press Control-\\. To sign in to Pi, use Settings → Agents instead.")
-                    .foregroundStyle(.secondary)
             }
             logInsSection
             Section {
@@ -83,12 +75,12 @@ struct ToolboxPane: View {
                             .disabled(model.toolbox?.state != .closed)
                             .help("Updates Linux for new agents, leaving behind what's listed above, then opens the "
                                 + "shell so you can install it again. To keep them instead, add them to your install "
-                                + "recipe, ~/.config/vibeos/toolbox.toml, and VibeOS tries again by itself.")
+                                + "list, ~/.config/vibeos/toolbox.toml, and VibeOS tries again by itself.")
                     } else {
                         Button("Reinstall Linux Tools…", action: rebuild)
                             .disabled(model.toolbox?.state != .closed)
                             .help("Gives new agents the newest Linux with your tools installed afresh, in Terminal. "
-                                + "Your install recipe, if you keep one, is ~/.config/vibeos/toolbox.toml.")
+                                + "Your install list, if you keep one, is ~/.config/vibeos/toolbox.toml.")
                     }
                     Spacer()
                     if summary.closable || model.toolboxClosing {
@@ -108,9 +100,8 @@ struct ToolboxPane: View {
 
     /// Always asks: what's in the template and not in toolbox.toml may not come along.
     private func rebuild() {
-        let detail = "New Linux agents get the newest Linux, with your tools installed afresh. What's in your "
-            + "install recipe comes back, and VibeOS tries to reinstall Debian and npm packages you installed by "
-            + "hand. Anything else you added outside your home folder doesn't come back, and VibeOS lists what it "
+        let detail = "New Linux agents get the newest Linux, with your tools installed again. VibeOS "
+            + "reinstalls what it can. Anything else you added outside your home folder doesn't come back, and VibeOS lists what it "
             + "can spot. Your logins and home folder stay."
         guard confirm("Reinstall Linux tools?", detail: detail, action: "Reinstall") else { return }
         model.runInTerminal(["toolbox", "rebuild"], exec: false)

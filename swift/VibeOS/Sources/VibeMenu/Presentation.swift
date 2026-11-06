@@ -229,25 +229,20 @@ public enum MCPSetup {
 }
 
 /// What Settings → Linux Toolbox says about the toolbox (PRD: The toolbox
-/// shell): what it's doing, the versions new agents boot, and a note or two
-/// (a newer base image the template is moving to, how the last run
-/// went). Only what vibed says now: the shell shows as open only while it
-/// is.
+/// shell): what it's doing, and a note or two (a newer base image the
+/// template is moving to, how the last run went). Only what vibed says now:
+/// the shell shows as open only while it is.
 public struct ToolboxSummary: Equatable, Sendable {
     /// What the toolbox is doing, in a word or two.
     public var state: String
     /// Whether it's busy with something that ends on its own.
     public var working: Bool
-    /// "Tools v3 · Logins & settings v2 · Linux v1", once there's any: the template, the
-    /// Linux home and the base image.
-    public var versions: String?
     public var notes: [String]
     /// Whether the shell is open, for Save & Close.
     public var closable: Bool
 
     public init(_ status: ToolboxStatus?) {
         working = false
-        versions = nil
         notes = []
         closable = status?.state == .open
         guard let status else {
@@ -271,11 +266,6 @@ public struct ToolboxSummary: Equatable, Sendable {
         }
         working = [.saving, .updating, .rebuilding].contains(status.state)
         guard status.state != .unavailable else { return }
-        var parts: [String] = []
-        if let template = status.template { parts.append("Tools v\(template)") }
-        if let home = status.home { parts.append("Logins & settings v\(home)") }
-        if let base = status.base { parts.append("Linux v\(base)") }
-        if !parts.isEmpty { versions = parts.joined(separator: " · ") }
         let held = status.rebuildHeld ?? []
         if let newest = status.newestBase, newest > (status.base ?? 0) {
             if held.isEmpty {
@@ -283,7 +273,7 @@ public struct ToolboxSummary: Equatable, Sendable {
             } else {
                 notes.append(
                     "A newer Linux is ready, but new agents stay on the current one for now. Updating would "
-                        + "lose these, which you installed by hand and aren't in your install recipe: "
+                        + "lose these, which you installed by hand and VibeOS can't put back: "
                         + held.joined(separator: ", ") + ".")
             }
         }
@@ -301,7 +291,7 @@ public struct ToolboxSummary: Equatable, Sendable {
                 notes.append("The last \(what) failed: \(error)")
             } else if !last.uncovered.isEmpty {
                 notes.append(
-                    "Left behind, as your install recipe doesn't cover them: "
+                    "Left behind, as VibeOS can't put them back: "
                         + last.uncovered.joined(separator: ", "))
             }
         }
@@ -358,8 +348,7 @@ public struct LoginsSummary: Equatable, Sendable {
         }
         switch (logins.home, logins.logins) {
         case (nil, _):
-            headline = "No GitHub or other tool logins saved yet. Sign in here, or in the shell for anything else, "
-                + "and they're kept."
+            headline = "No GitHub or other tool logins saved yet."
         case (_?, nil):
             headline = "VibeOS couldn't tell which logins are saved. Open the shell and exit it to look again."
         case (_?, let found?) where found.isEmpty:
@@ -432,27 +421,21 @@ public func keysPending(on hosts: [String]) -> String? {
     return "Key changes are pending on \(names). A key revoked here still works there until \(verb) next reachable."
 }
 
-/// What Settings → API Keys warns of: what a key can do, and that a key is no
-/// lock on this Mac's own login, as vibed's socket answers that login without
-/// one. Other accounts on this Mac can't reach that socket, so this says "your
-/// Mac login", not "anyone on this Mac".
+/// What Settings → API Keys warns of, in one sentence: what a key can do, and
+/// that a key is no lock on this Mac's own login, as vibed's socket answers
+/// that login without one. Other accounts on this Mac can't reach that socket,
+/// so this says "your Mac login", not "anyone on this Mac".
 public func keysWarning(linuxHosts: Bool) -> String {
     let reach = linuxHosts ? "this Mac and your Linux hosts" : "this Mac"
-    // A host that's away hasn't heard of a revoke yet (`keysPending`).
-    let revoke = linuxHosts
-        ? " If you stop trusting a key, revoke it. It stops working at once, though a Linux host that's away goes on "
-            + "accepting it until VibeOS reaches it again."
-        : " If you stop trusting a key, revoke it and it stops working at once."
-    return "Keep API keys private, like passwords. Anyone with a key can have VibeOS agents do whatever you can "
-        + "do on \(reach)." + revoke + " Anyone or anything already using your Mac login can "
-        + "control VibeOS without a key, so keep that login private too."
+    return "Keep API keys and your Mac login private, as anyone with either can have VibeOS agents do whatever "
+        + "you can do on \(reach)."
 }
 
 // MARK: Reaching MCP from elsewhere
 
 /// A word for Tailscale where MCP's settings are. It's optional, and VibeOS doesn't set it up.
 public let tailscaleSuggestion =
-    "To reach MCP from another machine, we suggest [Tailscale](https://tailscale.com). It's optional, "
+    "To reach MCP from another machine, you can use [Tailscale](https://tailscale.com). It's optional, "
     + "and both machines need it installed and signed in."
 
 // MARK: Rows, in words and symbols
@@ -882,17 +865,17 @@ public struct SetupProgress: Equatable, Sendable {
             return nil
         case .linked:
             return Step(
-                id: .command, title: "vibe command", detail: "Terminal and ssh find vibe in /usr/local/bin.",
+                id: .command, title: "vibe command", detail: "Terminal and ssh can find the vibe command.",
                 status: .done)
         case .missing:
             return Step(
                 id: .command, title: "Add the vibe command",
-                detail: "Links vibe into /usr/local/bin, for Terminal and ssh. macOS asks for your password.",
+                detail: "Lets Terminal and ssh find the vibe command. macOS asks for your password.",
                 status: .todo, action: .linkCommand, actionTitle: "Add…")
         case .other(let path):
             return Step(
                 id: .command, title: "Point vibe at this VibeOS",
-                detail: "/usr/local/bin/vibe is another vibe, at \(path).", status: .todo, action: .linkCommand,
+                detail: "Another vibe command is already installed, at \(path).", status: .todo, action: .linkCommand,
                 actionTitle: "Replace…")
         }
     }
@@ -989,17 +972,17 @@ public struct SetupProgress: Equatable, Sendable {
     private func welcomeDetail(_ check: DoctorCheck, claudeReady: Bool) -> String {
         if check.state == .pass || check.state == .working { return check.detail }
         switch check.id {
-        case .git: return "Agents' worktrees need git, from Apple's Command Line Tools."
+        case .git: return "Agents need git, from Apple's Command Line Tools."
         case .gh:
             return ghInstalled
                 ? "One click, in your browser, so agents can clone, push and open pull requests."
                 : check.detail
         case .ghGit:
-            return check.fixable ? check.detail : "Once gh is logged in."
+            return check.fixable ? check.detail : "Once GitHub is signed in."
         case .claude: return check.detail
         case .claudeLogin: return claudeReady ? "One click, in your browser." : "Once Claude Code is installed."
         case .power: return "Agents can't answer while this Mac sleeps. Turning it off asks for your password."
-        case .tailscale: return "Lets your other machines reach MCP here."
+        case .tailscale: return "Lets your other machines reach your agents over MCP."
         case .linger, .linux, .pi: return check.detail
         }
     }
@@ -1046,17 +1029,17 @@ public func checkTitle(_ id: CheckId, passed: Bool) -> String {
     case (.git, true): "git"
     case (.git, false): "Install git"
     case (.gh, true): "GitHub"
-    case (.gh, false): "Log in to GitHub"
-    case (.ghGit, true): "git through gh"
-    case (.ghGit, false): "Let git use gh for GitHub"
+    case (.gh, false): "Sign in to GitHub"
+    case (.ghGit, true): "Git uses your GitHub sign-in"
+    case (.ghGit, false): "Let Git use your GitHub sign-in"
     case (.claude, true): "Claude Code"
     case (.claude, false): "Install Claude Code"
     case (.claudeLogin, true): "Claude login"
     case (.claudeLogin, false): "Sign in to Claude Code"
     case (.power, true): "Sleep off"
     case (.power, false): "Keep this Mac awake"
-    case (.linger, true): "vibed stays up"
-    case (.linger, false): "Keep vibed up when you log out"
+    case (.linger, true): "VibeOS keeps running"
+    case (.linger, false): "Keep VibeOS running when you log out"
     case (.tailscale, true): "Tailscale"
     case (.tailscale, false): "Tailscale"
     case (.linux, true): "Linux"
@@ -1124,14 +1107,14 @@ public func headerAlerts(gh: GhStatus?, hosts: [HostInfo]) -> [HeaderAlert] {
             HeaderAlert(
                 id: "memory:\(host.name)", symbol: "memorychip", name: isMac ? nil : host.name,
                 headline: isMac ? "This Mac is short of memory" : "is short of memory",
-                detail: "Agents keep running, and it swaps. Delete agents you're done with to free some.",
+                detail: "Agents keep running, but may slow down. Delete agents you're done with to free some memory.",
                 reason: sentence(why), tone: .attention))
     }
     let ghAlert: (String, String)?
     switch gh?.state {
-    case .loggedOut?: ghAlert = ("GitHub CLI is logged out", "Agents on this Mac push with it. Sign in from Settings → Hosts.")
-    case .notInstalled?: ghAlert = ("GitHub CLI isn't installed", "Agents on this Mac push with it. VibeOS is installing it.")
-    case .error?: ghAlert = ("Can't check the GitHub login", "gh auth status didn't answer.")
+    case .loggedOut?: ghAlert = ("GitHub isn't signed in", "Agents on this Mac need it to push their work. Sign in from Settings → Hosts.")
+    case .notInstalled?: ghAlert = ("GitHub's gh tool isn't installed", "Agents on this Mac need it to push their work. VibeOS is installing it.")
+    case .error?: ghAlert = ("Can't check the GitHub login", "GitHub's gh tool didn't answer.")
     case .loggedIn?, .unknown?, nil: ghAlert = nil
     }
     if let ghAlert {
@@ -1169,8 +1152,8 @@ public func headerFacts(memory: HostMemory?, gh: GhStatus?, mcp: Bool, hosts: [H
     }
     let gitHub: (String, StatusTone)
     switch gh?.state {
-    case .loggedIn?: gitHub = (gh?.account ?? "Logged in", .normal)
-    case .loggedOut?: gitHub = ("Logged out", .attention)
+    case .loggedIn?: gitHub = (gh?.account ?? "Signed in", .normal)
+    case .loggedOut?: gitHub = ("Signed out", .attention)
     case .notInstalled?: gitHub = ("Not installed", .attention)
     case .error?: gitHub = ("Can't check", .attention)
     case .unknown?, nil: gitHub = ("Checking…", .normal)

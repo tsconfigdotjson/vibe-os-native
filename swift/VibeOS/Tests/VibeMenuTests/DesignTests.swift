@@ -61,7 +61,7 @@ import VibeRPC
         let badged = MenuBarGlyph.image(GlyphState(lit: 2, question: true, paused: true), awake: 2)
         #expect(!badged.isTemplate)
         #expect(badged.accessibilityDescription == "VibeOS, 2 agents awake, a question is waiting, an agent is paused")
-        #expect(MenuBarGlyph.image(GlyphState(lit: 0, connected: false)).accessibilityDescription == "VibeOS, can't reach vibed")
+        #expect(MenuBarGlyph.image(GlyphState(lit: 0, connected: false)).accessibilityDescription == "VibeOS, can't reach its background service")
         #expect(GlyphState(lit: 1).accessibilityLabel(awake: 1) == "VibeOS, 1 agent awake")
     }
 
@@ -654,7 +654,7 @@ typealias StepStatus = SetupProgress.Step.Status
             Issue.record("offline is \(offline.connection)")
             return
         }
-        #expect(why.contains("can't reach vibed"))
+        #expect(why.contains("can't reach VibeOS's background service"))
     }
 
     /// Every call a surface makes is answered, and decodes, so the gallery
@@ -788,7 +788,7 @@ typealias StepStatus = SetupProgress.Step.Status
         // A gh login missing.
         let out = try decode(GhStatus.self, ["state": "logged_out"])
         let worse = headerAlerts(gh: out, hosts: [hosts[1]])
-        #expect(worse.map(\.title) == ["GitHub CLI is logged out"])
+        #expect(worse.map(\.title) == ["GitHub isn't signed in"])
         #expect(worse.map(\.tone) == [.attention])
         // Nothing wrong, nothing shown.
         #expect(headerAlerts(gh: gh, hosts: Array(hosts.prefix(2))).isEmpty)
@@ -839,7 +839,7 @@ typealias StepStatus = SetupProgress.Step.Status
         #expect(alerts.map(\.title) == ["This Mac is short of memory", "vps is short of memory"])
         #expect(alerts.map(\.tone) == [.attention, .attention])
         #expect(alerts.map(\.reason) == ["macOS warns of memory pressure", "Its programs waited on memory 45% of the last 10 s"])
-        #expect(alerts.first?.detail == "Agents keep running, and it swaps. Delete agents you're done with to free some.")
+        #expect(alerts.first?.detail == "Agents keep running, but may slow down. Delete agents you're done with to free some memory.")
         let warned = headerFacts(memory: nil, gh: nil, mcp: true, hosts: [mac, vps])
         #expect(warned.first?.tone == .attention)
         #expect(warned.last?.tone == .attention)

@@ -105,7 +105,7 @@ struct NewAgentView: View {
                         .textFieldStyle(.roundedBorder)
                         .labelsHidden()
                         .autocorrectionDisabled()
-                        .help("The agent's ref and branch. Left empty, it gets three random words, such as quiet-amber-otter.")
+                        .help("The agent's name, also used as its Git branch. Left empty, it gets three random words, such as quiet-amber-otter.")
                 }
             }
             .disabled(starting)
@@ -119,7 +119,7 @@ struct NewAgentView: View {
 
             HStack {
                 if starting {
-                    Working(text: "Cutting a worktree, then starting \(chosen?.kind.title ?? "the agent")…")
+                    Working(text: "Setting up its working copy, then starting \(chosen?.kind.title ?? "the agent")…")
                 }
                 Spacer()
                 Button("Cancel") { dismissWindow(id: WindowID.newAgent) }

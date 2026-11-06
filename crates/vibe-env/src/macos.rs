@@ -279,8 +279,7 @@ impl Macos {
             .find(|c| is_executable(c))
             .ok_or_else(|| {
                 EnvError::new(format!(
-                    "can't find claude for macos agents: it isn't on your login shell's PATH \
-                     ({path}). VibeOS installs it by itself: try again in a moment"
+                    "can't find Claude Code for macOS agents (looked in {path}). VibeOS installs it by itself: try again in a moment"
                 ))
             })
     }
@@ -299,8 +298,7 @@ impl Macos {
             .find(|c| is_executable(c))
             .ok_or_else(|| {
                 EnvError::new(format!(
-                    "can't find pi for macos agents: it isn't on your login shell's PATH \
-                     ({path}). VibeOS installs it by itself when a profile here runs Pi"
+                    "can't find Pi for macOS agents (looked in {path}). VibeOS installs it by itself when a profile here runs Pi"
                 ))
             })
     }
@@ -1138,7 +1136,7 @@ mod tests {
         fs::create_dir(&bin).unwrap();
         let m = Macos::new(home.path()).with_path(bin.to_string_lossy().into_owned());
         let err = m.claude().unwrap_err();
-        assert!(err.message().contains("can't find claude"), "{err}");
+        assert!(err.message().contains("can't find Claude Code"), "{err}");
         // Not executable isn't found either.
         fs::write(bin.join("claude"), "#!/bin/sh\n").unwrap();
         assert!(m.claude().is_err());

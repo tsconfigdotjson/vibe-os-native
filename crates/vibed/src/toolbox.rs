@@ -812,7 +812,7 @@ impl Core {
                 self.keep(&kept);
                 self.toolbox_closed();
                 self.toolbox_event(format!(
-                    "The template stays on its base image for now: moving it would lose {}.",
+                    "Linux for new agents stays as it is for now: updating it would lose {}.",
                     kept.moved
                         .as_ref()
                         .map(|m| m.held.join(", "))

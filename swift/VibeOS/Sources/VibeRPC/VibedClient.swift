@@ -18,13 +18,13 @@ public enum VibedClientError: Error, Equatable, CustomStringConvertible {
         switch self {
         case .socketPathTooLong(let path): "the socket path is too long: \(path)"
         case .connect(let path, let code):
-            "can't reach vibed at \(path): \(String(cString: strerror(code))) (is vibed running?)"
-        case .io(let code): "talking to vibed: \(String(cString: strerror(code)))"
-        case .timedOut: "vibed didn't answer in time"
-        case .closed: "vibed closed the connection before answering"
-        case .messageTooLarge: "vibed's answer is too large"
-        case .badResponse(let why): "unexpected answer from vibed: \(why)"
-        case .rpc(let error): "vibed: \(error)"
+            "can't reach VibeOS's background service at \(path): \(String(cString: strerror(code))) (is it running?)"
+        case .io(let code): "talking to VibeOS's background service: \(String(cString: strerror(code)))"
+        case .timedOut: "VibeOS's background service didn't answer in time"
+        case .closed: "VibeOS's background service closed the connection before answering"
+        case .messageTooLarge: "the answer from VibeOS's background service is too large"
+        case .badResponse(let why): "unexpected answer from VibeOS's background service: \(why)"
+        case .rpc(let error): "VibeOS's background service: \(error)"
         }
     }
 }

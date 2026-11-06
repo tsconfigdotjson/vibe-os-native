@@ -186,7 +186,7 @@ struct PiModelPicker: View {
                 Text("Signed in").font(.caption).foregroundStyle(Palette.signal)
             } else if provider.ambient {
                 Text("From what's around it").font(.caption).foregroundStyle(.secondary)
-                    .help("It can sign in from a cloud profile or role, which can't be told from here.")
+                    .help("It may sign in another way that VibeOS can't see from here.")
             } else {
                 Text("Not signed in").font(.caption).foregroundStyle(.secondary)
             }
@@ -412,7 +412,7 @@ struct PiSignInSheet: View {
             // and that's on the host.
             if !opensItself && login.code == nil {
                 Text(
-                    "If the page ends somewhere that won't load, this way can't finish from another machine. "
+                    "If the page won't load at the end, this sign-in can't finish from another machine. "
                         + "Cancel and choose a device code, if it offers one."
                 )
                 .font(.callout)

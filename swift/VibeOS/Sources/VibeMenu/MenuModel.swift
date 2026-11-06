@@ -750,7 +750,7 @@ extension MenuModel {
         do {
             try installer.restartService()
         } catch {
-            message = "This VibeOS is \(mine), but vibed is still \(running): \(describe(error))"
+            message = "This VibeOS is \(mine), but its background service is still \(running): \(describe(error))"
         }
     }
 }

@@ -305,7 +305,7 @@ impl HostChecks for Machine {
                     let legacy = self.home.join(".claude/local/claude");
                     legacy.is_file().then_some(legacy)
                 })
-                .ok_or("claude isn't on your login shell's PATH")?,
+                .ok_or("Claude Code isn't installed, or your login shell can't find it")?,
         };
         match self.run(&[&claude.to_string_lossy(), "--version"])? {
             (true, text) => Ok((claude, first_line(&text))),
@@ -322,7 +322,7 @@ impl HostChecks for Machine {
             Some(p) => p.clone(),
             None => self
                 .which("pi")
-                .ok_or("Pi isn't on your login shell's PATH")?,
+                .ok_or("Pi isn't installed, or your login shell can't find it")?,
         };
         match self.run(&[&pi.to_string_lossy(), "--version"])? {
             (true, text) => Ok((pi, first_line(&text))),
@@ -807,13 +807,13 @@ fn report(
         Ok(None) => {}
         Ok(Some(true)) => checks.push(pass(
             CheckId::Linger,
-            "vibed runs while you're logged out, and starts again after a reboot",
+            "VibeOS runs while you're logged out, and starts again after a reboot",
         )),
         Ok(Some(false)) => checks.push(lingering_off(
-            "Lingering is off, so vibed stops when you log out of this server".to_owned(),
+            "VibeOS stops when you log out of this server".to_owned(),
         )),
         Err(why) => checks.push(lingering_off(format!(
-            "Lingering is off, so vibed stops when you log out of this server: {why}"
+            "VibeOS stops when you log out of this server: {why}"
         ))),
     }
     checks.push(match tailscale.first() {
@@ -974,14 +974,14 @@ impl Core {
                 .load(std::sync::atomic::Ordering::SeqCst)
         {
             check.state = CheckState::Optional;
-            check.detail = "VibeOS is moving the Linux template to the new base image.".to_owned();
+            check.detail = "VibeOS is updating Linux for new agents.".to_owned();
             check.hint = None;
         } else if !held.is_empty() {
             check.state = CheckState::Optional;
             check.detail = format!(
-                "The Linux template stays on its base image for now: moving it would lose what \
-                 was installed by hand and VibeOS can't put back: {}. Settings → Linux Toolbox \
-                 moves it with one click.",
+                "Linux for new agents stays as it is for now: updating it would lose what was \
+                 installed by hand and VibeOS can't put back: {}. Settings → Linux Toolbox \
+                 updates it with one click.",
                 held.join(", ")
             );
             check.hint = None;
@@ -1157,7 +1157,7 @@ mod tests {
                 "2.1.314 (Claude Code)".into(),
             )),
             claude_login: Ok("Claude Code is signed in".into()),
-            pi: Err("Pi isn't on your login shell's PATH".into()),
+            pi: Err("Pi isn't installed, or your login shell can't find it".into()),
             system_sleep: Ok(Some(0)),
             linger: Ok(None),
         }
@@ -1225,9 +1225,9 @@ mod tests {
             git: Err("git needs Apple's Command Line Tools, which aren't installed".into()),
             git_uses_gh: Ok(false),
             owners_helper: false,
-            claude: Err("claude isn't on your login shell's PATH".into()),
+            claude: Err("Claude Code isn't installed, or your login shell can't find it".into()),
             claude_login: Err("Claude Code isn't signed in".into()),
-            pi: Err("Pi isn't on your login shell's PATH".into()),
+            pi: Err("Pi isn't installed, or your login shell can't find it".into()),
             system_sleep: Ok(Some(10)),
             linger: Ok(None),
         };
@@ -1645,7 +1645,7 @@ rmdir "{h}""#,
         assert!(
             m.claude()
                 .unwrap_err()
-                .contains("isn't on your login shell's PATH")
+                .contains("your login shell can't find it")
         );
         if cfg!(target_os = "macos") {
             assert_eq!(m.claude_login(), no_claude_login(true));

@@ -272,7 +272,7 @@ public final class AppleScriptTerminal: TerminalScripting {
         } while Date() < deadline
         throw TerminalError.failed(
             "Terminal didn't answer within \(Int(launchTimeout)) s of starting (\(why)). "
-                + "It has to run in the logged-in GUI session.")
+                + "It has to run while you're logged in to this Mac.")
     }
 
     public func runWithoutScripting(_ command: String) throws {
@@ -294,7 +294,7 @@ public final class AppleScriptTerminal: TerminalScripting {
 
     private func execute(_ source: String) throws -> NSAppleEventDescriptor {
         guard let script = NSAppleScript(source: source) else {
-            throw TerminalError.failed("the AppleScript for Terminal doesn't compile")
+            throw TerminalError.failed("VibeOS couldn't talk to Terminal")
         }
         var info: NSDictionary?
         let result = script.executeAndReturnError(&info)

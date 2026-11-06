@@ -769,8 +769,8 @@ impl Toolbox {
                 .find(|p| p.contains("unknown setting"))
             {
                 return Err(err(format!(
-                    "base image {}'s vibe-guest is too old for the toolbox ({p}), so it can't \
-                     open until the template moves to the newest base image",
+                    "Linux {} is too old for the toolbox ({p}), so it can't open until VibeOS \
+                     has updated it",
                     plan.base.version
                 )));
             }
@@ -1044,7 +1044,7 @@ impl ToolboxHost for Toolbox {
         let base = match &unsaved {
             Some(u) => self.images.installed(u.base).ok_or_else(|| {
                 err(format!(
-                    "the unsaved toolbox was on base image {}, which is gone",
+                    "the unsaved toolbox was on Linux {}, which is gone",
                     u.base
                 ))
             })?,

@@ -748,7 +748,7 @@ fn shared_services_go_by_what_the_running_guest_says() {
             vm.old_guest = true;
         });
     let why = s.backend.services_unsupported(&h).unwrap().unwrap();
-    assert!(why.contains("once the template has moved"), "{why}");
+    assert!(why.contains("once Linux is updated"), "{why}");
     assert!(s.backend.services_relay(&h).unwrap().is_none());
 }
 

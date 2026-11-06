@@ -153,7 +153,7 @@ public final class FixtureDaemon: DaemonConnection, @unchecked Sendable {
                     "version": "0.1.0", "missing": ["claude"],
                 ] as [String: Any],
                 "notes": [
-                    "Lingering is on for you on vps.example.com, so vibed runs when you're logged out and starts "
+                    "VibeOS keeps running on vps.example.com when you're logged out, and starts "
                         + "again after a reboot."
                 ],
             ]
@@ -314,7 +314,7 @@ public final class FixtureDaemon: DaemonConnection, @unchecked Sendable {
         // runs Pi need it, so a Mac without it has nothing to do about it.
         let piInstalled = check(.pi, .pass, "Pi 1.5.0 is at \(macHome)/.local/bin/pi.")
         let noPi = check(
-            .pi, .optional, "Pi isn't on your login shell's PATH.",
+            .pi, .optional, "Pi isn't installed, or your login shell can't find it.",
             hint: "Only agents whose profile runs Pi need it: install it in Settings → Agents.")
         switch scenario {
         case .busy, .quiet, .offline, .demo:
@@ -345,7 +345,7 @@ public final class FixtureDaemon: DaemonConnection, @unchecked Sendable {
                     hint: "VibeOS installs it by itself."),
                 check(.ghGit, .optional, "VibeOS has git use gh for GitHub as soon as gh is logged in."),
                 check(
-                    .claude, .fail, "claude isn't on your login shell's PATH.",
+                    .claude, .fail, "Claude Code isn't installed, or your login shell can't find it.",
                     hint: "VibeOS installs it by itself."),
                 check(
                     .claudeLogin, .fail, "Claude Code can sign in once it's installed.",

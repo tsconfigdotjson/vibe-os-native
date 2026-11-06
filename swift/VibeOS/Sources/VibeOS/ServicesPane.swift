@@ -228,8 +228,8 @@ private struct ServiceConnectionRow: View {
                 confirm(
                     "Move \(service.title)'s login to \(hostLabel(host, model: model))?",
                     detail: "You'll sign in again in your browser. The login on \(ownerLabel) is then forgotten, and "
-                        + "every other host uses the new one. That works even if \(ownerLabel) is away: it's told "
-                        + "when it's next reachable.",
+                        + "every other host uses the new one. If \(ownerLabel) is offline, it finds out "
+                        + "when it's back.",
                     action: "Sign In")
             else { return }
         }
@@ -345,16 +345,16 @@ private struct ServiceHostRow: View {
             Toggle(
                 "Read-only",
                 isOn: Binding(get: { info.readOnly }, set: { on in Task { await change { $0.readOnly = on } } }))
-            .help("Agents reach \(info.title)'s read-only endpoint")
+            .help("Agents use \(info.title)'s read-only access")
             Toggle(
                 "Run tools without asking",
                 isOn: Binding(get: { info.autoAllow }, set: { on in Task { await change { $0.autoAllow = on } } }))
-            .help("Claude Code agents started from here on run \(info.title)'s tools, writes included, with no "
-                + "permission prompt. Off, its prompts govern them.")
+            .help("Claude Code agents started from here on run \(info.title)'s tools, changes included, with no "
+                + "permission prompt. Off, the usual permission prompts apply.")
             LabeledContent("Denied tools") {
                 CommitField(
                     title: "Denied tools", value: info.deniedTools.joined(separator: ", "), width: 260,
-                    help: "Tool names, by commas: no agent here may list or call them", trailing: false,
+                    help: "Tool names, separated by commas: no agent here can see or use them", trailing: false,
                     isValid: { _ in true }
                 ) { text in
                     await change { $0.deniedTools = parseToolNames(text) }

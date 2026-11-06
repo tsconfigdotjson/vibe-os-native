@@ -154,7 +154,7 @@ import VibeRPC
         #expect(unknown.signInHint == "Can't read the Claude login for linux agents: locked")
         let none = LoginsSummary(try decode(ToolboxLogins.self, ["logins": [Any](), "claude": true] as [String: Any]))
         // Claude's login isn't among these, so this must not say nothing's saved.
-        #expect(none.headline.hasPrefix("No GitHub or other tool logins saved yet."))
+        #expect(none.headline == "No GitHub or other tool logins saved yet.")
         #expect(LoginTool.allCases.map(toolName) == ["GitHub (gh)", "Google Cloud", "Git identity", "SSH key"])
     }
 
@@ -162,7 +162,7 @@ import VibeRPC
         #expect(ToolboxSummary(nil).state == "Loading…")
         let none = ToolboxSummary(try decode(ToolboxStatus.self, ["state": "unavailable"]))
         #expect(none.state == "Not on this host")
-        #expect(none.versions == nil && none.notes.isEmpty)
+        #expect(none.notes.isEmpty)
         var status = try decode(
             ToolboxStatus.self,
             [
@@ -173,11 +173,10 @@ import VibeRPC
         // Closed says closed: only an open shell says to exit it (#46).
         #expect(summary.state == "Closed")
         #expect(!summary.working && !summary.closable)
-        #expect(summary.versions == "Tools v3 · Logins & settings v2 · Linux v1")
         #expect(
             summary.notes == [
                 "A newer Linux is ready. VibeOS updates new agents to it by itself.",
-                "Left behind, as your install recipe doesn't cover them: apt: htop",
+                "Left behind, as VibeOS can't put them back: apt: htop",
             ])
         status.state = .open
         status.newestBase = 1
@@ -205,7 +204,31 @@ import VibeRPC
             status.state = state
             let words = ([ToolboxSummary(status).state] + ToolboxSummary(status).notes).joined(separator: " ")
             #expect(!words.contains("Claude"), "\(state)")
+            // vibed still says the versions, but people aren't shown them (#150).
+            #expect(words.range(of: #"\bv\d"#, options: .regularExpression) == nil, "\(state)")
         }
+    }
+
+    /// One reader, not a technical one: setup and the toolbox say what's
+    /// happening, not what's underneath (#150).
+    @Test func setupAndTheToolboxKeepToPlainWords() throws {
+        for id in [CheckId.gh, .ghGit, .linger] {
+            for passed in [true, false] {
+                let title = checkTitle(id, passed: passed)
+                #expect(!title.contains("vibed"), "\(id)")
+                #expect(!title.contains("Log in"), "\(id)")
+                #expect(!title.contains("through gh"), "\(id)")
+            }
+        }
+        let status = try decode(
+            ToolboxStatus.self,
+            [
+                "state": "closed", "base": 1, "newest_base": 2, "rebuild_held": ["apt: htop"],
+                "last": ["action": "rebuild", "at": "2026-10-30T12:00:00Z", "uncovered": ["apt: htop"]] as [String: Any],
+            ] as [String: Any])
+        let notes = ToolboxSummary(status).notes
+        #expect(notes.contains { $0.contains("VibeOS can't put back: apt: htop") })
+        #expect(!notes.joined(separator: " ").contains("recipe"))
     }
 
     /// Settings → Projects → a project, then a click in the sidebar: the
@@ -253,14 +276,16 @@ import VibeRPC
         let alone = keysWarning(linuxHosts: false)
         #expect(alone.contains("do whatever you can do on this Mac."))
         #expect(!alone.contains("internet"))
-        #expect(alone.contains("revoke it and it stops working at once."))
         let hosts = keysWarning(linuxHosts: true)
         #expect(hosts.contains("on this Mac and your Linux hosts."))
-        // A revoke doesn't reach a host that's away, so this can't say it does.
-        #expect(hosts.contains("a Linux host that's away goes on accepting it"))
         // vibed's socket takes no key, and only this login can reach it.
-        #expect(alone.contains("already using your Mac login can control VibeOS without a key"))
-        #expect(!alone.contains("anyone on this Mac"))
+        #expect(alone.contains("Keep API keys and your Mac login private"))
+        #expect(!alone.lowercased().contains("anyone on this mac"))
+        // One sentence, however many hosts there are (#150).
+        for warning in [alone, hosts] {
+            #expect(warning.filter { ".!?".contains($0) } == ".")
+            #expect(warning.hasSuffix("."))
+        }
     }
 
     @Test func aKeySaysWhenItWasLastUsed() {
@@ -306,7 +331,7 @@ import VibeRPC
 /// The word for Tailscale, which must stay a suggestion and not promise it just works.
 @Suite struct TailscaleSuggestionTests {
     @Test func itSuggestsAndSaysWhatItNeeds() {
-        #expect(tailscaleSuggestion.contains("we suggest [Tailscale](https://tailscale.com)"))
+        #expect(tailscaleSuggestion.contains("you can use [Tailscale](https://tailscale.com)"))
         #expect(tailscaleSuggestion.contains("optional"))
         #expect(tailscaleSuggestion.contains("both machines need it installed and signed in"))
     }

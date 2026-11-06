@@ -29,7 +29,7 @@ public struct GlyphState: Equatable, Sendable {
 
     /// What VoiceOver says for the icon.
     public func accessibilityLabel(awake: Int) -> String {
-        guard connected else { return "VibeOS, can't reach vibed" }
+        guard connected else { return "VibeOS, can't reach its background service" }
         var parts = ["VibeOS", awake == 1 ? "1 agent awake" : "\(awake) agents awake"]
         if question { parts.append("a question is waiting") }
         if paused { parts.append("an agent is paused") }

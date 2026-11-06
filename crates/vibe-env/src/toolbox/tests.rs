@@ -356,7 +356,7 @@ fn a_base_whose_guest_predates_the_toolbox_is_refused() {
         vec!["the kernel command line: `vibe.home=home`: unknown setting `vibe.home`".into()];
     let e = s.toolbox.open().unwrap_err();
     assert!(e.message().contains("too old for the toolbox"), "{e}");
-    assert!(e.message().contains("until the template moves"), "{e}");
+    assert!(e.message().contains("until VibeOS has updated it"), "{e}");
     assert!(!s.fake.vm(&s.socket()).running);
     assert!(!s.toolbox.is_open() && !s.working("template.img").exists());
 }
