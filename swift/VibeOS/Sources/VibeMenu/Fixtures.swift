@@ -124,7 +124,7 @@ public final class FixtureDaemon: DaemonConnection, @unchecked Sendable {
         case KeysList.name:
             return ["keys": setUp ? keys : []]
         case KeysCreate.name:
-            let name = params["name"] as? String ?? "laptop Claude Code"
+            let name = params["name"] as? String ?? "Claude Code on my laptop"
             return [
                 "key": ["name": name, "prefix": "vk_q7m2xk4p", "created_at": time(0)],
                 "secret": "vk_q7m2xk4pR8vN3cT6wY1zA5bE9hJ2kL4mP7sU0dF3gH6",
@@ -374,7 +374,7 @@ public final class FixtureDaemon: DaemonConnection, @unchecked Sendable {
     var keys: [[String: Any]] {
         if demo { return demoKeys }
         return [
-            ["name": "laptop Claude Code", "prefix": "vk_aaaqeaye", "created_at": time(3 * 86400), "last_used_at": time(240)],
+            ["name": "Claude Code on my laptop", "prefix": "vk_aaaqeaye", "created_at": time(3 * 86400), "last_used_at": time(240)],
             ["name": "cloud orchestrator", "prefix": "vk_b7d2kq9m", "created_at": time(86400)],
         ]
     }
@@ -482,7 +482,7 @@ extension FixtureDaemon {
     fileprivate var demoKeys: [[String: Any]] {
         [
             [
-                "name": "laptop Claude Code", "prefix": "vk_demo4f2a", "created_at": time(3 * 86400),
+                "name": "Claude Code on my laptop", "prefix": "vk_demo4f2a", "created_at": time(3 * 86400),
                 "last_used_at": time(240),
             ],
             [

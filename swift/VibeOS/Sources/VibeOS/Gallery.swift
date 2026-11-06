@@ -102,7 +102,7 @@ struct GallerySurface {
     static func all(_ m: GalleryModels, demo: Bool) -> [GallerySurface] {
         let fixture = FixtureDaemon(.busy)
         let install = try? fixture.call(HostsAdd.self, HostAddParams(name: "vps", address: "me@vps.example.com"))
-        let key = try? fixture.call(KeysCreate.self, KeyCreateParams(name: "laptop Claude Code"))
+        let key = try? fixture.call(KeysCreate.self, KeyCreateParams(name: "Claude Code on my laptop"))
         let settings = CGSize(width: 780, height: 600)
         var surfaces: [GallerySurface] = [
             GallerySurface(name: "menu", frame: .menu, view: AnyView(MenuView(model: m.busy))),

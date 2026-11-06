@@ -1005,3 +1005,28 @@ fn the_contract_and_the_app_have_no_pi_sign_in_and_keep_pis_list() {
     assert!(hosts.contains("Sign In to GitHub"));
     assert!(sources.join("SignInView.swift").is_file());
 }
+
+/// What the app says of hosts and MCP, held here as Swift can't be built on every machine
+/// (#158): no sample agent in Add Linux Host, one way to say a Tailscale toggle, and a key
+/// name that reads as one and is one.
+#[test]
+fn hosts_and_keys_say_things_one_way() {
+    let sources = protocol_dir().join("../swift/VibeOS/Sources/VibeOS");
+    let read = |name: &str| std::fs::read_to_string(sources.join(name)).unwrap();
+    assert!(!read("AddHostView.swift").contains("quiet-amber-otter"));
+    let settings = read("SettingsView.swift");
+    for said in [
+        "Serve MCP on this Mac's Tailscale address",
+        "Serve MCP on \\(host.name)'s Tailscale address",
+        "Stop serving MCP on \\(host.name)'s Tailscale address?",
+    ] {
+        assert!(settings.contains(said), "{said}");
+    }
+    for gone in ["Also serve MCP", "Tailscale name", "Update vibed on"] {
+        assert!(!settings.contains(gone), "{gone}");
+    }
+    assert!(settings.contains("Text(hostStatusLine(host))"));
+    let example = "Claude Code on my laptop";
+    assert!(settings.contains(&format!("prompt: Text(\"{example}\")")));
+    assert_eq!(vibe_core::model::validate_key_name(example), Ok(()));
+}

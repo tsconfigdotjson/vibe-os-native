@@ -73,7 +73,7 @@ struct AddHostView: View {
                 VStack(alignment: .leading, spacing: 3) {
                     Text("Add a Linux Host").font(.headline)
                     Text("VibeOS signs in with your SSH keys, installs itself there under your own account, and "
-                        + "links it to this Mac. Its agents then show in this menu as \(shownName):quiet-amber-otter.")
+                        + "links it to this Mac. Its agents then show in this menu.")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -115,8 +115,6 @@ struct AddHostView: View {
             }
         }
     }
-
-    private var shownName: String { trimmedName.isEmpty ? "vps" : trimmedName }
 
     /// A name from the destination's host, until one is typed: `vps` for
     /// `me@vps.example.com`.

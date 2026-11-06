@@ -751,7 +751,7 @@ pub fn ref_from_bytes(bytes: [u8; 3]) -> String {
 }
 
 /// API key names are only shown, never used as paths: anything printable up
-/// to 100 characters, such as "laptop Claude Code".
+/// to 100 characters, such as "Claude Code on my laptop".
 pub fn validate_key_name(name: &str) -> Result<(), String> {
     let ok = !name.trim().is_empty()
         && name.trim() == name
@@ -1144,7 +1144,7 @@ mod tests {
     fn key_names() {
         for ok in [
             "laptop",
-            "laptop Claude Code",
+            "Claude Code on my laptop",
             "CI (staging) ✓",
             &"k".repeat(100),
         ] {
