@@ -18,10 +18,9 @@ use serde_json::Value;
 pub use crate::limits::HostLimits;
 pub use crate::model::{
     Activity, AdminNeed, AgentKind, AgentState, Certainty, CheckId, CheckState, Environment,
-    EventKind, GhState, HostLink, LoginTool, MessageRole, Mode, Model, PiLoginMethod, PiLoginState,
-    PiPromptKind, PiTarget, Profile, ProjectSource, Reasoning, ServiceRole, ServiceState,
-    SessionState, SignInState, SignInWhat, StopReason, ToolboxAction, ToolboxState, TunnelState,
-    WakeupKind,
+    EventKind, GhState, HostLink, LoginTool, MessageRole, Mode, Model, PiTarget, Profile,
+    ProjectSource, Reasoning, ServiceRole, ServiceState, SessionState, SignInState, SignInWhat,
+    StopReason, ToolboxAction, ToolboxState, TunnelState, WakeupKind,
 };
 
 /// Bumped on any incompatible change to the contract. Clients send theirs in
@@ -404,10 +403,6 @@ pub const METHODS: &[&str] = &[
     PiInstall::NAME,
     PiForget::NAME,
     PiModelsGet::NAME,
-    PiLoginStart::NAME,
-    PiLoginGet::NAME,
-    PiLoginAnswer::NAME,
-    PiLoginCancel::NAME,
     DoctorCheckGet::NAME,
     DoctorFix::NAME,
     ServicesList::NAME,
@@ -786,31 +781,6 @@ method! {
     /// long as that download. An answer is kept until what it depends on changes.
     /// Why there's no list goes in `error`. Never changes a login.
     PiModelsGet = "pi.models", PiModelsParams => PiModels
-}
-
-method! {
-    /// `pi.login.start`: starts Pi's own sign-in to a provider, ending one already
-    /// under way, and answers when there's something to show or ask. The login
-    /// lands where that target's agents get theirs, as `/login` there would.
-    PiLoginStart = "pi.login.start", PiLoginStartParams => PiLogin
-}
-
-method! {
-    /// `pi.login.get`: how a sign-in stands. If it's still as `seen` says, this
-    /// answers when that changes, or after a while with the same.
-    PiLoginGet = "pi.login.get", PiLoginGetParams => PiLogin
-}
-
-method! {
-    /// `pi.login.answer`: answers a question a sign-in asked, and answers with how
-    /// it stands once it's moved on, or after a while.
-    PiLoginAnswer = "pi.login.answer", PiLoginAnswerParams => PiLogin
-}
-
-method! {
-    /// `pi.login.cancel`: gives up on a sign-in, once it's over if it isn't yet.
-    /// One that's over already stays as it ended.
-    PiLoginCancel = "pi.login.cancel", PiLoginParams => PiLogin
 }
 
 method! {
@@ -1786,13 +1756,6 @@ pub struct PiProvider {
     /// Whether it can sign in from what's around it, which can't be told from here:
     /// `signed_in` says only that there's no login.
     pub ambient: bool,
-    /// Whether it can be signed in to with an account.
-    pub oauth: bool,
-    /// What Pi calls that, if it says.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub oauth_label: Option<String>,
-    /// Whether it can be signed in to with an API key.
-    pub api_key: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<PiModel>,
 }
@@ -1805,110 +1768,6 @@ pub struct PiModel {
     /// What it's called, if that's more than its id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PiLoginStartParams {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub host: Option<String>,
-    pub target: PiTarget,
-    /// The provider, by name.
-    pub provider: String,
-    pub method: PiLoginMethod,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PiLoginParams {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub host: Option<String>,
-    pub id: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PiLoginGetParams {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub host: Option<String>,
-    pub id: String,
-    /// The `seq` last seen. Absent, it answers at once.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub seen: Option<u64>,
-}
-
-// By hand, below: its value can be an API key.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PiLoginAnswerParams {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub host: Option<String>,
-    pub id: String,
-    /// The question's `id`.
-    pub prompt: String,
-    pub value: String,
-}
-
-impl fmt::Debug for PiLoginAnswerParams {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("PiLoginAnswerParams")
-            .field("host", &self.host)
-            .field("id", &self.id)
-            .field("prompt", &self.prompt)
-            .finish_non_exhaustive()
-    }
-}
-
-/// How a Pi sign-in stands, whole: what to show is what's here. No answer given to
-/// it, and nothing of the login, is ever in it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PiLogin {
-    pub id: String,
-    pub host: String,
-    pub target: PiTarget,
-    pub provider: String,
-    pub method: PiLoginMethod,
-    /// Goes up with each change.
-    pub seq: u64,
-    pub state: PiLoginState,
-    /// A page to open, always `https`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub url: Option<String>,
-    /// What to do there, in Pi's words.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub instructions: Option<String>,
-    /// A code to enter at that page.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub code: Option<String>,
-    /// How it's going, in Pi's words.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub progress: Option<String>,
-    /// What it's waiting to be told.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prompt: Option<PiLoginPrompt>,
-    /// Why it failed, in words.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
-/// A question a Pi sign-in is asking.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PiLoginPrompt {
-    pub id: String,
-    pub kind: PiPromptKind,
-    pub message: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub placeholder: Option<String>,
-    /// For `select`, what it can be.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub options: Vec<PiLoginOption>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PiLoginOption {
-    /// What to answer with.
-    pub id: String,
-    pub label: String,
 }
 
 /// What an agent's transcript says it's doing, from agent-tail (PRD:

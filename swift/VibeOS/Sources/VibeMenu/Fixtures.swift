@@ -85,13 +85,11 @@ public final class FixtureDaemon: DaemonConnection, @unchecked Sendable {
                 "host": host, "target": params["target"] as? String ?? "native",
                 "providers": [
                     [
-                        "id": "anthropic", "name": "Anthropic", "signed_in": true, "ambient": false, "oauth": true,
-                        "api_key": true,
+                        "id": "anthropic", "name": "Anthropic", "signed_in": true, "ambient": false,
                         "models": [["id": "claude-sonnet-4", "name": "Claude Sonnet 4"]],
                     ],
                     [
-                        "id": "opencode", "name": "OpenCode Zen", "signed_in": false, "ambient": false, "oauth": false,
-                        "api_key": true,
+                        "id": "opencode", "name": "OpenCode Zen", "signed_in": false, "ambient": false,
                         "models": [["id": "deepseek-v4.1-flash", "name": "DeepSeek V4.1 Flash"]],
                     ],
                 ],

@@ -315,77 +315,49 @@ async fn rpc(core: &Core, method: &str, params: Value) -> Value {
     serde_json::from_str(&reply).unwrap()
 }
 
-/// A browser login for a host opens on the Mac, and comes back to `localhost` there.
-/// The Mac's `vibed` catches that and hands it on, so nobody pastes an address.
+/// A Mac doesn't pass on a Pi sign-in to a host, as nothing has one (#158), but a host's
+/// list of models still comes from there, with the login already there seen.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_hosts_browser_login_comes_back_through_the_macs_loopback() {
+async fn a_hosts_pi_list_comes_from_there_and_no_sign_in_is_passed_on() {
     let w = world().await;
     w.add_host().await;
     let own = w.host_world.home.join(".pi/agent");
     std::fs::create_dir_all(&own).unwrap();
-    // A port nothing has, for this sign-in's page to come back to.
-    let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+    let login = r#"{"openai":{"type":"api_key","key":"k"}}"#;
+    std::fs::write(own.join("auth.json"), login).unwrap();
+
+    let list = w
+        .rpc("pi.models", json!({"host": "vps", "target": "vm"}))
+        .await;
+    assert_eq!(list["result"]["host"], "vps", "{list}");
+    assert_eq!(
+        list["result"]["target"], "native",
+        "a host has no VMs: {list}"
+    );
+    let openai = list["result"]["providers"]
+        .as_array()
         .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    std::fs::write(own.join("redirect-port"), port.to_string()).unwrap();
-    let begun = w
+        .iter()
+        .find(|p| p["id"] == "openai")
+        .unwrap_or_else(|| panic!("{list}"))
+        .clone();
+    assert_eq!(openai["signed_in"], true, "{list}");
+
+    let tried = w
         .rpc(
             "pi.login.start",
             json!({"host": "vps", "target": "vm", "provider": "anthropic", "method": "oauth"}),
         )
         .await;
-    let login = &begun["result"];
-    assert_eq!(login["host"], "vps", "{begun}");
-    assert_eq!(login["target"], "native", "a host has no VMs: {begun}");
-    let page = w
-        .rpc(
-            "pi.login.answer",
-            json!({"host": "vps", "id": login["id"], "prompt": login["prompt"]["id"], "value": "browser"}),
-        )
-        .await;
-    assert_eq!(page["result"]["prompt"]["kind"], "manual_code", "{page}");
-    let state = page["result"]["url"]
-        .as_str()
-        .unwrap()
-        .rsplit_once("state=")
-        .unwrap()
-        .1
-        .to_owned();
-
-    /// One request to the Mac's loopback, as a browser makes it.
-    async fn browse(port: u16, target: &str) -> String {
-        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
-            .await
-            .unwrap();
-        stream
-            .write_all(format!("GET {target} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
-            .await
-            .unwrap();
-        let mut got = String::new();
-        stream.read_to_string(&mut got).await.unwrap();
-        got
-    }
-    // What isn't that sign-in's answer doesn't end it.
-    assert!(browse(port, "/favicon.ico").await.contains("404"));
-    assert!(browse(port, "/callback?nothing=1").await.contains("404"));
-    assert!(
-        browse(port, "/callback?code=x&state=not-it")
-            .await
-            .contains("404")
+    assert_eq!(
+        tried["error"]["code"],
+        vibe_core::rpc::ErrorCode::MethodNotFound.code(),
+        "{tried}"
     );
-    assert!(browse(port, "/callback?code=x").await.contains("404"));
-    let got = browse(port, &format!("/callback?code=good&state={state}")).await;
-    assert!(got.contains("You can close this tab"), "{got}");
-    let auth = std::fs::read_to_string(own.join("auth.json")).unwrap();
-    assert!(auth.contains("code=good"), "{auth}");
-    let over = w
-        .rpc("pi.login.get", json!({"host": "vps", "id": login["id"]}))
-        .await;
-    assert_eq!(over["result"]["state"], "done", "{over}");
-    // And it's let go of its port, once the Mac hears that.
-    assert!(std::net::TcpListener::bind(("127.0.0.1", port)).is_ok());
+    assert_eq!(
+        std::fs::read_to_string(own.join("auth.json")).unwrap(),
+        login
+    );
 }
 
 /// Section C, on the host: keys the Mac pushed say so when it's been away a while, and

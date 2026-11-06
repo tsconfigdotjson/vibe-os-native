@@ -212,11 +212,14 @@ async fn not_signed_in_is_said_at_once_and_undone() {
         .await
         .unwrap_err();
     assert_eq!(e.code, ErrorCode::Conflict.code());
-    assert!(e.message.contains("Settings → Agents"), "{}", e.message);
-    // What the app offers that sign-in from.
-    let offer = &e.data.as_ref().unwrap()["pi_sign_in"];
-    assert_eq!(offer["provider"], "xai");
-    assert!(offer["target"].is_string());
+    // It says what's wrong and whose it is to mend, Pi's, with nothing for the app to
+    // offer: VibeOS signs nobody in.
+    assert!(e.message.contains("Sign in to xai"), "{}", e.message);
+    assert!(e.message.contains("`pi` and /login"), "{}", e.message);
+    for gone in ["Settings", "VibeOS app"] {
+        assert!(!e.message.contains(gone), "{gone}: {}", e.message);
+    }
+    assert_eq!(e.data, None);
     // Nothing of it is left behind: no record, worktree or branch.
     assert!(
         w.core
@@ -234,6 +237,19 @@ async fn not_signed_in_is_said_at_once_and_undone() {
         ),
         ""
     );
+}
+
+/// A login that's already there is all an agent needs (#158): it starts with nothing more
+/// from VibeOS, and starting leaves that login as it was.
+#[tokio::test]
+async fn a_pi_already_signed_in_just_starts_and_keeps_its_login() {
+    let w = world().await;
+    w.sign_in();
+    let store = w.layout.linux_pi_logins_dir().join("auth.json");
+    let before = fs::read(&store).unwrap();
+    let a = w.start("hello").await;
+    assert_eq!(a.kind, AgentKind::Pi);
+    assert_eq!(fs::read(&store).unwrap(), before);
 }
 
 #[tokio::test]
@@ -288,7 +304,7 @@ async fn what_cant_answer_for_this_model_is_refused() {
     let e = refused(Arc::clone(&w.core)).await;
     assert_eq!(e.code, ErrorCode::Conflict.code());
     assert!(e.message.contains("signed in to xai"), "{}", e.message);
-    assert!(e.message.contains("Settings → Agents"), "{}", e.message);
+    assert!(!e.message.contains("Settings"), "{}", e.message);
     fs::write(dir.join("auth.json"), "{}").unwrap();
     // An unrelated line of pi.env.
     let file = w.layout.pi_env_file();
@@ -855,7 +871,9 @@ async fn a_first_sign_in_in_an_agent_is_told_to_the_owner() {
     w.core.pi_watch(&mut seen).await;
     let said = events.try_recv().unwrap().message.unwrap();
     assert!(said.contains(&a) && said.contains("xai"), "{said}");
-    assert!(said.contains("Settings → Agents"), "{said}");
+    // What it's for now is taking it away, never another sign-in.
+    assert!(said.contains("forget it in Settings → Agents"), "{said}");
+    assert!(!said.contains("sign in to it"), "{said}");
     assert_eq!(
         vibe_env::pi::logins_in(&w.layout.linux_pi_logins_dir()),
         ["mock", "xai"]

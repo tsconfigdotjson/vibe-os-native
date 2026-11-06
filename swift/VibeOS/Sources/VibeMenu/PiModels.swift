@@ -30,27 +30,6 @@ public func matchPiModel(_ text: String, in providers: [PiProvider]) -> PiModelM
     }
 }
 
-/// The provider `model` belongs to, if Pi knows it's not signed in to it and can be.
-/// One that signs in from what's around it, as Bedrock can, is left to try.
-public func piProviderToSignIn(for model: String, in providers: [PiProvider]) -> PiProvider? {
-    let named: String
-    switch matchPiModel(model, in: providers) {
-    case .listed(let full): named = full
-    case .several: return nil
-    case .unlisted: named = model
-    }
-    guard let slash = named.firstIndex(of: "/") else { return nil }
-    let name = named[..<slash]
-    return providers.first { $0.id == name && !$0.signedIn && !$0.ambient && ($0.oauth || $0.apiKey) }
-}
-
-/// Whether Pi has nobody to answer with at all, as far as its list can tell. What can
-/// sign in from what's around it doesn't count: vibed refuses a start on no model with
-/// only that, and it's in every list.
-public func piHasNoLogin(_ providers: [PiProvider]) -> Bool {
-    !providers.isEmpty && !providers.contains { $0.signedIn }
-}
-
 /// Pi's providers and models with `query` in their names, signed-in providers first as
 /// Pi's list has them. A provider's own name matching brings all its models.
 public func piModels(matching query: String, in providers: [PiProvider]) -> [PiProvider] {
@@ -69,24 +48,4 @@ public func piModels(matching query: String, in providers: [PiProvider]) -> [PiP
         found.models = models
         return found
     }
-}
-
-/// What vibed offers when a Pi agent was refused for not being signed in.
-public struct PiSignInOffer: Hashable, Sendable {
-    /// Who to sign in to. None for a model that names no one.
-    public var provider: String?
-    public var target: PiTarget
-}
-
-/// That offer, if `error` carries one.
-public func piSignInOffer(from error: any Error) -> PiSignInOffer? {
-    guard case VibedClientError.rpc(let rpc) = error,
-        case .object(let data)? = rpc.data,
-        case .object(let offer)? = data["pi_sign_in"],
-        case .string(let target)? = offer["target"],
-        let target = PiTarget(rawValue: target)
-    else { return nil }
-    var provider: String?
-    if case .string(let name)? = offer["provider"] { provider = name }
-    return PiSignInOffer(provider: provider, target: target)
 }

@@ -17,7 +17,6 @@
       "providers": [
         {
           "ambient": false,
-          "api_key": true,
           "id": "openai",
           "models": [
             {
@@ -29,21 +28,16 @@
             }
           ],
           "name": "OpenAI",
-          "oauth": true,
-          "oauth_label": "Sign in with ChatGPT",
           "signed_in": true
         },
         {
           "ambient": true,
-          "api_key": true,
           "id": "amazon-bedrock",
           "name": "Amazon Bedrock",
-          "oauth": false,
           "signed_in": false
         },
         {
           "ambient": false,
-          "api_key": true,
           "id": "anthropic",
           "models": [
             {
@@ -52,12 +46,10 @@
             }
           ],
           "name": "Anthropic",
-          "oauth": true,
           "signed_in": false
         },
         {
           "ambient": false,
-          "api_key": true,
           "id": "opencode",
           "models": [
             {
@@ -70,7 +62,6 @@
             }
           ],
           "name": "OpenCode Zen",
-          "oauth": false,
           "signed_in": false
         }
       ],

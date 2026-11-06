@@ -11,13 +11,12 @@ use vibe_core::rpc::{
     EventsSubscribe, GhStatusGet, Hello, HelloParams, HelloResult, HostsAdd, HostsAdmin, HostsList,
     HostsRemove, HostsUpgrade, Id, KeysCreate, KeysList, KeysRevoke, KeysSync, KeysVerify,
     LimitsGet, LimitsSet, McpGet, McpServeGet, McpServeSet, McpSet, Method, PROTOCOL_VERSION,
-    PiForget, PiInstall, PiLoginAnswer, PiLoginCancel, PiLoginGet, PiLoginStart, PiModelsGet,
-    PiStatusGet, ProfilesCreate, ProfilesDelete, ProfilesList, ProfilesUpdate, ProjectsAdd,
-    ProjectsList, ProjectsRemove, ProtocolMismatchData, Request, Response, ServicesAudit,
-    ServicesComplete, ServicesConnect, ServicesDisconnect, ServicesFollow, ServicesList,
-    ServicesOverview, ServicesSet, ServicesToken, SessionsAttach, SessionsList, Subscribed,
-    ToolboxClose, ToolboxLoginsGet, ToolboxOpen, ToolboxRebuild, ToolboxStatusGet, ToolboxUpdate,
-    TunnelPrepare,
+    PiForget, PiInstall, PiModelsGet, PiStatusGet, ProfilesCreate, ProfilesDelete, ProfilesList,
+    ProfilesUpdate, ProjectsAdd, ProjectsList, ProjectsRemove, ProtocolMismatchData, Request,
+    Response, ServicesAudit, ServicesComplete, ServicesConnect, ServicesDisconnect, ServicesFollow,
+    ServicesList, ServicesOverview, ServicesSet, ServicesToken, SessionsAttach, SessionsList,
+    Subscribed, ToolboxClose, ToolboxLoginsGet, ToolboxOpen, ToolboxRebuild, ToolboxStatusGet,
+    ToolboxUpdate, TunnelPrepare,
 };
 
 use crate::core::Core;
@@ -174,12 +173,7 @@ async fn call(
         if !params.is_object() {
             return Err(invalid_params("params must be an object"));
         }
-        let answer = core.forward(&link, method, params).await;
-        // A sign-in on a host may need its browser's return caught here.
-        if method.starts_with("pi.login.") {
-            core.pi_login_forwarded(&link, method, answer.as_ref().ok());
-        }
-        return answer;
+        return core.forward(&link, method, params).await;
     }
     match method {
         Hello::NAME => {
@@ -324,16 +318,6 @@ async fn call(
         PiForget::NAME => encode_result(core.pi_forget(decode::<PiForget>(params)?).await),
         PiInstall::NAME => encode_result(core.pi_install(decode::<PiInstall>(params)?).await),
         PiModelsGet::NAME => encode_result(core.pi_models(decode::<PiModelsGet>(params)?).await),
-        PiLoginStart::NAME => {
-            encode_result(core.pi_login_start(decode::<PiLoginStart>(params)?).await)
-        }
-        PiLoginGet::NAME => encode_result(core.pi_login_get(decode::<PiLoginGet>(params)?).await),
-        PiLoginAnswer::NAME => {
-            encode_result(core.pi_login_answer(decode::<PiLoginAnswer>(params)?).await)
-        }
-        PiLoginCancel::NAME => {
-            encode_result(core.pi_login_cancel(decode::<PiLoginCancel>(params)?).await)
-        }
         DoctorCheckGet::NAME => {
             decode::<DoctorCheckGet>(params)?;
             encode_result(Ok(core.doctor().await))

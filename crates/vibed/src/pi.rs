@@ -1,8 +1,8 @@
 //! Pi on this host (PRD: Who gets which credentials; What's inside `linux`):
 //! what's installed and which providers it's signed in to, for Settings, and
 //! installing it, once a profile here runs it, with nobody asked. VibeOS doesn't
-//! sign anyone in: that's Pi's own, whether from `/login` or the app
-//! ([`crate::pi_setup`]), and only the providers' names are ever read here.
+//! sign anyone in: that's Pi's own, from `/login`, and only the providers' names are
+//! ever read here.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
