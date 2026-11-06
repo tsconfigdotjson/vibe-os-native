@@ -56,8 +56,9 @@ works as the destination too.
 
 VibeOS installs `vibed` on the server as a systemd user service and links it to
 the Mac over SSH, so nothing new is opened on the server. Its agents then appear
-in the Mac's menu and MCP. Clicking one attaches with `ssh -t HOST vibe attach
-REF`.
+in the Mac's menu and MCP. Clicking one attaches with `ssh -t HOST
+.local/lib/vibeos/vibe attach REF`, by that path because a command over SSH doesn't
+get a login shell's `PATH`.
 
 ### One MCP for every host
 
@@ -88,11 +89,11 @@ If more than one Mac links to the same host, they share its one tunnel end, so t
 If you want a laptop or another machine to reach MCP, we suggest
 [Tailscale](https://tailscale.com). It's entirely optional.
 
-- **On the Mac:** turn on **Settings → Hosts → Also serve MCP on this Mac's
+- **On the Mac:** turn on **Settings → Hosts → Serve MCP on this Mac's
   Tailscale address**, or **Turn On** in the welcome. Then use the Tailscale URL
   Settings shows, with an API key.
 - **On a Linux host:** turn on **Settings → Hosts → Serve MCP on HOST's Tailscale
-  name**. You don't need SSH. Tailscale must already be installed and logged in on the
+  address**. You don't need SSH. Tailscale must already be installed and logged in on the
   host. Settings then shows `https://<machine>.<tailnet>.ts.net/mcp` and adds it to the
   **Copy Setup Command** menu when you make a key. `vibe key create` on the host prints it
   too.
@@ -117,11 +118,12 @@ because the loopback listener only accepts loopback `Host` headers and Serve pas
 
 | What Settings says | Why | What to do |
 | --- | --- | --- |
-| Tailscale already serves `/mcp` from something else | `/mcp` or `/mcp/` points anywhere but this host's listener, including `127.0.0.1` or a port it's no longer on. VibeOS won't overwrite it or remove it | If nothing needs it, run the `tailscale serve … off` line Settings gives on the host, then try again |
+| Tailscale already serves `/mcp` from something else | `/mcp` points anywhere but this host's listener, including `127.0.0.1` or a port it's no longer on, or anything at all is at `/mcp/` or in a foreground `tailscale serve`. VibeOS won't overwrite it or remove it | If nothing needs it, run the `tailscale serve … off` line Settings gives on the host, or stop the `tailscale serve` it says is running in the foreground, then try again |
 | Funnel is on for that name | `/mcp` there would be on the public internet. VibeOS never turns Funnel on, and won't turn yours off | Turn Funnel off for that name yourself, then try again. `tailscale funnel status` on the host shows what it exposes |
 | Tailscale doesn't let you change what it serves | The host's user isn't Tailscale's operator | Choose **Allow…** on the host's row, or run `sudo tailscale set --operator=<user>` on the host. Then turn the toggle on again |
-| Your tailnet needs HTTPS turned on | HTTPS or Serve is off for your tailnet | Open the link Settings shows, which is Tailscale's own, turn it on, and try again |
+| Your tailnet needs HTTPS turned on | HTTPS or Serve is off for your tailnet | Turn HTTPS on for your tailnet, and try again. If `tailscale` printed a link on the host, Settings shows it |
 | Tailscale isn't installed, logged in or running | VibeOS leaves those to you | Set it up on the host. The toggle is unavailable until then |
+| Tailscale has no name for this host | The `ts.net` name comes from MagicDNS | Turn on MagicDNS for your tailnet. The toggle is unavailable until then |
 
 If Funnel is turned on later for a name that already serves `/mcp`, MCP is on the public
 internet behind its API keys. Settings warns you, and you can still turn the toggle off.
@@ -135,8 +137,9 @@ alone, MCP is at `http://<tailscale-ip>:<mcp_port>/mcp`, and `vibe key create` p
 
 What to expect:
 
-- VibeOS doesn't install or sign in to Tailscale. The only thing it configures is the
-  `/mcp` path on a Linux host's Serve, when you turn that toggle on. Both machines need
+- VibeOS doesn't install or sign in to Tailscale. All it configures is the `/mcp` path on
+  a Linux host's Serve, when you turn that toggle on, and Tailscale's operator there, if you
+  choose **Allow…** and enter your password. Both machines need
   Tailscale running and logged in to the same tailnet, and your tailnet's access rules
   must allow the port. `vibe doctor` reports whether this host has a Tailscale
   address, but not whether another machine can reach it.
@@ -152,16 +155,18 @@ A Linux host doesn't need the Mac to keep working. Its agents keep running, and 
 keeps answering for them:
 
 - From the server itself, use `http://127.0.0.1:7878/mcp` with an API key.
-- From elsewhere, use `ssh -t HOST vibe attach REF` for a terminal, or the host's
-  Tailscale URL if you've turned it on. Serve and `mcp_tailscale` are both kept on the
-  host, so that URL doesn't depend on the Mac.
+- From elsewhere, use `ssh -t HOST .local/lib/vibeos/vibe attach REF` for a terminal,
+  which is where Add Linux Host installs `vibe`, or the host's Tailscale URL if you've
+  turned it on. Serve and `mcp_tailscale` are both kept on the host, so that URL doesn't
+  depend on the Mac.
 - On the server, `vibe project`, `vibe profile` and `vibe key` replace the
   Settings screens.
 
 Everything that goes through the Mac, its own agents and those on its other hosts, shows as
 unavailable, as last seen, until it's back. It's never reported as reachable while it isn't.
 You can't start or send to those agents until then. It all merges back by itself when the
-tunnel returns.
+tunnel returns. Last-seen agents are kept in memory, so a host restarted while the Mac is
+away shows the Mac as unavailable, with none of its agents, until it's back.
 
 ### Your own networking
 
@@ -173,14 +178,14 @@ unprotected.
 ## If you used External Address
 
 External Address served MCP publicly from a Linux host at `https://<domain>/mcp`, with a
-Let's Encrypt certificate on port 443. That public listener is retired
-([#143](https://github.com/tsconfigdotjson/vibe-os-native/issues/143)), and nothing replaces
-it as a public path. The private path to the Mac stays, and is now on for every linked host:
+Let's Encrypt certificate on port 443. VibeOS 0.1.7 was the last release with it: that public
+listener is retired ([#143](https://github.com/tsconfigdotjson/vibe-os-native/issues/143)),
+and nothing replaces it as a public path. The private path to the Mac stays, and is now on for every linked host:
 see [One MCP for every host](#one-mcp-for-every-host).
 
 > [!WARNING]
-> A linked host that still serves External Address is **not** upgraded by itself. It goes on
-> serving, and **Settings → Hosts** says it's waiting for you. Choosing **Update…** there, or
+> A linked host that still serves External Address, or that VibeOS can't tell about, is **not**
+> upgraded by itself. It goes on serving, and **Settings → Hosts** says it's waiting for you. Choosing **Update…** there, or
 > running `vibe host upgrade NAME`, ends its `https://<domain>/mcp`. Move anything that uses
 > that URL first.
 
@@ -204,8 +209,9 @@ Anyway** or use `vibe host remove NAME --force`, and if it ever comes back, revo
 on it with `vibe key revoke`.
 
 **Clearing up.** `vibed` deletes nothing. If it finds External Address settings or
-certificates, it logs a note at each start. What's left is inert, and these are yours to
-remove once the new build has settled:
+certificates, it logs a note at each start. VibeOS no longer uses what's left, but the helper
+and the port setting below stay in effect until you remove them. These are yours to remove
+once the new build has settled:
 
 | On | What | How |
 | --- | --- | --- |
@@ -218,9 +224,10 @@ remove once the new build has settled:
 
 If your API keys were used from the internet, consider replacing them.
 
-**Going back.** A host's registry keeps its External Address setting, so the build before this
-one can still read it, and that build **starts serving publicly again** if the setting was on.
-To turn it off for good, run `vibe host external local off` on the host before you upgrade.
+**Going back.** A host's registry keeps its External Address setting, so 0.1.7 can still read
+it, and that build **starts serving publicly again** if the setting was on. To turn it off for
+good, run `vibe host external local off` on the host before you upgrade. The command is gone
+from 0.1.8 on.
 
 ## MCP tools
 
