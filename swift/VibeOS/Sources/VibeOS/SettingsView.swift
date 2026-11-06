@@ -186,7 +186,9 @@ struct ProjectsPane: View {
             }
             Section {
                 HStack {
-                    TextField("Project", text: $source, prompt: Text("owner/name, or a folder"))
+                    TextField(
+                        "Project", text: $source,
+                        prompt: Text(local ? "owner/name, or a folder" : "owner/name, or a folder on \(host)"))
                         .labelsHidden()
                         .autocorrectionDisabled()
                         .onSubmit { Task { await add() } }
@@ -201,15 +203,6 @@ struct ProjectsPane: View {
                 ErrorText(error: error)
             } header: {
                 Text("Add a Project")
-            } footer: {
-                Text(
-                    local
-                        ? "A GitHub repo is cloned with this Mac's gh login into ~/VibeOS/projects; a folder stays "
-                            + "where it is. It starts with two profiles, one per environment."
-                        : "A GitHub repo is cloned with \(host)'s own gh login; a path is a folder on \(host). "
-                            + "It starts with one Linux profile."
-                )
-                .foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)
@@ -808,7 +801,8 @@ struct KeysPane: View {
                     if let pending = keysPending(on: pendingOn) {
                         Text(pending).foregroundStyle(Palette.attention)
                     }
-                    Text(keysNote).foregroundStyle(.secondary)
+                    InlineMessage(text: warning, symbol: "exclamationmark.shield.fill")
+                        .foregroundStyle(.primary)
                 }
             }
         }
@@ -827,9 +821,11 @@ struct KeysPane: View {
         }
     }
 
-    private var keysNote: String {
-        let reach = model.externalHost.map { "this Mac, and through \($0.name)" } ?? "this Mac"
-        return "A key is as good as a shell on \(reach). Revoke one you no longer trust, and it stops at once."
+    private var warning: String {
+        keysWarning(
+            linuxHosts: model.hosts.contains { $0.link != .local },
+            // A host serving publicly that this Mac isn't using still takes its keys.
+            externalHost: (model.externalHost ?? model.hosts.first { $0.externalServes != nil })?.name)
     }
 
     private func load() async {
@@ -934,7 +930,8 @@ struct NewKeySheet: View {
                 IconTile(symbol: "key.fill", color: .orange, size: 36)
                 VStack(alignment: .leading, spacing: 3) {
                     Text("New API Key").font(.headline)
-                    Text("Name it for where it will live. A key is as good as a shell on this Mac.")
+                    Text("Name it for where it will live, and keep it private: anyone with it can have VibeOS "
+                        + "agents do whatever you can do on this Mac.")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -1128,7 +1125,9 @@ struct HostsPane: View {
             } header: {
                 Text("MCP on This Mac")
             } footer: {
-                Text(mcpFooter).foregroundStyle(.secondary)
+                if let note = mcpNote {
+                    Text(note).foregroundStyle(.secondary)
+                }
             }
             Section {
                 ForEach(model.hosts, id: \.name) { host in
@@ -1146,10 +1145,6 @@ struct HostsPane: View {
                 Button("Add Linux Host…") { show(WindowID.addHost, with: openWindow) }
             } header: {
                 Text("Hosts")
-            } footer: {
-                Text("A Linux host runs its agents itself, under its own logins, and this Mac's menu and MCP show "
-                    + "them too. Removing one only forgets it here: its vibed and agents run on, on their own.")
-                    .foregroundStyle(.secondary)
             }
             if !linuxHosts.isEmpty {
                 Section {
@@ -1166,8 +1161,6 @@ struct HostsPane: View {
                     }
                 } header: {
                     Text("External Address")
-                } footer: {
-                    Text(externalFooter).foregroundStyle(.secondary)
                 }
             }
             if let error {
@@ -1181,21 +1174,10 @@ struct HostsPane: View {
         }
     }
 
-    private var mcpFooter: String {
-        var lines: [String] = []
-        if let mcp = model.mcp, mcp.tailscale, mcp.tailscaleUrls.isEmpty {
-            lines.append("This Mac has no Tailscale address now; MCP is served there once it has one.")
-        }
-        lines.append("Every call needs an API key. The port is mcp_port in ~/.config/vibeos/host.toml.")
-        return lines.joined(separator: " ")
-    }
-
-    private var externalFooter: String {
-        let name = model.externalHost?.name ?? "the host"
-        return "One Linux host with a public address can be the way in for MCP clients anywhere, to its agents "
-            + "and this Mac's. Clients send an API key with every call: \(name) checks it, and this Mac checks it "
-            + "again for its own agents. Nothing listens publicly on this Mac; it reaches \(name) through an SSH "
-            + "tunnel of its own."
+    /// Why the Tailscale toggle isn't doing anything yet, if it isn't.
+    private var mcpNote: String? {
+        guard let mcp = model.mcp, mcp.tailscale, mcp.tailscaleUrls.isEmpty else { return nil }
+        return "This Mac has no Tailscale address now; MCP is served there once it has one."
     }
 
     /// The picker shows the external address; choosing a host asks for its
@@ -1540,7 +1522,8 @@ struct LimitsPane: View {
     /// The selected host's OS, as vibed says: the labels follow it.
     private var os: String { model.hosts.first { $0.name == host }?.os ?? "macos" }
 
-    /// Each limit: its key in `host.toml`, a label, its kind, and its value.
+    /// Each limit: its key in `host.toml`, which only tells fields apart and
+    /// isn't shown, a label, its kind, and its value.
     /// A Linux host has its own words for a few, and some don't apply there
     /// at all: it has no VMs to give disks or snapshots to.
     struct Field {
@@ -1612,13 +1595,12 @@ struct LimitsPane: View {
                                 LabeledContent {
                                     CommitField(
                                         title: label, value: text(field, limits[keyPath: field.value]), width: 90,
-                                        help: "\(field.key) in host.toml", isValid: { parse(field.kind, $0) != nil }
+                                        help: hint(field.kind), isValid: { parse(field.kind, $0) != nil }
                                     ) { text in
                                         await save(field, text)
                                     }
                                 } label: {
                                     Text(label)
-                                    Text(field.key).font(.caption.monospaced())
                                 }
                             }
                         }
@@ -1630,14 +1612,21 @@ struct LimitsPane: View {
             Section {
                 ErrorText(error: error)
             } footer: {
-                Text("Sizes such as 4G or 512M, durations such as 60s. Saved to ~/.config/vibeos/host.toml, where "
-                    + "edits by hand take effect at once too.")
+                Text("Sizes such as 4G or 512M, durations such as 60s.")
                     .foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)
         .navigationTitle("Host Limits")
         .task(id: "\(host)#\(model.settingsRevision)") { await load() }
+    }
+
+    private func hint(_ kind: Field.Kind) -> String {
+        switch kind {
+        case .bytes: "A size, such as 4G or 512M"
+        case .count: "A whole number"
+        case .seconds: "A length of time, such as 60s"
+        }
     }
 
     private func text(_ field: Field, _ value: Int) -> String {
@@ -1674,8 +1663,15 @@ struct LimitsPane: View {
             error = nil
             return true
         } catch {
-            self.error = describe(error)
+            self.error = readable(describe(error))
             return false
+        }
+    }
+
+    /// vibed's refusals name a limit by its key; here it goes by its label.
+    private func readable(_ message: String) -> String {
+        Self.groups.flatMap(\.fields).reduce(message) { text, field in
+            text.replacingOccurrences(of: field.key, with: field.label(on: os) ?? field.label)
         }
     }
 }

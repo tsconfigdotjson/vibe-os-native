@@ -238,7 +238,8 @@ public struct ToolboxSummary: Equatable, Sendable {
     public var state: String
     /// Whether it's busy with something that ends on its own.
     public var working: Bool
-    /// "Template v3 · Linux home v2 · Base 1", once there's any.
+    /// "Tools v3 · Logins & settings v2 · Linux v1", once there's any: the template, the
+    /// Linux home and the base image.
     public var versions: String?
     public var notes: [String]
     /// Whether the shell is open, for Save & Close.
@@ -261,46 +262,47 @@ public struct ToolboxSummary: Equatable, Sendable {
             // Not known: a boot under way, a shim too slow to ask, or a
             // vibed from before #54.
             case nil: state = "Open: exit the shell to save"
-            case 0: state = "Open in the background, no Terminal attached"
-            default: state = "Attached in Terminal"
+            case 0: state = "Open in the background, with no Terminal window"
+            default: state = "Open in Terminal"
             }
         case .saving: state = "Saving…"
-        case .updating: state = "Running [update]…"
-        case .rebuilding: state = "Rebuilding…"
+        case .updating: state = "Installing updates…"
+        case .rebuilding: state = "Updating Linux…"
         }
         working = [.saving, .updating, .rebuilding].contains(status.state)
         guard status.state != .unavailable else { return }
         var parts: [String] = []
-        if let template = status.template { parts.append("Template v\(template)") }
-        if let home = status.home { parts.append("Linux home v\(home)") }
-        if let base = status.base { parts.append("Base \(base)") }
+        if let template = status.template { parts.append("Tools v\(template)") }
+        if let home = status.home { parts.append("Logins & settings v\(home)") }
+        if let base = status.base { parts.append("Linux v\(base)") }
         if !parts.isEmpty { versions = parts.joined(separator: " · ") }
         let held = status.rebuildHeld ?? []
         if let newest = status.newestBase, newest > (status.base ?? 0) {
             if held.isEmpty {
-                notes.append("Base \(newest) is installed. VibeOS moves the template to it by itself.")
+                notes.append("A newer Linux is ready. VibeOS updates new agents to it by itself.")
             } else {
                 notes.append(
-                    "Base \(newest) is installed. New agents stay on the current template, as moving would "
-                        + "lose what you installed by hand and toolbox.toml doesn't cover: "
+                    "A newer Linux is ready, but new agents stay on the current one for now. Updating would "
+                        + "lose these, which you installed by hand and aren't in your install recipe: "
                         + held.joined(separator: ", ") + ".")
             }
         }
         if servicesNeedRebuild(status) {
-            notes.append(
-                "Linux agents have no shared services until the template is on base \(VibeRPC.sharedServicesBase).")
+            notes.append("Linux agents have no shared services until their Linux is updated.")
         }
         if let last = status.last {
             let what: String
             switch last.action {
             case .shell: what = "save"
-            case .update: what = "update"
-            case .rebuild: what = "rebuild"
+            case .update: what = "tool update"
+            case .rebuild: what = "Linux update"
             }
             if let error = last.error {
                 notes.append("The last \(what) failed: \(error)")
             } else if !last.uncovered.isEmpty {
-                notes.append("Not in toolbox.toml: " + last.uncovered.joined(separator: ", "))
+                notes.append(
+                    "Left behind, as your install recipe doesn't cover them: "
+                        + last.uncovered.joined(separator: ", "))
             }
         }
     }
@@ -356,14 +358,14 @@ public struct LoginsSummary: Equatable, Sendable {
         }
         switch (logins.home, logins.logins) {
         case (nil, _):
-            headline = "No Linux home yet. Sign in here, or in the shell for anything else, and it's kept."
-        case (let home?, nil):
-            headline = "VibeOS couldn't tell which logins Linux home \(home) holds. Open the shell and exit it "
-                + "to look again."
-        case (let home?, let found?) where found.isEmpty:
-            headline = "No logins in Linux home \(home) yet."
-        case (let home?, _):
-            headline = "New Linux agents start with these, from Linux home \(home)."
+            headline = "No GitHub or other tool logins saved yet. Sign in here, or in the shell for anything else, "
+                + "and they're kept."
+        case (_?, nil):
+            headline = "VibeOS couldn't tell which logins are saved. Open the shell and exit it to look again."
+        case (_?, let found?) where found.isEmpty:
+            headline = "No GitHub or other tool logins saved yet."
+        case (_?, _):
+            headline = "New Linux agents start with these."
         }
         if logins.claude {
             signInHint = nil
@@ -428,6 +430,23 @@ public func keysPending(on hosts: [String]) -> String? {
     let names = hosts.joined(separator: ", ")
     let verb = hosts.count == 1 ? "it's" : "they're"
     return "Key changes are pending on \(names). A key revoked here still works there until \(verb) next reachable."
+}
+
+/// What Settings → API Keys warns of: what a key can do, and that a key is no
+/// lock on this Mac's own login, as vibed's socket answers that login without
+/// one. Other accounts on this Mac can't reach that socket, so this says "your
+/// Mac login", not "anyone on this Mac".
+public func keysWarning(linuxHosts: Bool, externalHost: String?) -> String {
+    let reach = linuxHosts ? "this Mac and your Linux hosts" : "this Mac"
+    let internet = externalHost.map { " Because \($0) has a public address, a key works from anywhere on the internet." }
+    // A host that's away hasn't heard of a revoke yet (`keysPending`).
+    let revoke = linuxHosts
+        ? " If you stop trusting a key, revoke it. It stops working at once, though a Linux host that's away goes on "
+            + "accepting it until VibeOS reaches it again."
+        : " If you stop trusting a key, revoke it and it stops working at once."
+    return "Keep API keys private, like passwords. Anyone with a key can have VibeOS agents do whatever you can "
+        + "do on \(reach)." + (internet ?? "") + revoke + " Anyone or anything already using your Mac login can "
+        + "control VibeOS without a key, so keep that login private too."
 }
 
 // MARK: External access

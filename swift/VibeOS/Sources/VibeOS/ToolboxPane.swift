@@ -24,8 +24,8 @@ struct ToolboxPane: View {
                 ContentUnavailableView {
                     Label("No Linux Toolbox", systemImage: "shippingbox")
                 } description: {
-                    Text("The toolbox comes with Linux agents in VMs on a Mac, and this one has none. On a "
-                        + "Linux host, install tools on the server itself.")
+                    Text("The toolbox comes with Linux agents on a Mac, and this one has none. On a Linux host, "
+                        + "install tools on the server itself.")
                 }
             }
         }
@@ -58,7 +58,7 @@ struct ToolboxPane: View {
                     }
                 }
                 if let versions = summary.versions {
-                    LabeledContent("New agents boot", value: versions)
+                    LabeledContent("New agents use", value: versions)
                 }
                 ForEach(summary.notes, id: \.self) { note in
                     Text(note)
@@ -67,31 +67,34 @@ struct ToolboxPane: View {
                 }
                 ErrorText(error: model.toolboxCloseError)
             } footer: {
-                Text("A Linux shell in Terminal. What you install or log in to there, every new Linux agent "
-                    + "starts with. Exit the shell or close its window to save; Control-\\ leaves it open. "
-                    + "Pi signs in from Settings → Agents, with no shell at all.")
+                Text("Open Shell gives you a Linux command line in Terminal. Anything you install or sign in to "
+                    + "there is ready for every new Linux agent. To save, exit the shell or close its window; to "
+                    + "leave it running for later, press Control-\\. To sign in to Pi, use Settings → Agents instead.")
                     .foregroundStyle(.secondary)
             }
             logInsSection
             Section {
                 HStack {
                     // VibeOS moves the template by itself. This is for when that would
-                    // lose something, or to apply toolbox.toml now. In Terminal, as it
-                    // can take many minutes and says how it goes.
+                    // lose something, or to apply toolbox.toml now: `vibe toolbox rebuild`.
+                    // In Terminal, as it can take many minutes and says how it goes.
                     if !(model.toolbox?.rebuildHeld ?? []).isEmpty {
-                        Button("Move and Open Shell") { model.moveTemplateAndOpenShell() }
+                        Button("Update Anyway and Open Shell") { model.moveTemplateAndOpenShell() }
                             .disabled(model.toolbox?.state != .closed)
-                            .help("Moves the template to the new base image, then opens the shell to put back what it lacks")
+                            .help("Updates Linux for new agents, leaving behind what's listed above, then opens the "
+                                + "shell so you can install it again. To keep them instead, add them to your install "
+                                + "recipe, ~/.config/vibeos/toolbox.toml, and VibeOS tries again by itself.")
                     } else {
-                        Button("Rebuild from toolbox.toml", action: rebuild)
+                        Button("Reinstall Linux Tools…", action: rebuild)
                             .disabled(model.toolbox?.state != .closed)
-                            .help("Makes a fresh template on the newest base image from toolbox.toml, in Terminal")
+                            .help("Gives new agents the newest Linux with your tools installed afresh, in Terminal. "
+                                + "Your install recipe, if you keep one, is ~/.config/vibeos/toolbox.toml.")
                     }
                     Spacer()
                     if summary.closable || model.toolboxClosing {
                         Button("Save & Close", action: saveAndClose)
                             .disabled(model.toolboxClosing)
-                            .help("Ends the shell and saves the template and Linux home, as exiting does")
+                            .help("Ends the shell and saves your tools and logins, as exiting does")
                     }
                     Button("Open Shell") { Task { await model.openToolbox() } }
                         .buttonStyle(.borderedProminent)
@@ -105,9 +108,11 @@ struct ToolboxPane: View {
 
     /// Always asks: what's in the template and not in toolbox.toml may not come along.
     private func rebuild() {
-        let detail = "New Linux agents get a fresh template on the newest base image, from toolbox.toml. VibeOS "
-            + "puts back the Debian and npm packages you installed by hand; anything else it can't, and it says what."
-        guard confirm("Rebuild the template?", detail: detail, action: "Rebuild") else { return }
+        let detail = "New Linux agents get the newest Linux, with your tools installed afresh. What's in your "
+            + "install recipe comes back, and VibeOS tries to reinstall Debian and npm packages you installed by "
+            + "hand. Anything else you added outside your home folder doesn't come back, and VibeOS lists what it "
+            + "can spot. Your logins and home folder stay."
+        guard confirm("Reinstall Linux tools?", detail: detail, action: "Reinstall") else { return }
         model.runInTerminal(["toolbox", "rebuild"], exec: false)
     }
 
@@ -119,8 +124,8 @@ struct ToolboxPane: View {
     /// Always asks: a detached shell is how a long install is left running,
     /// and what it has done so far would become the new template.
     private func saveAndClose() {
-        let detail = "The shell ends, and anything still running in it stops. The template and Linux home are "
-            + "saved as they are now, for new Linux agents."
+        let detail = "The shell ends, and anything still running in it stops. Your tools and logins are saved as "
+            + "they are now, for new Linux agents."
         guard confirm("Save and close the toolbox?", detail: detail, action: "Save & Close") else { return }
         Task { await model.closeToolbox() }
     }
@@ -143,7 +148,7 @@ struct ToolboxPane: View {
                     LabeledContent {
                         Button("Sign In…") { signIn(.toolboxGithub) }
                             .disabled(model.toolbox?.state != .closed)
-                            .help("One browser sign-in, kept in the Linux home")
+                            .help("One browser sign-in, kept with your Linux logins")
                     } label: {
                         Text("Linux agents aren't signed in to GitHub.").foregroundStyle(.secondary)
                     }
