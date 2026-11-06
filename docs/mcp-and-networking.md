@@ -104,11 +104,56 @@ stand in their way. It also doesn't test or support them. Whatever you put in
 front of MCP, keep API keys required and don't put it on the open internet
 unprotected.
 
-## External Address
+## If you used External Address
 
-Settings → Hosts still shows an **External Address** option, which serves MCP
-publicly from a Linux host. It's [planned for removal](https://github.com/tsconfigdotjson/vibe-os-native/issues/143),
-so we don't recommend setting it up.
+External Address served MCP publicly from a Linux host at `https://<domain>/mcp`,
+with a Let's Encrypt certificate on port 443 and an `ssh -R` tunnel back to the Mac.
+It's retired ([#143](https://github.com/tsconfigdotjson/vibe-os-native/issues/143)),
+and nothing replaces it as a public path.
+
+> [!WARNING]
+> Upgrading ends it, with no prompt. A Mac upgrades its linked hosts by itself, and a
+> host's `https://<domain>/mcp` stops answering as soon as its `vibed` is the new one.
+> Move anything that uses that URL first.
+
+**What changes:**
+
+- `vibed` no longer listens on port 443, asks Let's Encrypt for a certificate or
+  keeps an `ssh -R` tunnel. The old tunnel ends with the old `vibed` on the Mac.
+- A client on another machine can no longer reach the Mac's agents through a Linux
+  host. Agents named `mac:<ref>` are gone from a host's MCP.
+- `vibe host external` and the Settings controls are gone.
+
+**What doesn't:** API keys, SSH hosts and their links, agents, loopback MCP and the
+Tailscale option all carry on as they were.
+
+**Moving a client:** use one of the [ways to connect](#ways-to-connect) above. Tailscale
+is the closest match for a client on another machine. For a client on the server
+itself, use its loopback URL.
+
+**Before you forget a host:** let it upgrade first, or run `vibe host external local off`
+on it. A host that's still on an older build, with its link down, can go on serving
+publicly with your API keys, where a revoke from the Mac can't reach it.
+
+**Clearing up.** `vibed` deletes nothing. If it finds External Address settings or
+certificates, it logs a note at each start. What's left is inert, and these are yours to
+remove once the new build has settled:
+
+| On | What | How |
+| --- | --- | --- |
+| Linux host | The certificate, its private key and the ACME account key | `rm -r ~/.local/share/vibeos/external` |
+| Linux host | The helper's unprivileged copy | `rm ~/.local/lib/vibeos/vibe-bind` |
+| Linux host, if the helper was installed | The root-owned helper, which can open port 443 | `sudo rm /usr/local/lib/vibeos/vibe-bind-1 && sudo rmdir /usr/local/lib/vibeos` |
+| Linux host, if the fallback was used | A setting that lets any user there open ports from 443 up | `sudo rm /etc/sysctl.d/60-vibeos.conf && sudo sysctl -w net.ipv4.ip_unprivileged_port_start=1024` |
+| Your DNS and firewall | The name pointing at the host, and port 443 open to it | Remove them if nothing else uses them |
+
+Any `mac.sock` or `tunnel.sock` left in `run/` does no harm, and you can delete it. If your
+API keys were used from the internet, consider replacing them.
+
+**Going back.** The registry keeps its External Address settings, so the build before
+this one can still read it, and that build **starts serving publicly again** if the
+setting was on. To turn it off for good, run `vibe host external local off` on the host
+before you upgrade.
 
 ## MCP tools
 

@@ -1697,3 +1697,217 @@ mod upgrades {
         installs_reach(&w, before + 1).await;
     }
 }
+
+/// A Linux host's config, as a host that isn't linked yet has it.
+fn linux_config(world: &Golden) -> vibed::core::Config {
+    let mut config = world.config();
+    config.info.os = "linux".into();
+    config.layout = Layout::new(&world.home, "linux");
+    config.toolbox = None;
+    config
+}
+
+/// #143: what a build from before External Address was retired leaves on a host that
+/// had it on. This build serves none of it, says so, and leaves it all where it is, as
+/// the owner's to clear and what a build that's gone back would need.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn what_external_address_left_is_kept_and_serves_nothing() {
+    let world = Golden::new();
+    let layout = Layout::new(&world.home, "linux");
+    drop(Core::open(linux_config(&world)).unwrap());
+    assert!(
+        Core::open(linux_config(&world))
+            .unwrap()
+            .retired_external_note()
+            .is_none(),
+        "a host that never had it hears nothing of it"
+    );
+
+    rusqlite::Connection::open(layout.db())
+        .unwrap()
+        .execute(
+            "UPDATE hosts SET external = 'vps.example.com', external_changed_by = 'a Mac' \
+             WHERE name = 'local'",
+            [],
+        )
+        .unwrap();
+    let certs = layout.data_dir().join("external");
+    std::fs::create_dir_all(&certs).unwrap();
+    let kept = certs.join("vps.example.com.key");
+    std::fs::write(&kept, "a private key").unwrap();
+    // sshd's end of an older Mac's `ssh -R` has no lock; an older Mac's own socket has.
+    let run = layout.run_dir();
+    std::fs::create_dir_all(&run).unwrap();
+    let sshd_end = run.join("mac.sock");
+    let mac_end = run.join("tunnel.sock");
+    drop(std::os::unix::net::UnixListener::bind(&sshd_end).unwrap());
+    drop(std::os::unix::net::UnixListener::bind(&mac_end).unwrap());
+    std::fs::write(vibe_core::socket::lock_path(&mac_end), "").unwrap();
+
+    let core = Arc::new(Core::open(linux_config(&world)).unwrap());
+    let note = core
+        .retired_external_note()
+        .expect("what to tell its owner");
+    assert!(note.contains("vps.example.com"), "{note}");
+    assert!(note.contains(certs.to_str().unwrap()), "{note}");
+    assert!(note.contains("docs/mcp-and-networking.md"), "{note}");
+
+    // Neither's a way back in, nor does the host read as serving it.
+    for method in ["hosts.external", "tunnel.prepare"] {
+        let refused = rpc(
+            &core,
+            method,
+            json!({"on": true, "domain": "vps.example.com"}),
+        )
+        .await;
+        assert_eq!(
+            refused["error"]["code"],
+            vibe_core::rpc::ErrorCode::MethodNotFound.code(),
+            "{refused}"
+        );
+    }
+    let listed = rpc(&core, "hosts.list", json!({})).await;
+    let own = &listed["result"]["hosts"][0];
+    assert_eq!(own["external"], false, "{listed}");
+    assert!(own.get("url").is_none(), "{listed}");
+
+    // A scan finds no session in either socket, and removes neither.
+    let sessions = rpc(&core, "sessions.list", json!({})).await;
+    assert_eq!(sessions["result"]["sessions"], json!([]), "{sessions}");
+    for left in [&sshd_end, &mac_end, &kept] {
+        assert!(left.exists(), "{} went", left.display());
+    }
+    // And the row's as it was, for a build that goes back.
+    let domain: String = rusqlite::Connection::open(layout.db())
+        .unwrap()
+        .query_row("SELECT external FROM hosts WHERE name = 'local'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(domain, "vps.example.com");
+}
+
+/// An agent's row, as one made before 0.1.3 had a name that's since been reserved.
+fn legacy_agent(home: &std::path::Path, os: &str, agent_ref: &str) {
+    let layout = Layout::new(home, os);
+    let mut store = vibe_core::store::Store::open(&layout.db()).unwrap();
+    store
+        .add_agent(&vibe_core::store::AgentRecord {
+            host: vibe_core::model::LOCAL_HOST.into(),
+            agent_ref: agent_ref.into(),
+            project: "app".into(),
+            profile: "software-eng-linux".into(),
+            environment: vibe_core::model::Environment::Linux,
+            model: vibe_core::model::Model::Opus,
+            reasoning: vibe_core::model::Reasoning::High,
+            mode: vibe_core::model::Mode::Auto,
+            memory: 1 << 30,
+            worktree: home
+                .join("VibeOS/worktrees/app")
+                .join(agent_ref)
+                .to_string_lossy()
+                .into_owned(),
+            branch: agent_ref.into(),
+            session_id: "s".into(),
+            shim_socket: None,
+            state: vibe_core::model::AgentState::Exited,
+            created_at: 0,
+            compartment: "{}".into(),
+            starting: false,
+            shared_services: true,
+            agent: Default::default(),
+            pi_model: None,
+        })
+        .unwrap();
+}
+
+/// An agent named `mac` or `tunnel` before 0.1.3 is still listed and can be deleted. Its
+/// name's socket, if an older `vibed` left one, isn't a session's; sshd's has no lock, so
+/// deleting the agent leaves it (issue #45).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agents_named_for_the_retired_tunnel_can_still_be_deleted() {
+    let world = Golden::new();
+    let layout = Layout::new(&world.home, "linux");
+    let first = Core::open(linux_config(&world)).unwrap();
+    let path = world.home.join("src/app");
+    let added = rpc(&first, "projects.add", json!({"path": path})).await;
+    assert!(added.get("result").is_some(), "{added}");
+    drop(first);
+    for name in ["mac", "tunnel"] {
+        legacy_agent(&world.home, "linux", name);
+    }
+    let run = layout.run_dir();
+    std::fs::create_dir_all(&run).unwrap();
+    let sshd_end = run.join("mac.sock");
+    drop(std::os::unix::net::UnixListener::bind(&sshd_end).unwrap());
+    let core = Arc::new(Core::open(linux_config(&world)).unwrap());
+    let listed = rpc(&core, "agents.list", json!({})).await;
+    for name in ["mac", "tunnel"] {
+        let found = listed["result"]["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["ref"] == name);
+        assert!(found, "{name}: {listed}");
+    }
+    let sessions = rpc(&core, "sessions.list", json!({})).await;
+    assert_eq!(sessions["result"]["sessions"], json!([]), "{sessions}");
+    for name in ["mac", "tunnel"] {
+        let deleted = rpc(&core, "agents.delete", json!({"ref": name, "force": true})).await;
+        assert!(deleted.get("result").is_some(), "{name}: {deleted}");
+    }
+    assert!(sshd_end.exists(), "deleting `mac` removed sshd's socket");
+}
+
+/// Forgetting a host takes this Mac's keys off it, and another Mac's stay. With its link
+/// down it's forgotten all the same: there's no public endpoint they could go on opening.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forgetting_a_host_takes_only_this_macs_keys_off_it() {
+    let w = world().await;
+    w.add_host().await;
+    w.host
+        .sync_keys(vibe_core::rpc::KeySyncParams {
+            keys: vec![vibe_core::rpc::KeyHash {
+                name: "another Mac's".into(),
+                prefix: "vk_another".into(),
+                hash: "a".repeat(64),
+                created_at: "2026-10-30T12:00:00Z".into(),
+            }],
+            from: Some("another-mac".into()),
+        })
+        .unwrap();
+    let names = || -> Vec<String> {
+        let mut names: Vec<String> = w
+            .host
+            .keys()
+            .unwrap()
+            .keys
+            .into_iter()
+            .map(|k| k.name)
+            .collect();
+        names.sort();
+        names
+    };
+    w.mac
+        .create_key(vibe_core::rpc::KeyCreateParams {
+            name: "laptop".into(),
+        })
+        .unwrap();
+    for _ in 0..500 {
+        if names().contains(&"laptop".to_owned()) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(names(), ["another Mac's", "laptop"]);
+    let removed = w.rpc("hosts.remove", json!({"host": "vps"})).await;
+    assert!(removed.get("result").is_some(), "{removed}");
+    assert_eq!(names(), ["another Mac's"]);
+
+    // Added again and gone: it's forgotten with its link down.
+    w.add_host().await;
+    w.wires.pull();
+    w.wait_link(HostLink::Down).await;
+    let removed = w.rpc("hosts.remove", json!({"host": "vps"})).await;
+    assert!(removed.get("result").is_some(), "{removed}");
+}

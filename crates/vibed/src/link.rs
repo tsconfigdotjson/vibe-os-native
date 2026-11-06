@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
 use vibe_core::model::{HostLink, LOCAL_HOST};
-use vibe_core::rpc::{ACCEPTS_CALLS, TUNNEL_METHODS};
+use vibe_core::rpc::{ACCEPTED_METHODS, ACCEPTS_CALLS};
 use vibe_core::rpc::{
     ErrorCode, ErrorObject, Event, Hello, HostInfo, HostList, HostsList, Method, PROTOCOL_VERSION,
 };
@@ -83,8 +83,7 @@ impl Upgrade {
     }
 }
 
-/// How the link is timed, and the tunnel that follows it; tests make it
-/// quicker.
+/// How the link is timed; tests make it quicker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Timing {
     pub ping_every: Duration,
@@ -92,10 +91,6 @@ pub struct Timing {
     pub connect_timeout: Duration,
     pub min_backoff: Duration,
     pub max_backoff: Duration,
-    /// How long a tunnel may go without the host coming through it, since
-    /// it began or since the host last did, before it's started anew
-    /// ([`crate::tunnel::QUIET`]).
-    pub tunnel_quiet: Duration,
     /// How long after one try the host's `vibed` is upgraded by itself again.
     pub upgrade_retry: Duration,
     /// How long, at the least, if its link has come back since.
@@ -110,7 +105,6 @@ impl Default for Timing {
             connect_timeout: CONNECT_TIMEOUT,
             min_backoff: MIN_BACKOFF,
             max_backoff: MAX_BACKOFF,
-            tunnel_quiet: crate::tunnel::QUIET,
             upgrade_retry: UPGRADE_RETRY,
             upgrade_gap: UPGRADE_GAP,
         }
@@ -124,7 +118,7 @@ struct Status {
     /// Why it's down, when it is.
     detail: Option<String>,
     /// What the host last said of itself, its own row of `hosts.list`:
-    /// whether it serves MCP, and how its external address is.
+    /// whether it serves MCP, for one.
     own: Option<HostInfo>,
 }
 
@@ -151,14 +145,9 @@ pub struct Link {
     /// push failed or couldn't be made, or none has been since it started. The next
     /// ping tries again.
     pub(crate) keys_stale: AtomicBool,
-    /// When this Mac last told the host about its external address: a ping sent
-    /// before that may answer with what it was.
     /// One push of keys to it at a time, so that an older list can't arrive after a
     /// newer one and undo it, which could bring back a revoked key.
     pub(crate) keys_pushing: tokio::sync::Mutex<()>,
-    pub(crate) external_told: Mutex<Option<Instant>>,
-    /// Why the host wouldn't take what this Mac last told it, if it wouldn't.
-    pub(crate) external_refused: Mutex<Option<String>>,
     /// The projects it last listed, as it still has them while it's away.
     pub(crate) projects_seen: Mutex<Vec<String>>,
     /// Whether its `vibed` sends [`vibe_core::rpc::CALL_ACCEPTED`].
@@ -194,10 +183,20 @@ pub fn unavailable(name: &str, why: Option<&str>) -> ErrorObject {
     )
 }
 
+/// What to do about a call that changes something, once it's gone out and nobody
+/// has heard how it ended. Nothing, for one that doesn't.
+fn check_after(method: &str) -> Option<&'static str> {
+    match method {
+        "agents.send" => Some("check vibe_read_messages before resending"),
+        "agents.start" | "agents.delete" => Some("check vibe_list_agents before trying again"),
+        _ => None,
+    }
+}
+
 /// What a call gets that went out over a link and hasn't been heard of since.
 fn lost(name: &str, method: &str, why: Option<&str>) -> ErrorObject {
     let e = unavailable(name, why);
-    match crate::external::check_after(method) {
+    match check_after(method) {
         Some(check) => ErrorObject {
             message: format!("{}. Outcome unknown: {check}", e.message),
             ..e
@@ -227,8 +226,6 @@ impl Link {
             refresh_wanted: AtomicBool::new(false),
             keys_stale: AtomicBool::new(true),
             keys_pushing: tokio::sync::Mutex::new(()),
-            external_told: Mutex::new(None),
-            external_refused: Mutex::new(None),
             projects_seen: Mutex::new(Vec::new()),
             accepts_calls: AtomicBool::new(false),
         }
@@ -258,17 +255,6 @@ impl Link {
         s.connected.then(|| s.own.clone()).flatten()
     }
 
-    /// The public name the host says it serves the external address at, if
-    /// it says it does.
-    pub fn reported_domain(&self) -> Option<String> {
-        let own = self.reported()?;
-        own.external.then_some(())?;
-        own.url?
-            .strip_prefix("https://")?
-            .strip_suffix(vibe_mcp::PATH)
-            .map(str::to_owned)
-    }
-
     /// Reconnects now rather than at the end of the backoff.
     pub fn kick(&self) {
         self.kick.notify_one();
@@ -281,13 +267,6 @@ impl Link {
         }
         lock(&self.idle).clear();
         self.set_down(Some("removed".into()));
-    }
-
-    /// Notes what the host just answered of itself, as `hosts.external`
-    /// does, under the name it calls itself.
-    pub(crate) fn note_report(&self, mut own: HostInfo) {
-        own.name = LOCAL_HOST.to_owned();
-        self.set_report(own);
     }
 
     /// Notes what the host says of itself, and returns whether that
@@ -329,8 +308,6 @@ impl Link {
         };
         self.up.send_replace(false);
         lock(&self.idle).clear();
-        // What the next link says is news, however soon that is.
-        *lock(&self.external_told) = None;
         changed
     }
 
@@ -390,7 +367,7 @@ impl Link {
             }
             // Only the agent calls are said to be taken. Others, as a clone in
             // `projects.add` is, take their time with no word till they're done.
-            if self.accepts_calls.load(Ordering::SeqCst) && TUNNEL_METHODS.contains(&method) {
+            if self.accepts_calls.load(Ordering::SeqCst) && ACCEPTED_METHODS.contains(&method) {
                 channel.call_accepted(method, params, ACCEPT_WITHIN).await
             } else {
                 channel.call(method, params).await
@@ -551,7 +528,7 @@ async fn session(core: &Weak<Core>, link: &Arc<Link>, timing: Timing) -> Result<
                 {
                     waiting = None;
                     // The ping's answer is the host's own listing: whether
-                    // it serves MCP now, and its external address.
+                    // it serves MCP now, for one.
                     let own = message
                         .get("result")
                         .cloned()
@@ -568,9 +545,6 @@ async fn session(core: &Weak<Core>, link: &Arc<Link>, timing: Timing) -> Result<
                         if link.behind.load(Ordering::SeqCst) {
                             c.upgrade_in_background(link);
                         }
-                        // Every time, as a report put off for being too soon after
-                        // telling it won't change again.
-                        c.reconcile_external(link);
                         // A push that failed is tried again.
                         if link.keys_stale.load(Ordering::SeqCst) {
                             c.push_keys_to(link);

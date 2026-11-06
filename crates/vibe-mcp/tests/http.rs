@@ -221,7 +221,6 @@ impl Daemon for Fake {
             .map(|a| AgentView {
                 attach_remote: format!("ssh -t mac {}", a.attach),
                 available: true,
-                last_seen: None,
                 agent: a,
             })
             .collect())

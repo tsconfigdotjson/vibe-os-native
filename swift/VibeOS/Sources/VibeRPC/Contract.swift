@@ -30,8 +30,6 @@ public enum VibeRPC {
         SignInAnswer.name,
         SignInCancel.name,
         HostsRemove.name,
-        HostsExternal.name,
-        TunnelPrepare.name,
         ProjectsList.name,
         ProjectsAdd.name,
         ProjectsRemove.name,
@@ -293,8 +291,7 @@ public enum RPCErrorCode: Int, CaseIterable, Sendable {
     /// The call is for a Linux host whose link is down: its agents are
     /// unavailable until it's back.
     case hostUnavailable = -32005
-    /// A call that came through the external address's tunnel carried no
-    /// API key this Mac knows. Only the tunnel's socket says it.
+    /// The call is only for another host's link, and didn't come over one.
     case unauthorized = -32006
 
     /// The name protocol/vibed-rpc.json uses.
@@ -532,18 +529,6 @@ public enum HostLink: String, Codable, CaseIterable, Hashable, Sendable {
     case local, connected, down
 }
 
-/// The Mac's tunnel to the Linux host that's its external address: on the
-/// Mac, the tunnel it keeps; in that host's own row, whether a Mac answers
-/// through it.
-public enum TunnelState: String, Codable, CaseIterable, Hashable, Sendable {
-    /// ssh is starting, or the host hasn't come through it yet.
-    case connecting
-    /// The host reaches the Mac through it.
-    case up
-    /// It isn't up; `externalDetail` says why. It's tried again.
-    case down
-}
-
 /// Whether a session's shim still holds its terminal.
 public enum SessionState: String, Codable, CaseIterable, Hashable, Sendable {
     case running, exited
@@ -612,10 +597,9 @@ public enum CheckId: String, Codable, CaseIterable, Hashable, Sendable {
 
 /// What a Linux host needs someone with sudo there to allow, once, as VibeOS
 /// tried every way it has without a password: `linger`, vibed staying up while
-/// the owner's logged out; `port443`, the external address's port.
+/// the owner's logged out; `git`, which agents can't do without.
 public enum AdminNeed: String, Codable, CaseIterable, Hashable, Sendable {
     case linger
-    case port443 = "port_443"
     case git
 }
 
@@ -714,23 +698,6 @@ public enum HostsRemove: RPCMethod {
     public typealias Params = HostNameParams
     public typealias Result = HostInfo
     public static let name = "hosts.remove"
-}
-
-/// `hosts.external`: Settings → Hosts → Use as External Address. The Linux
-/// host serves `https://<domain>/mcp` with a certificate from Let's
-/// Encrypt, and this Mac keeps an SSH tunnel to it. One host at most.
-public enum HostsExternal: RPCMethod {
-    public typealias Params = HostExternalParams
-    public typealias Result = HostInfo
-    public static let name = "hosts.external"
-}
-
-/// `tunnel.prepare`: on a Linux host, where the Mac's tunnel ends. Only
-/// vibed calls it, over the link.
-public enum TunnelPrepare: RPCMethod {
-    public typealias Params = NoParams
-    public typealias Result = TunnelPrepared
-    public static let name = "tunnel.prepare"
 }
 
 /// `projects.list`: a host's projects, with their profiles.
@@ -1115,7 +1082,8 @@ public struct HostInfo: Codable, Hashable, Sendable {
     public var label: String
     /// `local` for vibed's own host; another's link is `connected` or `down`.
     public var link: HostLink
-    /// Whether it's the external address for outside MCP callers.
+    /// Always false: External Address is retired. It's in the contract for an older
+    /// Mac's `vibed`, which can't read a host's row without it; nothing here reads it.
     public var external: Bool
     /// Whether it serves MCP now: on loopback, at least.
     public var mcp: Bool
@@ -1127,23 +1095,6 @@ public struct HostInfo: Codable, Hashable, Sendable {
     public var missing: [String]
     /// For a host whose link is down, why.
     public var detail: String?
-    /// While it's the external address, where outside MCP callers reach it.
-    public var url: String?
-    /// While it's the external address, the Mac's tunnel to it.
-    public var tunnel: TunnelState?
-    /// On a Linux host's own row, when its external address last changed.
-    public var externalChangedAt: Int64?
-    /// What to know about its external address that isn't trouble: who turned it
-    /// off and when, or that it serves on its own, with this Mac not using it.
-    public var externalNote: String?
-    /// The name it serves, while this Mac isn't using it: what to use with one click.
-    public var externalServes: String?
-    /// The name this Mac chose for it, while it no longer serves that: what to turn on
-    /// again with one click.
-    public var externalLast: String?
-    /// While it's the external address and something keeps it from
-    /// working, or holds it up, what, and how to fix it.
-    public var externalDetail: String?
     /// What its memory is doing now: this host's own, and a Linux host's
     /// from its last ping while its link is up.
     public var memory: MemoryUse?
@@ -1157,12 +1108,7 @@ public struct HostInfo: Codable, Hashable, Sendable {
     public var upgradeError: String?
 
     public enum CodingKeys: String, CodingKey, CaseIterable {
-        case name, os, label, link, external, mcp, address, version, missing, detail, url, tunnel
-        case externalChangedAt = "external_changed_at"
-        case externalNote = "external_note"
-        case externalServes = "external_serves"
-        case externalLast = "external_last"
-        case externalDetail = "external_detail"
+        case name, os, label, link, external, mcp, address, version, missing, detail
         case memory
         case needsAdmin = "needs_admin"
         case signIns = "sign_ins"
@@ -1198,38 +1144,6 @@ public struct MemoryUse: Codable, Hashable, Sendable {
         case swapTotal = "swap_total"
         case swapUsed = "swap_used"
         case pressure
-    }
-}
-
-/// What Use as External Address takes.
-public struct HostExternalParams: Codable, Hashable, Sendable {
-    /// A Linux host this Mac added.
-    public var host: String?
-    public var on: Bool
-    /// The public DNS name it's reached at, pointing at the host. Needed to
-    /// turn it on.
-    public var domain: String?
-    /// Who's asking; `vibed` fills it in when it passes this on to a host.
-    public var by: String?
-
-    public init(host: String?, on: Bool, domain: String? = nil) {
-        self.host = host
-        self.on = on
-        self.domain = domain
-    }
-
-    public enum CodingKeys: String, CodingKey, CaseIterable {
-        case host, on, domain, by
-    }
-}
-
-/// Where the Mac's tunnel ends on a Linux host.
-public struct TunnelPrepared: Codable, Hashable, Sendable {
-    /// The socket's absolute path on the host.
-    public var socket: String
-
-    public enum CodingKeys: String, CodingKey, CaseIterable {
-        case socket
     }
 }
 

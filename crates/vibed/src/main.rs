@@ -30,9 +30,7 @@ usage: vibed [--socket PATH]
 
 Serves the VibeOS JSON-RPC API on a Unix socket, and MCP on
 http://127.0.0.1:7878/mcp (mcp_port and mcp_tailscale in host.toml), until
-SIGTERM or SIGINT. A Linux host that's the external address also serves MCP
-publicly on https://<its name>/mcp, port 443, with a certificate from Let's
-Encrypt; a Mac keeps an SSH tunnel to it, reaching run/tunnel.sock here.
+SIGTERM or SIGINT.
 State lives under $HOME: on macOS in ~/Library/Application Support/VibeOS
 (logs in ~/Library/Logs/VibeOS), elsewhere in ~/.local/share/vibeos. Host
 limits are in ~/.config/vibeos/host.toml.
@@ -75,18 +73,6 @@ environment:
                   never keeps this vibed out of the login Keychain; allow lets
                   one outside an app bundle in, which is otherwise kept out so
                   that no test reaches it; the agents it starts aren't given allow
-  VIBE_EXTERNAL_PORT, VIBE_EXTERNAL_LISTEN, VIBE_ACME_DIRECTORY
-                  for tests only: the port the external address is served
-                  on (default 443), the one address it listens on (default
-                  all), and the ACME server its certificate comes from
-                  (default Let's Encrypt's)
-  VIBE_EXTERNAL_CERT, VIBE_EXTERNAL_KEY
-                  for tests only: a PEM certificate chain and key the
-                  external address serves, instead of one from ACME
-  VIBE_TEST_SERVE_EXTERNAL
-                  for tests only, with VIBE_TEST_BACKEND: 1 lets this host be
-                  the external address whatever its OS, as a stand-in Linux
-                  host on a Mac
   VIBE_TEST_BACKEND
                   for tests only: run every environment's agents natively,
                   unlimited but for a supervisor, with this program as
@@ -259,39 +245,6 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
         config.vibe_cli = vibe;
     }
     config.services = Some(services_config(&config.layout));
-    if let Some(port) = env_text("VIBE_EXTERNAL_PORT") {
-        match port.parse() {
-            Ok(port) => config.external.port = port,
-            Err(_) => vibed::log!("vibed: VIBE_EXTERNAL_PORT isn't a port: {port}"),
-        }
-    }
-    if let Some(ip) = env_text("VIBE_EXTERNAL_LISTEN") {
-        match ip.parse() {
-            Ok(ip) => config.external.listen = Some(ip),
-            Err(_) => vibed::log!("vibed: VIBE_EXTERNAL_LISTEN isn't an IP address: {ip}"),
-        }
-    }
-    if let Some(directory) = env_text("VIBE_ACME_DIRECTORY") {
-        config.external.acme_directory = directory;
-    }
-    if let (Some(cert), Some(key)) = (
-        std::env::var_os("VIBE_EXTERNAL_CERT").filter(|v| !v.is_empty()),
-        std::env::var_os("VIBE_EXTERNAL_KEY").filter(|v| !v.is_empty()),
-    ) {
-        config.external.fixed_cert = Some((PathBuf::from(cert), PathBuf::from(key)));
-    }
-    let stand_in = env_text("VIBE_TEST_SERVE_EXTERNAL");
-    let serve = serve_here(
-        &config.info.os,
-        env_text("VIBE_TEST_BACKEND").is_some(),
-        stand_in.as_deref(),
-    );
-    if serve && config.info.os != "linux" {
-        vibed::log!(
-            "vibed: VIBE_TEST_SERVE_EXTERNAL is set: this host may be the external address"
-        );
-    }
-    config.external.serve_here = serve;
     if let Some(claude) = std::env::var_os("VIBE_TEST_BACKEND").filter(|v| !v.is_empty()) {
         vibed::log!(
             "vibed: VIBE_TEST_BACKEND is set: agents run under the test backend, with {} as \
@@ -419,9 +372,9 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
     let sleep = core.spawn_sleep_watch();
     // The links to Linux hosts, each kept up on its own.
     core.spawn_links();
-    // External access: a Linux host's public endpoint; a Mac's tunnel, and
-    // the socket it reaches, which checks every call's API key itself.
-    core.spawn_external();
+    if let Some(note) = core.retired_external_note() {
+        vibed::log!("vibed: {note}");
+    }
     // Shared MCP services: this host's broker, and on a Mac, the relays it
     // dials to its VMs.
     let services = core.spawn_services();
@@ -438,7 +391,6 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
     };
     server::serve(listener, Arc::clone(&core), MAX_MESSAGE_BYTES, shutdown).await;
     core.stop_links();
-    core.stop_external();
     for task in services {
         task.abort();
     }
@@ -470,13 +422,6 @@ async fn run(path: PathBuf, layout: Layout) -> Result<(), Box<dyn std::error::Er
     drop(guard);
     vibed::log!("vibed: stopped");
     Ok(())
-}
-
-/// Whether this host may serve the external address: a Linux host may, a
-/// Mac never; except, in tests, a stand-in Linux host on a Mac, which runs
-/// the test backend and asks with `VIBE_TEST_SERVE_EXTERNAL=1`.
-fn serve_here(os: &str, test_backend: bool, stand_in: Option<&str>) -> bool {
-    os == "linux" || (test_backend && stand_in == Some("1"))
 }
 
 /// Which services this host's broker offers, and where it keeps what it holds:
@@ -602,18 +547,6 @@ mod tests {
         std::fs::write(&login, "live").unwrap();
         assert_eq!(kind(mac_store(dir.clone(), false, true)), "Keychain");
         assert!(!login.exists());
-    }
-
-    #[test]
-    fn a_mac_never_serves_the_external_address() {
-        assert!(serve_here("linux", false, None));
-        assert!(!serve_here("macos", false, None));
-        // The variable alone does nothing: only a test's stand-in host,
-        // on the test backend, may.
-        assert!(!serve_here("macos", false, Some("1")));
-        assert!(!serve_here("macos", true, None));
-        assert!(!serve_here("macos", true, Some("yes")));
-        assert!(serve_here("macos", true, Some("1")));
     }
 
     #[test]

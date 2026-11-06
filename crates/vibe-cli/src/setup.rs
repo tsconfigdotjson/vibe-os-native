@@ -8,12 +8,12 @@ use std::time::Duration;
 
 use vibe_core::model::{AgentKind, Environment, Mode, Model, PiTarget, Reasoning};
 use vibe_core::rpc::{
-    HostAddParams, HostExternalParams, HostInfo, HostInstall, HostLink, HostNameParams, HostParams,
-    HostsAdd, HostsExternal, HostsList, HostsRemove, HostsUpgrade, NoParams, PiForget,
-    PiForgetParams, PiInstall, PiInstallParams, PiStatus, PiStatusGet, Profile,
-    ProfileCreateParams, ProfileParams, ProfileUpdateParams, ProfilesCreate, ProfilesDelete,
-    ProfilesList, ProfilesUpdate, Project, ProjectAddParams, ProjectParams, ProjectRemoveParams,
-    ProjectsAdd, ProjectsList, ProjectsRemove,
+    HostAddParams, HostInfo, HostInstall, HostLink, HostNameParams, HostParams, HostsAdd,
+    HostsList, HostsRemove, HostsUpgrade, NoParams, PiForget, PiForgetParams, PiInstall,
+    PiInstallParams, PiStatus, PiStatusGet, Profile, ProfileCreateParams, ProfileParams,
+    ProfileUpdateParams, ProfilesCreate, ProfilesDelete, ProfilesList, ProfilesUpdate, Project,
+    ProjectAddParams, ProjectParams, ProjectRemoveParams, ProjectsAdd, ProjectsList,
+    ProjectsRemove,
 };
 use vibe_core::units::{format_size, parse_size};
 
@@ -95,11 +95,6 @@ pub(crate) enum Command {
     },
     UpgradeHost(String),
     RemoveHost(String),
-    /// Makes a host the external address at a domain, or with none not.
-    External {
-        host: String,
-        domain: Option<String>,
-    },
 }
 
 /// Words, and `--flag value` pairs, from a command line.
@@ -312,18 +307,8 @@ impl Command {
             }),
             ["upgrade", name] => Ok(Command::UpgradeHost((*name).to_owned())),
             ["remove" | "rm", name] => Ok(Command::RemoveHost((*name).to_owned())),
-            ["external", name, "off"] => Ok(Command::External {
-                host: (*name).to_owned(),
-                domain: None,
-            }),
-            ["external", name, domain] => Ok(Command::External {
-                host: (*name).to_owned(),
-                domain: Some((*domain).to_owned()),
-            }),
             _ => Err(
-                "host takes list, add NAME SSH-DESTINATION, upgrade NAME, remove NAME, or \
-                 external NAME DOMAIN|off"
-                    .into(),
+                "host takes list, add NAME SSH-DESTINATION, upgrade NAME, or remove NAME".into(),
             ),
         }
     }
@@ -461,21 +446,6 @@ pub(crate) fn describe_host(h: &HostInfo) -> String {
     }
     if let Some(why) = &h.upgrade_error {
         out.push_str(&format!("  upgrading it failed: {why}"));
-    }
-    if let Some(note) = &h.external_note {
-        out.push_str(&format!("  ({note})"));
-    }
-    if h.external {
-        out.push_str("  external address");
-        if let Some(url) = &h.url {
-            out.push_str(&format!(" {url}"));
-        }
-        if let Some(t) = h.tunnel {
-            out.push_str(&format!(", tunnel {t}"));
-        }
-        if let Some(why) = &h.external_detail {
-            out.push_str(&format!(": {why}"));
-        }
     }
     out
 }
@@ -694,16 +664,6 @@ pub(crate) fn run(socket: &Path, command: Command) -> Result<(), String> {
                 .map_err(e)?;
             print!("{}", describe_install(&i));
         }
-        Command::External { host, domain } => {
-            let params = HostExternalParams {
-                host: Some(host),
-                on: domain.is_some(),
-                domain,
-                by: Some("this host's `vibe`".into()),
-            };
-            let h = client::call::<HostsExternal>(socket, &params, TIMEOUT).map_err(e)?;
-            println!("{}", describe_host(&h));
-        }
         Command::RemoveHost(host) => {
             let h = client::call::<HostsRemove>(socket, &HostNameParams { host }, TIMEOUT)
                 .map_err(e)?;
@@ -907,13 +867,6 @@ mod tests {
             version: Some("0.1.0".into()),
             missing: vec!["claude".into()],
             detail: Some("it stopped answering".into()),
-            url: None,
-            tunnel: None,
-            external_changed_at: None,
-            external_note: None,
-            external_serves: None,
-            external_last: None,
-            external_detail: None,
             memory: None,
             needs_admin: vec![],
             upgrade_error: None,
@@ -923,37 +876,9 @@ mod tests {
             describe_host(&h),
             "vps  vps-1 (linux)  down: it stopped answering  ssh me@vps  vibed 0.1.0  missing claude"
         );
-        let h = HostInfo {
-            link: HostLink::Connected,
-            detail: None,
-            missing: vec![],
-            external: true,
-            url: Some("https://vps.example.com/mcp".into()),
-            tunnel: Some(vibe_core::model::TunnelState::Down),
-            external_detail: Some("can't listen on port 443".into()),
-            memory: None,
-            ..h
-        };
-        assert_eq!(
-            describe_host(&h),
-            "vps  vps-1 (linux)  connected  ssh me@vps  vibed 0.1.0  external address \
-             https://vps.example.com/mcp, tunnel down: can't listen on port 443"
-        );
-        assert_eq!(
-            Command::parse_host(&words(&["external", "vps", "vps.example.com"])),
-            Ok(Command::External {
-                host: "vps".into(),
-                domain: Some("vps.example.com".into())
-            })
-        );
-        assert_eq!(
-            Command::parse_host(&words(&["external", "vps", "off"])),
-            Ok(Command::External {
-                host: "vps".into(),
-                domain: None
-            })
-        );
-        assert!(Command::parse_host(&words(&["external", "vps"])).is_err());
+        // A retired command is an error, not a way back in.
+        assert!(Command::parse_host(&words(&["external", "vps", "vps.example.com"])).is_err());
+        assert!(Command::parse_host(&words(&["external", "vps", "off"])).is_err());
     }
 
     #[test]

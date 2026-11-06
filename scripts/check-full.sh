@@ -46,8 +46,7 @@
 #     with a key from `vibe key create`, `vibe mcp` carries VibeOS's round
 #     over stdio: start an agent on a question, wait for it, read it, answer
 #     it with keys, wait for that answer, read it, and delete the agent. On
-#     a Mac, vibed serves no tunnel socket (run/tunnel.sock) while no host is
-#     the external address, and listens on no TCP port beyond loopback
+#     a Mac, vibed listens on no TCP port beyond loopback
 #     (lsof says so)
 #   - a Linux host over SSH, with every process real but the network
 #     (crates/vibe-cli/tests/linux_host.rs): a stand-in ssh runs commands in a
@@ -57,22 +56,14 @@
 #     Mac's MCP shows in the Mac's listing with its ssh attach line, the
 #     Mac's API key is pushed to the host, whose own MCP serves it with that
 #     key, and a pulled network shows the host down and its agent
-#     unavailable until it reconnects on its own. Then external access
-#     (#18) the same way: `vibe host external` makes the host the external
-#     address, served over HTTPS with a certificate made for the test and
-#     reached by `ssh -R` (a stand-in relay) from the Mac's tunnel socket;
-#     a client with curl, the URL and a key starts an agent on the host and
-#     one on the Mac and talks to both, gets 401 without a key, is logged
-#     by the key's name (never the key), sees the Mac's agents unavailable
-#     while the Mac is offline and the host's still answering, and is cut
-#     off on the host when the key is revoked on the Mac; the Mac listens on
-#     no public port. Then, with the tunnel's relay stopped as with a Mac
-#     asleep (#59), every tool for the host's own agents answers in under 5 s,
-#     the listing merges back when it resumes, and with the Mac stopped
-#     altogether, the same. (crates/vibed/tests/external.rs, in the test step,
-#     covers the same in one process, plus rate limits, the Mac refusing a
-#     host's own key and a revoked one even before the host hears, and the
-#     tunnel's supervision.)
+#     unavailable until it reconnects on its own. Then the host alone (#143):
+#     with no Tailscale asked for, a client on the host with curl and a key
+#     starts an agent there and talks to it on loopback, gets 401 without a key,
+#     and nothing listens beyond loopback on the host or the Mac. With the Mac
+#     stopped, every tool for the host's own agents answers in under 5 s and the
+#     line to attach over SSH is still given. (crates/vibed/tests/mcp.rs, in the
+#     test step, covers a Linux host's Tailscale setting from host.toml, as far as
+#     no tailnet can; crates/vibed/tests/hosts.rs what External Address left.)
 #   - a real Linux server, when VIBE_TEST_LINUX_HOST is an SSH destination
 #     that logs in with a key (N/A otherwise): the Linux builds of vibed
 #     (scripts/host-bundle.sh, which fetches zig and cargo-zigbuild on first
@@ -85,21 +76,8 @@
 #     vibe-shim: the conformance suite on its real cgroups, and a memory hog
 #     stopped by its own limit while its neighbour runs on. Every test agent
 #     there has a memory limit of tens of MB, and nothing is left behind. These
-#     run under scripts/keep-host-state.sh, which puts the server's external
-#     address back as it was, and fails if that or an API key isn't
-#   - external access through a real server (#18), when VIBE_TEST_LINUX_HOST
-#     is set and VIBE_TEST_EXTERNAL_DOMAIN is a public DNS name pointing at
-#     it, with port 443 open there and usable by its user (N/A otherwise):
-#     installed and linked as in the real-host step, made the external
-#     address, it gets a real certificate from Let's Encrypt (kept on the
-#     server, so a rerun doesn't ask again) and the Mac's real `ssh -R`
-#     tunnel comes up; then a client on the internet with
-#     https://<domain>/mcp and a key starts and talks to an agent on the
-#     Mac, and one on the server when VIBE_TEST_LINUX_PROJECT names a
-#     project there; with that ssh stopped, as with a Mac asleep, the server
-#     still lists it all promptly, with the Mac's agents as last seen, and
-#     has them back once it resumes; it gets nothing without a key, nothing once the key is
-#     revoked, and the Mac listens on no public port
+#     run under scripts/keep-host-state.sh, which refuses a server still serving
+#     External Address from an older build, and fails if an API key isn't
 #   - the Linux host's cgroups backend on this machine, on Linux with a
 #     systemd user manager (N/A otherwise; on a Mac, the real-host step runs
 #     it on a server): the same tests, and a linux agent through vibed in a
@@ -415,7 +393,7 @@ s_test_guest() { scripts/test-guest.sh build/test-guest; }
 s_cross() {
   local host target var
   host=$(rustc -vV | sed -n 's/^host: //p')
-  # C that dependencies build (ring, for the external address's TLS) needs
+  # C that dependencies build (ring, for the TLS of shared services' calls) needs
   # the target's C toolchain, which a Mac checking Linux doesn't have. A
   # check links nothing, so a stand-in compiler and archiver that make
   # empty outputs are enough, as the target's C is never used.
@@ -748,10 +726,8 @@ s_mcp() {
   wait "$bridge" || { echo "vibe mcp exited with $?"; cat "$WORK/mc-bridge.err"; return 1; }
   [ ! -e "$home/VibeOS/worktrees/app/mcp-check" ] || { echo "the worktree is left"; return 1; }
   git -C "$repo" rev-parse --verify --quiet refs/heads/mcp-check >/dev/null || { echo "the branch went"; return 1; }
-  # External access: with no host the external address, the tunnel's
-  # socket isn't there at all, and nothing listens beyond loopback.
-  local tunnel="$home/Library/Application Support/VibeOS/run/tunnel.sock" listening
-  [ ! -e "$tunnel" ] || { echo "$tunnel is served with no external address"; return 1; }
+  # Nothing listens beyond loopback.
+  local listening
   if [ "$OS" = Darwin ] && ! command -v lsof >/dev/null; then
     echo "no lsof to see what vibed listens on"
     return 1
@@ -989,7 +965,7 @@ s_surfaces() {
   for name in menu menu-status menu-welcome menu-welcome-fresh menu-install-move menu-install-login-items \
     menu-quiet menu-offline menu-bar new-agent new-agent-empty add-host add-host-local-network \
     add-host-done settings-projects settings-keys settings-hosts settings-toolbox settings-limits \
-    settings-general settings-project settings-projects-first-run new-key new-key-made external-address; do
+    settings-general settings-project settings-projects-first-run new-key new-key-made; do
     for look in light dark; do
       [ -s "$out/$name-$look.png" ] || { echo "no $name-$look.png"; return 1; }
     done
@@ -1447,7 +1423,7 @@ PY
 }
 
 s_linux_host() {
-  cargo test -p vibe-cli --test linux_host --locked -- a_linux_host an_unreachable external_access --test-threads=1
+  cargo test -p vibe-cli --test linux_host --locked -- a_linux_host an_unreachable --test-threads=1
 }
 
 s_real_host() {
@@ -1467,31 +1443,6 @@ s_real_host() {
   VIBE_HOST_BUNDLE="$bundle" scripts/keep-host-state.sh "$VIBE_TEST_LINUX_HOST" -- \
     cargo test -p vibe-cli --test linux_host --locked -- real_linux_host --ignored --nocapture
   real_host_cgroups "$VIBE_TEST_LINUX_HOST" "$arch" "$bundle"
-}
-
-# External access through the real server, with a real certificate and the
-# Mac's real ssh tunnel. It reuses the real-host step's bundle when that ran.
-s_real_external() {
-  if [ -z "${VIBE_TEST_LINUX_HOST:-}" ] || [ -z "${VIBE_TEST_EXTERNAL_DOMAIN:-}" ]; then
-    echo "no public Linux server: set VIBE_TEST_LINUX_HOST to an SSH destination that logs in with a key, and VIBE_TEST_EXTERNAL_DOMAIN to a DNS name pointing at it, with port 443 open"
-    return $NOT_APPLICABLE
-  fi
-  local bundle=${VIBE_HOST_BUNDLE:-} arch
-  # The real-host step's, when it built one.
-  if [ -z "$bundle" ] && [ -d "$WORK/host-bundle" ]; then bundle="$WORK/host-bundle"; fi
-  if [ -z "$bundle" ]; then
-    arch=$(ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -- "$VIBE_TEST_LINUX_HOST" uname -m)
-    case $arch in amd64) arch=x86_64 ;; arm64) arch=aarch64 ;; esac
-    bundle="$WORK/host-bundle"
-    scripts/host-bundle.sh --out "$bundle" --target "$arch"
-  fi
-  # Port 443 for vibed, which runs as the server's user (PRD: External
-  # access): vibed gets it itself with passwordless sudo; a server that needs
-  # a password fails this, saying so, as only the app's Allow… can do that.
-  # Under this, as it changes the external address: it's put back as it was.
-  # The bundle's path stays off its command line: the cleanup below kills by "$WORK/".
-  VIBE_HOST_BUNDLE="$bundle" scripts/keep-host-state.sh "$VIBE_TEST_LINUX_HOST" -- \
-    cargo test -p vibe-cli --test linux_host --locked -- real_external_access --ignored --nocapture
 }
 
 # real_host_cgroups <ssh destination> <arch> <bundle>: the cgroups backend's
@@ -1559,7 +1510,6 @@ step services-claude "shared MCP services: real Claude Code through the shim, to
 step pi-e2e "real Pi on a mock model: first prompt, a shared service, send, interrupt, sleep, resume" s_pi_e2e build
 step linux-host "a Linux host over SSH: install, link, an agent via MCP, a pulled network" s_linux_host build
 step real-host "a real Linux server over SSH (VIBE_TEST_LINUX_HOST), its cgroups too" s_real_host build
-step external "external access via a real server, Let's Encrypt and ssh -R (VIBE_TEST_EXTERNAL_DOMAIN)" s_real_external build
 step cgroups "the Linux host's backend: conformance on real cgroups, a memory hog, an agent" s_cgroups build
 mac_step macos-governor "the macos backend: conformance, fork bomb, memory, nohup, CPU, disk" s_macos_governor build
 mac_step macos-agents "a macos agent on the governor: Mac's ~/.claude, a limit pause, delete" s_macos_agents build

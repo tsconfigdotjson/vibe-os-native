@@ -102,9 +102,8 @@ the Swift contract tests, signing with the virtualization entitlement,
 smoke tests of `vibe-vm` and `VibeOS.app` against a live `vibed`, the menu
 following a live agent and two clicks giving one Terminal tab; a Linux host
 added over SSH and linked, on stand-ins for `ssh` and `systemctl` (and on a
-real server with `VIBE_TEST_LINUX_HOST` set), and external access through it
-(with a real certificate and tunnel when `VIBE_TEST_EXTERNAL_DOMAIN` names
-it too); real
+real server with `VIBE_TEST_LINUX_HOST` set), and that host answering for its own
+agents with the Mac gone; real
 VMs booted, saved and restored through `vibe-vm`, the Linux base image, and
 `linux` agents on it: the backend's conformance suite, and real Claude across
 a sleep; `vibe doctor` against a live `vibed`; and a release DMG, built ad

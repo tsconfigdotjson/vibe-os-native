@@ -24,8 +24,7 @@ public final class FixtureDaemon: DaemonConnection, @unchecked Sendable {
         case offline
         /// A fictional team's working day, on this Mac and two Linux hosts,
         /// for the README's screenshots: `--gallery --demo`. Larkfield Labs,
-        /// its people and its hosts are made up, and no host is the external
-        /// address.
+        /// its people and its hosts are made up.
         case demo
     }
 
@@ -177,9 +176,8 @@ public final class FixtureDaemon: DaemonConnection, @unchecked Sendable {
         return [
             local,
             [
-                "name": "vps", "os": "linux", "label": "vps-fra-1", "link": "connected", "external": true,
+                "name": "vps", "os": "linux", "label": "vps-fra-1", "link": "connected", "external": false,
                 "mcp": true, "address": "me@vps.example.com", "version": "0.1.0", "missing": [String](),
-                "url": "https://vps.example.com/mcp", "tunnel": "up",
                 "memory": ["total": 16 << 30, "used": 5 << 30, "swap_total": 4 << 30, "swap_used": 0],
             ],
             [

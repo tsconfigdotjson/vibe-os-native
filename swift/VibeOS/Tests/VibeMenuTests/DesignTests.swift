@@ -625,7 +625,6 @@ typealias StepStatus = SetupProgress.Step.Status
         #expect(Set(model.agents.map(\.state)) == [.busy, .question, .paused, .idle, .asleep])
         #expect(model.groups.map(\.host) == ["local", "vps", "box"])
         #expect(model.icon.question && model.icon.paused)
-        #expect(model.externalHost?.name == "vps")
         #expect(model.gh?.account == "octocat")
         #expect(model.mcp?.tailscaleUrls.isEmpty == false)
         // Rows read sensibly: the usage-limited one says until when.
@@ -634,14 +633,12 @@ typealias StepStatus = SetupProgress.Step.Status
     }
 
     /// What the README's screenshots draw: a fictional team, working, with
-    /// no host down and none the external address.
-    @Test func theDemoIsFictionalAndHasNoExternalAddress() async throws {
+    /// no host down.
+    @Test func theDemoIsFictional() async throws {
         let model = await MenuModel.fixture(.demo)
         #expect(model.connection == .connected)
         #expect(model.hosts.map(\.name) == ["local", "atlas", "forge"])
         #expect(model.unavailableHosts.isEmpty)
-        #expect(model.externalHost == nil)
-        #expect(model.hosts.allSatisfy { !$0.external })
         #expect(Set(model.agents.map(\.state)) == [.busy, .question, .idle, .asleep])
         #expect(model.gh?.account == "larkfield-dev")
     }
@@ -777,7 +774,7 @@ typealias StepStatus = SetupProgress.Step.Status
     @Test func theHeaderShowsOnlyWhatNeedsTheOwner() throws {
         let hosts = try [
             decode(HostInfo.self, hostJSON("local", mcp: true)),
-            decode(HostInfo.self, hostJSON("vps", link: .connected, external: true, tunnel: .up)),
+            decode(HostInfo.self, hostJSON("vps", link: .connected)),
             decode(HostInfo.self, hostJSON("box", link: .down, detail: "ssh: timed out")),
         ]
         let gh = try decode(GhStatus.self, ["state": "logged_in", "account": "octocat"])
@@ -788,12 +785,11 @@ typealias StepStatus = SetupProgress.Step.Status
         #expect(alerts.first?.tone == .trouble)
         #expect(alerts.first?.reason == "ssh: timed out")
         #expect(alerts.first?.detail == "Its agents keep running. VibeOS reconnects on its own.")
-        // A gh login missing and an external address outside can't reach.
+        // A gh login missing.
         let out = try decode(GhStatus.self, ["state": "logged_out"])
-        let unreachable = try decode(HostInfo.self, hostJSON("vps", link: .connected, external: true, tunnel: .down))
-        let worse = headerAlerts(gh: out, hosts: [unreachable])
-        #expect(worse.map(\.title) == ["vps isn't reachable from outside", "GitHub CLI is logged out"])
-        #expect(worse.map(\.tone) == [.attention, .attention])
+        let worse = headerAlerts(gh: out, hosts: [hosts[1]])
+        #expect(worse.map(\.title) == ["GitHub CLI is logged out"])
+        #expect(worse.map(\.tone) == [.attention])
         // Nothing wrong, nothing shown.
         #expect(headerAlerts(gh: gh, hosts: Array(hosts.prefix(2))).isEmpty)
         #expect(headerAlerts(gh: nil, hosts: []).isEmpty)
@@ -802,13 +798,13 @@ typealias StepStatus = SetupProgress.Step.Status
     @Test func theSteadyFactsAreAllThereOnRequest() throws {
         let hosts = try [
             decode(HostInfo.self, hostJSON("local", mcp: true)),
-            decode(HostInfo.self, hostJSON("vps", link: .connected, external: true, tunnel: .up)),
+            decode(HostInfo.self, hostJSON("vps", link: .connected)),
             decode(HostInfo.self, hostJSON("box", link: .down)),
         ]
         let gh = try decode(GhStatus.self, ["state": "logged_in", "account": "octocat"])
         let facts = headerFacts(memory: HostMemory(used: 3 << 30, total: 32 << 30), gh: gh, mcp: true, hosts: hosts)
         #expect(facts.map(\.label) == ["Memory", "GitHub", "MCP", "vps", "box"])
-        #expect(facts.map(\.value) == ["3G of 32G", "octocat", "On", "Connected, public", "Down"])
+        #expect(facts.map(\.value) == ["3G of 32G", "octocat", "On", "Connected", "Down"])
         #expect(facts.map(\.tone) == [.normal, .normal, .normal, .normal, .trouble])
         // A host may be named anything, "Memory" too: ids never collide.
         #expect(facts.map(\.id) == ["memory", "gh", "mcp", "host:vps", "host:box"])

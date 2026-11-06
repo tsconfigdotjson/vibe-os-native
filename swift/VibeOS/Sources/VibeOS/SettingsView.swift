@@ -4,7 +4,7 @@ import VibeMenu
 import VibeRPC
 
 /// Settings… (PRD: Menu bar, Footer): projects and their profiles, API keys,
-/// hosts and external access, the Linux toolbox, host limits, and the
+/// hosts, the Linux toolbox, host limits, and the
 /// menu's own preferences, in a sidebar as System Settings has. Every value
 /// is vibed's; nothing is kept here but the menu's own preferences. Fields
 /// save themselves.
@@ -822,10 +822,7 @@ struct KeysPane: View {
     }
 
     private var warning: String {
-        keysWarning(
-            linuxHosts: model.hosts.contains { $0.link != .local },
-            // A host serving publicly that this Mac isn't using still takes its keys.
-            externalHost: (model.externalHost ?? model.hosts.first { $0.externalServes != nil })?.name)
+        keysWarning(linuxHosts: model.hosts.contains { $0.link != .local })
     }
 
     private func load() async {
@@ -1003,8 +1000,7 @@ struct NewKeySheet: View {
     }
 
     /// The setup lines a client can use (PRD: MCP interface, Auth): this
-    /// Mac's, always; on the tailnet, while MCP is served there; and
-    /// anywhere, through the external address.
+    /// Mac's, always; and on the tailnet, while MCP is served there.
     private func setups(_ secret: String) -> [KeySetup] {
         let local = model.mcp?.url ?? MCPSetup.url
         var setups = [
@@ -1017,12 +1013,6 @@ struct NewKeySheet: View {
                 KeySetup(
                     title: "Tailscale", command: MCPSetup.command(secret: secret, url: tailscale),
                     help: "Sets up a client on your tailnet, at \(tailscale)"))
-        }
-        if let host = model.externalHost, let url = host.url {
-            setups.append(
-                KeySetup(
-                    title: "The Internet", command: MCPSetup.command(secret: secret, url: url),
-                    help: "Sets up a client anywhere, through \(host.name), at \(url)"))
         }
         return setups
     }
@@ -1098,10 +1088,6 @@ struct HostsPane: View {
     @State private var mcpError: String?
     /// The host whose vibed is being updated.
     @State private var updating: String?
-    /// The host Use as External Address is being turned on for.
-    @State private var externalFor: HostInfo?
-
-    private var linuxHosts: [HostInfo] { model.hosts.filter { $0.link != .local } }
 
     var body: some View {
         Form {
@@ -1127,6 +1113,8 @@ struct HostsPane: View {
             } footer: {
                 if let note = mcpNote {
                     Text(note).foregroundStyle(.secondary)
+                } else if model.mcp?.tailscale == false {
+                    Text(LocalizedStringKey(tailscaleSuggestion)).foregroundStyle(.secondary)
                 }
             }
             Section {
@@ -1146,116 +1134,18 @@ struct HostsPane: View {
             } header: {
                 Text("Hosts")
             }
-            if !linuxHosts.isEmpty {
-                Section {
-                    Picker("Use as external address", selection: externalSelection) {
-                        Text("None").tag("")
-                        ForEach(linuxHosts, id: \.name) { Text($0.name).tag($0.name) }
-                    }
-                    if let host = model.externalHost {
-                        ExternalAddressRows(host: host)
-                    }
-                    ForEach(linuxHosts.filter { !$0.external && $0.externalNote != nil }, id: \.name) {
-                        host in
-                        externalNoteRow(host)
-                    }
-                } header: {
-                    Text("External Address")
-                }
-            }
             if let error {
                 Section { ErrorText(error: error) }
             }
         }
         .formStyle(.grouped)
         .navigationTitle("Hosts")
-        .sheet(item: $externalFor) { host in
-            ExternalAddressSheet(model: model, host: host)
-        }
     }
 
     /// Why the Tailscale toggle isn't doing anything yet, if it isn't.
     private var mcpNote: String? {
         guard let mcp = model.mcp, mcp.tailscale, mcp.tailscaleUrls.isEmpty else { return nil }
         return "This Mac has no Tailscale address now; MCP is served there once it has one."
-    }
-
-    /// The picker shows the external address; choosing a host asks for its
-    /// public name, and None asks before it stops.
-    private var externalSelection: Binding<String> {
-        Binding(
-            get: { model.externalHost?.name ?? "" },
-            set: { name in
-                if name.isEmpty {
-                    if let host = model.externalHost { Task { await turnOffExternal(host) } }
-                } else if let host = model.hosts.first(where: { $0.name == name }) {
-                    externalFor = host
-                }
-            })
-    }
-
-    /// A host's external address that this Mac isn't using: why, and the fix.
-    private func externalNoteRow(_ host: HostInfo) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text(sentence(host.externalNote ?? ""))
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .textSelection(.enabled)
-                .fixedSize(horizontal: false, vertical: true)
-            HStack(spacing: 8) {
-                if let serves = host.externalServes {
-                    Button("Use It") { Task { await turnOnExternal(host, domain: serves) } }
-                    Button("Stop Serving") { Task { await stopServing(host) } }
-                } else if let last = host.externalLast {
-                    Button("Turn On Again") { Task { await turnOnExternal(host, domain: last) } }
-                } else {
-                    Button("Turn On") { externalFor = host }
-                }
-            }
-        }
-    }
-
-    private func turnOnExternal(_ host: HostInfo, domain: String) async {
-        do {
-            _ = try await model.setExternal(host.name, domain: domain)
-            error = nil
-        } catch {
-            self.error = describe(error)
-        }
-    }
-
-    private func stopServing(_ host: HostInfo) async {
-        guard
-            confirm(
-                "Stop \(host.name) serving publicly?",
-                detail: "MCP clients outside lose their way in to \(host.name), though this Mac "
-                    + "isn't using it, and another Mac may be. It stays off until someone turns "
-                    + "it on again.",
-                action: "Stop Serving")
-        else { return }
-        do {
-            _ = try await model.setExternal(host.name, domain: nil)
-            error = nil
-        } catch {
-            self.error = describe(error)
-        }
-    }
-
-    private func turnOffExternal(_ host: HostInfo) async {
-        guard
-            confirm(
-                "Stop using \(host.name) as the external address?",
-                detail: "MCP clients outside lose their way in, to every agent on \(host.name) and on this Mac. "
-                    + "The tunnel closes and \(host.name) stops listening publicly, until someone turns it on "
-                    + "again. Nothing else turns it off. Keys stay as they are.",
-                action: "Stop Using")
-        else { return }
-        do {
-            _ = try await model.setExternal(host.name, domain: nil)
-            error = nil
-        } catch {
-            self.error = describe(error)
-        }
     }
 
     private func upgrade(_ name: String) async {
@@ -1274,8 +1164,8 @@ struct HostsPane: View {
             confirm(
                 "Remove \(name)?",
                 detail: "This Mac forgets it and its agents, and its API keys stop working there. Otherwise nothing "
-                    + "changes on the server: vibed and its agents run on there, with their own MCP and any external "
-                    + "address it serves, and you can add it again later.",
+                    + "changes on the server: vibed and its agents run on there, with their own MCP, and you can add "
+                    + "it again later.",
                 action: "Remove")
         else { return }
         do {
@@ -1390,125 +1280,10 @@ private func adminNeedsText(_ needs: [AdminNeed], host: String) -> String {
     let what = needs.map { need -> String in
         switch need {
         case .linger: "keep vibed running while you're logged out"
-        case .port443: "serve the external address on port 443"
         case .git: "install git, which its agents need"
         }
     }
     return "\(host) needs your password once to \(what.joined(separator: " and "))"
-}
-
-/// The external address, under its picker: where outside clients reach it,
-/// and how it's doing.
-struct ExternalAddressRows: View {
-    let host: HostInfo
-
-    var body: some View {
-        if let url = host.url {
-            LabeledContent("Address") {
-                HStack(spacing: 8) {
-                    Text(url).font(.callout.monospaced()).textSelection(.enabled)
-                    CopyButton(title: "Copy", text: url).labelStyle(.iconOnly).buttonStyle(.borderless)
-                }
-            }
-        }
-        if let status = externalStatus(host) {
-            VStack(alignment: .leading, spacing: 4) {
-                Label {
-                    Text(status.summary).foregroundStyle(.primary)
-                } icon: {
-                    Image(systemName: status.symbol).foregroundStyle(status.tone.color)
-                }
-                if let detail = status.detail {
-                    Text(sentence(detail))
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                        .textSelection(.enabled)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
-            .accessibilityElement(children: .combine)
-        }
-    }
-}
-
-/// Use as External Address: the public name the host is reached at. vibed
-/// checks it too, and the host gets its certificate for it.
-struct ExternalAddressSheet: View {
-    @ObservedObject var model: MenuModel
-    let host: HostInfo
-    @Environment(\.dismiss) private var dismiss
-    @State private var domain: String
-    @State private var working = false
-    @State private var error: String?
-
-    init(model: MenuModel, host: HostInfo) {
-        self.model = model
-        self.host = host
-        _domain = State(initialValue: suggestedDomain(fromSSH: host.address ?? ""))
-    }
-
-    private var name: String? { normalizedDomain(domain) }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            HStack(alignment: .top, spacing: 12) {
-                IconTile(symbol: "globe", color: .indigo, size: 36)
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("Use \(host.name) as the External Address").font(.headline)
-                    Text("MCP clients anywhere, such as an orchestrator in the cloud, reach agents on \(host.name) "
-                        + "and on this Mac at one address, with an API key.")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
-            VStack(alignment: .leading, spacing: 6) {
-                TextField("Public name", text: $domain, prompt: Text("vps.example.com"))
-                    .textFieldStyle(.roundedBorder)
-                    .autocorrectionDisabled()
-                    .onSubmit { Task { await turnOn() } }
-                Text("https://\(name ?? "public name")/mcp")
-                    .font(.callout.monospaced())
-                    .foregroundStyle(.secondary)
-                    .accessibilityLabel("Clients use https://\(name ?? "the public name")/mcp")
-            }
-            .disabled(working)
-            Text("\(host.name) gets its certificate from Let's Encrypt, so the name must point at it and port 443 "
-                + "must be open there. Nothing opens on this Mac.")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-            if let other = model.externalHost, other.name != host.name {
-                Label("\(other.name) stops being the external address.", systemImage: "info.circle")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-            }
-            ErrorText(error: error)
-            HStack {
-                if working { Working(text: "Telling \(host.name)…") }
-                Spacer()
-                Button("Cancel") { dismiss() }
-                    .keyboardShortcut(.cancelAction)
-                Button("Turn On") { Task { await turnOn() } }
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(working || name == nil)
-            }
-        }
-        .padding(20)
-        .frame(width: 500)
-    }
-
-    private func turnOn() async {
-        guard let name, !working else { return }
-        working = true
-        defer { working = false }
-        do {
-            _ = try await model.setExternal(host.name, domain: name)
-            dismiss()
-        } catch {
-            self.error = describe(error)
-        }
-    }
 }
 
 // MARK: Host limits

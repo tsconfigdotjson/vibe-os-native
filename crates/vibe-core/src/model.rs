@@ -43,10 +43,6 @@ use crate::units::{GIB, MIB, TIB};
 /// under (#16), such as `vps`, which is how `vps:quiet-amber-otter` reads.
 pub const LOCAL_HOST: &str = "local";
 
-/// What the Mac goes by on the Linux host that's its external address, for
-/// outside MCP callers: its agents there are `mac:<ref>`.
-pub const MAC_HOST: &str = "mac";
-
 /// Declares a closed set of names, as serialized on the socket and stored in
 /// the registry, with the list `protocol/vibed-rpc.json` checks it against.
 macro_rules! names {
@@ -263,20 +259,6 @@ names! {
 }
 
 names! {
-    /// The Mac's tunnel to the Linux host that's its external address (PRD:
-    /// External access). On the Mac, the tunnel it keeps; on that host, its
-    /// own row says whether a Mac answers through it.
-    TunnelState {
-        /// `ssh` is starting, or up but the host hasn't come through it yet.
-        Connecting = "connecting",
-        /// The host reaches the Mac through it.
-        Up = "up",
-        /// It isn't up: `external_detail` says why. It's tried again.
-        Down = "down",
-    }
-}
-
-names! {
     /// Who said a message of an agent's conversation.
     MessageRole {
         User = "user",
@@ -423,10 +405,9 @@ names! {
 names! {
     /// What a Linux host needs someone with `sudo` there to allow, once, because
     /// VibeOS tried every way it has without a password and none worked:
-    /// `linger`, `vibed` staying up while the owner's logged out; `port_443`,
-    /// the external address's port; `git`, which agents can't do without and only a
-    /// package manager can install.
-    AdminNeed { Linger = "linger", Port443 = "port_443", Git = "git" }
+    /// `linger`, `vibed` staying up while the owner's logged out; `git`, which agents
+    /// can't do without and only a package manager can install.
+    AdminNeed { Linger = "linger", Git = "git" }
 }
 
 names! {
@@ -665,38 +646,6 @@ pub fn validate_host_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// The longest domain name, as DNS allows.
-pub const MAX_DOMAIN_LEN: usize = 253;
-
-/// The public name a Linux host serves MCP at as the external address, such
-/// as `vps.example.com`: a DNS name, as Let's Encrypt issues certificates
-/// for, in lowercase. Not an IP address, nor a single label, nor a
-/// wildcard.
-pub fn validate_domain(domain: &str) -> Result<(), String> {
-    let labels: Vec<&str> = domain.split('.').collect();
-    let label_ok = |l: &&str| {
-        !l.is_empty()
-            && l.len() <= 63
-            && !l.starts_with('-')
-            && !l.ends_with('-')
-            && l.bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-    };
-    let ok = !domain.is_empty()
-        && domain.len() <= MAX_DOMAIN_LEN
-        && labels.len() >= 2
-        && labels.iter().all(label_ok)
-        // The last label of a name is never all digits; an IPv4 address is.
-        && !labels.last().is_some_and(|l| l.bytes().all(|b| b.is_ascii_digit()));
-    if ok {
-        Ok(())
-    } else {
-        Err(format!(
-            "`{domain}` isn't a public name Let's Encrypt can certify: give the server's DNS name in lowercase, such as vps.example.com"
-        ))
-    }
-}
-
 /// An SSH destination as `ssh` takes it: `host`, `user@host`,
 /// `ssh://user@host:port` or a name from `~/.ssh/config`. It may not start
 /// with `-`, so it can't be read as an
@@ -724,13 +673,13 @@ pub fn validate_ssh_destination(dest: &str) -> Result<(), String> {
 /// `/Users/` and a name of up to 19 letters.
 pub const MAX_REF_LEN: usize = 32;
 
-/// The names `vibed` gives its own sockets in `run/`, beside the sessions'
-/// `<ref>.sock`: `vibed.sock`, `mac.sock` (where the Mac's tunnel ends on a
-/// Linux host) and `tunnel.sock` (the Mac's end of it). A new agent may not
-/// take one, in any case, as the Mac's file system ignores case: its session
-/// would be the daemon's socket (issue #45). Only `vibed` was reserved
-/// before 0.1.3, so an agent may already be called `mac` or `tunnel`; it's
-/// still a ref, and can be used and deleted ([`validate_ref`]).
+/// The names a session's socket can't have in `run/`: `vibed.sock`, the daemon's,
+/// and `mac.sock` and `tunnel.sock`, which a `vibed` from before External Address
+/// was retired (#143) may have left there, the first with an old Mac's `ssh -R`
+/// still holding it. A new agent may not take one, in any case, as the Mac's file
+/// system ignores case: its session would be that socket (issue #45). Only `vibed`
+/// was reserved before 0.1.3, so an agent may already be called `mac` or `tunnel`;
+/// it's still a ref, and can be used and deleted ([`validate_ref`]).
 pub const RESERVED_REFS: [&str; 3] = ["vibed", "mac", "tunnel"];
 
 /// Whether `r` is one of [`RESERVED_REFS`], in any case.
@@ -975,40 +924,6 @@ mod tests {
         assert_eq!(EventKind::AgentState.to_string(), "agent.state");
         assert!("Linux".parse::<Environment>().is_err());
         assert!(serde_json::from_str::<Mode>("\"plan\"").is_err());
-    }
-
-    #[test]
-    fn domains_are_public_dns_names() {
-        for good in [
-            "vps.example.com",
-            "a.b",
-            "x-1.example.co.uk",
-            "1.example.com",
-        ] {
-            assert_eq!(validate_domain(good), Ok(()), "{good}");
-        }
-        for bad in [
-            "",
-            "vps",
-            "Vps.example.com",
-            "203.0.113.7",
-            "*.example.com",
-            "-a.example.com",
-            "a-.example.com",
-            "a..example.com",
-            "example.com.",
-            "vps.example.com:443",
-            "https://vps.example.com",
-            "vps example.com",
-            "[::1]",
-        ] {
-            assert!(validate_domain(bad).is_err(), "{bad}");
-        }
-        let long = format!("{}.com", "a".repeat(64));
-        assert!(validate_domain(&long).is_err());
-        let longest = [&"a".repeat(63)[..]; 4].join(".");
-        assert_eq!(longest.len(), 255);
-        assert!(validate_domain(&longest).is_err());
     }
 
     #[test]

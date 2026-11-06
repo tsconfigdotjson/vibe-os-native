@@ -380,9 +380,6 @@ fn agent_json(v: &AgentView) -> Value {
     if let Value::Object(m) = &mut j {
         m.insert("attach_remote".into(), json!(v.attach_remote));
         m.insert("available".into(), json!(v.available));
-        if let Some(at) = &v.last_seen {
-            m.insert("last_seen".into(), json!(at));
-        }
     }
     j
 }
@@ -426,12 +423,8 @@ fn agent_line(v: &AgentView) -> String {
     }
     parts.push(format!("attach: {}", v.attach_remote));
     if !v.available {
-        let at = v
-            .last_seen
-            .as_ref()
-            .map_or(String::new(), |at| format!(" at {at}"));
         parts.push(format!(
-            "unavailable: {} can't be reached now, so this is how it was last seen{at}",
+            "unavailable: {} can't be reached now, so this is how it was last seen",
             a.host
         ));
     }

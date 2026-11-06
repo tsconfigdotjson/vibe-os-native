@@ -19,7 +19,8 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fs::{self, DirBuilder, OpenOptions, TryLockError};
 use std::io;
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt};
+use std::io::Write;
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -232,9 +233,23 @@ fn keep_start_prompt(a: &AgentRecord, handle: &Handle, prompt: &str) {
     let path = handle.agent_dir.join(START_PROMPT);
     // Whole or not at all, as the host going down is what this is kept for, and part
     // of a prompt would be a different task.
-    if let Err(e) = crate::acme::write_private(&path, prompt.as_bytes()) {
+    if let Err(e) = write_private(&path, prompt.as_bytes()) {
         crate::log!("vibed: can't keep {}: {e}", path.display());
     }
+}
+
+/// Writes a file only this user can read, whole or not at all.
+fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let tmp = path.with_extension("new");
+    let mut f = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    fs::rename(&tmp, path)
 }
 
 /// The prompt to start `handle`'s agent on again, if there's one kept.
@@ -485,8 +500,8 @@ fn remove(path: &Path) -> io::Result<()> {
 
 /// Removes a session's socket and its lock, unless a shim holds the lock.
 /// A socket with no lock beside it was never a shim's, so it's kept: on a
-/// Linux host, `run/mac.sock` with no lock is sshd's end of the Mac's
-/// tunnel, even for an agent named `mac` (issue #45).
+/// Linux host, `run/mac.sock` with no lock is sshd's, for an older Mac's `ssh -R`,
+/// even for an agent named `mac` (issue #45).
 pub(crate) fn remove_session_files(socket_path: &Path) -> io::Result<()> {
     let lock_path = socket::lock_path(socket_path);
     let lock = match OpenOptions::new().write(true).open(&lock_path) {
@@ -1708,10 +1723,9 @@ impl Core {
             .await?;
         }
         remove_worktree(&project_path, &worktree).await?;
-        // Not the tunnel's socket, for an agent named `tunnel` before the
-        // name was reserved.
+        // Not the daemon's own socket, for an agent named `vibed`.
         let socket = self.layout.session_socket(&p.agent);
-        if !self.serves_itself(&socket) {
+        if socket != self.layout.socket() {
             remove_session_files(&socket)
                 .map_err(|e| failed(format!("can't remove {}'s socket: {e}", p.agent)))?;
         }

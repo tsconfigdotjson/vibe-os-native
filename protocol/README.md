@@ -95,49 +95,23 @@ While the link is down such a call fails with `host_unavailable`, except
 `agents.list`, which gives the host's agents as they were last listed.
 `hosts.list` gives each host's `link` (`local` for itself; `connected` or
 `down` for a Linux host, with `detail` saying why it's down), the `vibed`
-it runs, what it's `missing` of `git`, `gh` and `claude`, whether it's the
-external address (#18) and whether it serves MCP now, on loopback at least,
-for the menu's header. `mcp.changed` says when that changes, and
+it runs, what it's `missing` of `git`, `gh` and `claude`, and whether it serves
+MCP now, on loopback at least, for the menu's header. `external` is retired: it's
+always `false`, and only sent for an older Mac that can't read a host's row
+without it. `mcp.changed` says when that changes, and
 `host.added`, `host.removed` and `host.link` when the hosts or their links
 do. A Linux host's events come onto the Mac's stream under its name. The Mac
 pushes its API keys to each linked host by their hashes (`keys.sync`), so
 one key works on every host. It says which Mac it is (`from`), and replaces only
 what that Mac pushed, so a host can be shared.
 
-**External access.** The external address belongs to the host, which keeps it
-with no Mac. `hosts.external` asks for it, naming who's asking (`by`), and only
-that switches it. It makes one Linux host the external
-address: it serves MCP publicly at `https://<domain>/mcp` (port 443, with a
-certificate from Let's Encrypt, every call rate-limited and logged), and
-the Mac keeps an SSH reverse tunnel to it. While it is, `hosts.list` gives
-its `url`, its `tunnel` (`connecting`, `up` or `down`) and, when something
-keeps it from working or holds it up, `external_detail`. On the Mac the
-choice is recorded and the host is told, now or once its link is back; on
-a Linux host, `hosts.external` for `local` turns it on there. A Mac never
-serves it itself. Before each tunnel the Mac calls `tunnel.prepare` on the
-host over the link, which gives the Unix socket in the host's private
-`run/` (`mac.sock`) the tunnel ends at, cleared of any an earlier tunnel
-left; the Mac forwards it with `ssh -R` to its own `run/tunnel.sock`.
-
-**The tunnel socket isn't this contract.** The Mac's `run/tunnel.sock`
-takes two methods only, in the same framing: `daemon.hello`, and
-`tunnel.call {key, method, params, sent_at}`. `sent_at` is when the host sent it,
-in Unix seconds: the Mac refuses an `agents.send`, `agents.start` or `agents.delete`
-more than about 60 s old when it arrives, so clocks that far apart refuse them too. That runs `method` on the Mac, for its
-own agents only (a `host` other than `local` is `invalid_params`), after
-the Mac checks `key`, the outside caller's API key, itself: a key it
-doesn't know, revoked here though a host hasn't heard yet, or a host's own,
-gets `unauthorized` (-32006), after a pause. `method` is one of the calls
-MCP's tools stand on: `projects.list`, `agents.list`, `agents.start`,
+**Calls over a link.** A connection to `vibed.sock` whose hello says it's a link gets
+`accepts_calls: true` in its `daemon.hello` answer. For the agent calls MCP's tools
+stand on (`hosts.list`, `projects.list`, `agents.list`, `agents.start`,
 `agents.delete`, `agents.send`, `agents.check`, `agents.output`,
-`agents.messages`; anything else is `method_not_found`. Its result is that
-call's, and `agents.list` also says the Mac's `memory`. As soon as it has a call,
-the socket says so with a notification, `call.accepted {id}`, and a host fails one
-that hasn't that or an answer within 5 s, however long it may run after that. A Mac
-that does this says `accepts_calls: true` in its `daemon.hello` answer. So does
-`vibed.sock` to a connection whose hello says it's a link, sending `call.accepted`
-for those same agent calls. On the external host the Mac goes by `mac`, so its agents are
-`mac:<ref>` to outside callers.
+`agents.messages`), it's then told as soon as a call is taken, with a notification,
+`call.accepted {id}`. The Mac fails one that hasn't that or an answer within 5 s,
+however long it may run after that.
 
 **Shared MCP services.** There's one login per install for each service, held by
 one owning host, and a broker on every `vibed`. `services.overview` gives each
@@ -151,8 +125,8 @@ exchange, which makes it the owner; any host that was is told to forget its logi
 Only a code that's useless without the verifier crosses the link for that, and the
 refresh token never does. `services.disconnect` forgets the login wherever it is.
 `services.token` and `services.follow` are how the Mac carries an access token from
-the owning host to each other host. They go only between `vibed`s and can't be
-called through the tunnel or the public endpoint, and the app never calls them.
+the owning host to each other host. They go only between `vibed`s, and the app never
+calls them: anything else asking gets `unauthorized` (-32006).
 `services.audit` gives the last calls agents on that host made to its services,
 which stay there. If `services.set` can't keep a setting, nothing changes and it
 says so. `service.changed` says when a service's state, settings or tools change:

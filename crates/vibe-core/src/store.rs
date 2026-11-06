@@ -24,11 +24,6 @@ use crate::model::{
 use crate::rpc::{ApiKey, HostInfo, KeyHash, Project};
 use crate::time::rfc3339;
 
-/// The URL outside MCP callers reach the external address at.
-pub fn external_url(domain: &str) -> String {
-    format!("https://{domain}/mcp")
-}
-
 /// Each entry moves the schema up one version.
 const MIGRATIONS: &[&str] = &[
     // 1: the registry as #2 left it. Agents are filled in by #4.
@@ -125,9 +120,8 @@ const MIGRATIONS: &[&str] = &[
         last_used_at INTEGER
     ) STRICT;
     ",
-    // 4: external access (#18). The public name a host is the external
-    // address at: on a Mac, for a Linux host it chose; on a Linux host, its
-    // own (this host's row). NULL while it isn't.
+    // 4: external access (#18), retired since (#143). The public name a host was
+    // the external address at. Only read to say it's gone.
     "
     ALTER TABLE hosts ADD COLUMN external TEXT;
     ",
@@ -162,7 +156,8 @@ const MIGRATIONS: &[&str] = &[
     // host's own (#100). Which Mac pushed each key, so that one replaces only its
     // own, with '' for what came from a Mac too old to say. This install's id, for
     // saying so. On a Mac, when the choice it couldn't deliver yet was made. On a
-    // Linux host's own row, when its external address changed and who asked.
+    // Linux host's own row, when its external address changed and who asked. The
+    // external address's columns are retired since (#143), and nothing reads them.
     "
     ALTER TABLE pushed_keys ADD COLUMN source TEXT NOT NULL DEFAULT '';
     ALTER TABLE revoked_pushed_keys ADD COLUMN source TEXT NOT NULL DEFAULT '';
@@ -375,19 +370,17 @@ impl Store {
 
     /// Every host, this one first, then the Linux hosts added to it by
     /// name. Another host's link is down here, and nothing says whether it
-    /// serves MCP, nor how its tunnel is: those are the daemon's to say.
-    /// Whether it's the external address, and at what URL, is recorded.
+    /// serves MCP: that's the daemon's to say.
     pub fn hosts(&self) -> Result<Vec<HostInfo>> {
         let mut stmt = self.conn.prepare(
-            "SELECT name, os, label, address, version, missing, external, needs_admin FROM hosts \
+            "SELECT name, os, label, address, version, missing, needs_admin FROM hosts \
                  ORDER BY address IS NOT NULL, name",
         )?;
         let hosts = stmt
             .query_map([], |r| {
                 let address: Option<String> = r.get(3)?;
                 let missing: String = r.get(5)?;
-                let external: Option<String> = r.get(6)?;
-                let needs_admin: String = r.get(7)?;
+                let needs_admin: String = r.get(6)?;
                 Ok(HostInfo {
                     name: r.get(0)?,
                     os: r.get(1)?,
@@ -397,19 +390,12 @@ impl Store {
                     } else {
                         HostLink::Down
                     },
-                    external: external.is_some(),
+                    external: false,
                     mcp: false,
                     address,
                     version: r.get(4)?,
                     missing: split_list(&missing),
                     detail: None,
-                    url: external.as_deref().map(external_url),
-                    tunnel: None,
-                    external_changed_at: None,
-                    external_note: None,
-                    external_serves: None,
-                    external_last: None,
-                    external_detail: None,
                     memory: None,
                     // Any this build doesn't know are left out.
                     needs_admin: split_list(&needs_admin)
@@ -519,135 +505,28 @@ impl Store {
         Ok(host)
     }
 
-    /// The public name `name` is the external address at, if it is.
-    pub fn host_external(&self, name: &str) -> Result<Option<String>> {
-        self.conn
-            .query_row("SELECT external FROM hosts WHERE name = ?1", [name], |r| {
-                r.get(0)
-            })
-            .optional()?
-            .ok_or_else(|| StoreError::NotFound(format!("no host named {name}")))
+    /// Whether a `vibed` from before External Address was retired (#143) recorded that
+    /// `name` was, or said it was, serving it.
+    pub fn host_had_external(&self, name: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT external IS NOT NULL OR external_seen IS NOT NULL FROM hosts WHERE name = ?1",
+            [name],
+            |r| r.get(0),
+        )?)
     }
 
-    /// On a Mac, when the choice for `name` that hasn't reached it yet was made.
-    pub fn host_external_asked(&self, name: &str) -> Result<Option<i64>> {
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT external_asked_at FROM hosts WHERE name = ?1",
-                [name],
-                |r| r.get(0),
-            )
-            .optional()?
-            .flatten())
-    }
-
-    /// On a Mac, notes that the choice for `name` is waiting to reach it, since `at`,
-    /// or with `None` that it has nothing waiting.
-    pub fn set_host_external_asked(&mut self, name: &str, at: Option<i64>) -> Result<()> {
-        self.conn.execute(
-            "UPDATE hosts SET external_asked_at = ?2 WHERE name = ?1",
-            params![name, at],
+    /// The public names a `vibed` from before External Address was retired (#143)
+    /// recorded here, as this build no longer uses them. The columns are left as they
+    /// were, so a build that's gone back to the one before still reads its database:
+    /// they say only what to tell whoever had it on.
+    pub fn retired_external_domains(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT external FROM hosts WHERE external IS NOT NULL ORDER BY external",
         )?;
-        Ok(())
-    }
-
-    /// On a Mac, the name someone chose for `name`'s external address that it has since
-    /// stopped serving, to go back to if it serves that name again.
-    pub fn host_external_chosen(&self, name: &str) -> Result<Option<String>> {
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT external_chosen FROM hosts WHERE name = ?1",
-                [name],
-                |r| r.get(0),
-            )
-            .optional()?
-            .flatten())
-    }
-
-    /// On a Mac, notes or with `None` clears what [`Self::host_external_chosen`] says.
-    pub fn set_host_external_chosen(&mut self, name: &str, domain: Option<&str>) -> Result<()> {
-        self.conn.execute(
-            "UPDATE hosts SET external_chosen = ?2 WHERE name = ?1",
-            params![name, domain],
-        )?;
-        Ok(())
-    }
-
-    /// On a Mac, the name `name` last said it serves, known while its link is down.
-    pub fn host_external_seen(&self, name: &str) -> Result<Option<String>> {
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT external_seen FROM hosts WHERE name = ?1",
-                [name],
-                |r| r.get(0),
-            )
-            .optional()?
-            .flatten())
-    }
-
-    /// On a Mac, notes what [`Self::host_external_seen`] says.
-    pub fn set_host_external_seen(&mut self, name: &str, domain: Option<&str>) -> Result<()> {
-        self.conn.execute(
-            "UPDATE hosts SET external_seen = ?2 WHERE name = ?1",
-            params![name, domain],
-        )?;
-        Ok(())
-    }
-
-    /// On a Mac, forgets every such name: someone has chosen afresh.
-    pub fn clear_host_external_chosen(&mut self) -> Result<()> {
-        self.conn
-            .execute("UPDATE hosts SET external_chosen = NULL", [])?;
-        Ok(())
-    }
-
-    /// On a Linux host, when its external address last changed and who asked.
-    pub fn host_external_changed(&self, name: &str) -> Result<Option<(i64, Option<String>)>> {
-        let row: Option<(Option<i64>, Option<String>)> = self
-            .conn
-            .query_row(
-                "SELECT external_changed_at, external_changed_by FROM hosts WHERE name = ?1",
-                [name],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        Ok(row.and_then(|(at, by)| at.map(|at| (at, by))))
-    }
-
-    /// On a Linux host, notes when its external address changed and who asked.
-    pub fn set_host_external_changed(
-        &mut self,
-        name: &str,
-        at: i64,
-        by: Option<&str>,
-    ) -> Result<()> {
-        self.conn.execute(
-            "UPDATE hosts SET external_changed_at = ?2, external_changed_by = ?3 WHERE name = ?1",
-            params![name, at, by],
-        )?;
-        Ok(())
-    }
-
-    /// Records that `name` is the external address at `domain`, or with
-    /// `None` that it isn't. On a Mac, at most one host is: choosing one
-    /// turns any other off, in the same transaction.
-    pub fn set_host_external(&mut self, name: &str, domain: Option<&str>) -> Result<()> {
-        let tx = self.conn.transaction()?;
-        if domain.is_some() {
-            tx.execute("UPDATE hosts SET external = NULL WHERE name != ?1", [name])?;
-        }
-        let n = tx.execute(
-            "UPDATE hosts SET external = ?2 WHERE name = ?1",
-            params![name, domain],
-        )?;
-        if n == 0 {
-            return Err(StoreError::NotFound(format!("no host named {name}")));
-        }
-        tx.commit()?;
-        Ok(())
+        let domains = stmt
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok(domains)
     }
 
     /// A Linux host's agents as it last listed them (JSON), kept for while
@@ -1603,13 +1482,6 @@ mod tests {
                 version: None,
                 missing: vec![],
                 detail: None,
-                url: None,
-                tunnel: None,
-                external_changed_at: None,
-                external_note: None,
-                external_serves: None,
-                external_last: None,
-                external_detail: None,
                 memory: None,
                 needs_admin: vec![],
                 upgrade_error: None,
@@ -1632,13 +1504,6 @@ mod tests {
             version: Some("0.1.0".into()),
             missing: vec!["gh".into(), "claude".into()],
             detail: None,
-            url: None,
-            tunnel: None,
-            external_changed_at: None,
-            external_note: None,
-            external_serves: None,
-            external_last: None,
-            external_detail: None,
             memory: None,
             needs_admin: vec![],
             upgrade_error: None,
@@ -1647,39 +1512,30 @@ mod tests {
     }
 
     #[test]
-    fn one_external_address() {
+    fn a_retired_external_address_is_only_read_to_say_so() {
         let mut s = store();
         s.add_host(&linux_host("vps"), 3).unwrap();
-        s.add_host(&linux_host("edge"), 3).unwrap();
-        assert_eq!(s.host_external("vps").unwrap(), None);
-        s.set_host_external("vps", Some("vps.example.com")).unwrap();
-        let vps = s.host("vps").unwrap();
-        assert!(vps.external);
-        assert_eq!(vps.url.as_deref(), Some("https://vps.example.com/mcp"));
-        // Choosing another turns the first off.
-        s.set_host_external("edge", Some("edge.example.com"))
-            .unwrap();
-        assert_eq!(s.host_external("vps").unwrap(), None);
-        assert!(!s.host("vps").unwrap().external);
+        assert!(s.retired_external_domains().unwrap().is_empty());
+        assert!(!s.host_had_external("vps").unwrap());
+        // As a `vibed` from before #143 left it, on a Mac's row for the host and a
+        // host's own row.
+        for name in ["vps", "local"] {
+            s.conn
+                .execute(
+                    "UPDATE hosts SET external = 'vps.example.com' WHERE name = ?1",
+                    [name],
+                )
+                .unwrap();
+        }
         assert_eq!(
-            s.host_external("edge").unwrap().as_deref(),
-            Some("edge.example.com")
+            s.retired_external_domains().unwrap(),
+            ["vps.example.com".to_owned()]
         );
-        s.set_host_external("edge", None).unwrap();
-        assert!(
-            s.hosts()
-                .unwrap()
-                .iter()
-                .all(|h| !h.external && h.url.is_none())
-        );
-        assert!(matches!(
-            s.set_host_external("nope", None),
-            Err(StoreError::NotFound(_))
-        ));
-        assert!(matches!(
-            s.host_external("nope"),
-            Err(StoreError::NotFound(_))
-        ));
+        assert!(s.host_had_external("vps").unwrap());
+        // No host reads as serving it, and the row stays as it was for a build that
+        // goes back.
+        assert!(s.hosts().unwrap().iter().all(|h| !h.external));
+        assert_eq!(s.schema_version().unwrap(), SCHEMA_VERSION as i64);
     }
 
     #[test]

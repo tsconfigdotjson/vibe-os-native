@@ -42,7 +42,7 @@ pub const HOST_VIBE: &str = ".local/lib/vibeos/vibe";
 pub const HOST_ATTACH_VIBE: &str = HOST_VIBE;
 
 /// What an install puts on a Linux host, from the bundle for its CPU.
-pub const BINARIES: [&str; 4] = ["vibed", "vibe", "vibe-shim", "vibe-bind"];
+pub const BINARIES: [&str; 3] = ["vibed", "vibe", "vibe-shim"];
 
 /// The tools a Linux host's agents need, which the owner installs and logs
 /// in to on the server (PRD: Adding a Linux host).
@@ -72,18 +72,6 @@ pub struct Installed {
     pub notes: Vec<String>,
 }
 
-/// An SSH reverse tunnel, kept up until it ends or is dropped.
-pub struct TunnelChild {
-    /// Resolves, with why, once the tunnel has ended.
-    pub ended: BoxFuture<'static, String>,
-}
-
-impl fmt::Debug for TunnelChild {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("TunnelChild").finish_non_exhaustive()
-    }
-}
-
 /// How this `vibed` reaches Linux hosts.
 pub trait Remote: Send + Sync + fmt::Debug {
     /// Opens a JSON-RPC connection to `vibed` on the host at `address`.
@@ -92,18 +80,6 @@ pub trait Remote: Send + Sync + fmt::Debug {
     /// Installs or upgrades `vibed` on the host at `address`, and checks
     /// its tools.
     fn install<'a>(&'a self, address: &'a str) -> BoxFuture<'a, Result<Installed, String>>;
-
-    /// Forwards the Unix socket `remote` on the host at `address` to the
-    /// socket `local` here (`ssh -R remote:local`), until the tunnel ends or
-    /// is dropped (PRD: External access, the Mac dials out).
-    fn tunnel<'a>(
-        &'a self,
-        address: &'a str,
-        _remote: &'a str,
-        _local: &'a std::path::Path,
-    ) -> BoxFuture<'a, Result<TunnelChild, String>> {
-        Box::pin(async move { Err(format!("can't keep a tunnel to {address}")) })
-    }
 
     /// The same, for the link's own session, which may share a connection
     /// with the install steps.
@@ -115,12 +91,6 @@ pub trait Remote: Send + Sync + fmt::Debug {
     /// once it has stopped answering: the next command makes a new one.
     fn drop_shared(&self, _address: &str) {}
 
-    /// The SHA-256 of the build of `vibe-bind` this VibeOS installs, for each CPU a
-    /// host may have: `x86_64` and `aarch64`. What a root-owned copy of it is held to.
-    fn bind_sums(&self) -> Vec<(&'static str, String)> {
-        Vec::new()
-    }
-
     /// The command a terminal here runs to do what `needs` take on `address`, with
     /// `sudo` asking for its password there. What each takes is written here,
     /// never given by the host, and the password goes to `sudo` alone.
@@ -129,7 +99,6 @@ pub trait Remote: Send + Sync + fmt::Debug {
         for need in needs {
             let step = match need {
                 AdminNeed::Linger => "sudo loginctl enable-linger \"$(id -un)\"\n".to_owned(),
-                AdminNeed::Port443 => port_443_step(&self.bind_sums()),
                 AdminNeed::Git => crate::tool_install::GIT_WITH_SUDO.replace("{sudo}", "sudo"),
             };
             script.push_str(&format!(
@@ -774,19 +743,6 @@ impl Default for Ssh {
 }
 
 impl Remote for Ssh {
-    fn bind_sums(&self) -> Vec<(&'static str, String)> {
-        let Some(bundle) = &self.bundle else {
-            return Vec::new();
-        };
-        ["x86_64", "aarch64"]
-            .into_iter()
-            .filter_map(|arch| {
-                let bytes = std::fs::read(bundle.join(arch).join(crate::bind_helper::SOURCE));
-                Some((arch, sha256_hex(&bytes.ok()?)))
-            })
-            .collect()
-    }
-
     fn dial<'a>(&'a self, address: &'a str) -> BoxFuture<'a, Result<Channel, String>> {
         self.dial_over(address, false)
     }
@@ -818,85 +774,6 @@ impl Remote for Ssh {
                 let _ = tokio::time::timeout(Duration::from_secs(10), exit.wait()).await;
             });
         }
-    }
-
-    fn tunnel<'a>(
-        &'a self,
-        address: &'a str,
-        remote: &'a str,
-        local: &'a std::path::Path,
-    ) -> BoxFuture<'a, Result<TunnelChild, String>> {
-        Box::pin(async move {
-            let mut child = tokio::process::Command::new(&self.program)
-                .args(tunnel_args(address, remote, local))
-                .stdin(Stdio::piped())
-                .stdout(Stdio::null())
-                .stderr(Stdio::piped())
-                .kill_on_drop(true)
-                .spawn()
-                .map_err(|e| format!("can't run {}: {e}", self.program.to_string_lossy()))?;
-            let stdin = child.stdin.take().expect("stdin is piped");
-            let why = keep_last_line(child.stderr.take().expect("stderr is piped"));
-            let address = address.to_owned();
-            Ok(TunnelChild {
-                ended: Box::pin(async move {
-                    // Held open while the tunnel is up: once vibed is gone,
-                    // however it went, `cat` there reads its end, and the
-                    // tunnel closes with it.
-                    let _stdin = stdin;
-                    let status = child.wait().await;
-                    // stderr's last line may come just after the exit.
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    let said = why.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                    match status {
-                        Ok(s) if s.code() == Some(255) && !said.is_empty() => {
-                            tunnel_failure(&address, &said)
-                        }
-                        Ok(s) if said.is_empty() => format!("ssh ended ({s})"),
-                        Ok(_) => format!("ssh ended: {said}"),
-                        Err(e) => format!("ssh ended: {e}"),
-                    }
-                }),
-            })
-        })
-    }
-}
-
-/// `ssh`'s arguments for the tunnel to `address`: its own connection (not
-/// one shared through a control master, which would outlive it), that
-/// fails when the forward can't be made, and runs `cat` there to end when
-/// its input does.
-pub fn tunnel_args(address: &str, remote: &str, local: &std::path::Path) -> Vec<OsString> {
-    let mut args: Vec<OsString> = SSH_OPTIONS.iter().map(OsString::from).collect();
-    for o in [
-        "ExitOnForwardFailure=yes",
-        "ControlMaster=no",
-        "ControlPath=none",
-    ] {
-        args.push("-o".into());
-        args.push(o.into());
-    }
-    args.push("-T".into());
-    args.push("-R".into());
-    let mut forward = OsString::from(remote);
-    forward.push(":");
-    forward.push(local.as_os_str());
-    args.push(forward);
-    args.push("--".into());
-    args.push(address.into());
-    args.push("cat >/dev/null".into());
-    args
-}
-
-/// Why a tunnel couldn't be made, with how to fix the usual reason.
-fn tunnel_failure(address: &str, said: &str) -> String {
-    if said.contains("remote port forwarding failed") || said.contains("forwarding failed") {
-        format!(
-            "{address}'s sshd refused to forward a Unix socket: {said}. Allow it in its \
-             /etc/ssh/sshd_config with AllowStreamLocalForwarding yes (the default), then restart sshd"
-        )
-    } else {
-        unreachable_message(address, said)
     }
 }
 
@@ -1025,7 +902,7 @@ lib="$HOME/.local/lib/vibeos"
 if [ -x "$lib/vibed" ]; then
   echo "ondisk=$("$lib/vibed" --version 2>/dev/null | cut -d ' ' -f 2)"
 fi
-for f in vibed vibe vibe-shim vibe-bind; do
+for f in vibed vibe vibe-shim; do
   # What an upload cut short left behind.
   rm -f "$lib/.$f.new"
   if [ -f "$lib/$f" ] && command -v sha256sum >/dev/null 2>&1; then
@@ -1056,39 +933,6 @@ fn base64(bytes: &[u8]) -> String {
         }
     }
     out
-}
-
-/// What gets port 443 usable on a server, with `sudo`'s prompt: the helper, held to
-/// this VibeOS's own sum for the server's CPU. With no sum for it, it stops: nothing
-/// unchecked is made privileged, and that's no reason to go the wider way.
-fn port_443_step(sums: &[(&'static str, String)]) -> String {
-    let want = |arch: &str| {
-        sums.iter()
-            .find(|(a, _)| *a == arch)
-            .map_or("", |(_, sum)| sum.as_str())
-            .to_owned()
-    };
-    let grant = crate::bind_helper::grant_lines(
-        "sudo",
-        &format!("\"$HOME/{HOST_LIB}/{}\"", crate::bind_helper::SOURCE),
-        "\"$want\"",
-        std::path::Path::new(crate::bind_helper::HELPER),
-    );
-    format!(
-        "case \"$(uname -m)\" in\n\
-           x86_64|amd64) want={} ;;\n\
-           aarch64|arm64) want={} ;;\n\
-           *) want= ;;\n\
-         esac\n\
-         if [ -z \"$want\" ]; then\n\
-           echo \"This VibeOS has no build of vibe-bind for this server.\" >&2\n\
-           false\n\
-         else\n\
-           {grant}\
-         fi\n",
-        shell_quote(&want("x86_64")),
-        shell_quote(&want("aarch64")),
-    )
 }
 
 /// The `PATH` `vibed` runs with on the server: the owner's login shell's,
@@ -1207,7 +1051,7 @@ fn configure_script(uploads: &[(&str, String)], unit: &str, path: &str) -> Strin
              why=$(journalctl --user -u vibed.service -t vibed -n 1 --no-pager -o cat 2>/dev/null)\n    \
              # A build that won't start isn't left to cut the host off.\n    \
              back=no\n    \
-             for f in vibed vibe vibe-shim vibe-bind; do\n      \
+             for f in vibed vibe vibe-shim; do\n      \
                if [ -f \"$lib/.$f.prev\" ]; then mv -f \"$lib/.$f.prev\" \"$lib/$f\"; back=yes; fi\n    \
              done\n    \
              if [ \"$back\" = yes ]; then\n      \
@@ -1323,43 +1167,6 @@ mod tests {
     }
 
     #[test]
-    fn the_tunnel_is_its_own_ssh_and_fails_when_its_forward_does() {
-        let args: Vec<String> = tunnel_args(
-            "me@vps",
-            "/home/me/.local/share/vibeos/run/mac.sock",
-            std::path::Path::new("/Users/me/Library/Application Support/VibeOS/run/tunnel.sock"),
-        )
-        .into_iter()
-        .map(|a| a.into_string().unwrap())
-        .collect();
-        let joined = args.join(" ");
-        for want in [
-            "BatchMode=yes",
-            "ForwardAgent=no",
-            "ExitOnForwardFailure=yes",
-            "ControlMaster=no",
-            "ControlPath=none",
-        ] {
-            assert!(joined.contains(want), "{joined}");
-        }
-        let r = args.iter().position(|a| a == "-R").unwrap();
-        assert_eq!(
-            args[r + 1],
-            "/home/me/.local/share/vibeos/run/mac.sock:/Users/me/Library/Application Support/VibeOS/run/tunnel.sock"
-        );
-        // The destination comes after `--`, so it's never read as an option.
-        let dd = args.iter().position(|a| a == "--").unwrap();
-        assert_eq!(&args[dd + 1..], ["me@vps", "cat >/dev/null"]);
-        assert!(
-            tunnel_failure(
-                "me@vps",
-                "Error: remote port forwarding failed for listen path x"
-            )
-            .contains("AllowStreamLocalForwarding")
-        );
-    }
-
-    #[test]
     fn quoting() {
         assert_eq!(shell_quote("me@vps.example.com"), "me@vps.example.com");
         assert_eq!(shell_quote("a b"), "'a b'");
@@ -1458,53 +1265,6 @@ mod tests {
         let said = String::from_utf8_lossy(&out.stdout);
         assert!(!said.contains("done"), "{said}");
         assert!(said.contains("didn't work"), "{said}");
-    }
-
-    /// The port's step, on stand-ins: the helper first, with this CPU's sum, and
-    /// never the wider way for a `sudo` that refused or a CPU with no build.
-    #[test]
-    fn the_port_step_holds_the_helper_to_its_sum_and_goes_no_wider_than_it_must() {
-        struct Summed(Vec<(&'static str, String)>);
-        impl std::fmt::Debug for Summed {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("Summed")
-            }
-        }
-        impl Remote for Summed {
-            fn dial<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Result<Channel, String>> {
-                Box::pin(async { Err(String::new()) })
-            }
-            fn install<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Result<Installed, String>> {
-                Box::pin(async { Err(String::new()) })
-            }
-            fn bind_sums(&self) -> Vec<(&'static str, String)> {
-                self.0.clone()
-            }
-        }
-        let sums = vec![("x86_64", "a".repeat(64)), ("aarch64", "b".repeat(64))];
-        let line = Summed(sums).admin_line("me@vps", &[AdminNeed::Port443]);
-        let (out, asked) = run_admin_line(&line, "exit 1");
-        assert!(!out.status.success(), "{out:?}");
-        // Only the one try: not the fallback, for a password refused.
-        let mut lines = asked.split("\n").filter(|l| l.starts_with("sh -c "));
-        assert!(lines.next().is_some(), "{asked}");
-        assert!(lines.next().is_none(), "{asked}");
-        assert!(asked.contains("/.local/lib/vibeos/vibe-bind "), "{asked}");
-        let sum = if cfg!(target_arch = "x86_64") {
-            "a"
-        } else {
-            "b"
-        }
-        .repeat(64);
-        assert!(asked.contains(&sum), "{asked}");
-        assert!(asked.contains(crate::bind_helper::HELPER), "{asked}");
-
-        // No build for it: sudo isn't asked at all.
-        let bare = Summed(Vec::new()).admin_line("me@vps", &[AdminNeed::Port443]);
-        let (out, asked) = run_admin_line(&bare, "exit 0");
-        assert!(!out.status.success(), "{out:?}");
-        assert_eq!(asked, "");
-        assert!(String::from_utf8_lossy(&out.stderr).contains("no build of vibe-bind"));
     }
 
     #[test]

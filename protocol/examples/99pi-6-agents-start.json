@@ -44,7 +44,7 @@
         "kind": "agent.added",
         "project": "app",
         "ref": "able-aqua-bison",
-        "seq": 42,
+        "seq": 40,
         "state": "busy"
       }
     }

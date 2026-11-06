@@ -4,19 +4,19 @@
 
 use serde_json::Value;
 use tokio::sync::broadcast;
-use vibe_core::rpc::{ACCEPTS_CALLS, TUNNEL_METHODS};
+use vibe_core::rpc::{ACCEPTED_METHODS, ACCEPTS_CALLS};
 use vibe_core::rpc::{
     AgentsCheck, AgentsDelete, AgentsInterrupt, AgentsList, AgentsMessages, AgentsOutput,
     AgentsSend, AgentsStart, DoctorCheckGet, DoctorFix, ErrorCode, ErrorObject, Event,
-    EventsSubscribe, GhStatusGet, Hello, HelloParams, HelloResult, HostsAdd, HostsAdmin,
-    HostsExternal, HostsList, HostsRemove, HostsUpgrade, Id, KeysCreate, KeysList, KeysRevoke,
-    KeysSync, KeysVerify, LimitsGet, LimitsSet, McpGet, McpSet, Method, PROTOCOL_VERSION, PiForget,
-    PiInstall, PiLoginAnswer, PiLoginCancel, PiLoginGet, PiLoginStart, PiModelsGet, PiStatusGet,
+    EventsSubscribe, GhStatusGet, Hello, HelloParams, HelloResult, HostsAdd, HostsAdmin, HostsList,
+    HostsRemove, HostsUpgrade, Id, KeysCreate, KeysList, KeysRevoke, KeysSync, KeysVerify,
+    LimitsGet, LimitsSet, McpGet, McpSet, Method, PROTOCOL_VERSION, PiForget, PiInstall,
+    PiLoginAnswer, PiLoginCancel, PiLoginGet, PiLoginStart, PiModelsGet, PiStatusGet,
     ProfilesCreate, ProfilesDelete, ProfilesList, ProfilesUpdate, ProjectsAdd, ProjectsList,
     ProjectsRemove, ProtocolMismatchData, Request, Response, ServicesAudit, ServicesComplete,
     ServicesConnect, ServicesDisconnect, ServicesFollow, ServicesList, ServicesOverview,
     ServicesSet, ServicesToken, SessionsAttach, SessionsList, Subscribed, ToolboxClose,
-    ToolboxLoginsGet, ToolboxOpen, ToolboxRebuild, ToolboxStatusGet, ToolboxUpdate, TunnelPrepare,
+    ToolboxLoginsGet, ToolboxOpen, ToolboxRebuild, ToolboxStatusGet, ToolboxUpdate,
 };
 
 use crate::core::Core;
@@ -70,7 +70,7 @@ impl Session {
         if !self.link {
             return None;
         }
-        vibe_core::rpc::accepted_frame(line, |method| TUNNEL_METHODS.contains(&method))
+        vibe_core::rpc::accepted_frame(line, |method| ACCEPTED_METHODS.contains(&method))
     }
 
     /// Refuses a call that only the Mac makes of a host over its link: an access
@@ -227,13 +227,6 @@ async fn call(
                 .await,
         ),
         HostsRemove::NAME => encode_result(core.remove_host(decode::<HostsRemove>(params)?).await),
-        HostsExternal::NAME => {
-            encode_result(core.set_external(decode::<HostsExternal>(params)?).await)
-        }
-        TunnelPrepare::NAME => {
-            decode::<TunnelPrepare>(params)?;
-            encode_result(core.prepare_tunnel())
-        }
         ProjectsList::NAME => encode_result(core.projects(decode::<ProjectsList>(params)?)),
         ProjectsAdd::NAME => encode_result(core.add_project(decode::<ProjectsAdd>(params)?).await),
         ProjectsRemove::NAME => {
@@ -372,17 +365,6 @@ async fn call(
             format!("Method not found: {method}"),
         )),
     }
-}
-
-/// Calls `method` on this host, with `params`, as a connection of its own
-/// would. The tunnel's socket runs its calls through this, with no `host`
-/// in them, so none goes on to a Linux host.
-pub(crate) async fn call_here(
-    core: &Core,
-    method: &str,
-    params: Value,
-) -> Result<Value, ErrorObject> {
-    call(core, &mut Session::default(), method, Some(params)).await
 }
 
 /// Decodes `M`'s params, by name only; absent means `{}`.

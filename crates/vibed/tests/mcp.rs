@@ -708,3 +708,65 @@ async fn settings_turn_tailscale_on_and_off_and_it_applies_at_once() {
     }
     assert!(!mcp_on(&core), "MCP is off once it isn't served");
 }
+
+/// #143: a Linux host's Tailscale MCP, which Settings doesn't reach, follows a hand edit
+/// of its `host.toml`. It's only ever on Tailscale's own addresses, whatever an interface
+/// scan finds; loopback stays up with an address it can't bind; and a key's still needed.
+/// Binding on a real tailnet needs a real one: this can't show that.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_linux_hosts_tailscale_mcp_follows_host_toml_and_never_binds_wider() {
+    use vibe_core::rpc::HostParams;
+    let golden = Golden::new();
+    let layout = Layout::new(&golden.home, "linux");
+    let mut config = golden.config();
+    config.info.os = "linux".into();
+    config.layout = layout.clone();
+    config.toolbox = None;
+    config.tailscale = Arc::new(|| {
+        ["0.0.0.0", "203.0.113.9", common::GOLDEN_TAILSCALE, "::"]
+            .iter()
+            .map(|a| a.parse().unwrap())
+            .collect()
+    });
+    let core = Arc::new(Core::open(config).unwrap());
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let host_toml = layout.host_config();
+    std::fs::create_dir_all(host_toml.parent().unwrap()).unwrap();
+    std::fs::write(&host_toml, format!("mcp_port = {port}\n")).unwrap();
+    let served = core.spawn_mcp(Duration::from_millis(20));
+    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+
+    // Off, as it is unless it's asked for: loopback alone.
+    let s = core.mcp(HostParams::default()).unwrap();
+    assert!(!s.tailscale && s.tailscale_urls.is_empty(), "{s:?}");
+
+    std::fs::write(
+        &host_toml,
+        format!("mcp_port = {port}\nmcp_tailscale = true\n"),
+    )
+    .unwrap();
+    let s = core.mcp(HostParams::default()).unwrap();
+    assert!(s.tailscale, "{s:?}");
+    assert_eq!(s.url, format!("http://127.0.0.1:{port}/mcp"));
+    assert_eq!(
+        s.tailscale_urls,
+        [format!("http://{}:{port}/mcp", common::GOLDEN_TAILSCALE)]
+    );
+
+    // This machine has no such address, and loopback goes on, with its key required.
+    let mut answered = None;
+    for _ in 0..200 {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            let ping = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+            answered = Some(post_raw(addr, vibe_mcp::PATH, &[], ping).await);
+            break;
+        }
+    }
+    let reply = answered.expect("loopback serves with Tailscale on");
+    assert_eq!(reply.status, 401);
+    served.abort();
+}

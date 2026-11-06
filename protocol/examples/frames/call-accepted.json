@@ -1,14 +1,10 @@
 {
-  "description": "Not a reply, and not part of the examples' session: what a peer sends as soon as it has a call it will run, ahead of the call's own answer. It says the call's `id`. A host fails a call that has neither this nor an answer within 5 s, however long it may run after that, which is how a sleeping Mac costs at most that. Only a peer whose `daemon.hello` said `accepts_calls: true` sends it: the tunnel's socket for `tunnel.call`, and `vibed.sock` on a link for the same agent calls.",
+  "description": "Not a reply, and not part of the examples' session: what a peer sends as soon as it has a call it will run, ahead of the call's own answer. It says the call's `id`. A host fails a call that has neither this nor an answer within 5 s, however long it may run after that, which is how a host that's gone costs at most that. Only a peer whose `daemon.hello` said `accepts_calls: true` sends it: `vibed.sock` on a link, for the agent calls.",
   "request": {
     "jsonrpc": "2.0",
     "id": 41,
-    "method": "tunnel.call",
-    "params": {
-      "key": "vk_FAKEKEY",
-      "method": "agents.list",
-      "params": {}
-    }
+    "method": "agents.list",
+    "params": {}
   },
   "frame": {
     "jsonrpc": "2.0",

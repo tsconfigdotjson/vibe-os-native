@@ -160,12 +160,6 @@ struct GallerySurface {
                     name: "new-key-made", frame: .window("New Key", nil),
                     view: AnyView(NewKeySheet(model: m.busy, preview: key))))
         }
-        if let vps = m.busy.hosts.first(where: { $0.name == "vps" }) {
-            surfaces.append(
-                GallerySurface(
-                    name: "external-address", frame: .window("External Address", nil),
-                    view: AnyView(ExternalAddressSheet(model: m.busy, host: vps))))
-        }
         return surfaces
     }
 }

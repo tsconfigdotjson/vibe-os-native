@@ -2158,6 +2158,6 @@ async fn keys_are_gone_and_tokens_only_go_between_vibeds() {
     // With no linked host, the login would be here.
     let overview = rpc(&n.core, "services.overview", json!({})).await;
     assert_eq!(overview["result"]["services"][0]["owner"], LOCAL_HOST);
-    assert!(!vibe_core::rpc::TUNNEL_METHODS.contains(&"services.token"));
+    assert!(!vibe_core::rpc::ACCEPTED_METHODS.contains(&"services.token"));
     assert!(!vibed::hosts::FORWARDED.contains(&"services.token"));
 }

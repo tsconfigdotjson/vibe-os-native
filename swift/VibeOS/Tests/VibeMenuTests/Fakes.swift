@@ -41,20 +41,15 @@ func agent(
 }
 
 func hostJSON(
-    _ name: String, link: HostLink = .local, external: Bool = false, mcp: Bool = false, missing: [String] = [],
-    detail: String? = nil, tunnel: TunnelState? = nil, externalDetail: String? = nil
+    _ name: String, link: HostLink = .local, mcp: Bool = false, missing: [String] = [],
+    detail: String? = nil
 ) -> [String: Any] {
     var host: [String: Any] = [
         "name": name, "os": name == "local" ? "macos" : "linux", "label": name == "local" ? "mac-mini" : name,
-        "link": link.rawValue, "external": external, "mcp": mcp, "version": "0.1.0", "missing": missing,
+        "link": link.rawValue, "external": false, "mcp": mcp, "version": "0.1.0", "missing": missing,
     ]
     if name != "local" { host["address"] = "me@\(name).example.com" }
     if let detail { host["detail"] = detail }
-    if external {
-        host["url"] = "https://\(name).example.com/mcp"
-        host["tunnel"] = (tunnel ?? .up).rawValue
-    }
-    if let externalDetail { host["external_detail"] = externalDetail }
     return host
 }
 
