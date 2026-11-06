@@ -70,6 +70,14 @@ struct Seen {
     check_fails: Arc<AtomicBool>,
     dial: Arc<Mutex<Dial>>,
     at_launch: Arc<AtLaunch>,
+    /// What's looked at to dial, all told.
+    looks: Arc<Mutex<usize>>,
+    /// What had been looked at each time asking its guest, which can boot it, ended.
+    looks_at_check: Arc<Mutex<Vec<usize>>>,
+    /// How long asking its guest takes, as a boot.
+    boot: Arc<Mutex<Duration>>,
+    /// The agents whose guest takes this long not to answer a dial.
+    wedged: Arc<Mutex<Vec<String>>>,
 }
 
 impl vibe_env::Compartment for Seen {
@@ -112,12 +120,22 @@ impl vibe_env::Compartment for Seen {
         if self.check_fails.load(Ordering::SeqCst) {
             return Err(vibe_env::EnvError::new("its guest didn't answer"));
         }
+        std::thread::sleep(*self.boot.lock().unwrap());
+        self.looks_at_check
+            .lock()
+            .unwrap()
+            .push(*self.looks.lock().unwrap());
         Ok(self.old_guest.then(|| "its guest is too old".to_owned()))
     }
-    fn services_relay(&self, _: &vibe_env::Handle) -> vibe_env::Result<Option<UnixStream>> {
+    fn services_relay(&self, h: &vibe_env::Handle) -> vibe_env::Result<Option<UnixStream>> {
         let Some(dir) = self.vm.as_ref().filter(|_| !self.old_guest) else {
             return Ok(None);
         };
+        *self.looks.lock().unwrap() += 1;
+        if self.wedged.lock().unwrap().contains(&h.agent_ref) {
+            std::thread::sleep(WEDGED);
+            return Err(vibe_env::EnvError::new("no answer"));
+        }
         match *self.dial.lock().unwrap() {
             Dial::NotUpUntil(at) if Instant::now() < at => return Ok(None),
             Dial::FailsUntil(at) if Instant::now() < at => {
@@ -168,6 +186,10 @@ struct Node {
     check_fails: Arc<AtomicBool>,
     dial: Arc<Mutex<Dial>>,
     at_launch: Arc<AtLaunch>,
+    looks: Arc<Mutex<usize>>,
+    looks_at_check: Arc<Mutex<Vec<usize>>>,
+    boot: Arc<Mutex<Duration>>,
+    wedged: Arc<Mutex<Vec<String>>>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
     layout: Layout,
 }
@@ -205,6 +227,10 @@ async fn node_with(
     let check_fails: Arc<AtomicBool> = Arc::default();
     let dial = Arc::new(Mutex::new(Dial::Now));
     let at_launch: Arc<AtLaunch> = Arc::default();
+    let looks: Arc<Mutex<usize>> = Arc::default();
+    let looks_at_check: Arc<Mutex<Vec<usize>>> = Arc::default();
+    let boot: Arc<Mutex<Duration>> = Arc::default();
+    let wedged: Arc<Mutex<Vec<String>>> = Arc::default();
     let os = if place == Place::LinuxHost {
         "linux"
     } else {
@@ -222,6 +248,10 @@ async fn node_with(
         check_fails: check_fails.clone(),
         dial: dial.clone(),
         at_launch: at_launch.clone(),
+        looks: looks.clone(),
+        looks_at_check: looks_at_check.clone(),
+        boot: boot.clone(),
+        wedged: wedged.clone(),
     }));
     config.services = Some(ServicesConfig {
         services: vec![fake.service()],
@@ -258,6 +288,10 @@ async fn node_with(
         check_fails,
         dial,
         at_launch,
+        looks,
+        looks_at_check,
+        boot,
+        wedged,
         tasks,
         layout,
     }
@@ -1003,6 +1037,9 @@ impl Node {
 
 const LATE: Duration = Duration::from_millis(1500);
 
+/// How long a guest that doesn't answer takes to say nothing.
+const WEDGED: Duration = Duration::from_millis(1000);
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_start_in_a_vm_waits_for_a_relay_thats_late_so_its_tools_are_there() {
     let dials: [fn(Instant) -> Dial; 2] = [Dial::NotUpUntil, Dial::FailsUntil];
@@ -1073,11 +1110,16 @@ async fn a_resume_in_a_vm_waits_for_its_relay_too_and_keeps_it() {
 
     let listed = n.list_tools_at_launch(&guest);
     *n.dial.lock().unwrap() = Dial::NotUpUntil(Instant::now() + LATE);
+    *n.boot.lock().unwrap() = Duration::from_millis(400);
     let before = *n.relays.lock().unwrap();
+    let looks = *n.looks.lock().unwrap();
     n.core.resume_agent(None, &a.agent).await.unwrap();
     let seen = listed.lock().unwrap().clone();
     assert_eq!(seen.len(), 1);
     assert!(seen[0].contains(&"list_issues".to_owned()), "{seen:?}");
+    // While it boots it's left alone: a look takes the lock `vibe-vm` tries for once as it
+    // starts, and that would refuse the resume.
+    assert_eq!(n.looks_at_check.lock().unwrap().last(), Some(&looks));
 
     // Between the launch and its state changing it isn't dropped and dialed again.
     tokio::time::sleep(Duration::from_millis(2500)).await;
@@ -1101,7 +1143,7 @@ async fn a_relay_that_doesnt_come_doesnt_refuse_or_hang_a_start() {
         )
         .await;
         n.sign_in_here().await;
-        *n.dial.lock().unwrap() = dial(Instant::now() + Duration::from_secs(2));
+        *n.dial.lock().unwrap() = dial(Instant::now() + Duration::from_secs(3600));
         let began = Instant::now();
         n.core
             .start_agent(start("in a vm", "software-eng-linux"))
@@ -1110,12 +1152,50 @@ async fn a_relay_that_doesnt_come_doesnt_refuse_or_hang_a_start() {
         assert!(began.elapsed() >= Duration::from_millis(300), "it waited");
         assert_eq!(n.launches.lock().unwrap().len(), 1, "and went ahead");
         assert_eq!(*n.relays.lock().unwrap(), 0, "without it");
+        *n.dial.lock().unwrap() = Dial::Now;
         let relays = n.relays.clone();
         wait_for("the Mac to dial the VM after all", || {
             *relays.lock().unwrap() >= 1
         })
         .await;
     }
+}
+
+/// Guests that don't answer take seconds each to find out about, and that's theirs alone: it
+/// doesn't use up the wait of another agent, whose guest is fine.
+#[tokio::test(flavor = "multi_thread")]
+async fn wedged_guests_dont_use_up_a_healthy_launchs_wait() {
+    let fake = FakeService::start().await;
+    let guest = Arc::new(Guest::start());
+    let n = node(
+        &fake,
+        Place::Mac,
+        Arc::new(MemoryStore::default()),
+        Some(guest.dir.path().to_owned()),
+        |c| c.services_relay_wait = 3 * WEDGED,
+    )
+    .await;
+    n.sign_in_here().await;
+    // With no relay yet, and each takes all its wait to start, which is what's not on trial.
+    *n.dial.lock().unwrap() = Dial::NotUpUntil(Instant::now() + Duration::from_secs(3600));
+    for i in 0..4 {
+        let a = n
+            .core
+            .start_agent(start(&format!("wedged {i}"), "software-eng-linux"))
+            .await
+            .unwrap();
+        n.wedged.lock().unwrap().push(a.agent);
+    }
+    *n.dial.lock().unwrap() = Dial::Now;
+    let listed = n.list_tools_at_launch(&guest);
+    let a = n
+        .core
+        .start_agent(start("healthy", "software-eng-linux"))
+        .await
+        .unwrap();
+    let listed = listed.lock().unwrap().clone();
+    assert_eq!(listed.len(), 1, "{}", a.agent);
+    assert!(listed[0].contains(&"list_issues".to_owned()), "{listed:?}");
 }
 
 /// Nobody's kept waiting for a relay that isn't coming: none is wanted.
