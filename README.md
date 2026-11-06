@@ -16,6 +16,10 @@
   &nbsp;·&nbsp; Apple Silicon · macOS 26 or later · <a href="LICENSE">MIT</a>
 </p>
 
+<p align="center">
+  <img src="docs/images/hero.png" width="960" alt="Illustration of cloud agents flowing between a Mac laptop and a VPS">
+</p>
+
 ## What you get
 
 **Agents on machines you control.** Run them on your Mac and on Linux servers you add — including a rented VPS. There is no VibeOS cloud in the middle.
@@ -25,6 +29,20 @@
 **Progress at a glance.** The menu bar shows what each agent is doing and when it needs you.
 
 **Your assistant can help drive them.** Compatible assistants can start agents and check in. How to connect one is in the docs — you don't need that for day one.
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/menu-dark.png">
+    <img src="docs/images/menu-light.png" width="300" alt="VibeOS menu listing agents on a Mac and Linux servers">
+  </picture>
+  &nbsp;&nbsp;
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/new-agent-dark.png">
+    <img src="docs/images/new-agent-light.png" width="360" alt="New Agent sheet to start work on a project">
+  </picture>
+</p>
+
+<p align="center"><sub>App screenshots show a fictional demo workspace.</sub></p>
 
 ## Get started
 
