@@ -35,14 +35,9 @@
     <source media="(prefers-color-scheme: dark)" srcset="docs/images/menu-dark.png">
     <img src="docs/images/menu-light.png" width="300" alt="VibeOS menu listing agents on a Mac and Linux servers">
   </picture>
-  &nbsp;&nbsp;
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/images/new-agent-dark.png">
-    <img src="docs/images/new-agent-light.png" width="360" alt="New Agent sheet to start work on a project">
-  </picture>
 </p>
 
-<p align="center"><sub>App screenshots show a fictional demo workspace.</sub></p>
+<p align="center"><sub>Screenshot shows a fictional demo workspace.</sub></p>
 
 ## Get started
 
