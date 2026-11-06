@@ -98,6 +98,8 @@ An agent, its worktree and its compartment are one unit. They're created togethe
 | Transcript | The session file the agent writes on its own. agent-tail reads it to get status. | Claude: `macos` and Linux hosts, `~/.claude/projects/`; `linux` on the Mac, the agent's own Claude home on the Mac. Pi: `macos` and Linux hosts, `~/.pi/agent/sessions/`; `linux` on the Mac, the agent's own `pi-sessions/` on the Mac |
 | Client | Anything attached to an agent or calling `vibed`: Terminal via `vibe attach`, an MCP client, or the menu bar app. | — |
 
+The app says "VibeOS" or "its background service" for `vibed`, "Linux" for the template and base image, an agent's "environment" for its compartment, and "working copy" for its worktree. The internal names stay in this document, logs and CLI help.
+
 ## Key user flows
 
 An agent's life runs setup → start (worktree and compartment included) → work → sleep or attach → finish → delete. Every step works over MCP, and most also work from the menu.
