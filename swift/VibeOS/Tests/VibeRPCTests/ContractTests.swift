@@ -538,7 +538,7 @@ let swiftErrorData: [RPCErrorCode: String] = [.protocolMismatch: "ProtocolMismat
             Issue.record("connected to a socket that doesn't exist")
         } catch let error as VibedClientError {
             #expect(error == .connect(path: client.socketPath, errno: ENOENT))
-            #expect(error.description.contains("is vibed running?"))
+            #expect(error.description.contains("is it running?"))
         } catch {
             Issue.record("unexpected error: \(error)")
         }
