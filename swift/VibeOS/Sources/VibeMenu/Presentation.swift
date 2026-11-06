@@ -229,25 +229,20 @@ public enum MCPSetup {
 }
 
 /// What Settings → Linux Toolbox says about the toolbox (PRD: The toolbox
-/// shell): what it's doing, the versions new agents boot, and a note or two
-/// (a newer base image the template is moving to, how the last run
-/// went). Only what vibed says now: the shell shows as open only while it
-/// is.
+/// shell): what it's doing, and a note or two (a newer base image the
+/// template is moving to, how the last run went). Only what vibed says now:
+/// the shell shows as open only while it is.
 public struct ToolboxSummary: Equatable, Sendable {
     /// What the toolbox is doing, in a word or two.
     public var state: String
     /// Whether it's busy with something that ends on its own.
     public var working: Bool
-    /// "Tools v3 · Logins & settings v2 · Linux v1", once there's any: the template, the
-    /// Linux home and the base image.
-    public var versions: String?
     public var notes: [String]
     /// Whether the shell is open, for Save & Close.
     public var closable: Bool
 
     public init(_ status: ToolboxStatus?) {
         working = false
-        versions = nil
         notes = []
         closable = status?.state == .open
         guard let status else {
@@ -271,11 +266,6 @@ public struct ToolboxSummary: Equatable, Sendable {
         }
         working = [.saving, .updating, .rebuilding].contains(status.state)
         guard status.state != .unavailable else { return }
-        var parts: [String] = []
-        if let template = status.template { parts.append("Tools v\(template)") }
-        if let home = status.home { parts.append("Logins & settings v\(home)") }
-        if let base = status.base { parts.append("Linux v\(base)") }
-        if !parts.isEmpty { versions = parts.joined(separator: " · ") }
         let held = status.rebuildHeld ?? []
         if let newest = status.newestBase, newest > (status.base ?? 0) {
             if held.isEmpty {
@@ -358,8 +348,7 @@ public struct LoginsSummary: Equatable, Sendable {
         }
         switch (logins.home, logins.logins) {
         case (nil, _):
-            headline = "No GitHub or other tool logins saved yet. Sign in here, or in the shell for anything else, "
-                + "and they're kept."
+            headline = "No GitHub or other tool logins saved yet."
         case (_?, nil):
             headline = "VibeOS couldn't tell which logins are saved. Open the shell and exit it to look again."
         case (_?, let found?) where found.isEmpty:
@@ -432,20 +421,14 @@ public func keysPending(on hosts: [String]) -> String? {
     return "Key changes are pending on \(names). A key revoked here still works there until \(verb) next reachable."
 }
 
-/// What Settings → API Keys warns of: what a key can do, and that a key is no
-/// lock on this Mac's own login, as vibed's socket answers that login without
-/// one. Other accounts on this Mac can't reach that socket, so this says "your
-/// Mac login", not "anyone on this Mac".
+/// What Settings → API Keys warns of, in one sentence: what a key can do, and
+/// that a key is no lock on this Mac's own login, as vibed's socket answers
+/// that login without one. Other accounts on this Mac can't reach that socket,
+/// so this says "your Mac login", not "anyone on this Mac".
 public func keysWarning(linuxHosts: Bool) -> String {
     let reach = linuxHosts ? "this Mac and your Linux hosts" : "this Mac"
-    // A host that's away hasn't heard of a revoke yet (`keysPending`).
-    let revoke = linuxHosts
-        ? " If you stop trusting a key, revoke it. It stops working at once, though a Linux host that's away goes on "
-            + "accepting it until VibeOS reaches it again."
-        : " If you stop trusting a key, revoke it and it stops working at once."
-    return "Keep API keys private, like passwords. Anyone with a key can have VibeOS agents do whatever you can "
-        + "do on \(reach)." + revoke + " Anyone or anything already using your Mac login can "
-        + "control VibeOS without a key, so keep that login private too."
+    return "Keep API keys and your Mac login private, as anyone with either can have VibeOS agents do whatever "
+        + "you can do on \(reach)."
 }
 
 // MARK: Reaching MCP from elsewhere

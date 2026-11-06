@@ -57,20 +57,12 @@ struct ToolboxPane: View {
                         Text(saving ? "Saving…" : summary.state)
                     }
                 }
-                if let versions = summary.versions {
-                    LabeledContent("New agents use", value: versions)
-                }
                 ForEach(summary.notes, id: \.self) { note in
                     Text(note)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 ErrorText(error: model.toolboxCloseError)
-            } footer: {
-                Text("Open Shell gives you a Linux command line in Terminal. Anything you install or sign in to "
-                    + "there is ready for every new Linux agent. To save, exit the shell or close its window; to "
-                    + "leave it running for later, press Control-\\. To sign in to Pi, use Settings → Agents instead.")
-                    .foregroundStyle(.secondary)
             }
             logInsSection
             Section {

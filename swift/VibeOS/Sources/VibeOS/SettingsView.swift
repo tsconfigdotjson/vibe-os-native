@@ -356,9 +356,6 @@ struct ProjectDetail: View {
                     }
                 } header: {
                     Text("Profiles")
-                } footer: {
-                    Text("Click a profile to change it. Memory is each agent's ceiling: a Linux VM's RAM on the Mac, its cgroup's limit on a Linux host, or a macOS agent's hard limit. Nothing is set aside up front.")
-                        .foregroundStyle(.secondary)
                 }
                 Section {
                     HStack {
@@ -376,16 +373,10 @@ struct ProjectDetail: View {
                     }
                 } header: {
                     Text("Add a Profile")
-                } footer: {
-                    Text("It starts as Claude, Linux, Opus, High, Auto and 4G. Change any of it above.")
-                        .foregroundStyle(.secondary)
                 }
                 Section {
                     Button("Remove Project…", role: .destructive) { Task { await remove(project) } }
                     ErrorText(error: error)
-                } footer: {
-                    Text(removalNote(project) + " A project with agents can't be removed.")
-                        .foregroundStyle(.secondary)
                 }
             } else if let error {
                 ErrorText(error: error)
@@ -432,12 +423,6 @@ struct ProjectDetail: View {
     /// and anything on this Mac, stays.
     private func deletesFiles(_ project: Project) -> Bool {
         project.source == .github && model.hosts.first { $0.name == host }?.os == "linux"
-    }
-
-    private func removalNote(_ project: Project) -> String {
-        deletesFiles(project)
-            ? "VibeOS forgets the project and its profiles, and deletes its clone at \(project.path) on \(host)."
-            : "VibeOS forgets the project and its profiles; its files stay at \(project.path)."
     }
 
     private func remove(_ project: Project) async {
