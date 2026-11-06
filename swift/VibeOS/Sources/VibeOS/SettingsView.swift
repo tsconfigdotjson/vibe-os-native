@@ -1501,7 +1501,7 @@ struct GeneralPane: View {
                     + "Clicking one opens its terminal.")
                     .foregroundStyle(.secondary)
             }
-            Section("Worktrees") {
+            Section("Working Copies") {
                 Picker("Open in Editor", selection: $editor) {
                     Text("The first of VS Code, Cursor, Zed or Xcode").tag("")
                     ForEach(WorktreeActions.editors, id: \.self) { id in

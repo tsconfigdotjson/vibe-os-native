@@ -24,7 +24,7 @@ public enum VibedClientError: Error, Equatable, CustomStringConvertible {
         case .closed: "VibeOS's background service closed the connection before answering"
         case .messageTooLarge: "the answer from VibeOS's background service is too large"
         case .badResponse(let why): "unexpected answer from VibeOS's background service: \(why)"
-        case .rpc(let error): "vibed: \(error)"
+        case .rpc(let error): "VibeOS's background service: \(error)"
         }
     }
 }

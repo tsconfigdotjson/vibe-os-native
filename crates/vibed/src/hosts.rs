@@ -195,9 +195,9 @@ impl Core {
                 h.upgrade_held = upgrade.held;
                 if h.link == HostLink::Down {
                     if upgrade.running {
-                        h.detail = Some("VibeOS is updating it".to_owned());
+                        h.detail = Some("VibeOS is updating itself there".to_owned());
                     } else if let Some(why) = &upgrade.error {
-                        h.detail = Some(format!("VibeOS can't update it: {why}"));
+                        h.detail = Some(format!("VibeOS can't update itself there: {why}"));
                     }
                 }
                 drop(upgrade);

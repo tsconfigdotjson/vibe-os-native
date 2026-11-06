@@ -74,7 +74,8 @@ struct ToolboxPane: View {
                         Button("Update Anyway and Open Shell") { model.moveTemplateAndOpenShell() }
                             .disabled(model.toolbox?.state != .closed)
                             .help("Updates Linux for new agents, leaving behind what's listed above, then opens the "
-                                + "shell so you can install it again.")
+                                + "shell so you can install it again. To keep them instead, add them to your install "
+                                + "list, ~/.config/vibeos/toolbox.toml, and VibeOS tries again by itself.")
                     } else {
                         Button("Reinstall Linux Tools…", action: rebuild)
                             .disabled(model.toolbox?.state != .closed)

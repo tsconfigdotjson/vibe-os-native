@@ -204,7 +204,7 @@ impl Watch {
             fixable: state != CheckState::Pass && state != CheckState::Working,
             progress,
         };
-        if let (Some(base), Some((claude, _))) = (&base, &managed) {
+        if let (Some(_), Some((claude, _))) = (&base, &managed) {
             // A template keeps the base it was built on, so one from before
             // shared services stays there until it's rebuilt. Nothing's broken,
             // and the download can't help: it says what will.

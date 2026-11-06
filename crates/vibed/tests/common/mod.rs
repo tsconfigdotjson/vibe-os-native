@@ -819,12 +819,14 @@ impl Remote for GoldenRemote {
                 changed: true,
                 notes: vec![if refuses {
                     format!(
-                        "VibeOS couldn't be set to keep running on {address}, so it stops when you log out. Settings → Hosts has a button that does it, asking for the \
+                        "Lingering couldn't be turned on, so vibed stops when you log out of \
+                         {address}. Settings → Hosts has a button that does it, asking for the \
                          password there once."
                     )
                 } else {
                     format!(
-                        "VibeOS keeps running on {address} when you're logged out, and starts again after a reboot."
+                        "Lingering is on for you on {address}, so vibed runs when you're logged \
+                         out and starts again after a reboot."
                     )
                 }],
             })
