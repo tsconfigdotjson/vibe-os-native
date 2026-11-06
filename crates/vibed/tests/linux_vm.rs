@@ -29,7 +29,8 @@ use vibe_core::model::Environment;
 use vibe_core::paths::Layout;
 use vibe_core::rpc::{AgentDeleteParams, AgentStartParams, HostParams, ProjectAddParams};
 use vibe_core::shim::{self, Frame, FrameKind, control_hello};
-use vibe_env::linux::{LinuxVm, Real, TokenSource};
+use vibe_env::guest::proto::{Ran, Run};
+use vibe_env::linux::{LinuxVm, Machine, Real, TokenSource};
 use vibe_env::{Handle, Sleeper, vm};
 use vibe_services::secrets::MemoryStore;
 use vibe_services::testing::FakeService;
@@ -90,6 +91,98 @@ fn wait_for(what: &str, timeout: Duration, mut ok: impl FnMut() -> bool, why: im
     }
 }
 
+/// Stops whatever VMs this test's agents still have when it ends, panicking included: a
+/// `vibe-vm boot` is detached, and outlives the test and its temporary home otherwise. To be
+/// made after the [`Golden`], so it's dropped before that home goes.
+struct StopVms {
+    layout: Layout,
+    vibe_vm: PathBuf,
+}
+
+impl Drop for StopVms {
+    fn drop(&mut self) {
+        let Ok(agents) = fs::read_dir(self.layout.agents_dir()) else {
+            return;
+        };
+        let machine = Real {
+            vibe_vm: self.vibe_vm.clone(),
+        };
+        for agent in agents.flatten() {
+            let socket = self.layout.vm_socket(&agent.file_name().to_string_lossy());
+            if machine.running(&socket)
+                && let Err(e) = machine.stop(&socket)
+            {
+                eprintln!("can't stop the VM at {}: {e}", socket.display());
+            }
+        }
+    }
+}
+
+/// What a guest can say of why something in it went wrong: what its kernel saw, as a crash can
+/// leave nothing on the screen, and how its session ended, if it has.
+fn guest_says(socket: &Path) -> String {
+    let dmesg = match vibe_env::guest::run(socket, &sh("dmesg | tail -n 40")) {
+        Ok(ran) => format!("{}{}", how_it_ended(&ran), ran.output),
+        Err(e) => format!("(can't ask: {e})"),
+    };
+    let session = vibe_env::guest::status(socket).map(|s| s.session.and_then(|s| s.exit));
+    format!("--- dmesg | tail\n{dmesg}\n--- its session's exit\n{session:?}")
+}
+
+fn how_it_ended(ran: &Ran) -> String {
+    format!(
+        "(code {:?}, signal {:?}, timed out: {}) ",
+        ran.code, ran.signal, ran.timed_out
+    )
+}
+
+/// `command` in a shell in the guest, as long as this test's commands get.
+fn sh(command: &str) -> Run {
+    Run {
+        command: vec!["/bin/sh".into(), "-c".into(), command.into()],
+        env: Default::default(),
+        cwd: None,
+        timeout_ms: 10_000,
+    }
+}
+
+/// Runs something in the guest that may well exit non-zero. A crash, or running out of time,
+/// is never what's being tested, and says so itself rather than as whatever comes of it later.
+fn guest_ran(socket: &Path, run: &Run) -> Ran {
+    let ran = vibe_env::guest::run(socket, run).unwrap_or_else(|e| {
+        panic!(
+            "can't run {:?} in the guest: {e}\n{}",
+            run.command,
+            guest_says(socket)
+        )
+    });
+    if ran.signal.is_some() || ran.timed_out {
+        panic!(
+            "{:?} crashed in the guest {}: {}\n{}",
+            run.command,
+            how_it_ended(&ran),
+            ran.output,
+            guest_says(socket)
+        );
+    }
+    ran
+}
+
+/// Runs something in the guest that this test relies on having worked.
+fn guest_ok(socket: &Path, run: &Run) -> Ran {
+    let ran = guest_ran(socket, run);
+    assert_eq!(
+        ran.code,
+        Some(0),
+        "{:?} failed in the guest {}: {}\n{}",
+        run.command,
+        how_it_ended(&ran),
+        ran.output,
+        guest_says(socket)
+    );
+    ran
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_linux_agent_answers_on_opus_and_carries_on_after_sleep() {
     let (Some(vibe_vm), Some(base), Ok(token)) = (
@@ -108,6 +201,10 @@ async fn a_linux_agent_answers_on_opus_and_carries_on_after_sleep() {
     let vibe_vm = absolute(PathBuf::from(vibe_vm));
     let golden = Golden::new();
     let layout = Layout::new(&golden.home, "macos");
+    let _stop_vms = StopVms {
+        layout: layout.clone(),
+        vibe_vm: vibe_vm.clone(),
+    };
 
     // The images, as vibed fetches them when it starts.
     let sources = vibed::linux::Sources {
@@ -210,7 +307,14 @@ async fn a_linux_agent_answers_on_opus_and_carries_on_after_sleep() {
                 .iter()
                 .any(|t| t.to_lowercase().contains("pong"))
         },
-        || format!("the screen:\n{}\n{}", screen(), logs()),
+        || {
+            format!(
+                "the screen:\n{}\n{}\n{}",
+                screen(),
+                logs(),
+                guest_says(&socket)
+            )
+        },
     );
     let text = fs::read_to_string(&transcript).unwrap();
     assert!(text.contains("\"model\":\"claude-opus"), "answered on Opus");
@@ -277,7 +381,14 @@ async fn a_linux_agent_answers_on_opus_and_carries_on_after_sleep() {
         "pong after the wake",
         Duration::from_secs(240),
         || pongs() >= 2,
-        || format!("the screen:\n{}\n{}", screen(), logs()),
+        || {
+            format!(
+                "the screen:\n{}\n{}\n{}",
+                screen(),
+                logs(),
+                guest_says(&socket)
+            )
+        },
     );
     let list = core.agents(HostParams::default()).await.unwrap();
     eprintln!("after the wake: {:?}", list.agents[0].status);
@@ -318,6 +429,10 @@ async fn a_pi_agent_answers_in_a_vm_and_shares_the_one_login() {
     let vibe_vm = absolute(PathBuf::from(vibe_vm));
     let golden = Golden::new();
     let layout = Layout::new(&golden.home, "macos");
+    let _stop_vms = StopVms {
+        layout: layout.clone(),
+        vibe_vm: vibe_vm.clone(),
+    };
     let sources = vibed::linux::Sources {
         base_releases: base,
         ..vibed::linux::Sources::from_env()
@@ -468,16 +583,15 @@ async fn a_pi_agent_answers_in_a_vm_and_shares_the_one_login() {
         test -L models.json && echo models-is-a-link\n\
         grep -q providers models.json && echo models-readable\n\
         touch auth.json && echo login-writable\n";
-    let ran = vibe_env::guest::run(
+    let ran = guest_ok(
         &socket,
-        &vibe_env::guest::proto::Run {
+        &Run {
             command: vec!["/bin/sh".into(), "-c".into(), script.into()],
             env: Default::default(),
             cwd: Some("/home/vibe".into()),
             timeout_ms: 30_000,
         },
-    )
-    .unwrap();
+    );
     let said = ran.output;
     for good in ["login-writable", "models-is-a-link", "models-readable"] {
         assert!(said.contains(good), "{good}: {said}");
@@ -525,7 +639,7 @@ async fn a_pi_agent_answers_in_a_vm_and_shares_the_one_login() {
         "Pi's answer in its session, on the host",
         Duration::from_secs(120),
         answers(1),
-        || format!("the screen:\n{}", screen(&r)),
+        || format!("the screen:\n{}\n{}", screen(&r), guest_says(&socket)),
     );
     assert!(!mock.keys.lock().unwrap().is_empty(), "it asked the mock");
     // The shared service, as a Pi agent in a VM gets it.
@@ -548,18 +662,17 @@ async fn a_pi_agent_answers_in_a_vm_and_shares_the_one_login() {
                 .iter()
                 .any(|c| c.tool.as_deref() == Some("list_issues"))
         },
-        || format!("the screen:\n{}", screen(&r)),
+        || format!("the screen:\n{}\n{}", screen(&r), guest_says(&socket)),
     );
-    let linked = vibe_env::guest::run(
+    let linked = guest_ok(
         &socket,
-        &vibe_env::guest::proto::Run {
+        &Run {
             command: vec!["/bin/cat".into(), "/tmp/vibe-link-check".into()],
             env: Default::default(),
             cwd: None,
             timeout_ms: 10_000,
         },
-    )
-    .unwrap();
+    );
     assert!(
         linked.output.contains("loaded"),
         "the owner's extension through its link: {}",
@@ -591,7 +704,7 @@ async fn a_pi_agent_answers_in_a_vm_and_shares_the_one_login() {
         "its second answer",
         Duration::from_secs(120),
         answers(2),
-        || format!("the screen:\n{}", screen(&r)),
+        || format!("the screen:\n{}\n{}", screen(&r), guest_says(&socket)),
     );
     let before: Vec<_> = fs::read_dir(&sessions)
         .unwrap()
@@ -602,18 +715,7 @@ async fn a_pi_agent_answers_in_a_vm_and_shares_the_one_login() {
     // A second VM has an agent dir of its own: what the first writes there, it
     // doesn't see. It sees what the owner keeps, and what `vibed` passes on.
     let b = start("hello").await;
-    let shared_run = |socket: &Path, command: &str| {
-        vibe_env::guest::run(
-            socket,
-            &vibe_env::guest::proto::Run {
-                command: vec!["/bin/sh".into(), "-c".into(), command.into()],
-                env: Default::default(),
-                cwd: None,
-                timeout_ms: 10_000,
-            },
-        )
-        .unwrap()
-    };
+    let shared_run = |socket: &Path, command: &str| guest_ok(socket, &sh(command));
     let other = layout.vm_socket(&b.agent);
     shared_run(&socket, "echo from-a > /home/vibe/.pi/agent/planted");
     let looked = shared_run(&other, "cat /home/vibe/.pi/agent/planted 2>&1; echo done");
@@ -639,11 +741,18 @@ async fn a_pi_agent_answers_in_a_vm_and_shares_the_one_login() {
         "the other VM to be given the login",
         Duration::from_secs(10),
         || {
-            shared_run(&other, "cat /home/vibe/.pi/agent/auth.json")
+            // It may not be there yet.
+            guest_ran(&other, &sh("cat /home/vibe/.pi/agent/auth.json"))
                 .output
                 .contains("from-a")
         },
-        String::new,
+        || {
+            format!(
+                "the VM it was signed in to:\n{}\nthe other:\n{}",
+                guest_says(&socket),
+                guest_says(&other)
+            )
+        },
     );
     shared_run(
         &socket,

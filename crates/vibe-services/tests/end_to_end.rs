@@ -317,6 +317,46 @@ fn find(haystack: &[u8], needle: &str) -> bool {
         .any(|w| w == needle.as_bytes())
 }
 
+/// "Up" has to mean a shim there would find it: a hub says hello before it has taken the
+/// relay on, and tells a shim there are no tools until it has.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relay_is_only_up_once_the_hub_has_it() {
+    let mac = Mac::start().await;
+    let machine = machine();
+    let (mac_end, machine_end) = UnixStream::pair().unwrap();
+    mac_end.set_nonblocking(true).unwrap();
+    let (read, write) = tokio::net::UnixStream::from_std(mac_end)
+        .unwrap()
+        .into_split();
+    let (said, heard) = tokio::sync::oneshot::channel();
+    let hub = machine.hub.clone();
+    let task = tokio::spawn(relay::serve_relay_then(
+        mac.services.clone(),
+        "quiet-amber-otter".to_owned(),
+        read,
+        write,
+        move || said.send(hub.connected()).unwrap(),
+    ));
+    assert!(!machine.hub.connected());
+    let hub = machine.hub.clone();
+    let (reader, writer, closer) = (
+        machine_end.try_clone().unwrap(),
+        machine_end.try_clone().unwrap(),
+        machine_end,
+    );
+    std::thread::spawn(move || {
+        let _ = hub.carry(reader, writer, move || {
+            let _ = closer.shutdown(std::net::Shutdown::Both);
+        });
+    });
+    let up = tokio::time::timeout(Duration::from_secs(10), heard)
+        .await
+        .expect("it's said to be up")
+        .unwrap();
+    assert!(up, "the hub had it by then");
+    task.abort();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn no_token_ever_reaches_a_vm() {
     let mac = Mac::start().await;

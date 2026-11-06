@@ -1146,6 +1146,15 @@ impl Core {
             env,
             cwd: PathBuf::from(&record.worktree),
         };
+        // Its tools have to be there as it starts. What told us about its guest has it
+        // booted by now, and its relay's kept until the agent is fully launched.
+        let relay = services
+            .is_some()
+            .then(|| self.relay_hold(backend, &record.agent_ref))
+            .flatten();
+        if relay.is_some() {
+            self.relay_ready(&record.agent_ref).await;
+        }
         // A Pi with nothing to do reads as at rest from here until it writes
         // again, whatever its transcript left open.
         if record.agent == AgentKind::Pi {
@@ -1513,6 +1522,8 @@ impl Core {
         } else {
             kept_start_prompt(&handle)
         };
+        // It's `asleep` or `exited` until this is done: its relay is kept till then.
+        let _relay = self.relay_hold(&backend, agent_ref);
         self.launch(&backend, &mut handle, &record, prompt.as_deref(), resume)
             .await?;
         crate::log!(
