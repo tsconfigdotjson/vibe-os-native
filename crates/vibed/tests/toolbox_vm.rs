@@ -37,7 +37,7 @@ use vibe_core::shim::{self, Frame, FrameKind, Hello, PROTOCOL, Role, control_hel
 use vibe_env::guest::{self, proto};
 use vibe_env::images::Images;
 use vibe_env::linux::{LinuxVm, Real, TokenSource};
-use vibe_env::toolbox::{TOOLBOX_REF, Toolbox};
+use vibe_env::toolbox::{TOOLBOX_REF, Toolbox, output_tail};
 use vibe_env::{AgentSpec, Compartment, Handle, Launch, Limits, Run, Sleeper, Woke, vm};
 use vibed::agents::Backends;
 use vibed::core::{Config, Core, DaemonInfo};
@@ -61,10 +61,23 @@ fn mark(test: &str) {
     }
 }
 
-/// The PRD's recipe line for gcloud, as root, and on `PATH` for everyone.
-const GCLOUD: &str = "curl -sSL https://sdk.cloud.google.com | bash -s -- --disable-prompts \
-                      --install-dir=/opt && ln -sf /opt/google-cloud-sdk/bin/gcloud \
-                      /usr/local/bin/gcloud";
+/// The PRD's recipe line for gcloud, as root, and on `PATH` for everyone by a link, so
+/// no shell's rc file comes into it. gcloud is only the example here, of a tool the
+/// toolbox installs. A download that fails has to fail this: on its own, `curl | bash`
+/// has a `bash` that read nothing and succeeded, and the link goes on to point at nothing.
+const GCLOUD: &str = "set -o pipefail; curl -fsSL https://sdk.cloud.google.com | bash -s -- \
+                      --disable-prompts --install-dir=/opt && ln -sf \
+                      /opt/google-cloud-sdk/bin/gcloud /usr/local/bin/gcloud";
+
+/// Says how `vibe` finds gcloud, and fails unless it's the link, to a real program.
+/// Run in the toolbox and in a new agent, what it prints tells a failed install from
+/// a save that lost it, and from a `PATH` that doesn't look there.
+const GCLOUD_LOOKUP: &str = "echo \"PATH=$PATH\" && ls -l /usr/local/bin/gcloud && \
+                             test -x \"$(readlink -e /usr/local/bin/gcloud)\" && \
+                             test \"$(command -v gcloud)\" = /usr/local/bin/gcloud";
+
+/// How long a booted toolbox may take to get its network.
+const NETWORK_PATIENCE: Duration = Duration::from_secs(60);
 
 struct World {
     golden: Golden,
@@ -111,6 +124,26 @@ impl World {
             self.logs(TOOLBOX_REF)
         );
         ran.output
+    }
+
+    /// Waits for the open toolbox's network. Opening it doesn't, as a shell works
+    /// offline and a person types slower than DHCP answers; a test doesn't.
+    fn wait_for_network(&self) {
+        let deadline = Instant::now() + NETWORK_PATIENCE;
+        loop {
+            let status = guest::status(&self.toolbox_vm()).unwrap();
+            if status.network.is_some() {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the toolbox VM got no network in {} s: {:?}\n{}",
+                NETWORK_PATIENCE.as_secs(),
+                status.problems,
+                self.logs(TOOLBOX_REF)
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
 
     /// Opens the toolbox shell, lets `work` change the template and home,
@@ -364,7 +397,13 @@ async fn new_agents_get_what_the_toolbox_installed_and_sleeping_ones_keep_theirs
             // Its mode and owner first, so a failure says whether the image or
             // the mounts lost setuid.
             w.in_toolbox("stat -c 'sudo is %a %U:%G' /usr/bin/sudo; sudo -n true");
-            w.in_toolbox(&format!("sudo -n -H bash -c '{GCLOUD}'"));
+            w.wait_for_network();
+            let installed = w.in_toolbox(&format!("sudo -n -H bash -c '{GCLOUD}'"));
+            eprintln!("gcloud's install{}", output_tail(&installed));
+            // It works here, for `vibe`, before anything is saved.
+            eprintln!("in the toolbox: {}", w.in_toolbox(GCLOUD_LOOKUP));
+            let version = w.in_toolbox("gcloud --version");
+            assert!(version.contains("Google Cloud SDK"), "{version}");
             w.in_toolbox("git config --global user.name 'Toolbox Test'");
             // Logins as gh and ssh-keygen leave them, for See logins.
             w.in_toolbox(concat!(
@@ -402,6 +441,12 @@ async fn new_agents_get_what_the_toolbox_installed_and_sleeping_ones_keep_theirs
     // 2. A new agent has them; it may not sudo.
     let old = w.agent("quiet-amber-otter");
     assert_eq!(w.template_of(&old), template_1);
+    let (ok, out) = w.in_agent(&old, GCLOUD_LOOKUP);
+    assert!(
+        ok,
+        "the link to gcloud worked in the toolbox, but not in a new agent:\n{out}\n{}",
+        w.logs("quiet-amber-otter")
+    );
     let (ok, out) = w.in_agent(&old, "gcloud --version");
     assert!(
         ok,
@@ -543,4 +588,44 @@ async fn new_agents_get_what_the_toolbox_installed_and_sleeping_ones_keep_theirs
         assert!(!vm::lock_held(&layout.vm_socket(r)));
     }
     mark("toolbox_vm");
+}
+
+/// [`GCLOUD`] as it is, with stand-ins for `curl` and `ln`, so it needs no VM: `curl` does
+/// as `curl_body` says. Whether it succeeded, and whether the link was made.
+fn install_with_curl(curl_body: &str) -> (bool, bool) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let linked = dir.path().join("linked");
+    for (name, body) in [
+        ("curl", curl_body.to_owned()),
+        ("ln", format!("touch '{}'", linked.display())),
+    ] {
+        let path = dir.path().join(name);
+        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let status = std::process::Command::new("/bin/bash")
+        .args(["-c", GCLOUD])
+        .env("PATH", format!("{}:/usr/bin:/bin", dir.path().display()))
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    (status.success(), linked.exists())
+}
+
+/// A failed install can't pass for one, or gcloud missing from a new agent would look
+/// like the save lost it (#69).
+#[test]
+fn an_install_that_failed_says_so_and_links_nothing() {
+    assert_eq!(install_with_curl("exit 6"), (false, false), "no download");
+    assert_eq!(
+        install_with_curl("echo 'exit 3'"),
+        (false, false),
+        "the installer failed"
+    );
+    assert_eq!(
+        install_with_curl("echo 'exit 0'"),
+        (true, true),
+        "it worked"
+    );
 }
