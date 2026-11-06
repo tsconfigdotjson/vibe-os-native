@@ -1,5 +1,6 @@
-//! Pi's list and its sign-in, for the app, through the core against the stand-in for
-//! Pi. The real `pi` does the same in `pi_e2e.rs`, where there is one.
+//! Pi's list, for the app, through the core against the stand-in for Pi. The real `pi`
+//! does the same in `pi_e2e.rs`, where there is one. VibeOS signs nobody in to Pi, so
+//! these also hold that a login that's there is used and left as it is.
 
 mod common;
 
@@ -8,12 +9,10 @@ use std::path::PathBuf;
 use std::sync::{Arc, Once};
 
 use common::{Golden, publish_pi};
-use vibe_core::model::{PiLoginMethod, PiLoginState, PiPromptKind, PiTarget};
+use serde_json::{Value, json};
+use vibe_core::model::PiTarget;
 use vibe_core::paths::Layout;
-use vibe_core::rpc::{
-    ErrorCode, PiLogin, PiLoginAnswerParams, PiLoginGetParams, PiLoginParams, PiLoginStartParams,
-    PiModels, PiModelsParams,
-};
+use vibe_core::rpc::{ErrorCode, PiModels, PiModelsParams};
 use vibe_env::pi_release;
 use vibed::core::Core;
 
@@ -53,24 +52,6 @@ fn world_with(change: impl FnOnce(&mut vibed::core::Config)) -> World {
     }
 }
 
-fn start(provider: &str, method: PiLoginMethod, target: PiTarget) -> PiLoginStartParams {
-    PiLoginStartParams {
-        host: None,
-        target,
-        provider: provider.into(),
-        method,
-    }
-}
-
-fn answer(login: &PiLogin, value: &str) -> PiLoginAnswerParams {
-    PiLoginAnswerParams {
-        host: None,
-        id: login.id.clone(),
-        prompt: login.prompt.as_ref().expect("a question").id.clone(),
-        value: value.into(),
-    }
-}
-
 impl World {
     async fn models(&self, target: PiTarget) -> PiModels {
         self.core
@@ -84,12 +65,18 @@ impl World {
         fs::read_to_string(self.own.join(name)).unwrap()
     }
 
-    fn own_auth(&self) -> String {
-        fs::read_to_string(self.own.join("auth.json")).unwrap_or_default()
-    }
-
-    fn store_auth(&self) -> String {
-        fs::read_to_string(self.layout.linux_pi_logins_dir().join("auth.json")).unwrap_or_default()
+    /// One call through the dispatcher, as a socket client makes it.
+    async fn rpc(&self, method: &str, params: Value) -> Value {
+        let line =
+            json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).to_string();
+        let reply = vibed::dispatch::handle_message(
+            &self.core,
+            &mut vibed::dispatch::Session::default(),
+            line.as_bytes(),
+        )
+        .await
+        .unwrap();
+        serde_json::from_str(&reply).unwrap()
     }
 
     /// Nothing's left of any run.
@@ -117,8 +104,7 @@ async fn a_list_says_who_is_signed_in_and_runs_nothing_of_anyones() {
     let ids: Vec<&str> = list.providers.iter().map(|p| p.id.as_str()).collect();
     assert_eq!(ids[0], "openai", "signed in comes first: {ids:?}");
     let openai = &list.providers[0];
-    assert!(openai.signed_in && openai.oauth && openai.api_key);
-    assert_eq!(openai.oauth_label.as_deref(), Some("Sign in with ChatGPT"));
+    assert!(openai.signed_in);
     let opencode = list.providers.iter().find(|p| p.id == "opencode").unwrap();
     assert!(!opencode.signed_in);
     // What can't be given back to Pi as one argument isn't offered.
@@ -224,366 +210,79 @@ async fn a_host_with_no_vms_takes_either_target_to_mean_its_own() {
         .await
         .unwrap();
     assert_eq!(list.target, PiTarget::Native);
-    let login = core
-        .pi_login_start(start("opencode", PiLoginMethod::ApiKey, PiTarget::Vm))
-        .await
-        .unwrap();
-    assert_eq!(login.target, PiTarget::Native);
 }
 
+/// Pi's sign-in was the app's until #158. It's gone from the socket, as if it never was,
+/// and what's kept answers.
 #[tokio::test]
-async fn a_key_goes_to_pis_own_store_for_native_agents_and_is_never_shown() {
+async fn nothing_on_the_socket_signs_anyone_in_to_pi() {
     let w = world().await;
-    let mut events = w.core.subscribe().1;
-    let login = w
-        .core
-        .pi_login_start(start("opencode", PiLoginMethod::ApiKey, PiTarget::Native))
-        .await
-        .unwrap();
-    assert_eq!(login.state, PiLoginState::Running);
-    let prompt = login.prompt.as_ref().unwrap();
-    assert_eq!(prompt.kind, PiPromptKind::Secret);
-    let args = w.last_run("rpc.args");
-    assert!(args.lines().any(|l| l == "--no-extensions"), "{args}");
-    let env = w.last_run("rpc.env");
-    assert!(!env.contains("stray"), "{env}");
-    assert!(
-        !env.contains("PI_OFFLINE"),
-        "signing in needs the net: {env}"
-    );
-
-    let done = w
-        .core
-        .pi_login_answer(answer(&login, "sk-the-key"))
-        .await
-        .unwrap();
-    assert_eq!(done.state, PiLoginState::Done);
-    assert!(
-        !serde_json::to_string(&done).unwrap().contains("sk-the-key"),
-        "{done:?}"
-    );
-    assert!(w.own_auth().contains("sk-the-key"));
-    assert!(w.store_auth().is_empty(), "that's not linux agents' login");
-    let event = events.try_recv().unwrap();
-    assert_eq!(event.kind, vibe_core::model::EventKind::PiChanged);
-    w.no_scratch_left();
-
-    // And the next list knows.
-    let list = w.models(PiTarget::Native).await;
-    let opencode = list.providers.iter().find(|p| p.id == "opencode");
-    assert!(opencode.unwrap().signed_in);
-}
-
-#[tokio::test]
-async fn a_key_for_linux_agents_lands_in_the_store_and_goes_through_its_rules() {
-    let w = world().await;
-    let login = w
-        .core
-        .pi_login_start(start("opencode", PiLoginMethod::ApiKey, PiTarget::Vm))
-        .await
-        .unwrap();
-    assert_eq!(login.target, PiTarget::Vm);
-    let done = w
-        .core
-        .pi_login_answer(answer(&login, "sk-for-vms"))
-        .await
-        .unwrap();
-    assert_eq!(done.state, PiLoginState::Done, "{:?}", done.error);
-    assert!(w.store_auth().contains("sk-for-vms"), "{}", w.store_auth());
-    assert!(w.own_auth().is_empty(), "that's not the owner's own login");
-    w.no_scratch_left();
-    // It's the owner's own: no agent's offer to be told of.
-    let status = w
-        .core
-        .pi_status(vibe_core::rpc::HostParams { host: None })
-        .await
-        .unwrap();
-    let vms = status.vms.unwrap();
-    assert_eq!(vms.logins, ["opencode"]);
-    assert!(vms.offered.is_empty(), "{:?}", vms.offered);
-    let list = w.models(PiTarget::Vm).await;
-    let opencode = list.providers.iter().find(|p| p.id == "opencode");
-    assert!(opencode.unwrap().signed_in);
-
-    // A key that would run something isn't even given to Pi, which on this Mac would
-    // run it as soon as it's saved. It stays asked, for the key itself.
-    let login = w
-        .core
-        .pi_login_start(start("deepseek", PiLoginMethod::ApiKey, PiTarget::Vm))
-        .await
-        .unwrap();
-    for bad in ["!cat ~/.secret-key", "$HOME"] {
-        let e = w
-            .core
-            .pi_login_answer(answer(&login, bad))
-            .await
-            .unwrap_err();
-        assert_eq!(e.code, ErrorCode::InvalidParams.code(), "{bad}");
+    for (method, params) in [
+        (
+            "pi.login.start",
+            json!({"target": "native", "provider": "opencode", "method": "api_key"}),
+        ),
+        ("pi.login.get", json!({"id": "x"})),
+        (
+            "pi.login.answer",
+            json!({"id": "x", "prompt": "p", "value": "sk-made-up"}),
+        ),
+        ("pi.login.cancel", json!({"id": "x"})),
+    ] {
+        let said = w.rpc(method, params).await;
+        assert_eq!(
+            said["error"]["code"],
+            ErrorCode::MethodNotFound.code(),
+            "{method}: {said}"
+        );
     }
-    let done = w
-        .core
-        .pi_login_answer(answer(&login, "sk-plain"))
-        .await
-        .unwrap();
-    assert_eq!(done.state, PiLoginState::Done, "{:?}", done.error);
-    assert!(w.store_auth().contains("sk-plain"));
-
-    // On the owner's own Pi it's theirs to do, as it is in `/login`.
-    let login = w
-        .core
-        .pi_login_start(start("xai", PiLoginMethod::ApiKey, PiTarget::Native))
-        .await
-        .unwrap();
-    let done = w
-        .core
-        .pi_login_answer(answer(&login, "!cat ~/.secret-key"))
-        .await
-        .unwrap();
-    assert_eq!(done.state, PiLoginState::Done);
-}
-
-/// A new sign-in only says it worked once the store holds it: one already there for
-/// that provider isn't this one.
-#[tokio::test]
-async fn signing_in_again_with_what_cant_be_shared_says_so_and_keeps_the_old_one() {
-    let w = world().await;
-    let login = w
-        .core
-        .pi_login_start(start("opencode", PiLoginMethod::ApiKey, PiTarget::Vm))
-        .await
-        .unwrap();
-    w.core
-        .pi_login_answer(answer(&login, "sk-first"))
-        .await
-        .unwrap();
-    assert!(w.store_auth().contains("sk-first"));
-    let again = w
-        .core
-        .pi_login_start(start("opencode", PiLoginMethod::ApiKey, PiTarget::Vm))
-        .await
-        .unwrap();
-    let refused = w
-        .core
-        .pi_login_answer(answer(&again, "odd-shape"))
-        .await
-        .unwrap();
-    assert_eq!(refused.state, PiLoginState::Failed);
-    assert!(refused.error.unwrap().contains("more than a key"));
-    assert!(w.store_auth().contains("sk-first"), "{}", w.store_auth());
-    w.no_scratch_left();
-    // And a good one goes through what's there.
-    let third = w
-        .core
-        .pi_login_start(start("opencode", PiLoginMethod::ApiKey, PiTarget::Vm))
-        .await
-        .unwrap();
-    let done = w
-        .core
-        .pi_login_answer(answer(&third, "sk-second"))
-        .await
-        .unwrap();
-    assert_eq!(done.state, PiLoginState::Done, "{:?}", done.error);
-    assert!(w.store_auth().contains("sk-second"), "{}", w.store_auth());
-    assert!(!w.store_auth().contains("sk-first"));
-}
-
-#[tokio::test]
-async fn one_nobody_is_watching_is_given_up_on() {
-    let w = world_with(|config| config.pi_login_idle = std::time::Duration::from_millis(200));
-    let login = w
-        .core
-        .pi_login_start(start("opencode", PiLoginMethod::ApiKey, PiTarget::Vm))
-        .await
-        .unwrap();
-    // Pi's own ending frees what it held, so a wait with no client asking is the test.
-    let root = w.layout.data_dir().join(".pi-setup");
-    for _ in 0..500 {
-        if fs::read_dir(&root).map_or(true, |mut d| d.next().is_none()) {
-            break;
+    assert!(
+        !w.own.join("auth.json").exists(),
+        "nothing wrote a login for any of that"
+    );
+    let list = w.rpc("pi.models", json!({"target": "native"})).await;
+    let providers = list["result"]["providers"].as_array().expect("a list");
+    assert!(providers.iter().any(|p| p["id"] == "opencode"), "{list}");
+    // How a provider signs in is no longer anything the app is told.
+    for provider in providers {
+        for gone in ["oauth", "oauth_label", "api_key"] {
+            assert!(provider.get(gone).is_none(), "{gone}: {provider}");
         }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    w.no_scratch_left();
-    let over = w
-        .core
-        .pi_login_get(PiLoginGetParams {
-            host: None,
-            id: login.id,
-            seen: None,
-        })
-        .await
-        .unwrap();
-    assert_eq!(over.state, PiLoginState::Cancelled);
+    let status = w.rpc("pi.status", json!({})).await;
+    assert!(status.get("result").is_some(), "{status}");
 }
 
+/// What Pi has already is what's used: a list says so with no step of VibeOS's, and
+/// looking at it leaves every login, for either kind of agent, as it was, to the byte.
 #[tokio::test]
-async fn a_browser_login_shows_its_page_and_only_a_good_answer_ends_it() {
+async fn logins_already_there_are_seen_and_left_exactly_as_they_are() {
     let w = world().await;
-    let login = w
-        .core
-        .pi_login_start(start("anthropic", PiLoginMethod::Oauth, PiTarget::Native))
-        .await
-        .unwrap();
-    let prompt = login.prompt.as_ref().unwrap();
-    assert_eq!(prompt.kind, PiPromptKind::Select);
-    assert_eq!(prompt.options.len(), 2);
-    // It has to be one of the choices, and it stays asked.
-    let e = w
-        .core
-        .pi_login_answer(answer(&login, "anything"))
-        .await
-        .unwrap_err();
-    assert_eq!(e.code, ErrorCode::InvalidParams.code());
-    let page = w
-        .core
-        .pi_login_answer(answer(&login, "browser"))
-        .await
-        .unwrap();
-    assert!(page.url.as_deref().unwrap().starts_with("https://"));
+    let own = r#"{"openai":{"type":"oauth","access":"a","refresh":"r","expires":4102444800000}}"#;
+    fs::create_dir_all(&w.own).unwrap();
+    fs::write(w.own.join("auth.json"), own).unwrap();
+    let stored = r#"{"anthropic":{"type":"api_key","key":"k"}}"#;
+    let store = w.layout.linux_pi_logins_dir();
+    fs::create_dir_all(&store).unwrap();
+    fs::write(store.join("auth.json"), stored).unwrap();
+
+    let signed = |list: &PiModels| -> Vec<String> {
+        let signed = list.providers.iter().filter(|p| p.signed_in);
+        signed.map(|p| p.id.clone()).collect()
+    };
+    assert_eq!(signed(&w.models(PiTarget::Native).await), ["openai"]);
+    assert_eq!(signed(&w.models(PiTarget::Vm).await), ["anthropic"]);
+    let status = w.rpc("pi.status", json!({})).await;
+    assert_eq!(status["result"]["logins"], json!(["openai"]), "{status}");
     assert_eq!(
-        page.instructions.as_deref(),
-        Some("Complete sign-in in your browser.")
+        status["result"]["vms"]["logins"],
+        json!(["anthropic"]),
+        "{status}"
     );
-    let asked = page.prompt.as_ref().unwrap();
-    assert_eq!(asked.kind, PiPromptKind::ManualCode);
-    // The question that's over can't be answered again.
-    let e = w
-        .core
-        .pi_login_answer(answer(&login, "browser"))
-        .await
-        .unwrap_err();
-    assert_eq!(e.code, ErrorCode::Conflict.code());
-    // Nor is it asked twice over.
-    let again = w
-        .core
-        .pi_login_get(PiLoginGetParams {
-            host: None,
-            id: page.id.clone(),
-            seen: Some(0),
-        })
-        .await
-        .unwrap();
-    assert_eq!(again, page);
-    let done = w
-        .core
-        .pi_login_answer(answer(&page, "http://localhost/callback?code=good"))
-        .await
-        .unwrap();
-    assert_eq!(done.state, PiLoginState::Done);
-    assert_eq!(done.url, None);
-    assert_eq!(done.prompt, None);
-    assert!(w.own_auth().contains("code=good"));
-}
 
-#[tokio::test]
-async fn one_that_goes_wrong_says_how_and_leaves_nothing() {
-    let w = world().await;
-    let failed = w
-        .core
-        .pi_login_start(start("no-such", PiLoginMethod::Oauth, PiTarget::Native))
-        .await
-        .unwrap();
-    assert_eq!(failed.state, PiLoginState::Failed);
-    assert_eq!(failed.error.as_deref(), Some("Unknown provider: no-such"));
-    let gone = w
-        .core
-        .pi_login_start(start("goes-away", PiLoginMethod::Oauth, PiTarget::Native))
-        .await
-        .unwrap();
-    assert_eq!(gone.state, PiLoginState::Failed);
-    assert!(gone.error.unwrap().contains("Pi stopped"));
+    assert_eq!(fs::read_to_string(w.own.join("auth.json")).unwrap(), own);
+    assert_eq!(fs::read_to_string(store.join("auth.json")).unwrap(), stored);
     w.no_scratch_left();
-    // A name that can't be a provider's never gets as far as Pi.
-    for bad in ["", "a b", "x\ny", "--flag;rm"] {
-        let e = w
-            .core
-            .pi_login_start(start(bad, PiLoginMethod::ApiKey, PiTarget::Native))
-            .await
-            .unwrap_err();
-        assert_eq!(e.code, ErrorCode::InvalidParams.code(), "{bad}");
-    }
-    let e = w
-        .core
-        .pi_login_get(PiLoginGetParams {
-            host: None,
-            id: "nope".into(),
-            seen: None,
-        })
-        .await
-        .unwrap_err();
-    assert_eq!(e.code, ErrorCode::NotFound.code());
-}
-
-#[tokio::test]
-async fn giving_up_ends_pi_and_a_new_one_ends_the_last() {
-    let w = world().await;
-    let login = w
-        .core
-        .pi_login_start(start("opencode", PiLoginMethod::ApiKey, PiTarget::Vm))
-        .await
-        .unwrap();
-    let over = w
-        .core
-        .pi_login_cancel(PiLoginParams {
-            host: None,
-            id: login.id.clone(),
-        })
-        .await
-        .unwrap();
-    assert_eq!(over.state, PiLoginState::Cancelled);
-    assert!(w.store_auth().is_empty());
-    w.no_scratch_left();
-    // Over already, it stays as it ended.
-    let still = w
-        .core
-        .pi_login_cancel(PiLoginParams {
-            host: None,
-            id: login.id,
-        })
-        .await
-        .unwrap();
-    assert_eq!(still.state, PiLoginState::Cancelled);
-
-    let first = w
-        .core
-        .pi_login_start(start("opencode", PiLoginMethod::ApiKey, PiTarget::Native))
-        .await
-        .unwrap();
-    let second = w
-        .core
-        .pi_login_start(start("deepseek", PiLoginMethod::ApiKey, PiTarget::Native))
-        .await
-        .unwrap();
-    assert_ne!(first.id, second.id);
-    let e = w
-        .core
-        .pi_login_answer(answer(&first, "sk-first"))
-        .await
-        .unwrap_err();
-    assert_eq!(e.code, ErrorCode::NotFound.code());
-    let done = w
-        .core
-        .pi_login_answer(answer(&second, "sk-second"))
-        .await
-        .unwrap();
-    assert_eq!(done.state, PiLoginState::Done);
-    assert!(!w.own_auth().contains("sk-first"));
-}
-
-#[tokio::test]
-async fn an_answer_too_long_is_refused() {
-    let w = world().await;
-    let login = w
-        .core
-        .pi_login_start(start("opencode", PiLoginMethod::ApiKey, PiTarget::Native))
-        .await
-        .unwrap();
-    let e = w
-        .core
-        .pi_login_answer(answer(&login, &"k".repeat(70_000)))
-        .await
-        .unwrap_err();
-    assert_eq!(e.code, ErrorCode::InvalidParams.code());
 }
 
 #[tokio::test]
@@ -615,7 +314,7 @@ async fn with_no_pi_at_all_the_pinned_one_is_got_and_linked_nowhere() {
 }
 
 #[tokio::test]
-async fn with_no_pi_to_be_had_a_list_says_why_and_a_sign_in_fails() {
+async fn with_no_pi_to_be_had_a_list_says_why() {
     let w = world_with(|config| {
         config.pi_driver = None;
         config.pi_releases = "file:///nowhere".to_owned();
@@ -626,12 +325,6 @@ async fn with_no_pi_to_be_had_a_list_says_why_and_a_sign_in_fails() {
     });
     let list = w.models(PiTarget::Native).await;
     assert!(list.error.unwrap().contains("can't get Pi"));
-    let e = w
-        .core
-        .pi_login_start(start("opencode", PiLoginMethod::ApiKey, PiTarget::Native))
-        .await
-        .unwrap_err();
-    assert_eq!(e.code, ErrorCode::CommandFailed.code());
 }
 
 #[tokio::test]

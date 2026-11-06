@@ -569,8 +569,8 @@ impl Golden {
             serde_json::json!([{
                 "provider": "xai",
                 "text": "brave-copper-lynx signed in to xai, and every Pi agent here now uses \
-                         that login. If that wasn't you, sign in to it in Settings → Agents to \
-                         replace it.",
+                         that login. If that wasn't you, forget it in Settings → Agents and \
+                         stop that agent.",
                 "at_ms": vibe_env::pi_logins::now_ms(),
                 "first": true,
             }])

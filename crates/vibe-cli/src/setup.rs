@@ -375,15 +375,7 @@ pub(crate) fn describe_pi(p: &PiStatus) -> String {
             Some(v) => format!("Pi {v}"),
             None => "Pi isn't downloaded (VibeOS fetches it once a profile runs it)".to_owned(),
         };
-        out.push_str(&format!(
-            "\nlinux agents: {layer}, {}",
-            match logins(&vms.logins) {
-                l if vms.logins.is_empty() => {
-                    format!("{l}. {}", vibe_core::model::PI_TOOLBOX_SIGN_IN)
-                }
-                l => l,
-            }
-        ));
+        out.push_str(&format!("\nlinux agents: {layer}, {}", logins(&vms.logins)));
         // What a daemon of any version says goes to this terminal only as text.
         for alert in &vms.alerts {
             let alert = vibe_core::model::clean_alert(alert);
@@ -1012,8 +1004,11 @@ mod tests {
             "{none}"
         );
         assert!(none.contains("fetches it once a profile runs it"), "{none}");
-        assert!(none.contains("Copy code login (headless)"), "{none}");
-        assert!(none.contains("Don't choose Browser login"), "{none}");
+        // What it's signed in to is said. How to is Pi's own, and not said here.
+        assert!(none.contains("not signed in"), "{none}");
+        for word in ["Sign in", "/login", "Settings", "headless"] {
+            assert!(!none.contains(word), "{word}: {none}");
+        }
         status.vms = Some(vibe_core::rpc::PiVms {
             alerts: vec!["quiet-otter signed in to xai".into()],
             ..Default::default()

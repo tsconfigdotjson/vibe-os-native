@@ -6,7 +6,7 @@ import VibeRPC
 
 private let piList = [
     PiProvider(
-        id: "openai", name: "OpenAI", signedIn: true, oauth: true,
+        id: "openai", name: "OpenAI", signedIn: true,
         models: [PiModel(id: "gpt-5", name: "GPT-5"), PiModel(id: "gpt-5-mini")]),
     PiProvider(
         id: "opencode", name: "OpenCode Zen", signedIn: false,
@@ -26,25 +26,6 @@ private let piList = [
     #expect(matchPiModel("gpt-5", in: []) == .unlisted)
 }
 
-@Test func onlyAModelsOwnProviderCanNeedASignIn() {
-    #expect(piProviderToSignIn(for: "opencode/gpt-5", in: piList)?.id == "opencode")
-    #expect(piProviderToSignIn(for: "deepseek-v4.1-flash", in: piList)?.id == "opencode")
-    // One Pi knows, with a model it doesn't list.
-    #expect(piProviderToSignIn(for: "opencode/new-one", in: piList)?.id == "opencode")
-    #expect(piProviderToSignIn(for: "openai/gpt-5", in: piList) == nil)
-    #expect(piProviderToSignIn(for: "amazon-bedrock/nova", in: piList) == nil, "it may have what's around it")
-    #expect(piProviderToSignIn(for: "gpt-5", in: piList) == nil, "it names nobody yet")
-    #expect(piProviderToSignIn(for: "mine/own", in: piList) == nil)
-    #expect(!piHasNoLogin(piList))
-    #expect(piHasNoLogin([PiProvider(id: "a", name: "A", signedIn: false)]))
-    #expect(
-        piHasNoLogin([
-            PiProvider(id: "a", name: "A", signedIn: false),
-            PiProvider(id: "amazon-bedrock", name: "Amazon Bedrock", signedIn: false, ambient: true),
-        ]), "every real list has one of those")
-    #expect(!piHasNoLogin([]), "no list says nothing")
-}
-
 @Test func searchingFindsModelsAndProviders() {
     #expect(piModels(matching: "", in: piList).map(\.id) == ["openai", "opencode", "openrouter", "amazon-bedrock"])
     let flash = piModels(matching: "FLASH", in: piList)
@@ -55,15 +36,21 @@ private let piList = [
     #expect(piModels(matching: "nothing like it", in: piList).isEmpty)
 }
 
-@Test func aRefusalOffersItsSignIn() {
-    let refusal = RPCError(
-        code: RPCErrorCode.conflict.rawValue, message: "Pi isn't signed in",
-        data: .object(["pi_sign_in": .object(["provider": .string("opencode"), "target": .string("vm")])]))
-    #expect(piSignInOffer(from: VibedClientError.rpc(refusal)) == PiSignInOffer(provider: "opencode", target: .vm))
-    let anyone = RPCError(
-        code: RPCErrorCode.conflict.rawValue, message: "Pi isn't signed in",
-        data: .object(["pi_sign_in": .object(["provider": .null, "target": .string("native")])]))
-    #expect(piSignInOffer(from: VibedClientError.rpc(anyone)) == PiSignInOffer(provider: nil, target: .native))
-    let other = RPCError(code: RPCErrorCode.conflict.rawValue, message: "That name is taken")
-    #expect(piSignInOffer(from: VibedClientError.rpc(other)) == nil)
+/// VibeOS signs nobody in to Pi (#158): no call does, and what's kept is all still there.
+@Test func nothingInTheContractSignsAnyoneInToPi() {
+    #expect(!VibeRPC.methods.contains { $0.hasPrefix("pi.login") })
+    for kept in [PiStatusGet.name, PiInstall.name, PiForget.name, PiModelsGet.name] {
+        #expect(VibeRPC.methods.contains(kept), "\(kept)")
+    }
+}
+
+/// A host on an older VibeOS says how each provider signs in. That's no matter here.
+@Test func aListFromAnOlderHostStillDecodes() throws {
+    let older = #"""
+        {"id": "openai", "name": "OpenAI", "signed_in": true, "ambient": false, "oauth": true,
+         "oauth_label": "Sign in with ChatGPT", "api_key": true, "models": [{"id": "gpt-5"}]}
+        """#
+    let provider = try JSONDecoder().decode(PiProvider.self, from: Data(older.utf8))
+    #expect(provider.id == "openai" && provider.signedIn)
+    #expect(provider.listedModels.map(\.id) == ["gpt-5"])
 }

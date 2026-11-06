@@ -154,7 +154,7 @@ async fn setup_world(pi: PathBuf) -> (Golden, Arc<Core>) {
 }
 
 #[tokio::test]
-async fn real_pi_gives_its_list_and_signs_in_with_a_key_and_nothing_elses_runs() {
+async fn real_pi_gives_its_list_with_a_login_already_there_and_nothing_elses_runs() {
     let Some(pi) = pi_binary() else {
         eprintln!("skipped: no pi");
         return;
@@ -181,38 +181,11 @@ async fn real_pi_gives_its_list_and_signs_in_with_a_key_and_nothing_elses_runs()
         .find(|p| p["id"] == "opencode")
         .unwrap_or_else(|| panic!("{list}"));
     assert_eq!(opencode["signed_in"], false);
-    assert_eq!(opencode["api_key"], true);
     assert!(!opencode["models"].as_array().unwrap().is_empty());
-    let anthropic = providers.iter().find(|p| p["id"] == "anthropic").unwrap();
-    assert_eq!(anthropic["oauth"], true);
 
-    let begun = rpc(
-        &core,
-        "pi.login.start",
-        json!({"target": "native", "provider": "opencode", "method": "api_key"}),
-    )
-    .await;
-    let login = &begun["result"];
-    assert_eq!(login["prompt"]["kind"], "secret", "{begun}");
-    let done = rpc(
-        &core,
-        "pi.login.answer",
-        json!({"id": login["id"], "prompt": login["prompt"]["id"], "value": "sk-made-up"}),
-    )
-    .await;
-    assert_eq!(done["result"]["state"], "done", "{done}");
-    assert!(!done.to_string().contains("sk-made-up"));
-    let auth = fs::read_to_string(own.join("auth.json")).unwrap();
-    assert!(auth.contains("sk-made-up"), "Pi's own store has it");
-    use std::os::unix::fs::PermissionsExt;
-    assert_eq!(
-        fs::metadata(own.join("auth.json"))
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777,
-        0o600
-    );
+    // A login of Pi's own, there already, is all it takes, and it's left as it is.
+    let login = r#"{"opencode":{"type":"api_key","key":"sk-made-up"}}"#;
+    fs::write(own.join("auth.json"), login).unwrap();
     let list = rpc(&core, "pi.models", json!({"target": "native"})).await;
     let opencode = list["result"]["providers"]
         .as_array()
@@ -222,67 +195,9 @@ async fn real_pi_gives_its_list_and_signs_in_with_a_key_and_nothing_elses_runs()
         .unwrap()
         .clone();
     assert_eq!(opencode["signed_in"], true, "{list}");
+    assert!(!list.to_string().contains("sk-made-up"));
+    assert_eq!(fs::read_to_string(own.join("auth.json")).unwrap(), login);
     assert!(!marker.exists(), "the owner's extension ran");
-}
-
-#[tokio::test]
-async fn real_pi_asks_how_shows_a_page_and_checks_what_comes_back() {
-    let Some(pi) = pi_binary() else {
-        eprintln!("skipped: no pi");
-        return;
-    };
-    mark();
-    let (_golden, core) = setup_world(pi).await;
-    let begun = rpc(
-        &core,
-        "pi.login.start",
-        json!({"target": "vm", "provider": "anthropic", "method": "oauth"}),
-    )
-    .await;
-    let login = &begun["result"];
-    assert_eq!(login["prompt"]["kind"], "select", "{begun}");
-    let options = login["prompt"]["options"].as_array().unwrap();
-    assert!(options.iter().any(|o| o["id"] == "browser"), "{begun}");
-    let page = rpc(
-        &core,
-        "pi.login.answer",
-        json!({"id": login["id"], "prompt": login["prompt"]["id"], "value": "browser"}),
-    )
-    .await;
-    let now = &page["result"];
-    let url = now["url"].as_str().unwrap_or_else(|| panic!("{page}"));
-    assert!(url.starts_with("https://"), "{page}");
-    assert!(
-        vibe_env::pi_setup::redirect_of(url).is_some(),
-        "it means to come back to loopback, for a Mac to catch: {url}"
-    );
-    assert_eq!(now["prompt"]["kind"], "manual_code", "{page}");
-    // Somewhere it never sent anyone. Pi refuses that before it asks anyone anything.
-    let wrong = rpc(
-        &core,
-        "pi.login.answer",
-        json!({
-            "id": now["id"], "prompt": now["prompt"]["id"],
-            "value": "http://localhost:53692/callback?code=nope&state=not-its-state",
-        }),
-    )
-    .await;
-    assert_eq!(wrong["result"]["state"], "failed", "{wrong}");
-
-    // Given up on, it's over at once.
-    let begun = rpc(
-        &core,
-        "pi.login.start",
-        json!({"target": "native", "provider": "anthropic", "method": "oauth"}),
-    )
-    .await;
-    let over = rpc(
-        &core,
-        "pi.login.cancel",
-        json!({"id": begun["result"]["id"]}),
-    )
-    .await;
-    assert_eq!(over["result"]["state"], "cancelled", "{over}");
 }
 
 /// One JSON-RPC call through the daemon's dispatcher, as a socket's client.

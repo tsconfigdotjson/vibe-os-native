@@ -6,7 +6,7 @@
     "method": "signin.cancel",
     "params": {
       "host": "local",
-      "id": "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf"
+      "id": "404142434445464748494a4b4c4d4e4f"
     }
   },
   "response": {
@@ -16,7 +16,7 @@
       "asks_for_code": false,
       "finishing": false,
       "host": "local",
-      "id": "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf",
+      "id": "404142434445464748494a4b4c4d4e4f",
       "opens_itself": false,
       "seq": 1,
       "state": "cancelled",

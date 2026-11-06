@@ -6,7 +6,7 @@
     "method": "signin.get",
     "params": {
       "host": "local",
-      "id": "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf",
+      "id": "404142434445464748494a4b4c4d4e4f",
       "seen": 1
     }
   },
@@ -17,7 +17,7 @@
       "asks_for_code": false,
       "finishing": false,
       "host": "local",
-      "id": "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf",
+      "id": "404142434445464748494a4b4c4d4e4f",
       "opens_itself": false,
       "seq": 0,
       "state": "running",

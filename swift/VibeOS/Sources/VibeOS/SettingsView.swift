@@ -919,7 +919,7 @@ struct NewKeySheet: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
-            TextField("Name", text: $name, prompt: Text("laptop Claude Code"))
+            TextField("Name", text: $name, prompt: Text("Claude Code on my laptop"))
                 .textFieldStyle(.roundedBorder)
                 .onSubmit { Task { await create() } }
             ErrorText(error: error)
@@ -998,7 +998,7 @@ struct NewKeySheet: View {
         if let tailscale = model.mcp?.tailscaleUrls.first {
             setups.append(
                 KeySetup(
-                    title: "Tailscale", command: MCPSetup.command(secret: secret, url: tailscale),
+                    title: "This Mac over Tailscale", command: MCPSetup.command(secret: secret, url: tailscale),
                     help: "Sets up a client on your tailnet, at \(tailscale)"))
         }
         for (host, url) in model.hostServeURLs {
@@ -1095,7 +1095,7 @@ struct HostsPane: View {
                         }
                     }
                     Toggle(
-                        "Also serve MCP on this Mac's Tailscale address",
+                        "Serve MCP on this Mac's Tailscale address",
                         isOn: Binding(get: { mcp.tailscale }, set: { on in Task { await setTailscale(on) } }))
                 } else {
                     Text("Where MCP is served isn't known yet.").foregroundStyle(.secondary)
@@ -1233,18 +1233,14 @@ struct HostRow: View {
             IconTile(symbol: local ? "laptopcomputer" : "server.rack", color: local ? .blue : .indigo, size: 26)
             VStack(alignment: .leading, spacing: 2) {
                 Text(local ? "\(host.label) (this Mac)" : host.name)
-                HStack(spacing: 6) {
+                HStack(spacing: 4) {
                     if !local {
-                        HStack(spacing: 4) {
-                            Circle()
-                                .fill(host.link == .connected ? Palette.signal : Palette.trouble)
-                                .frame(width: 6, height: 6)
-                            Text(host.link == .connected ? "Connected" : "Down")
-                        }
+                        Circle()
+                            .fill(host.link == .connected ? Palette.signal : Palette.trouble)
+                            .frame(width: 6, height: 6)
                     }
-                    if !local { Text(host.mcp ? "MCP on" : "MCP off") }
-                    if let version = host.version { Text("VibeOS \(version)") }
-                    if let address = host.address { Text(address).lineLimit(1).truncationMode(.middle) }
+                    // Its end, so a long address gives way before what it says of the host.
+                    Text(hostStatusLine(host)).lineLimit(1).truncationMode(.tail)
                 }
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -1334,7 +1330,7 @@ struct HostServeRow: View {
             if let serve {
                 HStack(spacing: 8) {
                     Toggle(
-                        "Serve MCP on \(host.name)'s Tailscale name",
+                        "Serve MCP on \(host.name)'s Tailscale address",
                         isOn: Binding(get: { serve.on }, set: { on in Task { await set(on) } })
                     )
                     .disabled(working || host.link != .connected || !serve.available)
@@ -1382,7 +1378,7 @@ struct HostServeRow: View {
             try await model.loadHostServe(host.name)
             unknown = nil
         } catch VibedClientError.rpc(let refused) where refused.code == RPCErrorCode.methodNotFound.rawValue {
-            unknown = "Update vibed on \(host.name) to serve its MCP over Tailscale from here."
+            unknown = "Update VibeOS on \(host.name) to serve its MCP over Tailscale from here."
         } catch {
             // It says what it last said until it answers.
             unknown = serve == nil ? "Can't ask \(host.name) about Tailscale: \(describe(error))" : nil
@@ -1393,8 +1389,8 @@ struct HostServeRow: View {
         if !on {
             guard
                 confirm(
-                    "Stop serving MCP on \(host.name)'s Tailscale name?",
-                    detail: "Clients using its Tailscale URL stop reaching it. This takes only /mcp off Tailscale Serve, "
+                    "Stop serving MCP on \(host.name)'s Tailscale address?",
+                    detail: "Clients using that address stop reaching it. This takes only /mcp off Tailscale Serve, "
                         + "and leaves anything else it serves.",
                     action: "Turn Off")
             else { return }

@@ -431,6 +431,22 @@ public func keysWarning(linuxHosts: Bool) -> String {
         + "you can do on \(reach)."
 }
 
+// MARK: Hosts
+
+/// A host's status under its name in Settings → Hosts, as one line:
+/// `Connected · MCP on · VibeOS 0.1.9 · me@vps.example.com`. This Mac has no link or
+/// MCP switch of its own to say.
+public func hostStatusLine(_ host: HostInfo) -> String {
+    var parts: [String] = []
+    if host.link != .local {
+        parts.append(host.link == .connected ? "Connected" : "Down")
+        parts.append(host.mcp ? "MCP on" : "MCP off")
+    }
+    if let version = host.version { parts.append("VibeOS \(version)") }
+    if let address = host.address { parts.append(address) }
+    return parts.joined(separator: " · ")
+}
+
 // MARK: Reaching MCP from elsewhere
 
 /// A word for Tailscale where MCP's settings are. It's optional, and VibeOS doesn't set it up.

@@ -1,16 +1,14 @@
-//! Talking to Pi for the app, with no terminal (PRD: Who gets which credentials;
-//! Profiles): its own list of providers and models, and its own sign-in. `vibed` runs
-//! `pi --mode rpc` with [`EXTENSION`] and nothing else of anyone's loaded, in an
-//! empty directory, and this is how it speaks to that: what to run, what to send and
-//! what Pi said. Pi's own code does the signing in and writes the login, as `/login`
-//! does. Nothing here holds a provider's details, and nothing here is logged.
+//! Talking to Pi for the app (PRD: Profiles): its own list of providers and models.
+//! `vibed` runs `pi --mode rpc` with [`EXTENSION`] and nothing else of anyone's loaded,
+//! in an empty directory, and this is how it speaks to that: what to run, what to send
+//! and what Pi said. Nothing here holds a provider's details, and nothing here is logged.
 
 use std::path::Path;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
-use vibe_core::model::{PiLoginMethod, PiPromptKind, clean_alert};
-use vibe_core::rpc::{PiLoginOption, PiLoginPrompt, PiModel, PiProvider};
+use vibe_core::model::clean_alert;
+use vibe_core::rpc::{PiModel, PiProvider};
 
 use crate::pi;
 
@@ -49,13 +47,12 @@ pub fn args(extension: &Path) -> Vec<String> {
 
 /// The environment for a run, on what Pi's agent dir is: as for any Pi, from an
 /// allowlist so no stray key is used ([`pi::allowed_env`]). `keys` is what the owner
-/// set on purpose in `pi.env`, for a list to say who has one. `offline` is for that
-/// list too: a look at it must not spend a rotating token or reach any network.
+/// set on purpose in `pi.env`, for a list to say who has one. It's offline: a look at a
+/// list must not spend a rotating token or reach any network.
 pub fn env(
     inherited: impl IntoIterator<Item = (String, String)>,
     agent_dir: &Path,
     keys: Vec<(String, String)>,
-    offline: bool,
 ) -> Vec<(String, String)> {
     let mut env = pi::allowed_env(inherited);
     env.extend(keys);
@@ -64,9 +61,7 @@ pub fn env(
         pi::AGENT_DIR_ENV.to_owned(),
         agent_dir.to_string_lossy().into_owned(),
     ));
-    if offline {
-        env.push(("PI_OFFLINE".to_owned(), "1".to_owned()));
-    }
+    env.push(("PI_OFFLINE".to_owned(), "1".to_owned()));
     env
 }
 
@@ -79,28 +74,11 @@ pub fn catalog_command() -> String {
     command("/vibe-catalog")
 }
 
-/// What starts a sign-in. `provider` has been through [`pi::provider_name_ok`], so
-/// it's one word.
-pub fn login_command(provider: &str, method: PiLoginMethod) -> String {
-    command(&format!("/vibe-login {provider} {method}"))
-}
-
-/// What answers prompt `id`.
-pub fn answer_line(id: &str, value: &str) -> String {
-    json!({"type": "extension_ui_response", "id": id, "value": value}).to_string()
-}
-
 /// One provider as Pi told it, with whether Pi has what it needs for it.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct CatalogProvider {
     pub id: String,
     pub name: String,
-    #[serde(default)]
-    pub oauth: bool,
-    #[serde(default)]
-    pub oauth_label: Option<String>,
-    #[serde(default)]
-    pub api_key: bool,
     #[serde(default)]
     pub configured: bool,
     #[serde(default)]
@@ -118,29 +96,11 @@ pub struct CatalogModel {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Said {
     Catalog(Vec<CatalogProvider>),
-    /// A page for the owner to open, with what to do there.
-    Url {
-        url: String,
-        instructions: Option<String>,
-    },
-    /// A code for the owner to enter at a page.
-    DeviceCode {
-        code: String,
-        url: Option<String>,
-    },
-    /// How it's going.
-    Progress(String),
-    Prompt(PiLoginPrompt),
-    /// The last prompt doesn't want its answer any more: it got one, or something
-    /// else answered it.
-    PromptOver,
-    Done,
     Failed(String),
 }
 
-/// What `line` of Pi's output says, if it's anything to do with this. A value in it
-/// can be read, but only `https` is ever to be opened, and everything's cleaned to
-/// show, as a host at the far end of a link may not be well.
+/// What `line` of Pi's output says, if it's anything to do with this. Everything's
+/// cleaned to show, as a host at the far end of a link may not be well.
 pub fn read_line(line: &str) -> Option<Said> {
     let value: Value = serde_json::from_str(line).ok()?;
     match value["type"].as_str()? {
@@ -148,20 +108,11 @@ pub fn read_line(line: &str) -> Option<Said> {
         "response" if value["success"] == false => Some(Said::Failed(clean_alert(
             value["error"].as_str().unwrap_or("Pi refused that"),
         ))),
-        "extension_ui_request" => match value["method"].as_str()? {
-            "notify" => read_said(&serde_json::from_str(value["message"].as_str()?).ok()?),
-            "input" => {
-                let asked: Value = serde_json::from_str(value["title"].as_str()?).ok()?;
-                read_prompt(value["id"].as_str()?, &asked)
-            }
-            _ => None,
-        },
+        "extension_ui_request" if value["method"] == "notify" => {
+            read_said(&serde_json::from_str(value["message"].as_str()?).ok()?)
+        }
         _ => None,
     }
-}
-
-fn text(value: &Value) -> Option<String> {
-    value.as_str().map(clean_alert)
 }
 
 fn read_said(said: &Value) -> Option<Said> {
@@ -169,70 +120,15 @@ fn read_said(said: &Value) -> Option<Said> {
         "catalog" => serde_json::from_value(said["providers"].clone())
             .ok()
             .map(Said::Catalog),
-        "prompt_over" => Some(Said::PromptOver),
-        "done" => Some(Said::Done),
-        // Pi's message for a failed exchange runs on into a stack, which says nothing
+        // Pi's message for what went wrong can run on into a stack, which says nothing
         // to anyone reading this.
         "failed" => {
             let message = said["message"].as_str()?;
             let message = message.split("; stack=").next().unwrap_or(message);
             Some(Said::Failed(clean_alert(message)))
         }
-        "event" => match said["type"].as_str()? {
-            "auth_url" => {
-                let url = said["url"].as_str()?;
-                Some(if url_can_be_opened(url) {
-                    Said::Url {
-                        url: url.to_owned(),
-                        instructions: text(&said["instructions"]),
-                    }
-                } else {
-                    Said::Failed("Pi gave a page VibeOS won't open: it isn't https".to_owned())
-                })
-            }
-            "device_code" => Some(Said::DeviceCode {
-                code: text(&said["userCode"])?,
-                url: said["verificationUri"]
-                    .as_str()
-                    .filter(|u| url_can_be_opened(u))
-                    .map(str::to_owned),
-            }),
-            "progress" | "info" => Some(Said::Progress(text(&said["message"])?)),
-            _ => None,
-        },
         _ => None,
     }
-}
-
-fn read_prompt(id: &str, asked: &Value) -> Option<Said> {
-    if asked["vibe"] != "prompt" {
-        return None;
-    }
-    let kind = match asked["type"].as_str()? {
-        "text" => PiPromptKind::Text,
-        "select" => PiPromptKind::Select,
-        "manual_code" => PiPromptKind::ManualCode,
-        // What Pi hasn't said is safe to show is treated as what isn't.
-        _ => PiPromptKind::Secret,
-    };
-    let options = asked["options"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|o| {
-            Some(PiLoginOption {
-                id: o["id"].as_str()?.to_owned(),
-                label: text(&o["label"])?,
-            })
-        })
-        .collect();
-    Some(Said::Prompt(PiLoginPrompt {
-        id: id.to_owned(),
-        kind,
-        message: text(&asked["message"]).unwrap_or_default(),
-        placeholder: text(&asked["placeholder"]).filter(|p| !p.is_empty()),
-        options,
-    }))
 }
 
 /// Whether the app may open `url` for the owner: `https`, and only an address.
@@ -243,111 +139,6 @@ pub fn url_can_be_opened(url: &str) -> bool {
             .is_some_and(|s| s.eq_ignore_ascii_case("https://"))
         && url.len() > 8
         && !url.chars().any(|c| c.is_whitespace() || c.is_control())
-}
-
-/// The sign-in pages of Pi 1.5 that come back to loopback and take where they ended
-/// as an answer (`auth/oauth/`, in its source): check them when the pin moves. Only
-/// these are ever listened for on a Mac for another host: a host's word is all there
-/// is for a page, and one that wasn't well could otherwise have a Mac catch a code
-/// meant for some other program that signs in the same way.
-const PAGES_THAT_COME_BACK: &[&str] = &["claude.ai", "auth.openai.com", "openrouter.ai"];
-
-/// Where a browser login means to come back to on the machine the browser is on: a
-/// loopback address and a path. Pi's listening for it on the machine it runs on,
-/// which is only the same one on a Mac.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Redirect {
-    pub host: String,
-    pub port: u16,
-    pub path: String,
-    /// What the page will say it's answering, if it says. Nothing else can know it.
-    pub state: Option<String>,
-}
-
-impl Redirect {
-    /// Whether a browser's request for `target` is this page's answer. Pi's own
-    /// listener ignores what isn't, but one wrong answer to its question ends a
-    /// sign-in, so what any other page or program on the Mac sends goes no further.
-    pub fn is_answered_by(&self, target: &str) -> bool {
-        let Some((path, query)) = target.split_once('?') else {
-            return false;
-        };
-        if path != self.path || target.chars().any(|c| c.is_whitespace() || c.is_control()) {
-            return false;
-        }
-        let said = |wanted: &str| {
-            query.split('&').find_map(|pair| {
-                let (name, value) = pair.split_once('=')?;
-                (name == wanted).then_some(value)
-            })
-        };
-        if said("code").is_none() && said("error").is_none() {
-            return false;
-        }
-        match &self.state {
-            None => true,
-            Some(state) => said("state").and_then(percent_decoded).as_ref() == Some(state),
-        }
-    }
-}
-
-/// The host of an `https` address, if that's all it's plainly naming.
-fn page_host(page: &str) -> Option<String> {
-    let rest = page.get(8..).filter(|_| url_can_be_opened(page))?;
-    let host = rest.split(['/', '?', '#']).next()?;
-    (!host.contains(['@', ':'])).then(|| host.to_ascii_lowercase())
-}
-
-/// The [`Redirect`] a sign-in page's address names, if it's one of Pi's and names one
-/// on loopback.
-pub fn redirect_of(page: &str) -> Option<Redirect> {
-    if !PAGES_THAT_COME_BACK.contains(&page_host(page)?.as_str()) {
-        return None;
-    }
-    let (_, query) = page.split_once('?')?;
-    let query = query.split('#').next()?;
-    let param = |wanted: &[&str]| {
-        query.split('&').find_map(|pair| {
-            let (name, value) = pair.split_once('=')?;
-            wanted.contains(&name).then_some(value)
-        })
-    };
-    let target = percent_decoded(param(&["redirect_uri", "callback_url"])?)?;
-    let rest = target.strip_prefix("http://")?;
-    let (authority, path) = match rest.find('/') {
-        Some(at) => rest.split_at(at),
-        None => (rest, "/"),
-    };
-    let (host, port) = authority.rsplit_once(':')?;
-    if !matches!(host, "localhost" | "127.0.0.1") {
-        return None;
-    }
-    Some(Redirect {
-        host: host.to_owned(),
-        port: port.parse().ok().filter(|p| *p != 0)?,
-        path: path.split('?').next()?.to_owned(),
-        state: match param(&["state"]) {
-            Some(state) => Some(percent_decoded(state)?),
-            None => None,
-        },
-    })
-}
-
-fn percent_decoded(text: &str) -> Option<String> {
-    let bytes = text.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while let Some(&b) = bytes.get(i) {
-        if b == b'%' {
-            let hex = text.get(i + 1..i + 3)?;
-            out.push(u8::from_str_radix(hex, 16).ok()?);
-            i += 3;
-        } else {
-            out.push(if b == b'+' { b' ' } else { b });
-            i += 1;
-        }
-    }
-    String::from_utf8(out).ok()
 }
 
 /// A catalog as the app is told it: only names that are safe to give Pi back and to
@@ -376,9 +167,6 @@ pub fn providers_of(
                 signed_in: p.configured || signed_in(&p.id),
                 ambient: pi::can_sign_in_from_around(&p.id),
                 name: clean_alert(&p.name),
-                oauth: p.oauth,
-                oauth_label: p.oauth_label.as_deref().map(clean_alert),
-                api_key: p.api_key,
                 models,
                 id: p.id,
             }
@@ -419,7 +207,7 @@ mod tests {
     }
 
     #[test]
-    fn a_run_gets_no_stray_key_and_only_a_list_is_offline() {
+    fn a_run_gets_no_stray_key_and_is_offline() {
         let inherited = [
             ("PATH", "/bin"),
             ("OPENROUTER_API_KEY", "stray"),
@@ -428,7 +216,7 @@ mod tests {
         ]
         .map(|(k, v)| (k.to_owned(), v.to_owned()));
         let keys = vec![("OPENCODE_API_KEY".to_owned(), "mine".to_owned())];
-        let on = env(inherited.clone(), Path::new("/a"), keys, true);
+        let on = env(inherited, Path::new("/a"), keys);
         let has =
             |e: &[(String, String)], k: &str, v: &str| e.iter().any(|(ek, ev)| ek == k && ev == v);
         assert!(has(&on, "PATH", "/bin"));
@@ -438,8 +226,6 @@ mod tests {
         assert!(!on.iter().any(|(k, _)| k == "OPENROUTER_API_KEY"));
         assert!(!on.iter().any(|(k, _)| k == "CLAUDE_CODE_OAUTH_TOKEN"));
         assert!(!has(&on, "PI_CODING_AGENT_DIR", "/elsewhere"));
-        let off = env(inherited, Path::new("/a"), Vec::new(), false);
-        assert!(!off.iter().any(|(k, _)| k == "PI_OFFLINE"));
     }
 
     #[test]
@@ -447,8 +233,8 @@ mod tests {
         assert_eq!(read_line("not json"), None);
         assert_eq!(read_line(r#"{"type":"agent_start"}"#), None);
         assert_eq!(
-            read_line(&notify(json!({"vibe": "done"}))),
-            Some(Said::Done)
+            read_line(&notify(json!({"vibe": "catalog", "providers": []}))),
+            Some(Said::Catalog(Vec::new()))
         );
         // Some other extension's, or Pi's own, isn't this.
         assert_eq!(read_line(&notify(json!({"note": "hi"}))), None);
@@ -469,16 +255,11 @@ mod tests {
         );
     }
 
+    /// The app's own sign-ins, to Claude and GitHub, go by this (`vibed`'s `signin`).
     #[test]
     fn a_page_that_isnt_https_is_never_passed_on_to_open() {
-        let event = |url: &str| notify(json!({"vibe": "event", "type": "auth_url", "url": url}));
-        assert_eq!(
-            read_line(&event("https://claude.ai/oauth?x=1")),
-            Some(Said::Url {
-                url: "https://claude.ai/oauth?x=1".into(),
-                instructions: None,
-            })
-        );
+        assert!(url_can_be_opened("https://claude.ai/oauth?x=1"));
+        assert!(url_can_be_opened("HTTPS://x.example"));
         for bad in [
             "http://evil.example",
             "file:///etc/passwd",
@@ -488,150 +269,30 @@ mod tests {
             "https://",
         ] {
             assert!(!url_can_be_opened(bad), "{bad}");
-            assert!(
-                matches!(read_line(&event(bad)), Some(Said::Failed(_))),
-                "{bad}"
-            );
         }
-        assert!(url_can_be_opened("HTTPS://x.example"));
         assert!(!url_can_be_opened(&format!(
             "https://x/{}",
             "a".repeat(MAX_URL)
         )));
-        // A code stands on its own, whatever its page.
-        assert_eq!(
-            read_line(&notify(json!({
-                "vibe": "event", "type": "device_code", "userCode": "AB-12",
-                "verificationUri": "file:///x",
-            }))),
-            Some(Said::DeviceCode {
-                code: "AB-12".into(),
-                url: None,
-            })
-        );
     }
 
+    /// VibeOS signs nobody in to Pi: what it loads into Pi can only read its list, and
+    /// a question from Pi, which would need an answer, isn't heard.
     #[test]
-    fn a_prompt_says_what_it_wants_and_unknown_ones_are_masked() {
-        let input = |asked: Value| {
-            json!({"type": "extension_ui_request", "id": "p1", "method": "input",
-                   "title": asked.to_string(), "placeholder": ""})
-            .to_string()
-        };
-        let Some(Said::Prompt(p)) = read_line(&input(json!({
-            "vibe": "prompt", "type": "select", "message": "How?",
-            "options": [{"id": "browser", "label": "Browser"}, {"nope": 1}],
-        }))) else {
-            panic!("a prompt");
-        };
-        assert_eq!(p.id, "p1");
-        assert_eq!(p.kind, PiPromptKind::Select);
-        assert_eq!(p.options.len(), 1);
-        let Some(Said::Prompt(p)) = read_line(&input(json!({
-            "vibe": "prompt", "type": "something_new", "message": "Key",
-        }))) else {
-            panic!("a prompt");
-        };
-        assert_eq!(p.kind, PiPromptKind::Secret);
-        // Another extension's input isn't one of these.
-        assert_eq!(read_line(&input(json!({"message": "x"}))), None);
-    }
-
-    #[test]
-    fn a_reply_carries_any_text_as_one_line() {
-        let line = answer_line("p1", "a\"b\nc");
-        assert!(!line.contains('\n'));
-        let value: Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(value["value"], "a\"b\nc");
-        assert_eq!(value["id"], "p1");
-    }
-
-    #[test]
-    fn a_redirect_is_only_ever_on_loopback() {
-        assert_eq!(
-            redirect_of(
-                "https://claude.ai/oauth/authorize?code=true&redirect_uri=\
-                 http%3A%2F%2Flocalhost%3A53692%2Fcallback&state=s%2F1"
-            ),
-            Some(Redirect {
-                host: "localhost".into(),
-                port: 53692,
-                path: "/callback".into(),
-                state: Some("s/1".into()),
-            })
-        );
-        assert_eq!(
-            redirect_of(
-                "https://openrouter.ai/auth?callback_url=\
-                 http%3A%2F%2F127.0.0.1%3A38517%2Foauth%2Fcallback%2F1ad3&code_challenge=x"
-            ),
-            Some(Redirect {
-                host: "127.0.0.1".into(),
-                port: 38517,
-                path: "/oauth/callback/1ad3".into(),
-                state: None,
-            })
-        );
-        for page in [
-            "https://claude.ai/auth",
-            "https://claude.ai/auth?state=s",
-            "https://claude.ai/auth?redirect_uri=https%3A%2F%2Fapp.example%2Fcb",
-            "https://claude.ai/auth?redirect_uri=http%3A%2F%2Fevil.example%3A80%2Fcb",
-            "https://claude.ai/auth?redirect_uri=http%3A%2F%2Flocalhost%2Fcb",
-            "https://claude.ai/auth?redirect_uri=http%3A%2F%2Flocalhost%3A0%2Fcb",
-            "https://claude.ai/auth?redirect_uri=http%3A%2F%2Flocalhost%3Azz%2Fcb",
-            "https://claude.ai/auth?redirect_uri=%ZZ",
+    fn what_vibeos_loads_into_pi_only_reads_its_list() {
+        assert!(EXTENSION.contains("vibe-catalog"));
+        for word in [
+            "vibe-login",
+            "runtime.login",
+            "runtime.logout",
+            "ctx.ui.input",
+            "writeFile",
         ] {
-            assert_eq!(redirect_of(page), None, "{page}");
+            assert!(!EXTENSION.contains(word), "{word}");
         }
-    }
-
-    #[test]
-    fn only_pis_own_pages_are_ever_listened_for() {
-        let back = "?redirect_uri=http%3A%2F%2Flocalhost%3A8085%2Fcb&state=s";
-        assert!(redirect_of(&format!("https://auth.openai.com/x{back}")).is_some());
-        assert!(redirect_of(&format!("https://CLAUDE.AI/x{back}")).is_some());
-        for host in [
-            "accounts.google.com",
-            "claude.ai.evil.example",
-            "evil.example",
-            "claude.ai@evil.example",
-            "claude.ai:443",
-        ] {
-            let page = format!("https://{host}/o/oauth2/auth{back}");
-            assert_eq!(redirect_of(&page), None, "{page}");
-        }
-    }
-
-    #[test]
-    fn only_that_pages_own_answer_counts() {
-        let redirect = Redirect {
-            host: "localhost".into(),
-            port: 53692,
-            path: "/callback".into(),
-            state: Some("the/state".into()),
-        };
-        assert!(redirect.is_answered_by("/callback?code=abc&state=the%2Fstate"));
-        assert!(redirect.is_answered_by("/callback?state=the/state&error=access_denied"));
-        for other in [
-            "/callback",
-            "/callback?code=abc",
-            "/callback?code=abc&state=another",
-            "/callback?state=the/state",
-            "/favicon.ico",
-            "/other?code=abc&state=the/state",
-            "/callback/x?code=abc&state=the/state",
-            "/callback?code=a b&state=the/state",
-        ] {
-            assert!(!redirect.is_answered_by(other), "{other}");
-        }
-        // A page that names no state has only its path, which it made up for this.
-        let open = Redirect {
-            state: None,
-            ..redirect
-        };
-        assert!(open.is_answered_by("/callback?code=abc"));
-        assert!(!open.is_answered_by("/callback?nothing=abc"));
+        let asked = json!({"type": "extension_ui_request", "id": "p1", "method": "input",
+                           "title": json!({"vibe": "prompt", "message": "API key"}).to_string()});
+        assert_eq!(read_line(&asked.to_string()), None);
     }
 
     #[test]
@@ -654,9 +315,6 @@ mod tests {
         let provider = |id: &str, name: &str, configured, models| CatalogProvider {
             id: id.to_owned(),
             name: name.to_owned(),
-            oauth: false,
-            oauth_label: None,
-            api_key: true,
             configured,
             models,
         };

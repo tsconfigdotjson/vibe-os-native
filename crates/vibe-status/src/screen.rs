@@ -155,9 +155,9 @@ pub fn pi_error_at_exit(screen: &str, cols: Option<u16>) -> Option<String> {
     // Naming one of them isn't enough with no login for it: a start would refuse it.
     Some(if no_login {
         format!(
-            "{words} Sign in to one of them in the VibeOS app, in Settings → Agents (at a \
-             terminal, `pi` and /login, in `vibe toolbox` for a `linux` agent), set this \
-             profile's model to it, written as provider/id, {then}"
+            "{words} Sign in to one of them with Pi itself (`pi` and /login, in `vibe toolbox` \
+             for a `linux` agent), set this profile's model to it, written as provider/id, \
+             {then}"
         )
     } else {
         format!("{words} Set this profile's model to one Pi has, written as provider/id, {then}")
@@ -408,7 +408,8 @@ mod tests {
             "{said}"
         );
         assert!(said.contains("Sign in to one of them"), "{said}");
-        assert!(said.contains("Settings → Agents"), "{said}");
+        assert!(!said.contains("Settings"), "{said}");
+        assert!(!said.contains("VibeOS app"), "{said}");
         assert!(said.contains("`pi` and /login"), "{said}");
         assert!(said.contains("start a new agent"), "{said}");
         assert!(!said.contains("--provider"), "{said}");

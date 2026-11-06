@@ -932,3 +932,12 @@ typealias StepStatus = SetupProgress.Step.Status
         #expect(sparse.share < 0.05)
     }
 }
+
+@Test func aHostsStatusReadsAsOneLine() throws {
+    let linked = try decode(HostInfo.self, hostJSON("vps", link: .connected, mcp: true))
+    #expect(hostStatusLine(linked) == "Connected · MCP on · VibeOS 0.1.0 · me@vps.example.com")
+    let down = try decode(HostInfo.self, hostJSON("box", link: .down))
+    #expect(hostStatusLine(down) == "Down · MCP off · VibeOS 0.1.0 · me@box.example.com")
+    let mac = try decode(HostInfo.self, hostJSON("local", mcp: true))
+    #expect(hostStatusLine(mac) == "VibeOS 0.1.0")
+}

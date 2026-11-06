@@ -10,9 +10,9 @@ use serde::{Serialize, forward_to_deserialize_any};
 use serde_json::{Value, json};
 use vibe_core::model::{
     Activity, AdminNeed, AgentKind, AgentState, Certainty, CheckId, CheckState, Environment,
-    EventKind, GhState, HostLink, LoginTool, MessageRole, Mode, Model, PiLoginMethod, PiLoginState,
-    PiPromptKind, PiTarget, ProjectSource, Reasoning, ServiceRole, ServiceState, SessionState,
-    SignInState, SignInWhat, StopReason, ToolboxAction, ToolboxState, TunnelState, WakeupKind,
+    EventKind, GhState, HostLink, LoginTool, MessageRole, Mode, Model, PiTarget, ProjectSource,
+    Reasoning, ServiceRole, ServiceState, SessionState, SignInState, SignInWhat, StopReason,
+    ToolboxAction, ToolboxState, TunnelState, WakeupKind,
 };
 use vibe_core::paths;
 use vibe_core::rpc::*;
@@ -235,13 +235,6 @@ fn rust_types() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
         entry::<PiModels>(),
         entry::<PiProvider>(),
         entry::<PiModel>(),
-        entry::<PiLoginStartParams>(),
-        entry::<PiLoginParams>(),
-        entry::<PiLoginGetParams>(),
-        entry::<PiLoginAnswerParams>(),
-        entry::<PiLogin>(),
-        entry::<PiLoginPrompt>(),
-        entry::<PiLoginOption>(),
         entry::<DoctorReport>(),
         entry::<DoctorCheck>(),
         entry::<DoctorFixParams>(),
@@ -345,10 +338,6 @@ fn rust_methods() -> BTreeMap<&'static str, MethodTypes> {
         method::<ToolboxClose>(),
         method::<PiStatusGet>(),
         method::<PiModelsGet>(),
-        method::<PiLoginStart>(),
-        method::<PiLoginGet>(),
-        method::<PiLoginAnswer>(),
-        method::<PiLoginCancel>(),
         method::<PiInstall>(),
         method::<PiForget>(),
         method::<DoctorCheckGet>(),
@@ -383,18 +372,6 @@ fn rust_enums() -> BTreeMap<&'static str, Vec<&'static str>> {
         ("Environment", names(Environment::ALL, Environment::as_str)),
         ("AgentKind", names(AgentKind::ALL, AgentKind::as_str)),
         ("PiTarget", names(PiTarget::ALL, PiTarget::as_str)),
-        (
-            "PiLoginMethod",
-            names(PiLoginMethod::ALL, PiLoginMethod::as_str),
-        ),
-        (
-            "PiLoginState",
-            names(PiLoginState::ALL, PiLoginState::as_str),
-        ),
-        (
-            "PiPromptKind",
-            names(PiPromptKind::ALL, PiPromptKind::as_str),
-        ),
         ("Model", names(Model::ALL, Model::as_str)),
         ("Reasoning", names(Reasoning::ALL, Reasoning::as_str)),
         ("Mode", names(Mode::ALL, Mode::as_str)),
@@ -889,21 +866,6 @@ fn examples_cover_the_contract() {
 }
 
 #[test]
-fn an_answer_to_a_pi_sign_in_doesnt_show_in_debug() {
-    let answer = PiLoginAnswerParams {
-        host: Some("vps".into()),
-        id: "login".into(),
-        prompt: "p1".into(),
-        value: "sk-the-key".into(),
-    };
-    let shown = format!("{answer:?}");
-    assert!(
-        shown.contains("vps") && !shown.contains("sk-the-key"),
-        "{shown}"
-    );
-}
-
-#[test]
 fn a_sign_ins_code_and_a_personal_key_dont_show_in_debug() {
     let complete = ServiceCompleteParams {
         host: Some("vps".into()),
@@ -972,4 +934,99 @@ fn a_hosts_row_reads_across_external_addresss_retirement() {
     for gone in ["url", "external_changed_at", "external_detail"] {
         assert!(ours.get(gone).is_none(), "{gone}: {ours}");
     }
+}
+
+/// Every file under `dir`, for what the Swift app can be held to from here.
+fn swift_sources(dir: &Path, out: &mut Vec<PathBuf>) {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            swift_sources(&path, out);
+        } else if path.extension().is_some_and(|e| e == "swift") {
+            out.push(path);
+        }
+    }
+}
+
+/// VibeOS signs nobody in to Pi (#158): no call does, and nothing in the app offers
+/// to, while Pi's status, install and forget and its model list all stay.
+#[test]
+fn the_contract_and_the_app_have_no_pi_sign_in_and_keep_pis_list() {
+    let index = std::fs::read_to_string(protocol_dir().join("vibed-rpc.json")).unwrap();
+    for gone in ["pi.login", "PiLogin", "PiPromptKind", "oauth", "api_key"] {
+        assert!(!index.contains(gone), "{gone} is back in the contract");
+    }
+    for kept in [
+        PiStatusGet::NAME,
+        PiInstall::NAME,
+        PiForget::NAME,
+        PiModelsGet::NAME,
+    ] {
+        assert!(METHODS.contains(&kept), "{kept}");
+    }
+    assert!(!METHODS.iter().any(|m| m.starts_with("pi.login")));
+
+    let root = protocol_dir().join("../swift/VibeOS");
+    let mut files = Vec::new();
+    swift_sources(&root.join("Sources"), &mut files);
+    assert!(!files.is_empty());
+    for file in &files {
+        let text = std::fs::read_to_string(file).unwrap();
+        for gone in [
+            "PiSignIn",
+            "piSignIn",
+            "piProviderToSignIn",
+            "piHasNoLogin",
+            "pi_sign_in",
+            "PiLogin",
+            "pi.login",
+            "Sign In to a Provider",
+        ] {
+            assert!(!text.contains(gone), "{gone} in {}", file.display());
+        }
+    }
+    let sources = root.join("Sources/VibeOS");
+    let picker = std::fs::read_to_string(sources.join("PiModelPicker.swift")).unwrap();
+    assert!(
+        picker.contains("PiModelsGet.self"),
+        "the list is still asked for"
+    );
+    assert!(!picker.contains("Sign In"), "the picker offers a sign-in");
+    let agents = std::fs::read_to_string(sources.join("AgentsPane.swift")).unwrap();
+    assert!(
+        !agents.contains("Sign In"),
+        "Settings → Agents offers a sign-in"
+    );
+    for kept in ["PiStatusGet.self", "PiInstall.self", "PiForget.self"] {
+        assert!(agents.contains(kept), "{kept}");
+    }
+    // Other sign-ins are nothing to do with this.
+    let hosts = std::fs::read_to_string(sources.join("SettingsView.swift")).unwrap();
+    assert!(hosts.contains("Sign In to GitHub"));
+    assert!(sources.join("SignInView.swift").is_file());
+}
+
+/// What the app says of hosts and MCP, held here as Swift can't be built on every machine
+/// (#158): no sample agent in Add Linux Host, one way to say a Tailscale toggle, and a key
+/// name that reads as one and is one.
+#[test]
+fn hosts_and_keys_say_things_one_way() {
+    let sources = protocol_dir().join("../swift/VibeOS/Sources/VibeOS");
+    let read = |name: &str| std::fs::read_to_string(sources.join(name)).unwrap();
+    assert!(!read("AddHostView.swift").contains("quiet-amber-otter"));
+    let settings = read("SettingsView.swift");
+    for said in [
+        "Serve MCP on this Mac's Tailscale address",
+        "Serve MCP on \\(host.name)'s Tailscale address",
+        "Stop serving MCP on \\(host.name)'s Tailscale address?",
+    ] {
+        assert!(settings.contains(said), "{said}");
+    }
+    for gone in ["Also serve MCP", "Tailscale name", "Update vibed on"] {
+        assert!(!settings.contains(gone), "{gone}");
+    }
+    assert!(settings.contains("Text(hostStatusLine(host))"));
+    let example = "Claude Code on my laptop";
+    assert!(settings.contains(&format!("prompt: Text(\"{example}\")")));
+    assert_eq!(vibe_core::model::validate_key_name(example), Ok(()));
 }

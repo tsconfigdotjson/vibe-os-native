@@ -5,15 +5,14 @@ import VibeRPC
 /// Settings → Agents (PRD: Who gets which credentials; What's inside
 /// `linux`): the coding agents besides Claude, on each host. For Pi, the
 /// `pi` a host's native agents run, the layer `linux` agents boot on this Mac,
-/// and who's signed in. Signing in is Pi's own, guided here with no terminal:
-/// VibeOS picks no provider, supplies no key, and shows only providers' names.
+/// and who's signed in. Signing in is Pi's own, and not done here: VibeOS picks no
+/// provider, supplies no key, and shows only providers' names.
 struct AgentsPane: View {
     @ObservedObject var model: MenuModel
     @State private var host = VibeRPC.localHost
     @State private var status: PiStatus?
     @State private var installing: PiTarget?
     @State private var error: String?
-    @State private var signIn: PiSignInRequest?
 
     private var local: Bool { host == VibeRPC.localHost }
 
@@ -33,9 +32,6 @@ struct AgentsPane: View {
         .formStyle(.grouped)
         .navigationTitle("Agents")
         .task(id: "\(host)#\(model.settingsRevision)") { await load() }
-        .sheet(item: $signIn) { request in
-            PiSignInSheet(model: model, request: request) { Task { await load() } }
-        }
     }
 
     /// The `pi` that runs natively: on the Mac for `macos` agents, on a server
@@ -58,15 +54,13 @@ struct AgentsPane: View {
                     .textSelection(.enabled)
             }
             loginsRow(status.logins ?? [])
-            HStack {
-                if installing == .native {
-                    Working(text: "Downloading Pi…")
-                }
-                Spacer()
-                Button("Sign In…") { signIn = PiSignInRequest(host: host, target: .native) }
-                    .help("Sign in to a provider, for these agents, with an account or an API key.")
-                // A `pi` of the owner's own is theirs to update.
-                if status.native == nil || status.native?.managed == true {
+            // A `pi` of the owner's own is theirs to update, which leaves nothing to show.
+            if status.native == nil || status.native?.managed == true {
+                HStack {
+                    if installing == .native {
+                        Working(text: "Downloading Pi…")
+                    }
+                    Spacer()
                     Button(status.error != nil ? "Try Again" : status.native == nil ? "Install Pi" : "Update Pi") {
                         Task { await install(.native) }
                     }
@@ -115,17 +109,13 @@ struct AgentsPane: View {
                     }
                 }
             }
-            HStack {
-                if installing == .vm {
-                    Working(text: "Downloading Pi…")
-                }
-                Spacer()
-                // For signing in, or in again over what an agent's left: an alert
-                // above may be sending the owner here.
-                Button("Sign In…") { signIn = PiSignInRequest(host: host, target: .vm) }
-                    .help("Sign in to a provider, for every Linux agent, with an account or an API key.")
-                // The version is this VibeOS's own: a new one comes with an update.
-                if vms.version == nil {
+            // The version is this VibeOS's own: a new one comes with an update.
+            if vms.version == nil {
+                HStack {
+                    if installing == .vm {
+                        Working(text: "Downloading Pi…")
+                    }
+                    Spacer()
                     Button("Download Pi") {
                         Task { await install(.vm) }
                     }

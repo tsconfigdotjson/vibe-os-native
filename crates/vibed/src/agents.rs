@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use vibe_core::limits::{self, HostLimits};
 use vibe_core::model::{
-    AgentKind, AgentState, Environment, EventKind, LOCAL_HOST, Mode, PiTarget, ref_from_bytes,
+    AgentKind, AgentState, Environment, EventKind, LOCAL_HOST, Mode, ref_from_bytes,
     validate_new_ref, validate_ref,
 };
 use vibe_core::rpc::{
@@ -1027,8 +1027,9 @@ impl Core {
         Err(failed(format!("{SETUP_SCRIPT} {how}{last}")))
     }
 
-    /// Refuses a Pi agent that couldn't answer, and says how to sign in: VibeOS
-    /// holds no key and picks no provider (PRD: Who gets which credentials).
+    /// Refuses a Pi agent that couldn't answer, and says so: its login is Pi's own, as
+    /// VibeOS signs nobody in, holds no key and picks no provider (PRD: Who gets which
+    /// credentials).
     /// With a model named, Pi says itself, where it can be run; otherwise, and
     /// in a VM, it's what can be told from its files.
     async fn check_pi_can_answer(
@@ -1057,38 +1058,27 @@ impl Core {
         let Some(missing) = missing else {
             return Ok(());
         };
-        // The app offers that sign-in from what's here (`PiSignInOffer`). Whoever
-        // else reads this has the words.
         let vm = backend.capabilities().file_containment;
-        let provider = model
+        let who = model
             .and_then(|m| m.split_once('/'))
-            .map(|(provider, _)| provider);
+            .map_or("one", |(provider, _)| provider);
         let at_a_terminal = if vm {
             "in `vibe toolbox`, `pi` and /login"
         } else {
             "`pi` and /login"
         };
-        let who = provider.unwrap_or("one");
-        let how = format!(
-            "Sign in to {who} in the VibeOS app, in Settings → Agents (at a terminal, \
-             {at_a_terminal})"
-        );
         let shared = if vm {
             "Every linux Pi agent gets that one login"
         } else {
             "Every Pi agent here shares that one login"
         };
-        let mut refused = error(
+        Err(error(
             ErrorCode::Conflict,
-            format!("{missing}, so it couldn't answer. {how}. {shared}"),
-        );
-        refused.data = Some(serde_json::json!({
-            "pi_sign_in": {
-                "provider": provider,
-                "target": if vm { PiTarget::Vm } else { PiTarget::Native },
-            }
-        }));
-        Err(refused)
+            format!(
+                "{missing}, so it couldn't answer. Sign in to {who} with Pi itself: \
+                 {at_a_terminal}. {shared}"
+            ),
+        ))
     }
 
     /// What a Pi agent gets in its environment on top of the compartment's:
