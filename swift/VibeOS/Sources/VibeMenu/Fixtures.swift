@@ -22,6 +22,11 @@ public final class FixtureDaemon: DaemonConnection, @unchecked Sendable {
         case freshMac = "fresh-mac"
         /// vibed isn't there.
         case offline
+        /// A fictional team's working day, on this Mac and two Linux hosts,
+        /// for the README's screenshots: `--gallery --demo`. Larkfield Labs,
+        /// its people and its hosts are made up, and no host is the external
+        /// address.
+        case demo
     }
 
     public let scenario: Scenario
@@ -55,7 +60,12 @@ public final class FixtureDaemon: DaemonConnection, @unchecked Sendable {
         ISO8601DateFormatter().string(from: now.addingTimeInterval(-ago))
     }
 
-    private var populated: Bool { scenario == .busy }
+    private var populated: Bool { scenario == .busy || scenario == .demo }
+    private var demo: Bool { scenario == .demo }
+    private var account: String { demo ? "larkfield-dev" : "octocat" }
+    private var macHome: String { demo ? "/Users/dev" : "/Users/me" }
+    private var tailscaleAddress: String { demo ? "100.96.14.27" : "100.101.102.103" }
+    private var limit: Int { demo ? 8 << 30 : 4 << 30 }
     private var setUp: Bool { scenario != .firstRun && scenario != .freshMac }
 
     func answer(_ method: String, host: String, params: [String: Any]) -> [String: Any]? {
@@ -66,7 +76,7 @@ public final class FixtureDaemon: DaemonConnection, @unchecked Sendable {
             return ["agents": populated ? agents(on: host) : []]
         case GhStatusGet.name:
             if scenario == .freshMac { return ["state": "not_installed", "detail": "gh isn't installed"] }
-            return ["state": "logged_in", "account": "octocat", "checked_at": time(600)]
+            return ["state": "logged_in", "account": account, "checked_at": time(600)]
         case DoctorCheckGet.name, DoctorFix.name:
             return ["checks": doctor]
         case ToolboxStatusGet.name, ToolboxClose.name:
@@ -94,14 +104,14 @@ public final class FixtureDaemon: DaemonConnection, @unchecked Sendable {
             }
             return [
                 "host": host,
-                "native": ["path": "/Users/me/.local/bin/pi", "version": "1.5.0"],
+                "native": ["path": "\(macHome)/.local/bin/pi", "version": "1.5.0"],
                 "logins": ["openai"],
                 "vms": ["version": "1.5.0", "logins": ["anthropic"]],
             ]
         case McpGet.name:
             return [
                 "port": 7878, "tailscale": populated, "url": "http://127.0.0.1:7878/mcp",
-                "tailscale_urls": populated ? ["http://100.101.102.103:7878/mcp"] : [String](),
+                "tailscale_urls": populated ? ["http://\(tailscaleAddress):7878/mcp"] : [String](),
             ]
         case ProjectsList.name:
             return ["projects": setUp ? projects(on: host) : []]
@@ -125,9 +135,12 @@ public final class FixtureDaemon: DaemonConnection, @unchecked Sendable {
             return [
                 "home": 2, "claude": true,
                 "logins": [
-                    ["tool": "gh", "account": "octocat on github.com"],
-                    ["tool": "git", "account": "The Octocat <octocat@github.com>"],
-                    ["tool": "ssh", "account": "ED25519 SHA256:3x8f…Q2k (octocat@vibe)"],
+                    ["tool": "gh", "account": "\(account) on github.com"],
+                    [
+                        "tool": "git",
+                        "account": demo ? "Larkfield Dev <dev@larkfield.example>" : "The Octocat <octocat@github.com>",
+                    ],
+                    ["tool": "ssh", "account": "ED25519 SHA256:3x8f…Q2k (\(account)@vibe)"],
                 ],
             ]
         case SessionsList.name:
@@ -151,6 +164,7 @@ public final class FixtureDaemon: DaemonConnection, @unchecked Sendable {
     }
 
     var hosts: [[String: Any]] {
+        if demo { return demoHosts }
         var local: [String: Any] = [
             "name": "local", "os": "macos", "label": "studio", "link": "local", "external": false, "mcp": true,
             "version": "0.1.0", "missing": [String](),
@@ -190,16 +204,17 @@ public final class FixtureDaemon: DaemonConnection, @unchecked Sendable {
         let environment = profile.hasSuffix("mac") ? "macos" : "linux"
         var agent: [String: Any] = [
             "host": host, "ref": ref, "project": project, "profile": profile, "environment": environment,
-            "state": state.rawValue, "worktree": "/Users/me/VibeOS/worktrees/\(project)/\(ref)", "branch": ref,
+            "state": state.rawValue, "worktree": "\(macHome)/VibeOS/worktrees/\(project)/\(ref)", "branch": ref,
             "session_id": "40414243-4445-4647-8849-4a4b4c4d4e4f", "created_at": time(age),
             "attach": host == VibeRPC.localHost ? "vibe attach \(ref)" : "ssh -t \(host) vibe attach \(ref)",
-            "memory": 4 << 30, "status": status,
+            "memory": limit, "status": status,
         ]
         if let used { agent["memory_used"] = used }
         return agent
     }
 
     func agents(on host: String) -> [[String: Any]] {
+        if demo { return demoAgents(on: host) }
         switch host {
         case VibeRPC.localHost:
             return [
@@ -248,10 +263,11 @@ public final class FixtureDaemon: DaemonConnection, @unchecked Sendable {
     private func profile(_ name: String, _ environment: String, model: String = "opus", mode: String = "auto")
         -> [String: Any]
     {
-        ["name": name, "environment": environment, "model": model, "reasoning": "high", "mode": mode, "memory": 4 << 30]
+        ["name": name, "environment": environment, "model": model, "reasoning": "high", "mode": mode, "memory": limit]
     }
 
     func projects(on host: String) -> [[String: Any]] {
+        if demo { return demoProjects(on: host) }
         if host != VibeRPC.localHost {
             return [
                 [
@@ -288,22 +304,22 @@ public final class FixtureDaemon: DaemonConnection, @unchecked Sendable {
             return c
         }
         let git = check(.git, .pass, "git 2.50.1 is installed.")
-        let gh = check(.gh, .pass, "GitHub's gh is logged in to github.com as octocat.")
-        let claude = check(.claude, .pass, "Claude Code 2.1.314 is at /Users/me/.local/bin/claude.")
+        let gh = check(.gh, .pass, "GitHub's gh is logged in to github.com as \(account).")
+        let claude = check(.claude, .pass, "Claude Code 2.1.314 is at \(macHome)/.local/bin/claude.")
         let login = check(.claudeLogin, .pass, "Claude Code is signed in, with its login in your Keychain.")
         // Only a Linux host's: no Mac's vibed says it. It's here so the canned report
         // has every check the contract does, and the welcome leaves it out.
         let linger = check(.linger, .pass, "vibed runs while you're logged out, and starts again after a reboot.")
-        let tailscale = check(.tailscale, .pass, "Tailscale is up, at 100.101.102.103; Settings can serve MCP there too.")
+        let tailscale = check(.tailscale, .pass, "Tailscale is up, at \(tailscaleAddress); Settings can serve MCP there too.")
         let linux = check(.linux, .pass, "Linux base image 2 and Claude Code 2.1.314 are ready for linux agents.")
         // The doctor's last check, as `vibed` says it. Only agents whose profile
         // runs Pi need it, so a Mac without it has nothing to do about it.
-        let piInstalled = check(.pi, .pass, "Pi 1.5.0 is at /Users/me/.local/bin/pi.")
+        let piInstalled = check(.pi, .pass, "Pi 1.5.0 is at \(macHome)/.local/bin/pi.")
         let noPi = check(
             .pi, .optional, "Pi isn't on your login shell's PATH.",
             hint: "Only agents whose profile runs Pi need it: install it in Settings → Agents.")
         switch scenario {
-        case .busy, .quiet, .offline:
+        case .busy, .quiet, .offline, .demo:
             return [
                 git, gh, check(.ghGit, .pass, "git asks gh for GitHub's credentials."), claude, login,
                 check(.power, .pass, "This Mac never sleeps on its own."), linger, tailscale, linux, piInstalled,
@@ -351,9 +367,123 @@ public final class FixtureDaemon: DaemonConnection, @unchecked Sendable {
     }
 
     var keys: [[String: Any]] {
-        [
+        if demo { return demoKeys }
+        return [
             ["name": "laptop Claude Code", "prefix": "vk_aaaqeaye", "created_at": time(3 * 86400), "last_used_at": time(240)],
             ["name": "cloud orchestrator", "prefix": "vk_b7d2kq9m", "created_at": time(86400)],
+        ]
+    }
+}
+
+// MARK: The demo: fictional, and all that the README's screenshots show
+
+extension FixtureDaemon {
+    fileprivate var demoHosts: [[String: Any]] {
+        [
+            [
+                "name": "local", "os": "macos", "label": "mac-studio", "link": "local", "external": false, "mcp": true,
+                "version": "0.1.7", "missing": [String](),
+                "memory": ["total": 64 << 30, "used": 21 << 30, "swap_total": 0, "swap_used": 0],
+            ],
+            [
+                "name": "atlas", "os": "linux", "label": "atlas-fra1", "link": "connected", "external": false,
+                "mcp": true, "address": "deploy@atlas.larkfield.example", "version": "0.1.7", "missing": [String](),
+                "memory": ["total": 32 << 30, "used": 9 << 30, "swap_total": 4 << 30, "swap_used": 0],
+            ],
+            [
+                // A Tailscale name, as an SSH destination can be.
+                "name": "forge", "os": "linux", "label": "forge", "link": "connected", "external": false,
+                "mcp": true, "address": "deploy@forge", "version": "0.1.7", "missing": [String](),
+                "memory": ["total": 128 << 30, "used": 41 << 30, "swap_total": 0, "swap_used": 0],
+            ],
+        ]
+    }
+
+    fileprivate func demoAgents(on host: String) -> [[String: Any]] {
+        switch host {
+        case VibeRPC.localHost:
+            return [
+                agent(
+                    "tidy-cedar-plover", project: "larkfield-ios", profile: "software-eng-mac", state: .busy,
+                    activity: .runningTool, title: "Fix the offline sync race in JobStore",
+                    line: "$ xcodebuild test -scheme Larkfield -only-testing:JobStoreTests",
+                    used: 3_543_348_019, age: 38 * 60),
+                agent(
+                    "warm-slate-ibis", project: "larkfield-ios", profile: "software-eng-linux", state: .question,
+                    activity: .awaitingAnswer, title: "Add quiet hours to push notifications",
+                    line: "Should quiet hours follow the device or the account time zone?",
+                    used: 1_288_490_188, age: 21 * 60),
+                agent(
+                    "sunny-moss-vole", project: "dispatch-web", profile: "software-eng-linux", state: .idle,
+                    activity: .done, title: "Upgrade Vite and fix the failing route tests",
+                    line: "Opened pull request #318", used: 944_245_094, age: 52 * 60),
+                agent(
+                    "lucky-fern-tern", project: "dispatch-web", profile: "reviewer", state: .asleep,
+                    activity: .done, title: "Review the route planner pull request",
+                    line: "Left 3 comments on #316", used: nil, age: 5 * 3600),
+            ]
+        case "atlas":
+            return [
+                agent(
+                    "merry-basalt-shrew", host: "atlas", project: "dispatch-api", profile: "software-eng-linux",
+                    state: .busy, activity: .thinking, title: "Partition job_events by month", line: "Thinking…",
+                    used: 2_854_348_019, age: 2 * 3600 + 14 * 60),
+                agent(
+                    "plain-indigo-stoat", host: "atlas", project: "dispatch-api", profile: "software-eng-linux",
+                    state: .busy, activity: .runningTool, title: "Find the slow query behind /v2/routes",
+                    line: "$ pytest tests/test_routes.py -q", used: 1_754_857_830, age: 26 * 60),
+            ]
+        case "forge":
+            return [
+                agent(
+                    "round-clay-pika", host: "forge", project: "eta-model", profile: "software-eng-linux",
+                    state: .busy, activity: .runningTool, title: "Retrain the ETA model on October data",
+                    line: "$ python train.py --config configs/eta-oct.yaml", used: 6_442_450_944,
+                    age: 3 * 3600 + 40 * 60)
+            ]
+        default:
+            return []
+        }
+    }
+
+    fileprivate func demoProjects(on host: String) -> [[String: Any]] {
+        if host != VibeRPC.localHost {
+            let name = host == "forge" ? "eta-model" : "dispatch-api"
+            return [
+                [
+                    "host": host, "name": name, "source": "github", "repo": "larkfield-labs/\(name)",
+                    "path": "/home/deploy/VibeOS/projects/\(name)", "added_at": time(86400),
+                    "profiles": [profile("software-eng-linux", "linux")],
+                ]
+            ]
+        }
+        return [
+            [
+                "host": host, "name": "larkfield-ios", "source": "github", "repo": "larkfield-labs/larkfield-ios",
+                "path": "/Users/dev/VibeOS/projects/larkfield-ios", "added_at": time(3 * 86400),
+                "profiles": [profile("software-eng-linux", "linux"), profile("software-eng-mac", "macos")],
+            ],
+            [
+                "host": host, "name": "dispatch-web", "source": "github", "repo": "larkfield-labs/dispatch-web",
+                "path": "/Users/dev/VibeOS/projects/dispatch-web", "added_at": time(2 * 86400),
+                "profiles": [
+                    profile("software-eng-linux", "linux"), profile("software-eng-mac", "macos"),
+                    profile("reviewer", "linux", model: "sonnet", mode: "bypass"),
+                ],
+            ],
+        ]
+    }
+
+    fileprivate var demoKeys: [[String: Any]] {
+        [
+            [
+                "name": "laptop Claude Code", "prefix": "vk_demo4f2a", "created_at": time(3 * 86400),
+                "last_used_at": time(240),
+            ],
+            [
+                "name": "release orchestrator", "prefix": "vk_demo91c7", "created_at": time(86400),
+                "last_used_at": time(35 * 60),
+            ],
         ]
     }
 }

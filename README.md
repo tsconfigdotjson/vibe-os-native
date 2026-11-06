@@ -1,182 +1,111 @@
-# VibeOS Native
+<p align="center">
+  <img src="swift/VibeOS/Support/AppIcon.iconset/icon_128x128@2x.png" width="112" height="112" alt="The VibeOS app icon">
+</p>
 
-Turns an always-on Apple Silicon Mac into a private host for Claude Code
-agents, each in its own git worktree and compartment, driven over MCP and
-watched from the menu bar. [PRD.md](PRD.md) is the design and the source of
-truth.
+<h1 align="center">VibeOS Native</h1>
 
-## Layout
+<p align="center"><strong>Cloud-agent workflows on machines you control.</strong></p>
 
-| Path | What |
-| --- | --- |
-| `crates/vibed` | The daemon. Owns all state; serves the JSON-RPC socket |
-| `crates/vibe-core` | Domain types, the store, and the socket contract (`vibe_core::rpc`) |
-| `crates/vibe-cli` | The `vibe` command |
-| `crates/vibe-status` | The status engine (agent-tail) |
-| `crates/vibe-env` | Environment backends behind `Compartment`, `Limiter`, `Sleeper`: the `linux` VMs on a Mac (`vibe_env::linux`, driving `vibe-vm` and `vibe-guest`), with the images they boot (`vibe_env::images`) |
-| `crates/vibe-shim` | Holds one agent's terminal |
-| `crates/vibe-guest` | PID 1 in each `linux` VM; a static `aarch64-unknown-linux-musl` binary. Its library is the protocol `vibed` and `vibe-shim` speak to it |
-| `crates/vibe-testguest` | PID 1 of the small test guest `vibe-vm` is tested with, and a stand-in for Claude in the one `vibe-guest` is; not shipped |
-| `crates/vibe-mcp` | The MCP server |
-| `crates/vibe-services` | Shared MCP services' broker, in every `vibed`: one login per install on its owning host, access tokens for the others, the OAuth lifecycle, policy and audit |
-| `crates/vibe-relay` | Their `vibe mcp-proxy` stdio shim, and the relay out of a VM; `std` only, as `vibe-guest` links it |
-| `swift/VibeOS` | `VibeOS.app`, the SwiftUI menu bar app, and `VibeRPC`, its socket client |
-| `swift/vibe-vm` | `vibe-vm`, the Virtualization.framework helper |
-| `protocol/` | The socket contract both sides are tested against, `vibe-vm`'s in `protocol/vibe-vm/` and `vibe-guest`'s in `protocol/vibe-guest/`; see the READMEs |
-| `scripts/` | `check-full.sh` runs every check; `advisories.sh` holds `Cargo.lock` to RustSec, by `deny.toml`'s rules; `sign-macos.sh` signs for local use; `test-guest.sh` builds the test guest; `base-image.sh` builds the Linux base image (with Docker); `vm-reboot-test.sh` checks a saved VM survives a reboot; `keep-host-state.sh` puts a real host back as it was after a test of it; `host-bundle.sh` builds the Linux `vibed` that Add Linux Host installs, with `zig-tools.sh` fetching what that takes on first use; `release-macos.sh` builds a release DMG; `sparkle.py` signs it for Sparkle and writes the appcast |
+<p align="center">
+  Hand coding agents a prompt, let them work in the background, and step in when they need you.<br>
+  They run on your own Mac and Linux servers, driven over MCP and watched from the menu bar.
+</p>
 
-Every crate builds on macOS and Linux (x86_64 and arm64); `vibe-guest` and
-`vibe-testguest` do their work only as static `aarch64-unknown-linux-musl`
-binaries in a VM. The Swift packages are macOS 26 only.
+<p align="center">
+  <a href="https://github.com/tsconfigdotjson/vibe-os-native/releases/latest"><strong>Download for Mac</strong></a>
+  &nbsp;·&nbsp; Apple Silicon, macOS 26 or later &nbsp;·&nbsp; Free and open source
+</p>
 
-## Install
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/menu-dark.png">
+    <img src="docs/images/menu-light.png" width="460" alt="The VibeOS menu listing seven agents, grouped by host and project, on a Mac and two Linux servers. Some are working, one asks whether quiet hours should follow the device or the account time zone, one has opened a pull request, and one is asleep.">
+  </picture>
+</p>
 
-Download `VibeOS-<version>.dmg` from
-[Releases](https://github.com/tsconfigdotjson/vibe-os-native/releases), drag
-VibeOS into Applications, and open it from there. It registers `vibed` as a
-login item (System Settings → General → Login Items lists it under
-VibeOS), and its menu walks through the rest in one list: adding the `vibe`
-command to `/usr/local/bin` (macOS asks for your password), what
-`vibe doctor` checks, letting VibeOS control Terminal, the Linux download,
-the toolbox for Linux agents (Settings → Linux Toolbox), a project and an API
-key.
-It updates itself through Sparkle.
+<p align="center"><sub>Screenshots show the real app's windows on a fictional demo workspace.</sub></p>
 
-```sh
-vibe doctor          # what truly needs you; asking has vibed try again what it sets up itself
-```
+## Why VibeOS
 
-## Develop
+- **Hand off work from any MCP client.** Claude Code on your laptop, or an orchestrator of your own, can start an agent with a prompt, wait for it, read what it said and answer its questions.
+- **Give every agent its own space.** Each one gets its own git worktree and branch, inside its own compartment, so parallel work doesn't collide. On the Mac that's a Linux micro-VM, or a native macOS process under resource limits when the work needs Xcode. On a Linux server it's a cgroup.
+- **Open a real terminal whenever you like.** Click an agent and Terminal.app opens attached to its live session, ready for you to type.
+- **Reconnect without losing the session.** Close the window, drop your SSH connection or quit the menu bar app, and the agent keeps running. Attach again and its screen comes back. It also carries on through a `vibed` restart or upgrade.
+- **Bring your Linux servers into the same menu.** Add a server by its SSH destination and VibeOS installs itself there. Its agents appear beside your Mac's, in the menu and over MCP.
+- **Let idle agents give back resources.** About a minute after an agent comes to rest with nothing attached, it goes to sleep. A Linux VM on the Mac is saved to disk, freeing its RAM. Other agents are frozen. A message or an attach wakes it where it left off.
+- **Hear about it when you're needed.** The menu shows what each agent is doing, and a notification fires when one has a question, hits an error or reaches a limit.
 
-You need rustup; on a Mac, also Xcode 26 or its command line tools.
-`rust-toolchain.toml` pins the toolchain and adds the musl target.
+Agents run [Claude Code](https://claude.com/product/claude-code) or [Pi](https://github.com/earendil-works/pi), with your own logins.
 
-```sh
-cargo build                     # everything in the workspace
-cargo test
-target/debug/vibed &            # the hello-world daemon on its default socket
-target/debug/vibe hello         # vibed 0.1.0 · protocol 2 · macos/aarch64 · pid …
-cargo build -p vibe-guest --target aarch64-unknown-linux-musl
+> [!NOTE]
+> A reboot ends running processes, and agents come back asleep. A Linux VM on the Mac that was saved to disk wakes right where it was. Other agents wake by resuming their conversation in a new process, so anything else they had running is gone. Critical memory pressure can end an agent the same way.
 
-scripts/sign-macos.sh           # build/VibeOS.app and build/vibe-vm, ad hoc signed
-open build/VibeOS.app
+## Get started
 
-scripts/test-guest.sh           # build/test-guest: small Linux guests for vibe-vm and vibe-guest
-cargo build -p vibe-shim        # the vibe-guest test attaches through a real shim
-VIBE_VM_BIN=build/vibe-vm VIBE_VM_GUEST=build/test-guest \
-  cargo test -p vibe-env --test vm_cycle -- --test-threads=1 --nocapture
-```
+**[Download the latest release](https://github.com/tsconfigdotjson/vibe-os-native/releases/latest)**, then:
 
-linux agents on a Mac boot the base image and Claude Code's managed layer,
-which `vibed` downloads into `~/VibeOS/linux/` when it starts, and sign in to
-Claude with the token `vibe setup-token` keeps in the Keychain. Until a base
-release is published, build one and point `vibed` at it:
+1. **Install.** Open the DMG, drag VibeOS into Applications and open it from there. The app is signed and notarized, and updates itself.
+2. **Follow the welcome.** The menu bar lists what's left, in order. VibeOS sets up what it can by itself and asks only for what needs you, such as signing in to GitHub and Claude.
+3. **Add a project.** Pick a GitHub repo or a folder on your Mac. It comes with two starter profiles, one for each environment.
+4. **Make an API key.** Go to **Settings → API Keys**, which gives you a setup line to copy:
 
-```sh
-scripts/base-image.sh           # build/base-image/base-3: kernel, initrd, Debian image
-VIBE_LOGIN_KEYCHAIN=allow target/debug/vibe setup-token   # the Claude login for linux agents
-target/debug/vibe pi            # Pi: what's installed, and who it's signed in to
-VIBE_LOGIN_KEYCHAIN=allow VIBE_BASE_RELEASES=file://$PWD/build/base-image target/debug/vibed
-```
+   ```sh
+   claude mcp add --transport http vibeos http://127.0.0.1:7878/mcp --header "Authorization: Bearer vk_…"
+   ```
 
-A build outside an app stays out of the login Keychain unless it's run with
-`VIBE_LOGIN_KEYCHAIN=allow`, which `cargo run` can't pass on, as `cargo` forces
-`never`, and which `vibed` doesn't pass on to its agents. Without it, a debug `vibed`
-keeps shared services' logins in `services/` in its state directory, removed when a
-later run uses the Keychain, and can't see a Claude login that's in the Keychain.
+5. **Start an agent.** Ask your MCP client, or choose **New Agent…** in the menu:
 
-Pi is pinned (`vibe_env::pi_release::PINNED`). Moving the pin means looking again
-at what the new version reads, runs and writes in its agent dir, at what the login
-broker accepts (`vibe_env::pi_logins`), and at the provider keys and screen
-messages read in `vibe_env::pi` and `vibe_status::screen`, then running
-`scripts/check-full.sh`'s `pi-e2e` with `PI_E2E_VERSION`.
+   > Use vibeos to start an agent on my-app that fixes the flaky login test, and tell me if it has a question.
 
-Add Linux Host installs the Linux builds of `vibed`, `vibe` and `vibe-shim`
-over SSH. A release carries them in the app; for a build of your own, make
-them and point `vibed` at them:
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/new-agent-dark.png">
+    <img src="docs/images/new-agent-light.png" width="460" alt="The New Agent sheet, with fields for a project, a profile and a prompt.">
+  </picture>
+</p>
 
-```sh
-scripts/host-bundle.sh          # build/host-bundle/{x86_64,aarch64}: static musl builds (fetches zig and cargo-zigbuild on first use)
-VIBE_HOST_BUNDLE=$PWD/build/host-bundle target/debug/vibed
-target/debug/vibe host add vps me@vps.example.com   # or Settings → Hosts → Add Linux Host…
-```
+## Connect your machines
 
-On the server, `vibe project`, `vibe profile` and `vibe key` set it up
-without the menu bar, and it serves its own MCP when the Mac is off.
+MCP always needs an API key, and it starts out on loopback only. From there, add what you need:
 
-A Linux host with a public DNS name can be the external address: outside MCP
-clients reach agents on it and on the Mac at `https://<name>/mcp` with an
-API key, and the Mac keeps an SSH tunnel to it, so nothing opens on the Mac.
+| You want to | Use | You'll need |
+| --- | --- | --- |
+| Drive agents from the same machine | `http://127.0.0.1:7878/mcp` | An API key |
+| Run agents on a Linux server | **Settings → Hosts → Add Linux Host…** | Key-based SSH to the server. Tailscale isn't required, though a Tailscale name works as the destination |
+| Reach MCP from your laptop or another machine | **Settings → Hosts → Also serve MCP on this Mac's Tailscale address** | Tailscale running and logged in on both machines, and access rules that allow it |
 
-```sh
-target/debug/vibe host external vps vps.example.com   # or Settings → Hosts → Use as External Address
-```
+We suggest [Tailscale](https://tailscale.com) if you want other machines to reach MCP, but it's optional. VibeOS doesn't install or configure it, and the Mac never listens on all interfaces.
 
-The server gets its certificate from Let's Encrypt on port 443. `vibed`, running
-as you, gets that port by itself with passwordless `sudo`; otherwise **Allow…** in
-Settings → Hosts asks for the server's password once. Nothing's run by hand.
+A Linux server doesn't depend on the Mac. With the Mac off, its agents keep running and it serves its own MCP on its own loopback address, and you can still attach with `ssh -t HOST vibe attach REF`. The Mac's own agents are unavailable until it's back.
 
-`VIBE_SOCKET` (or `--socket`) points `vibed`, `vibe` and the app at another
-socket. The app's rows attach Terminal with `/usr/local/bin/vibe`, or
-`$VIBE_CLI` when it's set, such as `VIBE_CLI=$PWD/target/debug/vibe`.
+[MCP and networking](docs/mcp-and-networking.md) covers each path and its limits.
 
-## Check
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/settings-hosts-dark.png">
+    <img src="docs/images/settings-hosts-light.png" width="720" alt="The Hosts pane in Settings, showing MCP's loopback and Tailscale addresses on the Mac, and the Mac and two connected Linux servers.">
+  </picture>
+</p>
 
-```sh
-scripts/check-full.sh
-```
+## Requirements
 
-One command for everything: Rust fmt, clippy, build and test; `Cargo.lock`
-against RustSec; the `vibe-guest` cross-build; a `vibed` smoke test; on a Mac, both Swift packages,
-the Swift contract tests, signing with the virtualization entitlement,
-smoke tests of `vibe-vm` and `VibeOS.app` against a live `vibed`, the menu
-following a live agent and two clicks giving one Terminal tab; a Linux host
-added over SSH and linked, on stand-ins for `ssh` and `systemctl` (and on a
-real server with `VIBE_TEST_LINUX_HOST` set), and external access through it
-(with a real certificate and tunnel when `VIBE_TEST_EXTERNAL_DOMAIN` names
-it too); real
-VMs booted, saved and restored through `vibe-vm`, the Linux base image, and
-`linux` agents on it: the backend's conformance suite, and real Claude across
-a sleep; `vibe doctor` against a live `vibed`; and a release DMG, built ad
-hoc with Sparkle and checked inside and out. It prints a
-PASS/FAIL table and leaves logs in `build/check/`. On Linux the macOS steps
-are skipped. CI runs the same script. It reads the Claude token from the Keychain
-only with `VIBE_CHECK_KEYCHAIN_TOKEN=1`.
+- **A Mac** with Apple Silicon and macOS 26 or later. Agents on it stop answering while it sleeps, so one that stays awake works best.
+- **Your own accounts**, such as GitHub, and Claude or another provider Pi supports.
+- **Linux servers (optional):** x86_64 or arm64, with systemd and cgroups v2, and key-based SSH.
 
-A saved VM must also survive a reboot of the Mac. That takes a reboot, so
-it's two commands around one: `scripts/vm-reboot-test.sh save`, reboot,
-then `scripts/vm-reboot-test.sh restore`.
+## Good to know
 
-## Release
+- **An API key is equivalent to a shell on the host.** Keep it like a password and revoke it if it leaks.
+- **Compartments limit different things.** A Linux VM on the Mac protects the Mac and other agents, with some exceptions, but not the logins you give it. A native macOS agent, or an agent on a Linux server, is limited in resources only and can do anything your user can. Network access isn't filtered.
+- **Your machines do the work, but they aren't sealed off.** There's no VibeOS account or hosted relay, and transcripts, scrollback and logs stay on the host that runs the agent. Agents still talk to the model provider and any services you sign them in to.
 
-Push a tag `vX.Y.Z`, where `X.Y.Z` is the version in `Cargo.toml` and
-`swift/VibeOS/Support/Info.plist` (both of its version keys; check-full.sh
-checks they agree). `.github/workflows/release.yml` runs on version tags
-only. It holds `Cargo.lock` to RustSec as it stands that day
-(`scripts/advisories.sh`), and with an advisory open publishes nothing. Fix it,
-or list it in `deny.toml` with its reason, on `main`, and tag that. It publishes
-the Linux base image as release `base-<n>` if that isn't out yet, then builds the app with `scripts/release-macos.sh`: signed with
-the Developer ID under the hardened runtime, notarized and stapled, in a
-notarized DMG, with Sparkle and its appcast. It publishes those as release
-`vX.Y.Z`, marked latest, where Sparkle looks for updates. It reads these
-repository Actions secrets:
+The [threat model](PRD.md#auth-security-and-trust) has the details.
 
-| Secret | What |
-| --- | --- |
-| `MACOS_CERT_P12`, `MACOS_CERT_PASSWORD` | The Developer ID Application certificate and key, as a base64 `.p12`, and its password |
-| `APPLE_TEAM_ID` | The Developer ID's team |
-| `NOTARY_KEY_ID`, `NOTARY_ISSUER_ID`, `NOTARY_KEY_P8` | An App Store Connect API key for notarization (the `.p8`'s text); or `APPLE_ID` and `APPLE_APP_PASSWORD` instead |
-| `SPARKLE_PRIVATE_KEY` | Sparkle's EdDSA private key, as Sparkle's `generate_keys -x` exports it, or from `scripts/sparkle.py keygen`. The app's public key is derived from it |
+## Learn more
 
-Without them, the same script makes an ad hoc signed DMG for trying on this
-Mac:
+- [MCP and networking](docs/mcp-and-networking.md): keys, addresses, remote access and the MCP tools
+- [Developing VibeOS](docs/development.md): the repo's layout, and how to build, check and release it
+- [PRD.md](PRD.md): the full design, and the source of truth
+- [Contributing](CONTRIBUTING.md) and [issues](https://github.com/tsconfigdotjson/vibe-os-native/issues): bug reports, questions and pull requests
 
-```sh
-scripts/release-macos.sh               # build/release/out/VibeOS-<version>.dmg
-```
-
-Without `zig` and `cargo-zigbuild` on your PATH, the first run on a machine also
-needs the network and a few more minutes, to get them for the Linux builds. Every
-checkout shares them after that.
-
-While the repo is private, a Mac without a GitHub login can't download from its Releases: neither the Linux base image `vibed` boots linux agents from, nor Sparkle's updates. Both work once the repo is public. Only a tag on a commit that's on `main` releases.
+VibeOS Native is released under the [MIT License](LICENSE).
