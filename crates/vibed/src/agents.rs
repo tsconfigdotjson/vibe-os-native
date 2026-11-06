@@ -43,7 +43,7 @@ use vibe_relay::local;
 
 use crate::core::{Core, error, invalid, lock, store_error};
 use crate::projects::{GIT_CONFIG_FROM_ENV, git, git_within, git_without};
-use crate::services::injection;
+use crate::services::{RelayHold, injection};
 use crate::sessions::{self, Probe, SessionSpec};
 use crate::sleep::Early;
 
@@ -1103,7 +1103,8 @@ impl Core {
     }
 
     /// Launches its coding agent in the agent's compartment and starts a shim
-    /// on its terminal, then holds it to its limits. Records the session.
+    /// on its terminal, then holds it to its limits. Records the session. What's returned
+    /// keeps its relay until the agent's state says it's awake.
     async fn launch(
         &self,
         backend: &Arc<dyn Backend>,
@@ -1111,7 +1112,7 @@ impl Core {
         record: &AgentRecord,
         prompt: Option<&str>,
         resume: bool,
-    ) -> Result<(), ErrorObject> {
+    ) -> Result<Option<RelayHold<'_>>, ErrorObject> {
         // A resume may find it's gone since.
         if record.agent == AgentKind::Pi {
             self.pi_ready(backend).await?;
@@ -1146,6 +1147,15 @@ impl Core {
             env,
             cwd: PathBuf::from(&record.worktree),
         };
+        // Its tools have to be there as it starts. What told us about its guest has it
+        // booted by now. Its relay is kept for as long as the caller keeps what's returned.
+        let relay = services
+            .is_some()
+            .then(|| self.relay_hold(backend, &record.agent_ref))
+            .flatten();
+        if relay.is_some() {
+            self.relay_ready(&record.agent_ref).await;
+        }
         // A Pi with nothing to do reads as at rest from here until it writes
         // again, whatever its transcript left open.
         if record.agent == AgentKind::Pi {
@@ -1156,7 +1166,8 @@ impl Core {
             blocking(move || b.launch(&h, &launch)).await?
         };
         self.pi_sync_copy(record, handle).await;
-        self.hold_terminal(backend, handle, record, &end).await
+        self.hold_terminal(backend, handle, record, &end).await?;
+        Ok(relay)
     }
 
     /// Starts a shim on `end`, records it as the agent's session, and holds
@@ -1513,7 +1524,9 @@ impl Core {
         } else {
             kept_start_prompt(&handle)
         };
-        self.launch(&backend, &mut handle, &record, prompt.as_deref(), resume)
+        // It's `asleep` or `exited` until this is done: its relay is kept till then.
+        let _relay = self
+            .launch(&backend, &mut handle, &record, prompt.as_deref(), resume)
             .await?;
         crate::log!(
             "vibed: {agent_ref} {}",

@@ -41,9 +41,23 @@ async fn read_frame(r: &mut (impl AsyncRead + Unpin)) -> io::Result<Option<Frame
 pub async fn serve_relay(
     services: Arc<Services>,
     agent: String,
+    reader: impl AsyncRead + Unpin,
+    writer: impl AsyncWrite + Unpin + Send + 'static,
+) -> io::Result<()> {
+    serve_relay_then(services, agent, reader, writer, || {}).await
+}
+
+/// [`serve_relay`], calling `up` once the far end is carrying it. Its hello isn't enough to
+/// know: a hub says hello first, and only takes the relay on once it's heard one back. It
+/// answers a ping only after that, so that's what's asked, of any hub there's ever been.
+pub async fn serve_relay_then(
+    services: Arc<Services>,
+    agent: String,
     mut reader: impl AsyncRead + Unpin,
     mut writer: impl AsyncWrite + Unpin + Send + 'static,
+    up: impl FnOnce(),
 ) -> io::Result<()> {
+    let mut up = Some(up);
     writer
         .write_all(&Frame::Hello { protocol: PROTOCOL }.encode())
         .await?;
@@ -72,6 +86,10 @@ pub async fn serve_relay(
             }
         }
     });
+    if frames.send(Frame::Ping.encode()).await.is_err() {
+        write_task.abort();
+        return Ok(());
+    }
     let mut streams: HashMap<u32, mpsc::Sender<Vec<u8>>> = HashMap::new();
     let ended = loop {
         let frame = match read_frame(&mut reader).await {
@@ -135,7 +153,12 @@ pub async fn serve_relay(
                     break Ok(());
                 }
             }
-            Frame::Pong | Frame::Hello { .. } => {}
+            Frame::Pong => {
+                if let Some(up) = up.take() {
+                    up();
+                }
+            }
+            Frame::Hello { .. } => {}
         }
     };
     // Dropping each stream's channel ends its calls.

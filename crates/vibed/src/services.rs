@@ -17,10 +17,11 @@
 //!   dials each awake one's vsock port with a relay to the Mac's broker; nothing
 //!   listens for a guest to call in.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
@@ -41,7 +42,7 @@ use vibe_relay::local;
 use vibe_services::relay;
 use vibe_services::{Deps, Place, SecretStore, Service, Services};
 
-use crate::core::{Core, error};
+use crate::core::{Core, error, lock};
 use crate::link::Link;
 
 /// How often the Mac looks at how each service's followers stand, if nothing
@@ -67,6 +68,18 @@ pub(crate) type GivenTokens = HashMap<(String, String), Given>;
 
 /// How often the Mac looks for VMs it should have a relay to.
 const RELAY_EVERY: Duration = Duration::from_secs(1);
+
+/// How often they're looked at while a launch is waiting for one.
+const RELAY_HURRY: Duration = Duration::from_millis(100);
+
+/// How long a launch in a VM waits for its relay. It's only for the tools to be there from
+/// the first, so past this the agent starts without them. A client that follows
+/// `list_changed` is told of them after that, once the shim next looks.
+pub const RELAY_WAIT: Duration = Duration::from_secs(10);
+
+/// How long a VM with no relay yet is taken to be still booting, and tried on every look.
+/// One whose guest never serves them is then left to back off.
+const BOOTING: Duration = Duration::from_secs(60);
 
 /// The first wait before dialing again after a relay fails, and the longest.
 const MIN_BACKOFF: Duration = Duration::from_secs(1);
@@ -678,7 +691,8 @@ impl Core {
             }
         }));
         let core = Arc::downgrade(self);
-        tasks.push(tokio::spawn(async move { keep_relays(core).await }));
+        let wake = Arc::clone(&self.relay_wake);
+        tasks.push(tokio::spawn(async move { keep_relays(core, wake).await }));
         // In the background, as a locked Keychain can take a while to say so.
         if let Some(broker) = self.services.clone() {
             tasks.push(tokio::spawn(async move {
@@ -871,10 +885,71 @@ async fn serve_socket(core: Weak<Core>, listener: UnixListener) {
     }
 }
 
+/// Keeps an agent's relay wanted, whatever its state says, until it's dropped.
+#[derive(Debug)]
+pub(crate) struct RelayHold<'a> {
+    core: &'a Core,
+    agent: String,
+}
+
+impl Drop for RelayHold<'_> {
+    fn drop(&mut self) {
+        let mut holds = lock(&self.core.relay_holds);
+        if let Some(at) = holds.iter().position(|a| *a == self.agent) {
+            holds.swap_remove(at);
+        }
+    }
+}
+
+impl Core {
+    /// Has `agent`'s relay kept and dialed on the next look, for a launch, if it's one that
+    /// would have a relay at all: this host has a broker, and its compartment is a machine of
+    /// its own. Not while its VM may still be booting: a look takes the lock that `vibe-vm`
+    /// tries for once as it starts, and looks often while there's a hold.
+    pub(crate) fn relay_hold(
+        &self,
+        backend: &Arc<dyn Backend>,
+        agent: &str,
+    ) -> Option<RelayHold<'_>> {
+        self.services.as_ref()?;
+        backend.services_program()?;
+        lock(&self.relay_holds).push(agent.to_owned());
+        self.relay_wake.notify_one();
+        Some(RelayHold {
+            core: self,
+            agent: agent.to_owned(),
+        })
+    }
+
+    /// Waits for `agent`'s relay to be carrying, for as long as a launch will: a shim with
+    /// nothing on disk tells its client there are no tools if there's no relay yet, and only
+    /// looks again much later. Past that the launch goes ahead, and says so.
+    pub(crate) async fn relay_ready(&self, agent: &str) {
+        let began = Instant::now();
+        let mut up = self.relays_up.subscribe();
+        let wait = up.wait_for(|up| up.contains(agent));
+        match tokio::time::timeout(self.relay_wait, wait).await {
+            Ok(Ok(_)) => crate::log!(
+                "vibed: {agent}'s shared services relay was up after {} ms",
+                began.elapsed().as_millis()
+            ),
+            _ => crate::log!(
+                "vibed: {agent} is starting without its shared services relay: it wasn't up \
+                 after {} s, so it may not have their tools at first",
+                self.relay_wait.as_secs_f32()
+            ),
+        }
+    }
+}
+
 /// One relay to a VM that the Mac keeps, or waits to dial again.
 #[derive(Debug)]
 struct Kept {
     task: Option<JoinHandle<io::Result<()>>>,
+    /// Whether the far end of that one is carrying it.
+    carrying: Arc<AtomicBool>,
+    /// When this VM's relay was first wanted.
+    wanted: Instant,
     started: Instant,
     backoff: Duration,
     next_try: Instant,
@@ -884,10 +959,24 @@ impl Kept {
     fn new() -> Kept {
         Kept {
             task: None,
+            carrying: Arc::default(),
+            wanted: Instant::now(),
             started: Instant::now(),
             backoff: MIN_BACKOFF,
             next_try: Instant::now(),
         }
+    }
+
+    /// Whether it's up, as far as a launch cares.
+    fn is_up(&self) -> bool {
+        self.carrying.load(Ordering::SeqCst)
+            && self.task.as_ref().is_some_and(|task| !task.is_finished())
+    }
+
+    /// To be dialed on this look, and with no backoff from before: a launch is waiting.
+    fn hurry(&mut self) {
+        self.backoff = MIN_BACKOFF;
+        self.next_try = Instant::now();
     }
 
     /// Whether it should be dialed now. Notes one that's ended, and what it
@@ -901,20 +990,26 @@ impl Kept {
             if self.started.elapsed() >= HELD {
                 self.backoff = MIN_BACKOFF;
             }
-            self.next_try = Instant::now() + self.backoff;
-            self.backoff = (self.backoff * 2).min(MAX_BACKOFF);
+            self.failed();
             crate::log!("vibed: the shared services relay to {what} ended");
         }
         Instant::now() >= self.next_try
     }
 
+    /// It's not there. A VM that's yet to have a relay carried is most likely still booting,
+    /// and is just looked at again.
     fn failed(&mut self) {
+        if !self.carrying.load(Ordering::SeqCst) && self.wanted.elapsed() < BOOTING {
+            self.next_try = Instant::now();
+            return;
+        }
         self.next_try = Instant::now() + self.backoff;
         self.backoff = (self.backoff * 2).min(MAX_BACKOFF);
     }
 
-    fn running(&mut self, task: JoinHandle<io::Result<()>>) {
+    fn running(&mut self, task: JoinHandle<io::Result<()>>, carrying: Arc<AtomicBool>) {
         self.started = Instant::now();
+        self.carrying = carrying;
         self.task = Some(task);
     }
 }
@@ -932,10 +1027,14 @@ impl Drop for Kept {
 /// again; the shim inside never notices beyond a call or two saying the Mac's
 /// away. Only a compartment that's a machine of its own has one, so on a Linux
 /// host this finds nothing to do.
-async fn keep_relays(core: Weak<Core>) {
+async fn keep_relays(core: Weak<Core>, wake: Arc<tokio::sync::Notify>) {
     let mut vms: HashMap<String, Kept> = HashMap::new();
+    let mut every = RELAY_EVERY;
     loop {
-        tokio::time::sleep(RELAY_EVERY).await;
+        tokio::select! {
+            () = tokio::time::sleep(every) => {}
+            () = wake.notified() => {}
+        }
         let Some(core) = core.upgrade() else {
             return;
         };
@@ -943,19 +1042,44 @@ async fn keep_relays(core: Weak<Core>) {
             return;
         };
         keep_vm_relays(&core, &broker, &mut vms).await;
+        every = if lock(&core.relay_holds).is_empty() {
+            RELAY_EVERY
+        } else {
+            RELAY_HURRY
+        };
     }
 }
 
 async fn keep_vm_relays(core: &Core, broker: &Arc<Services>, vms: &mut HashMap<String, Kept>) {
     let agents = core.store().agents(LOCAL_HOST).unwrap_or_default();
+    let holds = lock(&core.relay_holds).clone();
+    let held = |a: &AgentRecord| holds.contains(&a.agent_ref);
     let wanted: Vec<&AgentRecord> = agents
         .iter()
-        // A start included, so its agent has its tools from the first.
+        // One being launched included, as a resume is still `asleep` or `exited` until it's
+        // done, so its agent has its tools from the first.
         .filter(|a| {
-            !matches!(a.state, AgentState::Asleep | AgentState::Exited) && core.services_on(a)
+            (held(a) || !matches!(a.state, AgentState::Asleep | AgentState::Exited))
+                && core.services_on(a)
         })
         .collect();
     vms.retain(|r, _| wanted.iter().any(|a| &a.agent_ref == r));
+    // What's gone with its VM is no use to a launch. One that just ended says so itself.
+    let up: HashSet<String> = vms
+        .iter()
+        .filter(|(_, kept)| kept.is_up())
+        .map(|(agent, _)| agent.clone())
+        .collect();
+    core.relays_up.send_if_modified(|now| {
+        let changed = *now != up;
+        if changed {
+            now.clone_from(&up);
+        }
+        changed
+    });
+    // All at once: a guest that doesn't answer, which takes seconds to find, mustn't use up the
+    // time a launch has to wait for another's.
+    let mut dials = Vec::new();
     for agent in wanted {
         let Some(backend) = core.backends.get(agent.environment) else {
             continue;
@@ -968,19 +1092,52 @@ async fn keep_vm_relays(core: &Core, broker: &Arc<Services>, vms: &mut HashMap<S
             continue;
         };
         let kept = vms.entry(agent.agent_ref.clone()).or_insert_with(Kept::new);
-        if !kept.due(&agent.agent_ref) {
+        let due = kept.due(&agent.agent_ref);
+        if kept.task.is_some() {
             continue;
         }
-        let dialed = tokio::task::spawn_blocking(move || backend.services_relay(&handle)).await;
-        match dialed {
+        if held(agent) {
+            kept.hurry();
+        } else if !due {
+            continue;
+        }
+        let dial = tokio::task::spawn_blocking(move || backend.services_relay(&handle));
+        dials.push((agent, dial));
+    }
+    for (agent, dial) in dials {
+        let Some(kept) = vms.get_mut(&agent.agent_ref) else {
+            continue;
+        };
+        match dial.await {
             Ok(Ok(Some(stream))) => match relay_over(stream) {
                 Ok((read, write)) => {
-                    kept.running(tokio::spawn(relay::serve_relay(
+                    let carrying = Arc::new(AtomicBool::new(false));
+                    let (relays, name) = (core.relays_up.clone(), agent.agent_ref.clone());
+                    let up = {
+                        let (carrying, relays, name) =
+                            (carrying.clone(), relays.clone(), name.clone());
+                        move || {
+                            carrying.store(true, Ordering::SeqCst);
+                            relays.send_modify(|up| {
+                                up.insert(name);
+                            });
+                        }
+                    };
+                    let served = relay::serve_relay_then(
                         broker.clone(),
                         agent.agent_ref.clone(),
                         read,
                         write,
-                    )));
+                        up,
+                    );
+                    let task = tokio::spawn(async move {
+                        let ended = served.await;
+                        relays.send_modify(|up| {
+                            up.remove(&name);
+                        });
+                        ended
+                    });
+                    kept.running(task, carrying);
                 }
                 Err(_) => kept.failed(),
             },
@@ -1003,6 +1160,65 @@ fn relay_over(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_vm_with_no_relay_yet_isnt_backed_off_while_it_boots() {
+        let mut kept = Kept::new();
+        for _ in 0..8 {
+            kept.failed();
+            assert!(kept.due("vm"), "looked at again");
+        }
+        assert_eq!(kept.backoff, MIN_BACKOFF);
+
+        // Booted long ago and still nothing, as a guest too old for them: left to back off.
+        kept.wanted = Instant::now() - BOOTING;
+        kept.failed();
+        assert!(!kept.due("vm"));
+        assert_eq!(kept.backoff, MIN_BACKOFF * 2);
+    }
+
+    #[tokio::test]
+    async fn one_that_had_a_relay_backs_off_until_a_launch_is_waiting() {
+        let mut kept = Kept::new();
+        let task = tokio::spawn(async { Ok(()) });
+        let carrying = Arc::new(AtomicBool::new(true));
+        kept.running(task, carrying);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!kept.is_up(), "its task has ended");
+        assert!(!kept.due("vm"), "ended just now: backing off");
+        assert!(kept.task.is_none());
+        assert_eq!(kept.backoff, MIN_BACKOFF * 2);
+        kept.failed();
+        kept.failed();
+        assert_eq!(kept.backoff, MIN_BACKOFF * 8);
+        assert!(!kept.due("vm"));
+
+        kept.hurry();
+        assert!(kept.due("vm"));
+        assert_eq!(kept.backoff, MIN_BACKOFF);
+    }
+
+    /// A dial that's taken and dropped, as a guest still coming up can: not a relay yet.
+    #[tokio::test]
+    async fn a_relay_that_never_carried_doesnt_count_towards_backoff() {
+        let mut kept = Kept::new();
+        kept.running(tokio::spawn(async { Ok(()) }), Arc::default());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(kept.due("vm"));
+        assert_eq!(kept.backoff, MIN_BACKOFF);
+    }
+
+    #[tokio::test]
+    async fn a_running_relay_is_up_only_once_its_far_end_is_carrying_it() {
+        let mut kept = Kept::new();
+        let task = tokio::spawn(std::future::pending());
+        let carrying = Arc::new(AtomicBool::new(false));
+        kept.running(task, carrying.clone());
+        assert!(!kept.is_up());
+        assert!(!kept.due("vm"), "there's one running");
+        carrying.store(true, Ordering::SeqCst);
+        assert!(kept.is_up());
+    }
 
     fn linear() -> String {
         servers_json("/usr/local/bin/vibe", &["linear".to_owned()])

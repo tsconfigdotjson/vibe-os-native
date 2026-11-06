@@ -108,6 +108,9 @@ pub struct Config {
     pub tailscale_cli: Option<OsString>,
     /// How long one `tailscale` command may take: [`crate::tailscale::TAILSCALE_WAIT`].
     pub tailscale_wait: Duration,
+    /// How long a launch in a VM waits for its shared services' relay before going ahead
+    /// without it: [`crate::services::RELAY_WAIT`].
+    pub services_relay_wait: Duration,
     /// Whether a Mac's tunnel can end here: on a Linux host, and a stand-in for one in
     /// tests. [`Config::new`] says which by its OS. Nothing is served for it but the
     /// private socket sshd makes.
@@ -192,6 +195,7 @@ impl Config {
             tailscale: Arc::new(vibe_mcp::net::tailscale_addresses),
             tailscale_cli: (info.os == "linux").then(|| "tailscale".into()),
             tailscale_wait: crate::tailscale::TAILSCALE_WAIT,
+            services_relay_wait: crate::services::RELAY_WAIT,
             serves_mac_peer: info.os == "linux",
             mac_probe_every: Duration::from_secs(5),
             remote: Arc::new(Ssh::new().sharing_in(run_dir)),
@@ -492,6 +496,14 @@ pub struct Core {
     pub(crate) services: Option<Arc<vibe_services::Services>>,
     /// Wakes the look at what each service's followers have been given.
     pub(crate) services_wake: Arc<tokio::sync::Notify>,
+    /// The agents whose VM's relay is carrying now, for a launch to wait on.
+    pub(crate) relays_up: Arc<tokio::sync::watch::Sender<std::collections::HashSet<String>>>,
+    /// The agents being launched in a VM of their own, once for each launch: their relays
+    /// are kept whatever their state says, and dialed without waiting.
+    pub(crate) relay_holds: Mutex<Vec<String>>,
+    /// Has the relays looked at now, as a launch is waiting.
+    pub(crate) relay_wake: Arc<tokio::sync::Notify>,
+    pub(crate) relay_wait: Duration,
     /// What each follower was last given, by (host, service).
     pub(crate) services_given: tokio::sync::Mutex<crate::services::GivenTokens>,
     pub(crate) gh_status: Mutex<GhStatus>,
@@ -695,6 +707,10 @@ impl Core {
             vibe_cli: config.vibe_cli,
             services,
             services_wake,
+            relays_up: Arc::new(tokio::sync::watch::Sender::new(Default::default())),
+            relay_holds: Mutex::new(Vec::new()),
+            relay_wake: Arc::new(tokio::sync::Notify::new()),
+            relay_wait: config.services_relay_wait,
             services_given: tokio::sync::Mutex::default(),
             gh_status: Mutex::new(GhStatus {
                 state: GhState::Unknown,
