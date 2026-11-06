@@ -633,6 +633,19 @@ typealias StepStatus = SetupProgress.Step.Status
         #expect(rowLines(limited).line?.hasPrefix("limited until") == true)
     }
 
+    /// What the README's screenshots draw: a fictional team, working, with
+    /// no host down and none the external address.
+    @Test func theDemoIsFictionalAndHasNoExternalAddress() async throws {
+        let model = await MenuModel.fixture(.demo)
+        #expect(model.connection == .connected)
+        #expect(model.hosts.map(\.name) == ["local", "atlas", "forge"])
+        #expect(model.unavailableHosts.isEmpty)
+        #expect(model.externalHost == nil)
+        #expect(model.hosts.allSatisfy { !$0.external })
+        #expect(Set(model.agents.map(\.state)) == [.busy, .question, .idle, .asleep])
+        #expect(model.gh?.account == "larkfield-dev")
+    }
+
     @Test func theOtherScenarios() async throws {
         let quiet = await MenuModel.fixture(.quiet)
         #expect(quiet.connection == .connected)
@@ -650,7 +663,7 @@ typealias StepStatus = SetupProgress.Step.Status
     /// Every call a surface makes is answered, and decodes, so the gallery
     /// draws each one with data.
     @Test func everyCallTheSurfacesMakeDecodes() throws {
-        for scenario in [FixtureDaemon.Scenario.busy, .quiet, .firstRun, .freshMac] {
+        for scenario in [FixtureDaemon.Scenario.busy, .quiet, .firstRun, .freshMac, .demo] {
             let d = FixtureDaemon(scenario)
             for host in ["local", "vps"] {
                 _ = try d.call(ProjectsList.self, HostParams(host: host))

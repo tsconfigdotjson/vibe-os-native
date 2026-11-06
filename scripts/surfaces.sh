@@ -8,6 +8,7 @@
 #   scripts/surfaces.sh                        every surface, both appearances
 #   scripts/surfaces.sh --surface menu         just that one (repeatable)
 #   scripts/surfaces.sh --appearance dark      just dark
+#   scripts/surfaces.sh --demo                 the fictional team the README shows
 #
 # Needs the logged-in GUI session, and Screen Recording permission for the
 # terminal it runs in (macOS asks once). Builds the app with

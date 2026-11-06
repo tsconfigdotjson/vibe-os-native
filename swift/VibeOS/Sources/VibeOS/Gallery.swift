@@ -15,6 +15,9 @@ import VibeRPC
 //       draws each into <dir>/<surface>-<appearance>.png offscreen (no
 //       materials), lists them in <dir>/manifest.txt, and exits non-zero if
 //       one came out blank.
+//
+// `--demo` with either draws the fictional team of FixtureDaemon's demo
+// scenario in place of the busy one's, for the README's screenshots.
 
 struct GalleryRequest {
     enum Mode: Equatable {
@@ -26,6 +29,8 @@ struct GalleryRequest {
     var appearances: [GalleryAppearance] = GalleryAppearance.allCases
     /// Only these surfaces, if any are named.
     var only: Set<String> = []
+    /// The demo scenario in place of the busy one.
+    var demo: Bool
 
     init?(arguments: [String]) {
         if let i = arguments.firstIndex(of: "--render-surfaces"), arguments.indices.contains(i + 1) {
@@ -35,6 +40,7 @@ struct GalleryRequest {
         } else {
             return nil
         }
+        demo = arguments.contains("--demo")
         for (i, word) in arguments.enumerated() where arguments.indices.contains(i + 1) {
             let value = arguments[i + 1]
             if word == "--appearance", let appearance = GalleryAppearance(rawValue: value) {
@@ -67,9 +73,9 @@ struct GalleryModels {
     let fromDiskImage: MenuModel
     let turnedOff: MenuModel
 
-    static func load() async -> GalleryModels {
+    static func load(demo: Bool) async -> GalleryModels {
         GalleryModels(
-            busy: await MenuModel.fixture(.busy),
+            busy: await MenuModel.fixture(demo ? .demo : .busy),
             quiet: await MenuModel.fixture(.quiet),
             firstRun: await MenuModel.fixture(.firstRun),
             freshMac: await MenuModel.fixture(.freshMac),
@@ -93,7 +99,7 @@ struct GallerySurface {
     let frame: Frame
     let view: AnyView
 
-    static func all(_ m: GalleryModels) -> [GallerySurface] {
+    static func all(_ m: GalleryModels, demo: Bool) -> [GallerySurface] {
         let fixture = FixtureDaemon(.busy)
         let install = try? fixture.call(HostsAdd.self, HostAddParams(name: "vps", address: "me@vps.example.com"))
         let key = try? fixture.call(KeysCreate.self, KeyCreateParams(name: "laptop Claude Code"))
@@ -139,7 +145,7 @@ struct GallerySurface {
                 view: AnyView(
                     NavigationStack {
                         ProjectDetail(
-                            model: m.busy, host: VibeRPC.localHost, name: "app", expanded: ["software-eng-linux"])
+                            model: m.busy, host: VibeRPC.localHost, name: demo ? "larkfield-ios" : "app", expanded: ["software-eng-linux"])
                     })))
         surfaces.append(
             GallerySurface(
@@ -283,8 +289,8 @@ final class GalleryRunner: NSObject, NSApplicationDelegate {
     }
 
     private func open() async {
-        let models = await GalleryModels.load()
-        let surfaces = GallerySurface.all(models).filter { request.only.isEmpty || request.only.contains($0.name) }
+        let models = await GalleryModels.load(demo: request.demo)
+        let surfaces = GallerySurface.all(models, demo: request.demo).filter { request.only.isEmpty || request.only.contains($0.name) }
         var origin = CGPoint(x: 40, y: 60)
         for appearance in request.appearances {
             for surface in surfaces {
