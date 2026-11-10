@@ -80,7 +80,7 @@ commands:
               ~/VibeOS/projects (with any branches never pushed); without
               it, a removal that would delete one is refused
   profile list PROJECT  a project's profiles
-  profile create PROJECT NAME [--environment linux|macos] [--model opus|sonnet]
+  profile create PROJECT NAME [--environment linux|macos] [--model opus|sonnet|fable]
               [--reasoning low|medium|high|xhigh|max] [--mode auto|bypass]
               [--memory 4G] [--shared-services on|off] [--agent claude|pi]
               [--pi-model MODEL]

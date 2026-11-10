@@ -524,6 +524,7 @@ extension ClaudeModel {
         switch self {
         case .opus: "Opus"
         case .sonnet: "Sonnet"
+        case .fable: "Fable"
         }
     }
 }

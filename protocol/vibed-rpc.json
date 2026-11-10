@@ -93,7 +93,7 @@
     "Environment": ["linux", "macos"],
     "AgentKind": ["claude", "pi"],
     "PiTarget": ["native", "vm"],
-    "Model": ["opus", "sonnet"],
+    "Model": ["opus", "sonnet", "fable"],
     "Reasoning": ["low", "medium", "high", "xhigh", "max"],
     "Mode": ["auto", "bypass"],
     "ProjectSource": ["github", "path"],

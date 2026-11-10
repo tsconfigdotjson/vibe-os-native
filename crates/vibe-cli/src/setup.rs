@@ -781,6 +781,19 @@ mod tests {
             })
         );
         assert_eq!(
+            Command::parse_profile(&words(&["set", "web", "reviewer", "--model", "fable"])),
+            Ok(Command::UpdateProfile {
+                host: None,
+                project: "web".into(),
+                profile: "reviewer".into(),
+                rename: None,
+                settings: Settings {
+                    model: Some(Model::Fable),
+                    ..Default::default()
+                }
+            })
+        );
+        assert_eq!(
             Command::parse_profile(&words(&[
                 "set",
                 "web",

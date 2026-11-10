@@ -105,7 +105,7 @@ names! {
 
 names! {
     /// Claude's `--model`. A Pi profile names its model in `pi_model`.
-    Model { Opus = "opus", Sonnet = "sonnet" }
+    Model { Opus = "opus", Sonnet = "sonnet", Fable = "fable" }
 }
 
 names! {
@@ -910,6 +910,17 @@ mod tests {
             assert_eq!(e.as_str().parse::<Reasoning>(), Ok(*e));
             assert_eq!(serde_json::to_value(e).unwrap(), e.as_str());
         }
+        // Claude's own aliases, as `--model` takes them; a pinned id isn't one.
+        assert_eq!(
+            Model::ALL.iter().map(|m| m.as_str()).collect::<Vec<_>>(),
+            ["opus", "sonnet", "fable"]
+        );
+        for m in Model::ALL {
+            assert_eq!(m.as_str().parse::<Model>(), Ok(*m));
+            assert_eq!(serde_json::to_value(m).unwrap(), m.as_str());
+        }
+        assert!("claude-fable-5-2".parse::<Model>().is_err());
+        assert!("Fable".parse::<Model>().is_err());
         assert_eq!(EventKind::AgentState.to_string(), "agent.state");
         assert!("Linux".parse::<Environment>().is_err());
         assert!(serde_json::from_str::<Mode>("\"plan\"").is_err());
@@ -1009,6 +1020,19 @@ mod tests {
             ..Profile::with_defaults("c", Environment::Linux)
         };
         assert!(claude.validate("linux").unwrap_err().contains("Pi model"));
+    }
+
+    #[test]
+    fn a_fable_profile_is_a_claude_profile() {
+        let fable = Profile {
+            model: Model::Fable,
+            ..Profile::with_defaults("deep", Environment::Linux)
+        };
+        assert_eq!(fable.validate("linux"), Ok(()));
+        assert_eq!(fable.validate("macos"), Ok(()));
+        let wire = serde_json::to_value(&fable).unwrap();
+        assert_eq!(wire["model"], "fable");
+        assert_eq!(serde_json::from_value::<Profile>(wire).unwrap(), fable);
     }
 
     #[test]
