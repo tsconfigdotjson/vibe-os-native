@@ -2153,6 +2153,13 @@ mod tests {
                 "--dangerously-skip-permissions"
             ]
         );
+        // Fable goes by Claude's own alias, as Opus and Sonnet do.
+        let fable = AgentRecord {
+            model: Model::Fable,
+            ..record(Mode::Auto)
+        };
+        let args = claude_args(&fable, None, false, &[]);
+        assert_eq!(args[2..6], ["--model", "fable", "--effort", "xhigh"]);
     }
 
     #[test]

@@ -872,7 +872,7 @@ typealias StepStatus = SetupProgress.Step.Status
 
     @Test func valuesHaveOneVoice() throws {
         #expect(AgentEnvironment.allCases.map(\.title) == ["Linux", "macOS"])
-        #expect(ClaudeModel.allCases.map(\.title) == ["Opus", "Sonnet"])
+        #expect(ClaudeModel.allCases.map(\.title) == ["Opus", "Sonnet", "Fable"])
         #expect(ReasoningLevel.allCases.map(\.title) == ["Low", "Medium", "High", "Extra High", "Max"])
         #expect(PermissionMode.allCases.map(\.title) == ["Auto", "Bypass"])
         let profile = try decode(

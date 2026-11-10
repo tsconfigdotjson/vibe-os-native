@@ -424,7 +424,7 @@ public func piModelProblem(_ model: String) -> String? {
 
 /// Claude's `--model` (index: Model). A Pi profile names its own, in `piModel`.
 public enum ClaudeModel: String, Codable, CaseIterable, Hashable, Sendable {
-    case opus, sonnet
+    case opus, sonnet, fable
 }
 
 /// Claude's `--effort`, and Pi's `--thinking` (index: Reasoning).
