@@ -287,7 +287,7 @@ macOS has no cgroups, so `vibed` supervises each `macos` agent's process tree an
 - **CPU.** The cap is in cores, measured from CPU-time deltas. Over the cap, the agent is first demoted to `PRIO_DARWIN_BG`: efficiency cores and throttled I/O, enforced by the kernel. If it's still over, `SIGSTOP`/`SIGCONT` duty cycling holds it to the cap.
 - **Memory.** The governor sums `phys_footprint` (`proc_pid_rusage`). At 80% of the profile's memory, the agent is demoted and a notification fires. At 100%, the tree gets `SIGSTOP` and the agent is `paused`. The owner can raise the profile's memory and resume it, or delete it.
 - **Processes.** Over `max_processes`, the tree is paused. This is the fork-bomb stop.
-- **Disk.** The worktree and its temp dir are measured every minute. Past `disk_soft` a warning fires; past `disk_hard` the tree is paused.
+- **Disk.** The worktree and its temp dir are measured while the agent runs. Asleep or paused it can't change them, so it keeps what was last measured, and a wake measures it afresh. FSEvents says which directories changed, and only those are listed again, against sizes kept per directory, at most once a minute. A full walk every 10 minutes catches anything it missed, and while the disk has under 10 GB free every running agent is measured every 15 s. Past `disk_soft` a warning fires; past `disk_hard` the tree is paused.
 - **Logins and binaries.** `macos` agents use the Mac's own `claude`, `gh`, `gcloud` and Keychain logins. Nothing is redirected.
 
 ### What's inside `linux`
@@ -377,6 +377,7 @@ A Linux server runs the same `vibed`, so it joins the Mac as another host. Its a
 
 - Each agent gets its own cgroup v2 (through systemd, as the user, no root). Memory, CPU and process count are hard kernel limits from the profile and host limits.
 - Sleep uses the cgroup freezer: exact, like `SIGSTOP`, but memory stays allocated. Under memory pressure a frozen agent is ended and later resumes with the agent's resume.
+- Disk is held to `disk_soft` and `disk_hard` as on the Mac, measured only while the agent runs, by a walk of its worktree and temp dir. A walk comes at most once a minute, and only after one of the agent's processes has written something (`/proc/<pid>/io`, and the cgroup's `io.stat` where systemd delegates `io`). A walk every 10 minutes catches writes from outside the agent, and while the disk has under 10 GB free every running agent is walked every 15 s. Project quotas would count it exactly, but reading a project's usage needs root, so they aren't used.
 - The worktree, `.git`, transcripts and the `vibe-shim` session work exactly as on the Mac; it's the same code.
 - File containment is not in v1. `bubblewrap` could add it later, and a server with KVM could later get a micro-VM backend.
 
@@ -662,7 +663,7 @@ Never put to sleep: `thinking`, `running_tool` or `background_work`.
 | Reboot or logout | Every process ends. At login every agent is `asleep`. `linux` agents wake from their snapshots; `macos` agents wake with `claude --resume` |
 | Critical host memory pressure (`DISPATCH_SOURCE_TYPE_MEMORYPRESSURE`) | Warn in the menu's header (from macOS's warn level on); new agents still start. Put idle agents to sleep early, then pause the `macos` agent furthest over 80% of its memory. A paused agent is killed (resumable) after a 5 min grace period if pressure stays critical |
 | System sleep | While any agent is awake, `vibed` holds an IOPM no-idle-sleep assertion. Display sleep is still allowed |
-| Low disk | New agents are refused below 10 GB free (proposed). A `linux` agent whose snapshot wouldn't fit stays awake instead of sleeping |
+| Low disk | New agents are refused below 10 GB free (proposed), and the disks of agents that run are measured every 15 s instead of every minute. A `linux` agent whose snapshot wouldn't fit stays awake instead of sleeping |
 | The SSH link to a Linux host drops | That host's agents show as unavailable in the menu and MCP. They keep running on the host, and the link reconnects with backoff |
 | A Linux host reboots | systemd starts `vibed` again (the user service has lingering enabled, which `vibed` keeps on by itself). Every agent there is `asleep` and wakes with the agent's resume |
 | A linked host's upgrade fails | Its agents and its old `vibed` carry on. VibeOS tries again hourly and at a reconnect, and the host's row says why, with **Retry**. A build that won't start goes back to the one before, and is tried again only hourly or by **Retry** |

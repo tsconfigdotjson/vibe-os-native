@@ -34,6 +34,7 @@
 pub mod cgroups;
 pub mod claude;
 pub mod conformance;
+pub mod disk;
 pub mod ext4;
 pub mod governor;
 pub mod guest;

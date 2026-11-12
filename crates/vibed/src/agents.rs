@@ -120,7 +120,7 @@ impl Backends {
 }
 
 /// Below this much free disk, no agent starts (PRD: Failures, Low disk).
-pub const MIN_FREE_DISK: u64 = 10 * GIB;
+pub use vibe_core::limits::MIN_FREE_DISK;
 
 /// Why another agent can't be awake beside `awake` others, if it can't:
 /// `max_awake_agents` are awake. Memory is never a reason (#47): each
