@@ -471,9 +471,11 @@ mod tests {
     fn deep_trees_dont_run_out_of_descriptors() {
         let dir = tempfile::tempdir().unwrap();
         let mut d = dir.path().join("deep");
-        // Deeper than a process's usual 256 to 1024 descriptors, were each
-        // level kept open, but within PATH_MAX.
-        for _ in 0..1500 {
+        // As deep as PATH_MAX allows (about 460 levels on macOS, where it's
+        // 1024, and 2000 on Linux): more than the 256 descriptors a Mac
+        // gives a process by default, were each level kept open.
+        let depth = (libc::PATH_MAX as usize - d.as_os_str().len() - 64) / 2;
+        for _ in 0..depth {
             d.push("d");
         }
         fs::create_dir_all(&d).unwrap();
@@ -491,7 +493,8 @@ mod tests {
             usize::MAX,
             &mut Count(&mut levels),
         );
-        assert_eq!(levels, 1501);
+        assert_eq!(levels, depth + 1);
+        assert!(depth > 256, "{depth}");
         let roots = [dir.path().join("deep")];
         assert_eq!(usage(&roots), naive(&roots));
     }
