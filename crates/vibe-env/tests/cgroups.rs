@@ -202,14 +202,7 @@ impl Harness for CgHarness {
         if let Some(shim) = std::env::var_os("VIBE_SHIM").filter(|v| !v.is_empty()) {
             return PathBuf::from(shim);
         }
-        let exe = std::env::current_exe().unwrap();
-        let path = exe.parent().unwrap().parent().unwrap().join("vibe-shim");
-        assert!(
-            path.is_file(),
-            "{} isn't built; run `cargo build --workspace` first",
-            path.display()
-        );
-        path
+        vibe_env::testing::workspace_bin("vibe-shim")
     }
 
     fn scratch(&self) -> PathBuf {
@@ -850,6 +843,48 @@ fn a_full_disk_warns_then_pauses() {
     a.wait_screen("filled");
     std::thread::sleep(Duration::from_millis(600));
     assert_eq!(a.usage().paused, None);
+}
+
+#[test]
+fn an_asleep_agent_keeps_its_disk_and_a_wake_measures_it_again() {
+    let _one = serial();
+    let quick = Intervals {
+        watch: Duration::from_millis(100),
+        disk: Duration::from_millis(200),
+    };
+    let h = harness!(SCRIPT, quick);
+    let a = Agent::start(
+        &h,
+        "asleep-disk",
+        roomy(),
+        "head -c 1048576 /dev/zero >a; echo filled",
+    );
+    a.apply(roomy());
+    a.wait_screen("filled");
+    wait("a measurement of what it wrote", PATIENCE, || {
+        a.usage().disk.is_some_and(|d| d >= MIB)
+    });
+    h.backend.sleep(&a.handle).unwrap();
+    // Anything measuring as it fell asleep finishes.
+    std::thread::sleep(Duration::from_millis(600));
+    let asleep = a.usage().disk.unwrap();
+    // Written beside it while it sleeps, for longer than a reconcile (ten
+    // intervals) takes: it isn't measured, and keeps what it had.
+    fs::write(a.handle.worktree.join("beside"), vec![1u8; 4 << 20]).unwrap();
+    std::thread::sleep(Duration::from_millis(2600));
+    assert_eq!(a.usage().disk, Some(asleep));
+    // Woken, it's measured afresh at once.
+    assert_eq!(h.backend.wake(&a.handle).unwrap(), Woke::Exact);
+    wait("a fresh measurement", PATIENCE, || {
+        a.usage().disk.is_some_and(|d| d >= asleep + 4 * MIB)
+    });
+    // Running, what none of its processes wrote is found by the reconcile.
+    let woke = a.usage().disk.unwrap();
+    fs::write(a.handle.worktree.join("later"), vec![1u8; 2 << 20]).unwrap();
+    wait("the reconcile", PATIENCE, || {
+        a.usage().disk.is_some_and(|d| d >= woke + 2 * MIB)
+    });
+    a.answers("still here");
 }
 
 #[test]

@@ -20,8 +20,9 @@
 //!   (`PRIO_DARWIN_BG`, then `SIGSTOP`/`SIGCONT` duty cycling), memory by
 //!   `phys_footprint` (the background and a warning at 80%, a pause at
 //!   100%), `max_processes` (a pause), and disk, the worktree and its temp
-//!   dir measured every [`Intervals::disk`] (a warning past `disk_soft`, a
-//!   pause past `disk_hard`). A pause is `SIGSTOP` on the tree; it holds
+//!   dir as [`crate::disk`] measures them while the agent runs, from a cache
+//!   FSEvents keeps up to date (a warning past `disk_soft`, a pause past
+//!   `disk_hard`). A pause is `SIGSTOP` on the tree; it holds
 //!   until a wake, and survives a restart of `vibed` (`governor.json` in the
 //!   agent's directory).
 //! - **Sleep** is `SIGSTOP` on the tree and wake is `SIGCONT`. After a
@@ -34,7 +35,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -44,6 +45,7 @@ use serde::{Deserialize, Serialize};
 
 use vibe_core::model::AgentKind;
 
+use crate::disk::{self, Meter};
 use crate::governor::Governor;
 use crate::tree::{self, SessionTree};
 use crate::{
@@ -83,7 +85,8 @@ pub struct Intervals {
     pub walk: Duration,
     /// Also matches every process by session ID.
     pub scan: Duration,
-    /// Measures the worktree and its temp dir.
+    /// The least time between measurements of the worktree and its temp
+    /// dir while they may have changed ([`disk::Policy::interval`]).
     pub disk: Duration,
 }
 
@@ -110,6 +113,8 @@ pub struct Macos {
     /// couldn't say isn't kept, so the next launch asks again.
     path: Mutex<Option<String>>,
     intervals: Intervals,
+    /// Measures every agent's disk, on one thread.
+    disk: Meter,
     agents: Mutex<HashMap<String, Arc<Agent>>>,
 }
 
@@ -222,6 +227,7 @@ impl Macos {
             pi: None,
             path: Mutex::new(None),
             intervals: Intervals::default(),
+            disk: Meter::new(Intervals::default().disk),
             agents: Mutex::new(HashMap::new()),
         }
     }
@@ -248,6 +254,7 @@ impl Macos {
     /// check sooner.
     pub fn with_intervals(mut self, intervals: Intervals) -> Macos {
         self.intervals = intervals;
+        self.disk = Meter::new(intervals.disk);
         self
     }
 
@@ -637,9 +644,10 @@ impl Limiter for Macos {
         {
             let (agent, stop, intervals) = (Arc::clone(&agent), Arc::clone(&stop), self.intervals);
             let members = Members::new(sid).knowing(st.known.clone());
+            let meter = self.disk.clone();
             std::thread::Builder::new()
                 .name(format!("governor {}", h.agent_ref))
-                .spawn(move || govern(&agent, members, &stop, intervals))?;
+                .spawn(move || govern(&agent, members, &stop, intervals, &meter))?;
         }
         st.governor = Some(Running { shim: sid, stop });
         Ok(())
@@ -861,22 +869,39 @@ fn wall_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// The latest disk measurement, and which one: a measurement begun before a
-/// wake doesn't count after it.
-#[derive(Debug, Default)]
-struct Disk {
-    generation: u64,
-    bytes: Option<u64>,
+/// How the agent's worktree and temp dir are measured: from a cache that
+/// FSEvents keeps up to date on a Mac, by a walk on every change elsewhere
+/// (where nothing says what changed).
+fn disk_source(agent: &Agent, interval: Duration) -> Box<dyn disk::Source> {
+    let roots = vec![agent.worktree.clone(), agent.tmp.clone()];
+    #[cfg(target_os = "macos")]
+    match disk::Cached::new(&roots, (interval / 4).min(Duration::from_secs(1))) {
+        Ok(c) => return Box::new(c),
+        Err(e) => eprintln!(
+            "vibe-env: can't watch {} with FSEvents, so it's walked instead: {e}",
+            agent.worktree.display()
+        ),
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = interval;
+    Box::new(disk::Walk::new(roots, None))
 }
 
 /// The governor's thread: holds the agent to its limits until told to stop
 /// or until its tree has gone.
-fn govern(agent: &Agent, mut members: Members, stop: &AtomicBool, intervals: Intervals) {
+fn govern(
+    agent: &Agent,
+    mut members: Members,
+    stop: &AtomicBool,
+    intervals: Intervals,
+    meter: &Meter,
+) {
     let mut governor: Option<Governor> = None;
     let started = Instant::now();
-    let (mut next_walk, mut next_scan, mut next_disk) = (started, started, started);
-    let disk = Arc::new(Mutex::new(Disk::default()));
-    let measuring = Arc::new(AtomicBool::new(false));
+    let (mut next_walk, mut next_scan) = (started, started);
+    // Measured while it runs; what it took when it last ran is kept while
+    // it's frozen, as it can't change.
+    let track = meter.track(agent.worktree.clone(), disk_source(agent, intervals.disk));
     let mut procs: Vec<Proc> = Vec::new();
     let mut duty = 1.0;
     // A governor before this one, in a `vibed` that was killed, may have
@@ -920,31 +945,10 @@ fn govern(agent: &Agent, mut members: Members, stop: &AtomicBool, intervals: Int
             if std::mem::take(&mut st.woke) {
                 g.reset();
                 // What it took before the wake may be gone now.
-                let mut d = lock(&disk);
-                d.generation += 1;
-                d.bytes = None;
-                next_disk = now;
+                track.reset();
             }
-            if next_disk <= now && !measuring.swap(true, Ordering::SeqCst) {
-                next_disk = now + intervals.disk;
-                let (into, done) = (Arc::clone(&disk), Arc::clone(&measuring));
-                let generation = lock(&disk).generation;
-                let paths = [agent.worktree.clone(), agent.tmp.clone()];
-                let spawned = std::thread::Builder::new()
-                    .name("governor disk".into())
-                    .spawn(move || {
-                        let bytes = disk_usage(&paths);
-                        let mut d = lock(&into);
-                        if d.generation == generation {
-                            d.bytes = Some(bytes);
-                        }
-                        done.store(false, Ordering::SeqCst);
-                    });
-                if spawned.is_err() {
-                    measuring.store(false, Ordering::SeqCst);
-                }
-            }
-            let disk = lock(&disk).bytes;
+            track.set_running(st.mode == Mode::Running);
+            let disk = track.bytes();
             st.disk = disk;
             duty = 1.0;
             st.duty = duty;
@@ -1025,55 +1029,9 @@ fn govern(agent: &Agent, mut members: Members, stop: &AtomicBool, intervals: Int
     }
 }
 
-/// The bytes `paths` take on disk, each file once however many links it
-/// has, not following symbolic links.
-pub fn disk_usage(paths: &[PathBuf]) -> u64 {
-    let mut seen: HashSet<(u64, u64)> = HashSet::new();
-    let mut total = 0u64;
-    let mut stack: Vec<PathBuf> = paths.to_vec();
-    while let Some(path) = stack.pop() {
-        let Ok(m) = fs::symlink_metadata(&path) else {
-            continue;
-        };
-        if m.nlink() > 1 && !m.is_dir() && !seen.insert((m.dev(), m.ino())) {
-            continue;
-        }
-        total = total.saturating_add(m.blocks().saturating_mul(512));
-        if m.is_dir()
-            && let Ok(entries) = fs::read_dir(&path)
-        {
-            stack.extend(entries.filter_map(|e| e.ok().map(|e| e.path())));
-        }
-    }
-    total
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn disk_usage_counts_each_file_once_and_follows_no_links() {
-        let dir = tempfile::tempdir().unwrap();
-        let a = dir.path().join("a");
-        fs::create_dir(&a).unwrap();
-        let empty = disk_usage(std::slice::from_ref(&a));
-        fs::write(a.join("one"), vec![1u8; 1 << 20]).unwrap();
-        let one = disk_usage(std::slice::from_ref(&a));
-        assert!(one >= empty + (1 << 20), "{empty} then {one}");
-        // A second link to the same file, and a link to a big directory
-        // outside, add nothing much.
-        fs::hard_link(a.join("one"), a.join("two")).unwrap();
-        let big = dir.path().join("big");
-        fs::create_dir(&big).unwrap();
-        fs::write(big.join("f"), vec![1u8; 4 << 20]).unwrap();
-        std::os::unix::fs::symlink(&big, a.join("big")).unwrap();
-        let after = disk_usage(std::slice::from_ref(&a));
-        assert!(after < one + (64 << 10), "{one} then {after}");
-        // Several roots add up, and a missing one is nothing.
-        let both = disk_usage(&[a.clone(), big.clone(), dir.path().join("none")]);
-        assert!(both >= after + (4 << 20), "{both}");
-    }
 
     #[test]
     fn the_usual_bins_go_after_the_login_path() {

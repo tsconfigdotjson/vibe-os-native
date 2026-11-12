@@ -33,9 +33,10 @@
 //!   [`Intervals::watch`] and freezes it when it's over one: more processes
 //!   than `max_processes`, or a fork or thread the kernel refused at
 //!   `pids.max`; its memory in RAM and swap at [`PAUSE_PERCENT`] of the
-//!   profile's, or an OOM in it. It also measures the worktree and temp dir every
-//!   [`Intervals::disk`]: a warning past `disk_soft`, a pause past
-//!   `disk_hard`. Memory at 80% is a warning. A pause holds until a wake,
+//!   profile's, or an OOM in it. It holds the worktree and temp dir to
+//!   `disk_soft` (a warning) and `disk_hard` (a pause) as [`crate::disk`]
+//!   measures them: while the agent runs, when its processes wrote
+//!   something ([`Writes`]). Memory at 80% is a warning. A pause holds until a wake,
 //!   across restarts of `vibed` too (the kernel keeps the cgroup frozen and
 //!   [`STATE_FILE`] says why).
 //! - **Sleep** is the cgroup freezer (`cgroup.freeze`), which is exact, and
@@ -65,6 +66,7 @@ use vibe_core::limits::HostLimits;
 
 use vibe_core::model::AgentKind;
 
+use crate::disk::{self, Meter};
 use crate::tree::{self, SHIM_NAME, SessionTree};
 use crate::{
     AgentHome, AgentSpec, Backend, Capabilities, ClaudeHome, Compartment, EnvError, Handle, Launch,
@@ -123,7 +125,8 @@ const SCOPE_OOM_POLICY_FROM: u32 = 253;
 pub struct Intervals {
     /// Reads the agent's cgroup and acts on what it says.
     pub watch: Duration,
-    /// Measures the worktree and its temp dir.
+    /// The least time between measurements of the worktree and its temp
+    /// dir while they may have changed ([`disk::Policy::interval`]).
     pub disk: Duration,
 }
 
@@ -193,6 +196,12 @@ impl Systemd {
 
     fn has(&self, controller: &str) -> bool {
         self.controllers.iter().any(|c| c == controller)
+    }
+
+    /// Whether agents' scopes can have `io.stat`, which says when an agent
+    /// wrote something. Not needed: without it, its processes say.
+    pub fn io(&self) -> bool {
+        self.has("io")
     }
 
     /// The controllers the limits need that it lacks.
@@ -394,6 +403,125 @@ fn own_memory(current: u64, stat: &HashMap<String, u64>) -> u64 {
     current.saturating_sub(file.saturating_sub(shmem))
 }
 
+/// Whether an agent's processes wrote anything, to say when its disk may
+/// have changed ([`disk::Signal`]).
+///
+/// Each process's `/proc/<pid>/io` says how many bytes it dirtied
+/// (`write_bytes`, and `cancelled_write_bytes` for what a truncate took back),
+/// charged to the process that wrote, at the time it wrote, and a child's
+/// is added to its parent's when the parent reaps it. So what a build's
+/// short-lived processes wrote is still seen, in the process that ran them.
+/// A process that both starts and ends between two looks, and isn't reaped
+/// by one of the agent's, isn't; nor is a process outside the cgroup
+/// writing into the agent's tree. The reconcile walk is for those.
+///
+/// Where the user manager delegates the `io` controller, the scope's
+/// `io.stat` (`wbytes` and `dbytes`) says too. It sees what the cgroup's
+/// processes wrote whoever reaps them, but only as it's written back, and
+/// charged to the cgroup that first cached each page, which may be another.
+/// The cgroup's `memory.stat` isn't used: its `file_dirty` is charged that
+/// way too, and was seen changing for a frozen agent as others wrote.
+#[derive(Debug)]
+struct Writes {
+    cg: Cgroup,
+    /// What `io.stat` said last.
+    io: Option<u64>,
+    /// What each process had written at the last look, and at which look.
+    procs: HashMap<u32, (u64, u64)>,
+    looks: u64,
+    /// Whether the next look is a baseline.
+    fresh: bool,
+    buf: String,
+}
+
+impl Writes {
+    fn new(cg: Cgroup) -> Writes {
+        Writes {
+            cg,
+            io: None,
+            procs: HashMap::new(),
+            looks: 0,
+            fresh: true,
+            buf: String::new(),
+        }
+    }
+
+    /// Reads `path` into the buffer.
+    fn read(&mut self, path: &Path) -> bool {
+        use std::io::Read as _;
+        self.buf.clear();
+        fs::File::open(path)
+            .and_then(|mut f| f.read_to_string(&mut self.buf))
+            .is_ok()
+    }
+}
+
+/// What `io.stat` says the cgroup wrote and discarded, on every device.
+fn io_written(text: &str) -> u64 {
+    text.split_whitespace()
+        .filter_map(|kv| {
+            let (k, v) = kv.split_once('=')?;
+            matches!(k, "wbytes" | "dbytes").then(|| v.parse::<u64>().ok())?
+        })
+        .fold(0u64, u64::saturating_add)
+}
+
+/// What `/proc/<pid>/io` says the process wrote, and took back.
+fn proc_written(text: &str) -> Option<u64> {
+    let mut found = false;
+    let mut total = 0u64;
+    for l in text.lines() {
+        if let Some(v) = l
+            .strip_prefix("write_bytes:")
+            .or_else(|| l.strip_prefix("cancelled_write_bytes:"))
+        {
+            total = total.saturating_add(v.trim().parse().ok()?);
+            found = true;
+        }
+    }
+    found.then_some(total)
+}
+
+impl disk::Signal for Writes {
+    fn wrote(&mut self) -> Option<bool> {
+        let fresh = std::mem::replace(&mut self.fresh, false);
+        let mut knows = false;
+        let mut wrote = false;
+        let io_stat = self.cg.dir.join("io.stat");
+        if self.read(&io_stat) {
+            let io = io_written(&self.buf);
+            knows = true;
+            wrote |= self.io.is_some_and(|was| was != io);
+            self.io = Some(io);
+        }
+        self.looks += 1;
+        let look = self.looks;
+        for pid in self.cg.pids() {
+            let path = PathBuf::from(format!("/proc/{pid}/io"));
+            if !self.read(&path) {
+                continue;
+            }
+            let Some(written) = proc_written(&self.buf) else {
+                continue;
+            };
+            knows = true;
+            match self.procs.insert(pid, (written, look)) {
+                Some((was, _)) => wrote |= was != written,
+                // New since the last look, and it wrote already.
+                None => wrote |= !fresh && written > 0,
+            }
+        }
+        self.procs.retain(|_, (_, at)| *at == look);
+        knows.then_some(wrote && !fresh)
+    }
+
+    fn reset(&mut self) {
+        self.fresh = true;
+        self.io = None;
+        self.procs.clear();
+    }
+}
+
 /// Whether the agent runs, or why it's stopped.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -510,6 +638,8 @@ pub struct Cgroups {
     /// Where cgroups v2 is mounted.
     root: PathBuf,
     intervals: Intervals,
+    /// Measures every agent's disk, on one thread.
+    disk: Meter,
     /// The user manager, once it's been found.
     systemd: Mutex<Option<Systemd>>,
     agents: Mutex<HashMap<String, Arc<Agent>>>,
@@ -535,6 +665,7 @@ impl Cgroups {
             slice: SLICE.into(),
             root: PathBuf::from(CGROUP_ROOT),
             intervals: Intervals::default(),
+            disk: Meter::new(Intervals::default().disk),
             systemd: Mutex::new(None),
             agents: Mutex::new(HashMap::new()),
             runs: AtomicU64::new(0),
@@ -578,6 +709,7 @@ impl Cgroups {
     /// check sooner.
     pub fn with_intervals(mut self, intervals: Intervals) -> Cgroups {
         self.intervals = intervals;
+        self.disk = Meter::new(intervals.disk);
         self
     }
 
@@ -761,6 +893,11 @@ impl Cgroups {
         let mut props = Cgroups::properties(sd, limits);
         if sd.version >= SCOPE_OOM_POLICY_FROM {
             props.push("OOMPolicy=continue".into());
+        }
+        if sd.io() {
+            // For `io.stat`: what the agent writes, to say when to measure
+            // its disk.
+            props.push("IOAccounting=yes".into());
         }
         for p in props {
             argv.push("-p".into());
@@ -1145,9 +1282,10 @@ impl Limiter for Cgroups {
                 let (agent, stop, intervals) =
                     (Arc::clone(&agent), Arc::clone(&stop), self.intervals);
                 let cg = cg.clone();
+                let meter = self.disk.clone();
                 std::thread::Builder::new()
                     .name(format!("cgroup {}", h.agent_ref))
-                    .spawn(move || watch(&agent, &cg, &stop, intervals))?;
+                    .spawn(move || watch(&agent, &cg, &stop, intervals, &meter))?;
             }
             st.watcher = Some(stop);
         }
@@ -1306,20 +1444,29 @@ fn warnings(c: &Counters, limits: &Limits, disk: Option<u64>, had: &[Limit]) -> 
 
 /// Holds one agent to its limits until `stop`, or until its cgroup has
 /// gone (it was stopped, or Claude exited and took everything with it).
-fn watch(agent: &Arc<Agent>, cg: &Cgroup, stop: &Arc<AtomicBool>, intervals: Intervals) {
+fn watch(
+    agent: &Arc<Agent>,
+    cg: &Cgroup,
+    stop: &Arc<AtomicBool>,
+    intervals: Intervals,
+    meter: &Meter,
+) {
     // Counted from what's been refused when it first looks, unless a launch
     // or a wake says otherwise.
     let mut base: Option<Baseline> = None;
-    // The latest measurement, and which: one begun before a wake is stale.
-    let disk: Arc<Mutex<(u64, Option<u64>)>> = Arc::new(Mutex::new((0, None)));
-    let mut generation = 0u64;
-    let measuring = Arc::new(AtomicBool::new(false));
-    let mut next_disk = Instant::now();
+    // Measured while it runs, when its processes wrote something; what it
+    // took when it last ran is kept while it's frozen, as it can't change.
+    let track = meter.track(
+        agent.worktree.clone(),
+        Box::new(disk::Walk::new(
+            vec![agent.worktree.clone(), agent.tmp.clone()],
+            Some(Box::new(Writes::new(cg.clone()))),
+        )),
+    );
     loop {
         if stop.load(Ordering::SeqCst) {
             return;
         }
-        let now = Instant::now();
         // `apply` saw the scope before starting this, so once it's gone the
         // agent's processes are, and the next launch's `apply` starts the
         // next watcher. Asked again under the lock, as `apply` holds it: a
@@ -1344,36 +1491,12 @@ fn watch(agent: &Arc<Agent>, cg: &Cgroup, stop: &Arc<AtomicBool>, intervals: Int
                     Recount::Zero => Baseline::default(),
                     Recount::Now => Baseline::of(&cg.counters()),
                 });
-                generation += 1;
-                *lock(&disk) = (generation, None);
-                st.disk = None;
-                next_disk = now;
+                // What it took before may be gone now.
+                track.reset();
             }
             let base = *base.get_or_insert_with(|| Baseline::of(&cg.counters()));
-            if next_disk <= now && !measuring.swap(true, Ordering::SeqCst) {
-                next_disk = now + intervals.disk;
-                let paths = vec![agent.worktree.clone(), agent.tmp.clone()];
-                let (into, done) = (Arc::clone(&disk), Arc::clone(&measuring));
-                let spawned = std::thread::Builder::new()
-                    .name("cgroup disk".into())
-                    .spawn(move || {
-                        let bytes = crate::macos::disk_usage(&paths);
-                        let mut d = lock(&into);
-                        if d.0 == generation {
-                            d.1 = Some(bytes);
-                        }
-                        drop(d);
-                        done.store(false, Ordering::SeqCst);
-                    });
-                if spawned.is_err() {
-                    measuring.store(false, Ordering::SeqCst);
-                }
-            }
-            if let (g, Some(bytes)) = *lock(&disk)
-                && g == generation
-            {
-                st.disk = Some(bytes);
-            }
+            track.set_running(st.saved.mode == Mode::Running);
+            st.disk = track.bytes();
             if let (Mode::Running, Some(limits)) = (st.saved.mode, st.saved.limits) {
                 let c = cg.counters();
                 let now_warned = warnings(&c, &limits, st.disk, &st.warnings);
@@ -1486,9 +1609,15 @@ mod tests {
             "--expand-environment=no",
             "OOMPolicy=continue",
             "CPUQuota=200%",
+            "IOAccounting=yes",
         ] {
             assert!(!old.iter().any(|a| a == gone), "{gone} in {old:?}");
         }
+        // With the io controller, the scope has io.stat, which says when
+        // the agent wrote something.
+        assert!(!new.iter().any(|a| a == "IOAccounting=yes"), "{new:?}");
+        let io = cmd(&systemd(259, &["cpu", "io", "memory", "pids"]));
+        assert!(io.iter().any(|a| a == "IOAccounting=yes"), "{io:?}");
     }
 
     #[test]
@@ -1598,6 +1727,95 @@ mod tests {
         );
         assert!(warnings(&at(74), &l, None, &[Limit::Memory]).is_empty());
         assert_eq!(warnings(&at(0), &l, Some(1000), &[]), vec![Limit::Disk]);
+    }
+
+    #[test]
+    fn what_io_stat_and_proc_say_was_written() {
+        assert_eq!(
+            io_written(
+                "8:0 rbytes=10 wbytes=200 rios=1 wios=2 dbytes=3 dios=1\n\
+                 259:0 rbytes=0 wbytes=40 rios=0 wios=1 dbytes=0 dios=0\n"
+            ),
+            243
+        );
+        assert_eq!(io_written(""), 0);
+        let io = "rchar: 5\nwchar: 900\nsyscr: 1\nsyscw: 2\nread_bytes: 4096\n\
+                  write_bytes: 8192\ncancelled_write_bytes: 4096\n";
+        // wchar counts every write, to a terminal or a pipe too: only what
+        // reached a file's pages counts.
+        assert_eq!(proc_written(io), Some(12288));
+        assert_eq!(proc_written("rchar: 5\n"), None);
+    }
+
+    /// A process of the "agent's" that writes a file each time it's sent a
+    /// line, with a cgroup directory of its own that lists only it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn writes_say_when_the_agents_processes_wrote() {
+        use crate::disk::Signal;
+        use std::io::{BufRead, BufReader, Write};
+        if !Path::new("/proc/self/io").exists() {
+            eprintln!("no /proc/<pid>/io here (CONFIG_TASK_IO_ACCOUNTING): nothing to test");
+            return;
+        }
+        // On a disk, as tmpfs pages are never dirtied for writeback.
+        let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("while read -r n; do head -c 1048576 /dev/zero >\"$0/$n\"; echo wrote; done")
+            .arg(dir.path())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let (mut tell, mut heard) = (
+            child.stdin.take().unwrap(),
+            BufReader::new(child.stdout.take().unwrap()),
+        );
+        let mut write = |n: u32| {
+            writeln!(tell, "{n}").unwrap();
+            let mut line = String::new();
+            heard.read_line(&mut line).unwrap();
+            assert_eq!(line, "wrote\n");
+        };
+        let cg_dir = dir.path().join("cg");
+        fs::create_dir(&cg_dir).unwrap();
+        fs::write(cg_dir.join("cgroup.procs"), format!("{}\n", child.id())).unwrap();
+        let mut w = Writes::new(Cgroup {
+            dir: cg_dir.clone(),
+        });
+        // The first look is the baseline, even after it wrote.
+        write(1);
+        assert_eq!(w.wrote(), Some(false));
+        assert_eq!(w.wrote(), Some(false));
+        // What `head` wrote is its parent's once reaped.
+        write(2);
+        assert_eq!(w.wrote(), Some(true));
+        assert_eq!(w.wrote(), Some(false));
+        // io.stat, where there is one, says too.
+        fs::write(
+            cg_dir.join("io.stat"),
+            "8:0 rbytes=0 wbytes=4096 dbytes=0\n",
+        )
+        .unwrap();
+        assert_eq!(w.wrote(), Some(false), "a first io.stat is a baseline");
+        fs::write(
+            cg_dir.join("io.stat"),
+            "8:0 rbytes=0 wbytes=8192 dbytes=0\n",
+        )
+        .unwrap();
+        assert_eq!(w.wrote(), Some(true));
+        assert_eq!(w.wrote(), Some(false));
+        // A reset starts again from a baseline.
+        write(3);
+        w.reset();
+        assert_eq!(w.wrote(), Some(false));
+        drop(tell);
+        child.wait().unwrap();
+        // Nothing to read: it can't tell.
+        fs::write(cg_dir.join("cgroup.procs"), "").unwrap();
+        fs::remove_file(cg_dir.join("io.stat")).unwrap();
+        assert_eq!(w.wrote(), None);
     }
 
     #[test]

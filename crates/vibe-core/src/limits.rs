@@ -20,6 +20,10 @@ const MAX_SIZE: u64 = 1024 * TIB;
 /// The longest `idle_debounce`: a year.
 const MAX_DURATION: u64 = 365 * 24 * 3600;
 
+/// Below this much free disk a host is short of it (PRD: Failures, Low
+/// disk): no agent starts, and agents that run are measured more often.
+pub const MIN_FREE_DISK: u64 = 10 * GIB;
+
 /// Host-wide limits. On the socket, sizes are bytes and durations seconds;
 /// in `host.toml` they're written like `"4G"` and `"60s"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

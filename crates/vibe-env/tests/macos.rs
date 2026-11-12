@@ -120,14 +120,7 @@ impl Harness for MacHarness {
 
     fn shim(&self) -> PathBuf {
         // Built beside the tests by `cargo test --workspace`.
-        let exe = std::env::current_exe().unwrap();
-        let path = exe.parent().unwrap().parent().unwrap().join("vibe-shim");
-        assert!(
-            path.is_file(),
-            "{} isn't built; run `cargo build --workspace` first",
-            path.display()
-        );
-        path
+        vibe_env::testing::workspace_bin("vibe-shim")
     }
 
     fn scratch(&self) -> PathBuf {
@@ -739,6 +732,42 @@ fn disk_past_soft_warns_and_past_hard_pauses() {
     let u = a.usage();
     assert_eq!(u.paused, None, "{u:?}");
     assert!(a.procs().iter().all(|p| !p.stopped));
+}
+
+#[test]
+fn an_asleep_agent_keeps_its_disk_and_a_wake_measures_it_again() {
+    let _one = serial();
+    let h = MacHarness::with(SCRIPT, quick());
+    let a = Agent::start(&h, "asleep-disk", "head -c 1048576 /dev/zero >fill");
+    a.apply(roomy());
+    wait(
+        "a measurement of what it wrote",
+        Duration::from_secs(60),
+        || a.usage().disk.is_some_and(|d| d >= MIB),
+    );
+    h.backend.sleep(&a.handle).unwrap();
+    // Anything measuring as it fell asleep finishes.
+    std::thread::sleep(Duration::from_millis(1500));
+    let asleep = a.usage().disk.unwrap();
+    // Written beside it while it sleeps, for longer than a reconcile (ten
+    // intervals) takes: it isn't measured, and keeps what it had.
+    fs::write(a.handle.worktree.join("beside"), vec![1u8; 4 << 20]).unwrap();
+    std::thread::sleep(Duration::from_millis(6000));
+    assert_eq!(a.usage().disk, Some(asleep));
+    // Woken, it's measured afresh at once.
+    assert_eq!(h.backend.wake(&a.handle).unwrap(), Woke::Exact);
+    wait("a fresh measurement", Duration::from_secs(60), || {
+        a.usage().disk.is_some_and(|d| d >= asleep + 4 * MIB)
+    });
+    // Running, a change made from outside it is measured too: FSEvents
+    // sees it on a Mac, and the reconcile elsewhere.
+    let woke = a.usage().disk.unwrap();
+    fs::write(a.handle.worktree.join("later"), vec![1u8; 2 << 20]).unwrap();
+    wait(
+        "a measurement of the change",
+        Duration::from_secs(60),
+        || a.usage().disk.is_some_and(|d| d >= woke + 2 * MIB),
+    );
 }
 
 #[test]
