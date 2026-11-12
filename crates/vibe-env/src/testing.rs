@@ -22,6 +22,26 @@ use vibe_core::model::AgentKind;
 
 use crate::claude::{CONFIG_DIR_ENV, ClaudeHome};
 use crate::tree::SessionTree;
+
+/// A binary of the workspace's, such as `vibe-shim` or `vibed`, from a test:
+/// in the nearest directory above the test's own binary that has it. That's
+/// `target/<profile>`, whether cargo puts tests in its `deps` (as before
+/// 1.100) or deeper, under `build/<package>/<hash>/` (1.100's build
+/// directory). `cargo test --workspace` builds them all first; a test of
+/// one package needs `cargo build --workspace` before.
+pub fn workspace_bin(name: &str) -> PathBuf {
+    let exe = std::env::current_exe().expect("the test's own binary");
+    exe.ancestors()
+        .skip(1)
+        .map(|d| d.join(name))
+        .find(|p| p.is_file())
+        .unwrap_or_else(|| {
+            panic!(
+                "{name} isn't built beside {}; run `cargo build --workspace` first",
+                exe.display()
+            )
+        })
+}
 use crate::{
     AgentHome, AgentSpec, Backend, Capabilities, Compartment, EnvError, Handle, Launch, Limit,
     Limiter, Limits, PiHome, Result, Run, RunOutput, Sleeper, TerminalEnd, Usage, Woke, native, pi,

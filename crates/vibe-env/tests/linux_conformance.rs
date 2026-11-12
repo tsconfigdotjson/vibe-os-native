@@ -129,10 +129,7 @@ impl Harness for VmHarness {
     }
 
     fn shim(&self) -> PathBuf {
-        let exe = std::env::current_exe().unwrap();
-        let path = exe.parent().unwrap().parent().unwrap().join("vibe-shim");
-        assert!(path.is_file(), "{} isn't built", path.display());
-        path
+        vibe_env::testing::workspace_bin("vibe-shim")
     }
 
     fn scratch(&self) -> PathBuf {

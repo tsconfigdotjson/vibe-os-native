@@ -960,14 +960,7 @@ pub fn short_tempdir() -> tempfile::TempDir {
 /// `cargo test --workspace` builds them all first; a test of one package
 /// needs `cargo build --workspace` before.
 pub fn workspace_bin(name: &str) -> PathBuf {
-    let exe = std::env::current_exe().unwrap();
-    let path = exe.parent().unwrap().parent().unwrap().join(name);
-    assert!(
-        path.is_file(),
-        "{} isn't built; run `cargo build --workspace` first",
-        path.display()
-    );
-    path
+    vibe_env::testing::workspace_bin(name)
 }
 
 /// A record like the one a shim leaves when its command exits.

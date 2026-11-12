@@ -546,11 +546,7 @@ fn the_dirs_it_makes_are_private_whatever_the_umask() {
 /// which leads its session, and its socket.
 fn real_shim(s: &Setup, command: &[&str]) -> (u32, PathBuf) {
     use std::os::unix::fs::PermissionsExt;
-    let shim = {
-        let exe = std::env::current_exe().unwrap();
-        exe.parent().unwrap().parent().unwrap().join("vibe-shim")
-    };
-    assert!(shim.is_file(), "{} isn't built", shim.display());
+    let shim = crate::testing::workspace_bin("vibe-shim");
     let run = s.tmp.path().join("r");
     fs::create_dir_all(&run).unwrap();
     fs::set_permissions(&run, fs::Permissions::from_mode(0o700)).unwrap();

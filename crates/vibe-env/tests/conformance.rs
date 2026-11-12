@@ -75,14 +75,7 @@ impl Harness for TestHarness {
 
     fn shim(&self) -> PathBuf {
         // Built beside the tests by `cargo test --workspace`.
-        let exe = std::env::current_exe().unwrap();
-        let path = exe.parent().unwrap().parent().unwrap().join("vibe-shim");
-        assert!(
-            path.is_file(),
-            "{} isn't built; run `cargo build --workspace` first",
-            path.display()
-        );
-        path
+        vibe_env::testing::workspace_bin("vibe-shim")
     }
 
     fn scratch(&self) -> PathBuf {

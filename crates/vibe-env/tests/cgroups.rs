@@ -202,14 +202,7 @@ impl Harness for CgHarness {
         if let Some(shim) = std::env::var_os("VIBE_SHIM").filter(|v| !v.is_empty()) {
             return PathBuf::from(shim);
         }
-        let exe = std::env::current_exe().unwrap();
-        let path = exe.parent().unwrap().parent().unwrap().join("vibe-shim");
-        assert!(
-            path.is_file(),
-            "{} isn't built; run `cargo build --workspace` first",
-            path.display()
-        );
-        path
+        vibe_env::testing::workspace_bin("vibe-shim")
     }
 
     fn scratch(&self) -> PathBuf {
