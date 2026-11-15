@@ -23,6 +23,9 @@
 //!   governor, whose decisions are [`governor`]'s;
 //! - [`cgroups`], the `linux` backend on a Linux host: native agents, each
 //!   in a cgroup v2 of its own under the owner's systemd user manager;
+//! - [`mounts`], the mount namespace a native agent runs in on Linux, so its
+//!   mounts and unmounts never reach the server's, and what to say when the
+//!   server has lost cgroup v2 or `/dev/pts`;
 //! - [`testing`], a backend for tests, so the core doesn't wait on the real
 //!   ones;
 //! - [`conformance`], the suite every backend must pass;
@@ -41,6 +44,7 @@ pub mod guest;
 pub mod images;
 pub mod linux;
 pub mod macos;
+pub mod mounts;
 pub mod native;
 pub mod pi;
 pub mod pi_logins;

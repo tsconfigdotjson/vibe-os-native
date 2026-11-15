@@ -10,6 +10,13 @@
 #     differs
 #   - cargo check of the workspace for every host target it doesn't run on
 #     (macOS and Linux, arm64 and x86_64)
+#   - an agent's mounts (#169), on Linux: an agent running as root
+#     bind-mounts /sys and /dev recursively into a scratch rootfs and
+#     unmounts them under a real vibe-shim, and the stand-in server's
+#     /sys/fs/cgroup, /dev/pts and /dev/shm are all still mounted; the same
+#     steps without the shim's mount namespace do unmount them; and a server
+#     without /dev/pts is told so. All of it in a user and mount namespace
+#     of the test's own, run as root by sudo where this user can't have one
 #   - a vibed hello-world smoke test, through `vibe hello` and `vibe rpc`
 #   - `vibe doctor` against a live vibed, on this machine as it is: a line
 #     for every check, and an exit that says whether one needs the owner
@@ -1519,6 +1526,31 @@ real_host_cgroups() {
   return $rc
 }
 
+# An agent's scratch rootfs teardown leaves the server's mounts (#169):
+# crates/vibe-shim/tests/mounts.rs, made to run rather than skip. It needs a
+# user and mount namespace, which Ubuntu 24.04's AppArmor keeps from users
+# other than root, so there it runs as root by sudo. Either way it makes a
+# namespace of its own and touches none of this machine's mounts.
+s_mounts() {
+  local json bin
+  if [ "$OS" != Linux ]; then
+    echo "mount namespaces are Linux's"
+    return $NOT_APPLICABLE
+  fi
+  if unshare --user --map-root-user --mount true 2>/dev/null; then
+    VIBE_TEST_MOUNTS=1 cargo test -p vibe-shim --test mounts --locked -- --nocapture
+    return
+  fi
+  if ! sudo -n true 2>/dev/null; then
+    echo "this user can't have a user namespace here, and can't sudo without a password"
+    return $NOT_APPLICABLE
+  fi
+  json=$(cargo test -p vibe-shim --test mounts --locked --no-run --message-format=json)
+  bin=$(printf '%s\n' "$json" | sed -n 's/.*"name":"mounts".*"executable":"\([^"]*\)".*/\1/p' | tail -n 1)
+  [ -n "$bin" ] && [ -x "$bin" ] || { echo "cargo built no mounts test"; return 1; }
+  sudo -n env VIBE_TEST_MOUNTS=1 "$bin" --nocapture
+}
+
 # The Linux host's cgroups backend on this machine's own cgroups, where it
 # has them. Every test agent's memory limit is tens of MB, and the tests
 # keep to slices of their own, which they stop when they're done.
@@ -1545,6 +1577,7 @@ step test "cargo test (incl. the Rust contract tests)" s_test
 step guest "vibe-guest: static aarch64-unknown-linux-musl, clippy for musl" s_guest
 mac_step test-guest "test guests: kernel, initrd, initrd-guest, modloop" s_test_guest
 step cross "cargo check for macOS and Linux, arm64 and x86_64" s_cross
+step mounts "an agent's scratch rootfs teardown leaves the server's mounts (#169)" s_mounts build
 step smoke "vibed hello world via vibe hello and vibe rpc" s_smoke build
 step doctor "vibe doctor against a live vibed, on this machine" s_doctor build
 step registry "registry via vibe rpc survives a vibed restart" s_registry build

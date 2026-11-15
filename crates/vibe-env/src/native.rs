@@ -8,7 +8,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::{AgentHome, EnvError, Handle, Launch, Result, Run, RunOutput, pi};
+use crate::{AgentHome, EnvError, Handle, Launch, Result, Run, RunOutput, mounts, pi};
 
 /// The most output a [`run`] keeps: the end of it.
 pub const MAX_OUTPUT: usize = 1 << 20;
@@ -22,13 +22,15 @@ const DRAIN: Duration = Duration::from_secs(2);
 /// running in its group when it ends is killed, and so is everything once
 /// it runs out of time.
 pub fn run(r: &Run, env: &[(String, String)]) -> Result<RunOutput> {
-    run_in(r, env, false)
+    run_in(r, env, false, false)
 }
 
 /// [`run`], for a command in `h`'s compartment. A Pi agent's start from the
 /// same allowlist it does, so `.vibe/setup.sh` gets no stray provider key.
+/// On Linux it runs in a mount namespace of its own, as the agent does
+/// ([`mounts::contain`]).
 pub fn run_for(h: &Handle, r: &Run, env: &[(String, String)]) -> Result<RunOutput> {
-    run_in(r, env, matches!(h.home, AgentHome::Pi(_)))
+    run_in(r, env, matches!(h.home, AgentHome::Pi(_)), true)
 }
 
 /// What Pi says of `model`, asked with what the agent would start with. Pi
@@ -58,14 +60,16 @@ pub fn pi_auth_check(
         cwd: h.worktree.clone(),
         timeout: PI_AUTH_CHECK_TIMEOUT,
     };
-    let out = run_in(&run, &[], true).ok()?;
+    let out = run_in(&run, &[], true, false).ok()?;
     pi::read_auth_check(model, &String::from_utf8_lossy(&out.output))
 }
 
 /// Its check is local: longer than this and it's left to the screen to say.
 const PI_AUTH_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
-fn run_in(r: &Run, env: &[(String, String)], clean: bool) -> Result<RunOutput> {
+/// [`run`], from [`pi::allowed_env`] alone if `clean`, and in a mount
+/// namespace of its own if `contained`.
+fn run_in(r: &Run, env: &[(String, String)], clean: bool, contained: bool) -> Result<RunOutput> {
     let (program, args) = r
         .argv
         .split_first()
@@ -87,9 +91,20 @@ fn run_in(r: &Run, env: &[(String, String)], clean: bool) -> Result<RunOutput> {
         .stdout(writer.try_clone()?)
         .stderr(writer)
         .process_group(0);
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| EnvError::new(format!("can't run {program}: {e}")))?;
+    if contained {
+        // SAFETY: contain makes system calls only, and the child has one
+        // thread.
+        unsafe {
+            cmd.pre_exec(|| mounts::contain().map(drop));
+        }
+    }
+    let mut child = cmd.spawn().map_err(|e| {
+        EnvError::new(if contained {
+            format!("can't run {program} in a mount namespace of its own: {e}")
+        } else {
+            format!("can't run {program}: {e}")
+        })
+    })?;
     // Our copies of the pipe's write end go with the command, so the pipe
     // ends when the command and its children have all closed theirs.
     drop(cmd);
@@ -457,6 +472,49 @@ mod tests {
         assert!(sh("true", Duration::from_secs(10)).success());
         let killed = sh("kill -TERM $$", Duration::from_secs(10));
         assert_eq!((killed.code, killed.signal), (None, Some(libc::SIGTERM)));
+    }
+
+    /// A setup run's mounts are its own (#169): where this process may make
+    /// mount namespaces (as root), its run is in a new one, every mount in
+    /// it a slave of ours, so its unmounts can't reach ours.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_setup_run_has_a_mount_namespace_whose_unmounts_stay_in_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = handle(
+            crate::AgentHome::Claude(ClaudeHome::user(dir.path())),
+            dir.path(),
+        );
+        let out = run_for(
+            &h,
+            &Run {
+                argv: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "readlink /proc/self/ns/mnt; grep -c ' shared:' /proc/self/mountinfo; true"
+                        .into(),
+                ],
+                env: Vec::new(),
+                cwd: dir.path().to_owned(),
+                timeout: Duration::from_secs(10),
+            },
+            &[],
+        )
+        .unwrap();
+        let text = String::from_utf8(out.output).unwrap();
+        let mut lines = text.lines();
+        let (ns, shared) = (lines.next().unwrap(), lines.next().unwrap());
+        let ours = std::fs::read_link("/proc/self/ns/mnt").unwrap();
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("not root, so the run may not get a namespace: it got {ns}");
+            return;
+        }
+        assert_ne!(Path::new(ns), ours, "the run shared our mount namespace");
+        assert_eq!(
+            shared, "0",
+            "the run's mounts still propagate back:\n{text}"
+        );
     }
 
     #[test]

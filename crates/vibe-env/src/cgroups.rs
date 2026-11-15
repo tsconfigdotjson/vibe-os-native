@@ -11,6 +11,13 @@
 //!   instruction. The shim itself isn't in it: it must keep answering while
 //!   the agent is frozen. A `run` (`.vibe/setup.sh`) gets a scope of its own
 //!   with the same limits, and whatever it leaves in it is ended with it.
+//! - **Mounts.** The shim starts the agent's command, and a `run` its own,
+//!   in a mount namespace of its own whose mounts are slaves of the
+//!   server's ([`crate::mounts`]): an agent running as root may mount and
+//!   unmount what it likes, as building a chroot does, and none of it
+//!   reaches the server's `/sys/fs/cgroup` or `/dev/pts` (#169).
+//!   Every start checks the server still has both, and says so if it
+//!   doesn't.
 //! - **Membership** is the cgroup itself: no process scanning, and a
 //!   `nohup … &` or `setsid` job is still the agent's. A process the agent
 //!   moves into another of the owner's cgroups on purpose (the owner may
@@ -67,6 +74,7 @@ use vibe_core::limits::HostLimits;
 use vibe_core::model::AgentKind;
 
 use crate::disk::{self, Meter};
+use crate::mounts;
 use crate::tree::{self, SHIM_NAME, SessionTree};
 use crate::{
     AgentHome, AgentSpec, Backend, Capabilities, ClaudeHome, Compartment, EnvError, Handle, Launch,
@@ -83,6 +91,9 @@ pub const SLICE: &str = "vibeos.slice";
 
 /// Where cgroups v2 is mounted.
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
+
+/// What the shim opens for an agent's terminal.
+const PTMX: &str = "/dev/ptmx";
 
 /// The controllers the limits need; without the first two an agent doesn't
 /// start.
@@ -826,6 +837,22 @@ impl Cgroups {
         Ok(text)
     }
 
+    /// Whether the server still has cgroup v2 mounted, and `/dev/pts` if
+    /// the agent needs a `terminal`. Asked at every start rather than once
+    /// with [`Cgroups::systemd`], as they can go while `vibed` runs
+    /// (#169), and what fails without them doesn't say so.
+    fn still_mounted(&self, terminal: bool) -> Result<()> {
+        let missing = mounts::cgroup2_missing(&self.root).or_else(|| {
+            terminal
+                .then(|| mounts::terminal_missing(Path::new(PTMX)))
+                .flatten()
+        });
+        match missing {
+            Some(why) => Err(EnvError::new(why)),
+            None => Ok(()),
+        }
+    }
+
     /// The scope `agent_ref`'s processes run in.
     pub fn unit(&self, agent_ref: &str) -> String {
         format!("{}-{agent_ref}.scope", self.stem())
@@ -1079,6 +1106,7 @@ impl Compartment for Cgroups {
     /// In a scope of its own, with the agent's limits. Whatever it leaves
     /// running ends with it.
     fn run(&self, h: &Handle, r: &Run) -> Result<RunOutput> {
+        self.still_mounted(false)?;
         let sd = self.systemd()?;
         let tmp = h.agent_dir.join(vibe_core::paths::TMP_DIR);
         fs::create_dir_all(&tmp)?;
@@ -1124,6 +1152,7 @@ impl Compartment for Cgroups {
     }
 
     fn launch(&self, h: &Handle, launch: &Launch) -> Result<TerminalEnd> {
+        self.still_mounted(true)?;
         let sd = self.systemd()?;
         let program = match launch.agent {
             AgentKind::Claude => self.claude()?,

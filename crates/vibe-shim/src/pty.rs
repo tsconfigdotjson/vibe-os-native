@@ -48,6 +48,9 @@ fn cloexec(fd: RawFd) -> io::Result<()> {
     Ok(())
 }
 
+/// Where [`open_pty`]'s `posix_openpt` opens a new terminal.
+const PTMX: &str = "/dev/ptmx";
+
 /// A new terminal pair, master and slave, neither inherited by children.
 /// `posix_openpt` rather than `openpty`, which needs libutil on older glibc.
 /// Called while the process has one thread, as `ptsname` isn't thread-safe.
@@ -85,12 +88,38 @@ pub(crate) struct Pty {
 /// as the terminal's foreground process group. The caller ignores
 /// `SIGHUP`, as it owns the terminal and closing the master end, as a failed
 /// start does, hangs it up; and `SIGTTOU`, as it isn't the terminal's
-/// foreground.
-pub(crate) fn spawn(command: &[OsString], cwd: &Path, tmp: &Path, size: Size) -> io::Result<Pty> {
-    let (master, slave) = open_pty(size)?;
+/// foreground. What failed is said: the terminal (as when `/dev/pts` isn't
+/// mounted, which once read as the command's own `ENODEV`) or the command.
+pub(crate) fn spawn(
+    command: &[OsString],
+    cwd: &Path,
+    tmp: &Path,
+    size: Size,
+) -> Result<Pty, String> {
+    let terminal = |e: io::Error| {
+        vibe_env::mounts::terminal_error(Path::new(PTMX), &e)
+            .unwrap_or_else(|| format!("can't open a terminal for the agent: {e}"))
+    };
+    let (master, slave) = open_pty(size).map_err(terminal)?;
     // SAFETY: we lead our session and have no controlling terminal yet; this
     // makes the slave ours.
-    check(unsafe { libc::ioctl(slave.as_raw_fd(), libc::TIOCSCTTY as _, 0) })?;
+    check(unsafe { libc::ioctl(slave.as_raw_fd(), libc::TIOCSCTTY as _, 0) }).map_err(terminal)?;
+    start(command, cwd, tmp, master, slave).map_err(|e| {
+        format!(
+            "can't start {}: {e}",
+            command.first().map_or("".into(), |c| c.to_string_lossy())
+        )
+    })
+}
+
+/// Starts `command` on the terminal whose ends are `master` and `slave`.
+fn start(
+    command: &[OsString],
+    cwd: &Path,
+    tmp: &Path,
+    master: OwnedFd,
+    slave: OwnedFd,
+) -> io::Result<Pty> {
     let mut cmd = Command::new(&command[0]);
     cmd.args(&command[1..])
         .current_dir(cwd)
