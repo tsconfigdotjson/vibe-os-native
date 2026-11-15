@@ -125,6 +125,16 @@ fn sandbox_allowed() -> bool {
     false
 }
 
+/// A copy of the shim in `dir`, where the sandbox can run it: its root is
+/// only this user, and where the test runs as root (by sudo, in CI) the
+/// build's `/home/<user>` belongs to a user it has no mapping for, so it
+/// can't so much as look in it.
+fn shim_in(dir: &std::path::Path) -> String {
+    let copy = dir.join("vibe-shim");
+    std::fs::copy(SHIM, &copy).unwrap();
+    copy.to_string_lossy().into_owned()
+}
+
 fn line_for(output: &str, phase: &str, mount: &str) -> String {
     let prefix = format!("{phase} {mount} ");
     output
@@ -169,7 +179,7 @@ fn a_scratch_rootfs_torn_down_by_an_agent_leaves_the_servers_mounts() {
         &script.to_string_lossy(),
         &dir.path().to_string_lossy(),
         &outer.to_string_lossy(),
-        SHIM,
+        &shim_in(dir.path()),
     ])
     .output()
     .unwrap();
@@ -237,7 +247,7 @@ fn a_server_without_dev_pts_is_told_that_rather_than_blaming_the_command() {
         &dir.path().to_string_lossy(),
         &script.to_string_lossy(),
         &outer.to_string_lossy(),
-        SHIM,
+        &shim_in(dir.path()),
     ])
     .output()
     .unwrap();
