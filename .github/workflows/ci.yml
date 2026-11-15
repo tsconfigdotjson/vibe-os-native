@@ -3,10 +3,10 @@
 # cross-build and the vibed smoke test; on macOS 26 it adds both Swift
 # packages, the Swift contract tests,
 # ad hoc signing and the vibe-vm and VibeOS.app smoke tests. The runner is
-# itself a VM with no nested virtualization, so the steps that need VMs are
-# N/A there and say so: vm-cycle and linux-vm, which boot real VMs, and
-# base-image, whose Docker would need a Linux VM (release.yml builds the
-# base image on ubuntu-24.04-arm). They need a Mac on real hardware.
+# itself a VM with no nested virtualization and no Docker, so vm-cycle, which
+# boots real VMs, and base-image, which needs Docker, are N/A there and say
+# why (release.yml builds the base image on ubuntu-24.04-arm), and linux-vm,
+# which needs both, is skipped. They need a Mac on real hardware.
 #
 # Pull requests are gated by local checks: scripts/check-full.sh on the box
 # and on Lee's Mac. CI runs only on merges to main or by hand
@@ -61,8 +61,9 @@ jobs:
 
       # check-full.sh's terminal-attach step drives Terminal with Apple
       # events, which macOS asks the user to allow, and a hosted runner has
-      # nobody to click Allow: this allows this job's processes to, for
-      # Terminal alone (see the script).
+      # nobody to click Allow. This allows the runner's agent to send Apple
+      # events to Terminal alone (approved by the repo owner, #171; see the
+      # script). Here only, never from check-full.sh.
       - name: Allow this job to drive Terminal
         if: runner.os == 'macOS'
         run: scripts/ci-macos-automation.sh
