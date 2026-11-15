@@ -150,7 +150,8 @@
 #     itself a VM, such as a CI runner, this step is N/A: it can't nest VMs.
 #   - the Linux base image (scripts/base-image.sh, with Docker): its kernel,
 #     initrd and Debian image, built into build/base-image/. N/A, saying
-#     so, where there's no Docker, as on a hosted macOS runner
+#     so, only where there's no Docker and the Mac can't run VMs, as on a
+#     hosted macOS runner
 #   - linux agents in real VMs on that image: the linux backend passes the
 #     vibe-env conformance suite (crates/vibe-env/tests/linux_conformance.rs),
 #     and an agent from the starter profile answers on Opus in auto mode,
@@ -1072,15 +1073,18 @@ s_vm_cycle() {
   done
 }
 
-# N/A only where there's no Docker at all, as on a hosted macOS runner: a VM
-# with no nested virtualization, where Docker's Linux VM couldn't run if it
-# were installed (the release builds the image on ubuntu-24.04-arm,
-# release.yml). A Docker that's there but doesn't answer fails, in
-# base-image.sh.
+# N/A only where there's no Docker and this Mac can't run VMs
+# (kern.hv_support isn't 1), so Docker's Linux VM couldn't run if it were
+# installed: a hosted macOS runner, itself a VM with no nested
+# virtualization. The release builds the image on ubuntu-24.04-arm
+# (release.yml). A Mac that can run VMs and has no Docker fails, with
+# base-image.sh saying what to install; so does a Docker that's there but
+# doesn't answer.
 s_base_image() {
-  local docker=${DOCKER:-docker}
-  if ! command -v "$docker" >/dev/null; then
-    echo "no $docker on this machine to build the image's containers with (kern.hv_support=$(sysctl -n kern.hv_support 2>/dev/null || echo ?), kern.hv_vmm_present=$(sysctl -n kern.hv_vmm_present 2>/dev/null || echo ?))"
+  local docker=${DOCKER:-docker} hv
+  hv=$(sysctl -n kern.hv_support 2>/dev/null || echo 0)
+  if ! command -v "$docker" >/dev/null && [ "$hv" != 1 ]; then
+    echo "no $docker here, and this Mac can't run VMs for one (kern.hv_support=$hv, kern.hv_vmm_present=$(sysctl -n kern.hv_vmm_present 2>/dev/null || echo ?): a VM with no nested virtualization)"
     return $NOT_APPLICABLE
   fi
   scripts/base-image.sh build/base-image

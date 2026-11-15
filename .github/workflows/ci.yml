@@ -5,8 +5,9 @@
 # ad hoc signing and the vibe-vm and VibeOS.app smoke tests. The runner is
 # itself a VM with no nested virtualization and no Docker, so vm-cycle, which
 # boots real VMs, and base-image, which needs Docker, are N/A there and say
-# why (release.yml builds the base image on ubuntu-24.04-arm), and linux-vm,
-# which needs both, is skipped. They need a Mac on real hardware.
+# why (release.yml builds the base image on ubuntu-24.04-arm), and so is
+# linux-vm, which needs base-image, naming it. They need a Mac on real
+# hardware.
 #
 # Pull requests are gated by local checks: scripts/check-full.sh on the box
 # and on Lee's Mac. CI runs only on merges to main or by hand
