@@ -7,8 +7,11 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
-# std and serde_json only: it's linked into vibe-guest, a static musl binary.
+# std, serde_json and libc's bindings only: it's linked into vibe-guest, a
+# static musl binary. libc is to ask the kernel whether a link has ended,
+# which std can't (proxy.rs).
 [dependencies]
+libc.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]

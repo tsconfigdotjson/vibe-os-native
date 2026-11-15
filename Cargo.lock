@@ -1335,6 +1335,7 @@ dependencies = [
 name = "vibe-relay"
 version = "0.1.12"
 dependencies = [
+ "libc",
  "serde_json",
  "tempfile",
 ]
