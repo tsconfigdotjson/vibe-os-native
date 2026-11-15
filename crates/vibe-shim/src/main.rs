@@ -488,8 +488,11 @@ fn start_command(options: &Options, cwd: &std::path::Path) -> Result<Started, St
         .mode(0o700)
         .create(&tmp)
         .map_err(|e| format!("can't create {}: {e}", tmp.display()))?;
-    let pty = pty::spawn(&options.command, cwd, &tmp, options.size)
-        .map_err(|e| format!("can't start {}: {e}", command[0]))?;
+    // The agent's mounts and unmounts stay its own (#169): the shim
+    // makes the namespace while it has one thread, and the command and
+    // everything it starts are in it. Ours too, which mounts nothing.
+    vibe_env::mounts::contain().map_err(|e| vibe_env::mounts::contain_error(&e))?;
+    let pty = pty::spawn(&options.command, cwd, &tmp, options.size)?;
     Ok(Started {
         child_pid: pty.child.id(),
         end: serve::TerminalEnd::Pty(pty),
