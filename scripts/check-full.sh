@@ -149,7 +149,9 @@
 #     across a reboot is scripts/vm-reboot-test.sh, which can't run here. On a Mac that is
 #     itself a VM, such as a CI runner, this step is N/A: it can't nest VMs.
 #   - the Linux base image (scripts/base-image.sh, with Docker): its kernel,
-#     initrd and Debian image, built into build/base-image/
+#     initrd and Debian image, built into build/base-image/. N/A, saying
+#     so, only where there's no Docker and the Mac can't run VMs, as on a
+#     hosted macOS runner
 #   - linux agents in real VMs on that image: the linux backend passes the
 #     vibe-env conformance suite (crates/vibe-env/tests/linux_conformance.rs),
 #     and an agent from the starter profile answers on Opus in auto mode,
@@ -256,20 +258,41 @@ status_of() {
   echo NONE
 }
 
+# note_of <id>: what the summary says of a step that's been recorded.
+note_of() {
+  local i
+  for i in "${!IDS[@]}"; do
+    if [ "${IDS[$i]}" = "$1" ]; then
+      echo "${NOTES[$i]}"
+      return
+    fi
+  done
+}
+
 # A step function that exits with this has nothing it can check here, and
 # says why on its last line: the step is N/A, not a pass.
 NOT_APPLICABLE=77
 
 # step <id> <description> <function> [<id it needs>...]
+# A step whose need is N/A here is N/A too, and says which and why; one
+# whose need failed or was skipped is skipped, which fails a Mac's run.
 step() {
   local id=$1 desc=$2 fn=$3 dep log start rc
   shift 3
   for dep in "$@"; do
-    if [ "$(status_of "$dep")" != PASS ]; then
-      record "$id" SKIP "$desc (needs $dep)"
-      echo "--  $id: skipped, needs $dep"
-      return
-    fi
+    case $(status_of "$dep") in
+      PASS) ;;
+      N/A)
+        record "$id" N/A "$desc: needs $dep, which is N/A here ($(note_of "$dep" | sed 's/^[^:]*: //'))"
+        echo "--  $id: not applicable, needs $dep, which is N/A here"
+        return
+        ;;
+      *)
+        record "$id" SKIP "$desc (needs $dep)"
+        echo "--  $id: skipped, needs $dep"
+        return
+        ;;
+    esac
   done
   log="$LOGS/$id.log"
   start=$SECONDS
@@ -1050,7 +1073,22 @@ s_vm_cycle() {
   done
 }
 
-s_base_image() { scripts/base-image.sh build/base-image; }
+# N/A only where there's no Docker and this Mac can't run VMs
+# (kern.hv_support isn't 1), so Docker's Linux VM couldn't run if it were
+# installed: a hosted macOS runner, itself a VM with no nested
+# virtualization. The release builds the image on ubuntu-24.04-arm
+# (release.yml). A Mac that can run VMs and has no Docker fails, with
+# base-image.sh saying what to install; so does a Docker that's there but
+# doesn't answer.
+s_base_image() {
+  local docker=${DOCKER:-docker} hv
+  hv=$(sysctl -n kern.hv_support 2>/dev/null || echo 0)
+  if ! command -v "$docker" >/dev/null && [ "$hv" != 1 ]; then
+    echo "no $docker here, and this Mac can't run VMs for one (kern.hv_support=$hv, kern.hv_vmm_present=$(sysctl -n kern.hv_vmm_present 2>/dev/null || echo ?): a VM with no nested virtualization)"
+    return $NOT_APPLICABLE
+  fi
+  scripts/base-image.sh build/base-image
+}
 
 s_linux_vm() {
   local marker="$WORK/linux-marker" t token
@@ -1154,7 +1192,9 @@ terminal_up() {
       -e 'end timeout' >/dev/null 2>&1 && return 0
     sleep 0.5
   done
-  echo "Terminal is running but doesn't answer Apple events after 30 s"
+  # The usual cause: macOS is asking whether this process may control
+  # Terminal, and nobody has said yes.
+  echo "Terminal is running but doesn't answer Apple events after 30 s: if macOS asked whether this may control Terminal, allow it in System Settings → Privacy & Security → Automation (in CI, scripts/ci-macos-automation.sh does)"
   return 1
 }
 

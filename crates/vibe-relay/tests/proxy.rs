@@ -116,6 +116,8 @@ struct Broker {
     hellos: Arc<Mutex<Vec<Hello>>>,
     calls: Arc<AtomicUsize>,
     conns: Arc<Mutex<Vec<UnixStream>>>,
+    /// Those whose hello has been answered: links the shim holds.
+    answered: Arc<Mutex<Vec<UnixStream>>>,
 }
 
 impl Broker {
@@ -125,6 +127,7 @@ impl Broker {
             hellos: Arc::default(),
             calls: Arc::default(),
             conns: Arc::default(),
+            answered: Arc::default(),
         };
         let listener = UnixListener::bind(socket).unwrap();
         let b = broker.clone();
@@ -150,6 +153,10 @@ impl Broker {
         (&conn)
             .write_all(local::answer(&Ok(())).as_bytes())
             .unwrap();
+        self.answered
+            .lock()
+            .unwrap()
+            .push(conn.try_clone().unwrap());
         for line in reader.lines() {
             let Ok(line) = line else { return };
             let m: Value = serde_json::from_str(&line).unwrap();
@@ -195,6 +202,16 @@ impl Broker {
     fn hang_up_everyone(&self) {
         for c in self.conns.lock().unwrap().drain(..) {
             let _ = c.shutdown(std::net::Shutdown::Both);
+        }
+    }
+
+    /// Hangs up as macOS leaves it to the shim: the shim reads the end, but
+    /// what it writes still goes through. (A write to a peer that's hung up
+    /// succeeds on macOS; Linux refuses it, unless the peer only stopped
+    /// writing, as here.)
+    fn stop_answering_everyone(&self) {
+        for c in self.answered.lock().unwrap().drain(..) {
+            let _ = c.shutdown(std::net::Shutdown::Write);
         }
     }
 }
@@ -309,6 +326,28 @@ fn a_call_on_a_new_link_isnt_failed_by_the_old_links_end() {
         let answer = c.call(id, "list_issues");
         assert_eq!(tool_text(&answer), "did \"list_issues\"", "{answer}");
     }
+}
+
+/// #173: a call made after the broker has hung up, before the old link's
+/// reader has woken to it, went out on that link, as nothing failed the write
+/// on macOS, and the reader then failed it as dropped. Here every write to the
+/// old link goes through, as on macOS, so each round is that race; each call
+/// must go out on a new link, and be done once.
+#[test]
+fn a_call_after_the_broker_hung_up_goes_on_a_new_link_where_writes_to_the_old_still_go_through() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config(dir.path());
+    let broker = Broker::serve(&config.socket, &["list_issues"]);
+    let mut c = Client::start(config);
+    c.handshake();
+    let before = broker.calls.load(Ordering::SeqCst);
+    for id in 2..60 {
+        broker.stop_answering_everyone();
+        let answer = c.call(id, "list_issues");
+        assert_eq!(tool_text(&answer), "did \"list_issues\"", "{answer}");
+    }
+    // None went down a link the broker had left.
+    assert_eq!(broker.calls.load(Ordering::SeqCst) - before, 58);
 }
 
 #[test]

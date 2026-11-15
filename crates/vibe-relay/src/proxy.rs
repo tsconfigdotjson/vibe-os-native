@@ -14,6 +14,7 @@
 
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -250,6 +251,17 @@ impl Shim {
             let Some(l) = link.as_mut() else {
                 continue;
             };
+            if hung_up(&l.writer) {
+                // The broker has left this link, though its reader hasn't
+                // woken to it yet. Written now, the call would be swallowed
+                // (macOS lets the write through; Linux refuses it) and then
+                // failed by that reader as dropped (#173), so it goes out on
+                // a new link instead.
+                last = "VibeOS's connection dropped".to_owned();
+                let _ = l.writer.shutdown(std::net::Shutdown::Both);
+                *link = None;
+                continue;
+            }
             if let Some(id) = call {
                 lock(&self.state).in_flight.push((id.clone(), l.generation));
             }
@@ -474,6 +486,62 @@ impl Shim {
         }
         Ok(())
     }
+}
+
+/// Whether the broker has hung up on `conn`, though the link's reader may not
+/// have read to the end yet: the kernel says the read side has been shut down,
+/// or the link is broken. That's asked of the kernel rather than peeked, as an
+/// end can wait behind something the broker sent just before it (an answer to
+/// the catalog's poll, say), which a peek would take for a live link. Nothing
+/// is read and nothing waits.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn hung_up(conn: &UnixStream) -> bool {
+    let mut fd = libc::pollfd {
+        fd: conn.as_raw_fd(),
+        events: libc::POLLIN | libc::POLLRDHUP,
+        revents: 0,
+    };
+    // SAFETY: one pollfd, which outlives the call; a zero timeout doesn't wait.
+    let n = unsafe { libc::poll(&raw mut fd, 1, 0) };
+    n > 0 && fd.revents & (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+}
+
+/// As above, from kqueue: a read filter says `EV_EOF` once the read side has
+/// been shut down, whatever is still to read before it.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn hung_up(conn: &UnixStream) -> bool {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    // SAFETY: kqueue has no preconditions; its descriptor is owned at once.
+    let kq = unsafe { libc::kqueue() };
+    if kq < 0 {
+        return false;
+    }
+    // SAFETY: kq was just made, and nothing else owns it.
+    let kq = unsafe { OwnedFd::from_raw_fd(kq) };
+    // SAFETY: an all-zero kevent is a valid value of this plain C struct.
+    let mut change: libc::kevent = unsafe { std::mem::zeroed() };
+    change.ident = conn.as_raw_fd() as libc::uintptr_t;
+    change.filter = libc::EVFILT_READ;
+    change.flags = libc::EV_ADD;
+    // SAFETY: as above.
+    let mut event: libc::kevent = unsafe { std::mem::zeroed() };
+    let now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: one change and room for one event, both outliving the call; a
+    // zero timeout doesn't wait.
+    let n = unsafe {
+        libc::kevent(
+            kq.as_raw_fd(),
+            &raw const change,
+            1,
+            &raw mut event,
+            1,
+            &raw const now,
+        )
+    };
+    n > 0 && event.flags & (libc::EV_EOF | libc::EV_ERROR) != 0
 }
 
 fn error(id: &Value, code: i64, message: &str) -> Value {
