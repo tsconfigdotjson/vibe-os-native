@@ -257,20 +257,41 @@ status_of() {
   echo NONE
 }
 
+# note_of <id>: what the summary says of a step that's been recorded.
+note_of() {
+  local i
+  for i in "${!IDS[@]}"; do
+    if [ "${IDS[$i]}" = "$1" ]; then
+      echo "${NOTES[$i]}"
+      return
+    fi
+  done
+}
+
 # A step function that exits with this has nothing it can check here, and
 # says why on its last line: the step is N/A, not a pass.
 NOT_APPLICABLE=77
 
 # step <id> <description> <function> [<id it needs>...]
+# A step whose need is N/A here is N/A too, and says which and why; one
+# whose need failed or was skipped is skipped, which fails a Mac's run.
 step() {
   local id=$1 desc=$2 fn=$3 dep log start rc
   shift 3
   for dep in "$@"; do
-    if [ "$(status_of "$dep")" != PASS ]; then
-      record "$id" SKIP "$desc (needs $dep)"
-      echo "--  $id: skipped, needs $dep"
-      return
-    fi
+    case $(status_of "$dep") in
+      PASS) ;;
+      N/A)
+        record "$id" N/A "$desc: needs $dep, which is N/A here ($(note_of "$dep" | sed 's/^[^:]*: //'))"
+        echo "--  $id: not applicable, needs $dep, which is N/A here"
+        return
+        ;;
+      *)
+        record "$id" SKIP "$desc (needs $dep)"
+        echo "--  $id: skipped, needs $dep"
+        return
+        ;;
+    esac
   done
   log="$LOGS/$id.log"
   start=$SECONDS
