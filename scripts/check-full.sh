@@ -149,7 +149,8 @@
 #     across a reboot is scripts/vm-reboot-test.sh, which can't run here. On a Mac that is
 #     itself a VM, such as a CI runner, this step is N/A: it can't nest VMs.
 #   - the Linux base image (scripts/base-image.sh, with Docker): its kernel,
-#     initrd and Debian image, built into build/base-image/
+#     initrd and Debian image, built into build/base-image/. N/A on a Mac
+#     that can't run VMs, such as a CI runner, as Docker needs one
 #   - linux agents in real VMs on that image: the linux backend passes the
 #     vibe-env conformance suite (crates/vibe-env/tests/linux_conformance.rs),
 #     and an agent from the starter profile answers on Opus in auto mode,
@@ -1050,7 +1051,20 @@ s_vm_cycle() {
   done
 }
 
-s_base_image() { scripts/base-image.sh build/base-image; }
+# Docker on a Mac runs its containers in a Linux VM, so a Mac that can't run
+# VMs can't build the image: a hosted CI runner, itself a VM with no nested
+# virtualization (kern.hv_support 0). That one alone is N/A; a Mac that can
+# run VMs and has no Docker fails, as base-image.sh says what to install.
+# The release builds the image on an arm64 Linux runner (release.yml).
+s_base_image() {
+  local docker=${DOCKER:-docker}
+  if ! { command -v "$docker" >/dev/null && "$docker" info >/dev/null 2>&1; } &&
+    [ "$(sysctl -n kern.hv_support 2>/dev/null || echo 0)" != 1 ]; then
+    echo "this Mac can't run Docker: it has no hypervisor for Docker's Linux VM (kern.hv_support=0, kern.hv_vmm_present=$(sysctl -n kern.hv_vmm_present 2>/dev/null || echo ?): a VM without nested virtualization), and no $docker that answers"
+    return $NOT_APPLICABLE
+  fi
+  scripts/base-image.sh build/base-image
+}
 
 s_linux_vm() {
   local marker="$WORK/linux-marker" t token
@@ -1154,7 +1168,9 @@ terminal_up() {
       -e 'end timeout' >/dev/null 2>&1 && return 0
     sleep 0.5
   done
-  echo "Terminal is running but doesn't answer Apple events after 30 s"
+  # The usual cause: macOS is asking whether this process may control
+  # Terminal, and nobody has said yes.
+  echo "Terminal is running but doesn't answer Apple events after 30 s: if macOS asked whether this may control Terminal, allow it in System Settings → Privacy & Security → Automation (in CI, scripts/ci-macos-automation.sh does)"
   return 1
 }
 
