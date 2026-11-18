@@ -118,3 +118,60 @@ fn a_walk_allocates_nothing_per_file() {
         "allocations walking 10,000 files: old {before}, new {cold} cold and {big_warm} warm"
     );
 }
+
+/// A source kept by what the OS reports (FSEvents on a Mac, inotify on
+/// Linux) costs nothing between changes: a look that finds none, and the
+/// periodic full walk of a cache that agrees with it, allocate nothing. A
+/// change is listed again on its own.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_kept_tree_allocates_nothing_between_changes() {
+    use std::time::{Duration, Instant};
+    use vibe_env::disk::{Kind, Source, watched};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("kept");
+    tree(&root, 20, 200);
+    let roots = vec![root.clone()];
+    let mut src = watched(roots.clone(), Duration::from_millis(50), None);
+    let mut w = Walker::new();
+    assert_eq!(src.measure(Kind::Full, &mut w), usage(&roots));
+    // FSEvents starts from now, and may report the build's own reads of
+    // directories' times: let it settle.
+    std::thread::sleep(Duration::from_millis(500));
+    while src.changed() == Some(true) {
+        src.measure(Kind::Update, &mut w);
+    }
+    // Warm: once round, so the walker and the source have their buffers.
+    src.changed();
+    src.measure(Kind::Full, &mut w);
+
+    let (changed, looks) = allocations(|| (0..100).map(|_| src.changed()).collect::<Vec<_>>());
+    // The Vec of answers is the only allocation.
+    assert!(looks <= 1, "100 idle looks allocated {looks} times");
+    assert!(changed.iter().all(|c| *c == Some(false)), "{changed:?}");
+    let builds = src.builds();
+    let (bytes, reconcile) = allocations(|| src.measure(Kind::Full, &mut w));
+    assert_eq!(bytes, usage(&roots));
+    assert_eq!(reconcile, 0, "a full walk of a cache that agrees allocated");
+    assert_eq!(src.builds(), builds);
+
+    // A change: only its directory is listed again, which allocates a
+    // little, however big the tree.
+    fs::write(root.join("d1/e1/f0"), vec![1u8; 300_000]).unwrap();
+    let want = usage(&roots);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while src.changed() != Some(true) {
+        assert!(Instant::now() < deadline, "the change wasn't reported");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let (bytes, update) = allocations(|| src.measure(Kind::Update, &mut w));
+    assert_eq!(bytes, want);
+    assert!(
+        update < 64,
+        "an update of one directory allocated {update} times"
+    );
+    eprintln!(
+        "allocations: 100 idle looks {looks}, a reconcile {reconcile}, an update of one directory {update}"
+    );
+}

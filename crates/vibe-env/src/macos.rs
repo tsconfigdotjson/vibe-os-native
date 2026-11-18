@@ -870,21 +870,12 @@ fn wall_ms() -> u64 {
 }
 
 /// How the agent's worktree and temp dir are measured: from a cache that
-/// FSEvents keeps up to date on a Mac, by a walk on every change elsewhere
-/// (where nothing says what changed).
+/// FSEvents keeps up to date on a Mac (inotify on Linux, where this backend
+/// is tested), or by a walk on every change where it can't be kept.
 fn disk_source(agent: &Agent, interval: Duration) -> Box<dyn disk::Source> {
     let roots = vec![agent.worktree.clone(), agent.tmp.clone()];
-    #[cfg(target_os = "macos")]
-    match disk::Cached::new(&roots, (interval / 4).min(Duration::from_secs(1))) {
-        Ok(c) => return Box::new(c),
-        Err(e) => eprintln!(
-            "vibe-env: can't watch {} with FSEvents, so it's walked instead: {e}",
-            agent.worktree.display()
-        ),
-    }
-    #[cfg(not(target_os = "macos"))]
-    let _ = interval;
-    Box::new(disk::Walk::new(roots, None))
+    let latency = (interval / 4).min(Duration::from_secs(1));
+    Box::new(disk::watched(roots, latency, None))
 }
 
 /// The governor's thread: holds the agent to its limits until told to stop

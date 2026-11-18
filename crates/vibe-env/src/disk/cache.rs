@@ -19,9 +19,23 @@
 //! its links, but only the new link's directory changed. So when an update
 //! finds a file with several links that it didn't hold before, it walks
 //! everything afresh. That's rare but for tools that link many files at once
-//! (pnpm, say), and they're measured as a walk would measure them. The total
-//! is then always what a walk would find. Nothing here depends on how
+//! (pnpm, say), and they're measured as a walk would measure them. Likewise
+//! a file with several links written through one of them and that link
+//! then removed: only that link's directory is reported, and with it gone
+//! nothing says what the file takes now, so an update that lets go of a
+//! link to a file it still holds, without seeing what that file takes in
+//! the same update, walks everything afresh too. The total is then always
+//! what a walk would find. Nothing here depends on how
 //! changes are found, so it's tested on every OS.
+//!
+//! What finds them may need to know each directory the cache holds, as
+//! inotify does (a watch per directory): a [`Watcher`] is told of each one
+//! before it's listed, and of each one let go of.
+//!
+//! It holds at most [`MAX_DIRS`] directories and [`MAX_LINKS`] files with
+//! several links. A tree bigger than that is more than it's worth keeping a
+//! directory at a time: the cache says it's [over](Cache::over), and is let
+//! go of for a walk.
 
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
@@ -43,6 +57,42 @@ pub struct Dirty {
 /// More directories than this waiting is taken as everything having
 /// changed: a walk then costs less than keeping them.
 pub const MAX_DIRTY: usize = 4096;
+
+/// The most directories a cache holds, about 9 MiB of them.
+pub const MAX_DIRS: usize = 1 << 16;
+
+/// The most files with several links a cache holds.
+pub const MAX_LINKS: usize = 1 << 17;
+
+/// What has to see each directory the cache holds, to say when it changes.
+pub trait Watcher {
+    /// The directory at `path` is about to be listed, to be held: start
+    /// seeing what changes in it. Returns its tag, `0` for none.
+    fn watch(&mut self, path: &Path) -> i32;
+
+    /// The directory tagged `tag` is held as `node`.
+    fn added(&mut self, tag: i32, node: u32);
+
+    /// The directory tagged `tag`, held as `node`, is let go of.
+    fn removed(&mut self, tag: i32, node: u32);
+
+    /// Every directory is let go of at once.
+    fn cleared(&mut self);
+}
+
+/// Sees nothing, for changes found some other way (FSEvents watches whole
+/// trees).
+#[derive(Debug, Default)]
+pub struct NoWatch;
+
+impl Watcher for NoWatch {
+    fn watch(&mut self, _: &Path) -> i32 {
+        0
+    }
+    fn added(&mut self, _: i32, _: u32) {}
+    fn removed(&mut self, _: i32, _: u32) {}
+    fn cleared(&mut self) {}
+}
 
 impl Dirty {
     pub fn is_empty(&self) -> bool {
@@ -87,6 +137,20 @@ impl Dirty {
 
 const NONE: u32 = u32::MAX;
 
+/// A file with several links.
+#[derive(Debug, Default, Clone, Copy)]
+struct Linked {
+    /// How many of its links the cache holds.
+    count: u32,
+    /// What it takes.
+    bytes: u64,
+    /// The update that last saw what it takes.
+    seen: u32,
+}
+
+/// The parent of a node let go of, whose room waits to be used again.
+const FREED: u32 = u32::MAX - 1;
+
 #[derive(Debug, Default)]
 struct Node {
     parent: u32,
@@ -97,6 +161,8 @@ struct Node {
     /// Its files with several links.
     links: Vec<(u64, u64)>,
     children: Vec<u32>,
+    /// What its [`Watcher`] tagged it, `0` for nothing.
+    tag: i32,
 }
 
 /// One of the tree's roots.
@@ -115,14 +181,23 @@ pub struct Cache {
     roots: Vec<Root>,
     nodes: Vec<Node>,
     free: Vec<u32>,
-    /// Each file with several links, by device and inode: how many of its
-    /// links the cache holds, and its bytes.
-    links: HashMap<(u64, u64), (u32, u64)>,
+    /// Each file with several links, by device and inode.
+    links: HashMap<(u64, u64), Linked>,
+    /// Counts updates, to say which of them last saw what a file with
+    /// several links takes.
+    updates: u32,
+    /// Files with several links that the update running let go of a link
+    /// to, but still holds.
+    unsure: Vec<(u64, u64)>,
     total: u64,
     /// While an update runs: whether it must walk everything afresh, as it
     /// found a file with several links that it didn't hold before, or a
     /// change it can't place.
     rebuild: Option<bool>,
+    /// The most directories and files with several links it holds.
+    max: (usize, usize),
+    /// Whether it found more than that.
+    over: bool,
 }
 
 impl Cache {
@@ -142,13 +217,32 @@ impl Cache {
             nodes: Vec::new(),
             free: Vec::new(),
             links: HashMap::new(),
+            updates: 0,
+            unsure: Vec::new(),
             total: 0,
             rebuild: None,
+            max: (MAX_DIRS, MAX_LINKS),
+            over: false,
         }
     }
 
+    /// Holds no more than `dirs` directories and `links` files with several
+    /// links.
+    pub fn with_max(mut self, dirs: usize, links: usize) -> Cache {
+        self.max = (dirs, links);
+        self
+    }
+
+    /// What the tree takes, unless it's [over](Cache::over).
     pub fn total(&self) -> u64 {
         self.total
+    }
+
+    /// Whether the tree has more directories or files with several links
+    /// than it holds. Its total then means nothing, and it holds only part
+    /// of the tree, until it's built again.
+    pub fn over(&self) -> bool {
+        self.over
     }
 
     /// How many directories it holds.
@@ -156,31 +250,107 @@ impl Cache {
         self.nodes.len() - self.free.len()
     }
 
+    /// Whether most of the room it has for directories is unused, after a
+    /// tree that shrank, so that it's worth building afresh to let go of
+    /// it.
+    pub fn sparse(&self) -> bool {
+        self.nodes.len() >= 1024 && self.free.len() * 2 > self.nodes.len()
+    }
+
+    /// The path of directory `node`, if it holds one.
+    pub fn path(&self, node: u32) -> Option<PathBuf> {
+        let mut top = node;
+        // No deeper than it holds directories, so a node let go of (whose
+        // parent means nothing) can't send it round for ever.
+        for _ in 0..=self.nodes.len() {
+            let n = self.nodes.get(top as usize)?;
+            match n.parent {
+                NONE => break,
+                FREED => return None,
+                p => top = p,
+            }
+        }
+        if self.nodes.get(top as usize)?.parent != NONE {
+            return None;
+        }
+        let root = self.roots.iter().position(|r| r.node == top)?;
+        Some(self.path_of(root, node))
+    }
+
+    /// The root `node` is, if it's one.
+    pub fn root_of(&self, node: u32) -> Option<&Path> {
+        self.roots
+            .iter()
+            .find(|r| r.node == node)
+            .map(|r| r.path.as_path())
+    }
+
     /// Walks every root afresh.
     pub fn build(&mut self, walker: &mut Walker) {
-        self.nodes = Vec::new();
+        self.build_watched(walker, &mut NoWatch);
+    }
+
+    /// Walks every root afresh, `watcher` seeing each directory.
+    pub fn build_watched(&mut self, walker: &mut Walker, watcher: &mut dyn Watcher) {
+        watcher.cleared();
+        // Kept, as a build mostly fills it again.
+        self.nodes.clear();
         self.free = Vec::new();
         self.links = HashMap::new();
         self.total = 0;
+        self.over = false;
+        for r in &mut self.roots {
+            r.node = NONE;
+            r.file = None;
+        }
         for i in 0..self.roots.len() {
-            self.walk_root(i, walker);
+            self.walk_root(i, walker, watcher);
+        }
+        // A tree that shrank lets go of the room it took.
+        if self.nodes.capacity() > 2 * self.nodes.len() + 1024 {
+            self.nodes.shrink_to_fit();
         }
     }
 
     /// Brings it up to date with what `dirty` says changed.
     pub fn update(&mut self, dirty: &Dirty, walker: &mut Walker) {
-        if dirty.all {
-            self.build(walker);
+        self.update_watched(dirty, walker, &mut NoWatch);
+    }
+
+    /// Brings it up to date with what `dirty` says changed, `watcher`
+    /// seeing each directory it takes up or lets go of.
+    pub fn update_watched(
+        &mut self,
+        dirty: &Dirty,
+        walker: &mut Walker,
+        watcher: &mut dyn Watcher,
+    ) {
+        if dirty.all || self.over {
+            self.build_watched(walker, watcher);
             return;
         }
+        self.updates = self.updates.wrapping_add(1);
         self.rebuild = Some(false);
-        self.apply(dirty, walker);
+        self.apply(dirty, walker, watcher);
+        // A file it let go of a link to, and still holds, takes what was
+        // last seen, unless this update saw it again: it may have been
+        // written through the link that's gone.
+        let updates = self.updates;
+        let unsure = std::mem::take(&mut self.unsure);
+        if unsure
+            .iter()
+            .any(|k| self.links.get(k).is_some_and(|e| e.seen != updates))
+        {
+            self.rebuild = Some(true);
+        }
+        // Let go of: it's seldom needed, and then briefly.
+        drop(unsure);
         if self.rebuild.take() == Some(true) {
-            self.build(walker);
+            self.build_watched(walker, watcher);
         }
     }
 
-    fn apply(&mut self, dirty: &Dirty, walker: &mut Walker) {
+    fn apply(&mut self, dirty: &Dirty, walker: &mut Walker, watcher: &mut dyn Watcher) {
         // Shallower first, so a directory listed again has its new and gone
         // directories sorted out before anything under it is looked at.
         let mut todo: Vec<(&PathBuf, bool)> = dirty.dirs.iter().map(|(p, r)| (p, *r)).collect();
@@ -188,8 +358,8 @@ impl Cache {
         // What's been walked whole already.
         let mut whole: Vec<PathBuf> = Vec::new();
         for (path, recursive) in todo {
-            if self.rebuild == Some(true) {
-                // Everything is walked afresh anyway.
+            if self.rebuild == Some(true) || self.over {
+                // Everything is walked afresh anyway, or let go of.
                 return;
             }
             if whole.iter().any(|w| path.starts_with(w)) {
@@ -205,15 +375,15 @@ impl Cache {
             if node == NONE {
                 // The root itself isn't a directory the cache has.
                 whole.push(self.roots[root].path.clone());
-                self.drop_root(root);
-                self.walk_root(root, walker);
+                self.drop_root(root, watcher);
+                self.walk_root(root, walker, watcher);
                 continue;
             }
             if recursive && exact {
-                self.rewalk(root, node, walker);
+                self.rewalk(root, node, walker, watcher);
                 whole.push(path.clone());
             } else {
-                self.relist(root, node, walker);
+                self.relist(root, node, walker, watcher);
             }
         }
     }
@@ -267,14 +437,16 @@ impl Cache {
     }
 
     /// Walks root `i`, which holds nothing now, whole.
-    fn walk_root(&mut self, i: usize, walker: &mut Walker) {
+    fn walk_root(&mut self, i: usize, walker: &mut Walker, watcher: &mut dyn Watcher) {
         let path = self.roots[i].path.clone();
         let mut b = Builder {
             cache: self,
+            watcher,
             stack: Vec::new(),
             parent: NONE,
             first: NONE,
             file: None,
+            tag: 0,
         };
         walker.walk(&path, usize::MAX, &mut b);
         let (first, file) = (b.first, b.file);
@@ -294,10 +466,10 @@ impl Cache {
     }
 
     /// Lets go of everything root `i` holds.
-    fn drop_root(&mut self, i: usize) {
+    fn drop_root(&mut self, i: usize, watcher: &mut dyn Watcher) {
         let node = std::mem::replace(&mut self.roots[i].node, NONE);
         if node != NONE {
-            self.remove(node);
+            self.remove(node, watcher);
         }
         match self.roots[i].file.take() {
             Some(s) if s.links > 1 => self.unlink((s.dev, s.ino)),
@@ -307,37 +479,45 @@ impl Cache {
     }
 
     /// Walks again everything under `node`.
-    fn rewalk(&mut self, root: usize, node: u32, walker: &mut Walker) {
+    fn rewalk(&mut self, root: usize, node: u32, walker: &mut Walker, watcher: &mut dyn Watcher) {
         let parent = self.nodes[node as usize].parent;
         let path = self.path_of(root, node);
         if parent == NONE {
-            self.drop_root(root);
-            self.walk_root(root, walker);
+            self.drop_root(root, watcher);
+            self.walk_root(root, walker, watcher);
             return;
         }
-        self.remove(node);
-        if !self.walk_under(parent, &path, walker) {
+        self.remove(node, watcher);
+        if !self.walk_under(parent, &path, walker, watcher) {
             // Not a directory now: its parent counts what's there.
-            self.relist(root, parent, walker);
+            self.relist(root, parent, walker, watcher);
         }
     }
 
     /// Walks the directory at `path`, new under `parent`, whole. Returns
     /// whether there was one.
-    fn walk_under(&mut self, parent: u32, path: &Path, walker: &mut Walker) -> bool {
+    fn walk_under(
+        &mut self,
+        parent: u32,
+        path: &Path,
+        walker: &mut Walker,
+        watcher: &mut dyn Watcher,
+    ) -> bool {
         let mut b = Builder {
             cache: self,
+            watcher,
             stack: Vec::new(),
             parent,
             first: NONE,
             file: None,
+            tag: 0,
         };
         walker.walk(path, usize::MAX, &mut b);
         b.first != NONE
     }
 
     /// Lists `node` again, walking only what's new in it.
-    fn relist(&mut self, root: usize, node: u32, walker: &mut Walker) {
+    fn relist(&mut self, root: usize, node: u32, walker: &mut Walker, watcher: &mut dyn Watcher) {
         let path = self.path_of(root, node);
         let mut r = Relist {
             listed: None,
@@ -348,16 +528,16 @@ impl Cache {
             // Gone, or not a directory now: its parent says what's there.
             let parent = self.nodes[node as usize].parent;
             if parent == NONE {
-                self.drop_root(root);
-                self.walk_root(root, walker);
+                self.drop_root(root, watcher);
+                self.walk_root(root, walker, watcher);
             } else {
-                self.relist(root, parent, walker);
+                self.relist(root, parent, walker, watcher);
             }
             return;
         };
         if listed.ino != self.nodes[node as usize].ino {
             // Another directory by the same name: none of it is known.
-            self.rewalk(root, node, walker);
+            self.rewalk(root, node, walker, watcher);
             return;
         }
         self.set_own(node, listed.own, &listed.links);
@@ -381,13 +561,16 @@ impl Cache {
         let gone: Vec<u32> = by_name.into_values().collect();
         self.nodes[node as usize].children = kept;
         for c in gone {
-            self.remove(c);
+            self.remove(c, watcher);
         }
         for name in new {
-            if let Some(c) = self.child(node, &name) {
-                self.remove(c);
+            if self.over {
+                return;
             }
-            self.walk_under(node, &path.join(&name), walker);
+            if let Some(c) = self.child(node, &name) {
+                self.remove(c, watcher);
+            }
+            self.walk_under(node, &path.join(&name), walker, watcher);
         }
     }
 
@@ -408,24 +591,30 @@ impl Cache {
     /// Counts one more link to `l`, and its bytes if it's the first, or
     /// what it takes now if that changed.
     fn link(&mut self, l: &Link) -> (u64, u64) {
-        let e = self.links.entry(l.key()).or_insert((0, 0));
-        if e.0 == 0
+        if self.links.len() >= self.max.1 && !self.links.contains_key(&l.key()) {
+            self.over = true;
+        }
+        let e = self.links.entry(l.key()).or_default();
+        if e.count == 0
             && let Some(rebuild) = &mut self.rebuild
         {
             *rebuild = true;
         }
-        e.0 += 1;
-        self.total = self.total.saturating_sub(e.1).saturating_add(l.bytes);
-        e.1 = l.bytes;
+        e.count += 1;
+        self.total = self.total.saturating_sub(e.bytes).saturating_add(l.bytes);
+        e.bytes = l.bytes;
+        e.seen = self.updates;
         l.key()
     }
 
     fn unlink(&mut self, k: (u64, u64)) {
         if let Some(e) = self.links.get_mut(&k) {
-            e.0 -= 1;
-            if e.0 == 0 {
-                self.total = self.total.saturating_sub(e.1);
+            e.count -= 1;
+            if e.count == 0 {
+                self.total = self.total.saturating_sub(e.bytes);
                 self.links.remove(&k);
+            } else if self.rebuild.is_some() {
+                self.unsure.push(k);
             }
         }
     }
@@ -441,7 +630,7 @@ impl Cache {
     }
 
     /// Removes `node` and everything under it.
-    fn remove(&mut self, node: u32) {
+    fn remove(&mut self, node: u32, watcher: &mut dyn Watcher) {
         let parent = self.nodes[node as usize].parent;
         if parent != NONE {
             self.nodes[parent as usize].children.retain(|&c| c != node);
@@ -449,19 +638,60 @@ impl Cache {
         let mut stack = vec![node];
         while let Some(n) = stack.pop() {
             let gone = std::mem::take(&mut self.nodes[n as usize]);
+            if gone.tag != 0 {
+                watcher.removed(gone.tag, n);
+            }
             self.total = self.total.saturating_sub(gone.own);
             for k in gone.links {
                 self.unlink(k);
             }
             stack.extend(gone.children);
+            self.nodes[n as usize].parent = FREED;
             self.free.push(n);
         }
+    }
+}
+
+#[cfg(test)]
+impl Cache {
+    /// Where it differs from a cache of the same roots built afresh, for a
+    /// test that finds its total isn't what a walk finds.
+    pub(crate) fn differences(&self) -> String {
+        type Sizes = std::collections::BTreeMap<PathBuf, (u64, Vec<(u64, u64)>)>;
+        fn sizes(c: &Cache) -> Sizes {
+            let mut out = Sizes::new();
+            for (i, n) in c.nodes.iter().enumerate() {
+                if n.parent == FREED {
+                    continue;
+                }
+                if let Some(p) = c.path(i as u32) {
+                    let mut links = n.links.clone();
+                    links.sort_unstable();
+                    out.insert(p, (n.own, links));
+                }
+            }
+            out
+        }
+        let mut fresh = Cache::new(self.roots.iter().map(|r| r.path.clone()).collect());
+        fresh.build(&mut Walker::new());
+        let (mine, theirs) = (sizes(self), sizes(&fresh));
+        let mut out = String::new();
+        for (p, v) in &theirs {
+            if mine.get(p) != Some(v) {
+                out += &format!("\n{}: kept {:?}, walked {v:?}", p.display(), mine.get(p));
+            }
+        }
+        for p in mine.keys().filter(|p| !theirs.contains_key(*p)) {
+            out += &format!("\n{}: kept, not there", p.display());
+        }
+        out
     }
 }
 
 /// Adds what a walk finds under `parent` to the cache.
 struct Builder<'a> {
     cache: &'a mut Cache,
+    watcher: &'a mut dyn Watcher,
     /// The directory last listed at each depth of the walk.
     stack: Vec<u32>,
     parent: u32,
@@ -469,18 +699,40 @@ struct Builder<'a> {
     first: u32,
     /// The walk's root, when it isn't a directory.
     file: Option<Stat>,
+    /// What the watcher tagged the directory being listed.
+    tag: i32,
 }
 
 impl Visit for Builder<'_> {
+    fn opening(&mut self, path: &Path, _: usize) {
+        self.tag = if self.cache.over {
+            0
+        } else {
+            self.watcher.watch(path)
+        };
+    }
+
     fn dir(&mut self, l: &Listing<'_>) -> bool {
+        let tag = std::mem::take(&mut self.tag);
+        if self.cache.over || self.cache.dirs() >= self.cache.max.0 {
+            // More than it holds: what it has is let go of anyway, so
+            // nothing more is walked. A watch already made for this one
+            // goes with the watcher's others.
+            self.cache.over = true;
+            return false;
+        }
         self.stack.truncate(l.depth);
         let parent = self.stack.last().copied().unwrap_or(self.parent);
         let node = self.cache.alloc(Node {
             parent,
             name: l.name().as_bytes().into(),
             ino: l.stat.ino,
+            tag,
             ..Node::default()
         });
+        if tag != 0 {
+            self.watcher.added(tag, node);
+        }
         self.cache.set_own(node, l.own, l.links);
         if parent != NONE {
             self.cache.nodes[parent as usize].children.push(node);
@@ -528,7 +780,14 @@ mod tests {
     use std::fs;
 
     fn check(cache: &Cache, roots: &[PathBuf], what: &str) {
-        assert_eq!(cache.total(), usage(roots), "after {what}");
+        if cache.total() != usage(roots) {
+            panic!(
+                "after {what}, kept {} but walked {}:{}",
+                cache.total(),
+                usage(roots),
+                cache.differences()
+            );
+        }
     }
 
     fn dirty(dirs: &[(&Path, bool)]) -> Dirty {
@@ -706,6 +965,40 @@ mod tests {
     }
 
     #[test]
+    fn a_file_written_through_a_link_then_gone_isnt_left_as_it_was() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a");
+        fs::create_dir_all(a.join("one")).unwrap();
+        fs::create_dir_all(a.join("two")).unwrap();
+        fs::write(a.join("one/f"), vec![1u8; 50_000]).unwrap();
+        fs::hard_link(a.join("one/f"), a.join("two/g")).unwrap();
+        let roots = vec![a.clone()];
+        let mut w = Walker::new();
+        let mut c = Cache::new(roots.clone());
+        c.build(&mut w);
+        // Grown through one link, which then goes: only its directory is
+        // reported, and the other still holds the file.
+        {
+            use std::io::Write;
+            let mut f = fs::OpenOptions::new()
+                .append(true)
+                .open(a.join("two/g"))
+                .unwrap();
+            f.write_all(&vec![2u8; 400_000]).unwrap();
+        }
+        fs::remove_file(a.join("two/g")).unwrap();
+        c.update(&dirty(&[(&a.join("two"), false)]), &mut w);
+        check(&c, &roots, "a file grown through a link that's gone");
+        // A link moved to another directory, both reported, needs nothing
+        // walked afresh to stay exact.
+        fs::hard_link(a.join("one/f"), a.join("two/h")).unwrap();
+        c.update(&dirty(&[(&a.join("two"), false)]), &mut w);
+        fs::rename(a.join("two/h"), a.join("h")).unwrap();
+        c.update(&dirty(&[(&a.join("two"), false), (&a, false)]), &mut w);
+        check(&c, &roots, "a link moved");
+    }
+
+    #[test]
     fn symbolic_links_arent_followed() {
         let tmp = tempfile::tempdir().unwrap();
         let (a, out) = (tmp.path().join("a"), tmp.path().join("out"));
@@ -764,7 +1057,7 @@ mod tests {
         for round in 0..60 {
             let mut d = Dirty::default();
             for _ in 0..8 {
-                match rng.below(6) {
+                match rng.below(7) {
                     0 => {
                         let parent = dirs[rng.below(dirs.len())].clone();
                         let new = parent.join(format!("d{}", rng.next() % 1000));
@@ -805,6 +1098,16 @@ mod tests {
                             dirs.retain(|x| !x.starts_with(&gone));
                             files.retain(|x| !x.starts_with(&gone));
                             d.mark(gone.parent().unwrap(), false);
+                        }
+                    }
+                    // Appended to, through whichever link: reported as the
+                    // directory of that link.
+                    6 if !files.is_empty() => {
+                        use std::io::Write;
+                        let f = files[rng.below(files.len())].clone();
+                        if let Ok(mut h) = fs::OpenOptions::new().append(true).open(&f) {
+                            let _ = h.write_all(&vec![2u8; rng.below(300_000)]);
+                            d.mark(f.parent().unwrap(), false);
                         }
                     }
                     _ => {}

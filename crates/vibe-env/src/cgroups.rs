@@ -42,8 +42,9 @@
 //!   `pids.max`; its memory in RAM and swap at [`PAUSE_PERCENT`] of the
 //!   profile's, or an OOM in it. It holds the worktree and temp dir to
 //!   `disk_soft` (a warning) and `disk_hard` (a pause) as [`crate::disk`]
-//!   measures them: while the agent runs, when its processes wrote
-//!   something ([`Writes`]). Memory at 80% is a warning. A pause holds until a wake,
+//!   measures them: while the agent runs, listing again what inotify says
+//!   changed, or for a tree too big to watch walking it when its processes
+//!   wrote something ([`Writes`]). Memory at 80% is a warning. A pause holds until a wake,
 //!   across restarts of `vibed` too (the kernel keeps the cgroup frozen and
 //!   [`STATE_FILE`] says why).
 //! - **Sleep** is the cgroup freezer (`cgroup.freeze`), which is exact, and
@@ -435,6 +436,9 @@ fn own_memory(current: u64, stat: &HashMap<String, u64>) -> u64 {
 #[derive(Debug)]
 struct Writes {
     cg: Cgroup,
+    io_stat: PathBuf,
+    /// `/proc/<pid>/io`, for the pid being read.
+    proc_io: String,
     /// What `io.stat` said last.
     io: Option<u64>,
     /// What each process had written at the last look, and at which look.
@@ -448,6 +452,8 @@ struct Writes {
 impl Writes {
     fn new(cg: Cgroup) -> Writes {
         Writes {
+            io_stat: cg.dir.join("io.stat"),
+            proc_io: String::new(),
             cg,
             io: None,
             procs: HashMap::new(),
@@ -457,12 +463,12 @@ impl Writes {
         }
     }
 
-    /// Reads `path` into the buffer.
-    fn read(&mut self, path: &Path) -> bool {
+    /// Reads `path` into `buf`.
+    fn read(path: &Path, buf: &mut String) -> bool {
         use std::io::Read as _;
-        self.buf.clear();
+        buf.clear();
         fs::File::open(path)
-            .and_then(|mut f| f.read_to_string(&mut self.buf))
+            .and_then(|mut f| f.read_to_string(buf))
             .is_ok()
     }
 }
@@ -498,8 +504,7 @@ impl disk::Signal for Writes {
         let fresh = std::mem::replace(&mut self.fresh, false);
         let mut knows = false;
         let mut wrote = false;
-        let io_stat = self.cg.dir.join("io.stat");
-        if self.read(&io_stat) {
+        if Writes::read(&self.io_stat, &mut self.buf) {
             let io = io_written(&self.buf);
             knows = true;
             wrote |= self.io.is_some_and(|was| was != io);
@@ -508,8 +513,10 @@ impl disk::Signal for Writes {
         self.looks += 1;
         let look = self.looks;
         for pid in self.cg.pids() {
-            let path = PathBuf::from(format!("/proc/{pid}/io"));
-            if !self.read(&path) {
+            use std::fmt::Write as _;
+            self.proc_io.clear();
+            let _ = write!(self.proc_io, "/proc/{pid}/io");
+            if !Writes::read(Path::new(&self.proc_io), &mut self.buf) {
                 continue;
             }
             let Some(written) = proc_written(&self.buf) else {
@@ -1483,12 +1490,15 @@ fn watch(
     // Counted from what's been refused when it first looks, unless a launch
     // or a wake says otherwise.
     let mut base: Option<Baseline> = None;
-    // Measured while it runs, when its processes wrote something; what it
-    // took when it last ran is kept while it's frozen, as it can't change.
+    // Measured while it runs, where inotify says it changed (or, for a tree
+    // too big to watch, by a walk when its processes wrote something); what
+    // it took when it last ran is kept while it's frozen, as it can't
+    // change.
     let track = meter.track(
         agent.worktree.clone(),
-        Box::new(disk::Walk::new(
+        Box::new(disk::watched(
             vec![agent.worktree.clone(), agent.tmp.clone()],
+            Duration::ZERO,
             Some(Box::new(Writes::new(cg.clone()))),
         )),
     );
