@@ -673,6 +673,7 @@ impl Shim {
                 poll_connected: Duration::from_millis(200),
                 poll_away: Duration::from_millis(100),
                 first_list: Duration::from_secs(3),
+                ..proxy::Timing::default()
             },
         };
         std::thread::spawn(move || {
