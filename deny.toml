@@ -13,5 +13,13 @@ unused-ignored-advisory = "deny"
 # Every exception is listed with why it can't be fixed yet, and why it's safe
 # until it can:
 #   { id = "RUSTSEC-0000-0000", reason = "..." },
-# None today.
-ignore = []
+ignore = [
+  # chrono 0.4.45 (unmaintained) is transitive only: via rmcp, a required
+  # dependency of it on non-wasm targets, and via schemars' chrono04 feature,
+  # which rmcp's `server` feature turns on. None of our code uses chrono.
+  # Upstream tracking: https://github.com/modelcontextprotocol/rust-sdk/issues/1469
+  # Tracked in #176.
+  # REMOVE this ignore when rmcp ships a release that makes chrono optional or
+  # drops it (bump rmcp then).
+  { id = "RUSTSEC-2026-0543", reason = "chrono is transitive only, via rmcp and schemars' chrono04, and unused by our code; remove once rmcp drops it (modelcontextprotocol/rust-sdk#1469)" },
+]
