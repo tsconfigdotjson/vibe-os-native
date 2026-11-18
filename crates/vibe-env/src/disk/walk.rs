@@ -148,7 +148,8 @@ pub struct Walker {
 const KEEP_SEEN: usize = 1 << 16;
 
 /// A buffer that grew past this many bytes, for a directory with very many
-/// entries, is let go of when a walk ends rather than kept for the next.
+/// entries, is let go of once a measurement ends rather than kept for the
+/// next ([`Walker::trim`]).
 const KEEP_BYTES: usize = 1 << 20;
 
 impl Walker {
@@ -237,12 +238,12 @@ impl Walker {
                 self.names.truncate(mark);
             }
         }
-        self.trim();
     }
 
     /// Lets go of any buffer a walk of an unusually wide directory grew
-    /// past [`KEEP_BYTES`], so a walker keeps only what ordinary trees need.
-    fn trim(&mut self) {
+    /// past [`KEEP_BYTES`], so a walker keeps only what ordinary trees need
+    /// between measurements.
+    pub fn trim(&mut self) {
         fn trim<T>(v: &mut Vec<T>) {
             if v.capacity() * std::mem::size_of::<T>() > KEEP_BYTES {
                 *v = Vec::new();

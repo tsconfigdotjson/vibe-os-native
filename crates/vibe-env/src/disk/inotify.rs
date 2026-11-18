@@ -92,6 +92,8 @@ pub struct Inotify {
     /// The most watches the process may hold before this stops making
     /// more.
     budget: usize,
+    /// The most watches this instance may hold.
+    most: usize,
     failed: bool,
 }
 
@@ -116,8 +118,15 @@ impl Inotify {
             path: Vec::new(),
             seen: HashSet::new(),
             budget,
+            most: usize::MAX,
             failed: false,
         }
+    }
+
+    /// One that fails rather than hold more than `most` watches itself.
+    pub fn with_most(mut self, most: usize) -> Inotify {
+        self.most = most;
+        self
     }
 
     /// How many watches it holds.
@@ -187,7 +196,7 @@ impl Watcher for Inotify {
         if self.failed {
             return 0;
         }
-        if HELD.load(Ordering::SeqCst) >= self.budget {
+        if HELD.load(Ordering::SeqCst) >= self.budget || self.watches.len() >= self.most {
             self.failed = true;
             return 0;
         }
@@ -596,8 +605,10 @@ mod tests {
             fs::create_dir_all(root.join(format!("d{i}"))).unwrap();
         }
         let mut w = Walker::new();
-        // As if the process held nearly all it may.
-        let mut ino = Inotify::with_budget(held() + 5);
+        // As if the process had but five more it may hold (the budget
+        // the process holds across agents works the same way, but other
+        // tests change it as they run).
+        let mut ino = Inotify::new().with_most(5);
         let mut c = Cache::new(vec![root]);
         c.build_watched(&mut w, &mut ino);
         assert!(ino.failed());

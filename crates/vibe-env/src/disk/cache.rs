@@ -317,17 +317,27 @@ impl Cache {
         self.update_watched(dirty, walker, &mut NoWatch);
     }
 
+    /// Each root that isn't there (or can't be looked at), which nothing
+    /// watching the trees will say has come back.
+    pub fn missing(&self) -> impl Iterator<Item = &Path> {
+        self.roots
+            .iter()
+            .filter(|r| r.node == NONE && r.file.is_none())
+            .map(|r| r.path.as_path())
+    }
+
     /// Brings it up to date with what `dirty` says changed, `watcher`
-    /// seeing each directory it takes up or lets go of.
+    /// seeing each directory it takes up or lets go of. Returns whether
+    /// that took building it afresh.
     pub fn update_watched(
         &mut self,
         dirty: &Dirty,
         walker: &mut Walker,
         watcher: &mut dyn Watcher,
-    ) {
+    ) -> bool {
         if dirty.all || self.over {
             self.build_watched(walker, watcher);
-            return;
+            return true;
         }
         self.updates = self.updates.wrapping_add(1);
         self.rebuild = Some(false);
@@ -347,7 +357,9 @@ impl Cache {
         drop(unsure);
         if self.rebuild.take() == Some(true) {
             self.build_watched(walker, watcher);
+            return true;
         }
+        false
     }
 
     fn apply(&mut self, dirty: &Dirty, walker: &mut Walker, watcher: &mut dyn Watcher) {

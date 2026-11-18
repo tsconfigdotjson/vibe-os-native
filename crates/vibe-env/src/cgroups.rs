@@ -44,7 +44,8 @@
 //!   `disk_soft` (a warning) and `disk_hard` (a pause) as [`crate::disk`]
 //!   measures them: while the agent runs, listing again what inotify says
 //!   changed, or for a tree too big to watch walking it when its processes
-//!   wrote something ([`Writes`]). Memory at 80% is a warning. A pause holds until a wake,
+//!   wrote something ([`Writes`]); and walking it whole once they've written
+//!   [`disk::LOUD`] since the last, for what no watch sees. Memory at 80% is a warning. A pause holds until a wake,
 //!   across restarts of `vibed` too (the kernel keeps the cgroup frozen and
 //!   [`STATE_FILE`] says why).
 //! - **Sleep** is the cgroup freezer (`cgroup.freeze`), which is exact, and
@@ -446,6 +447,8 @@ struct Writes {
     looks: u64,
     /// Whether the next look is a baseline.
     fresh: bool,
+    /// About how many bytes it wrote since the last reset.
+    bytes: u64,
     buf: String,
 }
 
@@ -459,6 +462,7 @@ impl Writes {
             procs: HashMap::new(),
             looks: 0,
             fresh: true,
+            bytes: 0,
             buf: String::new(),
         }
     }
@@ -504,10 +508,13 @@ impl disk::Signal for Writes {
         let fresh = std::mem::replace(&mut self.fresh, false);
         let mut knows = false;
         let mut wrote = false;
+        // What this look found written, by io.stat and by the processes.
+        let (mut by_io, mut by_procs) = (0u64, 0u64);
         if Writes::read(&self.io_stat, &mut self.buf) {
             let io = io_written(&self.buf);
             knows = true;
             wrote |= self.io.is_some_and(|was| was != io);
+            by_io = self.io.map_or(0, |was| io.saturating_sub(was));
             self.io = Some(io);
         }
         self.looks += 1;
@@ -524,19 +531,32 @@ impl disk::Signal for Writes {
             };
             knows = true;
             match self.procs.insert(pid, (written, look)) {
-                Some((was, _)) => wrote |= was != written,
+                Some((was, _)) => {
+                    wrote |= was != written;
+                    by_procs = by_procs.saturating_add(written.saturating_sub(was));
+                }
                 // New since the last look, and it wrote already.
-                None => wrote |= !fresh && written > 0,
+                None if !fresh => {
+                    wrote |= written > 0;
+                    by_procs = by_procs.saturating_add(written);
+                }
+                None => {}
             }
         }
         self.procs.retain(|_, (_, at)| *at == look);
+        self.bytes = self.bytes.saturating_add(by_io.max(by_procs));
         knows.then_some(wrote && !fresh)
+    }
+
+    fn bytes(&self) -> Option<u64> {
+        Some(self.bytes)
     }
 
     fn reset(&mut self) {
         self.fresh = true;
         self.io = None;
         self.procs.clear();
+        self.bytes = 0;
     }
 }
 
@@ -1827,10 +1847,14 @@ mod tests {
         write(1);
         assert_eq!(w.wrote(), Some(false));
         assert_eq!(w.wrote(), Some(false));
-        // What `head` wrote is its parent's once reaped.
+        assert_eq!(w.bytes(), Some(0), "a baseline counts nothing");
+        // What `head` wrote is its parent's once reaped, and counted: a
+        // MiB, give or take what the shell wrote.
         write(2);
         assert_eq!(w.wrote(), Some(true));
         assert_eq!(w.wrote(), Some(false));
+        let after = w.bytes().unwrap();
+        assert!((1 << 20..2 << 20).contains(&after), "{after}");
         // io.stat, where there is one, says too.
         fs::write(
             cg_dir.join("io.stat"),
@@ -1845,10 +1869,13 @@ mod tests {
         .unwrap();
         assert_eq!(w.wrote(), Some(true));
         assert_eq!(w.wrote(), Some(false));
+        // What io.stat said more than the processes did is counted too.
+        assert_eq!(w.bytes(), Some(after + 4096));
         // A reset starts again from a baseline.
         write(3);
         w.reset();
         assert_eq!(w.wrote(), Some(false));
+        assert_eq!(w.bytes(), Some(0));
         drop(tell);
         child.wait().unwrap();
         // Nothing to read: it can't tell.

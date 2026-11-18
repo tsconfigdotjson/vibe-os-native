@@ -27,10 +27,14 @@
 //!   full walk every [`RECONCILE`] intervals whatever the source says, for
 //!   what no source sees (a process outside the agent writing into its
 //!   tree, say); and, while the filesystem has less than
-//!   [`vibe_core::limits::MIN_FREE_DISK`] free, [`TIGHT`] times an
-//!   interval (every 15 s), change or not. The full walk of a cache checks
-//!   it: a cache that agrees is kept as it is, and only one that doesn't is
-//!   built afresh.
+//!   [`vibe_core::limits::MIN_FREE_DISK`] free, a full walk [`TIGHT`]
+//!   times an interval (every 15 s), change or not. The full walk of a
+//!   cache checks it: a cache that agrees is kept as it is, and only one
+//!   that doesn't is built afresh. Where the agent's processes can be
+//!   asked what they wrote (on a Linux host), a full walk also comes once
+//!   they've written [`LOUD`] since the last, so what no watch sees (a file
+//!   in the trees grown through a link from outside them, or through
+//!   `mmap`) can't go further than that unmeasured.
 //! - **Holding little.** A frozen agent's cache, and its watches, are let
 //!   go of, and its wake builds them afresh. A cache holds at most
 //!   [`cache::MAX_DIRS`] directories. The worker lets go of its walker's
@@ -56,8 +60,17 @@ pub use walk::{Walker, usage};
 /// A full walk is due after this many intervals, whatever the source says.
 pub const RECONCILE: u32 = 10;
 
-/// While space is short, a measurement is due this many times an interval.
+/// While space is short, a full measurement is due this many times an
+/// interval.
 pub const TIGHT: u32 = 4;
+
+/// What an agent's processes may write, since the last full measurement,
+/// before one is due however little a cache saw change.
+pub const LOUD: u64 = 1 << 30;
+
+/// A source kept by a cache asks its [`Signal`] what was written once in
+/// this many looks.
+const LOUD_LOOKS: u32 = 8;
 
 /// The worker looks at each agent at least this often, to ask its source
 /// what changed.
@@ -104,14 +117,15 @@ impl Policy {
         if since_full >= self.reconcile() {
             return Some(Kind::Full);
         }
-        let every = if tight {
-            self.interval / TIGHT
-        } else if changed == Some(false) {
+        if tight {
+            // A full walk, as what was kept may have missed something, and
+            // space is short.
+            return (since >= self.interval / TIGHT).then_some(Kind::Full);
+        }
+        if changed == Some(false) {
             return None;
-        } else {
-            self.interval
-        };
-        (since >= every).then_some(Kind::Update)
+        }
+        (since >= self.interval).then_some(Kind::Update)
     }
 }
 
@@ -164,6 +178,12 @@ pub trait Signal: Send + fmt::Debug {
     /// baseline.
     fn wrote(&mut self) -> Option<bool>;
 
+    /// About how many bytes it wrote since the last reset, as of the last
+    /// [`Signal::wrote`], if it can tell.
+    fn bytes(&self) -> Option<u64> {
+        None
+    }
+
     fn reset(&mut self) {}
 }
 
@@ -203,6 +223,12 @@ pub struct Cached {
     max: (usize, usize),
     /// How many times it built its cache.
     builds: u64,
+    /// What the signal said was written as of the last full measurement.
+    loud_mark: u64,
+    /// Whether it's written [`LOUD`] since, so a full one is due.
+    loud: bool,
+    /// Looks since the signal was last asked, while caching.
+    looks: u32,
 }
 
 impl Cached {
@@ -223,6 +249,9 @@ impl Cached {
             walking: false,
             max: (cache::MAX_DIRS, cache::MAX_LINKS),
             builds: 0,
+            loud_mark: 0,
+            loud: false,
+            looks: 0,
         }
     }
 
@@ -256,10 +285,7 @@ impl Cached {
         };
         eprintln!(
             "vibe-env: {} is walked when it changes rather than kept a directory at a time: {why}",
-            self.roots
-                .first()
-                .map(|r| r.display().to_string())
-                .unwrap_or_default()
+            first(&self.roots)
         );
         self.cache = None;
         self.dirty.clear();
@@ -267,6 +293,8 @@ impl Cached {
         if let Some(c) = &mut self.changes {
             c.release();
         }
+        self.loud = false;
+        self.loud_mark = 0;
         if let Some(s) = &mut self.signal {
             s.reset();
             // The baseline, from before this walk.
@@ -274,6 +302,37 @@ impl Cached {
         }
         walker.usage(&self.roots)
     }
+
+    /// Asks the signal, once in [`LOUD_LOOKS`] looks, what was written
+    /// since the last full measurement.
+    fn listen(&mut self) {
+        self.looks += 1;
+        if self.looks < LOUD_LOOKS {
+            return;
+        }
+        self.looks = 0;
+        if let Some(s) = &mut self.signal {
+            s.wrote();
+            if s.bytes()
+                .is_some_and(|b| b.saturating_sub(self.loud_mark) >= LOUD)
+            {
+                self.loud = true;
+            }
+        }
+    }
+
+    /// A full measurement was made: what's written is counted from now.
+    fn heard(&mut self) {
+        self.loud = false;
+        self.loud_mark = self.signal.as_ref().and_then(|s| s.bytes()).unwrap_or(0);
+    }
+}
+
+/// The first of `roots`, to name them by in a log.
+fn first(roots: &[PathBuf]) -> std::path::Display<'_> {
+    roots
+        .first()
+        .map_or(Path::new("").display(), |r| r.display())
 }
 
 impl Source for Cached {
@@ -286,7 +345,15 @@ impl Source for Cached {
         if let Some(c) = &mut self.changes
             && c.take(cache, &mut self.dirty)
         {
-            return Some(!self.dirty.is_empty());
+            if let Some(cache) = cache {
+                // A root that's gone has no watch to say it's back: it's
+                // looked for again whenever it's due.
+                for root in cache.missing() {
+                    self.dirty.mark(root, false);
+                }
+                self.listen();
+            }
+            return Some(!self.dirty.is_empty() || self.loud);
         }
         self.signal.as_mut()?.wrote()
     }
@@ -298,17 +365,25 @@ impl Source for Cached {
         };
         changes.take(self.cache.as_ref(), &mut self.dirty);
         let dirty = std::mem::take(&mut self.dirty);
+        // Written past what a cache may miss: checked by a full walk.
+        let kind = if self.loud { Kind::Full } else { kind };
         let mut walked = None;
+        let mut full = kind == Kind::Full;
         let cache = match (&mut self.cache, kind) {
             (Some(c), Kind::Update) => {
-                c.update_watched(&dirty, walker, changes.watcher());
+                if c.update_watched(&dirty, walker, changes.watcher()) {
+                    self.builds += 1;
+                    full = true;
+                }
                 c
             }
             (Some(c), Kind::Full) if !c.sparse() => {
                 // Checked by a walk, which allocates nothing: kept as it is
-                // if it agrees, built afresh if not.
-                c.update_watched(&dirty, walker, changes.watcher());
-                if !c.over() && !changes.failed() {
+                // if it agrees, built afresh if not. One the update built
+                // afresh needs no check.
+                if c.update_watched(&dirty, walker, changes.watcher()) {
+                    self.builds += 1;
+                } else if !c.over() && !changes.failed() {
                     let w = walker.usage(&self.roots);
                     if w == c.total() {
                         walked = Some(w);
@@ -324,13 +399,18 @@ impl Source for Cached {
                 let c = cache.insert(Cache::new(roots).with_max(dirs, links));
                 c.build_watched(walker, changes.watcher());
                 self.builds += 1;
+                full = true;
                 c
             }
         };
         if cache.over() || changes.failed() {
             return self.give_up(walker);
         }
-        walked.unwrap_or(cache.total())
+        let total = walked.unwrap_or(cache.total());
+        if full {
+            self.heard();
+        }
+        total
     }
 
     fn rest(&mut self) {
@@ -344,6 +424,9 @@ impl Source for Cached {
     fn reset(&mut self) {
         self.rest();
         self.walking = false;
+        self.loud = false;
+        self.loud_mark = 0;
+        self.looks = 0;
         if let Some(s) = &mut self.signal {
             s.reset();
         }
@@ -392,10 +475,7 @@ pub fn watched(roots: Vec<PathBuf>, latency: Duration, signal: Option<Box<dyn Si
             Err(e) => {
                 eprintln!(
                     "vibe-env: can't watch {} with FSEvents, so it's walked instead: {e}",
-                    roots
-                        .first()
-                        .map(|r| r.display().to_string())
-                        .unwrap_or_default()
+                    first(&roots)
                 );
                 Cached::new(roots, None, signal)
             }
@@ -643,6 +723,7 @@ fn work(shared: &Shared) {
         for t in &live {
             running |= t.step(&policy, &mut walker);
         }
+        walker.trim();
         // Outside the lock, as the last of a track ends here and nudges.
         live.clear();
         if !running {
@@ -685,10 +766,11 @@ mod tests {
         assert_eq!(p.due(s(300), s(300), Some(false), false), None);
         assert_eq!(p.due(s(599), s(599), Some(false), false), None);
         assert_eq!(p.due(s(10), s(600), Some(false), false), Some(Kind::Full));
-        // Short of space: four times an interval, changed or not.
+        // Short of space: a full walk four times an interval, changed or
+        // not, as a cache may have missed something.
         assert_eq!(p.due(s(14), s(14), Some(false), true), None);
-        assert_eq!(p.due(s(15), s(15), Some(false), true), Some(Kind::Update));
-        assert_eq!(p.due(s(15), s(15), Some(true), true), Some(Kind::Update));
+        assert_eq!(p.due(s(15), s(15), Some(false), true), Some(Kind::Full));
+        assert_eq!(p.due(s(15), s(15), Some(true), true), Some(Kind::Full));
     }
 
     #[test]
@@ -960,6 +1042,77 @@ mod tests {
         c.reset();
         assert_eq!(c.measure(Kind::Full, &mut w), usage(&roots));
         assert!(c.walking());
+    }
+
+    /// Says what was written when told to.
+    #[derive(Debug, Clone, Default)]
+    struct Counted(Arc<AtomicU64>);
+
+    impl Signal for Counted {
+        fn wrote(&mut self) -> Option<bool> {
+            Some(false)
+        }
+        fn bytes(&self) -> Option<u64> {
+            Some(self.0.load(Ordering::SeqCst))
+        }
+    }
+
+    #[test]
+    fn what_no_watch_sees_is_found_once_the_agent_wrote_enough() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("r");
+        std::fs::create_dir_all(&root).unwrap();
+        let roots = vec![root.clone()];
+        let written = Counted::default();
+        let mut w = Walker::new();
+        let mut c = Cached::new(
+            roots.clone(),
+            Some(Box::new(Deaf::default())),
+            Some(Box::new(written.clone())),
+        );
+        c.measure(Kind::Full, &mut w);
+        // Grown where nothing watching says (through a link from outside,
+        // say), by processes that wrote a little: nothing's due.
+        std::fs::write(root.join("unseen"), vec![1u8; 200_000]).unwrap();
+        written.0.store(LOUD / 2, Ordering::SeqCst);
+        for _ in 0..LOUD_LOOKS * 2 {
+            assert_eq!(c.changed(), Some(false));
+        }
+        // Past what may go unmeasured: a full walk is due, and finds it.
+        written.0.store(LOUD + 1, Ordering::SeqCst);
+        let mut asked = 0;
+        while c.changed() != Some(true) {
+            asked += 1;
+            assert!(
+                asked <= LOUD_LOOKS,
+                "no measurement due after {asked} looks"
+            );
+        }
+        assert_eq!(c.measure(Kind::Update, &mut w), usage(&roots));
+        // And counted afresh from there.
+        for _ in 0..LOUD_LOOKS * 2 {
+            assert_eq!(c.changed(), Some(false));
+        }
+    }
+
+    #[test]
+    fn a_root_that_comes_back_is_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (a, b) = (tmp.path().join("a"), tmp.path().join("b"));
+        std::fs::create_dir_all(&a).unwrap();
+        let roots = vec![a.clone(), b.clone()];
+        let mut w = Walker::new();
+        let mut c = Cached::new(roots.clone(), Some(Box::new(Deaf::default())), None);
+        assert_eq!(c.measure(Kind::Full, &mut w), usage(&roots));
+        // Nothing watches a root that isn't there, so it's looked for at
+        // each measurement.
+        std::fs::create_dir_all(b.join("x")).unwrap();
+        std::fs::write(b.join("x/f"), vec![1u8; 300_000]).unwrap();
+        assert_eq!(c.changed(), Some(true));
+        assert_eq!(c.measure(Kind::Update, &mut w), usage(&roots));
+        assert_eq!(c.builds(), 1);
+        // Back, it's watched as the rest are, and looked for no more.
+        assert_eq!(c.changed(), Some(false));
     }
 
     /// The source a backend gets here, kept up to date by what this OS
