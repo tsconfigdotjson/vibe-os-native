@@ -17,8 +17,18 @@ fn timing() -> Timing {
         poll_connected: Duration::from_millis(100),
         poll_away: Duration::from_millis(50),
         first_list: Duration::from_millis(500),
+        end_delay: Duration::ZERO,
     }
 }
+
+/// How long the shim's old link's reader is held back at its end, in the tests
+/// of #173: long enough that each call made after a hang-up is made before the
+/// old link's end has been dealt with, as on a loaded machine.
+const END_HELD: Duration = Duration::from_millis(150);
+
+/// What `slow` takes to answer: longer than [`END_HELD`], so the old link's end
+/// comes while it's under way on the new one.
+const SLOW: Duration = Duration::from_millis(400);
 
 fn config(dir: &Path) -> Config {
     Config {
@@ -90,6 +100,20 @@ impl Client {
 
     fn call(&mut self, id: i64, tool: &str) -> Value {
         self.ask(id, "tools/call", json!({"name": tool, "arguments": {}}))
+    }
+
+    /// [`Self::call`], where nothing but its answer may come with an id: a
+    /// second answer to an earlier call fails it.
+    fn call_alone(&mut self, id: i64, tool: &str) -> Value {
+        self.send(json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": {"name": tool, "arguments": {}}}));
+        loop {
+            let m = self.next();
+            if m["id"] == json!(id) {
+                return m;
+            }
+            assert!(m.get("id").is_none(), "answered twice, or out of turn: {m}");
+        }
     }
 }
 
@@ -174,6 +198,13 @@ impl Broker {
                 Some("tools/call") if m["params"]["name"] == "hang_up" => {
                     let _ = conn.shutdown(std::net::Shutdown::Both);
                     return;
+                }
+                Some("tools/call") if m["params"]["name"] == "slow" => {
+                    std::thread::sleep(SLOW);
+                    self.calls.fetch_add(1, Ordering::SeqCst);
+                    json!({"jsonrpc": "2.0", "id": m["id"], "result": {
+                        "content": [{"type": "text", "text": format!("did {}", m["params"]["name"])}],
+                    }})
                 }
                 Some("tools/call") if m["params"]["name"] == "ask_back" => {
                     // A server's own request, then the call's answer once the
@@ -348,6 +379,63 @@ fn a_call_after_the_broker_hung_up_goes_on_a_new_link_where_writes_to_the_old_st
     }
     // None went down a link the broker had left.
     assert_eq!(broker.calls.load(Ordering::SeqCst) - before, 58);
+}
+
+/// #173 again, with the old link's reader held back at its end, so that every
+/// call below is made while the shim still holds the link the broker has left,
+/// whatever the machine's timing: each must go out on a new link, once, and the
+/// old link's end, coming while it's under way there, mustn't answer it.
+#[test]
+fn an_old_links_end_held_back_fails_no_call_made_after_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = config(dir.path());
+    config.timing.end_delay = END_HELD;
+    let broker = Broker::serve(&config.socket, &["list_issues", "slow"]);
+    let mut c = Client::start(config);
+    c.handshake();
+    let before = broker.calls.load(Ordering::SeqCst);
+    for id in 2..12 {
+        // Writes to the old link go through, as on macOS.
+        broker.stop_answering_everyone();
+        let tool = if id % 2 == 0 { "slow" } else { "list_issues" };
+        let answer = c.call_alone(id, tool);
+        assert_eq!(tool_text(&answer), format!("did {tool:?}"), "{answer}");
+    }
+    for id in 12..22 {
+        // Writes to the old link are refused, as on Linux.
+        broker.hang_up_everyone();
+        let tool = if id % 2 == 0 { "slow" } else { "list_issues" };
+        let answer = c.call_alone(id, tool);
+        assert_eq!(tool_text(&answer), format!("did {tool:?}"), "{answer}");
+    }
+    assert_eq!(broker.calls.load(Ordering::SeqCst) - before, 20);
+    // Nothing else came for any of them, the last old end included: no second
+    // answer.
+    std::thread::sleep(END_HELD * 2);
+    c.send(json!({"jsonrpc": "2.0", "id": 99, "method": "ping"}));
+    loop {
+        let m = c.next();
+        if m["id"] == json!(99) {
+            break;
+        }
+        assert!(m.get("id").is_none(), "a call was answered twice: {m}");
+    }
+}
+
+/// A call that was under way on a link when it dropped is still answered as
+/// dropped, however late that link's reader comes to the end.
+#[test]
+fn a_call_lost_with_its_link_is_answered_however_late_the_end_comes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = config(dir.path());
+    config.timing.end_delay = END_HELD;
+    Broker::serve(&config.socket, &["list_issues", "hang_up"]);
+    let mut c = Client::start(config);
+    c.handshake();
+    let lost = c.call(2, "hang_up");
+    assert_eq!(lost["result"]["isError"], true, "{lost}");
+    assert!(tool_text(&lost).contains("connection dropped"), "{lost}");
+    assert_eq!(tool_text(&c.call(3, "list_issues")), "did \"list_issues\"");
 }
 
 #[test]

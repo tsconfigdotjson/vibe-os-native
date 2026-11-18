@@ -52,6 +52,12 @@ pub struct Timing {
     /// With nothing on disk, how long a client's first `tools/list` waits for
     /// the live catalog before it's told there are no tools yet.
     pub first_list: Duration,
+    /// How long a link's reader lies still, once it has read to the link's end,
+    /// before it lets the link go and answers the calls that were on it. Zero
+    /// but in tests, which hold an old link's end back with it so that a call
+    /// made meanwhile always meets the race #173 was.
+    #[doc(hidden)]
+    pub end_delay: Duration,
 }
 
 impl Default for Timing {
@@ -60,6 +66,7 @@ impl Default for Timing {
             poll_connected: Duration::from_secs(5 * 60),
             poll_away: Duration::from_secs(30),
             first_list: Duration::from_secs(3),
+            end_delay: Duration::ZERO,
         }
     }
 }
@@ -300,6 +307,10 @@ impl Shim {
             if let Ok(message) = serde_json::from_slice::<Value>(&line) {
                 self.from_broker(message);
             }
+        }
+        let delay = self.config.timing.end_delay;
+        if !delay.is_zero() {
+            std::thread::sleep(delay);
         }
         let mut link = lock(&self.link);
         if link.as_ref().is_some_and(|l| l.generation == generation) {

@@ -14,7 +14,7 @@ use std::time::Duration;
 use common::{Conn, Golden, TestServer, serve};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 use vibe_core::model::{AdminNeed, AgentState, CheckId, CheckState, EventKind, HostLink};
 use vibe_core::paths::Layout;
 use vibe_core::rpc::{
@@ -27,14 +27,18 @@ use vibed::core::Core;
 use vibed::link::Timing;
 use vibed::remote::{BoxFuture, Channel, Installed, Remote};
 
-/// What the carrier between the two does with bytes.
+/// What the carrier between the two does with bytes, as one value, so a dial and
+/// a pull can't each see half of the other (#172).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Wire {
-    Up,
+struct Wire {
+    /// New connections can be made.
+    reachable: bool,
     /// Holds everything, as a pulled cable does: no data, no close.
-    Frozen,
-    /// Drops every connection.
-    Cut,
+    frozen: bool,
+    /// How many times every connection has been dropped. A connection made
+    /// before the latest drop is gone for good, however soon the network's
+    /// back: being plugged in again brings none back.
+    cuts: u64,
 }
 
 /// `ssh`, in process: each dial connects to the host's socket through a
@@ -42,7 +46,6 @@ enum Wire {
 #[derive(Debug)]
 struct Wires {
     sockets: Mutex<HashMap<String, PathBuf>>,
-    reachable: AtomicBool,
     wire: watch::Sender<Wire>,
     installs: Mutex<u32>,
     /// What an install fails with, while it does.
@@ -51,45 +54,60 @@ struct Wires {
     older_bundle: AtomicBool,
     /// It holds just what the Mac runs, the Mac's being [`upgrades::MAC`].
     macs_bundle: AtomicBool,
+    /// A dial to this address stops once it has connected, says so on the
+    /// first, and goes on when the second says: a dial under way as the
+    /// network goes.
+    held: Mutex<Option<(String, Arc<Notify>, Arc<Notify>)>>,
 }
 
 impl Wires {
     fn new() -> Arc<Wires> {
         Arc::new(Wires {
             sockets: Mutex::new(HashMap::new()),
-            reachable: AtomicBool::new(true),
-            wire: watch::channel(Wire::Up).0,
+            wire: watch::channel(Wire {
+                reachable: true,
+                frozen: false,
+                cuts: 0,
+            })
+            .0,
             installs: Mutex::new(0),
             install_fails: Mutex::new(None),
             older_bundle: AtomicBool::new(false),
             macs_bundle: AtomicBool::new(false),
+            held: Mutex::new(None),
         })
     }
 
     /// The network goes: connections drop, and new ones can't be made.
     fn pull(&self) {
-        self.reachable.store(false, Ordering::SeqCst);
-        self.wire.send_replace(Wire::Cut);
+        self.wire.send_modify(|w| {
+            w.reachable = false;
+            w.cuts += 1;
+        });
     }
 
     /// Connections hang, with nothing sent or closed.
     fn freeze(&self) {
-        self.wire.send_replace(Wire::Frozen);
+        self.wire.send_modify(|w| w.frozen = true);
     }
 
     fn plug_in(&self) {
-        self.wire.send_replace(Wire::Up);
-        self.reachable.store(true, Ordering::SeqCst);
+        self.wire.send_modify(|w| {
+            w.frozen = false;
+            w.reachable = true;
+        });
     }
+}
+
+fn unreachable(address: &str) -> String {
+    format!("ssh: connect to host {address} port 22: Network is unreachable")
 }
 
 impl Remote for Wires {
     fn dial<'a>(&'a self, address: &'a str) -> BoxFuture<'a, Result<Channel, String>> {
         Box::pin(async move {
-            if !self.reachable.load(Ordering::SeqCst) {
-                return Err(format!(
-                    "ssh: connect to host {address} port 22: Network is unreachable"
-                ));
+            if !self.wire.borrow().reachable {
+                return Err(unreachable(address));
             }
             let socket = self.sockets.lock().unwrap().get(address).cloned();
             let socket =
@@ -97,12 +115,25 @@ impl Remote for Wires {
             let stream = tokio::net::UnixStream::connect(&socket)
                 .await
                 .map_err(|e| format!("vibe: can't reach vibed: {e}"))?;
-            // The wire's state now, before a dial in a frozen spell sees it.
-            if *self.wire.borrow() == Wire::Cut {
-                self.wire.send_replace(Wire::Up);
+            let held = self.held.lock().unwrap().clone();
+            if let Some((at, connected, go_on)) = held
+                && at == address
+            {
+                connected.notify_one();
+                go_on.notified().await;
             }
-            let (ours, theirs) = tokio::io::duplex(1 << 20);
+            // Made now, in one look at the wire: a pull since the look above
+            // leaves nothing to connect over, and one from here on cuts this
+            // connection as it does the others, however soon it's undone.
             let mut wire = self.wire.subscribe();
+            let born = {
+                let now = wire.borrow_and_update();
+                if !now.reachable {
+                    return Err(unreachable(address));
+                }
+                now.cuts
+            };
+            let (ours, theirs) = tokio::io::duplex(1 << 20);
             tokio::spawn(async move {
                 let (mut sr, mut sw) = stream.into_split();
                 let (mut tr, mut tw) = tokio::io::split(theirs);
@@ -110,15 +141,14 @@ impl Remote for Wires {
                 let mut b = vec![0u8; 1 << 16];
                 loop {
                     let now = *wire.borrow_and_update();
-                    match now {
-                        Wire::Cut => return,
-                        Wire::Frozen => {
-                            if wire.changed().await.is_err() {
-                                return;
-                            }
-                            continue;
+                    if now.cuts != born {
+                        return;
+                    }
+                    if now.frozen {
+                        if wire.changed().await.is_err() {
+                            return;
                         }
-                        Wire::Up => {}
+                        continue;
                     }
                     tokio::select! {
                         _ = wire.changed() => {}
@@ -283,6 +313,22 @@ impl World {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         panic!("vps's link never became {want}: {:?}", self.link().await);
+    }
+
+    /// Waits for the Mac's tunnel to vps to have had a try with the link up.
+    /// Through these wires it can't keep one, and says so in vps's row: a
+    /// change, with a `host.link` event of its own, which comes a while after
+    /// the link does, as the tunnel looks at the link only now and then. After
+    /// that, each try says just the same, and changes nothing.
+    async fn wait_tunnel_tried(&self) {
+        let tried = Some("can't keep a tunnel to me@vps.example.com");
+        for _ in 0..500 {
+            if self.link().await.tunnel_detail.as_deref() == tried {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("vps's tunnel was never tried: {:?}", self.link().await);
     }
 
     async fn host_project(&self) {
@@ -1011,6 +1057,68 @@ async fn a_pulled_network_shows_the_host_down_and_it_reconnects() {
     assert_eq!(back["result"]["projects"][0]["host"], "vps");
 }
 
+/// #172: a dial that's under way as the network goes, as the Mac's often are,
+/// brings nothing back: neither a connection of its own, nor the link, which
+/// goes down as the network does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dial_under_way_as_the_network_goes_brings_nothing_back() {
+    let w = world().await;
+    w.add_host().await;
+    // Another way to vps, so the Mac's own dials aren't held.
+    let socket = w.wires.sockets.lock().unwrap()["me@vps.example.com"].clone();
+    w.wires
+        .sockets
+        .lock()
+        .unwrap()
+        .insert("held@vps.example.com".into(), socket);
+    let (connected, go_on) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    *w.wires.held.lock().unwrap() = Some((
+        "held@vps.example.com".into(),
+        Arc::clone(&connected),
+        Arc::clone(&go_on),
+    ));
+    let wires = Arc::clone(&w.wires);
+    let dial = tokio::spawn(async move { wires.dial("held@vps.example.com").await.map(drop) });
+    connected.notified().await;
+    w.wires.pull();
+    go_on.notify_one();
+    let dialed = dial.await.unwrap();
+    assert!(
+        dialed
+            .as_ref()
+            .is_err_and(|e| e.contains("Network is unreachable")),
+        "{dialed:?}"
+    );
+    w.wait_link(HostLink::Down).await;
+}
+
+/// #172: a network that's back at once has still dropped what was on it, as a
+/// pulled cable does, however soon it's plugged in again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_network_back_at_once_has_still_dropped_the_link() {
+    let w = world().await;
+    w.add_host().await;
+    let (_, mut events) = w.mac.subscribe();
+    w.wires.pull();
+    w.wires.plug_in();
+    let dropped = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let e = match events.recv().await {
+                Ok(e) => e,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(e) => panic!("the Mac's events ended: {e}"),
+            };
+            if e.kind == EventKind::HostLink && e.state.as_deref() == Some("down") {
+                return e;
+            }
+        }
+    })
+    .await
+    .expect("the link never dropped");
+    assert_eq!(dropped.host, "vps");
+    w.wait_link(HostLink::Connected).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_linux_hosts_memory_comes_with_its_pings_and_is_no_link_event() {
     // The host's own memory, as its kernel would measure it: 12G, with
@@ -1047,7 +1155,9 @@ async fn a_linux_hosts_memory_comes_with_its_pings_and_is_no_link_event() {
     );
 
     // Only its memory changes: the next ping brings it, and it's no change
-    // of the link, so no host.link event.
+    // of the link, so no host.link event. The tunnel's first try is a change,
+    // which is let go by first: on a busy machine it can come late (#172).
+    w.wait_tunnel_tried().await;
     let (_, mut events) = w.mac.subscribe();
     used.store(7 * GIB, Ordering::SeqCst);
     let mut seen = None;

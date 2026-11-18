@@ -207,6 +207,7 @@ impl Agent {
                 poll_connected: Duration::from_millis(200),
                 poll_away: Duration::from_millis(50),
                 first_list: Duration::from_secs(3),
+                ..proxy::Timing::default()
             },
         };
         std::thread::spawn(move || {
