@@ -864,9 +864,19 @@ fn an_asleep_agent_keeps_its_disk_and_a_wake_measures_it_again() {
     wait("a measurement of what it wrote", PATIENCE, || {
         a.usage().disk.is_some_and(|d| d >= MIB)
     });
+    // Its trees are watched with inotify while it runs (this test's agent
+    // is the only one), and the watches let go of while it sleeps.
+    #[cfg(target_os = "linux")]
+    let watched = || vibe_env::disk::inotify::held();
+    #[cfg(target_os = "linux")]
+    assert!(watched() > 0, "a running agent's trees aren't watched");
     h.backend.sleep(&a.handle).unwrap();
     // Anything measuring as it fell asleep finishes.
     std::thread::sleep(Duration::from_millis(600));
+    #[cfg(target_os = "linux")]
+    wait("an asleep agent's watches let go of", PATIENCE, || {
+        watched() == 0
+    });
     let asleep = a.usage().disk.unwrap();
     // Written beside it while it sleeps, for longer than a reconcile (ten
     // intervals) takes: it isn't measured, and keeps what it had.
@@ -878,12 +888,23 @@ fn an_asleep_agent_keeps_its_disk_and_a_wake_measures_it_again() {
     wait("a fresh measurement", PATIENCE, || {
         a.usage().disk.is_some_and(|d| d >= asleep + 4 * MIB)
     });
-    // Running, what none of its processes wrote is found by the reconcile.
+    #[cfg(target_os = "linux")]
+    assert!(watched() > 0, "a woken agent's trees aren't watched again");
+    // Running, what none of its processes wrote is seen too (by inotify;
+    // its shim's own writes would have it walked too, an interval apart):
+    // measured within an interval or so, well before the reconcile (ten
+    // intervals after the wake's measurement).
     let woke = a.usage().disk.unwrap();
+    let written = std::time::Instant::now();
     fs::write(a.handle.worktree.join("later"), vec![1u8; 2 << 20]).unwrap();
-    wait("the reconcile", PATIENCE, || {
+    wait("a measurement of the change", PATIENCE, || {
         a.usage().disk.is_some_and(|d| d >= woke + 2 * MIB)
     });
+    assert!(
+        written.elapsed() < Duration::from_millis(1200),
+        "a change took {:?} to be measured, as if only the reconcile found it",
+        written.elapsed()
+    );
     a.answers("still here");
 }
 

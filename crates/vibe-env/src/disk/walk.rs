@@ -110,6 +110,12 @@ pub trait Visit {
 
     /// A root that isn't a directory.
     fn root_file(&mut self, _stat: Stat) {}
+
+    /// The directory at `path` is about to be listed, `depth` below the
+    /// walk's root: anything that has to see what changes in it from now
+    /// on (an inotify watch) starts here, so nothing written into it after
+    /// it's listed goes unseen.
+    fn opening(&mut self, _path: &Path, _depth: usize) {}
 }
 
 /// A directory waiting to be listed.
@@ -140,6 +146,11 @@ pub struct Walker {
 /// More hard links than this kept between walks is let go of once a walk
 /// finds far fewer.
 const KEEP_SEEN: usize = 1 << 16;
+
+/// A buffer that grew past this many bytes, for a directory with very many
+/// entries, is let go of once a measurement ends rather than kept for the
+/// next ([`Walker::trim`]).
+const KEEP_BYTES: usize = 1 << 20;
 
 impl Walker {
     pub fn new() -> Walker {
@@ -204,6 +215,7 @@ impl Walker {
             }
             self.depth_len.truncate(p.depth);
             self.depth_len.push(self.path.len());
+            v.opening(Path::new(OsStr::from_bytes(&self.path)), p.depth);
             let mark = self.names.len();
             let own = self.list(p.stat, stat.dev);
             let descend = v.dir(&Listing {
@@ -226,6 +238,37 @@ impl Walker {
                 self.names.truncate(mark);
             }
         }
+    }
+
+    /// Lets go of any buffer a walk of an unusually wide directory grew
+    /// past [`KEEP_BYTES`], so a walker keeps only what ordinary trees need
+    /// between measurements.
+    pub fn trim(&mut self) {
+        fn trim<T>(v: &mut Vec<T>) {
+            if v.capacity() * std::mem::size_of::<T>() > KEEP_BYTES {
+                *v = Vec::new();
+            }
+        }
+        trim(&mut self.path);
+        trim(&mut self.depth_len);
+        trim(&mut self.names);
+        trim(&mut self.pending);
+        trim(&mut self.subdirs);
+        trim(&mut self.links);
+    }
+
+    /// How many bytes its buffers hold, for tests.
+    pub fn held(&self) -> usize {
+        fn held<T>(v: &Vec<T>) -> usize {
+            v.capacity() * std::mem::size_of::<T>()
+        }
+        held(&self.path)
+            + held(&self.depth_len)
+            + held(&self.names)
+            + held(&self.pending)
+            + held(&self.subdirs)
+            + held(&self.links)
+            + self.seen.capacity() * std::mem::size_of::<(u64, u64)>()
     }
 
     /// `lstat` of `path`.

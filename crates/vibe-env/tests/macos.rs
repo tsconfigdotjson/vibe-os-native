@@ -737,7 +737,13 @@ fn disk_past_soft_warns_and_past_hard_pauses() {
 #[test]
 fn an_asleep_agent_keeps_its_disk_and_a_wake_measures_it_again() {
     let _one = serial();
-    let h = MacHarness::with(SCRIPT, quick());
+    // A reconcile every 8 s, so a change measured well before one was seen
+    // by what the OS reports.
+    let intervals = Intervals {
+        disk: Duration::from_millis(800),
+        ..quick()
+    };
+    let h = MacHarness::with(SCRIPT, intervals);
     let a = Agent::start(&h, "asleep-disk", "head -c 1048576 /dev/zero >fill");
     a.apply(roomy());
     wait(
@@ -752,21 +758,30 @@ fn an_asleep_agent_keeps_its_disk_and_a_wake_measures_it_again() {
     // Written beside it while it sleeps, for longer than a reconcile (ten
     // intervals) takes: it isn't measured, and keeps what it had.
     fs::write(a.handle.worktree.join("beside"), vec![1u8; 4 << 20]).unwrap();
-    std::thread::sleep(Duration::from_millis(6000));
+    std::thread::sleep(Duration::from_millis(8500));
     assert_eq!(a.usage().disk, Some(asleep));
     // Woken, it's measured afresh at once.
     assert_eq!(h.backend.wake(&a.handle).unwrap(), Woke::Exact);
     wait("a fresh measurement", Duration::from_secs(60), || {
         a.usage().disk.is_some_and(|d| d >= asleep + 4 * MIB)
     });
-    // Running, a change made from outside it is measured too: FSEvents
-    // sees it on a Mac, and the reconcile elsewhere.
+    // Running, a change made from outside it is measured too, as FSEvents
+    // (inotify on Linux) reports it: within an interval or so, well before
+    // the reconcile, ten intervals after the wake's measurement. (With
+    // nothing to report changes it would be walked every interval, as
+    // quickly: the disk tests in the library tell those apart.)
     let woke = a.usage().disk.unwrap();
+    let written = Instant::now();
     fs::write(a.handle.worktree.join("later"), vec![1u8; 2 << 20]).unwrap();
     wait(
         "a measurement of the change",
         Duration::from_secs(60),
         || a.usage().disk.is_some_and(|d| d >= woke + 2 * MIB),
+    );
+    assert!(
+        written.elapsed() < Duration::from_secs(5),
+        "a change took {:?} to be measured, as if only the reconcile found it",
+        written.elapsed()
     );
 }
 
