@@ -635,6 +635,12 @@ async fn supervise(
             let mut v = lock(&view);
             let changed = *v != now;
             *v = now.clone();
+            // Said while nobody can see the change yet: whoever reads it from
+            // hosts.list has been sent its event already, so one who looks
+            // and then subscribes isn't sent it again (#172).
+            if changed {
+                core.host_link_changed(&link);
+            }
             changed
         };
         if changed {
@@ -645,7 +651,6 @@ async fn supervise(
                 }
                 _ => {}
             }
-            core.host_link_changed(&link);
         }
     };
     let mut backoff = timing.min_backoff;

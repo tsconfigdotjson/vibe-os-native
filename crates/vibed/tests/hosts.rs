@@ -29,7 +29,7 @@ use vibed::remote::{BoxFuture, Channel, Installed, Remote};
 
 /// What the carrier between the two does with bytes, as one value, so a dial and
 /// a pull can't each see half of the other (#172).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 struct Wire {
     /// New connections can be made.
     reachable: bool,
@@ -54,10 +54,17 @@ struct Wires {
     older_bundle: AtomicBool,
     /// It holds just what the Mac runs, the Mac's being [`upgrades::MAC`].
     macs_bundle: AtomicBool,
-    /// A dial to this address stops once it has connected, says so on the
-    /// first, and goes on when the second says: a dial under way as the
-    /// network goes.
-    held: Mutex<Option<(String, Arc<Notify>, Arc<Notify>)>>,
+    /// A dial to this address stops once it has connected: a dial under way
+    /// as the network goes.
+    held: Mutex<Option<Held>>,
+}
+
+/// Where a dial is held, how it says it's got there, and what lets it go on.
+#[derive(Debug, Clone)]
+struct Held {
+    address: String,
+    connected: Arc<Notify>,
+    go_on: Arc<Notify>,
 }
 
 impl Wires {
@@ -116,11 +123,11 @@ impl Remote for Wires {
                 .await
                 .map_err(|e| format!("vibe: can't reach vibed: {e}"))?;
             let held = self.held.lock().unwrap().clone();
-            if let Some((at, connected, go_on)) = held
-                && at == address
+            if let Some(held) = held
+                && held.address == address
             {
-                connected.notify_one();
-                go_on.notified().await;
+                held.connected.notify_one();
+                held.go_on.notified().await;
             }
             // Made now, in one look at the wire: a pull since the look above
             // leaves nothing to connect over, and one from here on cuts this
@@ -318,8 +325,9 @@ impl World {
     /// Waits for the Mac's tunnel to vps to have had a try with the link up.
     /// Through these wires it can't keep one, and says so in vps's row: a
     /// change, with a `host.link` event of its own, which comes a while after
-    /// the link does, as the tunnel looks at the link only now and then. After
-    /// that, each try says just the same, and changes nothing.
+    /// the link does, as the tunnel looks at the link only now and then. That
+    /// event is out before the row says so. After that, each try says just the
+    /// same, and changes nothing.
     async fn wait_tunnel_tried(&self) {
         let tried = Some("can't keep a tunnel to me@vps.example.com");
         for _ in 0..500 {
@@ -1072,14 +1080,17 @@ async fn a_dial_under_way_as_the_network_goes_brings_nothing_back() {
         .unwrap()
         .insert("held@vps.example.com".into(), socket);
     let (connected, go_on) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
-    *w.wires.held.lock().unwrap() = Some((
-        "held@vps.example.com".into(),
-        Arc::clone(&connected),
-        Arc::clone(&go_on),
-    ));
+    *w.wires.held.lock().unwrap() = Some(Held {
+        address: "held@vps.example.com".into(),
+        connected: Arc::clone(&connected),
+        go_on: Arc::clone(&go_on),
+    });
     let wires = Arc::clone(&w.wires);
     let dial = tokio::spawn(async move { wires.dial("held@vps.example.com").await.map(drop) });
-    connected.notified().await;
+    tokio::time::timeout(Duration::from_secs(10), connected.notified())
+        .await
+        .expect("the dial never connected");
+    *w.wires.held.lock().unwrap() = None;
     w.wires.pull();
     go_on.notify_one();
     let dialed = dial.await.unwrap();

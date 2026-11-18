@@ -199,19 +199,15 @@ impl Broker {
                     let _ = conn.shutdown(std::net::Shutdown::Both);
                     return;
                 }
-                Some("tools/call") if m["params"]["name"] == "slow" => {
-                    std::thread::sleep(SLOW);
-                    self.calls.fetch_add(1, Ordering::SeqCst);
-                    json!({"jsonrpc": "2.0", "id": m["id"], "result": {
-                        "content": [{"type": "text", "text": format!("did {}", m["params"]["name"])}],
-                    }})
-                }
                 Some("tools/call") if m["params"]["name"] == "ask_back" => {
                     // A server's own request, then the call's answer once the
                     // client has answered it.
                     json!({"jsonrpc": "2.0", "id": 900, "method": "elicitation/create", "params": {"call": m["id"]}})
                 }
                 Some("tools/call") => {
+                    if m["params"]["name"] == "slow" {
+                        std::thread::sleep(SLOW);
+                    }
                     self.calls.fetch_add(1, Ordering::SeqCst);
                     json!({"jsonrpc": "2.0", "id": m["id"], "result": {
                         "content": [{"type": "text", "text": format!("did {}", m["params"]["name"])}],
@@ -397,20 +393,21 @@ fn an_old_links_end_held_back_fails_no_call_made_after_it() {
     for id in 2..12 {
         // Writes to the old link go through, as on macOS.
         broker.stop_answering_everyone();
-        let tool = if id % 2 == 0 { "slow" } else { "list_issues" };
+        let tool = if id % 2 == 1 { "slow" } else { "list_issues" };
         let answer = c.call_alone(id, tool);
         assert_eq!(tool_text(&answer), format!("did {tool:?}"), "{answer}");
     }
     for id in 12..22 {
         // Writes to the old link are refused, as on Linux.
         broker.hang_up_everyone();
-        let tool = if id % 2 == 0 { "slow" } else { "list_issues" };
+        let tool = if id % 2 == 1 { "slow" } else { "list_issues" };
         let answer = c.call_alone(id, tool);
         assert_eq!(tool_text(&answer), format!("did {tool:?}"), "{answer}");
     }
     assert_eq!(broker.calls.load(Ordering::SeqCst) - before, 20);
-    // Nothing else came for any of them, the last old end included: no second
-    // answer.
+    // Nothing else came for any of them. Each old end has come by now, the
+    // last while the last call, a slow one, was under way; this looks for any
+    // straggler all the same.
     std::thread::sleep(END_HELD * 2);
     c.send(json!({"jsonrpc": "2.0", "id": 99, "method": "ping"}));
     loop {
