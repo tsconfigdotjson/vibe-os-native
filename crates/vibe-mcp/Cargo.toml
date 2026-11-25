@@ -10,26 +10,30 @@ repository.workspace = true
 [dependencies]
 vibe-core.workspace = true
 vibe-status.workspace = true
+# Already in the tree through rmcp: webhook signatures and secrets.
+base64 = "0.23"
 bytes = "1"
 http = "1"
 http-body-util = "0.1"
-hyper = { version = "1", features = ["http1", "server"] }
+# The server, and the client that posts webhooks.
+hyper = { version = "1", features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 libc.workspace = true
 # Only the server side, over Streamable HTTP; `vibe mcp` bridges stdio to it.
 rmcp = { version = "3.8", default-features = false, features = ["server", "transport-streamable-http-server"] }
+# Webhooks to HTTPS receivers, as vibe-services reaches services.
+rustls.workspace = true
+rustls-native-certs = "0.8"
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "ring", "tls12"] }
 # Already in the tree through rmcp: its cancellation tokens.
 tokio-util = "0.7"
 tower-service = "0.3"
 
 [dev-dependencies]
-# rmcp's own client, for a test that drives the server as a real client
-# would: its hyper client, over a Unix socket the test forwards to the TCP
-# listener, as reqwest isn't in the tree.
-rmcp = { version = "3.8", default-features = false, features = ["client", "transport-streamable-http-client-unix-socket"] }
 tempfile.workspace = true
 
 [lints]

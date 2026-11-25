@@ -693,8 +693,6 @@ dependencies = [
  "http",
  "http-body",
  "http-body-util",
- "hyper",
- "hyper-util",
  "indexmap",
  "libc",
  "pastey",
@@ -1317,6 +1315,7 @@ dependencies = [
 name = "vibe-mcp"
 version = "0.1.14"
 dependencies = [
+ "base64",
  "bytes",
  "http",
  "http-body-util",
@@ -1324,10 +1323,14 @@ dependencies = [
  "hyper-util",
  "libc",
  "rmcp",
+ "rustls",
+ "rustls-native-certs",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
+ "tokio-rustls",
  "tokio-util",
  "tower-service",
  "vibe-core",

@@ -4,6 +4,8 @@
 // vibed's test helpers: the golden world, with the stand-in for Claude.
 #[path = "../../vibed/tests/common/mod.rs"]
 mod common;
+#[path = "../../vibe-mcp/tests/receiver/mod.rs"]
+mod receiver;
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::SocketAddr;
@@ -261,46 +263,38 @@ fn the_bridge_carries_mcp_over_stdio() {
     .unwrap();
 }
 
-/// MCP Events over stdio: a push stream's notifications come through as
-/// they're sent, and a cancel ends it on the server, as it does a call.
+/// MCP Events over stdio, as ChatGPT has them: `initialize` says `capabilities.events`,
+/// and a webhook subscription made through the bridge gets each start posted to it, by
+/// the real `vibed`.
 #[test]
-fn the_bridge_carries_event_streams() {
+fn the_bridge_carries_webhook_subscriptions() {
     let w = world();
     let mut b = Bridge::start(&w, Some(&w.key));
-    let meta = json!({
-        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-        "io.modelcontextprotocol/clientInfo": {"name": "events", "version": "1"},
-        "io.modelcontextprotocol/clientCapabilities": {"extensions": {"io.modelcontextprotocol/events": {}}},
-    });
     b.send(
-        json!({"jsonrpc": "2.0", "id": 1, "method": "server/discover", "params": {"_meta": meta}}),
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+        "protocolVersion": "2025-03-26", "capabilities": {},
+        "clientInfo": {"name": "events", "version": "1"}}}),
     );
-    let d = b.expect();
+    let init = b.expect();
     assert_eq!(
-        d["result"]["capabilities"]["extensions"]["io.modelcontextprotocol/events"],
+        init["result"]["capabilities"]["events"],
         json!({}),
-        "{d}"
+        "{init}"
     );
+    b.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+    let hook = w.rt.block_on(receiver::Receiver::start());
+    let secret = receiver::secret(1);
     b.send(
-        json!({"jsonrpc": "2.0", "id": "s", "method": "events/stream", "params": {
-        "name": "agent.started", "arguments": {"project": "app"}, "cursor": null, "_meta": meta}}),
+        json!({"jsonrpc": "2.0", "id": 2, "method": "events/subscribe", "params": {
+        "name": "agent.started", "arguments": {"project": "app"}, "cursor": null,
+        "delivery": {"mode": "webhook", "url": hook.url("/hook"), "secret": secret}}}),
     );
-    let active = b.expect();
-    assert_eq!(active["method"], "notifications/events/active", "{active}");
-    assert_eq!(
-        active["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
-        "s"
-    );
-    let hub = vibe_mcp::Daemon::events(&*w.core).unwrap();
-    assert_eq!(hub.streams(), 1);
-    // A poll alongside it, from now.
-    b.send(
-        json!({"jsonrpc": "2.0", "id": 2, "method": "events/poll", "params": {
-        "name": "agent.started", "arguments": {}, "cursor": null, "_meta": meta}}),
-    );
-    let p = b.expect();
-    assert_eq!(p["id"], 2, "{p}");
-    let cursor = p["result"]["cursor"].clone();
+    let sub = b.expect();
+    let id = sub["result"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{sub}"))
+        .to_owned();
+    assert_eq!(hook.verifications().len(), 1);
     let a =
         w.rt.block_on(w.core.start_agent(AgentStartParams {
             project: "app".into(),
@@ -309,29 +303,21 @@ fn the_bridge_carries_event_streams() {
             ..Default::default()
         }))
         .unwrap();
-    let e = b.expect();
-    assert_eq!(e["method"], "notifications/events/event", "{e}");
-    assert_eq!(e["params"]["name"], "agent.started");
-    assert_eq!(e["params"]["data"]["ref"], a.agent);
-    assert_eq!(e["params"]["data"]["state"], "busy");
-    assert_eq!(
-        e["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
-        "s"
-    );
+    let got = w.rt.block_on(hook.wait_events(1, Duration::from_secs(20)));
+    assert_eq!(got[0].json["name"], "agent.started");
+    assert_eq!(got[0].json["data"]["ref"], a.agent);
+    assert_eq!(got[0].json["data"]["state"], "busy");
+    assert_eq!(got[0].header("x-mcp-subscription-id"), id);
+    assert!(receiver::signed_with(&secret, &got[0]));
     b.send(
-        json!({"jsonrpc": "2.0", "id": 3, "method": "events/poll", "params": {
-        "name": "agent.started", "arguments": {}, "cursor": cursor, "_meta": meta}}),
+        json!({"jsonrpc": "2.0", "id": 3, "method": "events/unsubscribe", "params": {
+        "name": "agent.started", "arguments": {"project": "app"},
+        "delivery": {"url": hook.url("/hook")}}}),
     );
-    let p = b.expect();
-    assert_eq!(p["result"]["events"][0]["data"]["agent"], a.agent, "{p}");
-    // A cancel ends the stream, and nothing answers it.
-    b.send(json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": "s"}}));
-    let gone = Instant::now() + Duration::from_secs(20);
-    while hub.streams() > 0 {
-        assert!(Instant::now() < gone, "the stream outlived its cancel");
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    assert!(b.next(Duration::from_secs(1)).is_none());
+    let gone = b.expect();
+    assert_eq!(gone["id"], 3, "{gone}");
+    assert!(gone.get("error").is_none(), "{gone}");
+    assert!(vibe_mcp::Daemon::webhooks(&*w.core).unwrap().is_empty());
     w.rt.block_on(w.core.delete_agent(vibe_core::rpc::AgentDeleteParams {
         host: None,
         agent: a.agent,

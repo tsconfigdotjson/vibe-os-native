@@ -364,7 +364,7 @@ impl Daemon for Core {
         }
     }
 
-    fn events(&self) -> Option<Arc<vibe_mcp::events::Hub>> {
+    fn webhooks(&self) -> Option<Arc<vibe_mcp::webhook::Webhooks>> {
         Some(Arc::clone(self.mcp_events.get_or_init(|| {
             let hub = Arc::new(vibe_mcp::events::Hub::default());
             // Subscribed first, so a change while it's seeded isn't lost.
@@ -385,15 +385,20 @@ impl Daemon for Core {
                 }
             }
             hub.spawn_feed(rx);
-            hub
+            // Kept beside vibe.db, so they outlast a restart.
+            let config = vibe_mcp::webhook::Config {
+                path: Some(self.layout.data_dir().join("mcp-webhooks.json")),
+                ..vibe_mcp::webhook::Config::default()
+            };
+            let hooks = vibe_mcp::webhook::Webhooks::new(hub, config);
+            let me = self.me.get().cloned().unwrap_or_default();
+            hooks.start(Arc::new(crate::mac_events::Owners(me)));
+            hooks
         })))
     }
 
-    async fn events_relayed(&self, c: &Caller) -> bool {
-        match self.events() {
-            Some(hub) => self.mac_events_heard(c.key(), &hub).await,
-            None => false,
-        }
+    async fn events_subscriber(&self, c: &Caller) {
+        self.mac_relay_for(c.key()).await;
     }
 
     fn known_hosts(&self, c: &Caller, agent: &str) -> Vec<String> {

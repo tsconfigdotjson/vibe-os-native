@@ -61,6 +61,37 @@ pub fn hash(key: &str) -> String {
         .collect()
 }
 
+/// HMAC-SHA256 (RFC 2104) of `parts`, one after another, under `key`.
+pub fn hmac_sha256(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
+    const BLOCK: usize = 64;
+    let mut k = [0u8; BLOCK];
+    if key.len() > BLOCK {
+        k[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+    let mut inner = Sha256::new();
+    inner.update(k.map(|b| b ^ 0x36));
+    for p in parts {
+        inner.update(p);
+    }
+    let inner = inner.finalize();
+    let mut outer = Sha256::new();
+    outer.update(k.map(|b| b ^ 0x5c));
+    outer.update(inner);
+    outer.finalize().into()
+}
+
+/// Bytes in lowercase hex.
+pub fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Whether `a` and `b` are the same, taking as long whatever they hold: for secrets.
+pub fn same_secret(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0
+}
+
 /// The part of a key that's kept to show it, e.g. `vk_abcdefgh`.
 pub fn shown_prefix(key: &str) -> String {
     key.chars().take(SHOWN).collect()
@@ -142,6 +173,27 @@ mod tests {
     fn shown_prefix_is_short() {
         let k = encode(&[0; 32]);
         assert_eq!(shown_prefix(&k), "vk_aaaaaaaa");
+    }
+
+    #[test]
+    fn hmac_matches_rfc_4231() {
+        // Test case 2.
+        let mac = hmac_sha256(b"Jefe", &[b"what do ya want ", b"for nothing?"]);
+        assert_eq!(
+            hex(&mac),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+        // Test case 6: a key longer than a block.
+        let mac = hmac_sha256(
+            &[0xaa; 131],
+            &[b"Test Using Larger Than Block-Size Key - Hash Key First"],
+        );
+        assert_eq!(
+            hex(&mac),
+            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
+        );
+        assert!(same_secret(b"abc", b"abc"));
+        assert!(!same_secret(b"abc", b"abd") && !same_secret(b"abc", b"ab"));
     }
 
     #[test]

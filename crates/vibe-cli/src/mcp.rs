@@ -6,8 +6,7 @@
 //! comes back, a JSON response or an event stream with progress, is
 //! written to stdout a message per line. So auth is the same as over HTTP:
 //! no key, no MCP. A cancel from the client closes the request it names,
-//! which cancels the call on the server: it's also how an `events/stream`
-//! (MCP Events) ends, whose notifications come through as they're sent.
+//! which cancels the call on the server.
 //!
 //! stdout is the protocol channel, so everything this says goes to stderr.
 
@@ -323,7 +322,7 @@ fn request_headers(message: &Value, agreed: Option<String>) -> Vec<(&'static str
     let key = match method {
         "tools/call" | "prompts/get" => "name",
         // MCP Events: the event type (SEP-3415, Routing Headers).
-        "events/poll" | "events/stream" | "events/subscribe" | "events/unsubscribe" => "name",
+        "events/subscribe" | "events/unsubscribe" => "name",
         "resources/read" | "resources/subscribe" | "resources/unsubscribe" => "uri",
         m if m.starts_with("tasks/") => "taskId",
         _ => return out,
@@ -613,13 +612,13 @@ mod tests {
                 ("Mcp-Method", "tools/list".to_owned()),
             ]
         );
-        let stream = json!({"jsonrpc": "2.0", "id": 3, "method": "events/stream",
+        let subscribe = json!({"jsonrpc": "2.0", "id": 3, "method": "events/subscribe",
             "params": {"name": "agent.turn_ended", "arguments": {}}});
         assert_eq!(
-            request_headers(&stream, Some("2026-07-28".into())),
+            request_headers(&subscribe, Some("2026-07-28".into())),
             [
                 ("MCP-Protocol-Version", "2026-07-28".to_owned()),
-                ("Mcp-Method", "events/stream".to_owned()),
+                ("Mcp-Method", "events/subscribe".to_owned()),
                 ("Mcp-Name", "agent.turn_ended".to_owned()),
             ]
         );

@@ -976,31 +976,80 @@ pub const CALL_ACCEPTED: &str = "call.accepted";
 /// One without it is older, and isn't held to the accept deadline.
 pub const ACCEPTS_CALLS: &str = "accepts_calls";
 
-/// `tunnel.events`, which only the Mac's tunnel sockets take: with a key the Mac checks
-/// itself, as for `tunnel.call`, it answers with each agent's state now
+/// `tunnel.grant`, which only the Mac's tunnel sockets take: with a caller's API key,
+/// checked as for `tunnel.call`, it answers with a relay grant ([`TunnelGrant`]) for
+/// that key. A grant opens [`TUNNEL_EVENTS`] and nothing else, so the host keeps it,
+/// never the key, for the webhook subscriptions that key made (PRD: MCP interface,
+/// Events). It holds until it expires, or the key is revoked on the Mac.
+pub const TUNNEL_GRANT: &str = "tunnel.grant";
+
+/// `tunnel.events`, which only the Mac's tunnel sockets take: with relay grants
+/// ([`TUNNEL_GRANT`]), it answers with each agent's state now and which grants it takes
 /// ([`TunnelEvents`]), then sends an `events.event` line on the same connection for each
 /// agent's start, change of state and deletion, on the Mac (`local`) and on the other
 /// hosts linked to it (by their names), and for those hosts' links coming and going,
-/// until the connection closes. Never the asking host's own. It closes when the key no
-/// longer works there, and when it fell behind, so what's listening starts over.
+/// until the connection closes. Never the asking host's own. When which grants it takes
+/// changes (a key revoked, a grant run out), it says so in an `events.admitted` line
+/// ([`TunnelAdmitted`]); it closes once it takes none, and when it fell behind, so
+/// what's listening starts over.
 pub const TUNNEL_EVENTS: &str = "tunnel.events";
 
-/// In a `daemon.hello` answer on a tunnel's socket: it takes [`TUNNEL_EVENTS`]. One
-/// without it is older, and isn't asked.
+/// In a `daemon.hello` answer on a tunnel's socket: it takes [`TUNNEL_GRANT`] and
+/// [`TUNNEL_EVENTS`]. One without it is older, and isn't asked.
 pub const SERVES_EVENTS: &str = "serves_events";
+
+/// The most grants one [`TUNNEL_EVENTS`] takes.
+pub const MAX_TUNNEL_GRANTS: usize = 64;
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct TunnelGrantParams {
+    /// The API key of a caller of the host's MCP, as it sent it.
+    pub key: String,
+}
+
+impl fmt::Debug for TunnelGrantParams {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TunnelGrantParams")
+            .field("key", &crate::keys::shown_prefix(&self.key))
+            .finish()
+    }
+}
+
+/// What [`TUNNEL_GRANT`] answers with.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TunnelGrant {
+    pub grant: String,
+    /// When it runs out, in seconds since the epoch.
+    pub expires: i64,
+}
+
+impl fmt::Debug for TunnelGrant {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TunnelGrant")
+            .field("expires", &self.expires)
+            .finish_non_exhaustive()
+    }
+}
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct TunnelEventsParams {
-    /// The API key of a caller of the host's MCP, as it sent it.
-    pub key: String,
+    /// Relay grants, each from [`TUNNEL_GRANT`].
+    pub grants: Vec<String>,
 }
 
 impl fmt::Debug for TunnelEventsParams {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TunnelEventsParams")
-            .field("key", &crate::keys::shown_prefix(&self.key))
+            .field("grants", &self.grants.len())
             .finish()
     }
+}
+
+/// An `events.admitted` line: which of a [`TUNNEL_EVENTS`] request's grants the Mac
+/// takes now, in its order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TunnelAdmitted {
+    pub admitted: Vec<bool>,
 }
 
 /// What [`TUNNEL_EVENTS`] answers with before its events: each agent's state now.
@@ -1010,6 +1059,9 @@ pub struct TunnelEvents {
     /// How each other host's link to the Mac stands now, as a `host.link` event says.
     #[serde(default)]
     pub links: Vec<TunnelLinkState>,
+    /// Which of the request's grants the Mac takes, in its order.
+    #[serde(default)]
+    pub admitted: Vec<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

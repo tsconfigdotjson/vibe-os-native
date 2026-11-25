@@ -190,14 +190,18 @@ unprotected.
 
 ## MCP events
 
-A client that speaks MCP protocol `2026-07-28` can subscribe to what
-happens to agents instead of calling `vibe_wait` or `vibe_list_agents` over
-and over. This uses the
-[Events extension](https://modelcontextprotocol.io/extensions/events/overview)
-(`io.modelcontextprotocol/events`, at Beta). `server/discover` advertises it.
-Older protocol versions don't see it, and get "method not found" for
-`events/*`. No widely used client supports Events yet, so this is for your
-own orchestrators and client SDKs that implement it.
+An MCP client can subscribe to what happens to agents instead of calling
+`vibe_wait` or `vibe_list_agents` over and over, and have each change posted
+to a webhook. This is MCP Events
+([SEP-3415](https://modelcontextprotocol.io/extensions/events/overview),
+`io.modelcontextprotocol/events`) as
+[ChatGPT implements it](https://developers.openai.com/plugins/build/mcp-events):
+webhook delivery with callback verification. It works between a client's
+turns, when nothing of the client is running. Poll and push aren't offered.
+
+`initialize` and `server/discover` both advertise `capabilities.events`, and
+`events/list`, `events/subscribe` and `events/unsubscribe` work at any
+protocol version, over HTTP or `vibe mcp`.
 
 | Event | Fires when | Payload |
 | --- | --- | --- |
@@ -213,39 +217,46 @@ schema doesn't list is refused. Payloads never carry what an agent wrote:
 read its answer with `vibe_read_messages` and its screen with
 `vibe_read_output`.
 
-- **Delivery.**
-  - Poll uses `events/poll`. Poll every `nextPollMs`, which is 5 s, or at
-    once while `hasMore` is true.
-  - Push uses `events/stream`, a long-lived request that comes back as an
-    event stream. It sends a heartbeat every 30 s by default, and a client
-    can ask for anything from 5 to 60 s.
-  - Webhooks (`events/subscribe`) aren't offered. VibeOS listens on
-    loopback and your tailnet, and doesn't post to URLs a client names.
-  - Over `vibe mcp`, a stream's notifications come through on stdout. A
-    `notifications/cancelled` for the stream's request ends it.
+- **Subscribing.** `events/subscribe` takes the event type, its arguments,
+  and `delivery: {mode: "webhook", url, secret}`, where `secret` is a
+  Standard Webhooks `whsec_` secret. The first time your key uses a URL,
+  VibeOS posts it a signed `{"type": "verification", "challenge": …}`, and
+  your receiver must answer 2xx with `{"challenge": …}` as it came. If it
+  doesn't, the subscribe fails with `-32015` and a `data.reason` such as
+  `challenge_failed` or `timeout`. Subscribing again with the same type,
+  arguments and URL refreshes the subscription (argument order doesn't
+  matter), and can replace the secret.
+- **Deliveries.** One signed POST per event, with `webhook-id`,
+  `webhook-timestamp`, `webhook-signature` and `X-MCP-Subscription-Id`, so
+  any Standard Webhooks library can check it. A failed delivery is tried
+  again four times over about ten minutes; `410` or `413` stops it at once.
+  Redirects aren't followed.
+- **Where it can post.** `https` URLs on the internet, and `http` or `https`
+  on this machine or your tailnet (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`,
+  `*.ts.net`). Private network, link-local and cloud metadata addresses are
+  refused, checked again every time it connects.
+- **Lifetimes.** 24 hours unless you ask, at least 5 minutes, at most 30
+  days (also for `ttlMs: null`). Refresh before `refreshBefore`.
+  Subscriptions survive `vibed` restarting. Deleting the API key that made
+  them ends them. `events/unsubscribe` ends one at once. A key can hold 32,
+  a host 256.
 - **Coverage.** Events cover every host the endpoint reaches. On the Mac,
   that's the Mac and its linked Linux hosts. On a Linux host, it's the host
   itself, the Mac (`mac:…`) and the other hosts linked to the Mac, while the
-  Mac is online. The Mac's events come down its tunnel, opened with your
-  key: the Mac must take that key, as for calls, so a key made on the
-  Linux host alone hears only that host. The first poll or stream that needs
-  them can take up to 3 s longer while the host subscribes.
-- **Cursors.**
-  - Each `vibed` keeps the last 4,096 events.
-  - A cursor older than that, or from before `vibed` restarted, comes back
-    with `truncated: true` and a fresh cursor.
-  - You also get `truncated: true` when a linked host's link comes back up,
-    since its events weren't heard while it was down. That applies only to
-    subscriptions that could include that host.
-  - On a Linux host, the Mac waking from sleep, its tunnel coming back, or
-    10 minutes with no client asking for events is also `truncated: true`,
-    for subscriptions that could include the Mac or the hosts linked to it.
-  - After a truncated reply, read what you need with the tools.
-- **Limits and keys.**
-  - At most 64 streams are open at once on a host.
-  - A stream ends when its listener stops, as when MCP on Tailscale is
-    turned off.
-  - A stream also ends when the API key it was opened with is deleted. It
-    ends with `notifications/events/terminated` (Forbidden).
-  - `subscriptions/listen` is accepted with an empty filter and stays quiet:
-    the tools never change. It counts against the same 64.
+  Mac is online. For the Mac's, the Linux host asks the Mac for a relay grant
+  when you subscribe: the Mac must take your key, as for calls, so a key made
+  on the Linux host alone hears only that host. The host keeps that grant,
+  which only reads events, never your key. A subscribe that needs it can
+  take up to 3 s longer.
+- **Cursors.** Each delivery carries a `cursor`. Pass the last one you have
+  when you refresh. If events may have been missed since then, the answer
+  says `truncated: true`:
+  - `vibed` restarted, or the cursor is older than the last 4,096 events;
+  - a linked host's link came back up, since its events weren't heard while
+    it was down (only for subscriptions that could include that host);
+  - on a Linux host, the Mac woke from sleep or its tunnel came back (only
+    for subscriptions that could include the Mac or its hosts).
+
+  A lapsed subscription renewed with a cursor gets what it missed, if this
+  `vibed` still has it. After `truncated`, read what you need with the
+  tools.

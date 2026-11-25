@@ -13,10 +13,10 @@ use std::time::{Duration, Instant};
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, CustomRequest,
     CustomResult, DiscoverResult, ErrorCode as McpErrorCode, Implementation, JsonObject,
-    ListToolsResult, PaginatedRequestParams, ProgressNotificationParam, ProtocolVersion,
-    ServerCapabilities, ServerConfig, SubscriptionFilter, Tool, ToolAnnotations,
+    ListToolsResult, PaginatedRequestParams, ProgressNotificationParam, ServerCapabilities,
+    ServerConfig, Tool, ToolAnnotations,
 };
-use rmcp::service::{RequestContext, SubscriptionContext};
+use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler};
 use serde_json::{Value, json};
 use vibe_core::model::{AgentKind, AgentState, LOCAL_HOST};
@@ -1316,14 +1316,15 @@ impl<D: Daemon> ServerHandler for Server<D> {
     }
 
     /// What `get_info` says, and, where the daemon offers events, the Events
-    /// extension: only here, as it's defined from 2026-07-28, which has no
-    /// `initialize`.
+    /// extension. `capabilities.events`, as ChatGPT looks for it, is added
+    /// to this and to `initialize`'s result on the way out
+    /// ([`crate::http`]), as `rmcp` has no place for it.
     async fn discover(
         &self,
         _context: RequestContext<RoleServer>,
     ) -> Result<DiscoverResult, ErrorData> {
         let mut info = self.get_info();
-        if self.daemon.events().is_some() {
+        if self.daemon.webhooks().is_some() {
             info.capabilities
                 .extensions
                 .get_or_insert_with(Default::default)
@@ -1335,33 +1336,11 @@ impl<D: Daemon> ServerHandler for Server<D> {
         ))
     }
 
-    /// `subscriptions/listen` (2026-07-28) is accepted, but with nothing in
-    /// it: the tools never change, and there are no resources or prompts, so
-    /// there's no list-change notification to send. The Events extension's
-    /// `eventsListChanged` is left out with them, as its event types never
-    /// change either. A client that opens one anyway gets its
-    /// acknowledgement, and a stream that stays quiet until it's closed.
-    fn accepted_subscription_filter(
-        &self,
-        _requested: &SubscriptionFilter,
-    ) -> Option<SubscriptionFilter> {
-        Some(SubscriptionFilter::new())
-    }
-
-    /// Holds a `subscriptions/listen` stream open until it's closed, or its
-    /// listener stops. It takes one of the event streams' places, so the two
-    /// together are held to [`events::MAX_STREAMS`]; past that it's closed
-    /// at once, gracefully.
-    async fn listen(&self, context: SubscriptionContext) -> Result<(), ErrorData> {
-        if let Some(_slot) = self.daemon.events().and_then(|h| h.open_stream().ok()) {
-            context.cancelled().await;
-        }
-        Ok(())
-    }
-
-    /// The Events extension's requests (`events/*`); any other is a method
-    /// not found, as is every one of them before 2026-07-28 or from a daemon
-    /// that offers no events.
+    /// The Events extension's requests (`events/*`), at any protocol
+    /// version, as ChatGPT sends them after `initialize`; any other is a
+    /// method not found, as is every one of them from a daemon that offers
+    /// no events. Webhook is the only delivery: `events/poll` and
+    /// `events/stream` aren't served.
     async fn on_custom_request(
         &self,
         request: CustomRequest,
@@ -1369,13 +1348,10 @@ impl<D: Daemon> ServerHandler for Server<D> {
     ) -> Result<CustomResult, ErrorData> {
         let method = request.method.as_str();
         let not_found = || ErrorData::new(McpErrorCode::METHOD_NOT_FOUND, method.to_owned(), None);
-        let modern = context
-            .protocol_version()
-            .is_some_and(|v| v.as_str() >= ProtocolVersion::V_2026_07_28.as_str());
-        let Some(hub) = self
+        let Some(hooks) = self
             .daemon
-            .events()
-            .filter(|_| modern && events::is_events_method(method))
+            .webhooks()
+            .filter(|_| events::is_events_method(method))
         else {
             return Err(not_found());
         };
@@ -1389,27 +1365,14 @@ impl<D: Daemon> ServerHandler for Server<D> {
         }
         let result = match method {
             "events/list" => events::list(params)?,
-            "events/poll" => {
-                // Asked first: a relay that starts for it has what it missed
-                // behind the cursor this poll gives.
-                let relayed = self.daemon.events_relayed(&caller).await;
-                events::poll(&hub, params, relayed)?
+            "events/subscribe" => {
+                let subscribe = hooks.check_subscribe(&caller, params)?;
+                // First: a relay that starts for it is behind the cursor
+                // this subscription starts from.
+                self.daemon.events_subscriber(&caller).await;
+                hooks.subscribe(subscribe).await?
             }
-            "events/stream" => {
-                let name = params
-                    .and_then(|p| p.get("name"))
-                    .and_then(Value::as_str)
-                    .and_then(events::Name::parse);
-                if let Some(name) = name {
-                    self.daemon.log(&format!(
-                        "mcp: key {:?} opened a stream of {}",
-                        caller.name(),
-                        name.as_str()
-                    ));
-                }
-                events::stream(&hub, &self.daemon, &caller, params, &context).await?
-            }
-            "events/subscribe" | "events/unsubscribe" => events::webhook(params)?,
+            "events/unsubscribe" => hooks.unsubscribe(&caller, params)?,
             _ => return Err(not_found()),
         };
         Ok(CustomResult::new(result))

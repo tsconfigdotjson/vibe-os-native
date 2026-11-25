@@ -179,22 +179,69 @@ async fn handle<D: Daemon>(
         return unauthorized();
     };
     req.extensions_mut().insert(caller);
+    let advertise = daemon.webhooks().is_some() && {
+        let Ok(body) = req.body().clone().collect().await;
+        says_capabilities(&body.to_bytes())
+    };
     let mut svc = svc;
-    match svc.call(req).await {
+    let response = match svc.call(req).await {
         Ok(r) => r,
         Err(never) => match never {},
+    };
+    if advertise {
+        with_events(response).await
+    } else {
+        response
     }
 }
 
+/// Whether a request's answer says the server's capabilities: `initialize`
+/// and `server/discover`.
+fn says_capabilities(body: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("method").and_then(|m| m.as_str()).map(str::to_owned))
+        .is_some_and(|m| m == "initialize" || m == "server/discover")
+}
+
+/// `capabilities.events: {}` in a JSON answer's result, where ChatGPT looks
+/// for MCP Events (`rmcp` has no place for it). Anything else passes as it is.
+async fn with_events(response: Response<Body>) -> Response<Body> {
+    let json = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("application/json"));
+    if !json {
+        return response;
+    }
+    let (mut parts, body) = response.into_parts();
+    let Ok(collected) = body.collect().await;
+    let bytes = collected.to_bytes();
+    let changed = serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .and_then(|mut v| {
+            let caps = v
+                .get_mut("result")?
+                .get_mut("capabilities")?
+                .as_object_mut()?;
+            caps.insert("events".into(), serde_json::json!({}));
+            serde_json::to_vec(&v).ok()
+        });
+    let bytes = changed.map_or(bytes, Bytes::from);
+    parts.headers.remove(header::CONTENT_LENGTH);
+    Response::from_parts(parts, Full::new(bytes).boxed())
+}
+
 /// Serves MCP on `listener` until the task is aborted. Connections already
-/// open finish on their own, but for event streams (`events/stream`),
-/// which never would: they end with the listener, so one turned off in
-/// Settings serves nothing more.
+/// open finish on their own, but for event streams with progress, which end
+/// with the listener, so one turned off in Settings serves nothing more.
 pub async fn serve<D: Daemon>(listener: TcpListener, daemon: Arc<D>, check_host: bool) {
     let stop = CancellationToken::new();
     let _ends_streams = stop.clone().drop_guard();
-    // The daemon's events are heard from now on, before anyone subscribes.
-    let _ = daemon.events();
+    // The daemon's events are heard from now on, and its webhooks
+    // delivered, before anyone subscribes.
+    let _ = daemon.webhooks();
     let svc = service(Arc::clone(&daemon), check_host, stop);
     // Open connections are capped, so peers that connect and say nothing
     // can't take every descriptor `vibed` has.

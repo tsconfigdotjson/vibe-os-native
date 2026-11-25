@@ -4,81 +4,54 @@
 //!
 //! Four event types, about agents on every host this endpoint reaches:
 //! this one, the Linux hosts linked to it, and on a Linux host the Mac
-//! behind it and the other hosts linked to that Mac. `agent.started`, `agent.state_changed`, `agent.turn_ended` and
-//! `agent.deleted`. Each payload is a ref, its host, project and state, and
-//! no more: what an agent said or shows is read with the tools, so nothing
-//! an agent wrote rides in an event.
+//! behind it and the other hosts linked to that Mac. `agent.started`,
+//! `agent.state_changed`, `agent.turn_ended` and `agent.deleted`. Each
+//! payload is a ref, its host, project and state, and no more: what an
+//! agent said or shows is read with the tools, so nothing an agent wrote
+//! rides in an event.
 //!
-//! Two of the three delivery modes: poll (`events/poll`) and push
-//! (`events/stream`). Webhook (`events/subscribe`) is refused as
-//! unsupported: `vibed` serves on loopback and the tailnet, and has no
-//! business posting to URLs a client names.
+//! One delivery mode: webhook ([`crate::webhook`]), the one that works
+//! between a client's turns, as ChatGPT has it. Poll and push need the
+//! client running, which ChatGPT's isn't, so they aren't offered.
 //!
-//! Both modes read one [`Hub`] per daemon: a ring of the last [`RING`]
+//! Subscriptions read one [`Hub`] per daemon: a ring of the last [`RING`]
 //! occurrences, fed from the daemon's event bus. A cursor is a position in
 //! it, `<boot>-<seq>`; one from an earlier `vibed`, or older than the ring
-//! holds, gets `truncated: true` and a fresh cursor, as do the times a
-//! host's events may have been missed (its link was down, or the feed fell
-//! behind).
+//! holds, is `truncated`, as are the times a host's events may have been
+//! missed (its link was down, or the feed fell behind).
 //!
 //! What another daemon relays (on a Linux host, the Mac's events, down its
 //! tunnel) is held apart as [`Occurrence::relayed`]: that daemon checks keys
-//! itself, so its events, and the gaps in them, go only to callers it takes
-//! ([`Daemon::events_relayed`]).
+//! itself, so its events, and the gaps in them, go only to subscriptions
+//! whose owner it takes ([`crate::webhook::Owners::hears_relayed`]).
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use rmcp::model::{CustomNotification, ErrorCode, ServerNotification};
-use rmcp::service::RequestContext;
-use rmcp::{ErrorData, RoleServer};
+use rmcp::ErrorData;
+use rmcp::model::ErrorCode;
 use serde_json::{Map, Value, json};
 use tokio::sync::{broadcast, watch};
 use vibe_core::model::{AgentState, EventKind, LOCAL_HOST};
 use vibe_core::rpc::Event;
 
-use crate::{Caller, Daemon, display_ref, split_ref};
+use crate::{display_ref, split_ref};
 
 /// The extension's identifier, the key it's advertised under.
 pub const EXTENSION: &str = "io.modelcontextprotocol/events";
 
-/// Where every push notification names its stream.
-const SUBSCRIPTION_ID: &str = "io.modelcontextprotocol/subscriptionId";
-
-/// How many occurrences the hub keeps for poll and replay.
+/// How many occurrences the hub keeps for replay.
 pub const RING: usize = 4096;
 
-/// The most `events/stream` requests open at once, across every listener.
-/// Each holds a connection, which the listeners cap at
-/// [`crate::http::MAX_CONNECTIONS`]; this leaves the rest for calls.
-pub const MAX_STREAMS: usize = 64;
-
-/// A stream's heartbeat, unless the client asks for another within
-/// [`MIN_HEARTBEAT`] and [`MAX_HEARTBEAT`]. The longest stays well inside
-/// `vibe mcp`'s read timeout.
-pub const DEFAULT_HEARTBEAT: Duration = Duration::from_secs(30);
-pub const MIN_HEARTBEAT: Duration = Duration::from_secs(5);
-pub const MAX_HEARTBEAT: Duration = Duration::from_secs(60);
-
-/// How long a poller is asked to wait between polls.
-pub const NEXT_POLL_MS: u64 = 5000;
-
-/// How often a stream asks again whether its caller hears what's relayed.
-const RELAY_RENEW: Duration = Duration::from_secs(30);
-
-const DEFAULT_MAX_EVENTS: u64 = 100;
-const MAX_EVENTS: u64 = 1000;
 const MAX_FILTER_AGENTS: usize = 32;
 
 // The extension's error codes (Error Handling).
-const NOT_FOUND: i32 = -32023;
-const FORBIDDEN: i32 = -32024;
-const RESOURCE_EXHAUSTED: i32 = -32025;
-const UNSUPPORTED: i32 = -32026;
+pub(crate) const NOT_FOUND: i32 = -32023;
+pub(crate) const RESOURCE_EXHAUSTED: i32 = -32025;
+pub(crate) const UNSUPPORTED: i32 = -32026;
 
-fn error(code: i32, message: impl Into<String>, data: Option<Value>) -> ErrorData {
+pub(crate) fn error(code: i32, message: impl Into<String>, data: Option<Value>) -> ErrorData {
     ErrorData::new(ErrorCode(code), message.into(), data)
 }
 
@@ -119,7 +92,7 @@ impl Name {
     fn description(self) -> &'static str {
         match self {
             Name::Started => {
-                "An agent was started, by any client or the app. Fires on this host and the Linux hosts linked to it."
+                "An agent was started, by any client or the app, on any host this server reaches."
             }
             Name::StateChanged => {
                 "An agent changed state: busy, idle, question (it's asking something), asleep, paused (a limit hit) or exited. previous is its state before, when known."
@@ -202,7 +175,7 @@ impl Name {
         json!({
             "name": self.as_str(),
             "description": self.description(),
-            "delivery": ["poll", "push"],
+            "delivery": ["webhook"],
             "inputSchema": self.input_schema(),
             "payloadSchema": self.payload_schema(),
         })
@@ -233,7 +206,8 @@ pub struct Occurrence {
 }
 
 impl Occurrence {
-    fn data(&self) -> Value {
+    /// Its payload: what a delivery's `data` is.
+    pub fn data(&self) -> Value {
         let mut d = json!({
             "ref": display_ref(&self.host, &self.agent),
             "host": self.host,
@@ -247,20 +221,6 @@ impl Occurrence {
             d["previous"] = json!(self.previous);
         }
         d
-    }
-
-    /// As an `EventOccurrence`, with `cursor` for push.
-    fn to_json(&self, boot: &str, cursor: bool) -> Value {
-        let mut o = json!({
-            "eventId": position(boot, self.seq),
-            "name": self.name.as_str(),
-            "timestamp": self.timestamp,
-            "data": self.data(),
-        });
-        if cursor {
-            o["cursor"] = json!(position(boot, self.seq));
-        }
-        o
     }
 }
 
@@ -353,9 +313,8 @@ pub struct Hub {
     inner: Mutex<Inner>,
     /// The last `seq`, for streams to wait on.
     newest: watch::Sender<u64>,
-    /// Bumped when the API keys change, so streams check theirs again.
+    /// Bumped when the API keys change, so subscriptions check theirs again.
     keys: watch::Sender<u64>,
-    streams: AtomicUsize,
 }
 
 impl Default for Hub {
@@ -391,7 +350,6 @@ impl Hub {
             inner: Mutex::new(Inner::default()),
             newest: watch::Sender::new(0),
             keys: watch::Sender::new(0),
-            streams: AtomicUsize::new(0),
         }
     }
 
@@ -569,9 +527,44 @@ impl Hub {
         });
     }
 
+    /// The last position.
+    pub fn last(&self) -> u64 {
+        lock(&self.inner).last
+    }
+
+    /// A position, as a cursor.
+    pub fn cursor(&self, seq: u64) -> String {
+        position(&self.boot, seq)
+    }
+
     /// The last position, as a cursor.
     pub fn cursor_now(&self) -> String {
-        position(&self.boot, lock(&self.inner).last)
+        self.cursor(self.last())
+    }
+
+    /// The last position, as it changes.
+    pub fn watch_newest(&self) -> watch::Receiver<u64> {
+        self.newest.subscribe()
+    }
+
+    /// Counts the times the API keys changed, as they do.
+    pub fn watch_keys(&self) -> watch::Receiver<u64> {
+        self.keys.subscribe()
+    }
+
+    /// Whether `filter` may have missed something after position `after`:
+    /// a gap that may hold one of its, or the ring having moved on past it.
+    pub fn gap_after(&self, after: u64, filter: &Filter) -> bool {
+        let inner = lock(&self.inner);
+        after < inner.floor()
+            || inner.ring.iter().any(|e| match e {
+                Entry::Gap { seq, host, relayed } => {
+                    *seq > after
+                        && (!relayed || filter.relayed)
+                        && host.as_deref().is_none_or(|h| filter.may_include_host(h))
+                }
+                Entry::Event(_) => false,
+            })
     }
 
     /// Where a client's cursor says to go on from, and whether that's later
@@ -652,37 +645,6 @@ impl Hub {
             cursor,
             has_more,
         }
-    }
-
-    /// How many streams are open now.
-    pub fn streams(&self) -> usize {
-        self.streams.load(Ordering::SeqCst)
-    }
-
-    /// Takes one of [`MAX_STREAMS`] places, for a stream, until the slot is
-    /// dropped.
-    pub fn open_stream(self: &Arc<Self>) -> Result<StreamSlot, ErrorData> {
-        let taken = self.streams.fetch_add(1, Ordering::SeqCst) < MAX_STREAMS;
-        // The slot's drop gives back what was taken, whichever way it went.
-        let slot = StreamSlot(Arc::clone(self));
-        if taken {
-            return Ok(slot);
-        }
-        Err(error(
-            RESOURCE_EXHAUSTED,
-            format!("{MAX_STREAMS} event streams are open already: close one, or use events/poll"),
-            Some(json!({"limit": "streams", "max": MAX_STREAMS})),
-        ))
-    }
-}
-
-/// One of [`MAX_STREAMS`], given back when the stream ends however it ends.
-#[derive(Debug)]
-pub struct StreamSlot(Arc<Hub>);
-
-impl Drop for StreamSlot {
-    fn drop(&mut self) {
-        self.0.streams.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -821,7 +783,7 @@ pub fn is_events_method(method: &str) -> bool {
     method.starts_with("events/")
 }
 
-fn params_object(params: Option<&Value>) -> Result<Map<String, Value>, ErrorData> {
+pub(crate) fn params_object(params: Option<&Value>) -> Result<Map<String, Value>, ErrorData> {
     match params {
         None | Some(Value::Null) => Ok(Map::new()),
         Some(Value::Object(m)) => Ok(m.clone()),
@@ -830,7 +792,7 @@ fn params_object(params: Option<&Value>) -> Result<Map<String, Value>, ErrorData
 }
 
 /// The event type a request names, which must be one.
-fn named(params: &Map<String, Value>) -> Result<Name, ErrorData> {
+pub(crate) fn named(params: &Map<String, Value>) -> Result<Name, ErrorData> {
     let name = params
         .get("name")
         .and_then(Value::as_str)
@@ -844,26 +806,11 @@ fn named(params: &Map<String, Value>) -> Result<Name, ErrorData> {
     })
 }
 
-fn cursor_param(params: &Map<String, Value>) -> Result<Option<String>, ErrorData> {
+pub(crate) fn cursor_param(params: &Map<String, Value>) -> Result<Option<String>, ErrorData> {
     match params.get("cursor") {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(s)) => Ok(Some(s.clone())),
         Some(_) => Err(invalid("cursor must be a string, or null for now")),
-    }
-}
-
-fn whole(
-    params: &Map<String, Value>,
-    key: &str,
-    min: u64,
-    max: u64,
-) -> Result<Option<u64>, ErrorData> {
-    match params.get(key) {
-        None | Some(Value::Null) => Ok(None),
-        Some(v) => match v.as_u64() {
-            Some(n) if n >= min => Ok(Some(n.min(max))),
-            _ => Err(invalid(format!("{key} must be a whole number from {min}"))),
-        },
     }
 }
 
@@ -877,223 +824,6 @@ pub fn list(params: Option<&Value>) -> Result<Value, ErrorData> {
         "resultType": "complete",
         "events": Name::ALL.iter().map(|n| n.descriptor()).collect::<Vec<_>>(),
     }))
-}
-
-/// `events/poll`: what happened since the cursor, with what's relayed if
-/// the caller hears it.
-pub fn poll(hub: &Hub, params: Option<&Value>, relayed: bool) -> Result<Value, ErrorData> {
-    let params = params_object(params)?;
-    let name = named(&params)?;
-    let mut filter = Filter::parse(name, params.get("arguments"))?;
-    filter.relayed = relayed;
-    let cursor = cursor_param(&params)?;
-    let max_age = whole(&params, "maxAgeMs", 0, u64::MAX)?;
-    let max_events = whole(&params, "maxEvents", 1, MAX_EVENTS)?.unwrap_or(DEFAULT_MAX_EVENTS);
-    let (after, reset) = hub.resolve(cursor.as_deref())?;
-    // Null is now: no events, and a cursor to poll on from.
-    let read = if cursor.is_none() || reset {
-        Read {
-            items: Vec::new(),
-            cursor: after,
-            has_more: false,
-        }
-    } else {
-        let floor = max_age.map(|age| now_ms().saturating_sub(age));
-        hub.read(after, &filter, max_events as usize, floor)
-    };
-    Ok(json!({
-        "resultType": "complete",
-        "events": read.events().map(|o| o.to_json(&hub.boot, false)).collect::<Vec<_>>(),
-        "cursor": position(&hub.boot, read.cursor),
-        "truncated": reset || read.truncated(),
-        "hasMore": read.has_more,
-        "nextPollMs": NEXT_POLL_MS,
-    }))
-}
-
-/// `events/subscribe` and `events/unsubscribe`: webhooks aren't offered.
-pub fn webhook(params: Option<&Value>) -> Result<Value, ErrorData> {
-    let params = params_object(params)?;
-    let name = named(&params)?;
-    Err(error(
-        UNSUPPORTED,
-        format!(
-            "{} is delivered by poll (events/poll) and push (events/stream), not webhook",
-            name.as_str()
-        ),
-        Some(json!({"feature": "deliveryMode", "value": "webhook"})),
-    ))
-}
-
-/// A push stream's notifications, each with its subscription id.
-struct Notifier<'a> {
-    ctx: &'a RequestContext<RoleServer>,
-    id: Value,
-}
-
-impl Notifier<'_> {
-    /// Sends one; `false` once the client has gone.
-    async fn send(&self, method: &str, mut params: Value) -> bool {
-        params["_meta"] = json!({ SUBSCRIPTION_ID: self.id });
-        self.ctx
-            .peer
-            .send_notification(ServerNotification::CustomNotification(
-                CustomNotification::new(method, Some(params)),
-            ))
-            .await
-            .is_ok()
-    }
-
-    async fn active(&self, boot: &str, cursor: u64, truncated: bool, heartbeat: Duration) -> bool {
-        self.send(
-            "notifications/events/active",
-            json!({"cursor": position(boot, cursor), "truncated": truncated, "heartbeatMs": heartbeat.as_millis() as u64}),
-        )
-        .await
-    }
-
-    /// Sends what a read gave, in order: a gap as a fresh `active`.
-    async fn items(&self, boot: &str, items: &[Item], heartbeat: Duration) -> bool {
-        for item in items {
-            let sent = match item {
-                Item::Event(o) => {
-                    self.send("notifications/events/event", o.to_json(boot, true))
-                        .await
-                }
-                Item::Gap(at) => self.active(boot, *at, true, heartbeat).await,
-            };
-            if !sent {
-                return false;
-            }
-        }
-        true
-    }
-
-    fn done(&self) -> Value {
-        json!({"resultType": "complete", "_meta": { SUBSCRIPTION_ID: self.id }})
-    }
-}
-
-/// `events/stream`: a push subscription, for as long as the request is
-/// open. Ends when the client goes (an abort over HTTP, which is also how
-/// `vibe mcp` passes on a cancel), or when the caller's key is deleted.
-pub async fn stream<D: Daemon>(
-    hub: &Arc<Hub>,
-    daemon: &Arc<D>,
-    caller: &Caller,
-    params: Option<&Value>,
-    ctx: &RequestContext<RoleServer>,
-) -> Result<Value, ErrorData> {
-    let params = params_object(params)?;
-    let name = named(&params)?;
-    let mut filter = Filter::parse(name, params.get("arguments"))?;
-    let cursor = cursor_param(&params)?;
-    let max_age = whole(&params, "maxAgeMs", 0, u64::MAX)?;
-    let heartbeat = whole(&params, "heartbeatMs", 0, u64::MAX)?
-        .map_or(DEFAULT_HEARTBEAT, Duration::from_millis)
-        .clamp(MIN_HEARTBEAT, MAX_HEARTBEAT);
-    let _slot = hub.open_stream()?;
-    // Asked first: a relay that starts for it has what it missed behind
-    // the cursor this stream starts from.
-    filter.relayed = daemon.events_relayed(caller).await;
-    let (from, reset) = hub.resolve(cursor.as_deref())?;
-    let notify = Notifier {
-        ctx,
-        id: serde_json::to_value(&ctx.id).unwrap_or(Value::Null),
-    };
-    // Watched before the first read, so nothing that comes in between is
-    // missed: a change seen twice reads nothing new.
-    let mut newest = hub.newest.subscribe();
-    let mut keys = hub.keys.subscribe();
-    let boot = hub.boot.as_str();
-    // The replay: from the cursor, unless it's now.
-    let mut replay = if cursor.is_none() || reset {
-        Read {
-            items: Vec::new(),
-            cursor: from,
-            has_more: false,
-        }
-    } else {
-        let floor = max_age.map(|age| now_ms().saturating_sub(age));
-        hub.read(from, &filter, usize::MAX, floor)
-    };
-    // A gap before the first event is said in the first `active`.
-    let (start, truncated) = match replay.items.first() {
-        Some(Item::Gap(at)) => {
-            let at = *at;
-            replay.items.remove(0);
-            (at, true)
-        }
-        _ => (from, reset),
-    };
-    if !notify.active(boot, start, truncated, heartbeat).await
-        || !notify.items(boot, &replay.items, heartbeat).await
-    {
-        return Ok(notify.done());
-    }
-    let mut at = replay.cursor;
-    let mut beat = tokio::time::Instant::now() + heartbeat;
-    let mut renew =
-        tokio::time::interval_at(tokio::time::Instant::now() + RELAY_RENEW, RELAY_RENEW);
-    loop {
-        tokio::select! {
-            () = ctx.ct.cancelled() => return Ok(notify.done()),
-            changed = newest.changed() => {
-                if changed.is_err() {
-                    return Ok(notify.done());
-                }
-                let read = hub.read(at, &filter, usize::MAX, None);
-                if !read.items.is_empty() {
-                    if !notify.items(boot, &read.items, heartbeat).await {
-                        return Ok(notify.done());
-                    }
-                    beat = tokio::time::Instant::now() + heartbeat;
-                }
-                at = read.cursor;
-            }
-            changed = keys.changed() => {
-                if changed.is_err() {
-                    continue;
-                }
-                let d = Arc::clone(daemon);
-                let key = caller.key().to_owned();
-                let still = tokio::task::spawn_blocking(move || d.verify_key(&key))
-                    .await
-                    .ok()
-                    .flatten()
-                    .is_some();
-                if !still {
-                    daemon.log(&format!(
-                        "mcp: key {:?} is gone: ending its {} stream",
-                        caller.name(),
-                        name.as_str()
-                    ));
-                    notify
-                        .send(
-                            "notifications/events/terminated",
-                            json!({"error": {"code": FORBIDDEN, "message": "Forbidden", "data": {"reason": "the API key was deleted"}}}),
-                        )
-                        .await;
-                    return Ok(notify.done());
-                }
-                filter.relayed = daemon.events_relayed(caller).await;
-            }
-            // Keeps what relays coming while it's listened to, and stops it
-            // for a caller its daemon no longer takes.
-            _ = renew.tick() => {
-                filter.relayed = daemon.events_relayed(caller).await;
-            }
-            () = tokio::time::sleep_until(beat) => {
-                if !notify
-                    .send("notifications/events/heartbeat", json!({"cursor": position(boot, at)}))
-                    .await
-                {
-                    return Ok(notify.done());
-                }
-                beat = tokio::time::Instant::now() + heartbeat;
-            }
-        }
-    }
 }
 
 /// Decodes a header value written as SEP-2243 says: as it is, or Base64 in
@@ -1397,46 +1127,33 @@ mod tests {
     }
 
     #[test]
-    fn polls_start_from_now() {
+    fn cursors_resolve_and_gaps_after_them_show() {
         let hub = Hub::new();
         hub.ingest(&event(EventKind::AgentState, "local", "a", Some("idle")));
-        let p = |v: Value| poll(&hub, Some(&v), false).unwrap();
-        let first = p(json!({"name": "agent.state_changed", "arguments": {}, "cursor": null}));
-        assert_eq!(first["events"], json!([]));
-        assert_eq!(first["truncated"], false);
-        assert_eq!(first["resultType"], "complete");
-        assert_eq!(first["nextPollMs"], NEXT_POLL_MS);
-        let cursor = first["cursor"].as_str().unwrap().to_owned();
-        hub.ingest(&event(EventKind::AgentState, "local", "a", Some("busy")));
-        let next = p(json!({"name": "agent.state_changed", "cursor": cursor}));
-        let events = next["events"].as_array().unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0]["name"], "agent.state_changed");
-        assert_eq!(
-            events[0]["data"],
-            json!({"ref": "a", "host": "local", "agent": "a", "project": "app", "state": "busy", "previous": "idle"})
-        );
-        assert!(events[0].get("cursor").is_none());
-        assert_eq!(events[0]["eventId"], next["cursor"]);
-        let stale = p(json!({"name": "agent.state_changed", "cursor": "feedfacecafe-1"}));
-        assert_eq!(
-            (stale["truncated"].clone(), stale["events"].clone()),
-            (json!(true), json!([]))
-        );
-        let missing = poll(&hub, Some(&json!({"name": "agent.exploded"})), false).unwrap_err();
-        assert_eq!(missing.code.0, NOT_FOUND);
-        assert_eq!(missing.data, Some(json!({"kind": "event"})));
-        assert!(poll(&hub, Some(&json!({})), false).is_err());
+        assert_eq!(hub.resolve(None).unwrap(), (1, false));
+        assert_eq!(hub.resolve(Some(&hub.cursor(1))).unwrap(), (1, false));
+        // One from an earlier vibed is now, and truncated.
+        assert_eq!(hub.resolve(Some("feedfacecafe-1")).unwrap(), (1, true));
+        assert!(hub.resolve(Some(&hub.cursor(9))).is_err());
+        assert!(hub.resolve(Some("nonsense")).is_err());
+        assert!(!hub.gap_after(0, &all()));
+        let mut link = event(EventKind::HostLink, "vps", "", Some("connected"));
+        link.agent = None;
+        hub.ingest(&link);
+        assert!(hub.gap_after(1, &all()));
+        assert!(!hub.gap_after(2, &all()), "the gap is behind it");
+        let here = Filter::parse(Name::StateChanged, Some(&json!({"host": "local"}))).unwrap();
+        assert!(!hub.gap_after(1, &here), "not a host it hears");
+        hub.relayed_gap();
         assert!(
-            poll(
-                &hub,
-                Some(&json!({"name": "agent.deleted", "maxEvents": 0})),
-                false,
-            )
-            .is_err()
+            !hub.gap_after(2, &all()),
+            "relayed, to a filter that hears none"
         );
-        let hook = webhook(Some(&json!({"name": "agent.deleted"}))).unwrap_err();
-        assert_eq!(hook.code.0, UNSUPPORTED);
+        let heard = Filter {
+            relayed: true,
+            ..Filter::default()
+        };
+        assert!(hub.gap_after(2, &heard));
     }
 
     #[test]
@@ -1455,7 +1172,7 @@ mod tests {
             ]
         );
         for e in events {
-            assert_eq!(e["delivery"], json!(["poll", "push"]));
+            assert_eq!(e["delivery"], json!(["webhook"]));
             assert_eq!(e["inputSchema"]["type"], "object");
             assert_eq!(e["inputSchema"]["additionalProperties"], false);
             assert!(
@@ -1480,22 +1197,22 @@ mod tests {
         let mut h = http::HeaderMap::new();
         let p = json!({"name": "agent.deleted"});
         // Before 2026-07-28, nothing's asked of them.
-        assert!(check_name_header(&h, "events/poll", Some(&p)).is_ok());
+        assert!(check_name_header(&h, "events/subscribe", Some(&p)).is_ok());
         h.insert("mcp-protocol-version", "2026-07-28".parse().unwrap());
         assert!(check_name_header(&h, "events/list", None).is_ok());
-        let e = check_name_header(&h, "events/poll", Some(&p)).unwrap_err();
+        let e = check_name_header(&h, "events/subscribe", Some(&p)).unwrap_err();
         assert_eq!(e.code, ErrorCode::HEADER_MISMATCH);
         h.insert("mcp-name", "agent.started".parse().unwrap());
-        assert!(check_name_header(&h, "events/stream", Some(&p)).is_err());
+        assert!(check_name_header(&h, "events/unsubscribe", Some(&p)).is_err());
         h.insert("mcp-name", "agent.deleted".parse().unwrap());
-        assert!(check_name_header(&h, "events/stream", Some(&p)).is_ok());
+        assert!(check_name_header(&h, "events/unsubscribe", Some(&p)).is_ok());
         h.insert(
             "mcp-name",
             "=?base64?YWdlbnQuZGVsZXRlZA==?=".parse().unwrap(),
         );
-        assert!(check_name_header(&h, "events/poll", Some(&p)).is_ok());
+        assert!(check_name_header(&h, "events/subscribe", Some(&p)).is_ok());
         h.append("mcp-name", "agent.deleted".parse().unwrap());
-        assert!(check_name_header(&h, "events/poll", Some(&p)).is_err());
+        assert!(check_name_header(&h, "events/subscribe", Some(&p)).is_err());
         assert_eq!(header_text("=?base64?w6k=?=").as_deref(), Some("é"));
         assert_eq!(header_text("=?base64?!?="), None);
     }
@@ -1554,18 +1271,5 @@ mod tests {
         assert!(hub.read(at, &edge_only, 100, None).truncated());
         assert!(!hub.read(at, &mac_only, 100, None).truncated());
         assert!(!hub.read(at, &all(), 100, None).truncated());
-        // Through poll, as the server asks it.
-        let p = |relayed| {
-            poll(
-                &hub,
-                Some(&json!({"name": "agent.started", "cursor": position(&hub.boot, 0)})),
-                relayed,
-            )
-            .unwrap()
-        };
-        assert_eq!(p(true)["events"].as_array().unwrap().len(), 2);
-        assert_eq!(p(true)["truncated"], true);
-        assert_eq!(p(false)["events"].as_array().unwrap().len(), 1);
-        assert_eq!(p(false)["truncated"], false);
     }
 }
