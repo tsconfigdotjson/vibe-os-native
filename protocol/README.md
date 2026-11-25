@@ -147,9 +147,10 @@ subscriptions that run with no caller around. `tunnel.grant {key}` checks the ke
 `tunnel.call` does, and answers `{grant, expires}`: a relay grant for that key. The host holds
 the grant in memory and never the key. A grant is `vgr1.<expires>.<key hash>.<mac>`, signed
 with a secret only the Mac holds, in memory; it opens `tunnel.events` and nothing else, and
-holds until `expires` (60 days on, in Unix seconds) while its key is still one of the Mac's own
+holds until `expires` (48 hours on, in Unix seconds) while its key is still one of the Mac's own
 and the Mac's `vibed` hasn't restarted. The host forgets a grant the Mac no longer takes, and
-asks for a fresh one at that key's next subscribe.
+asks for a fresh one at that key's next subscribe or refresh, as it does once less than 25
+hours are left, more than the longest subscription (24 hours) lasts unrefreshed.
 
 `tunnel.events {grants}` takes 1 to 64 grants, and is refused (`Unauthorized`) if the Mac takes
 none. It answers with `agents`, each agent's `{host, ref, state}` now, `links`, each other

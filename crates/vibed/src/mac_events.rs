@@ -41,8 +41,13 @@ use crate::core::{Core, lock};
 use crate::remote::Channel;
 
 /// A grant with less than this left is taken again at its key's next subscribe or
-/// refresh: more than the longest subscription granted (24 hours).
-const RENEW_WITHIN: i64 = 31 * 24 * 3600;
+/// refresh, the only times the key is at hand. It's more than the longest subscription
+/// granted (24 hours), so after any subscribe or refresh the grant outlasts what was
+/// granted then, by an hour for clocks that differ; a subscription not refreshed within
+/// its lifetime ends before its grant does. And less than a grant lasts
+/// ([`crate::relay_grant::GRANT_FOR`]), so a fresh one is used for a day.
+const RENEW_WITHIN: i64 = 25 * 3600;
+const _: () = assert!(crate::relay_grant::GRANT_FOR > RENEW_WITHIN);
 
 /// How long a subscribe waits for the feed to take its key, so its cursor is after the
 /// gap that subscribing is.
@@ -504,6 +509,18 @@ mod tests {
         assert_eq!(relay.wanted(50), [("h1".to_owned(), "g1-again".to_owned())]);
         relay.forget(&relay.wanted(50), &[]);
         assert!(relay.wanted(50).is_empty());
+    }
+
+    #[test]
+    fn a_grant_outlasts_every_subscription_refreshed_on_it() {
+        let longest = vibe_mcp::webhook::Config::default().max_ttl.as_secs() as i64;
+        assert_eq!(longest, 24 * 3600);
+        // Kept only with more than the longest subscription left, and a fresh one is kept.
+        assert!(RENEW_WITHIN > longest);
+        assert_eq!(
+            (crate::relay_grant::GRANT_FOR, RENEW_WITHIN),
+            (48 * 3600, 25 * 3600)
+        );
     }
 
     #[test]

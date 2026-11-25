@@ -15,9 +15,10 @@ use vibe_core::rpc::{ErrorCode, ErrorObject, TunnelGrant};
 
 use crate::core::{Core, error};
 
-/// How long a grant holds: longer than the longest webhook subscription a host grants
-/// (24 hours) by far, so one taken at a refresh outlasts what it's for.
-pub(crate) const GRANT_FOR: i64 = 60 * 24 * 3600;
+/// How long a grant holds: 48 hours. A host takes a fresh one at a subscribe or refresh
+/// once less than 25 hours are left (`mac_events::RENEW_WITHIN`), so the one it holds after
+/// any subscribe or refresh outlasts the longest subscription granted then (24 hours).
+pub(crate) const GRANT_FOR: i64 = 48 * 3600;
 
 const PREFIX: &str = "vgr1";
 

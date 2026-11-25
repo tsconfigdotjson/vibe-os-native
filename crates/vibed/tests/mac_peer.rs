@@ -2446,7 +2446,12 @@ async fn one_ingress_delivers_every_hosts_events_by_webhook() {
     }
     let granted = tunnel_raw(&end, "tunnel.grant", json!({"key": key})).await;
     let grant = granted["result"]["grant"].as_str().unwrap().to_owned();
-    assert!(granted["result"]["expires"].as_i64().unwrap() > vibe_core::time::now() + 30 * 86_400);
+    // 48 hours on, by the Mac's clock.
+    assert_eq!(
+        granted["result"]["expires"].as_i64().unwrap(),
+        common::GOLDEN_NOW + w.mac_clock_ahead.load(Ordering::SeqCst) + 48 * 3600,
+        "{granted}"
+    );
     let forged = {
         let mut parts: Vec<String> = grant.split('.').map(str::to_owned).collect();
         parts[1] = (parts[1].parse::<i64>().unwrap() + 1).to_string();

@@ -251,9 +251,10 @@ read its answer with `vibe_read_messages` and its screen with
   Mac is online. For the Mac's, the Linux host asks the Mac for a relay grant
   when you subscribe: the Mac must take your key, as for calls, so a key made
   on the Linux host alone hears only that host. The host holds that grant,
-  which only reads events, in memory, never your key; after either `vibed`
-  restarts, your next refresh takes a fresh one. A subscribe that needs it can
-  take up to 3 s longer.
+  which only reads events, in memory, never your key. It lasts 48 hours, and
+  a refresh takes a fresh one once less than 25 hours are left, or after
+  either `vibed` restarts, so refreshing before `refreshBefore` keeps it
+  going. A subscribe that needs it can take up to 3 s longer.
 - **Cursors.** Each delivery carries a `cursor`. Pass the last one you have
   when you refresh. If events may have been missed since then, the answer
   says `truncated: true`:
