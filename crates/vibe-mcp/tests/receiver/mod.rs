@@ -1,7 +1,8 @@
 //! A webhook receiver on loopback, for tests: it answers verifications as it's told,
 //! answers deliveries with the statuses it's given (200 once they run out), and keeps
-//! everything posted to it. Plain HTTP/1.1, a connection per request, as `vibed`
-//! posts them.
+//! everything posted to it. HTTPS, with a certificate for `127.0.0.1` from a test CA
+//! that only tests trust (`vibe_mcp::egress::trust_for_tests`, which starting one
+//! does), and HTTP/1.1 within, a connection per request, as `vibed` posts them.
 
 // Each test crate that includes this (vibe-mcp, vibed, vibe-cli) uses a different part of it.
 #![allow(dead_code)]
@@ -12,8 +13,29 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpListener;
+
+/// The test CA, and the certificate it issued for `127.0.0.1`, `::1` and
+/// `localhost` with its key: for tests only, never trusted anywhere else.
+const TEST_CA: &[u8] = include_bytes!("ca.der");
+const CERT: &[u8] = include_bytes!("cert.der");
+const KEY: &[u8] = include_bytes!("key.der");
+
+fn acceptor() -> tokio_rustls::TlsAcceptor {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    let provider = rustls::crypto::ring::default_provider();
+    let config = rustls::ServerConfig::builder_with_provider(provider.into())
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![CertificateDer::from(CERT.to_vec())],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(KEY.to_vec())),
+        )
+        .unwrap();
+    tokio_rustls::TlsAcceptor::from(Arc::new(config))
+}
 
 /// How a verification is answered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,7 +153,9 @@ pub(crate) fn signed_with(secret: &str, post: &Post) -> bool {
         .any(|s| s == want)
 }
 
-async fn read_request(s: &mut TcpStream) -> Option<(String, HashMap<String, String>, Vec<u8>)> {
+async fn read_request<S: AsyncRead + Unpin>(
+    s: &mut S,
+) -> Option<(String, HashMap<String, String>, Vec<u8>)> {
     let mut raw = Vec::new();
     let mut buf = [0u8; 4096];
     let end = loop {
@@ -173,7 +197,9 @@ async fn read_request(s: &mut TcpStream) -> Option<(String, HashMap<String, Stri
 
 impl Receiver {
     pub(crate) async fn start() -> Receiver {
+        vibe_mcp::egress::trust_for_tests(TEST_CA);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tls = acceptor();
         let addr = listener.local_addr().unwrap();
         let r = Receiver {
             addr,
@@ -187,13 +213,18 @@ impl Receiver {
         let me = r.clone();
         tokio::spawn(async move {
             while let Ok((s, _)) = listener.accept().await {
-                tokio::spawn(me.clone().serve(s));
+                let (me, tls) = (me.clone(), tls.clone());
+                tokio::spawn(async move {
+                    if let Ok(s) = tls.accept(s).await {
+                        me.serve(s).await;
+                    }
+                });
             }
         });
         r
     }
 
-    async fn serve(self, mut s: TcpStream) {
+    async fn serve<S: AsyncRead + AsyncWrite + Unpin>(self, mut s: S) {
         let Some((path, headers, body)) = read_request(&mut s).await else {
             return;
         };
@@ -234,7 +265,7 @@ impl Receiver {
 
     /// Its URL, at `path`.
     pub(crate) fn url(&self, path: &str) -> String {
-        format!("http://{}{path}", self.addr)
+        format!("https://{}{path}", self.addr)
     }
 
     /// The statuses the next deliveries get, in order.

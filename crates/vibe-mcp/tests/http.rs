@@ -1917,13 +1917,37 @@ async fn a_callback_that_fails_verification_says_why_and_gets_nothing() {
         subscription(
             "agent.started",
             json!({}),
-            &format!("http://{closed}/h"),
+            &format!("https://{closed}/h"),
             &secret(1),
         ),
     )
     .await
     .unwrap_err();
     assert_eq!(reason(&e), "connection_refused");
+    // Something there that answers in plain HTTP: no TLS, so nothing's sent.
+    let plain = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let plain_at = plain.local_addr().unwrap();
+    tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+        while let Ok((mut s, _)) = plain.accept().await {
+            let _ = s
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await;
+        }
+    });
+    let e = ask(
+        &mut c,
+        "events/subscribe",
+        subscription(
+            "agent.started",
+            json!({}),
+            &format!("https://{plain_at}/h"),
+            &secret(1),
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(reason(&e), "tls_error");
     assert!(hooks(&fake).is_empty());
     hooks(&fake).hub().ingest(&core_event(
         EventKind::AgentAdded,
@@ -1938,6 +1962,11 @@ async fn a_callback_that_fails_verification_says_why_and_gets_nothing() {
     let refused = |url: &str, secret: &str| subscription("agent.started", json!({}), url, secret);
     for (params, code) in [
         (refused("http://receiver.example.com/h", &secret(1)), -32602),
+        // https only, even to this machine.
+        (
+            refused(&url.replacen("https://", "http://", 1), &secret(1)),
+            -32602,
+        ),
         (refused("https://10.0.0.1/h", &secret(1)), -32602),
         (
             refused("https://169.254.169.254/latest", &secret(1)),

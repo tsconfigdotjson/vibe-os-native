@@ -231,10 +231,11 @@ read its answer with `vibe_read_messages` and its screen with
   any Standard Webhooks library can check it. A failed delivery is tried
   again four times over about ten minutes; `410` or `413` stops it at once.
   Redirects aren't followed.
-- **Where it can post.** `https` URLs on the internet, and `http` or `https`
-  on this machine or your tailnet (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`,
-  `*.ts.net`). Private network, link-local and cloud metadata addresses are
-  refused, checked again every time it connects.
+- **Where it can post.** `https` URLs only, with a certificate this machine
+  trusts, whether on the internet, on this machine or on your tailnet
+  (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`, `*.ts.net`). An `http` URL is
+  refused when you subscribe. Private network, link-local and cloud metadata
+  addresses are refused, checked again every time it connects.
 - **Lifetimes.** 24 hours unless you ask, at least 5 minutes, at most 30
   days (also for `ttlMs: null`). Refresh before `refreshBefore`.
   Subscriptions survive `vibed` restarting. Deleting the API key that made

@@ -1,12 +1,16 @@
 //! Posting to a URL a client named, for webhook delivery (PRD: MCP interface,
 //! Events), without being turned on this machine or its network (SSRF).
 //!
-//! HTTPS, to a public address; or, so a receiver on this machine or the
-//! tailnet works, HTTP or HTTPS to loopback or a Tailscale address
+//! HTTPS only, wherever it goes: to a public address, or, so a receiver on
+//! this machine or the tailnet works, to loopback or a Tailscale address
 //! (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`, which is what `*.ts.net` names
 //! resolve to). Anything else that isn't public is refused: private ranges,
 //! link-local (where cloud metadata answers), unique-local, multicast and
 //! reserved ones, and an IPv6 address that only wraps one of those.
+//!
+//! The server's certificate is checked against this machine's roots. Tests
+//! add a root of their own ([`trust_for_tests`]) through the `test-roots`
+//! feature, which only dev-dependencies turn on, so no other build has it.
 //!
 //! A name is resolved for every request, each address it gives is checked,
 //! and the connection goes to one that passed, with the name kept for TLS
@@ -14,6 +18,8 @@
 //! (DNS rebinding) is checked again. Redirects are never followed.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+#[cfg(feature = "test-roots")]
+use std::sync::Mutex;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -78,7 +84,6 @@ impl Failure {
 /// A URL that may be posted to, as far as can be told without resolving it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Target {
-    pub https: bool,
     /// Without brackets.
     pub host: String,
     pub port: u16,
@@ -168,8 +173,8 @@ fn is_public(ip: IpAddr) -> bool {
     }
 }
 
-/// Whether `ip` may be posted to, over HTTPS or not.
-pub fn allowed(ip: IpAddr, https: bool, policy: Policy) -> bool {
+/// Whether `ip` may be posted to.
+pub fn allowed(ip: IpAddr, policy: Policy) -> bool {
     let ip = match ip {
         IpAddr::V6(v6) => wrapped(v6).map_or(ip, IpAddr::V4),
         v4 => v4,
@@ -180,22 +185,19 @@ pub fn allowed(ip: IpAddr, https: bool, policy: Policy) -> bool {
     if is_tailscale(ip) {
         return policy.tailscale;
     }
-    https && is_public(ip)
+    is_public(ip)
 }
 
-/// Checks `url` as far as it can be without resolving it: HTTPS, or HTTP
-/// to loopback or the tailnet; no credentials in it; and, if its host is an
-/// address, one [`allowed`].
+/// Checks `url` as far as it can be without resolving it: HTTPS, with no
+/// credentials in it, and, if its host is an address, one [`allowed`].
 pub fn check_url(url: &str, policy: Policy) -> Result<Target, String> {
     if url.len() > MAX_URL {
         return Err(format!("the URL is longer than {MAX_URL} characters"));
     }
     let uri: Uri = url.parse().map_err(|_| "it isn't a URL".to_owned())?;
-    let https = match uri.scheme_str() {
-        Some("https") => true,
-        Some("http") => false,
-        _ => return Err("it must be an https URL".into()),
-    };
+    if uri.scheme_str() != Some("https") {
+        return Err("it must be an https URL".into());
+    }
     let authority = uri
         .authority()
         .ok_or_else(|| "it has no host".to_owned())?
@@ -213,29 +215,16 @@ pub fn check_url(url: &str, policy: Policy) -> Result<Target, String> {
     if host.is_empty() {
         return Err("it has no host".into());
     }
-    let port = uri.port_u16().unwrap_or(if https { 443 } else { 80 });
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        if !allowed(ip, https, policy) {
-            return Err(if https {
-                format!("{ip} isn't a public address")
-            } else {
-                "it must be an https URL: http is only for this machine and the tailnet".into()
-            });
-        }
-    } else if !https {
-        let fine = (policy.loopback && host == "localhost")
-            || (policy.tailscale && host.ends_with(".ts.net"));
-        if !fine {
-            return Err(
-                "it must be an https URL: http is only for this machine and the tailnet".into(),
-            );
-        }
+    let port = uri.port_u16().unwrap_or(443);
+    if let Ok(ip) = host.parse::<IpAddr>()
+        && !allowed(ip, policy)
+    {
+        return Err(format!("{ip} isn't a public address"));
     }
     let path = uri
         .path_and_query()
         .map_or_else(|| "/".to_owned(), |p| p.as_str().to_owned());
     Ok(Target {
-        https,
         host,
         port,
         authority,
@@ -250,23 +239,56 @@ pub struct Answer {
     pub body: Vec<u8>,
 }
 
-/// The TLS client: this machine's roots.
+fn client_config(roots: rustls::RootCertStore) -> Arc<rustls::ClientConfig> {
+    let provider = rustls::crypto::ring::default_provider();
+    Arc::new(
+        rustls::ClientConfig::builder_with_provider(provider.into())
+            .with_safe_default_protocol_versions()
+            .expect("ring supports the default protocol versions")
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    )
+}
+
+/// This machine's roots.
+fn native_roots() -> rustls::RootCertStore {
+    let mut roots = rustls::RootCertStore::empty();
+    // What can't be read just isn't trusted: a post then fails as
+    // `tls_error`.
+    let _ = roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
+    roots
+}
+
+/// Roots tests trust besides this machine's, as DER.
+#[cfg(feature = "test-roots")]
+static TEST_ROOTS: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+
+/// Trusts `der`, a CA certificate, for every post from now on: for tests'
+/// receivers, which serve HTTPS with a test CA's certificate. Only in builds
+/// with the `test-roots` feature, which only dev-dependencies turn on.
+#[cfg(feature = "test-roots")]
+pub fn trust_for_tests(der: &[u8]) {
+    let mut roots = TEST_ROOTS.lock().unwrap_or_else(|e| e.into_inner());
+    if !roots.iter().any(|r| r == der) {
+        roots.push(der.to_vec());
+    }
+}
+
+/// The TLS client: this machine's roots, and in tests their own.
 fn tls() -> Arc<rustls::ClientConfig> {
+    #[cfg(feature = "test-roots")]
+    {
+        let extra = TEST_ROOTS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if !extra.is_empty() {
+            let mut roots = native_roots();
+            for der in extra {
+                let _ = roots.add(rustls::pki_types::CertificateDer::from(der));
+            }
+            return client_config(roots);
+        }
+    }
     static TLS: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
-    Arc::clone(TLS.get_or_init(|| {
-        let mut roots = rustls::RootCertStore::empty();
-        // What can't be read just isn't trusted: a post then fails as
-        // `tls_error`.
-        let _ = roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
-        let provider = rustls::crypto::ring::default_provider();
-        Arc::new(
-            rustls::ClientConfig::builder_with_provider(provider.into())
-                .with_safe_default_protocol_versions()
-                .expect("ring supports the default protocol versions")
-                .with_root_certificates(roots)
-                .with_no_client_auth(),
-        )
-    }))
+    Arc::clone(TLS.get_or_init(|| client_config(native_roots())))
 }
 
 /// The addresses `target` may be connected to now.
@@ -280,7 +302,7 @@ async fn addresses(target: &Target, policy: Policy) -> Result<Vec<SocketAddr>, F
     };
     let fine: Vec<SocketAddr> = all
         .into_iter()
-        .filter(|a| allowed(a.ip(), target.https, policy))
+        .filter(|a| allowed(a.ip(), policy))
         .collect();
     if fine.is_empty() {
         return Err(Failure::Refused);
@@ -354,18 +376,13 @@ pub async fn post(
             }
         }
         let tcp = tcp.ok_or(Failure::Refused)?;
-        let body = Bytes::from(body);
-        if target.https {
-            let name = rustls::pki_types::ServerName::try_from(target.host.clone())
-                .map_err(|_| Failure::Tls)?;
-            let tls = tokio_rustls::TlsConnector::from(tls())
-                .connect(name, tcp)
-                .await
-                .map_err(|_| Failure::Tls)?;
-            exchange(tls, &target, headers, body).await
-        } else {
-            exchange(tcp, &target, headers, body).await
-        }
+        let name = rustls::pki_types::ServerName::try_from(target.host.clone())
+            .map_err(|_| Failure::Tls)?;
+        let tls = tokio_rustls::TlsConnector::from(tls())
+            .connect(name, tcp)
+            .await
+            .map_err(|_| Failure::Tls)?;
+        exchange(tls, &target, headers, Bytes::from(body)).await
     };
     tokio::time::timeout(within, go)
         .await
@@ -376,17 +393,16 @@ pub async fn post(
 mod tests {
     use super::*;
 
-    fn ok(ip: &str, https: bool) -> bool {
-        allowed(ip.parse().unwrap(), https, Policy::default())
+    fn ok(ip: &str) -> bool {
+        allowed(ip.parse().unwrap(), Policy::default())
     }
 
     #[test]
-    fn public_addresses_over_https_and_the_tailnet_and_loopback_over_either() {
-        for ip in ["93.184.216.34", "1.1.1.1", "2606:4700:4700::1111"] {
-            assert!(ok(ip, true), "{ip}");
-            assert!(!ok(ip, false), "{ip} over http");
-        }
+    fn public_addresses_and_the_tailnet_and_loopback() {
         for ip in [
+            "93.184.216.34",
+            "1.1.1.1",
+            "2606:4700:4700::1111",
             "127.0.0.1",
             "127.8.9.1",
             "::1",
@@ -397,7 +413,7 @@ mod tests {
             "fd7a:115c:a1e0::1",
             "fd7a:115c:a1e0:ab12::42",
         ] {
-            assert!(ok(ip, true) && ok(ip, false), "{ip}");
+            assert!(ok(ip), "{ip}");
         }
     }
 
@@ -433,12 +449,11 @@ mod tests {
             "2002:a00:1::",
             "2002:a9fe:a9fe::",
         ] {
-            assert!(!ok(ip, true), "{ip}");
-            assert!(!ok(ip, false), "{ip} over http");
+            assert!(!ok(ip), "{ip}");
         }
         // A wrapped public one is as public.
-        assert!(ok("::ffff:1.1.1.1", true) && ok("64:ff9b::101:101", true));
-        assert!(ok("100.128.0.1", true), "just past the tailnet's range");
+        assert!(ok("::ffff:1.1.1.1") && ok("64:ff9b::101:101"));
+        assert!(ok("100.128.0.1"), "just past the tailnet's range");
     }
 
     #[test]
@@ -448,38 +463,42 @@ mod tests {
             tailscale: false,
         };
         for ip in ["127.0.0.1", "::1", "100.64.0.1", "fd7a:115c:a1e0::1"] {
-            assert!(!allowed(ip.parse().unwrap(), true, none), "{ip}");
+            assert!(!allowed(ip.parse().unwrap(), none), "{ip}");
         }
-        assert!(check_url("http://localhost:9/x", none).is_err());
-        assert!(check_url("http://box.tail1234.ts.net/x", none).is_err());
+        assert!(check_url("https://127.0.0.1:9/x", none).is_err());
+        assert!(check_url("https://100.70.1.2/x", none).is_err());
     }
 
     #[test]
-    fn urls_are_https_unless_local_or_on_the_tailnet() {
+    fn urls_are_https_wherever_they_go() {
         let p = Policy::default();
         let t = check_url("https://Receiver.example.com/mcp-events/cb_1?x=1", p).unwrap();
         assert_eq!(
-            (t.https, t.host.as_str(), t.port, t.path.as_str()),
-            (true, "receiver.example.com", 443, "/mcp-events/cb_1?x=1")
+            (t.host.as_str(), t.port, t.path.as_str()),
+            ("receiver.example.com", 443, "/mcp-events/cb_1?x=1")
         );
-        let t = check_url("http://[::1]:8080/hook", p).unwrap();
+        let t = check_url("https://[::1]:8443/hook", p).unwrap();
         assert_eq!(
-            (t.https, t.host.as_str(), t.port, t.authority.as_str()),
-            (false, "::1", 8080, "[::1]:8080")
+            (t.host.as_str(), t.port, t.authority.as_str()),
+            ("::1", 8443, "[::1]:8443")
         );
         for fine in [
-            "http://127.0.0.1:9/x",
-            "http://localhost/x",
-            "http://box.tail1234.ts.net/hook",
-            "http://100.70.1.2:8000/",
+            "https://127.0.0.1:9/x",
+            "https://localhost/x",
             "https://box.tail1234.ts.net/hook",
+            "https://100.70.1.2:8000/",
             "https://8.8.8.8/x",
         ] {
             assert!(check_url(fine, p).is_ok(), "{fine}");
         }
         for bad in [
+            // Not even to this machine or the tailnet.
+            "http://127.0.0.1:9/x",
+            "http://localhost/x",
+            "http://[::1]:8080/hook",
+            "http://box.tail1234.ts.net/hook",
+            "http://100.70.1.2:8000/",
             "http://receiver.example.com/x",
-            "http://10.0.0.1/x",
             "https://10.0.0.1/x",
             "https://169.254.169.254/latest/meta-data",
             "https://[fe80::1]/x",
@@ -493,6 +512,10 @@ mod tests {
         ] {
             assert!(check_url(bad, p).is_err(), "{bad}");
         }
+        assert_eq!(
+            check_url("http://127.0.0.1:9/x", p).unwrap_err(),
+            "it must be an https URL"
+        );
         assert!(check_url(&format!("https://a.example/{}", "x".repeat(MAX_URL)), p).is_err());
     }
 
@@ -514,7 +537,6 @@ mod tests {
             tailscale: false,
         };
         let target = Target {
-            https: true,
             host: "localhost".into(),
             port: 9,
             authority: "localhost:9".into(),
