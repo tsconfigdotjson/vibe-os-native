@@ -445,7 +445,28 @@ MCP is the product. It keeps the shape of VibeOS's MCP, which already drives a w
 
 **Routing.** Every call after `vibe_start_agent` names an agent by its ref, which says which host it lives on, so `send`, `wait`, `read` and `delete` work the same on any host.
 
-**Rules carried over.** Reads (`vibe_wait`, `vibe_read_*`, `vibe_list_*`) never wake an agent; `vibe_send` does. Text results are cut at about 32,000 characters, keeping the end, with a note saying how much was cut. MCP Resources and Tasks aren't used in v1. Events reach the menu bar over the socket, and MCP clients through `vibe_wait`.
+**Rules carried over.** Reads (`vibe_wait`, `vibe_read_*`, `vibe_list_*`) never wake an agent; `vibe_send` does. Text results are cut at about 32,000 characters, keeping the end, with a note saying how much was cut. MCP Resources and Tasks aren't used in v1. Events reach the menu bar over the socket, and MCP clients through `vibe_wait` or MCP Events.
+
+**Events.** The server offers the MCP Events extension (SEP-3415, `io.modelcontextprotocol/events`), advertised only in `server/discover`, since it is defined from protocol `2026-07-28` on. For older protocols, `events/*` is "method not found".
+- **Event types.** There are four, about agents on this host and the Linux hosts linked to it:
+  - `agent.started`
+  - `agent.state_changed`, with `previous`
+  - `agent.turn_ended`: `busy` became anything else
+  - `agent.deleted`
+
+  Their filters are `host`, `project` and `agents`, plus `state` for the two state events. Arguments are checked against the schema, with no extra fields allowed.
+- **Payloads.** Kept to the ref, host, project and state: what an agent wrote is read with the tools.
+- **Delivery.** Poll and push (`events/stream`) only.
+  - Webhooks are refused as unsupported: `vibed` serves on loopback and the tailnet, and doesn't post to URLs a client names. For the same reason there is no legacy top-level `capabilities.events` key.
+  - A stream has a heartbeat of 5–60 s, 30 s by default. It ends when its listener stops, and with `terminated` (Forbidden) when its API key is deleted.
+  - At most 64 streams are open per host. They count against the listener's connection cap.
+  - `Mcp-Name` must match the event type.
+- **Cursors.** Both modes read one ring of the last 4,096 events per `vibed`, fed from the event bus. A cursor is `<boot>-<seq>`. `truncated: true` and a fresh cursor come with:
+  - a cursor from an earlier `vibed`, or older than the ring holds;
+  - a linked host whose link came up, for subscriptions that could include it;
+  - the feed falling behind the bus.
+- **Not covered.** `mac:` agents reached through the Mac's tunnel, whose events don't reach this host's bus.
+- **`subscriptions/listen`.** Accepted with an empty filter, since the tools never change and there's no list change to send. It stays open until it's closed, and counts against the same 64.
 
 ### Shared MCP services
 

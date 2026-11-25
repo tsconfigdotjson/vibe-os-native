@@ -1,0 +1,1412 @@
+//! MCP Events (SEP-3415, `io.modelcontextprotocol/events`; PRD: MCP
+//! interface, Events): a client subscribes to what happens to agents
+//! instead of polling `vibe_wait` and `vibe_list_agents`.
+//!
+//! Four event types, about agents on this host and the Linux hosts linked
+//! to it: `agent.started`, `agent.state_changed`, `agent.turn_ended` and
+//! `agent.deleted`. Each payload is a ref, its host, project and state, and
+//! no more: what an agent said or shows is read with the tools, so nothing
+//! an agent wrote rides in an event.
+//!
+//! Two of the three delivery modes: poll (`events/poll`) and push
+//! (`events/stream`). Webhook (`events/subscribe`) is refused as
+//! unsupported: `vibed` serves on loopback and the tailnet, and has no
+//! business posting to URLs a client names.
+//!
+//! Both modes read one [`Hub`] per daemon: a ring of the last [`RING`]
+//! occurrences, fed from the daemon's event bus. A cursor is a position in
+//! it, `<boot>-<seq>`; one from an earlier `vibed`, or older than the ring
+//! holds, gets `truncated: true` and a fresh cursor, as do the times a
+//! host's events may have been missed (its link was down, or the feed fell
+//! behind).
+
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use rmcp::model::{CustomNotification, ErrorCode, ServerNotification};
+use rmcp::service::RequestContext;
+use rmcp::{ErrorData, RoleServer};
+use serde_json::{Map, Value, json};
+use tokio::sync::{broadcast, watch};
+use vibe_core::model::{AgentState, EventKind, LOCAL_HOST};
+use vibe_core::rpc::Event;
+
+use crate::{Caller, Daemon, display_ref, split_ref};
+
+/// The extension's identifier, the key it's advertised under.
+pub const EXTENSION: &str = "io.modelcontextprotocol/events";
+
+/// Where every push notification names its stream.
+const SUBSCRIPTION_ID: &str = "io.modelcontextprotocol/subscriptionId";
+
+/// How many occurrences the hub keeps for poll and replay.
+pub const RING: usize = 4096;
+
+/// The most `events/stream` requests open at once, across every listener.
+/// Each holds a connection, which the listeners cap at
+/// [`crate::http::MAX_CONNECTIONS`]; this leaves the rest for calls.
+pub const MAX_STREAMS: usize = 64;
+
+/// A stream's heartbeat, unless the client asks for another within
+/// [`MIN_HEARTBEAT`] and [`MAX_HEARTBEAT`]. The longest stays well inside
+/// `vibe mcp`'s read timeout.
+pub const DEFAULT_HEARTBEAT: Duration = Duration::from_secs(30);
+pub const MIN_HEARTBEAT: Duration = Duration::from_secs(5);
+pub const MAX_HEARTBEAT: Duration = Duration::from_secs(60);
+
+/// How long a poller is asked to wait between polls.
+pub const NEXT_POLL_MS: u64 = 5000;
+
+const DEFAULT_MAX_EVENTS: u64 = 100;
+const MAX_EVENTS: u64 = 1000;
+const MAX_FILTER_AGENTS: usize = 32;
+
+// The extension's error codes (Error Handling).
+const NOT_FOUND: i32 = -32023;
+const FORBIDDEN: i32 = -32024;
+const RESOURCE_EXHAUSTED: i32 = -32025;
+const UNSUPPORTED: i32 = -32026;
+
+fn error(code: i32, message: impl Into<String>, data: Option<Value>) -> ErrorData {
+    ErrorData::new(ErrorCode(code), message.into(), data)
+}
+
+fn invalid(message: impl Into<String>) -> ErrorData {
+    ErrorData::invalid_params(message.into(), None)
+}
+
+/// An event type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Name {
+    Started,
+    StateChanged,
+    TurnEnded,
+    Deleted,
+}
+
+impl Name {
+    pub const ALL: [Name; 4] = [
+        Name::Started,
+        Name::StateChanged,
+        Name::TurnEnded,
+        Name::Deleted,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Name::Started => "agent.started",
+            Name::StateChanged => "agent.state_changed",
+            Name::TurnEnded => "agent.turn_ended",
+            Name::Deleted => "agent.deleted",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Name> {
+        Name::ALL.into_iter().find(|n| n.as_str() == s)
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Name::Started => {
+                "An agent was started, by any client or the app. Fires on this host and the Linux hosts linked to it."
+            }
+            Name::StateChanged => {
+                "An agent changed state: busy, idle, question (it's asking something), asleep, paused (a limit hit) or exited. previous is its state before, when known."
+            }
+            Name::TurnEnded => {
+                "An agent stopped working: it was busy and now isn't. state says where it stopped: idle (it has answered; read its answer with vibe_read_messages), question (it's asking something; read it with vibe_read_output and answer with vibe_send), or asleep, paused or exited."
+            }
+            Name::Deleted => "An agent was deleted, with its worktree. Its branch is kept.",
+        }
+    }
+
+    /// Whether `state` filters it.
+    fn has_state(self) -> bool {
+        matches!(self, Name::StateChanged | Name::TurnEnded)
+    }
+
+    /// The states it can carry, for its schemas.
+    fn states(self) -> &'static [&'static str] {
+        match self {
+            Name::StateChanged => &STATES,
+            Name::TurnEnded => &STATES[1..],
+            _ => &[],
+        }
+    }
+
+    fn input_schema(self) -> Value {
+        let mut properties = json!({
+            "host": {"type": "string", "description": "Only agents on this host, like local or vps"},
+            "project": {"type": "string", "description": "Only agents of this project, by name"},
+            "agents": {
+                "description": "Only these agents: one ref, or several. A bare ref, like quiet-amber-otter, matches it on any host; vps:quiet-amber-otter only on vps",
+                "anyOf": [
+                    {"type": "string"},
+                    {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": MAX_FILTER_AGENTS}
+                ]
+            }
+        });
+        if self.has_state() {
+            let states = self.states();
+            properties["state"] = json!({
+                "description": "Only when it changes to this state, or one of these",
+                "anyOf": [
+                    {"type": "string", "enum": states},
+                    {"type": "array", "items": {"type": "string", "enum": states}, "minItems": 1}
+                ]
+            });
+        }
+        json!({"type": "object", "properties": properties, "additionalProperties": false})
+    }
+
+    fn payload_schema(self) -> Value {
+        let mut properties = json!({
+            "ref": {"type": "string", "description": "The agent's ref as the tools take it: bare on this host, host:ref on another"},
+            "host": {"type": "string"},
+            "agent": {"type": "string", "description": "Its ref on its own host"},
+            "project": {"type": ["string", "null"]},
+        });
+        let mut required = vec!["ref", "host", "agent", "project"];
+        match self {
+            Name::Started | Name::StateChanged | Name::TurnEnded => {
+                let states: &[&str] = if self == Name::Started {
+                    &STATES
+                } else {
+                    self.states()
+                };
+                properties["state"] = json!({"type": "string", "enum": states});
+                required.push("state");
+            }
+            Name::Deleted => {}
+        }
+        if self == Name::StateChanged {
+            properties["previous"] = json!({"type": ["string", "null"], "enum": STATES.iter().map(|s| Value::from(*s)).chain([Value::Null]).collect::<Vec<_>>(), "description": "Its state before, or null when it isn't known"});
+            required.push("previous");
+        }
+        json!({"type": "object", "properties": properties, "required": required})
+    }
+
+    /// Its `events/list` entry.
+    fn descriptor(self) -> Value {
+        json!({
+            "name": self.as_str(),
+            "description": self.description(),
+            "delivery": ["poll", "push"],
+            "inputSchema": self.input_schema(),
+            "payloadSchema": self.payload_schema(),
+        })
+    }
+}
+
+/// Every agent state, busy first.
+const STATES: [&str; 6] = ["busy", "idle", "question", "asleep", "paused", "exited"];
+
+/// One thing that happened to an agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Occurrence {
+    pub seq: u64,
+    pub name: Name,
+    /// When it happened, as its host said.
+    pub timestamp: String,
+    /// When the hub heard of it, in milliseconds since the epoch, for
+    /// `maxAgeMs`.
+    pub heard_ms: u64,
+    pub host: String,
+    pub agent: String,
+    pub project: Option<String>,
+    pub state: Option<String>,
+    pub previous: Option<String>,
+}
+
+impl Occurrence {
+    fn data(&self) -> Value {
+        let mut d = json!({
+            "ref": display_ref(&self.host, &self.agent),
+            "host": self.host,
+            "agent": self.agent,
+            "project": self.project,
+        });
+        if self.name != Name::Deleted {
+            d["state"] = json!(self.state);
+        }
+        if self.name == Name::StateChanged {
+            d["previous"] = json!(self.previous);
+        }
+        d
+    }
+
+    /// As an `EventOccurrence`, with `cursor` for push.
+    fn to_json(&self, boot: &str, cursor: bool) -> Value {
+        let mut o = json!({
+            "eventId": position(boot, self.seq),
+            "name": self.name.as_str(),
+            "timestamp": self.timestamp,
+            "data": self.data(),
+        });
+        if cursor {
+            o["cursor"] = json!(position(boot, self.seq));
+        }
+        o
+    }
+}
+
+/// What the ring holds: an occurrence, or a point where events may have
+/// been missed, for one host or (`None`) every host.
+#[derive(Debug, Clone)]
+enum Entry {
+    Event(Occurrence),
+    Gap { seq: u64, host: Option<String> },
+}
+
+impl Entry {
+    fn seq(&self) -> u64 {
+        match self {
+            Entry::Event(o) => o.seq,
+            Entry::Gap { seq, .. } => *seq,
+        }
+    }
+}
+
+/// What a read of the ring gives, in order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Item {
+    Event(Occurrence),
+    /// Events may have been missed up to here: delivery resumes from this
+    /// position.
+    Gap(u64),
+}
+
+/// A read: what came after a position, and the position after it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Read {
+    pub items: Vec<Item>,
+    pub cursor: u64,
+    pub has_more: bool,
+}
+
+impl Read {
+    pub fn truncated(&self) -> bool {
+        self.items.iter().any(|i| matches!(i, Item::Gap(_)))
+    }
+
+    pub fn events(&self) -> impl Iterator<Item = &Occurrence> {
+        self.items.iter().filter_map(|i| match i {
+            Item::Event(o) => Some(o),
+            Item::Gap(_) => None,
+        })
+    }
+}
+
+#[derive(Debug, Default)]
+struct Inner {
+    ring: VecDeque<Entry>,
+    /// The last `seq` given out; 0 before the first.
+    last: u64,
+    /// Each agent's last state the hub heard, by host and ref.
+    states: HashMap<(String, String), String>,
+    /// Each linked host's link, as last heard.
+    links: HashMap<String, String>,
+}
+
+impl Inner {
+    fn push(&mut self, entry: impl FnOnce(u64) -> Entry) {
+        self.last += 1;
+        if self.ring.len() == RING {
+            self.ring.pop_front();
+        }
+        self.ring.push_back(entry(self.last));
+    }
+
+    /// The first position the ring can serve from: everything after it is
+    /// still held.
+    fn floor(&self) -> u64 {
+        self.ring.front().map_or(self.last, |e| e.seq() - 1)
+    }
+}
+
+/// The daemon's events, shared by every listener and request: `rmcp` makes
+/// a server per request, so nothing of a subscription lives anywhere else.
+#[derive(Debug)]
+pub struct Hub {
+    /// Names this process's cursors, so one from an earlier `vibed` is told
+    /// apart.
+    boot: String,
+    inner: Mutex<Inner>,
+    /// The last `seq`, for streams to wait on.
+    newest: watch::Sender<u64>,
+    /// Bumped when the API keys change, so streams check theirs again.
+    keys: watch::Sender<u64>,
+    streams: AtomicUsize,
+}
+
+impl Default for Hub {
+    fn default() -> Self {
+        Hub::new()
+    }
+}
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+/// A cursor: `<boot>-<seq>`.
+fn position(boot: &str, seq: u64) -> String {
+    format!("{boot}-{seq}")
+}
+
+impl Hub {
+    pub fn new() -> Hub {
+        let boot = match vibe_core::keys::random_bytes() {
+            Ok(b) => b[..6].iter().map(|b| format!("{b:02x}")).collect(),
+            // Only told apart from another process's by the time, then.
+            Err(_) => format!("{:x}", now_ms()),
+        };
+        Hub {
+            boot,
+            inner: Mutex::new(Inner::default()),
+            newest: watch::Sender::new(0),
+            keys: watch::Sender::new(0),
+            streams: AtomicUsize::new(0),
+        }
+    }
+
+    /// What the hub knows of an agent's state before it hears of a change,
+    /// as the daemon has it at the start: so the first change it hears of
+    /// has a `previous`, and a turn that ends is seen to.
+    pub fn seed(&self, host: &str, agent: &str, state: AgentState) {
+        lock(&self.inner)
+            .states
+            .entry((host.to_owned(), agent.to_owned()))
+            .or_insert_with(|| state.to_string());
+    }
+
+    /// Takes in an event from the daemon's bus.
+    pub fn ingest(&self, e: &Event) {
+        let heard_ms = now_ms();
+        let mut inner = lock(&self.inner);
+        let before = inner.last;
+        let occurrence = |seq, name, state: Option<String>, previous| {
+            Entry::Event(Occurrence {
+                seq,
+                name,
+                timestamp: e.at.clone(),
+                heard_ms,
+                host: e.host.clone(),
+                agent: e.agent.clone().unwrap_or_default(),
+                project: e.project.clone(),
+                state,
+                previous,
+            })
+        };
+        match e.kind {
+            EventKind::AgentAdded | EventKind::AgentState | EventKind::AgentDeleted
+                if e.agent.is_none() => {}
+            EventKind::AgentAdded => {
+                let state = e.state.clone().unwrap_or_else(|| "busy".into());
+                inner.states.insert(
+                    (e.host.clone(), e.agent.clone().unwrap_or_default()),
+                    state.clone(),
+                );
+                inner.push(|seq| occurrence(seq, Name::Started, Some(state), None));
+            }
+            EventKind::AgentState => {
+                let Some(state) = e.state.clone() else { return };
+                let key = (e.host.clone(), e.agent.clone().unwrap_or_default());
+                let previous = inner.states.insert(key, state.clone());
+                if previous.as_ref() == Some(&state) {
+                    return;
+                }
+                inner.push(|seq| {
+                    occurrence(
+                        seq,
+                        Name::StateChanged,
+                        Some(state.clone()),
+                        previous.clone(),
+                    )
+                });
+                if previous.as_deref() == Some("busy") {
+                    inner.push(|seq| occurrence(seq, Name::TurnEnded, Some(state), None));
+                }
+            }
+            EventKind::AgentDeleted => {
+                inner
+                    .states
+                    .remove(&(e.host.clone(), e.agent.clone().unwrap_or_default()));
+                inner.push(|seq| occurrence(seq, Name::Deleted, None, None));
+            }
+            // A linked host's link coming up: whatever happened there while
+            // it was down, or before it first came up, was never heard.
+            EventKind::HostLink if e.host != LOCAL_HOST => {
+                let state = e.state.clone().unwrap_or_default();
+                let was = inner.links.insert(e.host.clone(), state.clone());
+                if state == "connected" && was.as_deref() != Some("connected") {
+                    let host = e.host.clone();
+                    inner.push(|seq| Entry::Gap {
+                        seq,
+                        host: Some(host),
+                    });
+                }
+            }
+            // A linked host's own feed fell behind.
+            EventKind::Lagged if e.host != LOCAL_HOST => {
+                let host = e.host.clone();
+                inner.push(|seq| Entry::Gap {
+                    seq,
+                    host: Some(host),
+                });
+            }
+            EventKind::KeysChanged => {
+                self.keys.send_modify(|n| *n += 1);
+            }
+            _ => {}
+        }
+        let last = inner.last;
+        drop(inner);
+        if last != before {
+            self.newest.send_replace(last);
+        }
+    }
+
+    /// The hub's own feed fell behind the bus: anything may be missing.
+    pub fn lagged(&self) {
+        let mut inner = lock(&self.inner);
+        inner.push(|seq| Entry::Gap { seq, host: None });
+        let last = inner.last;
+        drop(inner);
+        self.newest.send_replace(last);
+    }
+
+    /// Feeds the hub from the daemon's bus until the bus closes.
+    pub fn spawn_feed(self: &Arc<Self>, mut rx: broadcast::Receiver<Event>) {
+        let hub = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(e) => hub.ingest(&e),
+                    Err(broadcast::error::RecvError::Lagged(_)) => hub.lagged(),
+                    Err(broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        });
+    }
+
+    /// The last position, as a cursor.
+    pub fn cursor_now(&self) -> String {
+        position(&self.boot, lock(&self.inner).last)
+    }
+
+    /// Where a client's cursor says to go on from, and whether that's later
+    /// than it asked (`truncated`): `None` is now, as is a cursor from an
+    /// earlier `vibed`.
+    pub fn resolve(&self, cursor: Option<&str>) -> Result<(u64, bool), ErrorData> {
+        let last = lock(&self.inner).last;
+        let Some(cursor) = cursor else {
+            return Ok((last, false));
+        };
+        let bad = || invalid(format!("cursor {cursor:?} isn't one this server gave"));
+        let (boot, seq) = cursor.rsplit_once('-').ok_or_else(bad)?;
+        let seq: u64 = seq.parse().map_err(|_| bad())?;
+        if boot != self.boot {
+            // Its events went with the process that gave it.
+            return Ok((last, true));
+        }
+        if seq > last {
+            return Err(bad());
+        }
+        Ok((seq, false))
+    }
+
+    /// What `filter` lets through after position `after`, up to `max`
+    /// events, leaving out those heard before `floor_ms`. A gap that may
+    /// hold one of `filter`'s is an [`Item::Gap`]; so is the ring having
+    /// moved on past `after`, and an event left out for its age.
+    pub fn read(&self, after: u64, filter: &Filter, max: usize, floor_ms: Option<u64>) -> Read {
+        let inner = lock(&self.inner);
+        let mut items = Vec::new();
+        let mut cursor = after;
+        let held_from = inner.floor();
+        if after < held_from {
+            items.push(Item::Gap(held_from));
+            cursor = held_from;
+        }
+        let mut count = 0;
+        let mut has_more = false;
+        let start = cursor;
+        for entry in inner.ring.iter().filter(|e| e.seq() > start) {
+            match entry {
+                Entry::Gap { seq, host } => {
+                    if host.as_deref().is_none_or(|h| filter.may_include_host(h)) {
+                        // Gaps one after another are one gap.
+                        if let Some(Item::Gap(last)) = items.last_mut() {
+                            *last = *seq;
+                        } else {
+                            items.push(Item::Gap(*seq));
+                        }
+                    }
+                }
+                Entry::Event(o) if filter.matches(o) => {
+                    if floor_ms.is_some_and(|f| o.heard_ms < f) {
+                        if let Some(Item::Gap(last)) = items.last_mut() {
+                            *last = o.seq;
+                        } else {
+                            items.push(Item::Gap(o.seq));
+                        }
+                    } else if count == max {
+                        has_more = true;
+                        break;
+                    } else {
+                        items.push(Item::Event(o.clone()));
+                        count += 1;
+                    }
+                }
+                Entry::Event(_) => {}
+            }
+            cursor = entry.seq();
+        }
+        if !has_more {
+            cursor = inner.last.max(cursor);
+        }
+        Read {
+            items,
+            cursor,
+            has_more,
+        }
+    }
+
+    /// How many streams are open now.
+    pub fn streams(&self) -> usize {
+        self.streams.load(Ordering::SeqCst)
+    }
+
+    /// Takes one of [`MAX_STREAMS`] places, for a stream, until the slot is
+    /// dropped.
+    pub fn open_stream(self: &Arc<Self>) -> Result<StreamSlot, ErrorData> {
+        let taken = self.streams.fetch_add(1, Ordering::SeqCst) < MAX_STREAMS;
+        // The slot's drop gives back what was taken, whichever way it went.
+        let slot = StreamSlot(Arc::clone(self));
+        if taken {
+            return Ok(slot);
+        }
+        Err(error(
+            RESOURCE_EXHAUSTED,
+            format!("{MAX_STREAMS} event streams are open already: close one, or use events/poll"),
+            Some(json!({"limit": "streams", "max": MAX_STREAMS})),
+        ))
+    }
+}
+
+/// One of [`MAX_STREAMS`], given back when the stream ends however it ends.
+#[derive(Debug)]
+pub struct StreamSlot(Arc<Hub>);
+
+impl Drop for StreamSlot {
+    fn drop(&mut self) {
+        self.0.streams.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// A subscription's arguments, checked.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Filter {
+    pub name: Option<Name>,
+    pub host: Option<String>,
+    pub project: Option<String>,
+    /// Refs, each with its host if it names one.
+    pub agents: Option<Vec<(Option<String>, String)>>,
+    pub states: Option<Vec<String>>,
+}
+
+impl Filter {
+    /// `arguments` for event type `name`, checked against its input schema.
+    pub fn parse(name: Name, arguments: Option<&Value>) -> Result<Filter, ErrorData> {
+        let empty = Map::new();
+        let args = match arguments {
+            None | Some(Value::Null) => &empty,
+            Some(Value::Object(m)) => m,
+            Some(_) => return Err(invalid("arguments must be an object")),
+        };
+        let mut f = Filter {
+            name: Some(name),
+            ..Filter::default()
+        };
+        for (key, value) in args {
+            match key.as_str() {
+                "host" | "project" => {
+                    let s = value
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(|| invalid(format!("{key} must be a name")))?
+                        .to_owned();
+                    if key == "host" {
+                        f.host = Some(s);
+                    } else {
+                        f.project = Some(s);
+                    }
+                }
+                "agents" => {
+                    let refs: Vec<&Value> = match value {
+                        Value::String(_) => vec![value],
+                        Value::Array(a) if (1..=MAX_FILTER_AGENTS).contains(&a.len()) => {
+                            a.iter().collect()
+                        }
+                        _ => {
+                            return Err(invalid(format!(
+                                "agents must be a ref, or a list of up to {MAX_FILTER_AGENTS}"
+                            )));
+                        }
+                    };
+                    let mut list = Vec::new();
+                    for r in refs {
+                        let (host, agent) = r
+                            .as_str()
+                            .map(split_ref)
+                            .filter(|(h, a)| !a.is_empty() && h.is_none_or(|h| !h.is_empty()))
+                            .ok_or_else(|| {
+                                invalid("agents must be refs, like quiet-amber-otter")
+                            })?;
+                        list.push((host.map(str::to_owned), agent.to_owned()));
+                    }
+                    f.agents = Some(list);
+                }
+                "state" if name.has_state() => {
+                    let allowed = name.states();
+                    let one = |v: &Value| {
+                        v.as_str()
+                            .filter(|s| allowed.contains(s))
+                            .map(str::to_owned)
+                            .ok_or_else(|| {
+                                invalid(format!("state must be one of {}", allowed.join(", ")))
+                            })
+                    };
+                    let states = match value {
+                        Value::Array(a) if !a.is_empty() => {
+                            a.iter().map(one).collect::<Result<Vec<_>, _>>()?
+                        }
+                        v => vec![one(v)?],
+                    };
+                    f.states = Some(states);
+                }
+                other => {
+                    return Err(invalid(format!(
+                        "{} takes no argument {other:?}; it takes {}",
+                        name.as_str(),
+                        name.input_schema()["properties"]
+                            .as_object()
+                            .map(|p| p.keys().cloned().collect::<Vec<_>>().join(", "))
+                            .unwrap_or_default()
+                    )));
+                }
+            }
+        }
+        Ok(f)
+    }
+
+    pub fn matches(&self, o: &Occurrence) -> bool {
+        self.name.is_none_or(|n| n == o.name)
+            && self.host.as_ref().is_none_or(|h| *h == o.host)
+            && self
+                .project
+                .as_ref()
+                .is_none_or(|p| o.project.as_ref() == Some(p))
+            && self.agents.as_ref().is_none_or(|list| {
+                list.iter()
+                    .any(|(h, a)| *a == o.agent && h.as_ref().is_none_or(|h| *h == o.host))
+            })
+            && self.states.as_ref().is_none_or(|states| {
+                o.state
+                    .as_ref()
+                    .is_some_and(|s| states.iter().any(|x| x == s))
+            })
+    }
+
+    /// Whether an event on `host` could be one of this filter's.
+    fn may_include_host(&self, host: &str) -> bool {
+        self.host.as_ref().is_none_or(|h| h == host)
+            && self.agents.as_ref().is_none_or(|list| {
+                list.iter()
+                    .any(|(h, _)| h.as_ref().is_none_or(|h| h == host))
+            })
+    }
+}
+
+// The requests.
+
+/// Whether `method` is one of this extension's.
+pub fn is_events_method(method: &str) -> bool {
+    method.starts_with("events/")
+}
+
+fn params_object(params: Option<&Value>) -> Result<Map<String, Value>, ErrorData> {
+    match params {
+        None | Some(Value::Null) => Ok(Map::new()),
+        Some(Value::Object(m)) => Ok(m.clone()),
+        Some(_) => Err(invalid("params must be an object")),
+    }
+}
+
+/// The event type a request names, which must be one.
+fn named(params: &Map<String, Value>) -> Result<Name, ErrorData> {
+    let name = params
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid("name is required: an event type from events/list"))?;
+    Name::parse(name).ok_or_else(|| {
+        error(
+            NOT_FOUND,
+            format!("no event type called {name}; events/list lists them"),
+            Some(json!({"kind": "event"})),
+        )
+    })
+}
+
+fn cursor_param(params: &Map<String, Value>) -> Result<Option<String>, ErrorData> {
+    match params.get("cursor") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.clone())),
+        Some(_) => Err(invalid("cursor must be a string, or null for now")),
+    }
+}
+
+fn whole(
+    params: &Map<String, Value>,
+    key: &str,
+    min: u64,
+    max: u64,
+) -> Result<Option<u64>, ErrorData> {
+    match params.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => match v.as_u64() {
+            Some(n) if n >= min => Ok(Some(n.min(max))),
+            _ => Err(invalid(format!("{key} must be a whole number from {min}"))),
+        },
+    }
+}
+
+/// `events/list`: every event type, in one page.
+pub fn list(params: Option<&Value>) -> Result<Value, ErrorData> {
+    let params = params_object(params)?;
+    if cursor_param(&params)?.is_some() {
+        return Err(invalid("events/list has one page, and no cursor"));
+    }
+    Ok(json!({
+        "resultType": "complete",
+        "events": Name::ALL.iter().map(|n| n.descriptor()).collect::<Vec<_>>(),
+    }))
+}
+
+/// `events/poll`: what happened since the cursor.
+pub fn poll(hub: &Hub, params: Option<&Value>) -> Result<Value, ErrorData> {
+    let params = params_object(params)?;
+    let name = named(&params)?;
+    let filter = Filter::parse(name, params.get("arguments"))?;
+    let cursor = cursor_param(&params)?;
+    let max_age = whole(&params, "maxAgeMs", 0, u64::MAX)?;
+    let max_events = whole(&params, "maxEvents", 1, MAX_EVENTS)?.unwrap_or(DEFAULT_MAX_EVENTS);
+    let (after, reset) = hub.resolve(cursor.as_deref())?;
+    // Null is now: no events, and a cursor to poll on from.
+    let read = if cursor.is_none() || reset {
+        Read {
+            items: Vec::new(),
+            cursor: after,
+            has_more: false,
+        }
+    } else {
+        let floor = max_age.map(|age| now_ms().saturating_sub(age));
+        hub.read(after, &filter, max_events as usize, floor)
+    };
+    Ok(json!({
+        "resultType": "complete",
+        "events": read.events().map(|o| o.to_json(&hub.boot, false)).collect::<Vec<_>>(),
+        "cursor": position(&hub.boot, read.cursor),
+        "truncated": reset || read.truncated(),
+        "hasMore": read.has_more,
+        "nextPollMs": NEXT_POLL_MS,
+    }))
+}
+
+/// `events/subscribe` and `events/unsubscribe`: webhooks aren't offered.
+pub fn webhook(params: Option<&Value>) -> Result<Value, ErrorData> {
+    let params = params_object(params)?;
+    let name = named(&params)?;
+    Err(error(
+        UNSUPPORTED,
+        format!(
+            "{} is delivered by poll (events/poll) and push (events/stream), not webhook",
+            name.as_str()
+        ),
+        Some(json!({"feature": "deliveryMode", "value": "webhook"})),
+    ))
+}
+
+/// A push stream's notifications, each with its subscription id.
+struct Notifier<'a> {
+    ctx: &'a RequestContext<RoleServer>,
+    id: Value,
+}
+
+impl Notifier<'_> {
+    /// Sends one; `false` once the client has gone.
+    async fn send(&self, method: &str, mut params: Value) -> bool {
+        params["_meta"] = json!({ SUBSCRIPTION_ID: self.id });
+        self.ctx
+            .peer
+            .send_notification(ServerNotification::CustomNotification(
+                CustomNotification::new(method, Some(params)),
+            ))
+            .await
+            .is_ok()
+    }
+
+    async fn active(&self, boot: &str, cursor: u64, truncated: bool, heartbeat: Duration) -> bool {
+        self.send(
+            "notifications/events/active",
+            json!({"cursor": position(boot, cursor), "truncated": truncated, "heartbeatMs": heartbeat.as_millis() as u64}),
+        )
+        .await
+    }
+
+    /// Sends what a read gave, in order: a gap as a fresh `active`.
+    async fn items(&self, boot: &str, items: &[Item], heartbeat: Duration) -> bool {
+        for item in items {
+            let sent = match item {
+                Item::Event(o) => {
+                    self.send("notifications/events/event", o.to_json(boot, true))
+                        .await
+                }
+                Item::Gap(at) => self.active(boot, *at, true, heartbeat).await,
+            };
+            if !sent {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn done(&self) -> Value {
+        json!({"resultType": "complete", "_meta": { SUBSCRIPTION_ID: self.id }})
+    }
+}
+
+/// `events/stream`: a push subscription, for as long as the request is
+/// open. Ends when the client goes (an abort over HTTP, which is also how
+/// `vibe mcp` passes on a cancel), or when the caller's key is deleted.
+pub async fn stream<D: Daemon>(
+    hub: &Arc<Hub>,
+    daemon: &Arc<D>,
+    caller: &Caller,
+    params: Option<&Value>,
+    ctx: &RequestContext<RoleServer>,
+) -> Result<Value, ErrorData> {
+    let params = params_object(params)?;
+    let name = named(&params)?;
+    let filter = Filter::parse(name, params.get("arguments"))?;
+    let cursor = cursor_param(&params)?;
+    let max_age = whole(&params, "maxAgeMs", 0, u64::MAX)?;
+    let heartbeat = whole(&params, "heartbeatMs", 0, u64::MAX)?
+        .map_or(DEFAULT_HEARTBEAT, Duration::from_millis)
+        .clamp(MIN_HEARTBEAT, MAX_HEARTBEAT);
+    let (from, reset) = hub.resolve(cursor.as_deref())?;
+    let _slot = hub.open_stream()?;
+    let notify = Notifier {
+        ctx,
+        id: serde_json::to_value(&ctx.id).unwrap_or(Value::Null),
+    };
+    // Watched before the first read, so nothing that comes in between is
+    // missed: a change seen twice reads nothing new.
+    let mut newest = hub.newest.subscribe();
+    let mut keys = hub.keys.subscribe();
+    let boot = hub.boot.as_str();
+    // The replay: from the cursor, unless it's now.
+    let mut replay = if cursor.is_none() || reset {
+        Read {
+            items: Vec::new(),
+            cursor: from,
+            has_more: false,
+        }
+    } else {
+        let floor = max_age.map(|age| now_ms().saturating_sub(age));
+        hub.read(from, &filter, usize::MAX, floor)
+    };
+    // A gap before the first event is said in the first `active`.
+    let (start, truncated) = match replay.items.first() {
+        Some(Item::Gap(at)) => {
+            let at = *at;
+            replay.items.remove(0);
+            (at, true)
+        }
+        _ => (from, reset),
+    };
+    if !notify.active(boot, start, truncated, heartbeat).await
+        || !notify.items(boot, &replay.items, heartbeat).await
+    {
+        return Ok(notify.done());
+    }
+    let mut at = replay.cursor;
+    let mut beat = tokio::time::Instant::now() + heartbeat;
+    loop {
+        tokio::select! {
+            () = ctx.ct.cancelled() => return Ok(notify.done()),
+            changed = newest.changed() => {
+                if changed.is_err() {
+                    return Ok(notify.done());
+                }
+                let read = hub.read(at, &filter, usize::MAX, None);
+                if !read.items.is_empty() {
+                    if !notify.items(boot, &read.items, heartbeat).await {
+                        return Ok(notify.done());
+                    }
+                    beat = tokio::time::Instant::now() + heartbeat;
+                }
+                at = read.cursor;
+            }
+            changed = keys.changed() => {
+                if changed.is_err() {
+                    continue;
+                }
+                let d = Arc::clone(daemon);
+                let key = caller.key().to_owned();
+                let still = tokio::task::spawn_blocking(move || d.verify_key(&key))
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some();
+                if !still {
+                    daemon.log(&format!(
+                        "mcp: key {:?} is gone: ending its {} stream",
+                        caller.name(),
+                        name.as_str()
+                    ));
+                    notify
+                        .send(
+                            "notifications/events/terminated",
+                            json!({"error": {"code": FORBIDDEN, "message": "Forbidden", "data": {"reason": "the API key was deleted"}}}),
+                        )
+                        .await;
+                    return Ok(notify.done());
+                }
+            }
+            () = tokio::time::sleep_until(beat) => {
+                if !notify
+                    .send("notifications/events/heartbeat", json!({"cursor": position(boot, at)}))
+                    .await
+                {
+                    return Ok(notify.done());
+                }
+                beat = tokio::time::Instant::now() + heartbeat;
+            }
+        }
+    }
+}
+
+/// Decodes a header value written as SEP-2243 says: as it is, or Base64 in
+/// `=?base64?…?=`.
+fn header_text(v: &str) -> Option<String> {
+    let Some(b64) = v
+        .strip_prefix("=?base64?")
+        .and_then(|r| r.strip_suffix("?="))
+    else {
+        return Some(v.to_owned());
+    };
+    let mut bits = 0u32;
+    let mut n = 0;
+    let mut out = Vec::new();
+    for c in b64.bytes().filter(|c| *c != b'=') {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        };
+        bits = (bits << 6) | u32::from(v);
+        n += 6;
+        if n >= 8 {
+            n -= 8;
+            out.push((bits >> n) as u8);
+            bits &= (1 << n) - 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// Checks the `Mcp-Name` header of a request that names an event type: on
+/// Streamable HTTP from 2026-07-28 it must say `params.name` (Routing
+/// Headers).
+pub fn check_name_header(
+    headers: &http::HeaderMap,
+    method: &str,
+    params: Option<&Value>,
+) -> Result<(), ErrorData> {
+    if method == "events/list" {
+        return Ok(());
+    }
+    let modern = headers
+        .get("mcp-protocol-version")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v >= rmcp::model::ProtocolVersion::V_2026_07_28.as_str());
+    if !modern {
+        return Ok(());
+    }
+    let want = params.and_then(|p| p.get("name")).and_then(Value::as_str);
+    let mut given = headers.get_all("mcp-name").iter();
+    let (first, second) = (given.next(), given.next());
+    let got = first
+        .filter(|_| second.is_none())
+        .and_then(|v| v.to_str().ok())
+        .and_then(header_text);
+    match (want, got) {
+        (Some(w), Some(g)) if w == g => Ok(()),
+        (want, _) => Err(ErrorData::header_mismatch(
+            format!(
+                "the Mcp-Name header must be the event type, {}",
+                want.unwrap_or("params.name")
+            ),
+            None,
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event(kind: EventKind, host: &str, agent: &str, state: Option<&str>) -> Event {
+        Event {
+            seq: 0,
+            at: "2026-11-25T12:00:00Z".into(),
+            host: host.into(),
+            kind,
+            project: Some("app".into()),
+            agent: Some(agent.into()),
+            state: state.map(str::to_owned),
+            limit: None,
+            message: None,
+            status: None,
+        }
+    }
+
+    fn all() -> Filter {
+        Filter::default()
+    }
+
+    fn names(r: &Read) -> Vec<(&'static str, String, Option<String>)> {
+        r.events()
+            .map(|o| {
+                (
+                    o.name.as_str(),
+                    display_ref(&o.host, &o.agent),
+                    o.state.clone(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_turn_ends_when_busy_stops() {
+        let hub = Hub::new();
+        hub.ingest(&event(EventKind::AgentAdded, "local", "a", Some("busy")));
+        hub.ingest(&event(EventKind::AgentStatus, "local", "a", None));
+        hub.ingest(&event(
+            EventKind::AgentState,
+            "local",
+            "a",
+            Some("question"),
+        ));
+        // The same state again isn't a change.
+        hub.ingest(&event(
+            EventKind::AgentState,
+            "local",
+            "a",
+            Some("question"),
+        ));
+        hub.ingest(&event(EventKind::AgentState, "local", "a", Some("busy")));
+        hub.ingest(&event(EventKind::AgentState, "vps", "b", Some("idle")));
+        hub.ingest(&event(EventKind::AgentDeleted, "local", "a", None));
+        let r = hub.read(0, &all(), 100, None);
+        assert_eq!(
+            names(&r),
+            [
+                ("agent.started", "a".into(), Some("busy".into())),
+                ("agent.state_changed", "a".into(), Some("question".into())),
+                ("agent.turn_ended", "a".into(), Some("question".into())),
+                ("agent.state_changed", "a".into(), Some("busy".into())),
+                ("agent.state_changed", "vps:b".into(), Some("idle".into())),
+                ("agent.deleted", "a".into(), None),
+            ]
+        );
+        let previous: Vec<Option<String>> = r
+            .events()
+            .filter(|o| o.name == Name::StateChanged)
+            .map(|o| o.previous.clone())
+            .collect();
+        assert_eq!(
+            previous,
+            [Some("busy".into()), Some("question".into()), None]
+        );
+        assert!(!r.truncated() && !r.has_more);
+        assert_eq!(r.cursor, 6);
+        // Seeded, a first change has its previous, and ends a turn.
+        let hub = Hub::new();
+        hub.seed("vps", "b", AgentState::Busy);
+        hub.ingest(&event(EventKind::AgentState, "vps", "b", Some("idle")));
+        let r = hub.read(0, &all(), 100, None);
+        assert_eq!(
+            names(&r),
+            [
+                ("agent.state_changed", "vps:b".into(), Some("idle".into())),
+                ("agent.turn_ended", "vps:b".into(), Some("idle".into())),
+            ]
+        );
+        assert_eq!(r.events().next().unwrap().previous.as_deref(), Some("busy"));
+    }
+
+    #[test]
+    fn filters_narrow_and_say_what_they_take() {
+        let hub = Hub::new();
+        for (host, agent, state) in [
+            ("local", "a", "busy"),
+            ("local", "a", "idle"),
+            ("vps", "a", "question"),
+            ("vps", "c", "idle"),
+        ] {
+            hub.ingest(&event(EventKind::AgentState, host, agent, Some(state)));
+        }
+        let f = |args: Value| Filter::parse(Name::StateChanged, Some(&args)).unwrap();
+        let count = |f: &Filter| hub.read(0, f, 100, None).events().count();
+        assert_eq!(count(&f(json!({}))), 4);
+        assert_eq!(count(&f(json!({"host": "vps"}))), 2);
+        assert_eq!(count(&f(json!({"agents": "a"}))), 3);
+        assert_eq!(count(&f(json!({"agents": ["vps:a", "c"]}))), 2);
+        assert_eq!(count(&f(json!({"state": ["idle", "question"]}))), 3);
+        assert_eq!(count(&f(json!({"project": "web"}))), 0);
+        assert_eq!(count(&f(json!({"project": "app", "state": "busy"}))), 1);
+        let started = Filter::parse(Name::Started, None).unwrap();
+        assert_eq!(count(&started), 0);
+        for bad in [
+            json!({"colour": "red"}),
+            json!({"host": 3}),
+            json!({"host": " "}),
+            json!({"agents": []}),
+            json!({"agents": [""]}),
+            json!({"agents": ":x"}),
+            json!({"state": "sleeping"}),
+            json!([]),
+        ] {
+            let e = Filter::parse(Name::StateChanged, Some(&bad)).unwrap_err();
+            assert_eq!(e.code, ErrorCode::INVALID_PARAMS, "{bad}");
+        }
+        // A turn never ends busy, and agent.started takes no state.
+        assert!(Filter::parse(Name::TurnEnded, Some(&json!({"state": "busy"}))).is_err());
+        let e = Filter::parse(Name::Started, Some(&json!({"state": "busy"}))).unwrap_err();
+        assert!(e.message.contains("agents, host, project"), "{}", e.message);
+    }
+
+    #[test]
+    fn cursors_go_on_from_where_they_were() {
+        let hub = Hub::new();
+        let (start, reset) = hub.resolve(None).unwrap();
+        assert_eq!((start, reset), (0, false));
+        let now = hub.cursor_now();
+        assert_eq!(hub.resolve(Some(&now)).unwrap(), (0, false));
+        hub.ingest(&event(EventKind::AgentState, "local", "a", Some("idle")));
+        hub.ingest(&event(EventKind::AgentState, "local", "b", Some("idle")));
+        let r = hub.read(0, &all(), 1, None);
+        assert_eq!((r.events().count(), r.cursor, r.has_more), (1, 1, true));
+        let r = hub.read(r.cursor, &all(), 1, None);
+        assert_eq!((r.events().count(), r.cursor, r.has_more), (1, 2, false));
+        // Nothing of a filter's, and the cursor still moves on.
+        let none = Filter::parse(Name::Deleted, None).unwrap();
+        assert_eq!(hub.read(0, &none, 10, None).cursor, 2);
+        // An earlier vibed's cursor starts again from now, truncated.
+        assert_eq!(hub.resolve(Some("0123456789ab-1")).unwrap(), (2, true));
+        for bad in ["", "x", "nope-x", &format!("{}-3", hub.boot)] {
+            assert!(hub.resolve(Some(bad)).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn gaps_are_said_to_the_subscriptions_they_touch() {
+        let hub = Hub::new();
+        let link = |state: &str| {
+            let mut e = event(EventKind::HostLink, "vps", "", Some(state));
+            e.agent = None;
+            e
+        };
+        hub.ingest(&link("connected"));
+        // A report while it's up is no gap.
+        hub.ingest(&link("connected"));
+        hub.ingest(&link("down"));
+        hub.ingest(&event(EventKind::AgentState, "local", "a", Some("idle")));
+        hub.ingest(&link("connected"));
+        let r = hub.read(0, &all(), 10, None);
+        assert_eq!(
+            r.items.iter().filter(|i| matches!(i, Item::Gap(_))).count(),
+            2
+        );
+        assert!(matches!(r.items.last(), Some(Item::Gap(3))));
+        // Only this host's agents can't have missed anything.
+        let here = Filter::parse(Name::StateChanged, Some(&json!({"host": "local"}))).unwrap();
+        assert!(!hub.read(0, &here, 10, None).truncated());
+        let named = Filter::parse(Name::StateChanged, Some(&json!({"agents": "local:a"}))).unwrap();
+        assert!(!hub.read(0, &named, 10, None).truncated());
+        let bare = Filter::parse(Name::StateChanged, Some(&json!({"agents": "a"}))).unwrap();
+        assert!(hub.read(0, &bare, 10, None).truncated());
+        // The hub's own feed falling behind touches every one.
+        hub.lagged();
+        let r = hub.read(3, &here, 10, None);
+        assert_eq!(r.items, [Item::Gap(4)]);
+    }
+
+    #[test]
+    fn the_ring_keeps_the_last_and_says_when_it_moved_on() {
+        let hub = Hub::new();
+        for i in 0..RING + 10 {
+            let state = if i % 2 == 0 { "idle" } else { "busy" };
+            hub.ingest(&event(EventKind::AgentState, "local", "a", Some(state)));
+        }
+        let last = lock(&hub.inner).last;
+        // Every other change ends a turn, so there are more entries than changes.
+        assert_eq!(lock(&hub.inner).ring.len(), RING);
+        let r = hub.read(0, &all(), 1, None);
+        assert_eq!(r.items[0], Item::Gap(last - RING as u64));
+        assert!(r.truncated());
+        let r = hub.read(last - 1, &all(), 10, None);
+        assert!(!r.truncated() && r.events().count() == 1);
+    }
+
+    #[test]
+    fn max_age_leaves_out_what_is_too_old() {
+        let hub = Hub::new();
+        hub.ingest(&event(EventKind::AgentState, "local", "a", Some("idle")));
+        lock(&hub.inner).ring.iter_mut().for_each(|e| {
+            if let Entry::Event(o) = e {
+                o.heard_ms -= 60_000;
+            }
+        });
+        hub.ingest(&event(EventKind::AgentState, "local", "b", Some("idle")));
+        let floor = now_ms() - 30_000;
+        let r = hub.read(0, &all(), 10, Some(floor));
+        assert_eq!(r.items.len(), 2);
+        assert_eq!(r.items[0], Item::Gap(1));
+        assert_eq!(
+            names(&r),
+            [("agent.state_changed", "b".into(), Some("idle".into()))]
+        );
+        // One that isn't the filter's is no loss.
+        let only_b = Filter::parse(Name::StateChanged, Some(&json!({"agents": "b"}))).unwrap();
+        assert!(!hub.read(0, &only_b, 10, Some(floor)).truncated());
+    }
+
+    #[test]
+    fn polls_start_from_now() {
+        let hub = Hub::new();
+        hub.ingest(&event(EventKind::AgentState, "local", "a", Some("idle")));
+        let p = |v: Value| poll(&hub, Some(&v)).unwrap();
+        let first = p(json!({"name": "agent.state_changed", "arguments": {}, "cursor": null}));
+        assert_eq!(first["events"], json!([]));
+        assert_eq!(first["truncated"], false);
+        assert_eq!(first["resultType"], "complete");
+        assert_eq!(first["nextPollMs"], NEXT_POLL_MS);
+        let cursor = first["cursor"].as_str().unwrap().to_owned();
+        hub.ingest(&event(EventKind::AgentState, "local", "a", Some("busy")));
+        let next = p(json!({"name": "agent.state_changed", "cursor": cursor}));
+        let events = next["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["name"], "agent.state_changed");
+        assert_eq!(
+            events[0]["data"],
+            json!({"ref": "a", "host": "local", "agent": "a", "project": "app", "state": "busy", "previous": "idle"})
+        );
+        assert!(events[0].get("cursor").is_none());
+        assert_eq!(events[0]["eventId"], next["cursor"]);
+        let stale = p(json!({"name": "agent.state_changed", "cursor": "feedfacecafe-1"}));
+        assert_eq!(
+            (stale["truncated"].clone(), stale["events"].clone()),
+            (json!(true), json!([]))
+        );
+        let missing = poll(&hub, Some(&json!({"name": "agent.exploded"}))).unwrap_err();
+        assert_eq!(missing.code.0, NOT_FOUND);
+        assert_eq!(missing.data, Some(json!({"kind": "event"})));
+        assert!(poll(&hub, Some(&json!({}))).is_err());
+        assert!(
+            poll(
+                &hub,
+                Some(&json!({"name": "agent.deleted", "maxEvents": 0}))
+            )
+            .is_err()
+        );
+        let hook = webhook(Some(&json!({"name": "agent.deleted"}))).unwrap_err();
+        assert_eq!(hook.code.0, UNSUPPORTED);
+    }
+
+    #[test]
+    fn four_event_types_listed_with_their_schemas() {
+        let l = list(None).unwrap();
+        assert_eq!(l["resultType"], "complete");
+        let events = l["events"].as_array().unwrap();
+        let names: Vec<&str> = events.iter().map(|e| e["name"].as_str().unwrap()).collect();
+        assert_eq!(
+            names,
+            [
+                "agent.started",
+                "agent.state_changed",
+                "agent.turn_ended",
+                "agent.deleted"
+            ]
+        );
+        for e in events {
+            assert_eq!(e["delivery"], json!(["poll", "push"]));
+            assert_eq!(e["inputSchema"]["type"], "object");
+            assert_eq!(e["inputSchema"]["additionalProperties"], false);
+            assert!(
+                e["payloadSchema"]["required"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("ref"))
+            );
+            assert!(e["description"].as_str().unwrap().len() > 20);
+        }
+        assert!(events[1]["inputSchema"]["properties"]["state"].is_object());
+        assert!(
+            events[0]["inputSchema"]["properties"]
+                .get("state")
+                .is_none()
+        );
+        assert!(list(Some(&json!({"cursor": "2"}))).is_err());
+    }
+
+    #[test]
+    fn name_headers() {
+        let mut h = http::HeaderMap::new();
+        let p = json!({"name": "agent.deleted"});
+        // Before 2026-07-28, nothing's asked of them.
+        assert!(check_name_header(&h, "events/poll", Some(&p)).is_ok());
+        h.insert("mcp-protocol-version", "2026-07-28".parse().unwrap());
+        assert!(check_name_header(&h, "events/list", None).is_ok());
+        let e = check_name_header(&h, "events/poll", Some(&p)).unwrap_err();
+        assert_eq!(e.code, ErrorCode::HEADER_MISMATCH);
+        h.insert("mcp-name", "agent.started".parse().unwrap());
+        assert!(check_name_header(&h, "events/stream", Some(&p)).is_err());
+        h.insert("mcp-name", "agent.deleted".parse().unwrap());
+        assert!(check_name_header(&h, "events/stream", Some(&p)).is_ok());
+        h.insert(
+            "mcp-name",
+            "=?base64?YWdlbnQuZGVsZXRlZA==?=".parse().unwrap(),
+        );
+        assert!(check_name_header(&h, "events/poll", Some(&p)).is_ok());
+        h.append("mcp-name", "agent.deleted".parse().unwrap());
+        assert!(check_name_header(&h, "events/poll", Some(&p)).is_err());
+        assert_eq!(header_text("=?base64?w6k=?=").as_deref(), Some("é"));
+        assert_eq!(header_text("=?base64?!?="), None);
+    }
+}

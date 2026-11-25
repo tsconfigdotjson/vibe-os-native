@@ -21,9 +21,15 @@ rmcp = { version = "3.8", default-features = false, features = ["server", "trans
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+# Already in the tree through rmcp: its cancellation tokens.
+tokio-util = "0.7"
 tower-service = "0.3"
 
 [dev-dependencies]
+# rmcp's own client, for a test that drives the server as a real client
+# would: its hyper client, over a Unix socket the test forwards to the TCP
+# listener, as reqwest isn't in the tree.
+rmcp = { version = "3.8", default-features = false, features = ["client", "transport-streamable-http-client-unix-socket"] }
 tempfile.workspace = true
 
 [lints]

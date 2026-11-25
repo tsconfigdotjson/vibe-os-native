@@ -187,3 +187,58 @@ unprotected.
 | `vibe_read_output` | Reads the agent's screen and recent scrollback |
 | `vibe_send` | Sends text or keys, waking the agent first if it's asleep |
 | `vibe_delete_agent` | Ends an agent and removes what VibeOS made for it, keeping the branch. Refuses on unsaved work unless forced |
+
+## MCP events
+
+A client that speaks MCP protocol `2026-07-28` can subscribe to what
+happens to agents instead of calling `vibe_wait` or `vibe_list_agents` over
+and over. This uses the
+[Events extension](https://modelcontextprotocol.io/extensions/events/overview)
+(`io.modelcontextprotocol/events`, at Beta). `server/discover` advertises it.
+Older protocol versions don't see it, and get "method not found" for
+`events/*`. No widely used client supports Events yet, so this is for your
+own orchestrators and client SDKs that implement it.
+
+| Event | Fires when | Payload |
+| --- | --- | --- |
+| `agent.started` | An agent is started, by any client or the app | `ref`, `host`, `agent`, `project`, `state` |
+| `agent.state_changed` | An agent's state changes | the same, plus `previous` (`null` when not known) |
+| `agent.turn_ended` | An agent was `busy` and stopped: `idle` (it has answered), `question`, `asleep`, `paused` or `exited` | the same as `agent.started` |
+| `agent.deleted` | An agent is deleted | `ref`, `host`, `agent`, `project` |
+
+Each event type takes the filters `host`, `project` and `agents` (one ref or
+a list, as `vibe_wait` takes them). `agent.state_changed` and
+`agent.turn_ended` also take `state` (one state or a list). An argument the
+schema doesn't list is refused. Payloads never carry what an agent wrote:
+read its answer with `vibe_read_messages` and its screen with
+`vibe_read_output`.
+
+- **Delivery.**
+  - Poll uses `events/poll`. Poll every `nextPollMs`, which is 5 s, or at
+    once while `hasMore` is true.
+  - Push uses `events/stream`, a long-lived request that comes back as an
+    event stream. It sends a heartbeat every 30 s by default, and a client
+    can ask for anything from 5 to 60 s.
+  - Webhooks (`events/subscribe`) aren't offered. VibeOS listens on
+    loopback and your tailnet, and doesn't post to URLs a client names.
+  - Over `vibe mcp`, a stream's notifications come through on stdout. A
+    `notifications/cancelled` for the stream's request ends it.
+- **Coverage.** Events cover this host and the Linux hosts linked to it.
+  Agents on a Mac reached through its tunnel (`mac:…` from a Linux host)
+  aren't covered. Ask the Mac's own MCP for those.
+- **Cursors.**
+  - Each `vibed` keeps the last 4,096 events.
+  - A cursor older than that, or from before `vibed` restarted, comes back
+    with `truncated: true` and a fresh cursor.
+  - You also get `truncated: true` when a linked host's link comes back up,
+    since its events weren't heard while it was down. That applies only to
+    subscriptions that could include that host.
+  - After a truncated reply, read what you need with the tools.
+- **Limits and keys.**
+  - At most 64 streams are open at once on a host.
+  - A stream ends when its listener stops, as when MCP on Tailscale is
+    turned off.
+  - A stream also ends when the API key it was opened with is deleted. It
+    ends with `notifications/events/terminated` (Forbidden).
+  - `subscriptions/listen` is accepted with an empty filter and stays quiet:
+    the tools never change. It counts against the same 64.

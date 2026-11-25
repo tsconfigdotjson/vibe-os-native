@@ -27,6 +27,7 @@ use rmcp::transport::streamable_http_server::session::never::NeverSessionManager
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tower_service::Service as _;
 
 use crate::{Caller, Daemon, PATH, Server};
@@ -49,16 +50,19 @@ pub(crate) const HEADER_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const MAX_BODY: usize = 4 << 20;
 
 /// The `rmcp` service behind the gate. `check_host` holds the `Host`
-/// header to loopback names.
+/// header to loopback names. Cancelling `stop` ends every event stream it
+/// has open.
 pub(crate) fn service<D: Daemon>(
     daemon: Arc<D>,
     check_host: bool,
+    stop: CancellationToken,
 ) -> StreamableHttpService<Server<D>, NeverSessionManager> {
     let mut config = StreamableHttpServerConfig::default()
         .with_legacy_session_mode(false)
         .with_json_response(true)
         .with_sse_keep_alive(Some(KEEP_ALIVE))
         .with_max_request_body_bytes(MAX_BODY)
+        .with_cancellation_token(stop)
         .enforce_origin_validation();
     if !check_host {
         config = config.disable_allowed_hosts();
@@ -183,9 +187,15 @@ async fn handle<D: Daemon>(
 }
 
 /// Serves MCP on `listener` until the task is aborted. Connections already
-/// open finish on their own.
+/// open finish on their own, but for event streams (`events/stream`),
+/// which never would: they end with the listener, so one turned off in
+/// Settings serves nothing more.
 pub async fn serve<D: Daemon>(listener: TcpListener, daemon: Arc<D>, check_host: bool) {
-    let svc = service(Arc::clone(&daemon), check_host);
+    let stop = CancellationToken::new();
+    let _ends_streams = stop.clone().drop_guard();
+    // The daemon's events are heard from now on, before anyone subscribes.
+    let _ = daemon.events();
+    let svc = service(Arc::clone(&daemon), check_host, stop);
     // Open connections are capped, so peers that connect and say nothing
     // can't take every descriptor `vibed` has.
     let room = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));

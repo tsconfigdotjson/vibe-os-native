@@ -12,14 +12,19 @@
 //! Every call needs an API key, sent as `Authorization: Bearer`; there's no
 //! unauthenticated mode, not even on loopback.
 //!
+//! From protocol 2026-07-28, clients can also subscribe to what happens to
+//! agents, with MCP Events ([`events`]), instead of polling the tools.
+//!
 //! This crate is the façade only. `vibed` implements [`Daemon`] on its
 //! core, so the tools can't drift from the socket API's handlers.
 
 use std::future::Future;
+use std::sync::Arc;
 
 use vibe_core::model::{Activity, AgentState};
 use vibe_core::rpc::{Agent, AgentDeleteParams, AgentStartParams, ErrorObject, Project};
 
+pub mod events;
 pub mod http;
 pub mod keys;
 pub mod net;
@@ -184,6 +189,15 @@ pub trait Daemon: Send + Sync + 'static {
     /// The name of the API key `secret` is, if it's a key; checking it
     /// records that it was used.
     fn verify_key(&self, secret: &str) -> Option<String>;
+
+    /// The daemon's events, for MCP Events (PRD: MCP interface, Events): one
+    /// [`events::Hub`] for every listener and request, fed from its event
+    /// bus, and started on the first call. `None`, the default, offers no
+    /// events: `events/*` is a method not found, and `server/discover`
+    /// doesn't advertise the extension.
+    fn events(&self) -> Option<Arc<events::Hub>> {
+        None
+    }
 
     /// The hosts `agent` was last seen on, as `c` may know them, so that a bare
     /// ref needn't go looking on every host.

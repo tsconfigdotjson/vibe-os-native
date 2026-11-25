@@ -522,6 +522,9 @@ pub struct Core {
     pub(crate) tailscale_needs_operator: std::sync::atomic::AtomicBool,
     /// Tells the MCP listeners to look at their settings again now.
     pub(crate) mcp_kick: Arc<tokio::sync::Notify>,
+    /// MCP Events: what the listeners serve `events/*` from, made and fed
+    /// from the event bus the first time MCP is served.
+    pub(crate) mcp_events: std::sync::OnceLock<Arc<vibe_mcp::events::Hub>>,
     /// Whether MCP is served on loopback now, for `hosts.list`.
     pub(crate) mcp_serving: AtomicBool,
     /// How Linux hosts are reached.
@@ -724,6 +727,7 @@ impl Core {
             serve_lock: tokio::sync::Mutex::new(()),
             tailscale_needs_operator: std::sync::atomic::AtomicBool::new(false),
             mcp_kick: Arc::new(tokio::sync::Notify::new()),
+            mcp_events: std::sync::OnceLock::new(),
             mcp_serving: AtomicBool::new(false),
             remote: config.remote,
             links: Mutex::new(HashMap::new()),

@@ -12,9 +12,11 @@ use std::time::{Duration, Instant};
 use client::{Client, post_raw, text};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
-use vibe_core::model::{Activity, AgentState, Certainty, Environment, Profile, ProjectSource};
+use vibe_core::model::{
+    Activity, AgentState, Certainty, Environment, EventKind, Profile, ProjectSource,
+};
 use vibe_core::rpc::{
-    Agent, AgentDeleteParams, AgentStartParams, AgentStatus, ErrorCode, ErrorObject, Project,
+    Agent, AgentDeleteParams, AgentStartParams, AgentStatus, ErrorCode, ErrorObject, Event, Project,
 };
 use vibe_mcp::{
     AgentView, Caller, Check, Daemon, Input, MAX_RESULT_CHARS, Message, Role, Screen, Sent, Target,
@@ -60,6 +62,12 @@ struct Fake {
     late_memory: AtomicBool,
     /// Checks of an agent, by their count, that find its host's link down.
     link_down: Mutex<HashMap<String, std::ops::RangeInclusive<u32>>>,
+    /// Its events, as [`Daemon::events`] gives them.
+    hub: std::sync::OnceLock<Arc<vibe_mcp::events::Hub>>,
+    /// It offers no events, as a daemon built before them.
+    no_events: AtomicBool,
+    /// [`KEY`] has been deleted.
+    revoked: AtomicBool,
 }
 
 fn not_found(m: String) -> ErrorObject {
@@ -142,7 +150,14 @@ impl Daemon for Fake {
     }
 
     fn verify_key(&self, secret: &str) -> Option<String> {
-        (secret == KEY).then(|| "laptop".to_owned())
+        (secret == KEY && !self.revoked.load(Ordering::SeqCst)).then(|| "laptop".to_owned())
+    }
+
+    fn events(&self) -> Option<Arc<vibe_mcp::events::Hub>> {
+        if self.no_events.load(Ordering::SeqCst) {
+            return None;
+        }
+        Some(Arc::clone(self.hub.get_or_init(Default::default)))
     }
 
     fn known_hosts(&self, _c: &Caller, agent: &str) -> Vec<String> {
@@ -1581,4 +1596,657 @@ async fn a_refused_request_is_read_before_it_is_answered() {
     let huge = "y".repeat(5 << 20);
     let r = post_raw(addr, "/mcp", &[("Authorization", &good)], &huge).await;
     assert_eq!(r.status, 413, "{}", r.body);
+}
+
+// MCP Events (SEP-3415).
+
+const EVENTS: &str = vibe_mcp::events::EXTENSION;
+
+/// What every 2026-07-28 request carries in its `_meta`.
+fn meta_2026() -> Value {
+    json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientInfo": {"name": "t", "version": "1"},
+        "io.modelcontextprotocol/clientCapabilities": {"extensions": {EVENTS: {}}},
+    })
+}
+
+/// A 2026-07-28 request, and the headers that go with it: `Mcp-Name` is
+/// `params.name` unless `name` says otherwise.
+fn request_2026(
+    id: u64,
+    method: &str,
+    mut params: Value,
+    name: Option<&str>,
+) -> (String, Vec<(String, String)>) {
+    let mut headers = vec![
+        ("Authorization".to_owned(), format!("Bearer {KEY}")),
+        ("MCP-Protocol-Version".to_owned(), "2026-07-28".to_owned()),
+        ("Mcp-Method".to_owned(), method.to_owned()),
+    ];
+    let name = name.map(str::to_owned).or_else(|| {
+        params
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    });
+    if let Some(n) = name.filter(|n| !n.is_empty()) {
+        headers.push(("Mcp-Name".to_owned(), n));
+    }
+    params["_meta"] = meta_2026();
+    let body = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+    (body.to_string(), headers)
+}
+
+async fn call_2026(addr: SocketAddr, method: &str, params: Value) -> client::Reply {
+    call_2026_named(addr, method, params, None).await
+}
+
+async fn call_2026_named(
+    addr: SocketAddr,
+    method: &str,
+    params: Value,
+    name: Option<&str>,
+) -> client::Reply {
+    let (body, headers) = request_2026(7, method, params, name);
+    let headers: Vec<(&str, &str)> = headers
+        .iter()
+        .map(|(n, v)| (n.as_str(), v.as_str()))
+        .collect();
+    post_raw(addr, "/mcp", &headers, &body).await
+}
+
+async fn open_stream(addr: SocketAddr, id: u64, params: Value) -> client::Stream {
+    let (body, headers) = request_2026(id, "events/stream", params, None);
+    let headers: Vec<(&str, &str)> = headers
+        .iter()
+        .map(|(n, v)| (n.as_str(), v.as_str()))
+        .collect();
+    client::Stream::open(addr, &headers, &body).await
+}
+
+fn core_event(kind: EventKind, host: &str, agent: &str, state: Option<&str>) -> Event {
+    Event {
+        seq: 0,
+        at: "2026-11-25T12:00:00Z".into(),
+        host: host.into(),
+        kind,
+        project: Some("app".into()),
+        agent: (!agent.is_empty()).then(|| agent.into()),
+        state: state.map(str::to_owned),
+        limit: None,
+        message: None,
+        status: None,
+    }
+}
+
+/// The JSON-RPC error a reply carries, whatever its status.
+fn error_of(r: &client::Reply) -> Value {
+    let v: Value = serde_json::from_str(&r.body).unwrap_or_else(|e| panic!("{e}: {}", r.body));
+    v["error"].clone()
+}
+
+fn hub(fake: &Fake) -> Arc<vibe_mcp::events::Hub> {
+    fake.events().unwrap()
+}
+
+const WAIT: Duration = Duration::from_secs(10);
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn events_are_discovered_from_2026_on() {
+    let fake = Arc::new(Fake::default());
+    let addr = serve(Arc::clone(&fake)).await;
+    let r = call_2026(addr, "server/discover", json!({})).await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    let caps = &r.response()["result"]["capabilities"];
+    assert_eq!(caps["extensions"][EVENTS], json!({}), "{}", r.body);
+    assert!(caps["tools"].is_object());
+    let r = call_2026(addr, "events/list", json!({})).await;
+    let events = r.response()["result"]["events"].as_array().unwrap().clone();
+    let names: Vec<&str> = events.iter().map(|e| e["name"].as_str().unwrap()).collect();
+    assert_eq!(
+        names,
+        [
+            "agent.started",
+            "agent.state_changed",
+            "agent.turn_ended",
+            "agent.deleted"
+        ]
+    );
+    assert_eq!(r.response()["result"]["resultType"], "complete");
+    // Not before 2026-07-28: it isn't advertised, and isn't there.
+    let mut old = Client::new(addr, KEY);
+    let info = old.initialize("2025-06-18").await;
+    assert!(info["capabilities"].get("extensions").is_none(), "{info}");
+    let r = old
+        .post(&json!({"jsonrpc": "2.0", "id": 9, "method": "events/list", "params": {}}))
+        .await;
+    assert_eq!(error_of(&r)["code"], -32601, "{}", r.body);
+    // Nor from a daemon that offers no events.
+    fake.no_events.store(true, Ordering::SeqCst);
+    let r = call_2026(addr, "server/discover", json!({})).await;
+    assert!(
+        r.response()["result"]["capabilities"]
+            .get("extensions")
+            .is_none(),
+        "{}",
+        r.body
+    );
+    let r = call_2026(addr, "events/list", json!({})).await;
+    assert_eq!(error_of(&r)["code"], -32601, "{}", r.body);
+    fake.no_events.store(false, Ordering::SeqCst);
+    // And never without a key.
+    let (body, _) = request_2026(1, "events/list", json!({}), None);
+    let r = post_raw(
+        addr,
+        "/mcp",
+        &[("MCP-Protocol-Version", "2026-07-28")],
+        &body,
+    )
+    .await;
+    assert_eq!(r.status, 401);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn polls_go_on_from_their_cursor() {
+    let fake = Arc::new(Fake::default());
+    let addr = serve(Arc::clone(&fake)).await;
+    let hub = hub(&fake);
+    let args = json!({"host": "local"});
+    let poll =
+        |cursor: Value| json!({"name": "agent.turn_ended", "arguments": args, "cursor": cursor});
+    let r = call_2026(addr, "events/poll", poll(Value::Null)).await;
+    let first = r.response()["result"].clone();
+    assert_eq!(first["events"], json!([]), "{}", r.body);
+    assert_eq!(
+        (first["truncated"].clone(), first["hasMore"].clone()),
+        (json!(false), json!(false))
+    );
+    assert_eq!(first["nextPollMs"], 5000);
+    hub.ingest(&core_event(
+        EventKind::AgentAdded,
+        "local",
+        "slow",
+        Some("busy"),
+    ));
+    hub.ingest(&core_event(
+        EventKind::AgentState,
+        "vps",
+        "remote-only",
+        Some("busy"),
+    ));
+    hub.ingest(&core_event(
+        EventKind::AgentState,
+        "vps",
+        "remote-only",
+        Some("idle"),
+    ));
+    hub.ingest(&core_event(
+        EventKind::AgentState,
+        "local",
+        "slow",
+        Some("question"),
+    ));
+    let r = call_2026(addr, "events/poll", poll(first["cursor"].clone())).await;
+    let next = r.response()["result"].clone();
+    let events = next["events"].as_array().unwrap();
+    assert_eq!(events.len(), 1, "{next}");
+    assert_eq!(events[0]["name"], "agent.turn_ended");
+    assert_eq!(
+        events[0]["data"],
+        json!({"ref": "slow", "host": "local", "agent": "slow", "project": "app", "state": "question"})
+    );
+    assert!(events[0]["eventId"].is_string() && events[0]["timestamp"] == "2026-11-25T12:00:00Z");
+    // Polled again from there, nothing new.
+    let r = call_2026(addr, "events/poll", poll(next["cursor"].clone())).await;
+    assert_eq!(r.response()["result"]["events"], json!([]));
+    assert_eq!(r.response()["result"]["cursor"], next["cursor"]);
+    // A cursor from an earlier vibed starts again from now, and says so.
+    let r = call_2026(addr, "events/poll", poll(json!("0badc0ffee00-3"))).await;
+    assert_eq!(r.response()["result"]["truncated"], true);
+    // What's wrong with a poll is an error of its own.
+    let r = call_2026(addr, "events/poll", json!({"name": "agent.exploded"})).await;
+    assert_eq!(error_of(&r)["code"], -32023, "{}", r.body);
+    let r = call_2026(
+        addr,
+        "events/poll",
+        json!({"name": "agent.deleted", "arguments": {"colour": 1}}),
+    )
+    .await;
+    assert_eq!(error_of(&r)["code"], -32602, "{}", r.body);
+    let r = call_2026(
+        addr,
+        "events/subscribe",
+        json!({"name": "agent.deleted", "arguments": {},
+        "delivery": {"mode": "webhook", "url": "https://example.com/h", "secret": "whsec_x"}}),
+    )
+    .await;
+    assert_eq!(error_of(&r)["code"], -32026, "{}", r.body);
+    assert_eq!(
+        error_of(&r)["data"],
+        json!({"feature": "deliveryMode", "value": "webhook"})
+    );
+    // The event type goes in Mcp-Name too, for whatever routes on it.
+    let r = call_2026_named(
+        addr,
+        "events/poll",
+        poll(Value::Null),
+        Some("agent.deleted"),
+    )
+    .await;
+    assert_eq!(r.status, 400, "{}", r.body);
+    assert_eq!(error_of(&r)["code"], -32020, "{}", r.body);
+    let r = call_2026_named(addr, "events/poll", poll(Value::Null), Some("")).await;
+    assert_eq!(r.status, 400, "{}", r.body);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stream_pushes_events_until_the_client_goes() {
+    let fake = Arc::new(Fake::default());
+    let addr = serve(Arc::clone(&fake)).await;
+    let hub = hub(&fake);
+    let mut s = open_stream(addr, 41, json!({"name": "agent.state_changed",
+        "arguments": {"agents": ["slow", "vps:quiet-amber-otter"]}, "cursor": null, "heartbeatMs": 1000})).await;
+    assert_eq!(s.status, 200);
+    let active = s.next(WAIT).await.unwrap();
+    assert_eq!(active["method"], "notifications/events/active", "{active}");
+    let sub = &active["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"];
+    assert_eq!(sub, &json!(41));
+    // Asked for 1 s, it's held to the least there is.
+    assert_eq!(active["params"]["heartbeatMs"], 5000);
+    assert_eq!(active["params"]["truncated"], false);
+    assert_eq!(hub.streams(), 1);
+    hub.ingest(&core_event(
+        EventKind::AgentState,
+        "local",
+        "quiet-amber-otter",
+        Some("busy"),
+    ));
+    hub.ingest(&core_event(
+        EventKind::AgentState,
+        "vps",
+        "quiet-amber-otter",
+        Some("question"),
+    ));
+    hub.ingest(&core_event(
+        EventKind::AgentState,
+        "local",
+        "slow",
+        Some("idle"),
+    ));
+    let mut got = Vec::new();
+    for _ in 0..2 {
+        let m = s.next(WAIT).await.unwrap();
+        assert_eq!(m["method"], "notifications/events/event", "{m}");
+        assert_eq!(
+            m["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
+            41
+        );
+        assert!(m["params"]["cursor"].is_string());
+        got.push(m["params"]["data"]["ref"].as_str().unwrap().to_owned());
+    }
+    assert_eq!(got, ["vps:quiet-amber-otter", "slow"]);
+    // Quiet, it beats, with where it has looked up to.
+    let beat = s.next(WAIT).await.unwrap();
+    assert_eq!(beat["method"], "notifications/events/heartbeat", "{beat}");
+    assert!(
+        beat["params"]["cursor"].as_str().unwrap().ends_with("-3"),
+        "{beat}"
+    );
+    // Gone, its slot is given back once a write finds it gone.
+    drop(s);
+    let given_back = Instant::now() + Duration::from_secs(20);
+    while hub.streams() > 0 {
+        assert!(
+            Instant::now() < given_back,
+            "the stream outlived its client"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        fake.log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.contains("opened a stream of agent.state_changed")),
+        "{:?}",
+        fake.log.lock().unwrap()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stream_replays_from_a_cursor_and_ends_when_its_key_goes() {
+    let fake = Arc::new(Fake::default());
+    let addr = serve(Arc::clone(&fake)).await;
+    let hub = hub(&fake);
+    let cursor = hub.cursor_now();
+    hub.ingest(&core_event(
+        EventKind::AgentAdded,
+        "local",
+        "new-one",
+        Some("busy"),
+    ));
+    hub.ingest(&core_event(
+        EventKind::AgentDeleted,
+        "local",
+        "old-one",
+        None,
+    ));
+    let mut s = open_stream(addr, 5, json!({"name": "agent.started", "cursor": cursor})).await;
+    let active = s.next(WAIT).await.unwrap();
+    assert_eq!(active["method"], "notifications/events/active");
+    assert_eq!(active["params"]["cursor"], cursor);
+    assert_eq!(active["params"]["heartbeatMs"], 30000);
+    let replayed = s.next(WAIT).await.unwrap();
+    assert_eq!(replayed["params"]["name"], "agent.started");
+    assert_eq!(replayed["params"]["data"]["agent"], "new-one");
+    // Another key changing ends nothing.
+    hub.ingest(&core_event(EventKind::KeysChanged, "local", "", None));
+    assert!(s.next(Duration::from_millis(500)).await.is_none());
+    fake.revoked.store(true, Ordering::SeqCst);
+    hub.ingest(&core_event(EventKind::KeysChanged, "local", "", None));
+    let ended = s.next(WAIT).await.unwrap();
+    assert_eq!(
+        ended["method"], "notifications/events/terminated",
+        "{ended}"
+    );
+    assert_eq!(ended["params"]["error"]["code"], -32024);
+    let done = s.next(WAIT).await.unwrap();
+    assert_eq!(done["id"], 5, "{done}");
+    assert_eq!(
+        done["result"],
+        json!({"resultType": "complete", "_meta": {"io.modelcontextprotocol/subscriptionId": 5}})
+    );
+    assert!(s.next(WAIT).await.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streams_are_capped_and_end_with_their_listener() {
+    let fake = Arc::new(Fake::default());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let served = tokio::spawn(vibe_mcp::http::serve(listener, Arc::clone(&fake), true));
+    let hub = hub(&fake);
+    let mut open = Vec::new();
+    for id in 0..vibe_mcp::events::MAX_STREAMS as u64 {
+        let mut s = open_stream(addr, id, json!({"name": "agent.deleted"})).await;
+        assert!(s.next(WAIT).await.is_some());
+        open.push(s);
+    }
+    let over = open_stream(addr, 99, json!({"name": "agent.deleted"})).await;
+    let body = over.rest().await;
+    let error: Value = serde_json::from_str(&body).unwrap_or_else(|e| panic!("{e}: {body}"));
+    assert_eq!(error["error"]["code"], -32025, "{body}");
+    assert_eq!(error["error"]["data"]["limit"], "streams");
+    assert_eq!(hub.streams(), vibe_mcp::events::MAX_STREAMS);
+    // A listener that stops takes its streams with it.
+    served.abort();
+    for s in &mut open {
+        assert!(s.next(WAIT).await.is_none());
+    }
+    let freed = Instant::now() + Duration::from_secs(10);
+    while hub.streams() > 0 {
+        assert!(
+            Instant::now() < freed,
+            "{} streams outlived their listener",
+            hub.streams()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+// A real rmcp client, on the same rmcp the server is built with: does it
+// all hold together without changes to rmcp?
+
+/// A Unix socket in front of `addr`, each connection carried to it: rmcp's
+/// own HTTP client speaks to Unix sockets.
+fn unix_front(addr: SocketAddr, dir: &std::path::Path) -> std::path::PathBuf {
+    let path = dir.join("mcp.sock");
+    let listener = tokio::net::UnixListener::bind(&path).unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut unix, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+                let _ = tokio::io::copy_bidirectional(&mut unix, &mut tcp).await;
+            });
+        }
+    });
+    path
+}
+
+/// What an rmcp client hears outside a `subscriptions/listen`: method,
+/// params, and the subscription id in its `_meta`.
+#[derive(Clone, Default)]
+struct Heard(Arc<Mutex<Vec<HeardNote>>>);
+
+/// A notification's method, params, and subscription id.
+type HeardNote = (String, Value, Option<Value>);
+
+impl rmcp::ClientHandler for Heard {
+    async fn on_custom_notification(
+        &self,
+        n: rmcp::model::CustomNotification,
+        ctx: rmcp::service::NotificationContext<rmcp::RoleClient>,
+    ) {
+        // rmcp 3.9 moves a custom notification's extensions out before its
+        // `_meta`, which lives in them, so `ctx.meta` is empty and the
+        // subscription id is found in `ctx.extensions`.
+        let sub = ctx
+            .meta
+            .subscription_id()
+            .or_else(|| {
+                ctx.extensions
+                    .get::<rmcp::model::NotificationMetaObject>()
+                    .and_then(|m| m.subscription_id())
+            })
+            .map(|id| serde_json::to_value(id).unwrap());
+        self.0
+            .lock()
+            .unwrap()
+            .push((n.method, n.params.unwrap_or(Value::Null), sub));
+    }
+}
+
+impl Heard {
+    /// The first notification `method` for subscription `sub`, after `skip`
+    /// of them, within [`WAIT`].
+    async fn wait(&self, method: &str, sub: &Value, skip: usize) -> Value {
+        let until = Instant::now() + WAIT;
+        loop {
+            let found = self
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(m, _, s)| m == method && s.as_ref() == Some(sub))
+                .nth(skip)
+                .map(|(_, p, _)| p.clone());
+            if let Some(p) = found {
+                return p;
+            }
+            assert!(
+                Instant::now() < until,
+                "no {method} for {sub}: {:?}",
+                self.0.lock().unwrap()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_rmcp_client_drives_events_beside_a_listen() {
+    use rmcp::model::{ClientRequest, CustomRequest, ProtocolVersion, SubscriptionFilter};
+    use rmcp::service::{ClientLifecycleMode, ClientServiceExt, PeerRequestOptions};
+    use rmcp::transport::StreamableHttpClientTransport;
+    use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
+
+    let fake = Arc::new(Fake::default());
+    let addr = serve(Arc::clone(&fake)).await;
+    let hub = hub(&fake);
+    let dir = tempfile::tempdir().unwrap();
+    let socket = unix_front(addr, dir.path());
+    // rmcp's client sends no Mcp-Name for events/*, so it goes on every
+    // request; where a method has no name, it's ignored.
+    let mut headers = HashMap::new();
+    headers.insert(
+        http::HeaderName::from_static("mcp-name"),
+        http::HeaderValue::from_static("agent.state_changed"),
+    );
+    let config = StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}/mcp"))
+        .auth_header(KEY)
+        .custom_headers(headers);
+    let transport = StreamableHttpClientTransport::from_unix_socket_with_config(
+        socket.to_str().unwrap(),
+        config,
+    );
+    let heard = Heard::default();
+    let client = heard
+        .clone()
+        .serve_with_lifecycle(
+            transport,
+            ClientLifecycleMode::Discover {
+                preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+            },
+        )
+        .await
+        .unwrap();
+    // server/discover advertised the extension.
+    let info = client.peer_info().unwrap();
+    let caps = serde_json::to_value(&info.capabilities).unwrap();
+    assert_eq!(caps["extensions"][EVENTS], json!({}), "{caps}");
+
+    let call = |method: &'static str, params: Value| {
+        let peer = client.peer().clone();
+        async move {
+            peer.send_request(ClientRequest::CustomRequest(CustomRequest::new(
+                method,
+                Some(params),
+            )))
+            .await
+            .map(|r| serde_json::to_value(r).unwrap())
+        }
+    };
+    let list = call("events/list", json!({})).await.unwrap();
+    assert_eq!(list["events"].as_array().unwrap().len(), 4, "{list}");
+    let first = call(
+        "events/poll",
+        json!({"name": "agent.state_changed", "arguments": {}, "cursor": null}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (first["events"].clone(), first["truncated"].clone()),
+        (json!([]), json!(false)),
+        "{first}"
+    );
+    hub.ingest(&core_event(
+        EventKind::AgentState,
+        "local",
+        "slow",
+        Some("idle"),
+    ));
+    let next = call(
+        "events/poll",
+        json!({"name": "agent.state_changed", "arguments": {}, "cursor": first["cursor"]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(next["events"][0]["data"]["ref"], "slow", "{next}");
+    assert_eq!(next["cursor"], next["events"][0]["eventId"]);
+    let stale = call(
+        "events/poll",
+        json!({"name": "agent.state_changed", "arguments": {}, "cursor": "0badc0ffee00-1"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (stale["events"].clone(), stale["truncated"].clone()),
+        (json!([]), json!(true)),
+        "{stale}"
+    );
+    let hook = call(
+        "events/subscribe",
+        json!({"name": "agent.state_changed", "arguments": {},
+        "delivery": {"mode": "webhook", "url": "https://example.com/h", "secret": "whsec_x"}}),
+    )
+    .await;
+    match hook {
+        Err(rmcp::service::ServiceError::McpError(e)) => {
+            assert_eq!(e.code.0, -32026, "{e:?}");
+            assert_eq!(
+                e.data,
+                Some(json!({"feature": "deliveryMode", "value": "webhook"}))
+            );
+        }
+        other => panic!("events/subscribe should be unsupported: {other:?}"),
+    }
+
+    let mut listen = client
+        .listen(SubscriptionFilter::builder().build())
+        .await
+        .unwrap();
+    // Acknowledged with nothing in it: there's no list change to send.
+    assert_eq!(listen.acknowledged(), &SubscriptionFilter::new());
+    let stream = client
+        .send_cancellable_request(
+            ClientRequest::CustomRequest(CustomRequest::new(
+                "events/stream",
+                Some(json!({"name": "agent.state_changed", "arguments": {"agents": "slow"}, "cursor": null, "heartbeatMs": 5000})),
+            )),
+            PeerRequestOptions::no_options(),
+        )
+        .await
+        .unwrap();
+    let sub = serde_json::to_value(&stream.id).unwrap();
+    let active = heard.wait("notifications/events/active", &sub, 0).await;
+    assert_eq!(
+        (active["truncated"].clone(), active["heartbeatMs"].clone()),
+        (json!(false), json!(5000)),
+        "{active}"
+    );
+    hub.ingest(&core_event(
+        EventKind::AgentState,
+        "local",
+        "slow",
+        Some("busy"),
+    ));
+    let event = heard.wait("notifications/events/event", &sub, 0).await;
+    assert_eq!(event["data"]["previous"], "idle", "{event}");
+    assert_eq!(event["data"]["state"], "busy", "{event}");
+    assert!(event["cursor"].is_string());
+    let beat = heard.wait("notifications/events/heartbeat", &sub, 0).await;
+    assert_eq!(beat["cursor"], event["cursor"], "{beat}");
+    // The listen and the event stream, side by side.
+    assert_eq!(hub.streams(), 2);
+    assert!(listen.end().is_none());
+    stream.cancel(None).await.unwrap();
+    let t = Instant::now();
+    while hub.streams() > 1 && t.elapsed() < Duration::from_secs(12) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // rmcp's cancel closes the request, which ends the stream on the
+    // server, and leaves the listen as it was.
+    assert_eq!(hub.streams(), 1, "the event stream outlived its cancel");
+    assert!(listen.end().is_none());
+    listen.cancel().await.unwrap();
+    let t = Instant::now();
+    while hub.streams() > 0 && t.elapsed() < Duration::from_secs(12) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(hub.streams(), 0, "the listen outlived its cancel");
+    // Nothing of the listen's reached the handler, and nothing of the event
+    // stream's went without its subscription id.
+    assert!(
+        heard
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(m, _, s)| m.starts_with("notifications/events/") && s.as_ref() == Some(&sub))
+    );
+    client.cancel().await.unwrap();
 }

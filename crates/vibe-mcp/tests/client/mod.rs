@@ -6,7 +6,9 @@
 use std::net::SocketAddr;
 
 use serde_json::{Value, json};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::time::Duration;
+
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
 /// What came back for one request.
@@ -242,4 +244,120 @@ pub fn text(result: &Value) -> String {
         .as_str()
         .unwrap_or("")
         .to_owned()
+}
+
+/// A response read as it comes: an event stream's messages one at a time,
+/// for a request that doesn't end on its own (`events/stream`).
+pub struct Stream {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    reader: BufReader<TcpStream>,
+    chunked: bool,
+    /// Bytes of the body read and not yet made into messages.
+    pending: String,
+    /// What's left of the chunk being read.
+    left: usize,
+}
+
+impl Stream {
+    /// Posts `body` and reads the answer's head.
+    pub async fn open(addr: SocketAddr, headers: &[(&str, &str)], body: &str) -> Stream {
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        let mut head = format!(
+            "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n",
+            body.len()
+        );
+        for (n, v) in headers {
+            head.push_str(&format!("{n}: {v}\r\n"));
+        }
+        head.push_str("\r\n");
+        s.write_all(head.as_bytes()).await.unwrap();
+        s.write_all(body.as_bytes()).await.unwrap();
+        let mut reader = BufReader::new(s);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        let status = line.split_whitespace().nth(1).unwrap().parse().unwrap();
+        let mut headers = Vec::new();
+        loop {
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            let l = line.trim_end();
+            if l.is_empty() {
+                break;
+            }
+            if let Some((n, v)) = l.split_once(':') {
+                headers.push((n.trim().to_owned(), v.trim().to_owned()));
+            }
+        }
+        let chunked = headers.iter().any(|(n, v)| {
+            n.eq_ignore_ascii_case("transfer-encoding")
+                && v.to_ascii_lowercase().contains("chunked")
+        });
+        Stream {
+            status,
+            headers,
+            reader,
+            chunked,
+            pending: String::new(),
+            left: 0,
+        }
+    }
+
+    /// More of the body; `false` at its end.
+    async fn more(&mut self) -> bool {
+        if self.chunked && self.left == 0 {
+            let mut size = String::new();
+            if self.reader.read_line(&mut size).await.unwrap_or(0) == 0 {
+                return false;
+            }
+            let size = size.trim();
+            if size.is_empty() {
+                return true;
+            }
+            self.left = usize::from_str_radix(size.split(';').next().unwrap(), 16).unwrap();
+            if self.left == 0 {
+                return false;
+            }
+        }
+        let mut buf = vec![0; if self.chunked { self.left } else { 4096 }];
+        let n = self.reader.read(&mut buf).await.unwrap_or(0);
+        if n == 0 {
+            return false;
+        }
+        if self.chunked {
+            self.left -= n;
+        }
+        self.pending.push_str(&String::from_utf8_lossy(&buf[..n]));
+        true
+    }
+
+    /// The next message, or `None` if the stream ends or nothing comes
+    /// within `wait`.
+    pub async fn next(&mut self, wait: Duration) -> Option<Value> {
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            while let Some(i) = self.pending.find("\n\n") {
+                let event: String = self.pending.drain(..i + 2).collect();
+                let data: Vec<&str> = event
+                    .lines()
+                    .filter_map(|l| l.strip_prefix("data:"))
+                    .map(|d| d.strip_prefix(' ').unwrap_or(d))
+                    .collect();
+                let data = data.join("\n");
+                if !data.trim().is_empty() {
+                    return Some(serde_json::from_str(&data).unwrap());
+                }
+            }
+            match tokio::time::timeout_at(deadline, self.more()).await {
+                Ok(true) => {}
+                Ok(false) | Err(_) => return None,
+            }
+        }
+    }
+
+    /// The body after the head, whole, for an answer that isn't a stream.
+    pub async fn rest(mut self) -> String {
+        while self.more().await {}
+        self.pending
+    }
 }

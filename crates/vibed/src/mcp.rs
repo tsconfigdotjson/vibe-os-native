@@ -364,6 +364,30 @@ impl Daemon for Core {
         }
     }
 
+    fn events(&self) -> Option<Arc<vibe_mcp::events::Hub>> {
+        Some(Arc::clone(self.mcp_events.get_or_init(|| {
+            let hub = Arc::new(vibe_mcp::events::Hub::default());
+            // Subscribed first, so a change while it's seeded isn't lost.
+            let (_, rx) = self.subscribe();
+            // Each agent's state as it is now, this host's and the linked
+            // hosts' as last listed, so the first change heard of has a
+            // `previous`, and a turn that ends then is seen to.
+            if let Ok(records) = self.store().agents(LOCAL_HOST) {
+                for r in records {
+                    hub.seed(LOCAL_HOST, &r.agent_ref, r.state);
+                }
+            }
+            let links: Vec<Arc<crate::link::Link>> = lock(&self.links).values().cloned().collect();
+            for link in links {
+                for a in self.kept_agents(&link) {
+                    hub.seed(&link.name, &a.agent, a.state);
+                }
+            }
+            hub.spawn_feed(rx);
+            hub
+        })))
+    }
+
     fn known_hosts(&self, c: &Caller, agent: &str) -> Vec<String> {
         let mut on = Vec::new();
         if let Some(mac) = self.mac() {

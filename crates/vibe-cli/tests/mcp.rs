@@ -261,6 +261,85 @@ fn the_bridge_carries_mcp_over_stdio() {
     .unwrap();
 }
 
+/// MCP Events over stdio: a push stream's notifications come through as
+/// they're sent, and a cancel ends it on the server, as it does a call.
+#[test]
+fn the_bridge_carries_event_streams() {
+    let w = world();
+    let mut b = Bridge::start(&w, Some(&w.key));
+    let meta = json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientInfo": {"name": "events", "version": "1"},
+        "io.modelcontextprotocol/clientCapabilities": {"extensions": {"io.modelcontextprotocol/events": {}}},
+    });
+    b.send(
+        json!({"jsonrpc": "2.0", "id": 1, "method": "server/discover", "params": {"_meta": meta}}),
+    );
+    let d = b.expect();
+    assert_eq!(
+        d["result"]["capabilities"]["extensions"]["io.modelcontextprotocol/events"],
+        json!({}),
+        "{d}"
+    );
+    b.send(
+        json!({"jsonrpc": "2.0", "id": "s", "method": "events/stream", "params": {
+        "name": "agent.started", "arguments": {"project": "app"}, "cursor": null, "_meta": meta}}),
+    );
+    let active = b.expect();
+    assert_eq!(active["method"], "notifications/events/active", "{active}");
+    assert_eq!(
+        active["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
+        "s"
+    );
+    let hub = vibe_mcp::Daemon::events(&*w.core).unwrap();
+    assert_eq!(hub.streams(), 1);
+    // A poll alongside it, from now.
+    b.send(
+        json!({"jsonrpc": "2.0", "id": 2, "method": "events/poll", "params": {
+        "name": "agent.started", "arguments": {}, "cursor": null, "_meta": meta}}),
+    );
+    let p = b.expect();
+    assert_eq!(p["id"], 2, "{p}");
+    let cursor = p["result"]["cursor"].clone();
+    let a =
+        w.rt.block_on(w.core.start_agent(AgentStartParams {
+            project: "app".into(),
+            profile: "software-eng-linux".into(),
+            prompt: "hello".into(),
+            ..Default::default()
+        }))
+        .unwrap();
+    let e = b.expect();
+    assert_eq!(e["method"], "notifications/events/event", "{e}");
+    assert_eq!(e["params"]["name"], "agent.started");
+    assert_eq!(e["params"]["data"]["ref"], a.agent);
+    assert_eq!(e["params"]["data"]["state"], "busy");
+    assert_eq!(
+        e["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
+        "s"
+    );
+    b.send(
+        json!({"jsonrpc": "2.0", "id": 3, "method": "events/poll", "params": {
+        "name": "agent.started", "arguments": {}, "cursor": cursor, "_meta": meta}}),
+    );
+    let p = b.expect();
+    assert_eq!(p["result"]["events"][0]["data"]["agent"], a.agent, "{p}");
+    // A cancel ends the stream, and nothing answers it.
+    b.send(json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": "s"}}));
+    let gone = Instant::now() + Duration::from_secs(20);
+    while hub.streams() > 0 {
+        assert!(Instant::now() < gone, "the stream outlived its cancel");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(b.next(Duration::from_secs(1)).is_none());
+    w.rt.block_on(w.core.delete_agent(vibe_core::rpc::AgentDeleteParams {
+        host: None,
+        agent: a.agent,
+        force: Some(true),
+    }))
+    .unwrap();
+}
+
 #[test]
 fn the_bridge_needs_a_key_the_daemon_knows() {
     let w = world();
