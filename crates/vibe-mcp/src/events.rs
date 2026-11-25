@@ -1,6 +1,6 @@
 //! MCP Events (SEP-3415, `io.modelcontextprotocol/events`; PRD: MCP
 //! interface, Events): a client subscribes to what happens to agents
-//! instead of polling `vibe_wait` and `vibe_list_agents`.
+//! instead of calling `vibe_wait` and `vibe_list_agents` over and over.
 //!
 //! Four event types, about agents on every host this endpoint reaches:
 //! this one, the Linux hosts linked to it, and on a Linux host the Mac
@@ -10,9 +10,8 @@
 //! agent said or shows is read with the tools, so nothing an agent wrote
 //! rides in an event.
 //!
-//! One delivery mode: webhook ([`crate::webhook`]), the one that works
-//! between a client's turns, as ChatGPT has it. Poll and push need the
-//! client running, which ChatGPT's isn't, so they aren't offered.
+//! Delivery is by webhook ([`crate::webhook`]), which works between a
+//! client's turns, as ChatGPT has it.
 //!
 //! Subscriptions read one [`Hub`] per daemon: a ring of the last [`RING`]
 //! occurrences, fed from the daemon's event bus. A cursor is a position in
@@ -311,7 +310,7 @@ pub struct Hub {
     /// apart.
     boot: String,
     inner: Mutex<Inner>,
-    /// The last `seq`, for streams to wait on.
+    /// The last `seq`, for deliveries to wait on.
     newest: watch::Sender<u64>,
     /// Bumped when the API keys change, so subscriptions check theirs again.
     keys: watch::Sender<u64>,

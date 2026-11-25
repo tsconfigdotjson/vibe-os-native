@@ -169,7 +169,7 @@ fn decode<T: serde::de::DeserializeOwned>(params: Option<Value>) -> Result<T, Er
 }
 
 /// `tunnel.grant`: for a key this Mac takes, a relay grant, which the host keeps for the
-/// webhook subscriptions that key made there in place of the key.
+/// webhook subscriptions that key made there. The host never keeps the key.
 async fn grant(core: &Core, end: &TunnelEnd, params: Option<Value>) -> Result<Value, ErrorObject> {
     let p: TunnelGrantParams = decode(params)?;
     let key = checked_key(core, &p.key, TUNNEL_GRANT).await?;
@@ -494,7 +494,7 @@ const GRANTS_RECHECK: Duration = Duration::from_secs(60);
 /// `tunnel.events`: with relay grants this Mac takes, each agent's state now and which
 /// grants it takes, then each event [`relayed`] lets through, one `events.event` line
 /// each, and an `events.admitted` line when which grants it takes changes. Until the host
-/// closes the connection, no grant holds any more, or this end falls behind, when it
+/// closes the connection, none of its grants holds, or this end falls behind, when it
 /// closes it and the host starts over, knowing it may have missed some.
 async fn events<R, W>(
     core: &Arc<Core>,

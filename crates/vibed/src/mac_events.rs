@@ -6,7 +6,7 @@
 //! The tunnel takes nothing without a caller's API key, which the Mac checks itself, and
 //! this host keeps only keys' hashes. So when a key subscribes here, its key is traded
 //! with the Mac for a relay grant (`tunnel.grant`; [`crate::relay_grant`] on the Mac),
-//! which is kept (`mac-relay.json`, its owner's alone) in its place: a grant opens the
+//! which is kept (`mac-relay.json`, its owner's alone) and the key never is: a grant opens the
 //! Mac's events and nothing else, and ends with the key. One feed down the tunnel
 //! (`tunnel.events`), on the grants of every key with a subscription here, puts the Mac's
 //! events in the hub as the Mac says them (its `local` is `mac` here; a host linked to it
@@ -390,7 +390,7 @@ impl Core {
     }
 
     /// The keys with webhook subscriptions here changed: the feed follows them, and the
-    /// grants of keys with none any more go.
+    /// grants of keys with none go.
     pub(crate) fn relay_owners_changed(&self, owners: &[String]) {
         let mut keys = lock(&self.relay.keys);
         self.load_grants(&mut keys);

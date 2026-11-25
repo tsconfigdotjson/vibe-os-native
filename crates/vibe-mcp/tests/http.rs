@@ -1772,13 +1772,6 @@ async fn events_are_advertised_where_chatgpt_looks() {
         ]
     );
     assert!(events.iter().all(|e| e["delivery"] == json!(["webhook"])));
-    // Poll and push aren't served.
-    for method in ["events/poll", "events/stream"] {
-        let e = ask(&mut c, method, json!({"name": "agent.started"}))
-            .await
-            .unwrap_err();
-        assert_eq!(e["code"], -32601, "{method}: {e}");
-    }
     // A daemon that offers no events says nothing of them.
     fake.no_events.store(true, Ordering::SeqCst);
     let mut old = Client::new(addr, KEY);
@@ -1953,7 +1946,7 @@ async fn a_callback_that_fails_verification_says_why_and_gets_nothing() {
         (refused(&url, "whsec_c2hvcnQ="), -32602),
         (refused(&url, "not-whsec"), -32602),
         (
-            json!({"name": "agent.started", "delivery": {"mode": "push"}}),
+            json!({"name": "agent.started", "delivery": {"mode": "email"}}),
             -32026,
         ),
         (
@@ -2031,7 +2024,7 @@ async fn a_subscription_lasts_what_was_granted_unless_refreshed() {
         vibe_core::time::parse_rfc3339(r["refreshBefore"].as_str().unwrap()).unwrap()
             - vibe_core::time::now()
     };
-    // No longer than asked, but no shorter than a floor.
+    // At most what was asked, but at least a floor.
     params["ttlMs"] = json!(10);
     let r = subscribe(&mut c, params.clone()).await;
     assert!(grant(&r) <= 1, "{r}");

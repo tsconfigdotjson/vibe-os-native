@@ -197,7 +197,7 @@ to a webhook. This is MCP Events
 `io.modelcontextprotocol/events`) as
 [ChatGPT implements it](https://developers.openai.com/plugins/build/mcp-events):
 webhook delivery with callback verification. It works between a client's
-turns, when nothing of the client is running. Poll and push aren't offered.
+turns, when nothing of the client is running.
 
 `initialize` and `server/discover` both advertise `capabilities.events`, and
 `events/list`, `events/subscribe` and `events/unsubscribe` work at any

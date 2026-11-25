@@ -13,8 +13,8 @@
 //! unauthenticated mode, not even on loopback.
 //!
 //! Clients can also subscribe to what happens to agents, with MCP Events
-//! ([`events`]) delivered by webhook ([`webhook`]), instead of polling the
-//! tools: what ChatGPT does, as it isn't running between turns.
+//! ([`events`]) delivered by webhook ([`webhook`]), which reaches a client
+//! like ChatGPT between its turns.
 //!
 //! This crate is the façade only. `vibed` implements [`Daemon`] on its
 //! core, so the tools can't drift from the socket API's handlers.

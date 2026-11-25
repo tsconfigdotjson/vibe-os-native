@@ -1339,8 +1339,7 @@ impl<D: Daemon> ServerHandler for Server<D> {
     /// The Events extension's requests (`events/*`), at any protocol
     /// version, as ChatGPT sends them after `initialize`; any other is a
     /// method not found, as is every one of them from a daemon that offers
-    /// no events. Webhook is the only delivery: `events/poll` and
-    /// `events/stream` aren't served.
+    /// no events.
     async fn on_custom_request(
         &self,
         request: CustomRequest,
