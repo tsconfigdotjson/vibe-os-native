@@ -29,8 +29,6 @@ serde_json.workspace = true
 sha2.workspace = true
 tokio.workspace = true
 tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "ring", "tls12"] }
-# Already in the tree through rmcp: its cancellation tokens.
-tokio-util = "0.7"
 tower-service = "0.3"
 
 [dev-dependencies]

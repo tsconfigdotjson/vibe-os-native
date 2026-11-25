@@ -3,7 +3,8 @@
 //! everything posted to it. Plain HTTP/1.1, a connection per request, as `vibed`
 //! posts them.
 
-#![allow(dead_code, unreachable_pub)]
+// Each test crate that includes this (vibe-mcp, vibed, vibe-cli) uses a different part of it.
+#![allow(dead_code)]
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -16,7 +17,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 /// How a verification is answered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Echo {
+pub(crate) enum Echo {
     /// With its challenge.
     Right,
     /// With another.
@@ -29,24 +30,24 @@ pub enum Echo {
 
 /// One post.
 #[derive(Debug, Clone)]
-pub struct Post {
+pub(crate) struct Post {
     /// Where it was posted, as the request line says.
-    pub path: String,
+    pub(crate) path: String,
     /// Lowercased names.
-    pub headers: HashMap<String, String>,
-    pub body: Vec<u8>,
-    pub json: Value,
-    pub status: u16,
+    pub(crate) headers: HashMap<String, String>,
+    pub(crate) body: Vec<u8>,
+    pub(crate) json: Value,
+    pub(crate) status: u16,
 }
 
 impl Post {
-    pub fn header(&self, name: &str) -> &str {
+    pub(crate) fn header(&self, name: &str) -> &str {
         self.headers
             .get(&name.to_ascii_lowercase())
             .map_or("", String::as_str)
     }
 
-    pub fn is_verification(&self) -> bool {
+    pub(crate) fn is_verification(&self) -> bool {
         self.json["type"] == "verification"
     }
 }
@@ -59,15 +60,15 @@ struct Inner {
 }
 
 #[derive(Debug, Clone)]
-pub struct Receiver {
-    pub addr: SocketAddr,
+pub(crate) struct Receiver {
+    pub(crate) addr: SocketAddr,
     inner: Arc<Mutex<Inner>>,
     heard: Arc<tokio::sync::Notify>,
 }
 
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-pub fn base64(bytes: &[u8]) -> String {
+pub(crate) fn base64(bytes: &[u8]) -> String {
     let mut out = String::new();
     for chunk in bytes.chunks(3) {
         let b = [
@@ -104,14 +105,14 @@ fn unbase64(text: &str) -> Vec<u8> {
 }
 
 /// A fresh `whsec_` secret.
-pub fn secret(seed: u8) -> String {
+pub(crate) fn secret(seed: u8) -> String {
     format!("whsec_{}", base64(&[seed; 32]))
 }
 
 /// Whether `post` is signed with `secret`, as a Standard Webhooks receiver checks it:
 /// any of the `v1,` signatures, over `id.timestamp.body`, with a timestamp within five
 /// minutes.
-pub fn signed_with(secret: &str, post: &Post) -> bool {
+pub(crate) fn signed_with(secret: &str, post: &Post) -> bool {
     let key = unbase64(secret.strip_prefix("whsec_").expect("whsec_"));
     let (id, ts) = (post.header("webhook-id"), post.header("webhook-timestamp"));
     let Ok(ts_n) = ts.parse::<i64>() else {
@@ -171,7 +172,7 @@ async fn read_request(s: &mut TcpStream) -> Option<(String, HashMap<String, Stri
 }
 
 impl Receiver {
-    pub async fn start() -> Receiver {
+    pub(crate) async fn start() -> Receiver {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let r = Receiver {
@@ -232,24 +233,24 @@ impl Receiver {
     }
 
     /// Its URL, at `path`.
-    pub fn url(&self, path: &str) -> String {
+    pub(crate) fn url(&self, path: &str) -> String {
         format!("http://{}{path}", self.addr)
     }
 
     /// The statuses the next deliveries get, in order.
-    pub fn answer(&self, statuses: &[u16]) {
+    pub(crate) fn answer(&self, statuses: &[u16]) {
         self.inner.lock().unwrap().statuses.extend(statuses);
     }
 
-    pub fn echo(&self, echo: Echo) {
+    pub(crate) fn echo(&self, echo: Echo) {
         self.inner.lock().unwrap().echo = echo;
     }
 
-    pub fn posts(&self) -> Vec<Post> {
+    pub(crate) fn posts(&self) -> Vec<Post> {
         self.inner.lock().unwrap().posts.clone()
     }
 
-    pub fn verifications(&self) -> Vec<Post> {
+    pub(crate) fn verifications(&self) -> Vec<Post> {
         self.posts()
             .into_iter()
             .filter(Post::is_verification)
@@ -257,7 +258,7 @@ impl Receiver {
     }
 
     /// Every delivery of an event.
-    pub fn events(&self) -> Vec<Post> {
+    pub(crate) fn events(&self) -> Vec<Post> {
         self.posts()
             .into_iter()
             .filter(|p| !p.is_verification())
@@ -265,7 +266,7 @@ impl Receiver {
     }
 
     /// Waits up to `within` for at least `n` deliveries of events.
-    pub async fn wait_events(&self, n: usize, within: Duration) -> Vec<Post> {
+    pub(crate) async fn wait_events(&self, n: usize, within: Duration) -> Vec<Post> {
         let end = tokio::time::Instant::now() + within;
         loop {
             let heard = self.heard.notified();
@@ -289,7 +290,7 @@ impl Receiver {
     }
 
     /// Waits up to `within` for a delivery that `matches`.
-    pub async fn wait_for(&self, within: Duration, matches: impl Fn(&Post) -> bool) -> Post {
+    pub(crate) async fn wait_for(&self, within: Duration, matches: impl Fn(&Post) -> bool) -> Post {
         let end = tokio::time::Instant::now() + within;
         loop {
             let heard = self.heard.notified();

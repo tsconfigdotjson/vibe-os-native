@@ -34,8 +34,7 @@ use rmcp::model::ErrorCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use tokio::sync::{Notify, Semaphore};
-use tokio_util::sync::CancellationToken;
+use tokio::sync::{Notify, Semaphore, watch};
 use vibe_core::keys::{hex, hmac_sha256, same_secret};
 
 use crate::Caller;
@@ -334,7 +333,8 @@ pub struct Webhooks {
     wake: Notify,
     owners: OnceLock<Arc<dyn Owners>>,
     sending: Semaphore,
-    stop: CancellationToken,
+    /// Set once delivery stops.
+    stop: watch::Sender<bool>,
 }
 
 impl fmt::Debug for Webhooks {
@@ -361,7 +361,7 @@ impl Webhooks {
             wake: Notify::new(),
             owners: OnceLock::new(),
             sending: Semaphore::new(SENDING_AT_ONCE),
-            stop: CancellationToken::new(),
+            stop: watch::Sender::new(false),
         })
     }
 
@@ -387,7 +387,12 @@ impl Webhooks {
 
     /// Stops delivering, as when the daemon stops: nothing more is posted.
     pub fn stop(&self) {
-        self.stop.cancel();
+        self.stop.send_replace(true);
+    }
+
+    /// Resolves once delivery stops.
+    async fn stopped(&self) {
+        let _ = self.stop.subscribe().wait_for(|s| *s).await;
     }
 
     fn log(&self, line: &str) {
@@ -774,7 +779,7 @@ impl Webhooks {
         loop {
             self.scan();
             tokio::select! {
-                () = self.stop.cancelled() => return,
+                () = self.stopped() => return,
                 changed = newest.changed() => if changed.is_err() { return },
                 () = self.wake.notified() => {}
                 changed = keys.changed() => if changed.is_ok() {
@@ -798,8 +803,8 @@ impl Webhooks {
                 }
                 let filter = self.relayed(&sub.kept.owner, &sub.filter);
                 loop {
-                    let read = self.hub.read(sub.scanned, &filter, 256, None);
-                    for o in read.events() {
+                    let read = self.hub.read(sub.scanned, &filter, 256);
+                    for o in &read.events {
                         if sub.pending.len() >= MAX_PENDING {
                             dropped.push(sub.kept.owner_name.clone());
                             continue;
@@ -871,14 +876,14 @@ impl Webhooks {
         for attempt in 0..tries {
             if attempt > 0 {
                 tokio::select! {
-                    () = self.stop.cancelled() => break,
+                    () = self.stopped() => break,
                     () = tokio::time::sleep(self.config.retries[attempt - 1]) => {}
                 }
             }
             let Ok(_turn) = self.sending.acquire().await else {
                 break;
             };
-            if self.stop.is_cancelled() {
+            if *self.stop.borrow() {
                 break;
             }
             // Made again for each try: its cursor may have moved on.
@@ -993,7 +998,7 @@ impl Webhooks {
 
 impl Drop for Webhooks {
     fn drop(&mut self) {
-        self.stop.cancel();
+        self.stop.send_replace(true);
     }
 }
 

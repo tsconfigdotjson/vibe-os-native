@@ -1053,14 +1053,12 @@ pub struct TunnelAdmitted {
 }
 
 /// What [`TUNNEL_EVENTS`] answers with before its events: each agent's state now.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TunnelEvents {
     pub agents: Vec<TunnelAgentState>,
     /// How each other host's link to the Mac stands now, as a `host.link` event says.
-    #[serde(default)]
     pub links: Vec<TunnelLinkState>,
     /// Which of the request's grants the Mac takes, in its order.
-    #[serde(default)]
     pub admitted: Vec<bool>,
 }
 

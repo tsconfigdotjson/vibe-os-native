@@ -2417,8 +2417,9 @@ async fn one_ingress_delivers_every_hosts_events_by_webhook() {
     // The Mac's own hub hears the Linux hosts linked to it.
     let everything = vibe_mcp::events::Filter::default();
     let on_mac_hub: Vec<String> = mac_hub
-        .read(0, &everything, 1000, None)
-        .events()
+        .read(0, &everything, 1000)
+        .events
+        .iter()
         .filter(|o| o.name == vibe_mcp::events::Name::Started)
         .map(|o| format!("{}:{}", o.host, o.agent))
         .collect();

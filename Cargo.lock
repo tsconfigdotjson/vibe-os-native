@@ -1331,7 +1331,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-rustls",
- "tokio-util",
  "tower-service",
  "vibe-core",
  "vibe-status",

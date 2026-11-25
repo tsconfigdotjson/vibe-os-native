@@ -191,9 +191,6 @@ pub struct Occurrence {
     pub name: Name,
     /// When it happened, as its host said.
     pub timestamp: String,
-    /// When the hub heard of it, in milliseconds since the epoch, for
-    /// `maxAgeMs`.
-    pub heard_ms: u64,
     pub host: String,
     pub agent: String,
     pub project: Option<String>,
@@ -245,34 +242,12 @@ impl Entry {
     }
 }
 
-/// What a read of the ring gives, in order.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Item {
-    Event(Occurrence),
-    /// Events may have been missed up to here: delivery resumes from this
-    /// position.
-    Gap(u64),
-}
-
 /// A read: what came after a position, and the position after it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Read {
-    pub items: Vec<Item>,
+    pub events: Vec<Occurrence>,
     pub cursor: u64,
     pub has_more: bool,
-}
-
-impl Read {
-    pub fn truncated(&self) -> bool {
-        self.items.iter().any(|i| matches!(i, Item::Gap(_)))
-    }
-
-    pub fn events(&self) -> impl Iterator<Item = &Occurrence> {
-        self.items.iter().filter_map(|i| match i {
-            Item::Event(o) => Some(o),
-            Item::Gap(_) => None,
-        })
-    }
 }
 
 #[derive(Debug, Default)]
@@ -405,13 +380,7 @@ impl Hub {
             .insert(host.to_owned(), state.to_owned());
     }
 
-    /// Counts the times the API keys changed.
-    pub fn key_epoch(&self) -> u64 {
-        *self.keys.borrow()
-    }
-
     fn take_in(&self, e: &Event, relayed: bool) {
-        let heard_ms = now_ms();
         let mut inner = lock(&self.inner);
         let before = inner.last;
         let occurrence = |seq, name, state: Option<String>, previous| {
@@ -419,7 +388,6 @@ impl Hub {
                 seq,
                 name,
                 timestamp: e.at.clone(),
-                heard_ms,
                 host: e.host.clone(),
                 agent: e.agent.clone().unwrap_or_default(),
                 project: e.project.clone(),
@@ -536,11 +504,6 @@ impl Hub {
         position(&self.boot, seq)
     }
 
-    /// The last position, as a cursor.
-    pub fn cursor_now(&self) -> String {
-        self.cursor(self.last())
-    }
-
     /// The last position, as it changes.
     pub fn watch_newest(&self) -> watch::Receiver<u64> {
         self.newest.subscribe()
@@ -588,51 +551,23 @@ impl Hub {
     }
 
     /// What `filter` lets through after position `after`, up to `max`
-    /// events, leaving out those heard before `floor_ms`. A gap that may
-    /// hold one of `filter`'s is an [`Item::Gap`]; so is the ring having
-    /// moved on past `after`, and an event left out for its age.
-    pub fn read(&self, after: u64, filter: &Filter, max: usize, floor_ms: Option<u64>) -> Read {
+    /// events: from what the ring still holds, if it's moved on past
+    /// `after`. What may have been missed is [`Hub::gap_after`]'s to say.
+    pub fn read(&self, after: u64, filter: &Filter, max: usize) -> Read {
         let inner = lock(&self.inner);
-        let mut items = Vec::new();
-        let mut cursor = after;
-        let held_from = inner.floor();
-        if after < held_from {
-            items.push(Item::Gap(held_from));
-            cursor = held_from;
-        }
-        let mut count = 0;
+        let start = after.max(inner.floor());
+        let mut events = Vec::new();
+        let mut cursor = start;
         let mut has_more = false;
-        let start = cursor;
         for entry in inner.ring.iter().filter(|e| e.seq() > start) {
-            match entry {
-                Entry::Gap { seq, host, relayed } => {
-                    if (!relayed || filter.relayed)
-                        && host.as_deref().is_none_or(|h| filter.may_include_host(h))
-                    {
-                        // Gaps one after another are one gap.
-                        if let Some(Item::Gap(last)) = items.last_mut() {
-                            *last = *seq;
-                        } else {
-                            items.push(Item::Gap(*seq));
-                        }
-                    }
+            if let Entry::Event(o) = entry
+                && filter.matches(o)
+            {
+                if events.len() == max {
+                    has_more = true;
+                    break;
                 }
-                Entry::Event(o) if filter.matches(o) => {
-                    if floor_ms.is_some_and(|f| o.heard_ms < f) {
-                        if let Some(Item::Gap(last)) = items.last_mut() {
-                            *last = o.seq;
-                        } else {
-                            items.push(Item::Gap(o.seq));
-                        }
-                    } else if count == max {
-                        has_more = true;
-                        break;
-                    } else {
-                        items.push(Item::Event(o.clone()));
-                        count += 1;
-                    }
-                }
-                Entry::Event(_) => {}
+                events.push(o.clone());
             }
             cursor = entry.seq();
         }
@@ -640,7 +575,7 @@ impl Hub {
             cursor = inner.last.max(cursor);
         }
         Read {
-            items,
+            events,
             cursor,
             has_more,
         }
@@ -918,7 +853,8 @@ mod tests {
     }
 
     fn names(r: &Read) -> Vec<(&'static str, String, Option<String>)> {
-        r.events()
+        r.events
+            .iter()
             .map(|o| {
                 (
                     o.name.as_str(),
@@ -950,7 +886,7 @@ mod tests {
         hub.ingest(&event(EventKind::AgentState, "local", "a", Some("busy")));
         hub.ingest(&event(EventKind::AgentState, "vps", "b", Some("idle")));
         hub.ingest(&event(EventKind::AgentDeleted, "local", "a", None));
-        let r = hub.read(0, &all(), 100, None);
+        let r = hub.read(0, &all(), 100);
         assert_eq!(
             names(&r),
             [
@@ -963,7 +899,8 @@ mod tests {
             ]
         );
         let previous: Vec<Option<String>> = r
-            .events()
+            .events
+            .iter()
             .filter(|o| o.name == Name::StateChanged)
             .map(|o| o.previous.clone())
             .collect();
@@ -971,13 +908,13 @@ mod tests {
             previous,
             [Some("busy".into()), Some("question".into()), None]
         );
-        assert!(!r.truncated() && !r.has_more);
+        assert!(!r.has_more && !hub.gap_after(0, &all()));
         assert_eq!(r.cursor, 6);
         // Seeded, a first change has its previous, and ends a turn.
         let hub = Hub::new();
         hub.seed("vps", "b", AgentState::Busy);
         hub.ingest(&event(EventKind::AgentState, "vps", "b", Some("idle")));
-        let r = hub.read(0, &all(), 100, None);
+        let r = hub.read(0, &all(), 100);
         assert_eq!(
             names(&r),
             [
@@ -985,7 +922,7 @@ mod tests {
                 ("agent.turn_ended", "vps:b".into(), Some("idle".into())),
             ]
         );
-        assert_eq!(r.events().next().unwrap().previous.as_deref(), Some("busy"));
+        assert_eq!(r.events.first().unwrap().previous.as_deref(), Some("busy"));
     }
 
     #[test]
@@ -1000,7 +937,7 @@ mod tests {
             hub.ingest(&event(EventKind::AgentState, host, agent, Some(state)));
         }
         let f = |args: Value| Filter::parse(Name::StateChanged, Some(&args)).unwrap();
-        let count = |f: &Filter| hub.read(0, f, 100, None).events().count();
+        let count = |f: &Filter| hub.read(0, f, 100).events.len();
         assert_eq!(count(&f(json!({}))), 4);
         assert_eq!(count(&f(json!({"host": "vps"}))), 2);
         assert_eq!(count(&f(json!({"agents": "a"}))), 3);
@@ -1034,17 +971,17 @@ mod tests {
         let hub = Hub::new();
         let (start, reset) = hub.resolve(None).unwrap();
         assert_eq!((start, reset), (0, false));
-        let now = hub.cursor_now();
+        let now = hub.cursor(hub.last());
         assert_eq!(hub.resolve(Some(&now)).unwrap(), (0, false));
         hub.ingest(&event(EventKind::AgentState, "local", "a", Some("idle")));
         hub.ingest(&event(EventKind::AgentState, "local", "b", Some("idle")));
-        let r = hub.read(0, &all(), 1, None);
-        assert_eq!((r.events().count(), r.cursor, r.has_more), (1, 1, true));
-        let r = hub.read(r.cursor, &all(), 1, None);
-        assert_eq!((r.events().count(), r.cursor, r.has_more), (1, 2, false));
+        let r = hub.read(0, &all(), 1);
+        assert_eq!((r.events.len(), r.cursor, r.has_more), (1, 1, true));
+        let r = hub.read(r.cursor, &all(), 1);
+        assert_eq!((r.events.len(), r.cursor, r.has_more), (1, 2, false));
         // Nothing of a filter's, and the cursor still moves on.
         let none = Filter::parse(Name::Deleted, None).unwrap();
-        assert_eq!(hub.read(0, &none, 10, None).cursor, 2);
+        assert_eq!(hub.read(0, &none, 10).cursor, 2);
         // An earlier vibed's cursor starts again from now, truncated.
         assert_eq!(hub.resolve(Some("0123456789ab-1")).unwrap(), (2, true));
         for bad in ["", "x", "nope-x", &format!("{}-3", hub.boot)] {
@@ -1066,23 +1003,21 @@ mod tests {
         hub.ingest(&link("down"));
         hub.ingest(&event(EventKind::AgentState, "local", "a", Some("idle")));
         hub.ingest(&link("connected"));
-        let r = hub.read(0, &all(), 10, None);
-        assert_eq!(
-            r.items.iter().filter(|i| matches!(i, Item::Gap(_))).count(),
-            2
-        );
-        assert!(matches!(r.items.last(), Some(Item::Gap(3))));
+        // The first coming up (1), and coming back up (3) after the event (2).
+        assert_eq!(hub.last(), 3);
+        assert!(hub.gap_after(0, &all()));
+        assert!(hub.gap_after(2, &all()));
+        assert!(!hub.gap_after(3, &all()));
         // Only this host's agents can't have missed anything.
         let here = Filter::parse(Name::StateChanged, Some(&json!({"host": "local"}))).unwrap();
-        assert!(!hub.read(0, &here, 10, None).truncated());
+        assert!(!hub.gap_after(0, &here));
         let named = Filter::parse(Name::StateChanged, Some(&json!({"agents": "local:a"}))).unwrap();
-        assert!(!hub.read(0, &named, 10, None).truncated());
+        assert!(!hub.gap_after(0, &named));
         let bare = Filter::parse(Name::StateChanged, Some(&json!({"agents": "a"}))).unwrap();
-        assert!(hub.read(0, &bare, 10, None).truncated());
+        assert!(hub.gap_after(0, &bare));
         // The hub's own feed falling behind touches every one.
         hub.lagged();
-        let r = hub.read(3, &here, 10, None);
-        assert_eq!(r.items, [Item::Gap(4)]);
+        assert!(hub.gap_after(3, &here));
     }
 
     #[test]
@@ -1095,34 +1030,15 @@ mod tests {
         let last = lock(&hub.inner).last;
         // Every other change ends a turn, so there are more entries than changes.
         assert_eq!(lock(&hub.inner).ring.len(), RING);
-        let r = hub.read(0, &all(), 1, None);
-        assert_eq!(r.items[0], Item::Gap(last - RING as u64));
-        assert!(r.truncated());
-        let r = hub.read(last - 1, &all(), 10, None);
-        assert!(!r.truncated() && r.events().count() == 1);
-    }
-
-    #[test]
-    fn max_age_leaves_out_what_is_too_old() {
-        let hub = Hub::new();
-        hub.ingest(&event(EventKind::AgentState, "local", "a", Some("idle")));
-        lock(&hub.inner).ring.iter_mut().for_each(|e| {
-            if let Entry::Event(o) = e {
-                o.heard_ms -= 60_000;
-            }
-        });
-        hub.ingest(&event(EventKind::AgentState, "local", "b", Some("idle")));
-        let floor = now_ms() - 30_000;
-        let r = hub.read(0, &all(), 10, Some(floor));
-        assert_eq!(r.items.len(), 2);
-        assert_eq!(r.items[0], Item::Gap(1));
+        let r = hub.read(0, &all(), 1);
         assert_eq!(
-            names(&r),
-            [("agent.state_changed", "b".into(), Some("idle".into()))]
+            r.events[0].seq,
+            last - RING as u64 + 1,
+            "from what it holds"
         );
-        // One that isn't the filter's is no loss.
-        let only_b = Filter::parse(Name::StateChanged, Some(&json!({"agents": "b"}))).unwrap();
-        assert!(!hub.read(0, &only_b, 10, Some(floor)).truncated());
+        assert!(hub.gap_after(0, &all()));
+        let r = hub.read(last - 1, &all(), 10);
+        assert!(!hub.gap_after(last - 1, &all()) && r.events.len() == 1);
     }
 
     #[test]
@@ -1231,7 +1147,7 @@ mod tests {
         hub.ingest_relayed(&event(EventKind::AgentAdded, "edge", "e", Some("busy")));
         // Nothing relayed is ever this host's own.
         hub.ingest_relayed(&event(EventKind::AgentAdded, "local", "x", Some("busy")));
-        let r = hub.read(0, &heard, 100, None);
+        let r = hub.read(0, &heard, 100);
         assert_eq!(
             names(&r),
             [
@@ -1242,17 +1158,17 @@ mod tests {
             ]
         );
         assert!(
-            r.truncated(),
+            hub.gap_after(0, &heard),
             "the relay's start is a gap to those who hear it"
         );
-        assert_eq!(r.events().nth(1).unwrap().previous.as_deref(), Some("busy"));
+        assert_eq!(r.events.get(1).unwrap().previous.as_deref(), Some("busy"));
         // A caller the relaying daemon doesn't take hears none of it, gaps included.
-        let r = hub.read(0, &all(), 100, None);
+        let r = hub.read(0, &all(), 100);
         assert_eq!(
             names(&r),
             [("agent.started", "a".into(), Some("busy".into()))]
         );
-        assert!(!r.truncated());
+        assert!(!hub.gap_after(0, &all()));
         assert_eq!(r.cursor, 5);
         // A host the relay reaches coming back is a gap for that host alone.
         let at = r.cursor;
@@ -1267,8 +1183,8 @@ mod tests {
             host: Some("mac".into()),
             ..heard.clone()
         };
-        assert!(hub.read(at, &edge_only, 100, None).truncated());
-        assert!(!hub.read(at, &mac_only, 100, None).truncated());
-        assert!(!hub.read(at, &all(), 100, None).truncated());
+        assert!(hub.gap_after(at, &edge_only));
+        assert!(!hub.gap_after(at, &mac_only));
+        assert!(!hub.gap_after(at, &all()));
     }
 }
