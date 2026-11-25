@@ -11,19 +11,18 @@
 //! echo. Each event is posted alone, retried with backoff on failure (never
 //! on 410 or 413), and given up after the last try.
 //!
-//! Subscriptions are kept in a private file, so they outlast a restart for
-//! the lifetime granted ([`Config::max_ttl`] at most). A key that's revoked
-//! ends its subscriptions; one that expires ends without being refreshed.
+//! Subscriptions live in memory only, for the lifetime granted
+//! ([`Config::max_ttl`] at most), and a restart ends them all. The client's
+//! next refresh makes its subscription again: the same id, its URL verified
+//! again, and `truncated: true`, since its cursor is from a process that's
+//! gone. A key that's revoked ends its subscriptions; one that expires ends
+//! without being refreshed.
 //!
 //! Every subscription reads the [`Hub`]: its cursor is a position there, and
 //! a gap since the cursor a client refreshes with is `truncated: true`.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
-use std::fs;
-use std::io::Write as _;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -31,7 +30,6 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use rmcp::ErrorData;
 use rmcp::model::ErrorCode;
-use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Notify, Semaphore, watch};
@@ -55,9 +53,6 @@ const MAX_PENDING: usize = 1024;
 /// How many deliveries are under way at once, across every subscription.
 const SENDING_AT_ONCE: usize = 16;
 
-/// The file's shape.
-const VERSION: u32 = 1;
-
 /// What a subscription's owner may do, as the daemon says.
 pub trait Owners: Send + Sync + 'static {
     /// Whether the key with this hash is still one.
@@ -72,11 +67,9 @@ pub trait Owners: Send + Sync + 'static {
     fn log(&self, line: &str);
 }
 
-/// How subscriptions are granted, kept and delivered.
+/// How subscriptions are granted and delivered.
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// Where they're kept; `None` keeps them in memory only.
-    pub path: Option<PathBuf>,
     pub policy: Policy,
     /// The waits between tries at a delivery: one more try than waits.
     pub retries: Vec<Duration>,
@@ -100,7 +93,6 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
-            path: None,
             policy: Policy::default(),
             // Five tries over about ten minutes.
             retries: vec![
@@ -209,44 +201,24 @@ pub fn sign(secrets: &[String], id: &str, timestamp: u64, body: &[u8]) -> String
         .join(" ")
 }
 
-/// A subscription as it's kept.
-#[derive(Clone, Serialize, Deserialize)]
-struct Kept {
+/// What a subscription is, as it was asked for.
+struct Terms {
     id: String,
     /// Its key's hash.
     owner: String,
     /// Its key's name, for the log.
     owner_name: String,
-    name: String,
-    arguments: Value,
     url: String,
     secret: String,
     /// The secret it replaced, and until when that still signs.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     old_secret: Option<String>,
-    #[serde(default)]
     old_until_ms: u64,
     expires_ms: u64,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-struct KeptVerified {
-    owner: String,
-    url: String,
-    until_ms: u64,
-}
-
-#[derive(Serialize, Deserialize)]
-struct KeptFile {
-    version: u32,
-    subscriptions: Vec<Kept>,
-    #[serde(default)]
-    verified: Vec<KeptVerified>,
-}
-
 /// A subscription.
 struct Sub {
-    kept: Kept,
+    terms: Terms,
     name: Name,
     filter: Filter,
     /// The hub's position it's been read to.
@@ -273,9 +245,9 @@ impl Sub {
     }
 
     fn secrets(&self, now: u64) -> Vec<String> {
-        let mut out = vec![self.kept.secret.clone()];
-        if let Some(old) = &self.kept.old_secret
-            && self.kept.old_until_ms > now
+        let mut out = vec![self.terms.secret.clone()];
+        if let Some(old) = &self.terms.old_secret
+            && self.terms.old_until_ms > now
         {
             out.push(old.clone());
         }
@@ -290,13 +262,11 @@ struct State {
     verified: HashMap<(String, String), u64>,
     /// The owners last said to [`Owners::owners_changed`].
     owners: Option<Vec<String>>,
-    /// What loading said, for the log once there is one.
-    notes: Vec<String>,
 }
 
 impl State {
     fn owners(&self) -> Vec<String> {
-        let set: BTreeSet<&String> = self.subs.values().map(|s| &s.kept.owner).collect();
+        let set: BTreeSet<&String> = self.subs.values().map(|s| &s.terms.owner).collect();
         set.into_iter().cloned().collect()
     }
 }
@@ -307,7 +277,6 @@ pub struct Subscribe {
     owner_name: String,
     name: Name,
     filter: Filter,
-    arguments: Value,
     url: String,
     secret: String,
     cursor: Option<String>,
@@ -329,7 +298,6 @@ pub struct Webhooks {
     hub: Arc<Hub>,
     config: Config,
     state: Mutex<State>,
-    saving: Mutex<()>,
     wake: Notify,
     owners: OnceLock<Arc<dyn Owners>>,
     sending: Semaphore,
@@ -346,18 +314,13 @@ impl fmt::Debug for Webhooks {
 }
 
 impl Webhooks {
-    /// Subscriptions as they're kept at [`Config::path`], read from `hub`.
-    /// Nothing's delivered before [`Webhooks::start`].
+    /// No subscriptions yet, read from `hub` once there are. Nothing's
+    /// delivered before [`Webhooks::start`].
     pub fn new(hub: Arc<Hub>, config: Config) -> Arc<Webhooks> {
-        let mut state = State::default();
-        if let Some(path) = &config.path {
-            load(path, &hub, &mut state);
-        }
         Arc::new(Webhooks {
             hub,
             config,
-            state: Mutex::new(state),
-            saving: Mutex::new(()),
+            state: Mutex::new(State::default()),
             wake: Notify::new(),
             owners: OnceLock::new(),
             sending: Semaphore::new(SENDING_AT_ONCE),
@@ -377,10 +340,6 @@ impl Webhooks {
     pub fn start(self: &Arc<Self>, owners: Arc<dyn Owners>) {
         if self.owners.set(owners).is_err() {
             return;
-        }
-        let notes = std::mem::take(&mut lock(&self.state).notes);
-        for n in notes {
-            self.log(&n);
         }
         tokio::spawn(Arc::clone(self).run());
     }
@@ -484,7 +443,6 @@ impl Webhooks {
             owner_name: caller.name().to_owned(),
             name,
             filter,
-            arguments,
             url: url.to_owned(),
             secret: secret.to_owned(),
             cursor,
@@ -497,7 +455,11 @@ impl Webhooks {
         if st.subs.contains_key(&s.id) {
             return Ok(());
         }
-        let theirs = st.subs.values().filter(|x| x.kept.owner == s.owner).count();
+        let theirs = st
+            .subs
+            .values()
+            .filter(|x| x.terms.owner == s.owner)
+            .count();
         let (limit, max) = if theirs >= self.config.max_per_owner {
             ("subscriptionsPerKey", self.config.max_per_owner)
         } else if st.subs.len() >= self.config.max_total {
@@ -558,11 +520,11 @@ impl Webhooks {
         let (watermark, truncated, status) = if let Some(sub) = st.subs.get_mut(&s.id) {
             // Live: the cursor goes on as it was. Anything missed since the
             // client's says so.
-            if sub.kept.secret != s.secret {
-                sub.kept.old_secret = Some(std::mem::replace(&mut sub.kept.secret, s.secret));
-                sub.kept.old_until_ms = now + self.config.rotation.as_millis() as u64;
+            if sub.terms.secret != s.secret {
+                sub.terms.old_secret = Some(std::mem::replace(&mut sub.terms.secret, s.secret));
+                sub.terms.old_until_ms = now + self.config.rotation.as_millis() as u64;
             }
-            sub.kept.expires_ms = expires_ms;
+            sub.terms.expires_ms = expires_ms;
             let truncated = match resolved {
                 Some((_, true)) => true,
                 Some((after, false)) => self.hub.gap_after(after, &filter),
@@ -585,12 +547,10 @@ impl Webhooks {
             st.subs.insert(
                 s.id.clone(),
                 Sub {
-                    kept: Kept {
+                    terms: Terms {
                         id: s.id.clone(),
                         owner: s.owner.clone(),
                         owner_name: s.owner_name.clone(),
-                        name: s.name.as_str().to_owned(),
-                        arguments: s.arguments.clone(),
                         url: s.url.clone(),
                         secret: s.secret,
                         old_secret: None,
@@ -667,9 +627,8 @@ impl Webhooks {
         Ok(json!({"resultType": "complete"}))
     }
 
-    /// After subscriptions changed: kept, read, and their owners said.
+    /// After subscriptions changed: read, and their owners said.
     fn changed(&self) {
-        self.save();
         self.wake.notify_one();
         let owners = {
             let mut st = lock(&self.state);
@@ -683,38 +642,6 @@ impl Webhooks {
         };
         if let (Some(owners), Some(o)) = (owners, self.owners.get()) {
             o.owners_changed(&owners);
-        }
-    }
-
-    fn save(&self) {
-        let Some(path) = &self.config.path else {
-            return;
-        };
-        let _one_at_a_time = lock(&self.saving);
-        let file = {
-            let st = lock(&self.state);
-            let mut subscriptions: Vec<Kept> = st.subs.values().map(|s| s.kept.clone()).collect();
-            subscriptions.sort_by(|a, b| a.id.cmp(&b.id));
-            KeptFile {
-                version: VERSION,
-                subscriptions,
-                verified: st
-                    .verified
-                    .iter()
-                    .map(|((owner, url), until)| KeptVerified {
-                        owner: owner.clone(),
-                        url: url.clone(),
-                        until_ms: *until,
-                    })
-                    .collect(),
-            }
-        };
-        let bytes = serde_json::to_vec_pretty(&file).expect("subscriptions serialize");
-        if let Err(e) = write_private(path, &bytes) {
-            self.log(&format!(
-                "mcp: can't keep the webhook subscriptions in {}: {e}",
-                path.display()
-            ));
         }
     }
 
@@ -798,19 +725,19 @@ impl Webhooks {
             let mut st = lock(&self.state);
             let now = now_ms();
             for sub in st.subs.values_mut() {
-                if sub.kept.expires_ms <= now {
+                if sub.terms.expires_ms <= now {
                     continue;
                 }
-                let filter = self.relayed(&sub.kept.owner, &sub.filter);
+                let filter = self.relayed(&sub.terms.owner, &sub.filter);
                 loop {
                     let read = self.hub.read(sub.scanned, &filter, 256);
                     for o in &read.events {
                         if sub.pending.len() >= MAX_PENDING {
-                            dropped.push(sub.kept.owner_name.clone());
+                            dropped.push(sub.terms.owner_name.clone());
                             continue;
                         }
                         sub.pending.insert(o.seq);
-                        sends.push((sub.kept.id.clone(), o.clone()));
+                        sends.push((sub.terms.id.clone(), o.clone()));
                     }
                     sub.scanned = read.cursor;
                     if !read.has_more {
@@ -834,7 +761,7 @@ impl Webhooks {
         let st = lock(&self.state);
         let sub = st.subs.get(id)?;
         let now = now_ms();
-        if sub.kept.expires_ms <= now {
+        if sub.terms.expires_ms <= now {
             return None;
         }
         let event_id = format!(
@@ -853,7 +780,7 @@ impl Webhooks {
         if body.len() > MAX_BODY {
             return None;
         }
-        Some((sub.kept.url.clone(), sub.secrets(now), event_id, body))
+        Some((sub.terms.url.clone(), sub.secrets(now), event_id, body))
     }
 
     fn note(&self, id: &str, outcome: Result<(), Failure>) {
@@ -900,7 +827,7 @@ impl Webhooks {
                     let name = lock(&self.state)
                         .subs
                         .get(&id)
-                        .map(|s| s.kept.owner_name.clone());
+                        .map(|s| s.terms.owner_name.clone());
                     if let Some(name) = name {
                         self.log(&format!(
                             "mcp: gave up delivering an event to key {name:?}'s webhook at {} after {tries} tries",
@@ -920,23 +847,19 @@ impl Webhooks {
     fn sweep(&self) {
         let now = now_ms();
         let mut gone = Vec::new();
-        let mut changed = false;
         {
             let mut st = lock(&self.state);
             st.subs.retain(|_, s| {
-                let keep = s.kept.expires_ms > now;
+                let keep = s.terms.expires_ms > now;
                 if !keep {
-                    gone.push((s.kept.owner_name.clone(), s.kept.name.clone()));
+                    gone.push((s.terms.owner_name.clone(), s.name.as_str()));
                 }
                 keep
             });
-            let before = st.verified.len();
             st.verified.retain(|_, until| *until > now);
-            changed |= st.verified.len() != before;
             for s in st.subs.values_mut() {
-                if s.kept.old_secret.is_some() && s.kept.old_until_ms <= now {
-                    s.kept.old_secret = None;
-                    changed = true;
+                if s.terms.old_until_ms <= now {
+                    s.terms.old_secret = None;
                 }
             }
         }
@@ -945,7 +868,7 @@ impl Webhooks {
                 "mcp: key {owner:?}'s webhook subscription to {name} expired"
             ));
         }
-        if changed || !gone.is_empty() {
+        if !gone.is_empty() {
             self.changed();
         }
     }
@@ -977,9 +900,9 @@ impl Webhooks {
         }
         let mut ended: HashMap<String, usize> = HashMap::new();
         lock(&self.state).subs.retain(|_, s| {
-            let keep = !gone.contains(&s.kept.owner);
+            let keep = !gone.contains(&s.terms.owner);
             if !keep {
-                *ended.entry(s.kept.owner_name.clone()).or_default() += 1;
+                *ended.entry(s.terms.owner_name.clone()).or_default() += 1;
             }
             keep
         });
@@ -1008,87 +931,6 @@ fn url_host(url: &str) -> String {
         .ok()
         .and_then(|u| u.host().map(str::to_owned))
         .unwrap_or_else(|| "?".into())
-}
-
-/// Reads what was kept at `path` into `state`.
-fn load(path: &Path, hub: &Hub, state: &mut State) {
-    let bytes = match fs::read(path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
-        Err(e) => {
-            state.notes.push(format!(
-                "mcp: can't read the webhook subscriptions in {}: {e}",
-                path.display()
-            ));
-            return;
-        }
-    };
-    if let Ok(meta) = fs::metadata(path)
-        && meta.permissions().mode() & 0o077 != 0
-    {
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
-        state.notes.push(format!(
-            "mcp: {} was open to other users: it's only its owner's now",
-            path.display()
-        ));
-    }
-    let file: KeptFile = match serde_json::from_slice(&bytes) {
-        Ok(f) => f,
-        Err(_) => {
-            state.notes.push(format!(
-                "mcp: the webhook subscriptions in {} make no sense: starting with none",
-                path.display()
-            ));
-            return;
-        }
-    };
-    let now = now_ms();
-    for kept in file.subscriptions {
-        if kept.expires_ms <= now {
-            continue;
-        }
-        let Some(name) = Name::parse(&kept.name) else {
-            continue;
-        };
-        let Ok(filter) = Filter::parse(name, Some(&kept.arguments)) else {
-            continue;
-        };
-        state.subs.insert(
-            kept.id.clone(),
-            Sub {
-                kept,
-                name,
-                filter,
-                scanned: hub.last(),
-                pending: BTreeSet::new(),
-                last_delivery_ms: None,
-                last_error: None,
-            },
-        );
-    }
-    for v in file.verified {
-        if v.until_ms > now {
-            state.verified.insert((v.owner, v.url), v.until_ms);
-        }
-    }
-}
-
-/// Replaces `path` whole with `bytes`, readable by its owner alone.
-pub fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
-    }
-    let tmp = path.with_extension("tmp");
-    let _ = fs::remove_file(&tmp);
-    let mut f = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&tmp)?;
-    f.write_all(bytes)?;
-    f.sync_all()?;
-    drop(f);
-    fs::rename(&tmp, path)
 }
 
 #[cfg(test)]
@@ -1168,19 +1010,5 @@ mod tests {
             subscription_id("o", "u", "agent.started", &a),
             subscription_id("o", "u", "agent.deleted", &a)
         );
-    }
-
-    #[test]
-    fn kept_privately_and_whole() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("sub/mcp-webhooks.json");
-        write_private(&path, b"one").unwrap();
-        write_private(&path, b"two").unwrap();
-        assert_eq!(fs::read(&path).unwrap(), b"two");
-        assert_eq!(
-            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-        assert!(!path.with_extension("tmp").exists());
     }
 }

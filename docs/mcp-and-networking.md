@@ -238,16 +238,21 @@ read its answer with `vibe_read_messages` and its screen with
   addresses are refused, checked again every time it connects.
 - **Lifetimes.** 24 hours unless you ask, at least 5 minutes, at most 30
   days (also for `ttlMs: null`). Refresh before `refreshBefore`.
-  Subscriptions survive `vibed` restarting. Deleting the API key that made
-  them ends them. `events/unsubscribe` ends one at once. A key can hold 32,
-  a host 256.
+  Deleting the API key that made them ends them. `events/unsubscribe` ends
+  one at once. A key can hold 32, a host 256.
+- **Restarts.** Subscriptions live in `vibed`'s memory, so a restart ends
+  them, and nothing's delivered until you refresh. Refresh as usual (the
+  same type, arguments, URL and secret, with your last cursor): that makes
+  the subscription again, with the same id, a fresh verification and
+  `truncated: true`.
 - **Coverage.** Events cover every host the endpoint reaches. On the Mac,
   that's the Mac and its linked Linux hosts. On a Linux host, it's the host
   itself, the Mac (`mac:…`) and the other hosts linked to the Mac, while the
   Mac is online. For the Mac's, the Linux host asks the Mac for a relay grant
   when you subscribe: the Mac must take your key, as for calls, so a key made
-  on the Linux host alone hears only that host. The host keeps that grant,
-  which only reads events, never your key. A subscribe that needs it can
+  on the Linux host alone hears only that host. The host holds that grant,
+  which only reads events, in memory, never your key; after either `vibed`
+  restarts, your next refresh takes a fresh one. A subscribe that needs it can
   take up to 3 s longer.
 - **Cursors.** Each delivery carries a `cursor`. Pass the last one you have
   when you refresh. If events may have been missed since then, the answer

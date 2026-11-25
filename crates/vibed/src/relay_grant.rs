@@ -3,15 +3,12 @@
 //! Mac's events (`tunnel.grant`, then `tunnel.events`), with no caller around.
 //!
 //! A grant is `vgr1.<expires>.<key hash>.<mac>`: the hash of one of this Mac's own keys,
-//! when it runs out, and an HMAC of both under a secret only this Mac holds
-//! (`relay-grant.key`, beside `vibe.db`). It takes nothing to keep but that secret: it
-//! holds while it's unexpired and its key is still one of this Mac's, so revoking the key
-//! ends it. It opens `tunnel.events` and nothing else, so a host's disk gives up, at
-//! worst, which agents run here and how they stand, never a way to drive them.
-
-use std::fs;
-use std::io::{Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
+//! when it runs out, and an HMAC of both under a secret only this Mac holds, in memory: a
+//! restart of this `vibed` ends every grant, and a host takes a fresh one at its keys' next
+//! subscribe or refresh. A grant holds while it's unexpired and its key is still one of
+//! this Mac's, so revoking the key ends it. It opens `tunnel.events` and nothing else, so a
+//! host's memory gives up, at worst, which agents run here and how they stand, never a way
+//! to drive them.
 
 use vibe_core::keys::{hex, hmac_sha256, same_secret};
 use vibe_core::rpc::{ErrorCode, ErrorObject, TunnelGrant};
@@ -23,9 +20,6 @@ use crate::core::{Core, error};
 pub(crate) const GRANT_FOR: i64 = 60 * 24 * 3600;
 
 const PREFIX: &str = "vgr1";
-
-/// Where the secret is kept.
-const SECRET_FILE: &str = "relay-grant.key";
 
 fn mac_of(secret: &[u8], expires: i64, hash: &str) -> String {
     hex(&hmac_sha256(
@@ -56,43 +50,14 @@ impl Core {
         if let Some(s) = self.relay_grant_secret.get() {
             return Ok(*s);
         }
-        let path = self.layout.data_dir().join(SECRET_FILE);
-        let read = |path: &std::path::Path| -> std::io::Result<Option<[u8; 32]>> {
-            let mut bytes = Vec::new();
-            match fs::File::open(path) {
-                Ok(mut f) => f.read_to_end(&mut bytes)?,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-                Err(e) => return Err(e),
-            };
-            Ok(<[u8; 32]>::try_from(bytes.as_slice()).ok())
-        };
-        let fail = |e: std::io::Error| {
+        let fresh = vibe_core::keys::random_bytes().map_err(|e| {
             error(
                 ErrorCode::InternalError,
-                format!("can't keep relay grants' secret in {}: {e}", path.display()),
+                format!("can't make relay grants' secret: {e}"),
             )
-        };
-        let secret = match read(&path).map_err(fail)? {
-            Some(s) => s,
-            None => {
-                let fresh = vibe_core::keys::random_bytes().map_err(fail)?;
-                let made = fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .mode(0o600)
-                    .open(&path)
-                    .and_then(|mut f| f.write_all(&fresh).and_then(|()| f.sync_all()));
-                match made {
-                    Ok(()) => fresh,
-                    // Made just now by another call: that one's it.
-                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => read(&path)
-                        .map_err(fail)?
-                        .ok_or_else(|| fail(std::io::Error::other("it isn't 32 bytes")))?,
-                    Err(e) => return Err(fail(e)),
-                }
-            }
-        };
-        Ok(*self.relay_grant_secret.get_or_init(|| secret))
+        })?;
+        // Another call's, if it made one just now.
+        Ok(*self.relay_grant_secret.get_or_init(|| fresh))
     }
 
     /// A grant for this Mac's own key with this hash.

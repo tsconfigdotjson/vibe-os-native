@@ -549,7 +549,7 @@ pub struct Core {
     pub(crate) peer: crate::mac_peer::MacPeer,
     /// On a Linux host, the Mac's events, heard down its tunnel for MCP Events.
     pub(crate) relay: crate::mac_events::Relay,
-    /// On a Mac, what relay grants are signed with, read or made on first use.
+    /// On a Mac, what relay grants are signed with, made on first use, in memory only.
     pub(crate) relay_grant_secret: OnceLock<[u8; 32]>,
     /// On a Mac, the tunnel to each Linux host linked to it.
     pub(crate) tunnels: Mutex<HashMap<String, crate::tunnel::Tunnel>>,

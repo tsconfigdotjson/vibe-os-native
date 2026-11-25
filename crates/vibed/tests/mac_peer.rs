@@ -2294,10 +2294,11 @@ fn posted_refs(hook: &receiver::Receiver, path: &str) -> Vec<String> {
 /// it reaches, through the Mac alone, by webhook, which is what works between a client's
 /// turns: the Mac's agents (`mac:`), another host's linked to the Mac (`edge:`), and its
 /// own, narrowed by host. The Mac decides who hears its events, as it does for calls: the
-/// host keeps a relay grant it gave for the key, never the key, and a key of the host's
-/// own hears none of it. The Mac sleeping is a gap, said as `truncated` at the next
-/// refresh. A revoke on the Mac ends it all. And the Mac's own hub hears the Linux hosts
-/// linked to it.
+/// host holds a relay grant it gave for the key, in memory, never the key, and a key of
+/// the host's own hears none of it. The Mac sleeping is a gap, said as `truncated` at the
+/// next refresh. A restart of the host's vibed ends its subscriptions until the client's
+/// refresh makes them again. A revoke on the Mac ends it all. And the Mac's own hub hears
+/// the Linux hosts linked to it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn one_ingress_delivers_every_hosts_events_by_webhook() {
     use receiver::{Receiver, secret, signed_with};
@@ -2342,22 +2343,24 @@ async fn one_ingress_delivers_every_hosts_events_by_webhook() {
     let here = subscribe(&key, "agent.started", json!({"host": "local"}), "/here", 4).await;
     subscribe(&key, "agent.deleted", json!({}), "/deleted", 5).await;
     assert_eq!(hook.verifications().len(), 5);
-    // What the host keeps: the Mac's grant for the key, and never the key.
-    let data = w.host.layout().data_dir();
-    let grants = std::fs::read_to_string(data.join("mac-relay.json")).unwrap();
-    let hooks_kept = std::fs::read_to_string(data.join("mcp-webhooks.json")).unwrap();
-    assert!(grants.contains("vgr1."), "{grants}");
-    for kept in [&grants, &hooks_kept] {
-        assert!(
-            !kept.contains(&key) && !kept.contains(&own),
-            "a key was kept: {kept}"
-        );
+    // The host keeps none of it on disk: no key, no grant, no subscription.
+    let on_disk = files_under(&w.host.layout().data_dir());
+    for (path, bytes) in &on_disk {
+        let text = String::from_utf8_lossy(bytes);
+        for secret in [
+            key.as_str(),
+            own.as_str(),
+            "vgr1.",
+            "whsec_",
+            hook.url("/").as_str(),
+        ] {
+            assert!(
+                !text.contains(secret),
+                "{secret:?} is in {}",
+                path.display()
+            );
+        }
     }
-    assert_eq!(
-        grants.matches("vgr1.").count(),
-        1,
-        "none for the host's own key: {grants}"
-    );
 
     // An agent on each host, started here.
     let mut c = w.client(&key);
@@ -2524,6 +2527,60 @@ async fn one_ingress_delivers_every_hosts_events_by_webhook() {
     let gone = hook.wait_for(wait, |p| p.path == "/deleted").await;
     assert_eq!(gone.json["data"]["ref"], "mac:on-mac", "{}", gone.json);
 
+    // vibed on the host restarts. Its subscriptions and the Mac's grant were in memory
+    // alone, so they're gone, until ChatGPT refreshes with its last cursor: that makes the
+    // subscription again, with the same id, verified again, `truncated` (the cursor is
+    // from the vibed that's gone), and a fresh grant, so the Mac's events come again.
+    let last = hook
+        .events()
+        .iter()
+        .rfind(|p| p.path == "/all")
+        .unwrap()
+        .json["cursor"]
+        .clone();
+    let verified = hook.verifications().len();
+    let w = w.restart_host().await;
+    w.pushed(&key).await;
+    w.mac_reachable(&key).await;
+    assert!(w.host.webhooks().unwrap().is_empty());
+    let mut params =
+        webhook_subscription("agent.started", json!({}), &hook.url("/all"), &secret(1));
+    params["cursor"] = last.clone();
+    let remade = events_ask(w.public, &key, "events/subscribe", params)
+        .await
+        .unwrap();
+    assert_eq!(remade["id"], all["id"], "{remade}");
+    assert_eq!(remade["truncated"], true, "{remade}");
+    assert_ne!(remade["cursor"], last);
+    assert_eq!(hook.verifications().len(), verified + 1, "verified again");
+    let params = webhook_subscription("agent.started", json!({}), &hook.url("/own"), &secret(2));
+    events_ask(w.public, &own, "events/subscribe", params)
+        .await
+        .unwrap();
+    let mut c = w.client(&key);
+    for (host, profile, name) in [
+        ("mac", "software-eng-mac", "on-mac-2"),
+        ("local", "software-eng-linux", "on-vps-2"),
+    ] {
+        c.call(
+            "vibe_start_agent",
+            json!({"project": "app", "profile": profile, "prompt": "talk", "host": host,
+                   "name": name}),
+        )
+        .await;
+    }
+    for shown in ["mac:on-mac-2", "on-vps-2"] {
+        let p = hook
+            .wait_for(wait, |p| p.path == "/all" && p.json["data"]["ref"] == shown)
+            .await;
+        assert!(signed_with(&secret(1), &p), "{shown}");
+        assert_eq!(
+            p.header("x-mcp-subscription-id"),
+            all["id"].as_str().unwrap()
+        );
+    }
+    let end = w.tunnel_end();
+
     // A revoke on the Mac: the grant stops working, and the key's subscriptions here end
     // as the revoke reaches the host; the host's own key's goes on.
     w.mac
@@ -2548,6 +2605,20 @@ async fn one_ingress_delivers_every_hosts_events_by_webhook() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert_eq!(hooks.owners(), [vibe_core::keys::hash(&own)]);
+}
+
+/// Every file under `dir`, and what's in it.
+fn files_under(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(files_under(&path));
+        } else if let Ok(bytes) = std::fs::read(&path) {
+            out.push((path, bytes));
+        }
+    }
+    out
 }
 
 /// `method` down the tunnel at `end`, on a connection of its own: its answer.

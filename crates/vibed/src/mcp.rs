@@ -385,12 +385,9 @@ impl Daemon for Core {
                 }
             }
             hub.spawn_feed(rx);
-            // Kept beside vibe.db, so they outlast a restart.
-            let config = vibe_mcp::webhook::Config {
-                path: Some(self.layout.data_dir().join("mcp-webhooks.json")),
-                ..vibe_mcp::webhook::Config::default()
-            };
-            let hooks = vibe_mcp::webhook::Webhooks::new(hub, config);
+            // In memory only: a client's next refresh makes its subscription again
+            // after a restart.
+            let hooks = vibe_mcp::webhook::Webhooks::new(hub, vibe_mcp::webhook::Config::default());
             let me = self.me.get().cloned().unwrap_or_default();
             hooks.start(Arc::new(crate::mac_events::Owners(me)));
             hooks

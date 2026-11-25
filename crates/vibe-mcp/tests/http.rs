@@ -1662,9 +1662,8 @@ const EVENTS: &str = vibe_mcp::events::EXTENSION;
 const WAIT: Duration = Duration::from_secs(10);
 
 /// Webhooks that try again quickly, and let a subscription last a second.
-fn quick(path: Option<std::path::PathBuf>) -> webhook::Config {
+fn quick() -> webhook::Config {
     webhook::Config {
-        path,
         retries: vec![Duration::from_millis(50), Duration::from_millis(100)],
         timeout: Duration::from_secs(2),
         min_ttl: Duration::from_secs(1),
@@ -1793,7 +1792,7 @@ async fn events_are_advertised_where_chatgpt_looks() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_callback_is_verified_then_gets_each_event_signed() {
-    let (fake, mut c) = events_fake(quick(None)).await;
+    let (fake, mut c) = events_fake(quick()).await;
     let hook = Receiver::start().await;
     let url = hook.url("/hooks/chat-1");
     let s1 = secret(1);
@@ -1880,7 +1879,7 @@ async fn a_callback_is_verified_then_gets_each_event_signed() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_callback_that_fails_verification_says_why_and_gets_nothing() {
-    let mut config = quick(None);
+    let mut config = quick();
     config.timeout = Duration::from_millis(500);
     let (fake, mut c) = events_fake(config).await;
     let hook = Receiver::start().await;
@@ -1999,7 +1998,7 @@ async fn a_callback_that_fails_verification_says_why_and_gets_nothing() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn deliveries_are_tried_again_but_never_after_410_or_413() {
-    let (fake, mut c) = events_fake(quick(None)).await;
+    let (fake, mut c) = events_fake(quick()).await;
     let hook = Receiver::start().await;
     let s1 = secret(1);
     subscribe(
@@ -2045,7 +2044,7 @@ async fn deliveries_are_tried_again_but_never_after_410_or_413() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_subscription_lasts_what_was_granted_unless_refreshed() {
-    let (fake, mut c) = events_fake(quick(None)).await;
+    let (fake, mut c) = events_fake(quick()).await;
     let hook = Receiver::start().await;
     let url = hook.url("/h");
     let mut params = subscription("agent.state_changed", json!({}), &url, &secret(1));
@@ -2088,7 +2087,7 @@ async fn a_subscription_lasts_what_was_granted_unless_refreshed() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unsubscribing_stops_delivery_and_can_be_done_twice() {
-    let (fake, mut c) = events_fake(quick(None)).await;
+    let (fake, mut c) = events_fake(quick()).await;
     let hook = Receiver::start().await;
     let url = hook.url("/h");
     let args = json!({"agents": ["a", "vps:b"]});
@@ -2126,7 +2125,7 @@ async fn unsubscribing_stops_delivery_and_can_be_done_twice() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_deleted_key_ends_its_subscriptions() {
-    let (fake, mut c) = events_fake(quick(None)).await;
+    let (fake, mut c) = events_fake(quick()).await;
     let hook = Receiver::start().await;
     subscribe(
         &mut c,
@@ -2156,57 +2155,81 @@ async fn a_deleted_key_ends_its_subscriptions() {
     );
 }
 
+/// Subscriptions live in memory only. After a restart, the client's refresh (the same
+/// name, arguments, URL and secret, with its last cursor) makes its subscription again, as
+/// SEP-3415 has it: the same id, its URL verified again, `truncated` since the cursor is
+/// from the process that's gone, and delivery going on, what's relayed included.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn subscriptions_outlast_a_restart() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("mcp-webhooks.json");
+async fn a_refresh_after_a_restart_makes_the_subscription_again() {
     let hook = Receiver::start().await;
     let s1 = secret(1);
-    let (fake, mut c) = events_fake(quick(Some(path.clone()))).await;
-    let sub = subscribe(
-        &mut c,
-        subscription("agent.started", json!({}), &hook.url("/h"), &s1),
-    )
-    .await;
-    // Kept privately, with no key in it.
-    let kept = std::fs::read_to_string(&path).unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    assert_eq!(
-        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-        0o600
-    );
-    assert!(
-        !kept.contains(KEY) && kept.contains(&vibe_core::keys::hash(KEY)),
-        "{kept}"
-    );
-    hooks(&fake).stop();
-    // Another daemon, as after a restart: it delivers with no subscribe.
-    let (fake2, mut c2) = events_fake(quick(Some(path.clone()))).await;
-    assert_eq!(hooks(&fake2).len(), 1);
-    hooks(&fake2).hub().ingest(&core_event(
+    let (fake, mut c) = events_fake(quick()).await;
+    let params = subscription("agent.started", json!({}), &hook.url("/h"), &s1);
+    let sub = subscribe(&mut c, params.clone()).await;
+    hooks(&fake).hub().ingest(&core_event(
         EventKind::AgentAdded,
         "local",
         "a",
         Some("busy"),
     ));
-    let got = hook.wait_events(1, WAIT).await;
-    assert!(signed_with(&s1, &got[0]));
-    assert_eq!(
-        got[0].header("x-mcp-subscription-id"),
-        sub["id"].as_str().unwrap()
-    );
-    // Its refresh needs no verifying again, and says what it may have missed.
-    let mut params = subscription("agent.started", json!({}), &hook.url("/h"), &s1);
-    params["cursor"] = sub["cursor"].clone();
-    let again = subscribe(&mut c2, params).await;
+    let last = hook.wait_events(1, WAIT).await[0].json["cursor"].clone();
+    hooks(&fake).stop();
+
+    // Another daemon, as after a restart: a hub and webhooks of its own, and nothing kept.
+    let (fake2, mut c2) = events_fake(quick()).await;
+    fake2
+        .relayed
+        .lock()
+        .unwrap()
+        .insert(vibe_core::keys::hash(KEY));
+    let hub = Arc::clone(hooks(&fake2).hub());
+    assert!(hooks(&fake2).is_empty());
+    hub.ingest(&core_event(
+        EventKind::AgentAdded,
+        "local",
+        "missed",
+        Some("busy"),
+    ));
+    let mut refresh = params;
+    refresh["cursor"] = last.clone();
+    let again = subscribe(&mut c2, refresh).await;
     assert_eq!(again["id"], sub["id"]);
-    assert_eq!(again["truncated"], true);
-    assert_eq!(hook.verifications().len(), 1);
+    assert_eq!(again["truncated"], true, "{again}");
+    assert!(again.get("deliveryStatus").is_none(), "{again}");
+    assert_ne!(again["cursor"], last);
+    assert_eq!(hook.verifications().len(), 2, "verified again");
+    // The daemon heard it subscribe, as vibed takes the Mac's grant then.
+    assert_eq!(*fake2.subscribers.lock().unwrap(), ["laptop"]);
+
+    hub.ingest(&core_event(
+        EventKind::AgentAdded,
+        "local",
+        "b",
+        Some("busy"),
+    ));
+    hub.ingest_relayed(&core_event(EventKind::AgentAdded, "mac", "m", Some("busy")));
+    hook.wait_events(3, WAIT).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let got = hook.events();
+    let mut refs: Vec<&str> = got[1..]
+        .iter()
+        .map(|p| p.json["data"]["ref"].as_str().unwrap())
+        .collect();
+    refs.sort();
+    // Not what happened before the refresh, which `truncated` said.
+    assert_eq!(refs, ["b", "mac:m"]);
+    for p in &got[1..] {
+        assert!(signed_with(&s1, p));
+        assert_eq!(
+            p.header("x-mcp-subscription-id"),
+            sub["id"].as_str().unwrap()
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_new_secret_signs_beside_the_old_for_a_while() {
-    let (fake, mut c) = events_fake(quick(None)).await;
+    let (fake, mut c) = events_fake(quick()).await;
     let hook = Receiver::start().await;
     let (s1, s2) = (secret(1), secret(2));
     subscribe(
@@ -2232,7 +2255,7 @@ async fn a_new_secret_signs_beside_the_old_for_a_while() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn subscriptions_are_limited_per_key_and_all_told() {
-    let mut config = quick(None);
+    let mut config = quick();
     config.max_per_owner = 2;
     config.max_total = 3;
     let (_fake, mut c) = events_fake(config).await;
@@ -2263,7 +2286,7 @@ async fn subscriptions_are_limited_per_key_and_all_told() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cursor_picks_up_where_a_lapsed_subscription_left_off() {
-    let (fake, mut c) = events_fake(quick(None)).await;
+    let (fake, mut c) = events_fake(quick()).await;
     let hook = Receiver::start().await;
     let url = hook.url("/h");
     let params = subscription("agent.state_changed", json!({}), &url, &secret(1));
@@ -2315,7 +2338,7 @@ async fn a_cursor_picks_up_where_a_lapsed_subscription_left_off() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn what_is_relayed_reaches_only_keys_its_daemon_takes() {
-    let (fake, mut c) = events_fake(quick(None)).await;
+    let (fake, mut c) = events_fake(quick()).await;
     let hook = Receiver::start().await;
     let mut phone = Client::new(c.addr, &key2());
     phone.initialize("2025-03-26").await;

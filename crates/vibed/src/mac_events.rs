@@ -6,11 +6,13 @@
 //! The tunnel takes nothing without a caller's API key, which the Mac checks itself, and
 //! this host keeps only keys' hashes. So when a key subscribes here, its key is traded
 //! with the Mac for a relay grant (`tunnel.grant`; [`crate::relay_grant`] on the Mac),
-//! which is kept (`mac-relay.json`, its owner's alone) and the key never is: a grant opens the
-//! Mac's events and nothing else, and ends with the key. One feed down the tunnel
-//! (`tunnel.events`), on the grants of every key with a subscription here, puts the Mac's
-//! events in the hub as the Mac says them (its `local` is `mac` here; a host linked to it
-//! keeps its name), and the Mac says which grants it still takes as keys change.
+//! which is held in memory and the key never is: a grant opens the Mac's events and
+//! nothing else, and ends with the key. One feed down the tunnel (`tunnel.events`), on the
+//! grants of every key with a subscription here, puts the Mac's events in the hub as the
+//! Mac says them (its `local` is `mac` here; a host linked to it keeps its name), and the
+//! Mac says which grants it still takes as keys change. A grant it stops taking is
+//! forgotten, so the key's next subscribe or refresh takes a fresh one, as it does after
+//! a restart of either `vibed`.
 //!
 //! They're relayed in the hub ([`vibe_mcp::events::Occurrence::relayed`]), so only
 //! subscriptions whose key the Mac takes hear them: a key of this host's own gets no
@@ -20,12 +22,11 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::BufReader;
 use tokio::net::UnixStream;
@@ -38,9 +39,6 @@ use vibe_mcp::events::Hub;
 
 use crate::core::{Core, lock};
 use crate::remote::Channel;
-
-/// Where grants are kept, beside `vibe.db`.
-const GRANTS_FILE: &str = "mac-relay.json";
 
 /// A grant with less than this left is taken again at its key's next subscribe or
 /// refresh: more than the longest subscription granted (30 days).
@@ -63,10 +61,6 @@ const LOOK_EVERY: Duration = Duration::from_millis(250);
 const MIN_BACKOFF: Duration = Duration::from_millis(250);
 const MAX_BACKOFF: Duration = Duration::from_secs(10);
 
-/// How long the feed waits after the Mac took none of its grants, unless they change.
-const REFUSED_WAIT: Duration = Duration::from_secs(60);
-
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Held {
     grant: String,
     expires: i64,
@@ -80,15 +74,8 @@ impl fmt::Debug for Held {
     }
 }
 
-#[derive(Default, Serialize, Deserialize)]
-struct Kept {
-    /// By key hash.
-    grants: BTreeMap<String, Held>,
-}
-
 #[derive(Debug, Default)]
 struct Keys {
-    loaded: bool,
     /// By key hash.
     grants: BTreeMap<String, Held>,
     /// Keys with webhook subscriptions here, by hash.
@@ -129,6 +116,20 @@ impl Relay {
     fn admit(&self, owners: HashSet<String>) {
         *lock(&self.admitted) = owners;
         self.heard.send_modify(|n| *n += 1);
+    }
+
+    /// Forgets the grants of `on` the Mac said it doesn't take (`said` false, or missing),
+    /// unless one's been taken again since: the key's next subscribe or refresh takes a
+    /// fresh one.
+    fn forget(&self, on: &[(String, String)], said: &[bool]) {
+        let mut keys = lock(&self.keys);
+        for (i, (owner, grant)) in on.iter().enumerate() {
+            if !said.get(i).copied().unwrap_or(false)
+                && keys.grants.get(owner).is_some_and(|h| &h.grant == grant)
+            {
+                keys.grants.remove(owner);
+            }
+        }
     }
 
     /// The grants the feed should be on now: of keys with subscriptions, or subscribing,
@@ -225,6 +226,7 @@ async fn hear(
                         let Some(c) = core.upgrade() else {
                             return "this vibed is stopping".into();
                         };
+                        c.relay.forget(on, &a.admitted);
                         c.relay.admit(admitted(on, &a.admitted));
                     }
                     _ => {}
@@ -308,6 +310,7 @@ async fn feed(core: Weak<Core>) {
                 hub.relayed_gap();
                 let Some(c) = core.upgrade() else { return };
                 let heard = admitted(&on, &states.admitted);
+                c.relay.forget(&on, &states.admitted);
                 crate::log!(
                     "vibed: hearing the Mac's events through its tunnel, for {} key(s)",
                     heard.len()
@@ -320,19 +323,12 @@ async fn feed(core: Weak<Core>) {
                 crate::log!("vibed: stopped hearing the Mac's events: {why}");
             }
             Asked::Refused => {
-                crate::log!("vibed: the Mac takes none of the relay grants kept here");
+                // As after the Mac's vibed restarted: until each key subscribes or
+                // refreshes again, with a fresh grant.
+                crate::log!("vibed: the Mac takes none of the relay grants held here");
                 let Some(c) = core.upgrade() else { return };
+                c.relay.forget(&on, &[]);
                 c.relay.admit(HashSet::new());
-                drop(c);
-                // Until a key subscribes again, with a grant taken again.
-                let until = Instant::now() + REFUSED_WAIT;
-                while Instant::now() < until {
-                    tokio::time::sleep(LOOK_EVERY).await;
-                    let Some(c) = core.upgrade() else { return };
-                    if c.relay.wanted(c.now()) != on {
-                        break;
-                    }
-                }
             }
             Asked::Failed(why) => {
                 crate::log!("vibed: can't hear the Mac's events: {why}");
@@ -344,33 +340,6 @@ async fn feed(core: Weak<Core>) {
 }
 
 impl Core {
-    fn grants_path(&self) -> PathBuf {
-        self.layout.data_dir().join(GRANTS_FILE)
-    }
-
-    /// The grants kept, read the first time.
-    fn load_grants(&self, keys: &mut Keys) {
-        if keys.loaded {
-            return;
-        }
-        keys.loaded = true;
-        if let Ok(bytes) = std::fs::read(self.grants_path())
-            && let Ok(kept) = serde_json::from_slice::<Kept>(&bytes)
-        {
-            keys.grants = kept.grants;
-        }
-    }
-
-    fn save_grants(&self, keys: &Keys) {
-        let kept = Kept {
-            grants: keys.grants.clone(),
-        };
-        let bytes = serde_json::to_vec_pretty(&kept).expect("grants serialize");
-        if let Err(e) = vibe_mcp::webhook::write_private(&self.grants_path(), &bytes) {
-            crate::log!("vibed: can't keep the Mac's relay grants: {e}");
-        }
-    }
-
     /// Starts the feed, unless it's running.
     fn kick_feed(&self) {
         if self
@@ -393,19 +362,13 @@ impl Core {
     /// grants of keys with none go.
     pub(crate) fn relay_owners_changed(&self, owners: &[String]) {
         let mut keys = lock(&self.relay.keys);
-        self.load_grants(&mut keys);
         keys.owners = owners.iter().cloned().collect();
-        let before = keys.grants.len();
         let Keys {
             grants,
             owners,
             subscribing,
-            ..
         } = &mut *keys;
         grants.retain(|owner, _| owners.contains(owner) || subscribing.contains_key(owner));
-        if keys.grants.len() != before {
-            self.save_grants(&keys);
-        }
         let any = !keys.grants.is_empty();
         drop(keys);
         if any {
@@ -414,7 +377,7 @@ impl Core {
     }
 
     /// A key is subscribing (`events/subscribe`): on a host with a Mac that serves events,
-    /// get the Mac's grant for it, unless one's kept that has long enough left, and wait a
+    /// get the Mac's grant for it, unless one's held that has long enough left, and wait a
     /// moment for the feed to take it. A key the Mac doesn't take gets none, and hears
     /// nothing of the Mac's.
     pub(crate) async fn mac_relay_for(&self, key: &str) {
@@ -425,7 +388,6 @@ impl Core {
         let owner = vibe_core::keys::hash(key);
         let fresh = {
             let mut keys = lock(&self.relay.keys);
-            self.load_grants(&mut keys);
             keys.subscribing.insert(owner.clone(), Instant::now());
             keys.grants
                 .get(&owner)
@@ -435,22 +397,17 @@ impl Core {
             match ask(self.peer.socket(), TUNNEL_GRANT, json!({ "key": key })).await {
                 Asked::Gave((_, answer)) => {
                     if let Ok(g) = serde_json::from_value::<TunnelGrant>(answer) {
-                        let mut keys = lock(&self.relay.keys);
-                        keys.grants.insert(
+                        lock(&self.relay.keys).grants.insert(
                             owner.clone(),
                             Held {
                                 grant: g.grant,
                                 expires: g.expires,
                             },
                         );
-                        self.save_grants(&keys);
                     }
                 }
                 Asked::Refused => {
-                    let mut keys = lock(&self.relay.keys);
-                    if keys.grants.remove(&owner).is_some() {
-                        self.save_grants(&keys);
-                    }
+                    lock(&self.relay.keys).grants.remove(&owner);
                     return;
                 }
                 Asked::Failed(why) => {
@@ -539,6 +496,14 @@ mod tests {
         );
         relay.admit(admitted(&on, &[true, true]));
         assert!(relay.hears("h1") && relay.hears("h2") && !relay.hears("h3"));
+        // A grant the Mac stops taking is forgotten, unless it's been taken again since.
+        lock(&relay.keys)
+            .grants
+            .insert("h1".into(), held("g1-again", 100));
+        relay.forget(&on, &[false, false]);
+        assert_eq!(relay.wanted(50), [("h1".to_owned(), "g1-again".to_owned())]);
+        relay.forget(&relay.wanted(50), &[]);
+        assert!(relay.wanted(50).is_empty());
     }
 
     #[test]
