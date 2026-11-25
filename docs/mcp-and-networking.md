@@ -187,3 +187,83 @@ unprotected.
 | `vibe_read_output` | Reads the agent's screen and recent scrollback |
 | `vibe_send` | Sends text or keys, waking the agent first if it's asleep |
 | `vibe_delete_agent` | Ends an agent and removes what VibeOS made for it, keeping the branch. Refuses on unsaved work unless forced |
+
+## MCP events
+
+An MCP client can subscribe to what happens to agents instead of calling
+`vibe_wait` or `vibe_list_agents` over and over, and have each change posted
+to a webhook. This is MCP Events
+([SEP-3415](https://modelcontextprotocol.io/extensions/events/overview),
+`io.modelcontextprotocol/events`) as
+[ChatGPT implements it](https://developers.openai.com/plugins/build/mcp-events):
+webhook delivery with callback verification. It works between a client's
+turns, when nothing of the client is running.
+
+`initialize` and `server/discover` both advertise `capabilities.events`, and
+`events/list`, `events/subscribe` and `events/unsubscribe` work at any
+protocol version, over HTTP or `vibe mcp`.
+
+| Event | Fires when | Payload |
+| --- | --- | --- |
+| `agent.started` | An agent is started, by any client or the app | `ref`, `host`, `agent`, `project`, `state` |
+| `agent.state_changed` | An agent's state changes | the same, plus `previous` (`null` when not known) |
+| `agent.turn_ended` | An agent was `busy` and stopped: `idle` (it has answered), `question`, `asleep`, `paused` or `exited` | the same as `agent.started` |
+| `agent.deleted` | An agent is deleted | `ref`, `host`, `agent`, `project` |
+
+Each event type takes the filters `host`, `project` and `agents` (one ref or
+a list, as `vibe_wait` takes them). `agent.state_changed` and
+`agent.turn_ended` also take `state` (one state or a list). An argument the
+schema doesn't list is refused. Payloads never carry what an agent wrote:
+read its answer with `vibe_read_messages` and its screen with
+`vibe_read_output`.
+
+- **Subscribing.** `events/subscribe` takes the event type, its arguments,
+  and `delivery: {mode: "webhook", url, secret}`, where `secret` is a
+  Standard Webhooks `whsec_` secret. The first time your key uses a URL,
+  VibeOS posts it a signed `{"type": "verification", "challenge": …}`, and
+  your receiver must answer 2xx with `{"challenge": …}` as it came. If it
+  doesn't, the subscribe fails with `-32015` and a `data.reason` such as
+  `challenge_failed` or `timeout`. Subscribing again with the same type,
+  arguments and URL refreshes the subscription (argument order doesn't
+  matter), and can replace the secret.
+- **Deliveries.** One signed POST per event, with `webhook-id`,
+  `webhook-timestamp`, `webhook-signature` and `X-MCP-Subscription-Id`, so
+  any Standard Webhooks library can check it. A failed delivery is tried
+  again four times over about ten minutes; `410` or `413` stops it at once.
+  Redirects aren't followed.
+- **Where it can post.** `https` URLs only, with a certificate this machine
+  trusts, whether on the internet, on this machine or on your tailnet
+  (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`, `*.ts.net`). An `http` URL is
+  refused when you subscribe. Private network, link-local and cloud metadata
+  addresses are refused, checked again every time it connects.
+- **Lifetimes.** 1 hour unless you ask, at least 5 minutes, at most 24
+  hours (also for `ttlMs: null`). Refresh before `refreshBefore`.
+  Deleting the API key that made them ends them. `events/unsubscribe` ends
+  one at once. A key can hold 32, a host 256.
+- **Restarts.** Subscriptions live in `vibed`'s memory, so a restart ends
+  them, and nothing's delivered until you refresh. Refresh as usual (the
+  same type, arguments, URL and secret, with your last cursor): that makes
+  the subscription again, with the same id, a fresh verification and
+  `truncated: true`.
+- **Coverage.** Events cover every host the endpoint reaches. On the Mac,
+  that's the Mac and its linked Linux hosts. On a Linux host, it's the host
+  itself, the Mac (`mac:…`) and the other hosts linked to the Mac, while the
+  Mac is online. For the Mac's, the Linux host asks the Mac for a relay grant
+  when you subscribe: the Mac must take your key, as for calls, so a key made
+  on the Linux host alone hears only that host. The host holds that grant,
+  which only reads events, in memory, never your key. It lasts 48 hours, and
+  a refresh takes a fresh one once less than 25 hours are left, or after
+  either `vibed` restarts, so refreshing before `refreshBefore` keeps it
+  going. A subscribe that needs it can take up to 3 s longer.
+- **Cursors.** Each delivery carries a `cursor`. Pass the last one you have
+  when you refresh. If events may have been missed since then, the answer
+  says `truncated: true`:
+  - `vibed` restarted, or the cursor is older than the last 4,096 events;
+  - a linked host's link came back up, since its events weren't heard while
+    it was down (only for subscriptions that could include that host);
+  - on a Linux host, the Mac woke from sleep or its tunnel came back (only
+    for subscriptions that could include the Mac or its hosts).
+
+  A lapsed subscription renewed with a cursor gets what it missed, if this
+  `vibed` still has it. After `truncated`, read what you need with the
+  tools.

@@ -12,18 +12,26 @@
 //! Every call needs an API key, sent as `Authorization: Bearer`; there's no
 //! unauthenticated mode, not even on loopback.
 //!
+//! Clients can also subscribe to what happens to agents, with MCP Events
+//! ([`events`]) delivered by webhook ([`webhook`]), which reaches a client
+//! like ChatGPT between its turns.
+//!
 //! This crate is the façade only. `vibed` implements [`Daemon`] on its
 //! core, so the tools can't drift from the socket API's handlers.
 
 use std::future::Future;
+use std::sync::Arc;
 
 use vibe_core::model::{Activity, AgentState};
 use vibe_core::rpc::{Agent, AgentDeleteParams, AgentStartParams, ErrorObject, Project};
 
+pub mod egress;
+pub mod events;
 pub mod http;
 pub mod keys;
 pub mod net;
 mod tools;
+pub mod webhook;
 
 pub use tools::{MAX_RESULT_CHARS, MAX_WAIT_SECS, Server, clip};
 
@@ -184,6 +192,21 @@ pub trait Daemon: Send + Sync + 'static {
     /// The name of the API key `secret` is, if it's a key; checking it
     /// records that it was used.
     fn verify_key(&self, secret: &str) -> Option<String>;
+
+    /// The daemon's MCP Events (PRD: MCP interface, Events): its webhook
+    /// subscriptions, read from one [`events::Hub`] fed from its event bus,
+    /// and started on the first call. `None`, the default, offers no events:
+    /// `events/*` is a method not found, and nothing advertises them.
+    fn webhooks(&self) -> Option<Arc<webhook::Webhooks>> {
+        None
+    }
+
+    /// Called for each `events/subscribe` as it's taken, before its cursor
+    /// is: on a Linux host, `vibed` gets the Mac's relay grant for `c`'s key
+    /// here, so its subscriptions hear the Mac's events too.
+    fn events_subscriber(&self, _c: &Caller) -> impl Future<Output = ()> + Send {
+        async {}
+    }
 
     /// The hosts `agent` was last seen on, as `c` may know them, so that a bare
     /// ref needn't go looking on every host.

@@ -11,6 +11,10 @@
 //! tests/linux_host.rs.
 
 mod common;
+#[path = "../../vibe-mcp/tests/client/mod.rs"]
+mod events_client;
+#[path = "../../vibe-mcp/tests/receiver/mod.rs"]
+mod receiver;
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -2246,5 +2250,396 @@ async fn a_host_the_mac_cant_reach_is_unavailable_with_the_mac_there() {
     for agent in ["on-vps", "mac:on-mac", "edge:on-edge"] {
         c.call("vibe_delete_agent", json!({"agent": agent, "force": true}))
             .await;
+    }
+}
+
+// MCP Events through one ingress, by webhook.
+
+/// Asks the host's MCP at `addr`, with `key`, as ChatGPT does after `initialize`: the
+/// result, or the error.
+async fn events_ask(
+    addr: SocketAddr,
+    key: &str,
+    method: &str,
+    params: Value,
+) -> Result<Value, Value> {
+    let mut c = events_client::Client::new(addr, key);
+    c.initialize("2025-03-26").await;
+    let r = c
+        .post(&json!({"jsonrpc": "2.0", "id": 9, "method": method, "params": params}))
+        .await;
+    assert_eq!(r.status, 200, "{method}: {}", r.body);
+    let m = r.response().clone();
+    match m.get("error") {
+        Some(e) => Err(e.clone()),
+        None => Ok(m["result"].clone()),
+    }
+}
+
+fn webhook_subscription(name: &str, args: Value, url: &str, secret: &str) -> Value {
+    json!({"name": name, "arguments": args, "cursor": null,
+        "delivery": {"mode": "webhook", "url": url, "secret": secret}})
+}
+
+/// The refs posted to `path`, in the order they came.
+fn posted_refs(hook: &receiver::Receiver, path: &str) -> Vec<String> {
+    hook.events()
+        .iter()
+        .filter(|p| p.path == path)
+        .map(|p| p.json["data"]["ref"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// Lee's rule for #178: one endpoint on a Linux host delivers what happens on every host
+/// it reaches, through the Mac alone, by webhook, which is what works between a client's
+/// turns: the Mac's agents (`mac:`), another host's linked to the Mac (`edge:`), and its
+/// own, narrowed by host. The Mac decides who hears its events, as it does for calls: the
+/// host holds a relay grant it gave for the key, in memory, never the key, and a key of
+/// the host's own hears none of it. The Mac sleeping is a gap, said as `truncated` at the
+/// next refresh. A restart of the host's vibed ends its subscriptions until the client's
+/// refresh makes them again. A revoke on the Mac ends it all. And the Mac's own hub hears
+/// the Linux hosts linked to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_ingress_delivers_every_hosts_events_by_webhook() {
+    use receiver::{Receiver, secret, signed_with};
+    use vibe_mcp::Daemon as _;
+    let w = world().await;
+    let edge = w.add_edge().await;
+    // The Mac's own hub, heard from the start.
+    let mac_hub = Arc::clone(w.mac.webhooks().unwrap().hub());
+    w.turn_on().await;
+    let key = w.key("laptop");
+    w.pushed(&key).await;
+    for _ in 0..500 {
+        if edge.core.verify_key(&key).unwrap().is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    w.mac_reachable(&key).await;
+    let own = w
+        .host
+        .create_key(KeyCreateParams {
+            name: "host-own".into(),
+        })
+        .unwrap()
+        .secret;
+
+    // ChatGPT subscribes, through the host's endpoint.
+    let hook = Receiver::start().await;
+    let subscribe = |k: &str, name: &str, args: Value, path: &str, seed: u8| {
+        let params = webhook_subscription(name, args, &hook.url(path), &secret(seed));
+        let (k, name) = (k.to_owned(), name.to_owned());
+        async move {
+            events_ask(w.public, &k, "events/subscribe", params)
+                .await
+                .unwrap_or_else(|e| panic!("{name}: {e}"))
+        }
+    };
+    let all = subscribe(&key, "agent.started", json!({}), "/all", 1).await;
+    assert_eq!(all["truncated"], false, "{all}");
+    subscribe(&own, "agent.started", json!({}), "/own", 2).await;
+    subscribe(&key, "agent.started", json!({"host": "mac"}), "/mac", 3).await;
+    let here = subscribe(&key, "agent.started", json!({"host": "local"}), "/here", 4).await;
+    subscribe(&key, "agent.deleted", json!({}), "/deleted", 5).await;
+    assert_eq!(hook.verifications().len(), 5);
+    // The host keeps none of it on disk: no key, no grant, no subscription.
+    let on_disk = files_under(&w.host.layout().data_dir());
+    for (path, bytes) in &on_disk {
+        let text = String::from_utf8_lossy(bytes);
+        for secret in [
+            key.as_str(),
+            own.as_str(),
+            "vgr1.",
+            "whsec_",
+            hook.url("/").as_str(),
+        ] {
+            assert!(
+                !text.contains(secret),
+                "{secret:?} is in {}",
+                path.display()
+            );
+        }
+    }
+
+    // An agent on each host, started here.
+    let mut c = w.client(&key);
+    for (host, profile, name, shown) in [
+        ("local", "software-eng-linux", "on-vps", "on-vps"),
+        ("mac", "software-eng-mac", "on-mac", "mac:on-mac"),
+        ("edge", "software-eng-linux", "on-edge", "edge:on-edge"),
+    ] {
+        let started = c
+            .call(
+                "vibe_start_agent",
+                json!({"project": "app", "profile": profile, "prompt": "talk", "host": host,
+                       "name": name}),
+            )
+            .await;
+        assert!(started.contains(&format!("started {shown}")), "{started}");
+    }
+
+    // All three posted, signed, for the key the Mac takes.
+    let wait = Duration::from_secs(30);
+    for shown in ["on-vps", "mac:on-mac", "edge:on-edge"] {
+        let p = hook
+            .wait_for(wait, |p| p.path == "/all" && p.json["data"]["ref"] == shown)
+            .await;
+        assert!(signed_with(&secret(1), &p), "{shown}");
+        assert_eq!(
+            p.header("x-mcp-subscription-id"),
+            all["id"].as_str().unwrap()
+        );
+        assert_eq!(p.json["name"], "agent.started");
+        if shown == "mac:on-mac" {
+            assert_eq!(
+                (
+                    p.json["data"]["host"].clone(),
+                    p.json["data"]["agent"].clone(),
+                    p.json["data"]["project"].clone()
+                ),
+                (json!("mac"), json!("on-mac"), json!("app")),
+                "{}",
+                p.json
+            );
+        }
+    }
+    hook.wait_for(wait, |p| p.path == "/mac").await;
+    hook.wait_for(wait, |p| p.path == "/own").await;
+    hook.wait_for(wait, |p| p.path == "/here").await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let mut everything = posted_refs(&hook, "/all");
+    everything.sort();
+    assert_eq!(everything, ["edge:on-edge", "mac:on-mac", "on-vps"]);
+    // Narrowed by host.
+    assert_eq!(posted_refs(&hook, "/mac"), ["mac:on-mac"]);
+    assert_eq!(posted_refs(&hook, "/here"), ["on-vps"]);
+    // The host's own key: the Mac doesn't take it, so it hears only the host's.
+    assert_eq!(posted_refs(&hook, "/own"), ["on-vps"]);
+
+    // The Mac's own hub hears the Linux hosts linked to it.
+    let everything = vibe_mcp::events::Filter::default();
+    let on_mac_hub: Vec<String> = mac_hub
+        .read(0, &everything, 1000)
+        .events
+        .iter()
+        .filter(|o| o.name == vibe_mcp::events::Name::Started)
+        .map(|o| format!("{}:{}", o.host, o.agent))
+        .collect();
+    for want in ["vps:on-vps", "local:on-mac", "edge:on-edge"] {
+        assert!(
+            on_mac_hub.iter().any(|r| r == want),
+            "{want}: {on_mac_hub:?}"
+        );
+    }
+
+    // The tunnel itself: no grant without a key the Mac takes, no events without a grant
+    // it gave, never the asking host's own agents, and the states now before the events.
+    let end = w.tunnel_end();
+    for k in ["vk_wrong", own.as_str()] {
+        let refused = tunnel_raw(&end, "tunnel.grant", json!({"key": k})).await;
+        assert_eq!(
+            refused["error"]["code"],
+            ErrorCode::Unauthorized.code(),
+            "{refused}"
+        );
+    }
+    let granted = tunnel_raw(&end, "tunnel.grant", json!({"key": key})).await;
+    let grant = granted["result"]["grant"].as_str().unwrap().to_owned();
+    // 48 hours on, by the Mac's clock.
+    assert_eq!(
+        granted["result"]["expires"].as_i64().unwrap(),
+        common::GOLDEN_NOW + w.mac_clock_ahead.load(Ordering::SeqCst) + 48 * 3600,
+        "{granted}"
+    );
+    let forged = {
+        let mut parts: Vec<String> = grant.split('.').map(str::to_owned).collect();
+        parts[1] = (parts[1].parse::<i64>().unwrap() + 1).to_string();
+        parts.join(".")
+    };
+    for bad in [
+        json!({"grants": [forged]}),
+        json!({"grants": []}),
+        json!({"key": key}),
+    ] {
+        let refused = tunnel_raw(&end, "tunnel.events", bad.clone()).await;
+        assert!(refused.get("error").is_some(), "{bad}: {refused}");
+    }
+    let now = tunnel_raw(
+        &end,
+        "tunnel.events",
+        json!({"grants": [grant.clone(), "vgr1.x"]}),
+    )
+    .await;
+    assert_eq!(now["result"]["admitted"], json!([true, false]), "{now}");
+    let mut states: Vec<String> = now["result"]["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| {
+            format!(
+                "{}:{}",
+                a["host"].as_str().unwrap(),
+                a["ref"].as_str().unwrap()
+            )
+        })
+        .collect();
+    states.sort();
+    assert_eq!(states, ["edge:on-edge", "local:on-mac"], "{now}");
+
+    // The Mac sleeps and wakes: what happened meanwhile may be lost, which a refresh from
+    // a cursor from before says, but not to a subscription to this host's own alone.
+    let before = hook
+        .events()
+        .iter()
+        .rfind(|p| p.path == "/all")
+        .unwrap()
+        .json["cursor"]
+        .clone();
+    w.wires.freeze(true);
+    w.tunnel_down().await;
+    w.thaw().await;
+    w.mac_reachable(&key).await;
+    let refresh = |args: Value, path: &str, seed: u8, cursor: &Value| {
+        let mut params =
+            webhook_subscription("agent.started", args, &hook.url(path), &secret(seed));
+        params["cursor"] = cursor.clone();
+        let key = key.clone();
+        async move {
+            events_ask(w.public, &key, "events/subscribe", params)
+                .await
+                .unwrap()
+        }
+    };
+    let mut again = Value::Null;
+    for _ in 0..200 {
+        again = refresh(json!({}), "/all", 1, &before).await;
+        if again["truncated"] == true {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(again["truncated"], true, "{again}");
+    assert_eq!(again["id"], all["id"]);
+    let here_again = refresh(json!({"host": "local"}), "/here", 4, &here["cursor"]).await;
+    assert_eq!(here_again["truncated"], false, "{here_again}");
+    // And it carries on afterwards.
+    c.call(
+        "vibe_delete_agent",
+        json!({"agent": "mac:on-mac", "force": true}),
+    )
+    .await;
+    let gone = hook.wait_for(wait, |p| p.path == "/deleted").await;
+    assert_eq!(gone.json["data"]["ref"], "mac:on-mac", "{}", gone.json);
+
+    // vibed on the host restarts. Its subscriptions and the Mac's grant were in memory
+    // alone, so they're gone, until ChatGPT refreshes with its last cursor: that makes the
+    // subscription again, with the same id, verified again, `truncated` (the cursor is
+    // from the vibed that's gone), and a fresh grant, so the Mac's events come again.
+    let last = hook
+        .events()
+        .iter()
+        .rfind(|p| p.path == "/all")
+        .unwrap()
+        .json["cursor"]
+        .clone();
+    let verified = hook.verifications().len();
+    let w = w.restart_host().await;
+    w.pushed(&key).await;
+    w.mac_reachable(&key).await;
+    assert!(w.host.webhooks().unwrap().is_empty());
+    let mut params =
+        webhook_subscription("agent.started", json!({}), &hook.url("/all"), &secret(1));
+    params["cursor"] = last.clone();
+    let remade = events_ask(w.public, &key, "events/subscribe", params)
+        .await
+        .unwrap();
+    assert_eq!(remade["id"], all["id"], "{remade}");
+    assert_eq!(remade["truncated"], true, "{remade}");
+    assert_ne!(remade["cursor"], last);
+    assert_eq!(hook.verifications().len(), verified + 1, "verified again");
+    let params = webhook_subscription("agent.started", json!({}), &hook.url("/own"), &secret(2));
+    events_ask(w.public, &own, "events/subscribe", params)
+        .await
+        .unwrap();
+    let mut c = w.client(&key);
+    for (host, profile, name) in [
+        ("mac", "software-eng-mac", "on-mac-2"),
+        ("local", "software-eng-linux", "on-vps-2"),
+    ] {
+        c.call(
+            "vibe_start_agent",
+            json!({"project": "app", "profile": profile, "prompt": "talk", "host": host,
+                   "name": name}),
+        )
+        .await;
+    }
+    for shown in ["mac:on-mac-2", "on-vps-2"] {
+        let p = hook
+            .wait_for(wait, |p| p.path == "/all" && p.json["data"]["ref"] == shown)
+            .await;
+        assert!(signed_with(&secret(1), &p), "{shown}");
+        assert_eq!(
+            p.header("x-mcp-subscription-id"),
+            all["id"].as_str().unwrap()
+        );
+    }
+    let end = w.tunnel_end();
+
+    // A revoke on the Mac: the grant stops working, and the key's subscriptions here end
+    // as the revoke reaches the host; the host's own key's goes on.
+    w.mac
+        .revoke_key(KeyParams {
+            name: "laptop".into(),
+        })
+        .unwrap();
+    let refused = tunnel_raw(&end, "tunnel.events", json!({"grants": [grant]})).await;
+    assert_eq!(
+        refused["error"]["code"],
+        ErrorCode::Unauthorized.code(),
+        "{refused}"
+    );
+    let hooks = w.host.webhooks().unwrap();
+    let deadline = Instant::now() + wait;
+    while hooks.len() > 1 {
+        assert!(
+            Instant::now() < deadline,
+            "{} subscriptions outlived their key",
+            hooks.len() - 1
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(hooks.owners(), [vibe_core::keys::hash(&own)]);
+}
+
+/// Every file under `dir`, and what's in it.
+fn files_under(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(files_under(&path));
+        } else if let Ok(bytes) = std::fs::read(&path) {
+            out.push((path, bytes));
+        }
+    }
+    out
+}
+
+/// `method` down the tunnel at `end`, on a connection of its own: its answer.
+async fn tunnel_raw(end: &Path, method: &str, params: Value) -> Value {
+    let stream = UnixStream::connect(end).await.unwrap();
+    let (read, mut write) = stream.into_split();
+    let line = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
+    write
+        .write_all(format!("{line}\n").as_bytes())
+        .await
+        .unwrap();
+    let mut read = BufReader::new(read.reunite(write).unwrap());
+    loop {
+        let answer = answer_from(&mut read).await;
+        if answer.get("id").is_some() {
+            return answer;
+        }
     }
 }

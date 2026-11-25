@@ -4,6 +4,8 @@
 // vibed's test helpers: the golden world, with the stand-in for Claude.
 #[path = "../../vibed/tests/common/mod.rs"]
 mod common;
+#[path = "../../vibe-mcp/tests/receiver/mod.rs"]
+mod receiver;
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::SocketAddr;
@@ -253,6 +255,69 @@ fn the_bridge_carries_mcp_over_stdio() {
     drop(b.stdin.take());
     let status = b.child.wait().unwrap();
     assert!(status.success());
+    w.rt.block_on(w.core.delete_agent(vibe_core::rpc::AgentDeleteParams {
+        host: None,
+        agent: a.agent,
+        force: Some(true),
+    }))
+    .unwrap();
+}
+
+/// MCP Events over stdio, as ChatGPT has them: `initialize` says `capabilities.events`,
+/// and a webhook subscription made through the bridge gets each start posted to it, by
+/// the real `vibed`.
+#[test]
+fn the_bridge_carries_webhook_subscriptions() {
+    let w = world();
+    let mut b = Bridge::start(&w, Some(&w.key));
+    b.send(
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+        "protocolVersion": "2025-03-26", "capabilities": {},
+        "clientInfo": {"name": "events", "version": "1"}}}),
+    );
+    let init = b.expect();
+    assert_eq!(
+        init["result"]["capabilities"]["events"],
+        json!({}),
+        "{init}"
+    );
+    b.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+    let hook = w.rt.block_on(receiver::Receiver::start());
+    let secret = receiver::secret(1);
+    b.send(
+        json!({"jsonrpc": "2.0", "id": 2, "method": "events/subscribe", "params": {
+        "name": "agent.started", "arguments": {"project": "app"}, "cursor": null,
+        "delivery": {"mode": "webhook", "url": hook.url("/hook"), "secret": secret}}}),
+    );
+    let sub = b.expect();
+    let id = sub["result"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{sub}"))
+        .to_owned();
+    assert_eq!(hook.verifications().len(), 1);
+    let a =
+        w.rt.block_on(w.core.start_agent(AgentStartParams {
+            project: "app".into(),
+            profile: "software-eng-linux".into(),
+            prompt: "hello".into(),
+            ..Default::default()
+        }))
+        .unwrap();
+    let got = w.rt.block_on(hook.wait_events(1, Duration::from_secs(20)));
+    assert_eq!(got[0].json["name"], "agent.started");
+    assert_eq!(got[0].json["data"]["ref"], a.agent);
+    assert_eq!(got[0].json["data"]["state"], "busy");
+    assert_eq!(got[0].header("x-mcp-subscription-id"), id);
+    assert!(receiver::signed_with(&secret, &got[0]));
+    b.send(
+        json!({"jsonrpc": "2.0", "id": 3, "method": "events/unsubscribe", "params": {
+        "name": "agent.started", "arguments": {"project": "app"},
+        "delivery": {"url": hook.url("/hook")}}}),
+    );
+    let gone = b.expect();
+    assert_eq!(gone["id"], 3, "{gone}");
+    assert!(gone.get("error").is_none(), "{gone}");
+    assert!(vibe_mcp::Daemon::webhooks(&*w.core).unwrap().is_empty());
     w.rt.block_on(w.core.delete_agent(vibe_core::rpc::AgentDeleteParams {
         host: None,
         agent: a.agent,

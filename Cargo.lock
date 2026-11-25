@@ -1259,9 +1259,11 @@ name = "vibe-cli"
 version = "0.1.14"
 dependencies = [
  "libc",
+ "rustls",
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-rustls",
  "vibe-core",
  "vibe-env",
  "vibe-mcp",
@@ -1315,6 +1317,7 @@ dependencies = [
 name = "vibe-mcp"
 version = "0.1.14"
 dependencies = [
+ "base64",
  "bytes",
  "http",
  "http-body-util",
@@ -1322,12 +1325,17 @@ dependencies = [
  "hyper-util",
  "libc",
  "rmcp",
+ "rustls",
+ "rustls-native-certs",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
+ "tokio-rustls",
  "tower-service",
  "vibe-core",
+ "vibe-mcp",
  "vibe-status",
 ]
 
@@ -1402,11 +1410,13 @@ version = "0.1.14"
 dependencies = [
  "libc",
  "rusqlite",
+ "rustls",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
  "tokio",
+ "tokio-rustls",
  "vibe-core",
  "vibe-env",
  "vibe-mcp",

@@ -169,14 +169,21 @@ impl Broker {
         self.conns.lock().unwrap().push(conn.try_clone().unwrap());
         let mut reader = BufReader::new(conn.try_clone().unwrap());
         let mut hello = String::new();
-        reader.read_line(&mut hello).unwrap();
-        self.hellos
-            .lock()
-            .unwrap()
-            .push(Hello::parse(hello.trim_end().as_bytes()).unwrap());
-        (&conn)
+        // `hang_up_everyone` can catch a link the shim is still opening (its
+        // catalog poll's, say) before its hello is read: that one just ends.
+        if reader.read_line(&mut hello).unwrap_or(0) == 0 {
+            return;
+        }
+        // Parsed before the lock's taken, so a bad hello fails this link's
+        // thread without poisoning every one after it.
+        let hello = Hello::parse(hello.trim_end().as_bytes()).unwrap();
+        self.hellos.lock().unwrap().push(hello);
+        if (&conn)
             .write_all(local::answer(&Ok(())).as_bytes())
-            .unwrap();
+            .is_err()
+        {
+            return;
+        }
         self.answered
             .lock()
             .unwrap()

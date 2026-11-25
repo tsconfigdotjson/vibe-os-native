@@ -6,8 +6,11 @@
 //! `run/t/<host>.sock`. That socket isn't `vibed.sock`: it takes only `daemon.hello` and
 //! `tunnel.call`, which runs one of the agent calls MCP makes ([`TUNNEL_METHODS`]), for
 //! this Mac's agents or, through it, those of another host linked to it, after checking
-//! the caller's API key itself. So a host's MCP reaches the whole of what this Mac does,
-//! with no SSH between the hosts. `hosts.list` there says which: this Mac's row and the
+//! the caller's API key itself. For the host's MCP Events, it also takes `tunnel.grant`
+//! ([`TUNNEL_GRANT`]), which for such a key gives a relay grant ([`crate::relay_grant`]),
+//! and `tunnel.events` ([`TUNNEL_EVENTS`]), which with grants streams what happens to
+//! those agents. So a host's MCP reaches the whole of what this Mac does, with no SSH
+//! between the hosts. `hosts.list` there says which: this Mac's row and the
 //! other hosts', never the asking host's own, or anyone's address. Asking for itself is
 //! refused, as that would only come back. A key the host took but this Mac doesn't know,
 //! revoked here and not yet there, say, or one of the host's own, gets nothing; so a host
@@ -25,8 +28,12 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::task::JoinHandle;
-use vibe_core::model::{LOCAL_HOST, TunnelState};
-use vibe_core::rpc::{ACCEPTS_CALLS, AgentsList, accepted_frame};
+use vibe_core::model::{EventKind, LOCAL_HOST, TunnelState};
+use vibe_core::rpc::{
+    ACCEPTS_CALLS, AgentsList, Event, MAX_TUNNEL_GRANTS, SERVES_EVENTS, TUNNEL_EVENTS,
+    TUNNEL_GRANT, TunnelAdmitted, TunnelAgentState, TunnelEvents, TunnelEventsParams,
+    TunnelGrantParams, TunnelLinkState, accepted_frame,
+};
 use vibe_core::rpc::{
     ErrorCode, ErrorObject, Hello, HelloParams, HostsList, Id, Method, NoParams, Request, Response,
     TUNNEL_METHODS, TunnelCall, TunnelCallParams, TunnelPrepare,
@@ -124,17 +131,55 @@ pub(crate) async fn tunnel_message(core: &Core, end: &TunnelEnd, line: &[u8]) ->
     let outcome = match request.method.as_str() {
         Hello::NAME => hello(core, end, request.params),
         TunnelCall::NAME => tunnel_call(core, end, request.params).await,
+        TUNNEL_GRANT => grant(core, end, request.params).await,
         other => Err(ErrorObject::new(
             ErrorCode::MethodNotFound,
-            format!("Method not found: {other}: this socket takes daemon.hello and tunnel.call"),
+            format!(
+                "Method not found: {other}: this socket takes daemon.hello, tunnel.call, tunnel.grant and tunnel.events"
+            ),
         )),
     };
     reply(request.id, outcome)
 }
 
+/// The key, checked here, where the agents live, whatever the host made of it. A key
+/// pushed here (a Mac never has any) doesn't count.
+async fn checked_key(
+    core: &Core,
+    key: &str,
+    method: &str,
+) -> Result<vibe_core::rpc::ApiKey, ErrorObject> {
+    match core.verify_key(key) {
+        Ok(Some(k)) if !k.pushed => Ok(k),
+        Ok(_) => {
+            crate::log!("vibed: tunnel: refused {method} with a key this Mac doesn't know");
+            tokio::time::sleep(REFUSED_PAUSE).await;
+            Err(error(
+                ErrorCode::Unauthorized,
+                "this Mac doesn't take that API key: it's unknown here, revoked, or a Linux host's own",
+            ))
+        }
+        Err(e) => Err(e),
+    }
+}
+
 fn decode<T: serde::de::DeserializeOwned>(params: Option<Value>) -> Result<T, ErrorObject> {
     serde_json::from_value(params.unwrap_or_else(|| json!({})))
         .map_err(|e| ErrorObject::new(ErrorCode::InvalidParams, format!("Invalid params: {e}")))
+}
+
+/// `tunnel.grant`: for a key this Mac takes, a relay grant, which the host keeps for the
+/// webhook subscriptions that key made there. The host never keeps the key.
+async fn grant(core: &Core, end: &TunnelEnd, params: Option<Value>) -> Result<Value, ErrorObject> {
+    let p: TunnelGrantParams = decode(params)?;
+    let key = checked_key(core, &p.key, TUNNEL_GRANT).await?;
+    let grant = core.issue_grant(&vibe_core::keys::hash(&p.key))?;
+    crate::log!(
+        "vibed: tunnel: key {:?} has a relay grant for {}'s webhooks",
+        key.name,
+        end.host
+    );
+    Ok(serde_json::to_value(grant).expect("a grant serializes"))
 }
 
 fn hello(core: &Core, end: &TunnelEnd, params: Option<Value>) -> Result<Value, ErrorObject> {
@@ -143,6 +188,7 @@ fn hello(core: &Core, end: &TunnelEnd, params: Option<Value>) -> Result<Value, E
     let r = crate::dispatch::hello(core.info(), p)?;
     let mut answer = serde_json::to_value(r).expect("hello serializes");
     answer[ACCEPTS_CALLS] = json!(true);
+    answer[SERVES_EVENTS] = json!(true);
     Ok(answer)
 }
 
@@ -172,23 +218,7 @@ async fn tunnel_call(
             ));
         }
     };
-    // The key is checked here, where the agents live, whatever the host
-    // made of it. A key pushed here (a Mac never has any) doesn't count.
-    let key = match core.verify_key(&p.key) {
-        Ok(Some(k)) if !k.pushed => k,
-        Ok(_) => {
-            crate::log!(
-                "vibed: tunnel: refused {} with a key this Mac doesn't know",
-                p.method
-            );
-            tokio::time::sleep(REFUSED_PAUSE).await;
-            return Err(error(
-                ErrorCode::Unauthorized,
-                "this Mac doesn't take that API key: it's unknown here, revoked, or a Linux host's own",
-            ));
-        }
-        Err(e) => return Err(e),
-    };
+    let key = checked_key(core, &p.key, &p.method).await?;
     // Only now, so what's linked here is no one's to find out without a key: this Mac, or
     // another host linked to it. Not the one asking, which would only come back to it.
     let through = match params.remove("host") {
@@ -360,6 +390,12 @@ async fn connection(core: Arc<Core>, end: Arc<TunnelEnd>, stream: UnixStream) {
             return;
         }
         line.pop();
+        if let Ok(request) = serde_json::from_slice::<Request>(&line)
+            && request.method == TUNNEL_EVENTS
+        {
+            // The rest of the connection is the stream's.
+            return events(&core, &end, request, &mut read, &mut write).await;
+        }
         // At once: a call can run for a long time, and whoever sent it is waiting to
         // hear that this end is here at all.
         if let Some(frame) = accepted_frame(&line, |m| m == TunnelCall::NAME)
@@ -373,6 +409,204 @@ async fn connection(core: Arc<Core>, end: Arc<TunnelEnd>, stream: UnixStream) {
         if let Some(r) = tunnel_message(&core, &end, &line).await
             && write.write_all(format!("{r}\n").as_bytes()).await.is_err()
         {
+            return;
+        }
+    }
+}
+
+/// What of an event on this Mac's bus goes to `asking`'s MCP, cut to what MCP Events say:
+/// an agent's start, state and deletion, here and on the other hosts linked here, and
+/// those hosts' links coming and going, or falling behind. Nothing of `asking`'s own.
+fn relayed(e: &Event, asking: &str) -> Option<Event> {
+    if e.host == asking {
+        return None;
+    }
+    let wanted = match e.kind {
+        EventKind::AgentAdded | EventKind::AgentState | EventKind::AgentDeleted => {
+            e.agent.is_some()
+        }
+        EventKind::HostLink | EventKind::Lagged => e.host != LOCAL_HOST,
+        _ => false,
+    };
+    wanted.then(|| Event {
+        seq: 0,
+        at: e.at.clone(),
+        host: e.host.clone(),
+        kind: e.kind,
+        project: e.project.clone(),
+        agent: e.agent.clone(),
+        state: e.state.clone(),
+        limit: None,
+        message: None,
+        status: None,
+    })
+}
+
+/// Each agent's state now, here and on the other hosts linked here as last listed, and
+/// those hosts' links; nothing of `asking`'s.
+fn states_now(core: &Core, asking: &str) -> TunnelEvents {
+    let mut agents: Vec<TunnelAgentState> = core
+        .store()
+        .agents(LOCAL_HOST)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| TunnelAgentState {
+            host: LOCAL_HOST.to_owned(),
+            agent: r.agent_ref,
+            state: r.state.to_string(),
+        })
+        .collect();
+    let mut links = Vec::new();
+    let linked: Vec<Arc<Link>> = lock(&core.links).values().cloned().collect();
+    for link in linked.iter().filter(|l| l.name != asking) {
+        agents.extend(
+            core.kept_agents(link)
+                .into_iter()
+                .map(|a| TunnelAgentState {
+                    host: link.name.clone(),
+                    agent: a.agent,
+                    state: a.state.to_string(),
+                }),
+        );
+        links.push(TunnelLinkState {
+            host: link.name.clone(),
+            link: Core::link_state(link),
+        });
+    }
+    TunnelEvents {
+        agents,
+        links,
+        admitted: Vec::new(),
+    }
+}
+
+/// Writes one line; `false` once the other end is gone.
+async fn say<W: tokio::io::AsyncWrite + Unpin>(write: &mut W, line: String) -> bool {
+    write
+        .write_all(format!("{line}\n").as_bytes())
+        .await
+        .is_ok()
+}
+
+/// How often an open `tunnel.events` checks its grants again, for one run out.
+const GRANTS_RECHECK: Duration = Duration::from_secs(60);
+
+/// `tunnel.events`: with relay grants this Mac takes, each agent's state now and which
+/// grants it takes, then each event [`relayed`] lets through, one `events.event` line
+/// each, and an `events.admitted` line when which grants it takes changes. Until the host
+/// closes the connection, none of its grants holds, or this end falls behind, when it
+/// closes it and the host starts over, knowing it may have missed some.
+async fn events<R, W>(
+    core: &Arc<Core>,
+    end: &TunnelEnd,
+    request: Request,
+    read: &mut R,
+    write: &mut W,
+) where
+    R: tokio::io::AsyncBufRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let refuse = |e: ErrorObject| reply(request.id.clone(), Err(e));
+    let grants = match decode::<TunnelEventsParams>(request.params.clone()) {
+        Ok(p) if (1..=MAX_TUNNEL_GRANTS).contains(&p.grants.len()) => p.grants,
+        Ok(_) => {
+            let e = error(
+                ErrorCode::InvalidParams,
+                format!("tunnel.events takes 1 to {MAX_TUNNEL_GRANTS} grants"),
+            );
+            if let Some(r) = refuse(e) {
+                say(write, r).await;
+            }
+            return;
+        }
+        Err(e) => {
+            if let Some(r) = refuse(e) {
+                say(write, r).await;
+            }
+            return;
+        }
+    };
+    let judge = || {
+        grants
+            .iter()
+            .map(|g| core.grant_holds(g))
+            .collect::<Vec<bool>>()
+    };
+    // Subscribed before the states are taken, so nothing in between is missed.
+    let (_, mut rx) = core.subscribe();
+    let mut admitted = judge();
+    if !admitted.contains(&true) {
+        crate::log!("vibed: tunnel: refused tunnel.events with no grant this Mac takes");
+        tokio::time::sleep(REFUSED_PAUSE).await;
+        let e = error(
+            ErrorCode::Unauthorized,
+            "this Mac takes none of those grants: they ran out, or their keys were revoked",
+        );
+        if let Some(r) = refuse(e) {
+            say(write, r).await;
+        }
+        return;
+    }
+    let count = |a: &[bool]| a.iter().filter(|x| **x).count();
+    crate::log!(
+        "vibed: tunnel: {} key(s) listen to events from {}",
+        count(&admitted),
+        end.host
+    );
+    let mut now = states_now(core, &end.host);
+    now.admitted = admitted.clone();
+    let answer = serde_json::to_value(now).expect("states serialize");
+    if let Some(r) = reply(request.id, Ok(answer))
+        && !say(write, r).await
+    {
+        return;
+    }
+    let mut recheck =
+        tokio::time::interval_at(tokio::time::Instant::now() + GRANTS_RECHECK, GRANTS_RECHECK);
+    let mut rest = Vec::new();
+    loop {
+        let again = tokio::select! {
+            got = rx.recv() => match got {
+                Ok(e) if e.kind == EventKind::KeysChanged => true,
+                Ok(e) => {
+                    let Some(e) = relayed(&e, &end.host) else { continue };
+                    let line = json!({"jsonrpc": "2.0", "method": "events.event", "params": e});
+                    if !say(write, line.to_string()).await {
+                        return;
+                    }
+                    false
+                }
+                // Something was missed: the host starts over.
+                Err(_) => return,
+            },
+            _ = recheck.tick() => true,
+            // The host says nothing more on it; it's gone once it closes it.
+            n = read.read_until(b'\n', &mut rest) => match n {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {
+                    rest.clear();
+                    false
+                }
+            },
+        };
+        if !again {
+            continue;
+        }
+        let now = judge();
+        if now == admitted {
+            continue;
+        }
+        admitted = now;
+        if !admitted.contains(&true) {
+            crate::log!(
+                "vibed: tunnel: no grant {} listened with holds now: no more events for it",
+                end.host
+            );
+            return;
+        }
+        let line = json!({"jsonrpc": "2.0", "method": "events.admitted",
+            "params": TunnelAdmitted { admitted: admitted.clone() }});
+        if !say(write, line.to_string()).await {
             return;
         }
     }

@@ -364,6 +364,40 @@ impl Daemon for Core {
         }
     }
 
+    fn webhooks(&self) -> Option<Arc<vibe_mcp::webhook::Webhooks>> {
+        Some(Arc::clone(self.mcp_events.get_or_init(|| {
+            let hub = Arc::new(vibe_mcp::events::Hub::default());
+            // Subscribed first, so a change while it's seeded isn't lost.
+            let (_, rx) = self.subscribe();
+            // Each agent's state as it is now, this host's and the linked
+            // hosts' as last listed, so the first change heard of has a
+            // `previous`, and a turn that ends then is seen to.
+            if let Ok(records) = self.store().agents(LOCAL_HOST) {
+                for r in records {
+                    hub.seed(LOCAL_HOST, &r.agent_ref, r.state);
+                }
+            }
+            let links: Vec<Arc<crate::link::Link>> = lock(&self.links).values().cloned().collect();
+            for link in links {
+                hub.seed_link(&link.name, &Core::link_state(&link));
+                for a in self.kept_agents(&link) {
+                    hub.seed(&link.name, &a.agent, a.state);
+                }
+            }
+            hub.spawn_feed(rx);
+            // In memory only: a client's next refresh makes its subscription again
+            // after a restart.
+            let hooks = vibe_mcp::webhook::Webhooks::new(hub, vibe_mcp::webhook::Config::default());
+            let me = self.me.get().cloned().unwrap_or_default();
+            hooks.start(Arc::new(crate::mac_events::Owners(me)));
+            hooks
+        })))
+    }
+
+    async fn events_subscriber(&self, c: &Caller) {
+        self.mac_relay_for(c.key()).await;
+    }
+
     fn known_hosts(&self, c: &Caller, agent: &str) -> Vec<String> {
         let mut on = Vec::new();
         if let Some(mac) = self.mac() {

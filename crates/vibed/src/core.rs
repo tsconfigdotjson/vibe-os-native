@@ -522,6 +522,10 @@ pub struct Core {
     pub(crate) tailscale_needs_operator: std::sync::atomic::AtomicBool,
     /// Tells the MCP listeners to look at their settings again now.
     pub(crate) mcp_kick: Arc<tokio::sync::Notify>,
+    /// MCP Events: the webhook subscriptions the listeners serve `events/*`
+    /// for, and the hub they read, made and fed from the event bus the first
+    /// time MCP is served.
+    pub(crate) mcp_events: std::sync::OnceLock<Arc<vibe_mcp::webhook::Webhooks>>,
     /// Whether MCP is served on loopback now, for `hosts.list`.
     pub(crate) mcp_serving: AtomicBool,
     /// How Linux hosts are reached.
@@ -543,6 +547,10 @@ pub struct Core {
     pub(crate) mac_probe: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// On a Linux host, the Mac behind it, at the tunnel's end.
     pub(crate) peer: crate::mac_peer::MacPeer,
+    /// On a Linux host, the Mac's events, heard down its tunnel for MCP Events.
+    pub(crate) relay: crate::mac_events::Relay,
+    /// On a Mac, what relay grants are signed with, made on first use, in memory only.
+    pub(crate) relay_grant_secret: OnceLock<[u8; 32]>,
     /// On a Mac, the tunnel to each Linux host linked to it.
     pub(crate) tunnels: Mutex<HashMap<String, crate::tunnel::Tunnel>>,
     _state_lock: StateLock,
@@ -724,6 +732,7 @@ impl Core {
             serve_lock: tokio::sync::Mutex::new(()),
             tailscale_needs_operator: std::sync::atomic::AtomicBool::new(false),
             mcp_kick: Arc::new(tokio::sync::Notify::new()),
+            mcp_events: std::sync::OnceLock::new(),
             mcp_serving: AtomicBool::new(false),
             remote: config.remote,
             links: Mutex::new(HashMap::new()),
@@ -735,6 +744,8 @@ impl Core {
             mac_probe_every: config.mac_probe_every,
             mac_probe: Mutex::new(None),
             peer: crate::mac_peer::MacPeer::new(tunnel_end),
+            relay: crate::mac_events::Relay::default(),
+            relay_grant_secret: OnceLock::new(),
             tunnels: Mutex::new(HashMap::new()),
             _state_lock: state_lock,
         };

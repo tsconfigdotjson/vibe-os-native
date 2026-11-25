@@ -11,9 +11,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
-    JsonObject, ListToolsResult, PaginatedRequestParams, ProgressNotificationParam,
-    ServerCapabilities, ServerConfig, Tool, ToolAnnotations,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, CustomRequest,
+    CustomResult, DiscoverResult, ErrorCode as McpErrorCode, Implementation, JsonObject,
+    ListToolsResult, PaginatedRequestParams, ProgressNotificationParam, ServerCapabilities,
+    ServerConfig, Tool, ToolAnnotations,
 };
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler};
@@ -22,8 +23,8 @@ use vibe_core::model::{AgentKind, AgentState, LOCAL_HOST};
 use vibe_core::rpc::{Agent, AgentDeleteParams, AgentStartParams, ErrorCode, MemoryUse};
 
 use crate::{
-    AgentView, Caller, Check, Daemon, Error, Input, Message, Role, Target, display_ref, keys,
-    split_ref,
+    AgentView, Caller, Check, Daemon, Error, Input, Message, Role, Target, display_ref, events,
+    keys, split_ref,
 };
 
 /// The most text one result carries, about 8k tokens: Claude Code warns
@@ -1312,6 +1313,68 @@ impl<D: Daemon> ServerHandler for Server<D> {
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
         tools().into_iter().find(|t| t.name == name)
+    }
+
+    /// What `get_info` says, and, where the daemon offers events, the Events
+    /// extension. `capabilities.events`, as ChatGPT looks for it, is added
+    /// to this and to `initialize`'s result on the way out
+    /// ([`crate::http`]), as `rmcp` has no place for it.
+    async fn discover(
+        &self,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<DiscoverResult, ErrorData> {
+        let mut info = self.get_info();
+        if self.daemon.webhooks().is_some() {
+            info.capabilities
+                .extensions
+                .get_or_insert_with(Default::default)
+                .insert(events::EXTENSION.to_owned(), JsonObject::new());
+        }
+        Ok(DiscoverResult::from_server_info(
+            self.supported_protocol_versions().into_owned(),
+            info,
+        ))
+    }
+
+    /// The Events extension's requests (`events/*`), at any protocol
+    /// version, as ChatGPT sends them after `initialize`; any other is a
+    /// method not found, as is every one of them from a daemon that offers
+    /// no events.
+    async fn on_custom_request(
+        &self,
+        request: CustomRequest,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CustomResult, ErrorData> {
+        let method = request.method.as_str();
+        let not_found = || ErrorData::new(McpErrorCode::METHOD_NOT_FOUND, method.to_owned(), None);
+        let Some(hooks) = self
+            .daemon
+            .webhooks()
+            .filter(|_| events::is_events_method(method))
+        else {
+            return Err(not_found());
+        };
+        let parts = context.extensions.get::<http::request::Parts>();
+        let Some(caller) = parts.and_then(|p| p.extensions.get::<Caller>()).cloned() else {
+            return Err(ErrorData::invalid_request("an API key is needed", None));
+        };
+        let params = request.params.as_ref();
+        if let Some(p) = parts {
+            events::check_name_header(&p.headers, method, params)?;
+        }
+        let result = match method {
+            "events/list" => events::list(params)?,
+            "events/subscribe" => {
+                let subscribe = hooks.check_subscribe(&caller, params)?;
+                // First: a relay that starts for it is behind the cursor
+                // this subscription starts from.
+                self.daemon.events_subscriber(&caller).await;
+                hooks.subscribe(subscribe).await?
+            }
+            "events/unsubscribe" => hooks.unsubscribe(&caller, params)?,
+            _ => return Err(not_found()),
+        };
+        Ok(CustomResult::new(result))
     }
 
     async fn call_tool(

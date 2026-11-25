@@ -1218,6 +1218,25 @@ impl Store {
         Ok(n > 0)
     }
 
+    /// Whether there's a key with this hash now, without marking it used:
+    /// `Some(true)` for one a Mac pushed, `Some(false)` for this host's own.
+    pub fn key_by_hash(&self, hash: &str) -> Result<Option<bool>> {
+        let own = self
+            .conn
+            .query_row("SELECT 1 FROM api_keys WHERE hash = ?1", [hash], |_| Ok(()))
+            .optional()?;
+        if own.is_some() {
+            return Ok(Some(false));
+        }
+        let pushed = self
+            .conn
+            .query_row("SELECT 1 FROM pushed_keys WHERE hash = ?1", [hash], |_| {
+                Ok(())
+            })
+            .optional()?;
+        Ok(pushed.map(|()| true))
+    }
+
     /// The key with this hash, now marked as used, or `None` if there's no
     /// such key (it never existed, or it was revoked).
     pub fn use_key(&mut self, hash: &str, now: i64) -> Result<Option<ApiKey>> {

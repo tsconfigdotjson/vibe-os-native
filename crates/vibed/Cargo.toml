@@ -21,6 +21,11 @@ sha2.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+# Tests' webhook receivers serve HTTPS with a test CA, which vibe-mcp's
+# test-roots feature trusts.
+rustls.workspace = true
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "ring", "tls12"] }
+vibe-mcp = { workspace = true, features = ["test-roots"] }
 rusqlite.workspace = true
 tempfile.workspace = true
 

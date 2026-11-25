@@ -321,6 +321,8 @@ fn request_headers(message: &Value, agreed: Option<String>) -> Vec<(&'static str
     out.push(("Mcp-Method", header_value(method)));
     let key = match method {
         "tools/call" | "prompts/get" => "name",
+        // MCP Events: the event type (SEP-3415, Routing Headers).
+        "events/subscribe" | "events/unsubscribe" => "name",
         "resources/read" | "resources/subscribe" | "resources/unsubscribe" => "uri",
         m if m.starts_with("tasks/") => "taskId",
         _ => return out,
@@ -608,6 +610,16 @@ mod tests {
             [
                 ("MCP-Protocol-Version", "2026-07-28".to_owned()),
                 ("Mcp-Method", "tools/list".to_owned()),
+            ]
+        );
+        let subscribe = json!({"jsonrpc": "2.0", "id": 3, "method": "events/subscribe",
+            "params": {"name": "agent.turn_ended", "arguments": {}}});
+        assert_eq!(
+            request_headers(&subscribe, Some("2026-07-28".into())),
+            [
+                ("MCP-Protocol-Version", "2026-07-28".to_owned()),
+                ("Mcp-Method", "events/subscribe".to_owned()),
+                ("Mcp-Name", "agent.turn_ended".to_owned()),
             ]
         );
         let first = json!({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {}});
