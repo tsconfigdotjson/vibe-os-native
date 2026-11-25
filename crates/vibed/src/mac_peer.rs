@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 use tokio::io::BufReader;
 use tokio::net::UnixStream;
 use vibe_core::model::{EventKind, LOCAL_HOST, MAC_HOST};
-use vibe_core::rpc::{ACCEPTS_CALLS, MemoryUse};
+use vibe_core::rpc::{ACCEPTS_CALLS, MemoryUse, SERVES_EVENTS};
 use vibe_core::rpc::{Agent, ErrorCode, ErrorObject, Method, Project, TunnelPrepared};
 
 use crate::core::{Core, error, lock};
@@ -45,6 +45,8 @@ pub(crate) struct MacPeer {
     /// Whether the Mac's `vibed` is one that sends `call.accepted`, as its hello
     /// says, and gives its memory with its agents. An older one does neither.
     accepts_calls: AtomicBool,
+    /// Whether its hello says it takes `tunnel.events`, for MCP Events.
+    serves_events: AtomicBool,
     idle: Mutex<Vec<(Channel, Instant)>>,
     /// Calls to the Mac at once, fewer than its tunnel socket serves, so
     /// one is always left for the look that says it's there.
@@ -140,6 +142,7 @@ impl MacPeer {
             up: AtomicBool::new(false),
             misses: AtomicU32::new(0),
             accepts_calls: AtomicBool::new(false),
+            serves_events: AtomicBool::new(false),
             idle: Mutex::new(Vec::new()),
             calls: tokio::sync::Semaphore::new(MAX_CALLS),
             seen: Mutex::new(HashMap::new()),
@@ -152,6 +155,21 @@ impl MacPeer {
 
     pub(crate) fn is_up(&self) -> bool {
         self.up.load(Ordering::SeqCst)
+    }
+
+    /// Whether looks at the tunnel have found the Mac gone, as calls under way give up.
+    pub(crate) fn is_gone(&self) -> bool {
+        self.misses.load(Ordering::SeqCst) >= GONE_AFTER
+    }
+
+    /// Whether the Mac takes `tunnel.events`, as its last hello said.
+    pub(crate) fn serves_events(&self) -> bool {
+        self.serves_events.load(Ordering::SeqCst)
+    }
+
+    /// Where its tunnel ends here.
+    pub(crate) fn socket(&self) -> &std::path::Path {
+        &self.socket
     }
 
     /// What a look at the tunnel found. A miss stops new calls at once; only
@@ -199,6 +217,10 @@ impl MacPeer {
         if let Some(answer) = &answer {
             self.accepts_calls.store(
                 answer.get(ACCEPTS_CALLS) == Some(&Value::Bool(true)),
+                Ordering::SeqCst,
+            );
+            self.serves_events.store(
+                answer.get(SERVES_EVENTS) == Some(&Value::Bool(true)),
                 Ordering::SeqCst,
             );
         }

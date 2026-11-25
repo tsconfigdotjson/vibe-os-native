@@ -199,6 +199,15 @@ pub trait Daemon: Send + Sync + 'static {
         None
     }
 
+    /// Whether `c` hears the events another daemon relays to [`Daemon::events`]
+    /// (on a Linux host, the Mac's and its other hosts', down its tunnel), as that
+    /// daemon, which checks keys itself, says. Asked before each poll, as a stream
+    /// starts and every so often while it's open: what relays them goes on while
+    /// someone's listening. `false`, the default, hears nothing relayed.
+    fn events_relayed(&self, _c: &Caller) -> impl Future<Output = bool> + Send {
+        async { false }
+    }
+
     /// The hosts `agent` was last seen on, as `c` may know them, so that a bare
     /// ref needn't go looking on every host.
     fn known_hosts(&self, _c: &Caller, _agent: &str) -> Vec<String> {

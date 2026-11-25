@@ -976,6 +976,57 @@ pub const CALL_ACCEPTED: &str = "call.accepted";
 /// One without it is older, and isn't held to the accept deadline.
 pub const ACCEPTS_CALLS: &str = "accepts_calls";
 
+/// `tunnel.events`, which only the Mac's tunnel sockets take: with a key the Mac checks
+/// itself, as for `tunnel.call`, it answers with each agent's state now
+/// ([`TunnelEvents`]), then sends an `events.event` line on the same connection for each
+/// agent's start, change of state and deletion, on the Mac (`local`) and on the other
+/// hosts linked to it (by their names), and for those hosts' links coming and going,
+/// until the connection closes. Never the asking host's own. It closes when the key no
+/// longer works there, and when it fell behind, so what's listening starts over.
+pub const TUNNEL_EVENTS: &str = "tunnel.events";
+
+/// In a `daemon.hello` answer on a tunnel's socket: it takes [`TUNNEL_EVENTS`]. One
+/// without it is older, and isn't asked.
+pub const SERVES_EVENTS: &str = "serves_events";
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct TunnelEventsParams {
+    /// The API key of a caller of the host's MCP, as it sent it.
+    pub key: String,
+}
+
+impl fmt::Debug for TunnelEventsParams {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TunnelEventsParams")
+            .field("key", &crate::keys::shown_prefix(&self.key))
+            .finish()
+    }
+}
+
+/// What [`TUNNEL_EVENTS`] answers with before its events: each agent's state now.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TunnelEvents {
+    pub agents: Vec<TunnelAgentState>,
+    /// How each other host's link to the Mac stands now, as a `host.link` event says.
+    #[serde(default)]
+    pub links: Vec<TunnelLinkState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TunnelLinkState {
+    pub host: String,
+    pub link: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TunnelAgentState {
+    /// `local` for the Mac's own.
+    pub host: String,
+    #[serde(rename = "ref")]
+    pub agent: String,
+    pub state: String,
+}
+
 /// The [`CALL_ACCEPTED`] line for a message, if it's a call to a `method` that `wanted`
 /// says is to get one.
 pub fn accepted_frame(line: &[u8], wanted: impl FnOnce(&str) -> bool) -> Option<String> {

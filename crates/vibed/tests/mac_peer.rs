@@ -11,6 +11,8 @@
 //! tests/linux_host.rs.
 
 mod common;
+#[path = "../../vibe-mcp/tests/client/mod.rs"]
+mod events_client;
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -2246,5 +2248,344 @@ async fn a_host_the_mac_cant_reach_is_unavailable_with_the_mac_there() {
     for agent in ["on-vps", "mac:on-mac", "edge:on-edge"] {
         c.call("vibe_delete_agent", json!({"agent": agent, "force": true}))
             .await;
+    }
+}
+
+// MCP Events through one ingress.
+
+/// Where the host's MCP is, with the key it's asked with.
+#[derive(Clone, Copy)]
+struct Events<'a> {
+    addr: SocketAddr,
+    key: &'a str,
+}
+
+impl Events<'_> {
+    /// A 2026-07-28 request and its headers, `Mcp-Name` its event type.
+    fn request(&self, id: u64, method: &str, mut params: Value) -> (String, Vec<(String, String)>) {
+        let mut headers = vec![
+            ("Authorization".to_owned(), format!("Bearer {}", self.key)),
+            ("MCP-Protocol-Version".to_owned(), "2026-07-28".to_owned()),
+            ("Mcp-Method".to_owned(), method.to_owned()),
+        ];
+        if let Some(name) = params.get("name").and_then(Value::as_str) {
+            headers.push(("Mcp-Name".to_owned(), name.to_owned()));
+        }
+        params["_meta"] = json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientInfo": {"name": "t", "version": "1"},
+            "io.modelcontextprotocol/clientCapabilities":
+                {"extensions": {"io.modelcontextprotocol/events": {}}},
+        });
+        let body = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+        (body.to_string(), headers)
+    }
+
+    /// `events/poll` of `name` from `cursor`, narrowed by `arguments`.
+    async fn poll(&self, name: &str, cursor: Option<&str>, arguments: Value) -> Value {
+        let (body, headers) = self.request(
+            1,
+            "events/poll",
+            json!({"name": name, "cursor": cursor, "arguments": arguments}),
+        );
+        let headers: Vec<(&str, &str)> = headers
+            .iter()
+            .map(|(n, v)| (n.as_str(), v.as_str()))
+            .collect();
+        let r = events_client::post_raw(self.addr, "/mcp", &headers, &body).await;
+        assert_eq!(r.status, 200, "{}", r.body);
+        r.response()["result"].clone()
+    }
+
+    async fn stream(&self, id: u64, name: &str) -> events_client::Stream {
+        let (body, headers) = self.request(id, "events/stream", json!({"name": name}));
+        let headers: Vec<(&str, &str)> = headers
+            .iter()
+            .map(|(n, v)| (n.as_str(), v.as_str()))
+            .collect();
+        let s = events_client::Stream::open(self.addr, &headers, &body).await;
+        assert_eq!(s.status, 200);
+        s
+    }
+}
+
+/// The refs of a poll's events.
+fn refs(result: &Value) -> Vec<String> {
+    result["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["data"]["ref"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// The next of a stream's notifications that `wanted`, passing over the rest.
+async fn notice(
+    s: &mut events_client::Stream,
+    what: &str,
+    wanted: impl Fn(&Value) -> bool,
+) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut passed = Vec::new();
+    while Instant::now() < deadline {
+        if let Some(m) = s.next(Duration::from_secs(1)).await {
+            if wanted(&m) {
+                return m;
+            }
+            passed.push(m);
+        }
+    }
+    panic!("no {what} on the stream, only {passed:?}");
+}
+
+/// Lee's rule for #178: one endpoint on a Linux host hears what happens on every host it
+/// reaches, through the Mac alone: the Mac's agents (`mac:`), another host's linked to the
+/// Mac (`edge:`), and its own, by poll and by push, narrowed by host. The Mac decides who
+/// hears its events, as it does for calls: a key of the host's own hears none. The Mac
+/// sleeping is a gap, said as `truncated`. And the Mac's own endpoint hears the Linux
+/// hosts linked to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_ingress_hears_every_hosts_events() {
+    use vibe_mcp::Daemon as _;
+    let w = world().await;
+    let edge = w.add_edge().await;
+    // The Mac's own hub, heard from the start.
+    let mac_hub = w.mac.events().unwrap();
+    w.turn_on().await;
+    let key = w.key("laptop");
+    w.pushed(&key).await;
+    for _ in 0..500 {
+        if edge.core.verify_key(&key).unwrap().is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    w.mac_reachable(&key).await;
+    let ev = Events {
+        addr: w.public,
+        key: &key,
+    };
+    let own = w
+        .host
+        .create_key(KeyCreateParams {
+            name: "host-own".into(),
+        })
+        .unwrap()
+        .secret;
+    let ev_own = Events {
+        addr: w.public,
+        key: &own,
+    };
+
+    // Cursors from now, and a stream of every start.
+    let start = ev.poll("agent.started", None, json!({})).await;
+    let from = start["cursor"].as_str().unwrap().to_owned();
+    let own_from = ev_own.poll("agent.started", None, json!({})).await["cursor"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut changes = ev.stream(41, "agent.started").await;
+    let active = notice(&mut changes, "active", |m| {
+        m["method"] == "notifications/events/active"
+    })
+    .await;
+    assert_eq!(active["params"]["truncated"], false, "{active}");
+
+    // An agent on each host, started here.
+    let mut c = w.client(&key);
+    for (host, profile, name, shown) in [
+        ("local", "software-eng-linux", "on-vps", "on-vps"),
+        ("mac", "software-eng-mac", "on-mac", "mac:on-mac"),
+        ("edge", "software-eng-linux", "on-edge", "edge:on-edge"),
+    ] {
+        let started = c
+            .call(
+                "vibe_start_agent",
+                json!({"project": "app", "profile": profile, "prompt": "talk", "host": host,
+                       "name": name}),
+            )
+            .await;
+        assert!(started.contains(&format!("started {shown}")), "{started}");
+        c.call("vibe_wait", json!({"agents": shown, "timeout": 60}))
+            .await;
+    }
+
+    // Poll: all three, nothing missed.
+    let mut heard = Value::Null;
+    for _ in 0..100 {
+        heard = ev.poll("agent.started", Some(&from), json!({})).await;
+        if refs(&heard).len() == 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let mut started = refs(&heard);
+    started.sort();
+    assert_eq!(started, ["edge:on-edge", "mac:on-mac", "on-vps"], "{heard}");
+    assert_eq!(heard["truncated"], false, "{heard}");
+    let mac_event = heard["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["data"]["host"] == "mac")
+        .unwrap();
+    assert_eq!(mac_event["data"]["agent"], "on-mac", "{mac_event}");
+    assert_eq!(mac_event["data"]["project"], "app", "{mac_event}");
+    // Narrowed by host, and by ref.
+    let on_mac = ev
+        .poll("agent.started", Some(&from), json!({"host": "mac"}))
+        .await;
+    assert_eq!(refs(&on_mac), ["mac:on-mac"], "{on_mac}");
+    let on_edge = ev
+        .poll(
+            "agent.started",
+            Some(&from),
+            json!({"agents": ["edge:on-edge"]}),
+        )
+        .await;
+    assert_eq!(refs(&on_edge), ["edge:on-edge"], "{on_edge}");
+    // A key of the host's own: the Mac doesn't take it, so it hears only the host's.
+    let only_here = ev_own
+        .poll("agent.started", Some(&own_from), json!({}))
+        .await;
+    assert_eq!(refs(&only_here), ["on-vps"], "{only_here}");
+    assert_eq!(only_here["truncated"], false, "{only_here}");
+
+    // Push: the Mac's agent and edge's on the stream too, with its id.
+    for shown in ["mac:on-mac", "edge:on-edge"] {
+        let e = notice(&mut changes, shown, |m| {
+            m["method"] == "notifications/events/event" && m["params"]["data"]["ref"] == shown
+        })
+        .await;
+        assert_eq!(
+            e["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"], 41,
+            "{e}"
+        );
+    }
+
+    // The Mac's own endpoint hears the Linux hosts linked to it.
+    let everything = vibe_mcp::events::Filter::default();
+    let on_mac_hub: Vec<String> = mac_hub
+        .read(0, &everything, 1000, None)
+        .events()
+        .filter(|o| o.name == vibe_mcp::events::Name::Started)
+        .map(|o| format!("{}:{}", o.host, o.agent))
+        .collect();
+    for want in ["vps:on-vps", "local:on-mac", "edge:on-edge"] {
+        assert!(
+            on_mac_hub.iter().any(|r| r == want),
+            "{want}: {on_mac_hub:?}"
+        );
+    }
+
+    // The tunnel itself: nothing without a key the Mac takes, never the asking host's own
+    // agents, and the states now before the events.
+    let end = w.tunnel_end();
+    let refused = down_the_tunnel_events(&end, "vk_wrong").await;
+    assert_eq!(
+        refused["error"]["code"],
+        ErrorCode::Unauthorized.code(),
+        "{refused}"
+    );
+    let refused = down_the_tunnel_events(&end, &own).await;
+    assert_eq!(
+        refused["error"]["code"],
+        ErrorCode::Unauthorized.code(),
+        "{refused}"
+    );
+    let now = down_the_tunnel_events(&end, &key).await;
+    let mut states: Vec<String> = now["result"]["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| {
+            format!(
+                "{}:{}",
+                a["host"].as_str().unwrap(),
+                a["ref"].as_str().unwrap()
+            )
+        })
+        .collect();
+    states.sort();
+    assert_eq!(states, ["edge:on-edge", "local:on-mac"], "{now}");
+
+    // The Mac sleeps and wakes: what happened meanwhile may be lost, and every cursor
+    // from before says so, on poll and on the stream.
+    let before = heard["cursor"].as_str().unwrap().to_owned();
+    w.wires.freeze(true);
+    w.tunnel_down().await;
+    w.thaw().await;
+    let mut after = Value::Null;
+    for _ in 0..200 {
+        after = ev.poll("agent.started", Some(&before), json!({})).await;
+        if after["truncated"] == true {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(after["truncated"], true, "{after}");
+    let again = notice(&mut changes, "a fresh active", |m| {
+        m["method"] == "notifications/events/active"
+    })
+    .await;
+    assert_eq!(again["params"]["truncated"], true, "{again}");
+    // Narrowed to this host's own, the Mac's sleep missed nothing.
+    let here = ev
+        .poll("agent.started", Some(&before), json!({"host": "local"}))
+        .await;
+    assert_eq!(here["truncated"], false, "{here}");
+    // And it carries on afterwards.
+    let at = after["cursor"].as_str().unwrap().to_owned();
+    c.call(
+        "vibe_delete_agent",
+        json!({"agent": "mac:on-mac", "force": true}),
+    )
+    .await;
+    let mut gone = Value::Null;
+    for _ in 0..100 {
+        gone = ev.poll("agent.deleted", Some(&at), json!({})).await;
+        if !refs(&gone).is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(refs(&gone), ["mac:on-mac"], "{gone}");
+    assert_eq!(gone["truncated"], false, "{gone}");
+
+    // A revoke on the Mac: its stream of events for the host goes with the key.
+    w.mac
+        .revoke_key(KeyParams {
+            name: "laptop".into(),
+        })
+        .unwrap();
+    let refused = down_the_tunnel_events(&end, &key).await;
+    assert_eq!(
+        refused["error"]["code"],
+        ErrorCode::Unauthorized.code(),
+        "{refused}"
+    );
+    let ended = notice(&mut changes, "the end", |m| {
+        m["method"] == "notifications/events/terminated" || m.get("result").is_some()
+    })
+    .await;
+    assert!(ended.to_string().contains("subscriptionId"), "{ended}");
+}
+
+/// `tunnel.events` down the tunnel with `key`: its answer.
+async fn down_the_tunnel_events(end: &Path, key: &str) -> Value {
+    let stream = UnixStream::connect(end).await.unwrap();
+    let (read, mut write) = stream.into_split();
+    let line = json!({"jsonrpc": "2.0", "id": 1, "method": "tunnel.events",
+                      "params": {"key": key}});
+    write
+        .write_all(format!("{line}\n").as_bytes())
+        .await
+        .unwrap();
+    let mut read = BufReader::new(read.reunite(write).unwrap());
+    loop {
+        let answer = answer_from(&mut read).await;
+        if answer.get("id").is_some() {
+            return answer;
+        }
     }
 }

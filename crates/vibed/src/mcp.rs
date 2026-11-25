@@ -379,6 +379,7 @@ impl Daemon for Core {
             }
             let links: Vec<Arc<crate::link::Link>> = lock(&self.links).values().cloned().collect();
             for link in links {
+                hub.seed_link(&link.name, &Core::link_state(&link));
                 for a in self.kept_agents(&link) {
                     hub.seed(&link.name, &a.agent, a.state);
                 }
@@ -386,6 +387,13 @@ impl Daemon for Core {
             hub.spawn_feed(rx);
             hub
         })))
+    }
+
+    async fn events_relayed(&self, c: &Caller) -> bool {
+        match self.events() {
+            Some(hub) => self.mac_events_heard(c.key(), &hub).await,
+            None => false,
+        }
     }
 
     fn known_hosts(&self, c: &Caller, agent: &str) -> Vec<String> {

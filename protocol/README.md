@@ -120,8 +120,8 @@ there. `hosts.list` gives each host's `tunnel` (`connecting`, `up` or `down`) an
 isn't up, `tunnel_detail`; a host's own row says whether a Mac answers through it, once one
 has opened one.
 
-**A tunnel's socket isn't this contract.** It takes two methods only, in the same framing:
-`daemon.hello`, and `tunnel.call {key, method, params, sent_at}`. `sent_at` is when the host
+**A tunnel's socket isn't this contract.** It takes three methods only, in the same framing:
+`daemon.hello`, `tunnel.call {key, method, params, sent_at}` and `tunnel.events {key}`. `sent_at` is when the host
 sent it, in Unix seconds: the Mac refuses an `agents.send`, `agents.start` or `agents.delete`
 more than about 60 s old when it arrives, so clocks that far apart refuse them too. It checks
 `key`, the caller's API key, itself first: a key it doesn't know, revoked here though a host
@@ -140,6 +140,17 @@ call, the socket says so with a notification, `call.accepted {id}`, and a host f
 hasn't that or an answer within 5 s, however long it may run after that. A Mac that does this
 says `accepts_calls: true` in its `daemon.hello` answer. So does `vibed.sock` to a connection
 whose hello says it's a link, sending `call.accepted` for those same agent calls.
+
+`tunnel.events {key}` is the host's MCP Events hearing the Mac. The key is checked as for
+`tunnel.call`. It answers with `agents`, each agent's `{host, ref, state}` now, and `links`,
+each other host's `{host, link}`, with the Mac's own as `local` and never the asking host's.
+From then on the connection carries an `events.event` line for each `agent.added`,
+`agent.state` and `agent.deleted` on the Mac and the other hosts linked to it, and each
+`host.link` and `lagged` of those hosts. Each one is cut to `at`, `host`, `kind`, `project`,
+`ref` and `state`, and none is the asking host's. The Mac closes the connection when the key
+stops working there, and when it falls behind. Either way, the host subscribes again and takes
+whatever came between as missed. A Mac that takes it says `serves_events: true` in its
+`daemon.hello` answer. A host doesn't ask one that doesn't, and an older host never asks.
 
 **Shared MCP services.** There's one login per install for each service, held by
 one owning host, and a broker on every `vibed`. `services.overview` gives each

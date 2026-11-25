@@ -11,6 +11,7 @@ pub mod limit_watch;
 pub mod link;
 pub mod linux;
 pub mod logging;
+pub mod mac_events;
 pub mod mac_peer;
 pub mod mcp;
 pub mod memory;

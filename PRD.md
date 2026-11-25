@@ -409,7 +409,7 @@ caller ──API key──▶ Linux host's MCP (loopback or Tailscale) ══ tu
   - **Local first.** Listings and lookups ask every host at once. One that doesn't answer in time shows as unavailable, with its agents as last seen and when, and a lookup that finds nothing says it didn't answer rather than that nothing's there. A multi-agent `vibe_wait` checks them all at once under the same limit.
   - **A sleeping Mac is caught quickly.** The end of its tunnel can go on accepting with nothing behind it. So the Mac says it has a call as soon as it gets one (`call.accepted`), and one it hasn't taken within 5 s fails, whatever its own timeout; once taken, it may run as long as it needs. An older Mac doesn't say so, and isn't held to this, which its hello shows. The host also looks every 5 s, and at once again after a look fails. One failed look makes new calls for `mac` fail at once; two make those under way stop waiting, within about 15 s. Only a look decides whether the Mac's gone: one call failing says nothing of the others.
   - **A change sent to a Mac that then goes quiet has an unknown outcome, and says so.** A send, start or delete that had gone out is never sent again. It may have happened or may yet: the bytes can sit in the tunnel until the Mac wakes. So the error says to check `vibe_read_messages` or `vibe_list_agents` first, and a send's gives the `request_id` that delivers it at most once. The Mac refuses a send, start or delete more than about 60 s old when it arrives, so the outcome stays open only that long; a Mac and host whose clocks disagree by that much have theirs refused too, and the error says so. One that never went out says nothing was sent.
-  - **A bare ref is local first, then the ref directory; this host wins a collision.** It's this host's if this host has it, whoever else has one of that name, and nothing else is asked. Failing that it's where that key last saw it: from a listing, a start, anything the agent answered, and for a linked host its events too. The Mac sends no events through the tunnel, where nothing crosses without a key. Only failing all that are the others asked. Two other hosts having it, known or asked, is an error that says to name the host.
+  - **A bare ref is local first, then the ref directory; this host wins a collision.** It's this host's if this host has it, whoever else has one of that name, and nothing else is asked. Failing that it's where that key last saw it: from a listing, a start, anything the agent answered, and for a linked host its events too. The Mac's events cross the tunnel only for MCP Events, on a caller's key, and refs aren't looked up in them. Only failing all that are the others asked. Two other hosts having it, known or asked, is an error that says to name the host.
   - **A project on several hosts is an error that says to name the host,** counting a host that doesn't answer in time if that key last saw the project there, so it doesn't turn on how quickly a host answers. A project this key has never seen on a host that isn't answering goes to the one host that has it.
 - Two parts of #59's design weren't built, and aren't planned (decided in #63). The Mac's last-seen agents are kept in memory, not in the store, so a host restarted while the Mac is away says the Mac is unavailable, with none of its agents, until it's back. And there's no separate federation layer: the tools ask each host under the peer deadline themselves, with the same bounds.
 - A Mac older than its host doesn't send its memory with its agents, so it's asked separately. While that Mac is asleep, a listing can take twice the peer deadline until the host's next look finds it gone, 5 to 10 s at most. That's accepted, and ends when the Mac updates (#63).
@@ -448,7 +448,7 @@ MCP is the product. It keeps the shape of VibeOS's MCP, which already drives a w
 **Rules carried over.** Reads (`vibe_wait`, `vibe_read_*`, `vibe_list_*`) never wake an agent; `vibe_send` does. Text results are cut at about 32,000 characters, keeping the end, with a note saying how much was cut. MCP Resources and Tasks aren't used in v1. Events reach the menu bar over the socket, and MCP clients through `vibe_wait` or MCP Events.
 
 **Events.** The server offers the MCP Events extension (SEP-3415, `io.modelcontextprotocol/events`), advertised only in `server/discover`, since it is defined from protocol `2026-07-28` on. For older protocols, `events/*` is "method not found".
-- **Event types.** There are four, about agents on this host and the Linux hosts linked to it:
+- **Event types.** There are four, about agents on every host the endpoint reaches: this host and the Linux hosts linked to it, and on a Linux host the Mac behind it and the other hosts linked to that Mac:
   - `agent.started`
   - `agent.state_changed`, with `previous`
   - `agent.turn_ended`: `busy` became anything else
@@ -465,7 +465,14 @@ MCP is the product. It keeps the shape of VibeOS's MCP, which already drives a w
   - a cursor from an earlier `vibed`, or older than the ring holds;
   - a linked host whose link came up, for subscriptions that could include it;
   - the feed falling behind the bus.
-- **Not covered.** `mac:` agents reached through the Mac's tunnel, whose events don't reach this host's bus.
+- **The Mac's events on a Linux host.** They come down the Mac's tunnel (`tunnel.events`), as one endpoint on a Linux host reaches every host while the Mac is online.
+  - The tunnel takes nothing without a caller's key, which the Mac checks itself, and the host keeps only hashes. So a caller of `events/poll` or `events/stream` opens them.
+  - The host first asks the Mac whether it takes the caller's key (`hosts.list` through the tunnel). The answer is kept for 60 s, or until the keys change here.
+  - One feed runs on a key that has asked in the last 10 minutes, and stops once none has, so no key is kept for longer.
+  - Only callers the Mac takes hear the Mac's events and the gaps in them. A key of the host's own hears none, as its calls get nothing there.
+  - Each time the feed subscribes is a gap in what came through the Mac: the Mac slept, the tunnel dropped, the feed stopped, or the Mac fell behind. A cursor from before it is `truncated` for subscriptions that could include the Mac's hosts. One of the Mac's links coming back up is a gap for that host only.
+  - The first request to start the feed waits up to 3 s for it, so its cursor is after that gap.
+  - An older Mac, without `serves_events`, sends none.
 - **`subscriptions/listen`.** Accepted with an empty filter, since the tools never change and there's no list change to send. It stays open until it's closed, and counts against the same 64.
 
 ### Shared MCP services

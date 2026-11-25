@@ -546,6 +546,8 @@ pub struct Core {
     pub(crate) mac_probe: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// On a Linux host, the Mac behind it, at the tunnel's end.
     pub(crate) peer: crate::mac_peer::MacPeer,
+    /// On a Linux host, the Mac's events, heard down its tunnel for MCP Events.
+    pub(crate) relay: crate::mac_events::Relay,
     /// On a Mac, the tunnel to each Linux host linked to it.
     pub(crate) tunnels: Mutex<HashMap<String, crate::tunnel::Tunnel>>,
     _state_lock: StateLock,
@@ -739,6 +741,7 @@ impl Core {
             mac_probe_every: config.mac_probe_every,
             mac_probe: Mutex::new(None),
             peer: crate::mac_peer::MacPeer::new(tunnel_end),
+            relay: crate::mac_events::Relay::default(),
             tunnels: Mutex::new(HashMap::new()),
             _state_lock: state_lock,
         };

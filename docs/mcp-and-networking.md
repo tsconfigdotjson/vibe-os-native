@@ -223,9 +223,13 @@ read its answer with `vibe_read_messages` and its screen with
     loopback and your tailnet, and doesn't post to URLs a client names.
   - Over `vibe mcp`, a stream's notifications come through on stdout. A
     `notifications/cancelled` for the stream's request ends it.
-- **Coverage.** Events cover this host and the Linux hosts linked to it.
-  Agents on a Mac reached through its tunnel (`mac:…` from a Linux host)
-  aren't covered. Ask the Mac's own MCP for those.
+- **Coverage.** Events cover every host the endpoint reaches. On the Mac,
+  that's the Mac and its linked Linux hosts. On a Linux host, it's the host
+  itself, the Mac (`mac:…`) and the other hosts linked to the Mac, while the
+  Mac is online. The Mac's events come down its tunnel, opened with your
+  key: the Mac must take that key, as for calls, so a key made on the
+  Linux host alone hears only that host. The first poll or stream that needs
+  them can take up to 3 s longer while the host subscribes.
 - **Cursors.**
   - Each `vibed` keeps the last 4,096 events.
   - A cursor older than that, or from before `vibed` restarted, comes back
@@ -233,6 +237,9 @@ read its answer with `vibe_read_messages` and its screen with
   - You also get `truncated: true` when a linked host's link comes back up,
     since its events weren't heard while it was down. That applies only to
     subscriptions that could include that host.
+  - On a Linux host, the Mac waking from sleep, its tunnel coming back, or
+    10 minutes with no client asking for events is also `truncated: true`,
+    for subscriptions that could include the Mac or the hosts linked to it.
   - After a truncated reply, read what you need with the tools.
 - **Limits and keys.**
   - At most 64 streams are open at once on a host.

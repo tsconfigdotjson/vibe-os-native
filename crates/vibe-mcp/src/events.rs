@@ -2,8 +2,9 @@
 //! interface, Events): a client subscribes to what happens to agents
 //! instead of polling `vibe_wait` and `vibe_list_agents`.
 //!
-//! Four event types, about agents on this host and the Linux hosts linked
-//! to it: `agent.started`, `agent.state_changed`, `agent.turn_ended` and
+//! Four event types, about agents on every host this endpoint reaches:
+//! this one, the Linux hosts linked to it, and on a Linux host the Mac
+//! behind it and the other hosts linked to that Mac. `agent.started`, `agent.state_changed`, `agent.turn_ended` and
 //! `agent.deleted`. Each payload is a ref, its host, project and state, and
 //! no more: what an agent said or shows is read with the tools, so nothing
 //! an agent wrote rides in an event.
@@ -19,6 +20,11 @@
 //! holds, gets `truncated: true` and a fresh cursor, as do the times a
 //! host's events may have been missed (its link was down, or the feed fell
 //! behind).
+//!
+//! What another daemon relays (on a Linux host, the Mac's events, down its
+//! tunnel) is held apart as [`Occurrence::relayed`]: that daemon checks keys
+//! itself, so its events, and the gaps in them, go only to callers it takes
+//! ([`Daemon::events_relayed`]).
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -58,6 +64,9 @@ pub const MAX_HEARTBEAT: Duration = Duration::from_secs(60);
 
 /// How long a poller is asked to wait between polls.
 pub const NEXT_POLL_MS: u64 = 5000;
+
+/// How often a stream asks again whether its caller hears what's relayed.
+const RELAY_RENEW: Duration = Duration::from_secs(30);
 
 const DEFAULT_MAX_EVENTS: u64 = 100;
 const MAX_EVENTS: u64 = 1000;
@@ -218,6 +227,9 @@ pub struct Occurrence {
     pub project: Option<String>,
     pub state: Option<String>,
     pub previous: Option<String>,
+    /// Relayed by another daemon, which decides who hears it: only callers
+    /// it takes do.
+    pub relayed: bool,
 }
 
 impl Occurrence {
@@ -253,11 +265,16 @@ impl Occurrence {
 }
 
 /// What the ring holds: an occurrence, or a point where events may have
-/// been missed, for one host or (`None`) every host.
+/// been missed, for one host or (`None`) every host; of those relayed
+/// alone, if `relayed`.
 #[derive(Debug, Clone)]
 enum Entry {
     Event(Occurrence),
-    Gap { seq: u64, host: Option<String> },
+    Gap {
+        seq: u64,
+        host: Option<String>,
+        relayed: bool,
+    },
 }
 
 impl Entry {
@@ -390,6 +407,53 @@ impl Hub {
 
     /// Takes in an event from the daemon's bus.
     pub fn ingest(&self, e: &Event) {
+        self.take_in(e, false);
+    }
+
+    /// Takes in an event another daemon relayed, its host as it goes by
+    /// here: only callers that daemon takes hear of it.
+    pub fn ingest_relayed(&self, e: &Event) {
+        if e.host != LOCAL_HOST {
+            self.take_in(e, true);
+        }
+    }
+
+    /// What a relay may have missed, on every host it relays: it's only now
+    /// (again) heard from.
+    pub fn relayed_gap(&self) {
+        let mut inner = lock(&self.inner);
+        inner.push(|seq| Entry::Gap {
+            seq,
+            host: None,
+            relayed: true,
+        });
+        let last = inner.last;
+        drop(inner);
+        self.newest.send_replace(last);
+    }
+
+    /// An agent's state as a relay says it is now, over what was heard
+    /// before: what changed in between was missed.
+    pub fn seed_relayed(&self, host: &str, agent: &str, state: &str) {
+        lock(&self.inner)
+            .states
+            .insert((host.to_owned(), agent.to_owned()), state.to_owned());
+    }
+
+    /// How a linked host's link stands as the hub starts hearing of it, so
+    /// only its coming back up afterwards is a gap.
+    pub fn seed_link(&self, host: &str, state: &str) {
+        lock(&self.inner)
+            .links
+            .insert(host.to_owned(), state.to_owned());
+    }
+
+    /// Counts the times the API keys changed.
+    pub fn key_epoch(&self) -> u64 {
+        *self.keys.borrow()
+    }
+
+    fn take_in(&self, e: &Event, relayed: bool) {
         let heard_ms = now_ms();
         let mut inner = lock(&self.inner);
         let before = inner.last;
@@ -404,6 +468,7 @@ impl Hub {
                 project: e.project.clone(),
                 state,
                 previous,
+                relayed,
             })
         };
         match e.kind {
@@ -452,6 +517,7 @@ impl Hub {
                     inner.push(|seq| Entry::Gap {
                         seq,
                         host: Some(host),
+                        relayed,
                     });
                 }
             }
@@ -461,9 +527,10 @@ impl Hub {
                 inner.push(|seq| Entry::Gap {
                     seq,
                     host: Some(host),
+                    relayed,
                 });
             }
-            EventKind::KeysChanged => {
+            EventKind::KeysChanged if !relayed => {
                 self.keys.send_modify(|n| *n += 1);
             }
             _ => {}
@@ -478,7 +545,11 @@ impl Hub {
     /// The hub's own feed fell behind the bus: anything may be missing.
     pub fn lagged(&self) {
         let mut inner = lock(&self.inner);
-        inner.push(|seq| Entry::Gap { seq, host: None });
+        inner.push(|seq| Entry::Gap {
+            seq,
+            host: None,
+            relayed: false,
+        });
         let last = inner.last;
         drop(inner);
         self.newest.send_replace(last);
@@ -542,8 +613,10 @@ impl Hub {
         let start = cursor;
         for entry in inner.ring.iter().filter(|e| e.seq() > start) {
             match entry {
-                Entry::Gap { seq, host } => {
-                    if host.as_deref().is_none_or(|h| filter.may_include_host(h)) {
+                Entry::Gap { seq, host, relayed } => {
+                    if (!relayed || filter.relayed)
+                        && host.as_deref().is_none_or(|h| filter.may_include_host(h))
+                    {
                         // Gaps one after another are one gap.
                         if let Some(Item::Gap(last)) = items.last_mut() {
                             *last = *seq;
@@ -622,6 +695,8 @@ pub struct Filter {
     /// Refs, each with its host if it names one.
     pub agents: Option<Vec<(Option<String>, String)>>,
     pub states: Option<Vec<String>>,
+    /// Whether the caller hears what's relayed ([`Occurrence::relayed`]).
+    pub relayed: bool,
 }
 
 impl Filter {
@@ -711,7 +786,8 @@ impl Filter {
     }
 
     pub fn matches(&self, o: &Occurrence) -> bool {
-        self.name.is_none_or(|n| n == o.name)
+        (!o.relayed || self.relayed)
+            && self.name.is_none_or(|n| n == o.name)
             && self.host.as_ref().is_none_or(|h| *h == o.host)
             && self
                 .project
@@ -803,11 +879,13 @@ pub fn list(params: Option<&Value>) -> Result<Value, ErrorData> {
     }))
 }
 
-/// `events/poll`: what happened since the cursor.
-pub fn poll(hub: &Hub, params: Option<&Value>) -> Result<Value, ErrorData> {
+/// `events/poll`: what happened since the cursor, with what's relayed if
+/// the caller hears it.
+pub fn poll(hub: &Hub, params: Option<&Value>, relayed: bool) -> Result<Value, ErrorData> {
     let params = params_object(params)?;
     let name = named(&params)?;
-    let filter = Filter::parse(name, params.get("arguments"))?;
+    let mut filter = Filter::parse(name, params.get("arguments"))?;
+    filter.relayed = relayed;
     let cursor = cursor_param(&params)?;
     let max_age = whole(&params, "maxAgeMs", 0, u64::MAX)?;
     let max_events = whole(&params, "maxEvents", 1, MAX_EVENTS)?.unwrap_or(DEFAULT_MAX_EVENTS);
@@ -908,14 +986,17 @@ pub async fn stream<D: Daemon>(
 ) -> Result<Value, ErrorData> {
     let params = params_object(params)?;
     let name = named(&params)?;
-    let filter = Filter::parse(name, params.get("arguments"))?;
+    let mut filter = Filter::parse(name, params.get("arguments"))?;
     let cursor = cursor_param(&params)?;
     let max_age = whole(&params, "maxAgeMs", 0, u64::MAX)?;
     let heartbeat = whole(&params, "heartbeatMs", 0, u64::MAX)?
         .map_or(DEFAULT_HEARTBEAT, Duration::from_millis)
         .clamp(MIN_HEARTBEAT, MAX_HEARTBEAT);
-    let (from, reset) = hub.resolve(cursor.as_deref())?;
     let _slot = hub.open_stream()?;
+    // Asked first: a relay that starts for it has what it missed behind
+    // the cursor this stream starts from.
+    filter.relayed = daemon.events_relayed(caller).await;
+    let (from, reset) = hub.resolve(cursor.as_deref())?;
     let notify = Notifier {
         ctx,
         id: serde_json::to_value(&ctx.id).unwrap_or(Value::Null),
@@ -952,6 +1033,8 @@ pub async fn stream<D: Daemon>(
     }
     let mut at = replay.cursor;
     let mut beat = tokio::time::Instant::now() + heartbeat;
+    let mut renew =
+        tokio::time::interval_at(tokio::time::Instant::now() + RELAY_RENEW, RELAY_RENEW);
     loop {
         tokio::select! {
             () = ctx.ct.cancelled() => return Ok(notify.done()),
@@ -993,6 +1076,12 @@ pub async fn stream<D: Daemon>(
                         .await;
                     return Ok(notify.done());
                 }
+                filter.relayed = daemon.events_relayed(caller).await;
+            }
+            // Keeps what relays coming while it's listened to, and stops it
+            // for a caller its daemon no longer takes.
+            _ = renew.tick() => {
+                filter.relayed = daemon.events_relayed(caller).await;
             }
             () = tokio::time::sleep_until(beat) => {
                 if !notify
@@ -1311,7 +1400,7 @@ mod tests {
     fn polls_start_from_now() {
         let hub = Hub::new();
         hub.ingest(&event(EventKind::AgentState, "local", "a", Some("idle")));
-        let p = |v: Value| poll(&hub, Some(&v)).unwrap();
+        let p = |v: Value| poll(&hub, Some(&v), false).unwrap();
         let first = p(json!({"name": "agent.state_changed", "arguments": {}, "cursor": null}));
         assert_eq!(first["events"], json!([]));
         assert_eq!(first["truncated"], false);
@@ -1334,14 +1423,15 @@ mod tests {
             (stale["truncated"].clone(), stale["events"].clone()),
             (json!(true), json!([]))
         );
-        let missing = poll(&hub, Some(&json!({"name": "agent.exploded"}))).unwrap_err();
+        let missing = poll(&hub, Some(&json!({"name": "agent.exploded"})), false).unwrap_err();
         assert_eq!(missing.code.0, NOT_FOUND);
         assert_eq!(missing.data, Some(json!({"kind": "event"})));
-        assert!(poll(&hub, Some(&json!({}))).is_err());
+        assert!(poll(&hub, Some(&json!({})), false).is_err());
         assert!(
             poll(
                 &hub,
-                Some(&json!({"name": "agent.deleted", "maxEvents": 0}))
+                Some(&json!({"name": "agent.deleted", "maxEvents": 0})),
+                false,
             )
             .is_err()
         );
@@ -1408,5 +1498,74 @@ mod tests {
         assert!(check_name_header(&h, "events/poll", Some(&p)).is_err());
         assert_eq!(header_text("=?base64?w6k=?=").as_deref(), Some("é"));
         assert_eq!(header_text("=?base64?!?="), None);
+    }
+
+    #[test]
+    fn what_is_relayed_goes_only_to_callers_its_daemon_takes() {
+        let hub = Hub::new();
+        let heard = Filter {
+            relayed: true,
+            ..Filter::default()
+        };
+        hub.ingest(&event(EventKind::AgentAdded, "local", "a", Some("busy")));
+        // The relay's view of the Mac now, then what it says from then on.
+        hub.seed_relayed("mac", "m", "busy");
+        hub.relayed_gap();
+        hub.ingest_relayed(&event(EventKind::AgentState, "mac", "m", Some("idle")));
+        hub.ingest_relayed(&event(EventKind::AgentAdded, "edge", "e", Some("busy")));
+        // Nothing relayed is ever this host's own.
+        hub.ingest_relayed(&event(EventKind::AgentAdded, "local", "x", Some("busy")));
+        let r = hub.read(0, &heard, 100, None);
+        assert_eq!(
+            names(&r),
+            [
+                ("agent.started", "a".into(), Some("busy".into())),
+                ("agent.state_changed", "mac:m".into(), Some("idle".into())),
+                ("agent.turn_ended", "mac:m".into(), Some("idle".into())),
+                ("agent.started", "edge:e".into(), Some("busy".into())),
+            ]
+        );
+        assert!(
+            r.truncated(),
+            "the relay's start is a gap to those who hear it"
+        );
+        assert_eq!(r.events().nth(1).unwrap().previous.as_deref(), Some("busy"));
+        // A caller the relaying daemon doesn't take hears none of it, gaps included.
+        let r = hub.read(0, &all(), 100, None);
+        assert_eq!(
+            names(&r),
+            [("agent.started", "a".into(), Some("busy".into()))]
+        );
+        assert!(!r.truncated());
+        assert_eq!(r.cursor, 5);
+        // A host the relay reaches coming back is a gap for that host alone.
+        let at = r.cursor;
+        let mut link = event(EventKind::HostLink, "edge", "", Some("connected"));
+        link.agent = None;
+        hub.ingest_relayed(&link);
+        let edge_only = Filter {
+            host: Some("edge".into()),
+            ..heard.clone()
+        };
+        let mac_only = Filter {
+            host: Some("mac".into()),
+            ..heard.clone()
+        };
+        assert!(hub.read(at, &edge_only, 100, None).truncated());
+        assert!(!hub.read(at, &mac_only, 100, None).truncated());
+        assert!(!hub.read(at, &all(), 100, None).truncated());
+        // Through poll, as the server asks it.
+        let p = |relayed| {
+            poll(
+                &hub,
+                Some(&json!({"name": "agent.started", "cursor": position(&hub.boot, 0)})),
+                relayed,
+            )
+            .unwrap()
+        };
+        assert_eq!(p(true)["events"].as_array().unwrap().len(), 2);
+        assert_eq!(p(true)["truncated"], true);
+        assert_eq!(p(false)["events"].as_array().unwrap().len(), 1);
+        assert_eq!(p(false)["truncated"], false);
     }
 }

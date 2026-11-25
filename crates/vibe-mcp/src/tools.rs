@@ -1389,7 +1389,12 @@ impl<D: Daemon> ServerHandler for Server<D> {
         }
         let result = match method {
             "events/list" => events::list(params)?,
-            "events/poll" => events::poll(&hub, params)?,
+            "events/poll" => {
+                // Asked first: a relay that starts for it has what it missed
+                // behind the cursor this poll gives.
+                let relayed = self.daemon.events_relayed(&caller).await;
+                events::poll(&hub, params, relayed)?
+            }
             "events/stream" => {
                 let name = params
                     .and_then(|p| p.get("name"))

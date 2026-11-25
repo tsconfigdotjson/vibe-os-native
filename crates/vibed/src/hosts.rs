@@ -767,7 +767,20 @@ impl Core {
     pub(crate) fn host_link_changed(&self, link: &Link) {
         let mut e = self.event(EventKind::HostLink);
         e.host = link.name.clone();
-        let info = link.describe(HostInfo {
+        let info = Self::described(link);
+        e.state = Some(info.link.to_string());
+        e.message = info.detail;
+        self.publish(e);
+    }
+
+    /// How `link` stands now, as a `host.link` event says it.
+    pub(crate) fn link_state(link: &Link) -> String {
+        Self::described(link).link.to_string()
+    }
+
+    /// What `link` says of itself, in a row of its own.
+    fn described(link: &Link) -> HostInfo {
+        link.describe(HostInfo {
             name: link.name.clone(),
             os: String::new(),
             label: String::new(),
@@ -785,10 +798,7 @@ impl Core {
             upgrade_error: None,
             upgrade_held: false,
             sign_ins: Vec::new(),
-        });
-        e.state = Some(info.link.to_string());
-        e.message = info.detail;
-        self.publish(e);
+        })
     }
 
     /// What follows a link coming up: the host's agents read again, this
