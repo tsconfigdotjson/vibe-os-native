@@ -77,7 +77,7 @@ pub struct Config {
     pub timeout: Duration,
     pub default_ttl: Duration,
     pub min_ttl: Duration,
-    /// The longest lifetime granted, also for `ttlMs: null`.
+    /// The longest lifetime granted, also for `ttlMs: null`: never none.
     pub max_ttl: Duration,
     /// How long a verified URL stays verified for its owner's next
     /// subscriptions to it.
@@ -102,9 +102,11 @@ impl Default for Config {
                 Duration::from_secs(480),
             ],
             timeout: Duration::from_secs(10),
-            default_ttl: Duration::from_secs(24 * 3600),
+            // Short, as subscriptions live in memory: after a restart, a client
+            // hears nothing until it refreshes.
+            default_ttl: Duration::from_secs(3600),
             min_ttl: Duration::from_secs(5 * 60),
-            max_ttl: Duration::from_secs(30 * 24 * 3600),
+            max_ttl: Duration::from_secs(24 * 3600),
             verified_for: Duration::from_secs(24 * 3600),
             rotation: Duration::from_secs(5 * 60),
             max_per_owner: 32,

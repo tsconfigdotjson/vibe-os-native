@@ -1812,10 +1812,7 @@ async fn a_callback_is_verified_then_gets_each_event_signed() {
     assert!(sub["cursor"].is_string());
     let before = vibe_core::time::parse_rfc3339(sub["refreshBefore"].as_str().unwrap()).unwrap();
     let left = before - vibe_core::time::now();
-    assert!(
-        (23 * 3600..=24 * 3600).contains(&left),
-        "a day by default: {left}"
-    );
+    assert!((3500..=3600).contains(&left), "an hour by default: {left}");
     assert_eq!(*fake.subscribers.lock().unwrap(), ["laptop"]);
     // Verified first, signed, with a single-use challenge.
     let v = hook.verifications();
@@ -2056,10 +2053,14 @@ async fn a_subscription_lasts_what_was_granted_unless_refreshed() {
     params["ttlMs"] = json!(10);
     let r = subscribe(&mut c, params.clone()).await;
     assert!(grant(&r) <= 1, "{r}");
-    // No expiry asked for is the longest there is.
+    // No expiry asked for is the longest there is, a day, and so is more than that.
     params["ttlMs"] = Value::Null;
     let r = subscribe(&mut c, params.clone()).await;
-    assert!(grant(&r) > 29 * 24 * 3600, "{r}");
+    assert!(r["refreshBefore"].is_string(), "{r}");
+    assert!((24 * 3600 - 100..=24 * 3600).contains(&grant(&r)), "{r}");
+    params["ttlMs"] = json!(30u64 * 24 * 3600 * 1000);
+    let r = subscribe(&mut c, params.clone()).await;
+    assert!((24 * 3600 - 100..=24 * 3600).contains(&grant(&r)), "{r}");
     // Refreshed to two seconds, it delivers; left, it ends.
     params["ttlMs"] = json!(2000);
     subscribe(&mut c, params.clone()).await;

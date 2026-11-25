@@ -41,7 +41,7 @@ use crate::core::{Core, lock};
 use crate::remote::Channel;
 
 /// A grant with less than this left is taken again at its key's next subscribe or
-/// refresh: more than the longest subscription granted (30 days).
+/// refresh: more than the longest subscription granted (24 hours).
 const RENEW_WITHIN: i64 = 31 * 24 * 3600;
 
 /// How long a subscribe waits for the feed to take its key, so its cursor is after the

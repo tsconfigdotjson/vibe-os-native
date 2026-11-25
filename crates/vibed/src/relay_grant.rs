@@ -16,7 +16,7 @@ use vibe_core::rpc::{ErrorCode, ErrorObject, TunnelGrant};
 use crate::core::{Core, error};
 
 /// How long a grant holds: longer than the longest webhook subscription a host grants
-/// (30 days), so one taken at a refresh outlasts what it's for.
+/// (24 hours) by far, so one taken at a refresh outlasts what it's for.
 pub(crate) const GRANT_FOR: i64 = 60 * 24 * 3600;
 
 const PREFIX: &str = "vgr1";

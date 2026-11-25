@@ -236,8 +236,8 @@ read its answer with `vibe_read_messages` and its screen with
   (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`, `*.ts.net`). An `http` URL is
   refused when you subscribe. Private network, link-local and cloud metadata
   addresses are refused, checked again every time it connects.
-- **Lifetimes.** 24 hours unless you ask, at least 5 minutes, at most 30
-  days (also for `ttlMs: null`). Refresh before `refreshBefore`.
+- **Lifetimes.** 1 hour unless you ask, at least 5 minutes, at most 24
+  hours (also for `ttlMs: null`). Refresh before `refreshBefore`.
   Deleting the API key that made them ends them. `events/unsubscribe` ends
   one at once. A key can hold 32, a host 256.
 - **Restarts.** Subscriptions live in `vibed`'s memory, so a restart ends
